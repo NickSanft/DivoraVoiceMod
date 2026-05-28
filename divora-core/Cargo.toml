@@ -1,0 +1,15 @@
+[package]
+name = "divora-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Audio engine and DSP primitives for Divora"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

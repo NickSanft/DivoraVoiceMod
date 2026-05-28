@@ -1,0 +1,63 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / pnpm
+node_modules/
+pnpm-debug.log*
+.pnpm-store/
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/schemas/
+
+# Frontend build outputs
+dist/
+.vite/
+build/
+*.tsbuildinfo
+
+# Vitest
+coverage/
+
+# Playwright
+playwright-report/
+test-results/
+playwright/.cache/
+
+# Tauri bundled artifacts in dist
+src-tauri/Cargo.lock.bak
+
+# IDE / editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Claude Code local project config
+.claude/
+
+# Local environment
+.env
+.env.local
+.env.*.local
+
+# OS
+desktop.ini
+
+# User test recordings (large)
+test-recordings/
+goldens/.cache/
+
+# Logs
+*.log
+logs/
+
+# Local user data (for in-source dev testing)
+.divora-userdata/
