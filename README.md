@@ -1,6 +1,8 @@
-# Divora
+# DivoraVoice
 
 A free, open-source real-time voice modulator for Windows. Local-first, no account, no telemetry.
+
+The visual identity is **"spellcraft for your voice"** — a calm utility tool wearing a dusk-lit arcane skin. See [`docs/mockups/`](docs/mockups/) for the design.
 
 > **Status:** Phase 0 — scaffold. Not yet usable. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 

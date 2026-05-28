@@ -4,6 +4,25 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `docs/mockups/` — high-fidelity design reference (README spec, HTML + React interactive prototype, screenshots) defining the "spellcraft for your voice" visual identity, spell-circle Mixer, glyph-casting easter egg, and Tweaks system.
+- Detailed design system section in `docs/PLAN.md` (color tokens, type scale, components, window chrome, motion).
+- Glyph casting (Phase 7), A/B preset compare (Phase 4), and user-facing Tweaks (Phase 6) added to v1 scope.
+
+### Changed
+
+- **Product name finalized as "DivoraVoice"** (brand parent: Divora). Updated `tauri.conf.json` productName + window title, `README.md`, `index.html` `<title>`, placeholder App.tsx + test, and Rust doc comments. Internal crate names (`divora-app`, `divora-core`) kept as is.
+- **Phase plan restructured** — design system + app shell is now Phase 1; original Phase 1 (audio passthrough) becomes Phase 2; all downstream phases shifted by +1.
+- Bundled preset names changed from generic archetypes (e.g. "Deep Narrator") to the design-spec names: **Hollow King, Static Wraith, Velvet Demon, Choir of Ash, Clean Passthrough**.
+- DSP effect catalog and parameter ranges aligned with the design spec.
+- Placeholder `src/styles.css` swapped Inter (forbidden by design) for system-ui until Phase 1 ships Bricolage / Space Grotesk / Space Mono.
+- Placeholder background swapped from `#09090b` (zinc-950) to `#07060d` (dusk-violet `--bg`).
+
+### Why it matters
+
+The design mockups raised the visual ambition substantially. Restructuring the phase plan now (rather than discovering the shell's complexity mid-Phase 1) keeps every future phase a single tight unit of work that plugs into a known-good shell.
+
 ## [0.0.0] — 2026-05-28
 
 ### Added

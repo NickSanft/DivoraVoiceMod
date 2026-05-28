@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Divora",
+  "productName": "DivoraVoice",
   "version": "0.0.0",
   "identifier": "com.divora.voicemod",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Divora",
+        "title": "DivoraVoice",
         "width": 1100,
         "height": 720,
         "minWidth": 900,
@@ -39,7 +39,7 @@
     "copyright": "Copyright © 2026 Divora Contributors",
     "category": "Utility",
     "shortDescription": "Free real-time voice modulator",
-    "longDescription": "Divora is a free, open-source, Windows-only real-time voice modulator. Local-first, no account, no telemetry.",
+    "longDescription": "DivoraVoice is a free, open-source, Windows-only real-time voice modulator. Local-first, no account, no telemetry.",
     "windows": {
       "wix": {},
       "nsis": {}

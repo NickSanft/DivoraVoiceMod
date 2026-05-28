@@ -1,7 +1,7 @@
-//! Divora Tauri shell.
+//! `DivoraVoice` Tauri shell.
 //!
-//! Phase 0: blank window with a smoke-test IPC command. Real UI and audio
-//! engine wiring land in later phases.
+//! Phase 0: blank window with a smoke-test IPC command. The design system
+//! and app shell land in Phase 1; the audio engine lands in Phase 2.
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -19,5 +19,5 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![ping, project_name])
         .run(tauri::generate_context!())
-        .expect("error while running Divora");
+        .expect("error while running DivoraVoice");
 }

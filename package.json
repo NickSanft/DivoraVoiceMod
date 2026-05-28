@@ -1,9 +1,9 @@
 {
-  "name": "divora",
+  "name": "divoravoice",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Divora - free real-time voice modulator for Windows",
+  "description": "DivoraVoice - free real-time voice modulator for Windows",
   "license": "MIT",
   "scripts": {
     "dev": "vite",

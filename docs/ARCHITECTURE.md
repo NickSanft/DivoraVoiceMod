@@ -3,6 +3,7 @@
 This document evolves with the project. Phase 0 establishes the workspace shape; each subsequent phase adds a section.
 
 > See [PLAN.md](PLAN.md) for the phase-by-phase plan and SDLC workflow.
+> See [`mockups/README.md`](mockups/README.md) and [`mockups/prototype/Divora.html`](mockups/prototype/Divora.html) for the design source of truth.
 
 ## Phase 0 — workspace shape
 
@@ -12,16 +13,16 @@ DivoraVoiceMod/
 ├── package.json                # frontend deps + tauri CLI
 ├── vite.config.ts              # Vite for SolidJS dev/build
 ├── vitest.config.ts            # Vitest config
-├── tsconfig.json               # TypeScript strict mode
+├── tsconfig.json               # TypeScript strict mode + noEmit
 ├── tailwind.config.js
 ├── postcss.config.js
 ├── index.html                  # Vite entry
 ├── src/                        # SolidJS frontend
 │   ├── main.tsx
-│   ├── App.tsx
+│   ├── App.tsx                 # Phase 0 placeholder; rewritten in Phase 1
 │   ├── App.test.tsx
 │   ├── test-setup.ts
-│   └── styles.css
+│   └── styles.css              # placeholder; Phase 1 lands the token system
 ├── src-tauri/                  # Tauri shell crate
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
@@ -31,11 +32,12 @@ DivoraVoiceMod/
 │   └── src/
 │       ├── main.rs             # entry, calls lib::run()
 │       └── lib.rs              # tauri::Builder setup, commands
-├── divora-core/                # audio engine + DSP (grows from Phase 1)
+├── divora-core/                # audio engine + DSP (grows from Phase 2)
 │   ├── Cargo.toml
 │   └── src/lib.rs              # placeholder
-├── presets/                    # bundled JSON presets (populated Phase 3)
+├── presets/                    # bundled JSON presets (populated Phase 4)
 ├── docs/                       # PLAN, ARCHITECTURE, CONTRIBUTING, MANUAL_TESTS
+│   └── mockups/                # design spec + interactive prototype + screenshots
 └── .github/workflows/          # CI + release pipelines
 ```
 
@@ -43,11 +45,13 @@ DivoraVoiceMod/
 
 | Crate | Purpose | Talks to |
 |---|---|---|
-| `divora-core` | All non-Tauri-coupled audio logic: capture/output streams (Phase 1), DSP effect trait + implementations (Phase 2+), preset model (Phase 3), soundboard mixer (Phase 4), virtual mic detection (Phase 5). Unit-testable without a UI. | The OS audio APIs (via `cpal`), the filesystem (presets, soundboard cache) |
+| `divora-core` | All non-Tauri-coupled audio logic: capture/output streams (Phase 2), DSP effect trait + implementations (Phase 3+), preset model (Phase 4), soundboard mixer (Phase 5), virtual mic detection (Phase 6). Unit-testable without a UI. | The OS audio APIs (via `cpal`), the filesystem (presets, soundboard cache) |
 | `divora-app` | Tauri shell. Owns the IPC surface, lifecycle, window. Bridges UI events to `divora-core` and pushes engine state back. | `divora-core`, Tauri runtime, frontend |
-| `src/` (frontend) | SolidJS UI. Effect controls, preset picker, soundboard grid, settings, device picker. | Tauri commands via `@tauri-apps/api/core` |
+| `src/` (frontend) | SolidJS UI. App shell, design system, effect controls, preset picker, soundboard grid, settings, device picker, first-run wizard. | Tauri commands via `@tauri-apps/api/core` |
 
-### Threading (planned, materializes in Phase 1)
+The crate name `divora-app` is internal; the user-visible product name is **DivoraVoice** (set via `tauri.conf.json` `productName`).
+
+### Threading (planned, materializes in Phase 2)
 
 - **Audio callback thread** — driven by `cpal`. Real-time. Zero allocations. Reads input, writes input ring buffer, reads output ring buffer, writes output device.
 - **DSP worker thread** — high priority, not real-time. Runs the effect chain + soundboard mixer. Owns mutable DSP state.
@@ -69,13 +73,27 @@ State across threads:
 | Phase | Commands |
 |---|---|
 | 0 | `ping`, `project_name` (smoke tests) |
-| 1 | `list_devices`, `start_engine`, `stop_engine`, `set_monitor` |
-| 2 | `set_effect_chain`, `set_effect_param` |
-| 3 | `list_presets`, `load_preset`, `save_preset`, `delete_preset` |
-| 4 | `pick_soundboard_folder`, `list_soundboard_tiles`, `play_clip`, `stop_clip`, `stop_all` |
-| 5 | `detect_virtual_mic`, `set_virtual_mic_output` |
-| 6 | `set_hotkey`, `set_hotkey_mode` |
+| 1 | (no new audio commands — design system + app shell) |
+| 2 | `list_devices`, `start_engine`, `stop_engine`, `set_monitor`, `subscribe_levels` |
+| 3 | `set_effect_chain`, `set_effect_param`, `set_ptm_state` |
+| 4 | `list_presets`, `load_preset`, `save_preset`, `delete_preset`, `export_preset_json`, `ab_compare_swap` |
+| 5 | `pick_soundboard_folder`, `list_soundboard_tiles`, `play_clip`, `stop_clip`, `stop_all` |
+| 6 | `detect_virtual_mic`, `set_virtual_mic_output`, `set_hotkey`, `set_hotkey_mode`, `set_tweaks`, `bind_glyph` |
+| 7 | `cast_preset_by_glyph`, `set_first_run_complete` |
 
-## Phase 1 — (placeholder)
+## Phase 1 — design system + app shell
 
-To be filled in when Phase 1 lands.
+To be filled in when Phase 1 lands. Will cover:
+
+- Token system implementation (CSS custom properties + Tailwind theme extension)
+- Font loading (self-hosted `@fontsource/bricolage-grotesque`, `@fontsource/space-grotesk`, `@fontsource/space-mono`)
+- Sigil component architecture (port from `docs/mockups/prototype/divora/sigils.jsx`)
+- Component library structure
+- Frameless titlebar wiring (Tauri `decorations: false`, drag region, custom window controls)
+- Sidebar nav + routing
+- Tweaks state shape and persistence
+- prefers-reduced-motion integration
+
+## Phase 2+ — (placeholders)
+
+To be filled in as each phase lands.

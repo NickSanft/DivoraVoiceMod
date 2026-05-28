@@ -7,9 +7,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 describe("App", () => {
-  it("renders the Divora heading", () => {
+  it("renders the DivoraVoice heading", () => {
     const { getByText } = render(() => <App />);
-    expect(getByText("Divora")).toBeInTheDocument();
+    expect(getByText("DivoraVoice")).toBeInTheDocument();
   });
 
   it("renders the Phase 0 description", () => {

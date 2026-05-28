@@ -4,7 +4,7 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## Setup
 
-- [ ] Fresh install on a clean machine (or wipe `%APPDATA%\Divora\`).
+- [ ] Fresh install on a clean machine (or wipe `%APPDATA%\DivoraVoice\`).
 - [ ] VB-Cable installed.
 - [ ] At least one wired headset connected.
 - [ ] Discord, Zoom, and OBS Studio installed.

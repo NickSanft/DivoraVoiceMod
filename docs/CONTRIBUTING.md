@@ -1,4 +1,4 @@
-# Contributing to Divora
+# Contributing to DivoraVoice
 
 Thanks for considering a contribution. This document covers the development workflow and house style.
 
@@ -32,7 +32,7 @@ See `docs/ARCHITECTURE.md` for a full breakdown. The short version:
 
 ## Per-phase ship workflow
 
-Divora ships in phases. Each phase follows the **same loop**, in order:
+DivoraVoice ships in phases. Each phase follows the **same loop**, in order:
 
 1. **Implement** the phase's scope.
 2. **Tests** — unit (DSP blocks, pure helpers) + Playwright e2e (UI smoke).

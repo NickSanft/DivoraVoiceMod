@@ -1,0 +1,209 @@
+/* ============================================================
+   DIVORA — Design System
+   Dusk-lit arcane. Tool bones, spellcraft skin.
+   ============================================================ */
+
+/* ---- Fonts ---- */
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+
+/* ============================================================
+   TOKENS
+   ============================================================ */
+:root {
+  /* --- Surfaces (dusk-violet darks) --- */
+  --bg:          #07060d;   /* behind the window */
+  --surface-0:   #0d0a16;   /* app canvas */
+  --surface-1:   #14101f;   /* panels / sidebar */
+  --surface-2:   #1a1528;   /* cards */
+  --surface-3:   #221b34;   /* raised / hover */
+  --surface-4:   #2c2442;   /* active / pressed */
+
+  /* --- Lines --- */
+  --line:        rgba(168, 150, 220, 0.10);
+  --line-strong: rgba(168, 150, 220, 0.18);
+  --line-glow:   rgba(124, 92, 246, 0.40);
+
+  /* --- Text --- */
+  --text-hi:  #ECE7F8;
+  --text-mid: #A99FC4;
+  --text-lo:  #6E6590;
+  --text-dim: #4b4368;
+
+  /* --- Accent identity (brand gradient) --- */
+  --indigo:    #6D5BF0;   /* brightened brand #4F46E5 for dark UI */
+  --indigo-deep:#4F46E5;
+  --pink:      #EC4899;
+  --pink-deep: #DB2777;
+  --grad: linear-gradient(120deg, #4F46E5 0%, #7C5CF6 42%, #DB2777 100%);
+  --grad-soft: linear-gradient(120deg, rgba(79,70,229,0.22), rgba(219,39,119,0.22));
+
+  /* --- Semantic --- */
+  --success:  #34D9A0;   /* armed / ok — emerald */
+  --warning:  #E9B14C;   /* candlelit gold */
+  --danger:   #F2567A;   /* crimson-rose */
+  --info:     #58C6F2;   /* cyan */
+
+  --success-bg: rgba(52, 217, 160, 0.12);
+  --warning-bg: rgba(233, 177, 76, 0.12);
+  --danger-bg:  rgba(242, 86, 122, 0.12);
+  --info-bg:    rgba(88, 198, 242, 0.12);
+  --accent-bg:  rgba(124, 92, 246, 0.14);
+
+  /* --- Radii --- */
+  --r-sm: 7px;
+  --r-md: 11px;
+  --r-lg: 16px;
+  --r-xl: 22px;
+  --r-pill: 999px;
+
+  /* --- Spacing scale (4px base) --- */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px;
+  --s5: 20px; --s6: 24px; --s7: 32px; --s8: 40px; --s9: 56px;
+
+  /* --- Shadows / glows --- */
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-2: 0 6px 22px rgba(0,0,0,0.45);
+  --shadow-3: 0 18px 50px rgba(0,0,0,0.55);
+  --glow-accent: 0 0 0 1px rgba(124,92,246,0.35), 0 0 30px rgba(124,92,246,0.35);
+
+  /* --- Type --- */
+  --font-display: 'Bricolage Grotesque', system-ui, sans-serif;
+  --font-ui: 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'Space Mono', ui-monospace, monospace;
+
+  /* type scale */
+  --t-display: 34px;
+  --t-h1: 24px;
+  --t-h2: 19px;
+  --t-h3: 16px;
+  --t-body: 14px;
+  --t-sm: 12.5px;
+  --t-xs: 11px;
+  --t-micro: 9.5px;
+
+  /* motion knob (overridden by Tweaks) */
+  --motion: 1;
+}
+
+/* ---- Color-mood variants (Tweaks) ---- */
+:root[data-mood="ink"] {
+  --bg:        #08070b;
+  --surface-0: #0e0c10;
+  --surface-1: #15131a;
+  --surface-2: #1c1922;
+  --surface-3: #26222d;
+  --surface-4: #322c3a;
+  --warning:   #E9B14C;
+  --line:        rgba(233, 200, 150, 0.10);
+  --line-strong: rgba(233, 200, 150, 0.16);
+  --text-mid: #b4a896;
+  --text-lo:  #75694f;
+}
+:root[data-mood="midnight"] {
+  --bg:        #040406;
+  --surface-0: #08080c;
+  --surface-1: #0d0d13;
+  --surface-2: #131319;
+  --surface-3: #1b1b23;
+  --surface-4: #24242e;
+  --line:        rgba(150, 160, 200, 0.08);
+  --line-strong: rgba(150, 160, 200, 0.14);
+  --text-mid: #9aa0b8;
+  --text-lo:  #5d6178;
+}
+
+/* ============================================================
+   RESET / BASE
+   ============================================================ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: var(--t-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+button { font-family: inherit; color: inherit; cursor: pointer; border: none; background: none; }
+input { font-family: inherit; }
+::selection { background: rgba(124,92,246,0.35); }
+
+/* arcane scrollbars */
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: var(--surface-4); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background: var(--surface-3); background-clip: padding-box; border: 2px solid transparent; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   APP STAGE — scales 1100x720 canvas into any viewport
+   ============================================================ */
+#stage {
+  position: fixed; inset: 0;
+  display: grid; place-items: center;
+  background:
+    radial-gradient(1200px 700px at 20% -10%, rgba(79,70,229,0.10), transparent 60%),
+    radial-gradient(1000px 800px at 110% 120%, rgba(219,39,119,0.08), transparent 55%),
+    var(--bg);
+  overflow: hidden;
+}
+#frame {
+  width: 1100px; height: 720px;
+  transform-origin: center center;
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: var(--shadow-3), 0 0 0 1px rgba(168,150,220,0.08);
+  position: relative;
+}
+
+/* ============================================================
+   GRAIN / TEXTURE overlay (toggle via Tweaks)
+   ============================================================ */
+.grain::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 60;
+  opacity: 0.5;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+  mix-blend-mode: overlay;
+}
+.vignette::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 59;
+  box-shadow: inset 0 0 160px 30px rgba(0,0,0,0.55);
+  border-radius: 14px;
+}
+
+/* ============================================================
+   UTILITY
+   ============================================================ */
+.display { font-family: var(--font-display); font-weight: 700; letter-spacing: -0.01em; }
+.mono { font-family: var(--font-mono); }
+.tnum { font-variant-numeric: tabular-nums; }
+.eyebrow {
+  font-family: var(--font-mono); font-size: var(--t-micro);
+  letter-spacing: 0.22em; text-transform: uppercase; color: var(--text-lo);
+}
+.gradtext {
+  background: var(--grad); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+}
+.thin-rule { height: 1px; background: var(--line); border: 0; }
+
+@keyframes breathe {
+  0%,100% { opacity: calc(0.55 + 0.1 * var(--motion)); transform: scale(1); }
+  50%     { opacity: 1; transform: scale(calc(1 + 0.03 * var(--motion))); }
+}
+@keyframes spin-slow { to { transform: rotate(360deg); } }
+@keyframes spin-rev { to { transform: rotate(-360deg); } }
+@keyframes shimmer {
+  0% { opacity: 0.3; } 50% { opacity: 0.9; } 100% { opacity: 0.3; }
+}
+@keyframes float-up {
+  0% { transform: translateY(0) scale(1); opacity: 0; }
+  15% { opacity: 1; }
+  100% { transform: translateY(-46px) scale(0.4); opacity: 0; }
+}
+@keyframes pulse-ring {
+  0% { transform: scale(0.8); opacity: 0.7; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+@keyframes dash-flow { to { stroke-dashoffset: -28; } }
