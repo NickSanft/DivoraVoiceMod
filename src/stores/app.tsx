@@ -1,0 +1,176 @@
+// Top-level app state for DivoraVoice.
+//
+// Mirrors the prototype's `app.jsx` state shape (presetId, chains, ui,
+// tweaks, glyphs) using SolidJS signals + stores. Wire mock data into
+// signals so screens can be developed without a real audio engine; the
+// engine comes online in Phase 2.
+
+import {
+  createContext,
+  createMemo,
+  createSignal,
+  type JSX,
+  type Setter,
+  useContext,
+} from "solid-js";
+import { createStore, type SetStoreFunction } from "solid-js/store";
+import { PRESETS } from "../data/presets";
+import type {
+  AbSlot,
+  ChainEntry,
+  GlyphId,
+  NavId,
+  Preset,
+  PtmMode,
+  TweaksState,
+  UiState,
+  VoiceStatus,
+} from "../types";
+
+const prefersReducedMotion = (): boolean => {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+};
+
+const defaultTweaks = (): TweaksState => ({
+  mystical: 1,
+  motion: prefersReducedMotion() ? 0 : 1,
+  mood: "violet",
+  accent: "brand",
+  grain: false,
+  vignette: false,
+});
+
+const initialChains = (): Record<string, ChainEntry[]> =>
+  Object.fromEntries(
+    PRESETS.map((p) => [
+      p.id,
+      p.chain.map((c) => ({ ...c, vals: { ...c.vals } })),
+    ]),
+  );
+
+const defaultGlyphs: Record<GlyphId, string> = {
+  triangle: "velvet-demon",
+  invtriangle: "glass-oracle",
+  square: "hollow-king",
+  circle: "clean",
+};
+
+const defaultUi = (): UiState => ({
+  muted: false,
+  monitor: true,
+  ab: "A",
+  ptmMode: "apply",
+  ptmKey: "Space",
+  pressed: false,
+});
+
+export interface AppState {
+  // Nav
+  nav: () => NavId;
+  setNav: Setter<NavId>;
+
+  // Active preset + chain
+  presetId: () => string;
+  setPresetId: Setter<string>;
+  preset: () => Preset;
+  chains: Record<string, ChainEntry[]>;
+  setChains: SetStoreFunction<Record<string, ChainEntry[]>>;
+  chain: () => ChainEntry[];
+
+  // UI state
+  ui: UiState;
+  setUi: SetStoreFunction<UiState>;
+
+  // Wizard
+  wizardOpen: () => boolean;
+  setWizardOpen: Setter<boolean>;
+
+  // Tweaks
+  tweaks: TweaksState;
+  setTweaks: SetStoreFunction<TweaksState>;
+
+  // Glyph bindings
+  glyphs: Record<GlyphId, string>;
+  setGlyphs: SetStoreFunction<Record<GlyphId, string>>;
+
+  // Derived
+  hasEnabled: () => boolean;
+  effectiveModulated: () => boolean;
+  status: () => VoiceStatus;
+}
+
+export function createAppState(): AppState {
+  const [nav, setNav] = createSignal<NavId>("mixer");
+  const firstPreset = PRESETS[0];
+  if (!firstPreset) throw new Error("PRESETS must contain at least one preset");
+  const [presetId, setPresetId] = createSignal<string>(firstPreset.id);
+  const [chains, setChains] = createStore<Record<string, ChainEntry[]>>(initialChains());
+  const [ui, setUi] = createStore<UiState>(defaultUi());
+  const [wizardOpen, setWizardOpen] = createSignal(true);
+  const [tweaks, setTweaks] = createStore<TweaksState>(defaultTweaks());
+  const [glyphs, setGlyphs] = createStore<Record<GlyphId, string>>({ ...defaultGlyphs });
+
+  const preset = createMemo<Preset>(
+    () => PRESETS.find((p) => p.id === presetId()) ?? firstPreset,
+  );
+  const chain = createMemo<ChainEntry[]>(() => chains[presetId()] ?? []);
+
+  const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
+  const effectiveModulated = createMemo(() =>
+    ui.ptmMode === "apply" ? ui.pressed : !ui.pressed,
+  );
+  const status = createMemo<VoiceStatus>(() =>
+    ui.muted ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
+  );
+
+  return {
+    nav,
+    setNav,
+    presetId,
+    setPresetId,
+    preset,
+    chains,
+    setChains,
+    chain,
+    ui,
+    setUi,
+    wizardOpen,
+    setWizardOpen,
+    tweaks,
+    setTweaks,
+    glyphs,
+    setGlyphs,
+    hasEnabled,
+    effectiveModulated,
+    status,
+  };
+}
+
+const AppContext = createContext<AppState>();
+
+export function AppProvider(props: { children: JSX.Element }): JSX.Element {
+  const state = createAppState();
+  return (
+    <AppContext.Provider value={state}>{props.children}</AppContext.Provider>
+  );
+}
+
+export function useApp(): AppState {
+  const ctx = useContext(AppContext);
+  if (!ctx) throw new Error("useApp must be used within <AppProvider>");
+  return ctx;
+}
+
+// Re-exports for convenience.
+export type {
+  AbSlot,
+  ChainEntry,
+  GlyphId,
+  NavId,
+  Preset,
+  PtmMode,
+  TweaksState,
+  UiState,
+  VoiceStatus,
+};

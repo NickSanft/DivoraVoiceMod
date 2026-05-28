@@ -1,0 +1,109 @@
+// Shared types for DivoraVoice. Audio/DSP types live alongside the
+// engine in Phase 2+; this file is UI-side only.
+
+export type EffectId =
+  | "pitch"
+  | "formant"
+  | "reverb"
+  | "eq"
+  | "robot"
+  | "distortion"
+  | "echo"
+  | "gate";
+
+export type NavId = "mixer" | "soundboard" | "presets" | "settings";
+
+export type VoiceStatus = "clean" | "modulated" | "muted";
+
+export type PtmMode = "apply" | "bypass";
+
+export type AbSlot = "A" | "B";
+
+export type GlyphId = "triangle" | "invtriangle" | "square" | "circle";
+
+export type Tone =
+  | ""
+  | "accent"
+  | "success"
+  | "warning"
+  | "danger"
+  | "info";
+
+/** Single parameter knob on an effect. */
+export interface EffectParam {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  unit: string;
+  default: number;
+  bipolar?: boolean;
+}
+
+/** Effect catalog entry. */
+export interface EffectDef {
+  id: EffectId;
+  name: string;
+  sigil: string;
+  desc: string;
+  params: EffectParam[];
+  readout: (vals: Record<string, number>) => string;
+}
+
+/** One effect's state inside a preset chain. */
+export interface ChainEntry {
+  id: EffectId;
+  enabled: boolean;
+  vals: Record<string, number>;
+}
+
+/** A named, color-tagged preset with an ordered effect chain. */
+export interface Preset {
+  id: string;
+  name: string;
+  color: string;
+  glyph: string;
+  tag: "Bundled" | "User";
+  desc: string;
+  chain: ChainEntry[];
+}
+
+/** Audio device option for input/output pickers. */
+export interface DeviceOption {
+  value: string;
+  label: string;
+  sub: string;
+}
+
+/** Soundboard tile (sample data; Phase 5 reads from disk). */
+export interface SoundboardTile {
+  id: number;
+  label: string;
+  emoji: string;
+  color: string;
+  key: string[] | null;
+  dur: number;
+}
+
+/** Tweaks visual variations. */
+export interface TweaksState {
+  /** 0 = subtle, 0.5 = balanced, 1 = rich */
+  mystical: number;
+  /** 0 = functional, 0.6 = ambient, 1 = rich */
+  motion: number;
+  mood: "violet" | "ink" | "midnight";
+  accent: "brand" | "abyssal" | "ember";
+  grain: boolean;
+  vignette: boolean;
+}
+
+/** UI-side ephemeral state. */
+export interface UiState {
+  muted: boolean;
+  monitor: boolean;
+  ab: AbSlot;
+  ptmMode: PtmMode;
+  ptmKey: string;
+  pressed: boolean;
+}

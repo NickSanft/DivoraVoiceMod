@@ -83,16 +83,81 @@ State across threads:
 
 ## Phase 1 — design system + app shell
 
-To be filled in when Phase 1 lands. Will cover:
+### File layout (added)
 
-- Token system implementation (CSS custom properties + Tailwind theme extension)
-- Font loading (self-hosted `@fontsource/bricolage-grotesque`, `@fontsource/space-grotesk`, `@fontsource/space-mono`)
-- Sigil component architecture (port from `docs/mockups/prototype/divora/sigils.jsx`)
-- Component library structure
-- Frameless titlebar wiring (Tauri `decorations: false`, drag region, custom window controls)
-- Sidebar nav + routing
-- Tweaks state shape and persistence
-- prefers-reduced-motion integration
+```
+src/
+├── App.tsx                     # composes AppProvider + Titlebar + Sidebar + routed screen
+├── main.tsx                    # imports font CSS, mounts SolidJS
+├── styles.css                  # tokens + base + @layer components + utilities
+├── types.ts                    # shared UI types
+├── components/                 # design-system primitives
+│   ├── Sigil.tsx + DMark.tsx
+│   ├── Button.tsx, IconButton.tsx, Toggle.tsx, Slider.tsx
+│   ├── Badge.tsx, Kbd.tsx, Segmented.tsx, Select.tsx
+│   ├── Card.tsx, EmptyState.tsx, HotkeyCapture.tsx
+│   ├── Tooltip.tsx, Meters.tsx (VMeter + HMeter)
+│   └── *.test.tsx              # component unit tests
+├── data/                       # mock data layer
+│   ├── effects.ts              # EFFECTS catalog + EFFECT_ORDER + fx helper
+│   ├── presets.ts              # bundled + user PRESETS
+│   ├── devices.ts              # DEVICES_IN / DEVICES_OUT
+│   ├── soundboard.ts           # SOUNDBOARD tiles
+│   └── effects.test.ts         # catalog invariants
+├── shell/                      # window chrome
+│   ├── Titlebar.tsx            # custom frameless titlebar
+│   ├── Sidebar.tsx             # 80px icon rail
+│   ├── statusMeta.ts           # Clean/Modulated/Muted UI metadata
+│   └── statusMeta.test.ts
+├── screens/                    # one per nav tab (Phase 1 placeholders)
+│   ├── MixerScreen.tsx
+│   ├── SoundboardScreen.tsx
+│   ├── PresetsScreen.tsx
+│   └── SettingsScreen.tsx      # Tweaks knobs live here in Phase 1
+└── stores/
+    ├── app.tsx                 # AppProvider + useApp; signals + stores
+    └── app.test.tsx            # store derivation tests
+```
+
+### State architecture
+
+`AppProvider` (Solid context) exposes:
+
+| Field | Kind | Purpose |
+|---|---|---|
+| `nav` / `setNav` | signal | Active screen |
+| `presetId` / `setPresetId` | signal | Active preset id |
+| `preset` | memo | Active preset object (from PRESETS) |
+| `chains` / `setChains` | store | Per-preset editable copies of the chain (mutated when sliders move) |
+| `chain` | memo | Active preset's current chain |
+| `ui` / `setUi` | store | `{ muted, monitor, ab, ptmMode, ptmKey, pressed }` |
+| `wizardOpen` / `setWizardOpen` | signal | First-run overlay visibility |
+| `tweaks` / `setTweaks` | store | Mystical / motion / mood / accent / grain / vignette |
+| `glyphs` / `setGlyphs` | store | Triangle / invtriangle / square / circle → preset id |
+| `hasEnabled` | memo | Any effect on the active chain enabled |
+| `effectiveModulated` | memo | PTM apply/bypass logic |
+| `status` | memo | "muted" / "modulated" / "clean" |
+
+Components access this via `useApp()`; tests use `renderHook(() => useApp(), { wrapper: AppProvider })`.
+
+### Tweaks → token cascade
+
+`src/styles.css` defines every token under `:root`. Mood variants override the surface/line palette under `:root[data-mood="ink"]` and `:root[data-mood="midnight"]`. Accent variants override the gradient under `:root[data-accent="abyssal"]` and `[data-accent="ember"]`. Motion levels set `--motion: 0 / 0.6 / 1` under `[data-motion="…"]` to scale every keyframe's amplitude.
+
+`App.tsx` runs `createEffect`s that mirror `tweaks.mood`, `tweaks.accent`, and `tweaks.motion` into root-level data attributes. The `data-motion-user="true"` attribute, also set by the same effect, prevents the `prefers-reduced-motion` media query from overriding a user choice.
+
+### Frameless window
+
+- `tauri.conf.json` window: `decorations: false`
+- Capabilities (`src-tauri/capabilities/default.json`) added: `core:window:allow-minimize`, `allow-maximize`, `allow-unmaximize`, `allow-toggle-maximize`, `allow-is-maximized`, `allow-close`, `allow-start-dragging`.
+- `src/shell/Titlebar.tsx` carries `data-tauri-drag-region` on its wrapper (Tauri 2 natively handles the drag). Window controls call `getCurrentWindow().minimize() / maximize() / unmaximize() / close()`.
+
+### Styling approach
+
+- **CSS custom properties** for design tokens (cascade through mood/accent/motion swaps).
+- **Tailwind theme extension** maps token names to utility classes via `var(--…)` references.
+- **`@layer components`** owns the named component classes (`.btn`, `.toggle`, `.slider`, …). These mirror the prototype's `components.css` so the design-system source of truth is one CSS file.
+- Component files focus on structure and behavior; styling stays in `src/styles.css`.
 
 ## Phase 2+ — (placeholders)
 
