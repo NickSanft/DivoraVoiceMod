@@ -1,9 +1,9 @@
 // Top-level app state for DivoraVoice.
 //
 // Mirrors the prototype's `app.jsx` state shape (presetId, chains, ui,
-// tweaks, glyphs) using SolidJS signals + stores. Wire mock data into
-// signals so screens can be developed without a real audio engine; the
-// engine comes online in Phase 2.
+// tweaks, glyphs) using SolidJS signals + stores. Phase 2 adds the
+// audio engine signals (device lists, selected devices, engine status,
+// live levels, last error) and wraps the Tauri command surface.
 
 import {
   createContext,
@@ -14,6 +14,17 @@ import {
   useContext,
 } from "solid-js";
 import { createStore, type SetStoreFunction } from "solid-js/store";
+import {
+  ZERO_LEVELS,
+  listInputDevices,
+  listOutputDevices,
+  setAudioMonitor as setAudioMonitorCmd,
+  startAudioEngine,
+  stopAudioEngine,
+  type DeviceInfo,
+  type Levels,
+  type StreamInfo,
+} from "../audio/api";
 import { PRESETS } from "../data/presets";
 import type {
   AbSlot,
@@ -94,6 +105,35 @@ export interface AppState {
   glyphs: Record<GlyphId, string>;
   setGlyphs: SetStoreFunction<Record<GlyphId, string>>;
 
+  // Audio engine
+  audioInputs: () => DeviceInfo[];
+  setAudioInputs: Setter<DeviceInfo[]>;
+  audioOutputs: () => DeviceInfo[];
+  setAudioOutputs: Setter<DeviceInfo[]>;
+  selectedInput: () => string | null;
+  setSelectedInput: Setter<string | null>;
+  selectedOutput: () => string | null;
+  setSelectedOutput: Setter<string | null>;
+  engineRunning: () => boolean;
+  setEngineRunning: Setter<boolean>;
+  engineMonitoring: () => boolean;
+  setEngineMonitoring: Setter<boolean>;
+  engineError: () => string | null;
+  setEngineError: Setter<string | null>;
+  streamInfo: () => StreamInfo | null;
+  setStreamInfo: Setter<StreamInfo | null>;
+  inputLevels: () => Levels;
+  setInputLevels: Setter<Levels>;
+  outputLevels: () => Levels;
+  setOutputLevels: Setter<Levels>;
+
+  // Audio actions
+  refreshDevices: () => Promise<void>;
+  startEngine: () => Promise<void>;
+  stopEngine: () => Promise<void>;
+  toggleMonitor: () => Promise<void>;
+  setMonitor: (enabled: boolean) => Promise<void>;
+
   // Derived
   hasEnabled: () => boolean;
   effectiveModulated: () => boolean;
@@ -111,6 +151,18 @@ export function createAppState(): AppState {
   const [tweaks, setTweaks] = createStore<TweaksState>(defaultTweaks());
   const [glyphs, setGlyphs] = createStore<Record<GlyphId, string>>({ ...defaultGlyphs });
 
+  // Audio engine signals.
+  const [audioInputs, setAudioInputs] = createSignal<DeviceInfo[]>([]);
+  const [audioOutputs, setAudioOutputs] = createSignal<DeviceInfo[]>([]);
+  const [selectedInput, setSelectedInput] = createSignal<string | null>(null);
+  const [selectedOutput, setSelectedOutput] = createSignal<string | null>(null);
+  const [engineRunning, setEngineRunning] = createSignal(false);
+  const [engineMonitoring, setEngineMonitoring] = createSignal(true);
+  const [engineError, setEngineError] = createSignal<string | null>(null);
+  const [streamInfo, setStreamInfo] = createSignal<StreamInfo | null>(null);
+  const [inputLevels, setInputLevels] = createSignal<Levels>(ZERO_LEVELS);
+  const [outputLevels, setOutputLevels] = createSignal<Levels>(ZERO_LEVELS);
+
   const preset = createMemo<Preset>(
     () => PRESETS.find((p) => p.id === presetId()) ?? firstPreset,
   );
@@ -123,6 +175,51 @@ export function createAppState(): AppState {
   const status = createMemo<VoiceStatus>(() =>
     ui.muted ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
   );
+
+  const refreshDevices = async (): Promise<void> => {
+    const [ins, outs] = await Promise.all([
+      listInputDevices(),
+      listOutputDevices(),
+    ]);
+    setAudioInputs(ins);
+    setAudioOutputs(outs);
+    if (!selectedInput()) {
+      const def = ins.find((d) => d.isDefault) ?? ins[0];
+      if (def) setSelectedInput(def.name);
+    }
+    if (!selectedOutput()) {
+      const def = outs.find((d) => d.isDefault) ?? outs[0];
+      if (def) setSelectedOutput(def.name);
+    }
+  };
+
+  const startEngine = async (): Promise<void> => {
+    try {
+      const info = await startAudioEngine(selectedInput(), selectedOutput());
+      setStreamInfo(info);
+      setEngineRunning(true);
+      setEngineError(null);
+    } catch (err) {
+      setEngineRunning(false);
+      setStreamInfo(null);
+      setEngineError(String(err));
+    }
+  };
+
+  const stopEngine = async (): Promise<void> => {
+    await stopAudioEngine();
+    setEngineRunning(false);
+    setStreamInfo(null);
+    setInputLevels(ZERO_LEVELS);
+    setOutputLevels(ZERO_LEVELS);
+  };
+
+  const setMonitor = async (enabled: boolean): Promise<void> => {
+    await setAudioMonitorCmd(enabled);
+    setEngineMonitoring(enabled);
+  };
+
+  const toggleMonitor = (): Promise<void> => setMonitor(!engineMonitoring());
 
   return {
     nav,
@@ -141,6 +238,34 @@ export function createAppState(): AppState {
     setTweaks,
     glyphs,
     setGlyphs,
+
+    audioInputs,
+    setAudioInputs,
+    audioOutputs,
+    setAudioOutputs,
+    selectedInput,
+    setSelectedInput,
+    selectedOutput,
+    setSelectedOutput,
+    engineRunning,
+    setEngineRunning,
+    engineMonitoring,
+    setEngineMonitoring,
+    engineError,
+    setEngineError,
+    streamInfo,
+    setStreamInfo,
+    inputLevels,
+    setInputLevels,
+    outputLevels,
+    setOutputLevels,
+
+    refreshDevices,
+    startEngine,
+    stopEngine,
+    toggleMonitor,
+    setMonitor,
+
     hasEnabled,
     effectiveModulated,
     status,

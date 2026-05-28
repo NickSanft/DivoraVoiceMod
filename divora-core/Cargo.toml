@@ -11,5 +11,10 @@ description = "Audio engine and DSP primitives for Divora"
 workspace = true
 
 [dependencies]
+cpal = "0.15"
+ringbuf = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
 
 [dev-dependencies]

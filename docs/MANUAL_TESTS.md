@@ -15,11 +15,23 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] All UI tabs reachable (Mixer / Soundboard / Presets / Settings).
 - [ ] No background CPU usage above ~3% while idle.
 
-## Audio passthrough
+## Audio passthrough (Phase 2)
 
-- [ ] Select physical mic as input → speakers as output → toggle self-monitor.
-- [ ] Speaking into mic produces sound from headset with no glitches for 60 seconds.
-- [ ] Round-trip latency feels under 30 ms (no perceptible echo of own voice).
+- [ ] Open Settings → Audio devices on first launch.
+- [ ] Both input and output device pickers populate with at least one device each.
+- [ ] Default devices are pre-selected (marked with "default" in the sub-label).
+- [ ] Engine shows "Stopped" or auto-started "Running at N Hz" depending on hardware compatibility.
+- [ ] Click Start (if stopped). Status changes to "Running at <rate> Hz" with no error banner.
+- [ ] Input level meter (HMeter under "Input level") moves when you speak into the mic.
+- [ ] Switch input device while running → engine restarts with the new device without crashing.
+- [ ] Switch output device while running → engine restarts; sound flows from the new output.
+- [ ] Toggle Monitor off → speaker / headphones go silent within ~50 ms; IN meter still moves; OUT meter falls to zero.
+- [ ] Toggle Monitor on → sound resumes within ~50 ms.
+- [ ] Click Stop → engine reports "Stopped"; IN and OUT meters drop to zero.
+- [ ] Round-trip latency feels under 30 ms (no perceptible echo of own voice when monitor is on).
+- [ ] Open Mixer → both vertical IN and OUT meters move while engine is running; peak-hold caps decay over ~1 s.
+- [ ] When engine is stopped, Mixer shows "Engine offline" card with a clickable Settings link.
+- [ ] Sample-rate mismatch test: pick devices with different default sample rates (e.g., 44.1 kHz mic + 48 kHz output) → start fails with a clear "sample-rate mismatch" error message.
 
 ## Presets
 

@@ -3,7 +3,30 @@ import { render } from "@solidjs/testing-library";
 import App from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async () => "pong"),
+  invoke: vi.fn(async (cmd: string) => {
+    switch (cmd) {
+      case "ping":
+        return "pong";
+      case "list_audio_input_devices":
+        return [];
+      case "list_audio_output_devices":
+        return [];
+      case "audio_engine_status":
+        return {
+          running: false,
+          monitoring: true,
+          input: { rms: 0, peak: 0 },
+          output: { rms: 0, peak: 0 },
+        };
+      default:
+        return null;
+    }
+  }),
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => () => {
+    /* unlisten no-op */
+  }),
 }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: vi.fn(() => ({
@@ -28,8 +51,6 @@ describe("App shell", () => {
 
   it("shows the Clean status by default", () => {
     const { getAllByText } = render(() => <App />);
-    // The status pill in the titlebar and the eventual status card both
-    // say "Clean" — at least the titlebar pill must be present.
     expect(getAllByText(/Clean/).length).toBeGreaterThanOrEqual(1);
   });
 });

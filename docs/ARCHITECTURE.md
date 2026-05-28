@@ -159,6 +159,94 @@ Components access this via `useApp()`; tests use `renderHook(() => useApp(), { w
 - **`@layer components`** owns the named component classes (`.btn`, `.toggle`, `.slider`, …). These mirror the prototype's `components.css` so the design-system source of truth is one CSS file.
 - Component files focus on structure and behavior; styling stays in `src/styles.css`.
 
-## Phase 2+ — (placeholders)
+## Phase 2 — audio passthrough + real meters
+
+### Module layout (added)
+
+```
+divora-core/
+└── src/
+    └── audio/
+        ├── mod.rs           # public re-exports; AudioEngineError
+        ├── state.rs         # EngineState (atomic) + Levels
+        ├── level.rs         # LevelMeter (RMS + peak-with-decay)
+        ├── devices.rs       # DeviceInfo + list_input/output_devices
+        └── engine.rs        # AudioEngine + engine_thread + cpal streams
+```
+
+### Audio engine architecture
+
+The `AudioEngine` owns a dedicated OS thread (`divora-audio`) that hosts
+the cpal streams (which are `!Send`). The Tauri main thread talks to it
+through an `mpsc` channel; shared state is an `Arc<EngineState>` with
+atomic fields so the UI thread can read levels / monitor / running flag
+without locking.
+
+Each cpal callback is **alloc-free**: a stack array up to
+`MAX_FRAMES_PER_CALLBACK` (4096 mono samples) absorbs the buffer,
+samples flow through a `ringbuf::HeapRb<f32>` SPSC ring buffer between
+the input and output callbacks (`RING_BUFFER_FRAMES = 8192` ≈ 170 ms at
+48 kHz). The output callback fans the mono signal across the device's
+output channels, or writes silence when `monitor` is false.
+
+```
+Mic device  -> input callback  -> mono mixdown -> SPSC ring buf
+                                      |                  |
+                                      v                  v
+                              LevelMeter (IN)    output callback
+                                                       |
+                                                       v
+                                  LevelMeter (OUT) -> speaker / headphones
+```
+
+#### Constraints (Phase 2 only — relaxed in later phases)
+
+- Sample format: F32 only on both devices. Non-F32 fails with a clear
+  `AudioEngineError::UnsupportedSampleFormat`.
+- Sample rates must match. `AudioEngineError::SampleRateMismatch` fires
+  if not. Resampling via `rubato` lands in Phase 8 polish.
+- Internal channel layout: mono. Mixdown is straight sum / channel count.
+
+### Tauri command surface
+
+| Command | Payload | Returns |
+|---|---|---|
+| `list_audio_input_devices` | — | `DeviceInfo[]` |
+| `list_audio_output_devices` | — | `DeviceInfo[]` |
+| `start_audio_engine` | `{ inputName?, outputName? }` | `StreamInfo` (throws on error) |
+| `stop_audio_engine` | — | — |
+| `set_audio_monitor` | `{ enabled }` | — |
+| `audio_engine_status` | — | `EngineStatus` |
+
+### Tauri events
+
+| Event | Payload | Cadence |
+|---|---|---|
+| `audio-levels` | `{ input: Levels, output: Levels, running: bool, monitoring: bool }` | ~30 Hz (`33 ms` thread loop) |
+
+Emitter thread (`divora-level-emitter`) is spawned in the Tauri `setup`
+hook and reads from the same `Arc<AudioEngine>` that commands mutate.
+
+### Frontend wiring
+
+- `src/audio/api.ts` — typed wrappers around the commands + a
+  `subscribeLevels` helper that returns the Tauri `UnlistenFn`.
+- `src/stores/app.tsx` — adds audio signals (device lists, selected
+  devices, engine running/monitoring/error, stream info, IN/OUT levels)
+  plus actions (`refreshDevices`, `startEngine`, `stopEngine`,
+  `setMonitor`, `toggleMonitor`).
+- `src/App.tsx` `onMount` runs the bootstrap: refresh devices →
+  subscribe to levels → auto-start the engine when input + output are
+  selected. Failures are caught and surfaced via `engineError`.
+- `src/screens/SettingsScreen.tsx` — adds the Audio devices section
+  (input picker, live IN HMeter with dB readout, output picker, engine
+  start/stop button, monitor toggle).
+- `src/screens/MixerScreen.tsx` — upgraded from EmptyState to the real
+  layout: preset header (glyph chip + name + Bundled/User badge + active
+  rune count), vertical IN/OUT VMeters flanking a spell-circle
+  placeholder, right rail with Voice status / Push-to-modulate /
+  Monitor cards + engine error / offline cards as needed.
+
+## Phase 3+ — (placeholders)
 
 To be filled in as each phase lands.

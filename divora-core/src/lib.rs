@@ -1,9 +1,13 @@
 //! Divora core — audio engine and DSP primitives.
 //!
-//! In Phase 0 this crate is a placeholder. Real audio capture/output,
-//! the DSP graph, and effect implementations land in Phase 1+.
+//! Phase 2 lands the audio engine: real-time capture from an input device,
+//! optional sidetone monitoring to an output device, level metering, and
+//! enumeration of available devices. DSP effects, presets, soundboard, and
+//! virtual-mic routing all build on top of this in later phases.
 
-/// Returns the project name. Used as a smoke test for the workspace build.
+pub mod audio;
+
+/// Returns the project name. Useful as a smoke test for the workspace build.
 #[must_use]
 pub fn project_name() -> &'static str {
     "Divora"

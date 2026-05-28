@@ -1,9 +1,20 @@
 // App shell. Composes the custom titlebar, sidebar nav rail, and the
 // active screen. Wires the Tweaks system into root-level data-mood,
 // data-accent, and data-motion attributes so the design-token swap
-// works without rerendering anything.
+// works without rerendering anything. Phase 2 adds the audio-engine
+// bootstrap: refresh devices, auto-start, and subscribe to live level
+// events.
 
-import { createEffect, Match, onCleanup, onMount, Switch, type JSX } from "solid-js";
+import {
+  createEffect,
+  Match,
+  onCleanup,
+  onMount,
+  Switch,
+  type JSX,
+} from "solid-js";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { subscribeLevels } from "./audio/api";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
 import { MixerScreen } from "./screens/MixerScreen";
@@ -45,8 +56,6 @@ function Shell(): JSX.Element {
     applyRootAttr("data-motion-user", "true");
   });
   createEffect(() => {
-    // Grain and vignette overlays live on the shell root rather than a
-    // CSS-variable attribute. We toggle via a class.
     document.body.classList.toggle("grain", app.tweaks.grain);
     document.body.classList.toggle("vignette", app.tweaks.vignette);
   });
@@ -71,6 +80,48 @@ function Shell(): JSX.Element {
     onCleanup(() => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
+    });
+  });
+
+  // Audio engine bootstrap.
+  // 1) Enumerate devices.
+  // 2) Subscribe to `audio-levels` events from the backend.
+  // 3) Attempt to auto-start with the selected (default) devices.
+  // Each step is wrapped to fail gracefully — we may be running in a
+  // browser preview without the Tauri bridge.
+  onMount(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        await app.refreshDevices();
+      } catch (err) {
+        app.setEngineError(`device enumeration failed: ${String(err)}`);
+      }
+
+      try {
+        unlisten = await subscribeLevels((update) => {
+          app.setInputLevels(update.input);
+          app.setOutputLevels(update.output);
+          app.setEngineRunning(update.running);
+          app.setEngineMonitoring(update.monitoring);
+        });
+      } catch (err) {
+        app.setEngineError(`level subscription failed: ${String(err)}`);
+      }
+
+      if (cancelled) return;
+      // Only auto-start when we have something to talk to.
+      if (app.selectedInput() && app.selectedOutput()) {
+        await app.startEngine();
+      }
+    })();
+
+    onCleanup(() => {
+      cancelled = true;
+      if (unlisten) unlisten();
+      void app.stopEngine();
     });
   });
 

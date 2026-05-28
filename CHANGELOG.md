@@ -4,6 +4,54 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-28 — Phase 2: Audio passthrough + real meters
+
+### Added
+
+- **`divora-core::audio` module** — new audio engine subsystem with submodules:
+  - `state.rs`: `EngineState` (atomic running / monitor / level bits) + `Levels` struct (RMS + peak).
+  - `level.rs`: `LevelMeter` with smoothed RMS and peak-with-decay; alloc-free, designed for the audio callback.
+  - `devices.rs`: `DeviceInfo` + `list_input_devices` / `list_output_devices` via cpal.
+  - `engine.rs`: `AudioEngine` owning a dedicated `divora-audio` thread that hosts cpal streams (`!Send`), receives commands via `mpsc`, and shares level state via `Arc<EngineState>`.
+- **Passthrough audio path**: mic → mono mixdown → SPSC ring buffer (`ringbuf::HeapRb<f32>`, ~170 ms at 48 kHz) → output device, with optional `monitor` toggle silencing the output without disturbing the input metering. Stack-allocated 4096-frame scratch buffer; zero allocation in the callback.
+- **Tauri commands**: `list_audio_input_devices`, `list_audio_output_devices`, `start_audio_engine`, `stop_audio_engine`, `set_audio_monitor`, `audio_engine_status`.
+- **Tauri event**: `audio-levels` emitted at ~30 Hz from a `divora-level-emitter` thread spawned during the Tauri `setup` hook.
+- **`src/audio/api.ts`**: typed TypeScript wrappers for every command + a `subscribeLevels` helper.
+- **Audio signals + actions in `src/stores/app.tsx`**: `audioInputs`, `audioOutputs`, `selectedInput`, `selectedOutput`, `engineRunning`, `engineMonitoring`, `engineError`, `streamInfo`, `inputLevels`, `outputLevels`. Actions: `refreshDevices`, `startEngine`, `stopEngine`, `toggleMonitor`, `setMonitor`.
+- **Settings → Audio devices section**: input device picker with live confirmation `HMeter` + dB readout, output device picker, engine Start / Stop button with running-state status text, sidetone Monitor toggle, clear error banner on failure.
+- **Mixer screen upgraded** from Phase 1 placeholder to real layout: preset header (glyph chip + display-font name + Bundled / User badge + active rune count + routed-via line), vertical IN / OUT `VMeter`s flanking a `breathe`-animated spell-circle placeholder, right rail with Voice status, Push-to-modulate (segmented mode toggle + Hold to test button), Monitor cards, plus contextual Engine error / Engine offline cards.
+- **App bootstrap (`src/App.tsx` `onMount`)**: refresh devices → subscribe to `audio-levels` → auto-start engine when both devices are selected. Failures caught and surfaced via `engineError`.
+
+### Tests
+
+- **Rust**: 14 tests across `divora-core` (LevelMeter behaviour, EngineState round-trips, device enumeration smoke, AudioEngine spawn / drop / level defaults).
+- **Frontend**: 38 tests total (up from 24). New: 8 audio API tests, 6 audio store action tests.
+
+### Architecture notes
+
+- Phase 2 supports F32-only sample format and requires matching input / output sample rates. Non-F32 formats and resampling come in later phases (`AudioEngineError::UnsupportedSampleFormat` and `::SampleRateMismatch` surface these for the UI).
+- Polyphony, DSP graph, virtual mic routing all slot in between input and output in later phases without touching this architecture.
+- See `docs/ARCHITECTURE.md` for the full breakdown.
+
+### Bundle
+
+- CSS: 26 KB (up from 25 KB; new audio-section styles).
+- JS index: 71 KB (gzip 23 KB) (up from 45 KB; audio API + store).
+- Debug exe: 11 MB (cpal / ringbuf / serde land in-place; the workspace's release-profile LTO keeps the exe size flat in debug too).
+
+### Pre-push checklist (local, 2026-05-28)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (14 + 1 = 15)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (38)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The audio engine is now a real thing. Sliders in later phases will hook into the same `Arc<EngineState>` for per-effect parameter sweeps; the spell circle will read from the same level signals that the IN / OUT meters use today. The whole later DSP graph plugs in between input and output without changing this scaffolding.
+
 ## [0.1.0] — 2026-05-28 — Phase 1: Design system + app shell
 
 ### Added
