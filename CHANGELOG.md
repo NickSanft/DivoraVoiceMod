@@ -4,6 +4,35 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.11.5] — 2026-05-29 — Restore titlebar drag (regression from v0.11.3)
+
+Field report:
+
+> "Can you also allow the window to be dragged? It looks like with the 'cast anywhere' changes that stopped."
+
+v0.11.3's `SparkLayer` listens at the window level on `pointerdown` with `capture: true` so a drag started anywhere on the Mixer (except UI controls) becomes a cast. The capture phase fires before any element-level listener — including Tauri's native handler for `data-tauri-drag-region`, which is what makes the custom titlebar a draggable window-chrome surface in our frameless build. `isCastBlocker` only knew about controls and cards, so it let the titlebar pointerdown through, started a cast, and silently swallowed the would-be drag.
+
+### Fixed
+
+- **`isCastBlocker` now also short-circuits on `[data-tauri-drag-region]`.** Adding this attribute selector to the CSS list makes the predicate report any titlebar surface (or anything else marked as OS drag chrome) as a cast blocker. The SparkLayer pointerdown handler bails without `preventDefault`-ing, the event continues to Tauri's drag-region listener, and the OS-level `startDragging` fires as it did before v0.11.3.
+
+### Tests
+
+- **Frontend**: 222 → 224 (+2). Two new cases in `SparkLayer.isCastBlocker` — a bare `[data-tauri-drag-region]` div is a blocker; a descendant span inside one is also a blocker.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (224)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The custom frameless titlebar is the only way to move the window — there's no OS-drawn one to fall back on. A regression here turned the app into a "stuck where I opened it" experience whenever the user was on the Mixer. Trivial one-line fix in the CSS selector; regression test ensures the case is now hard-coded into the predicate's expectations.
+
 ## [0.11.4] — 2026-05-29 — Live device enumeration: refresh on focus + Settings entry + manual button
 
 Field report:

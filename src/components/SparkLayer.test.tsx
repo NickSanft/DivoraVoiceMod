@@ -95,4 +95,23 @@ describe("SparkLayer.isCastBlocker", () => {
     nest(icon, [header, button]);
     expect(isCastBlocker(icon)).toBe(true);
   });
+
+  // v0.11.5: the custom titlebar surfaces are tagged
+  // `data-tauri-drag-region` so the OS treats them as window chrome
+  // for dragging. SparkLayer must NOT intercept pointerdown there,
+  // otherwise the window stops being draggable on the Mixer (where
+  // SparkLayer is mounted). Regression catch.
+  it("returns true on a [data-tauri-drag-region] surface (titlebar)", () => {
+    const dragRegion = document.createElement("div");
+    dragRegion.setAttribute("data-tauri-drag-region", "");
+    expect(isCastBlocker(dragRegion)).toBe(true);
+  });
+
+  it("returns true for a child of [data-tauri-drag-region] (wordmark span)", () => {
+    const dragRegion = document.createElement("div");
+    dragRegion.setAttribute("data-tauri-drag-region", "");
+    const wordmark = document.createElement("span");
+    nest(wordmark, [dragRegion]);
+    expect(isCastBlocker(wordmark)).toBe(true);
+  });
 });

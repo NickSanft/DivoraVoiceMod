@@ -92,6 +92,13 @@ export function isCastBlocker(el: EventTarget | null): boolean {
       ".card",
       ".seg",
       ".kbd",
+      // v0.11.5: the custom titlebar uses `data-tauri-drag-region` to
+      // mark surfaces the OS should treat as a draggable window chrome.
+      // Without this exclusion, the cast surface intercepts the
+      // pointerdown in capture-phase before Tauri's native drag handler
+      // can fire — and the window stops being draggable. Adding the
+      // attribute selector lets the drag continue to the OS.
+      "[data-tauri-drag-region]",
       "[data-cast-block]",
     ].join(","),
   );
