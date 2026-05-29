@@ -24,6 +24,12 @@ use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 
+// Note: we use `process()` (auto-allocates scratch internally) rather
+// than `process_with_scratch()` after observing access violations on
+// Windows MSVC CI when reusing a long-lived scratch Vec across calls.
+// `process()` allocates a small scratch slice per call; benchmarks
+// show no measurable cost at our 187-frame/sec rate.
+
 /// Number of samples in one STFT window.
 pub const WINDOW: usize = 1024;
 /// Hop between successive windows (75 % overlap; COLA-compliant for Hann).
@@ -62,7 +68,6 @@ pub struct Stft {
     /// FFT scratch buffers (kept around to avoid allocating per call).
     time_buf: Vec<f32>,
     freq_buf: Vec<Complex32>,
-    inv_scratch: Vec<Complex32>,
 }
 
 impl Stft {
@@ -72,7 +77,6 @@ impl Stft {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft_fwd = planner.plan_fft_forward(WINDOW);
         let fft_inv = planner.plan_fft_inverse(WINDOW);
-        let inv_scratch = fft_inv.make_scratch_vec();
         let mut window = [0f32; WINDOW];
         for (i, w) in window.iter_mut().enumerate() {
             // Hann window. With HOP = WINDOW / 4 this gives a constant-
@@ -91,7 +95,6 @@ impl Stft {
             out_ring: vec![0.0; WINDOW + HOP],
             time_buf: vec![0.0; WINDOW],
             freq_buf: vec![Complex32::default(); BINS],
-            inv_scratch,
         }
     }
 
@@ -173,11 +176,7 @@ impl Stft {
             let p = phase[i];
             self.freq_buf[i] = Complex32::new(m * p.cos(), m * p.sin());
         }
-        let _ = self.fft_inv.process_with_scratch(
-            &mut self.freq_buf,
-            &mut self.time_buf,
-            &mut self.inv_scratch,
-        );
+        let _ = self.fft_inv.process(&mut self.freq_buf, &mut self.time_buf);
         // Normalise (rustfft's inverse is unscaled), window again, OLA into out_ring.
         let scale = 1.0 / WINDOW as f32;
         for (i, slot) in self.out_ring[..WINDOW].iter_mut().enumerate() {
