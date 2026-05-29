@@ -14,6 +14,11 @@
     "core:window:allow-start-dragging",
     "shell:allow-open",
     "dialog:default",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "global-shortcut:default",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-unregister-all",
+    "global-shortcut:allow-is-registered"
   ]
 }

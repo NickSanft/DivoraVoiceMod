@@ -14,7 +14,7 @@ import {
   type JSX,
 } from "solid-js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { subscribeLevels } from "./audio/api";
+import { subscribeGlobalShortcut, subscribeLevels } from "./audio/api";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
 import { MixerScreen } from "./screens/MixerScreen";
@@ -60,17 +60,30 @@ function Shell(): JSX.Element {
     document.body.classList.toggle("vignette", app.tweaks.vignette);
   });
 
-  // Push-to-modulate placeholder: hold the bound key, set ui.pressed.
-  // The global hotkey system (works while backgrounded) ships in Phase 3.
+  // Push-to-modulate fallback (in-app keyboard). The system-level
+  // tauri-plugin-global-shortcut wiring lives in the next onMount and
+  // fires even while the app is unfocused — this listener covers the
+  // case where the window IS focused, since global-shortcut on Windows
+  // does NOT swallow the key from the focused app.
   onMount(() => {
+    const matches = (e: KeyboardEvent): boolean => {
+      const target = app.ui.ptmKey || "Space";
+      // Tauri accelerators look like "Space", "Ctrl+Shift+P". We only
+      // need to match the trailing key for the in-app fallback.
+      const parts = target.split("+");
+      const last = parts[parts.length - 1] ?? "Space";
+      if (last === "Space") return e.code === "Space";
+      if (last.length === 1) return e.key.toUpperCase() === last.toUpperCase();
+      return e.key === last;
+    };
     const down = (e: KeyboardEvent) => {
-      if (e.code === "Space" && e.target === document.body) {
+      if (matches(e) && e.target === document.body) {
         e.preventDefault();
         if (!app.ui.pressed) app.setUi("pressed", true);
       }
     };
     const up = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
+      if (matches(e)) {
         e.preventDefault();
         app.setUi("pressed", false);
       }
@@ -80,6 +93,50 @@ function Shell(): JSX.Element {
     onCleanup(() => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
+    });
+  });
+
+  // Global hotkey subscription. The backend emits `global-shortcut`
+  // events with the binding's id ("ptm" | "panic" | "monitor") and
+  // pressed/released state. We translate those into store mutations:
+  //   ptm     → set ui.pressed on press, clear on release
+  //   panic   → stop all soundboard clips on press
+  //   monitor → toggle sidetone on press
+  onMount(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        unlisten = await subscribeGlobalShortcut((event) => {
+          if (event.id === "ptm") {
+            app.setUi("pressed", event.state === "pressed");
+            return;
+          }
+          if (event.state !== "pressed") return;
+          if (event.id === "panic") {
+            void app.panicSoundboard();
+          } else if (event.id === "monitor") {
+            void app.toggleMonitor();
+          }
+        });
+      } catch (err) {
+        // Browser preview without the Tauri bridge — the in-app
+        // fallback above still works.
+        console.warn("[hotkey] subscribe failed", err);
+      }
+      if (cancelled && unlisten) {
+        unlisten();
+        unlisten = null;
+        return;
+      }
+      // Push any persisted bindings into the backend so they survive
+      // a restart. Defaults: PTM = Space, others empty (so this is a
+      // no-op on first boot).
+      await app.syncHotkeyBindings();
+    })();
+    onCleanup(() => {
+      cancelled = true;
+      if (unlisten) unlisten();
     });
   });
 

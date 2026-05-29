@@ -109,20 +109,61 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Drop a 44.1 kHz WAV into the folder, play it on a 48 kHz engine → playback pitch matches the original (not chipmunked).
 - [ ] Drop a 22.05 kHz file → playback still pitch-correct, with mild interpolation softness.
 
-## Virtual mic
+## Virtual mic (Phase 6)
 
-- [ ] First run with VB-Cable missing → setup card visible, link opens browser.
-- [ ] First run with VB-Cable present → CABLE Input auto-suggested as modulated output target.
-- [ ] In Discord call, change input device to "CABLE Output (VB-Audio Virtual Cable)" → other party hears modulated voice.
+- [ ] Settings → Virtual microphone with VB-Cable **missing** → gold warning banner reads "VB-Cable not detected", Download button visible.
+- [ ] Click Download → default browser opens https://vb-audio.com/Cable/.
+- [ ] Install VB-Cable, click Re-scan → banner flips to emerald "VB-Cable detected" within ~1 s; routing hint lists `CABLE Input (VB-Audio …)` and `CABLE Output (VB-Audio …)` by name.
+- [ ] Three call-app instruction cards (Discord / Zoom / OBS) appear under the banner with the exact menu path.
+- [ ] Audio devices section now lists CABLE Input as a selectable output device — picking it routes the modulated voice into the cable.
+- [ ] In Discord call, set input device to "CABLE Output (VB-Audio Virtual Cable)" → other party hears modulated voice.
 - [ ] In Zoom, same test, with screen share active.
-- [ ] In OBS, add "Audio Input Capture" of CABLE Output → meters move while speaking.
+- [ ] In OBS, add "Audio Input Capture" of CABLE Output → OBS audio meter moves while speaking.
+- [ ] Uninstall VB-Cable, click Re-scan → banner flips back to gold "VB-Cable not detected"; instruction cards disappear; Download button returns.
 
-## Push-to-modulate
+## Hotkeys (Phase 6)
 
-- [ ] Default Right Alt key applies active preset only while held.
-- [ ] Release returns to clean voice within one buffer (~5 ms).
-- [ ] Reassign hotkey via Settings → new key works.
-- [ ] Invert mode ("hold to bypass") toggles direction correctly.
+- [ ] Settings → Hotkeys shows 3 rows: Push-to-modulate (defaulted to Space), Panic, Toggle monitor.
+- [ ] Click the Push-to-modulate field → "Press a key… (Esc to cancel)" hint shows.
+- [ ] Press a chord (e.g., Ctrl+Shift+P) → chip set updates to show `Ctrl` `Shift` `P` and the binding is registered with the backend.
+- [ ] Focus a different app (e.g., Notepad), press the bound chord → DivoraVoice's Mixer status flips to Modulated while held.
+- [ ] Release the chord → Mixer status returns to Clean within one buffer.
+- [ ] Bind Panic to a key (e.g., F8). Trigger 4 soundboard clips. Focus another app. Press F8 → all clips stop immediately.
+- [ ] Bind Toggle monitor to a key (e.g., F9). Focus another app. Press F9 → engine monitor toggles in DivoraVoice; Settings reflects the new state on next focus.
+- [ ] Click Clear next to any binding → chip set clears, accelerator becomes empty, the OS hotkey stops firing.
+- [ ] Close and reopen the app → bindings survive (re-registered via `syncHotkeyBindings`).
+- [ ] Bind PTM to an invalid accelerator (e.g., a single modifier) → the in-app field accepts it but the backend log records the registration failure; nothing crashes.
+
+## Push-to-modulate (focus-time fallback)
+
+- [ ] With DivoraVoice focused and PTM = Space, hold Space → status flips to Modulated; the Spell circle threads animate; particles drift.
+- [ ] Release Space → status flips back to Clean within one buffer (~5 ms).
+- [ ] Rebind PTM to a different key (e.g., Ctrl+M) in Settings → the in-app fallback honours the new key immediately (no app restart needed).
+- [ ] Invert mode (`ui.ptmMode = "bypass"`) inverts: PTM held = Clean; idle = Modulated.
+
+## Glyph casting bindings (Phase 6)
+
+- [ ] Settings → Glyph casting shows 4 rows: Triangle, Inverted triangle, Square, Circle.
+- [ ] Each row has a glyph chip on the left + a preset dropdown filled with every preset (Bundled + User).
+- [ ] Change Triangle's binding to "Static Wraith" → `app.glyphs.triangle` updates; restart preserves it.
+- [ ] (Phase 7) Casting the glyph on the Mixer switches the active preset to the bound id.
+
+## Appearance — Mystical / Grain / Vignette (Phase 6)
+
+- [ ] Mystical · subtle → outer decorative ring + tick marks + constellation dots fade from the Mixer spell circle.
+- [ ] Mystical · balanced → middle level (no constellation dots, outer ring still present).
+- [ ] Mystical · rich → full set of arcane glyph decorations visible.
+- [ ] Parchment grain on → faint paper-noise overlay on the surface backgrounds.
+- [ ] Parchment grain off → clean surfaces, no overlay.
+- [ ] Vignette on → soft darkening around the window edges.
+- [ ] Vignette off → uniform surface brightness.
+
+## About (Phase 6)
+
+- [ ] Settings → About shows the DMark + "DivoraVoice v0.6.0" + "MIT License · Tauri + SolidJS".
+- [ ] Click View on GitHub → default browser opens https://github.com/NickSanft/DivoraVoiceMod.
+- [ ] Three pillar cards visible: No telemetry, No account, Free forever.
+- [ ] Click Replay setup → `wizardOpen` flips true (Phase 7 wizard shows up once it ships).
 
 ## Stress
 

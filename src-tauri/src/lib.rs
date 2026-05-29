@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use divora_core::audio::{
-    list_input_devices as list_input_devices_core, list_output_devices as list_output_devices_core,
-    AudioEngine, DeviceInfo, Levels, StreamInfo,
+    detect_virtual_mic as detect_virtual_mic_core, list_input_devices as list_input_devices_core,
+    list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, Levels, StreamInfo,
+    VirtualMicStatus,
 };
 use divora_core::dsp::{DspCommand, EffectSpec};
 use divora_core::presets::{bundled_presets, Preset, PresetStore};
@@ -23,6 +24,7 @@ use divora_core::soundboard::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 /// Payload of the periodic `audio-levels` event. Frontend listens with
 /// `tauri.event.listen("audio-levels", …)`.
@@ -47,11 +49,24 @@ struct EngineStatus {
 }
 
 /// Tauri-managed shared state. Holds the live audio engine, the user
-/// preset store, and the decoded-clip cache (keyed by `tile id`).
+/// preset store, the decoded-clip cache (keyed by `tile id`), and the
+/// active global-shortcut bindings.
 struct AppState {
     engine: Arc<AudioEngine>,
     preset_store: Arc<PresetStore>,
     clip_cache: Mutex<HashMap<String, DecodedClip>>,
+    /// Maps a stable id (chosen by the frontend, e.g. "ptm") to the
+    /// `Shortcut` we registered for it. Used to unregister cleanly.
+    shortcuts: Mutex<HashMap<String, Shortcut>>,
+}
+
+/// Wire payload emitted by `global-shortcut` events.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GlobalShortcutEvent {
+    id: String,
+    accelerator: String,
+    state: &'static str, // "pressed" | "released"
 }
 
 #[tauri::command]
@@ -193,6 +208,65 @@ fn stop_all_soundboard_clips(state: State<'_, AppState>) {
     state.engine.send_soundboard(SoundboardCommand::StopAll);
 }
 
+#[tauri::command]
+fn detect_virtual_mic() -> VirtualMicStatus {
+    detect_virtual_mic_core()
+}
+
+#[tauri::command]
+fn register_global_shortcut(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    accelerator: String,
+) -> Result<(), String> {
+    let shortcut: Shortcut = accelerator.parse().map_err(|e| format!("{e:?}"))?;
+    {
+        let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+        if let Some(old) = map.remove(&id) {
+            let _ = app.global_shortcut().unregister(old);
+        }
+        map.insert(id.clone(), shortcut);
+    }
+    app.global_shortcut()
+        .register(shortcut)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_global_shortcut(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+    if let Some(shortcut) = map.remove(&id) {
+        app.global_shortcut()
+            .unregister(shortcut)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_all_global_shortcuts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+    let mut last_err: Option<String> = None;
+    for (_, shortcut) in map.drain() {
+        if let Err(e) = app.global_shortcut().unregister(shortcut) {
+            last_err = Some(e.to_string());
+        }
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Decode a clip on first play; subsequent plays reuse the cached
 /// `Arc<Vec<f32>>` so a hot soundboard doesn't decode anything twice.
 fn decode_or_cache(
@@ -210,6 +284,34 @@ fn decode_or_cache(
     let mut cache = state.clip_cache.lock().map_err(|e| e.to_string())?;
     cache.insert(clip_id.to_owned(), clip.clone());
     Ok(clip)
+}
+
+/// Handle a global-shortcut event by looking up the registration id
+/// from the shared state and emitting a `global-shortcut` Tauri event
+/// the frontend can react to.
+fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
+    let state_opt = app.try_state::<AppState>();
+    let Some(state) = state_opt else { return };
+    let hit = {
+        let Ok(map) = state.shortcuts.lock() else {
+            return;
+        };
+        map.iter()
+            .find(|(_, s)| *s == shortcut)
+            .map(|(id, _)| id.clone())
+    };
+    if let Some(id) = hit {
+        let state_str = match event.state {
+            ShortcutState::Pressed => "pressed",
+            ShortcutState::Released => "released",
+        };
+        let payload = GlobalShortcutEvent {
+            id,
+            accelerator: shortcut.to_string(),
+            state: state_str,
+        };
+        let _ = app.emit("global-shortcut", &payload);
+    }
 }
 
 /// Spawn a background thread that emits `audio-levels` events to the
@@ -239,6 +341,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(global_shortcut_handler)
+                .build(),
+        )
         .setup(|app| {
             let engine = Arc::new(AudioEngine::new());
             spawn_level_emitter(app.handle().clone(), engine.clone());
@@ -265,6 +372,7 @@ pub fn run() {
                 engine,
                 preset_store,
                 clip_cache: Mutex::new(HashMap::new()),
+                shortcuts: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -290,6 +398,10 @@ pub fn run() {
             play_soundboard_clip,
             stop_soundboard_clip,
             stop_all_soundboard_clips,
+            detect_virtual_mic,
+            register_global_shortcut,
+            unregister_global_shortcut,
+            unregister_all_global_shortcuts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");

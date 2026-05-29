@@ -586,3 +586,152 @@ describe("app store — Phase 3 DSP chain", () => {
     expect(next.id).not.toBe(otherId);
   });
 });
+
+describe("app store — Phase 6 virtual mic + hotkeys", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+  });
+
+  it("refreshVirtualMicStatus stores the backend status verbatim", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "detect_virtual_mic") {
+        return {
+          detected: true,
+          cableInputDevice: {
+            name: "CABLE Input (VB-Audio Virtual Cable)",
+            isDefault: false,
+            defaultSampleRate: 48000,
+            channels: 2,
+          },
+          cableOutputDevice: {
+            name: "CABLE Output (VB-Audio Virtual Cable)",
+            isDefault: false,
+            defaultSampleRate: 48000,
+            channels: 2,
+          },
+          downloadUrl: "https://vb-audio.com/Cable/",
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    expect(result.virtualMicStatus()).toBeNull();
+    await result.refreshVirtualMicStatus();
+    expect(result.virtualMicStatus()?.detected).toBe(true);
+    expect(result.virtualMicStatus()?.cableInputDevice?.name).toContain(
+      "CABLE Input",
+    );
+  });
+
+  it("refreshVirtualMicStatus swallows backend errors and leaves status null", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "detect_virtual_mic") throw new Error("backend exploded");
+      return null;
+    });
+    const { result } = setupApp();
+    await result.refreshVirtualMicStatus();
+    expect(result.virtualMicStatus()).toBeNull();
+  });
+
+  it("hotkeyBindings default to Space for PTM and empty for panic + monitor", () => {
+    const { result } = setupApp();
+    expect(result.hotkeyBindings.ptm).toBe("Space");
+    expect(result.hotkeyBindings.panic).toBe("");
+    expect(result.hotkeyBindings.monitor).toBe("");
+  });
+
+  it("setHotkeyBinding stores the accelerator and forwards to the backend", async () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.setHotkeyBinding("panic", "Ctrl+Shift+P");
+    expect(result.hotkeyBindings.panic).toBe("Ctrl+Shift+P");
+    expect(invokeMock).toHaveBeenCalledWith("register_global_shortcut", {
+      id: "panic",
+      accelerator: "Ctrl+Shift+P",
+    });
+  });
+
+  it("setHotkeyBinding for PTM also updates ui.ptmKey for the in-app fallback", async () => {
+    const { result } = setupApp();
+    await result.setHotkeyBinding("ptm", "Ctrl+Space");
+    expect(result.hotkeyBindings.ptm).toBe("Ctrl+Space");
+    expect(result.ui.ptmKey).toBe("Ctrl+Space");
+  });
+
+  it("setHotkeyBinding with empty accelerator unregisters instead of registering", async () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.setHotkeyBinding("panic", "");
+    expect(result.hotkeyBindings.panic).toBe("");
+    expect(invokeMock).toHaveBeenCalledWith("unregister_global_shortcut", {
+      id: "panic",
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "register_global_shortcut",
+      expect.anything(),
+    );
+  });
+
+  it("clearHotkeyBinding is equivalent to setHotkeyBinding(action, '')", async () => {
+    const { result } = setupApp();
+    await result.setHotkeyBinding("monitor", "F8");
+    expect(result.hotkeyBindings.monitor).toBe("F8");
+    invokeMock.mockClear();
+    await result.clearHotkeyBinding("monitor");
+    expect(result.hotkeyBindings.monitor).toBe("");
+    expect(invokeMock).toHaveBeenCalledWith("unregister_global_shortcut", {
+      id: "monitor",
+    });
+  });
+
+  it("setHotkeyBinding swallows backend register failures so the UI stays consistent", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "register_global_shortcut") throw new Error("bad accelerator");
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.setHotkeyBinding("panic", "F19");
+    // Even though the backend rejected, the local binding still records
+    // what the user picked — the next sync attempt will retry.
+    expect(result.hotkeyBindings.panic).toBe("F19");
+  });
+
+  it("syncHotkeyBindings registers every non-empty binding (and skips empty ones)", async () => {
+    const { result } = setupApp();
+    // PTM defaults to "Space"; set panic + leave monitor empty.
+    await result.setHotkeyBinding("panic", "Ctrl+Shift+P");
+    invokeMock.mockClear();
+    await result.syncHotkeyBindings();
+    const calls = invokeMock.mock.calls.filter(
+      (c) => c[0] === "register_global_shortcut",
+    );
+    const ids = calls.map((c) => (c[1] as { id: string }).id).sort();
+    expect(ids).toEqual(["panic", "ptm"]);
+  });
+
+  it("tweaks default to mystical=1, grain=false, vignette=false (Phase 6 fields)", () => {
+    const { result } = setupApp();
+    expect(result.tweaks.mystical).toBe(1);
+    expect(result.tweaks.grain).toBe(false);
+    expect(result.tweaks.vignette).toBe(false);
+  });
+
+  it("setTweaks updates the new Phase 6 fields", () => {
+    const { result } = setupApp();
+    result.setTweaks("mystical", 0);
+    result.setTweaks("grain", true);
+    result.setTweaks("vignette", true);
+    expect(result.tweaks.mystical).toBe(0);
+    expect(result.tweaks.grain).toBe(true);
+    expect(result.tweaks.vignette).toBe(true);
+  });
+
+  it("glyphs default to bundled preset ids and update via setGlyphs", () => {
+    const { result } = setupApp();
+    expect(result.glyphs.triangle).toBe("velvet-demon");
+    expect(result.glyphs.circle).toBe("clean");
+    result.setGlyphs("triangle", "static-wraith");
+    expect(result.glyphs.triangle).toBe("static-wraith");
+  });
+});

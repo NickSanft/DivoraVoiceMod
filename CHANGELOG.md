@@ -4,6 +4,49 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-28 — Phase 6: virtual mic + global hotkeys + full Settings
+
+### Added
+
+- **`divora-core::audio::virtual_mic` module** — `detect_virtual_mic()` walks both device lists looking for VB-Cable's canonical names (`CABLE Input (VB-Audio Virtual Cable)` / `CABLE Output (...)`), or the broader `VB-Audio … Input/Output` variant for HiFi Cable / Voicemeeter VAIO. Returns a `VirtualMicStatus { detected, cableInputDevice, cableOutputDevice, downloadUrl }` struct (camelCase wire). The download URL is a hard-coded constant pointing at https://vb-audio.com/Cable/.
+- **`tauri-plugin-global-shortcut`** wired in. New `AppState.shortcuts: Mutex<HashMap<String, Shortcut>>` keyed by stable id (`ptm` / `panic` / `monitor`). The plugin's handler emits a Tauri event `global-shortcut` with payload `{ id, accelerator, state: "pressed" | "released" }` on every transition.
+- **Tauri commands**: `detect_virtual_mic`, `register_global_shortcut(id, accelerator)`, `unregister_global_shortcut(id)`, `unregister_all_global_shortcuts`. The capability extension permits `global-shortcut:default`, `…allow-register`, `…allow-unregister`, `…allow-unregister-all`, `…allow-is-registered`.
+- **Frontend audio API extensions** (`src/audio/api.ts`): `VirtualMicStatus`, `GlobalShortcutEvent` types + `detectVirtualMic`, `registerGlobalShortcut`, `unregisterGlobalShortcut`, `unregisterAllGlobalShortcuts`, `subscribeGlobalShortcut` wrappers.
+- **Store**: `virtualMicStatus()` signal + `refreshVirtualMicStatus()` action; `hotkeyBindings` store (`{ ptm: "Space", panic: "", monitor: "" }`) + `setHotkeyBinding(action, accelerator)` / `clearHotkeyBinding(action)` / `syncHotkeyBindings()`. PTM bindings also update `ui.ptmKey` so the in-app keyboard fallback (used while the window is focused) tracks the same key.
+- **`SettingsScreen.tsx`** filled out: keeps the Phase 2 Audio devices block and adds
+  - **Virtual microphone** — emerald check + routing hint when detected, gold warning + Download button when missing. Re-scan button calls `refreshVirtualMicStatus`. Three call-app instruction cards (Discord / Zoom / OBS) appear once VB-Cable is detected.
+  - **Hotkeys** — three rows (push-to-modulate / panic / toggle monitor) each with a `HotkeyCapture` chip set + a "Clear" button. Captured key arrays are joined with `+` into Tauri accelerator strings.
+  - **Glyph casting** — Triangle / Inverted triangle / Square / Circle rows, each with a preset Select. Already-existing `app.glyphs` store from Phase 1 is the source of truth.
+  - **Appearance** — Phase 1's mood / accent / motion plus Mystical (subtle / balanced / rich), Parchment grain toggle, Vignette toggle (all already in `app.tweaks`).
+  - **About** — DMark + version v0.6.0 + "MIT License · Tauri + SolidJS" + GitHub link + three pillar cards (No telemetry / No account / Free forever) + Replay setup button that flips `wizardOpen` for the Phase 7 wizard.
+- **`App.tsx`** subscribes to `global-shortcut` events on mount. PTM events drive `ui.pressed`; `panic` triggers `panicSoundboard`; `monitor` triggers `toggleMonitor`. The in-app Space-key fallback was generalised to read the current `ui.ptmKey` so re-binding PTM works without a window restart. `syncHotkeyBindings()` is called once after subscribe so persisted bindings survive a restart.
+- **`openExternal(url)`** helper inside SettingsScreen — lazy-loads `@tauri-apps/plugin-shell` so the screen still renders in browser preview that lacks the bridge.
+
+### Tests
+
+- **Rust**: 70 → 76. New 6 tests on `virtual_mic.rs` (canonical cable input recogniser, canonical cable output recogniser, case-insensitive matching, rejects unrelated devices, accepts VB-Audio HiFi / Voicemeeter variants, `detect_virtual_mic` runs without panicking on CI hosts with no audio hardware).
+- **Frontend**: 86 → 105. New 6 API wrappers (`detectVirtualMic` two variants, `registerGlobalShortcut` happy + error, `unregisterGlobalShortcut`, `unregisterAllGlobalShortcuts`, `subscribeGlobalShortcut`) + 13 store helpers (refresh status, swallow detect failure, default hotkeys, set + register, PTM dual-write to ui.ptmKey, empty accelerator → unregister, clearHotkeyBinding, register failure stays consistent, syncHotkeyBindings skips empty, Phase 6 tweak defaults, setTweaks updates, glyph defaults + setGlyphs).
+
+### Architecture notes
+
+- **Why bridge VB-Cable instead of writing our own kernel driver**: writing a virtual audio device for Windows means a signed WDF driver, an EV cert, and a months-long Microsoft attestation pipeline. We are a free OSS tool; we don't have that runway. VB-Cable is the de facto standard, is free for personal use, and works identically on every supported Windows release. Detection-only is the right scope.
+- **Global vs in-app hotkeys**: `tauri-plugin-global-shortcut` is the only way to get the key while the window is unfocused, but on Windows it does *not* swallow the press from the focused app (a Discord/OBS chat box still receives the Space). The in-app keyboard listener stays as a focus-time backup that suppresses the default behaviour. Both paths converge on the same store action (`setUi("pressed", …)` / `panicSoundboard` / `toggleMonitor`).
+- **Hotkey accelerator format**: we store and emit the Tauri-native string (`"Space"`, `"Ctrl+Shift+P"`). The `HotkeyCapture` component natively works with `string[]` (one chip per key); the SettingsScreen joins/splits on `+` at the boundary.
+- **Glyph casting** is stored entirely on the frontend (`app.glyphs`). The cast → preset mapping fires on the Mixer (Phase 7 wizard wires the picker UX too); the backend never sees it.
+
+### Pre-push checklist (local, 2026-05-28)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (76 in divora-core)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (105)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+Phase 5 ended with both voice and clips landing in the same engine output. Phase 6 makes that output reachable from another app: VB-Cable detection turns the "did the user install the bridge?" question into a one-glance answer, and the global-shortcut layer means push-to-modulate / panic / monitor work even when Discord, Zoom, or OBS has focus. Plus the full Settings screen is now the home for everything users need to configure end-to-end: devices, cable, hotkeys, glyph casts, look, and the about block. Phase 7 builds the welcome wizard that uses these signals to walk first-run users through setup.
+
 ## [0.5.0] — 2026-05-28 — Phase 5: soundboard
 
 ### Added

@@ -15,11 +15,13 @@ mod devices;
 mod engine;
 mod level;
 mod state;
+mod virtual_mic;
 
 pub use devices::{list_input_devices, list_output_devices, DeviceInfo};
 pub use engine::{AudioEngine, StreamInfo};
 pub use level::LevelMeter;
 pub use state::Levels;
+pub use virtual_mic::{detect_virtual_mic, VirtualMicStatus};
 
 use thiserror::Error;
 

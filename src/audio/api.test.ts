@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 import {
   clearEffectChain,
   deleteUserPreset,
+  detectVirtualMic,
   exportPresetJson,
   getEngineStatus,
   listInputDevices,
@@ -20,6 +21,7 @@ import {
   listPresets,
   playSoundboardClip,
   presetStorePath,
+  registerGlobalShortcut,
   saveUserPreset,
   scanSoundboardFolder,
   setAudioMonitor,
@@ -30,7 +32,10 @@ import {
   stopAllSoundboardClips,
   stopAudioEngine,
   stopSoundboardClip,
+  subscribeGlobalShortcut,
   subscribeLevels,
+  unregisterAllGlobalShortcuts,
+  unregisterGlobalShortcut,
 } from "./api";
 
 describe("audio api", () => {
@@ -256,6 +261,97 @@ describe("audio api", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await stopAllSoundboardClips();
     expect(invokeMock).toHaveBeenCalledWith("stop_all_soundboard_clips");
+  });
+
+  it("detectVirtualMic invokes detect_virtual_mic and returns the status", async () => {
+    invokeMock.mockResolvedValueOnce({
+      detected: true,
+      cableInputDevice: {
+        name: "CABLE Input (VB-Audio Virtual Cable)",
+        isDefault: false,
+        defaultSampleRate: 48000,
+        channels: 2,
+      },
+      cableOutputDevice: {
+        name: "CABLE Output (VB-Audio Virtual Cable)",
+        isDefault: false,
+        defaultSampleRate: 48000,
+        channels: 2,
+      },
+      downloadUrl: "https://vb-audio.com/Cable/",
+    });
+    const status = await detectVirtualMic();
+    expect(invokeMock).toHaveBeenCalledWith("detect_virtual_mic");
+    expect(status.detected).toBe(true);
+    expect(status.cableInputDevice?.name).toContain("CABLE Input");
+    expect(status.cableOutputDevice?.name).toContain("CABLE Output");
+  });
+
+  it("detectVirtualMic forwards a missing-cable status untouched", async () => {
+    invokeMock.mockResolvedValueOnce({
+      detected: false,
+      cableInputDevice: null,
+      cableOutputDevice: null,
+      downloadUrl: "https://vb-audio.com/Cable/",
+    });
+    const status = await detectVirtualMic();
+    expect(status.detected).toBe(false);
+    expect(status.cableInputDevice).toBeNull();
+    expect(status.cableOutputDevice).toBeNull();
+    expect(status.downloadUrl).toMatch(/vb-audio/);
+  });
+
+  it("registerGlobalShortcut forwards id + accelerator", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await registerGlobalShortcut("ptm", "Space");
+    expect(invokeMock).toHaveBeenCalledWith("register_global_shortcut", {
+      id: "ptm",
+      accelerator: "Space",
+    });
+  });
+
+  it("registerGlobalShortcut surfaces backend errors for bad accelerators", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("invalid accelerator: ZZZ"));
+    await expect(registerGlobalShortcut("ptm", "ZZZ")).rejects.toThrow(
+      /invalid accelerator/,
+    );
+  });
+
+  it("unregisterGlobalShortcut forwards the id", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await unregisterGlobalShortcut("ptm");
+    expect(invokeMock).toHaveBeenCalledWith("unregister_global_shortcut", {
+      id: "ptm",
+    });
+  });
+
+  it("unregisterAllGlobalShortcuts invokes unregister_all_global_shortcuts", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await unregisterAllGlobalShortcuts();
+    expect(invokeMock).toHaveBeenCalledWith("unregister_all_global_shortcuts");
+  });
+
+  it("subscribeGlobalShortcut listens on global-shortcut and forwards payloads", async () => {
+    let captured: unknown = null;
+    listenMock.mockImplementationOnce(
+      async (
+        _event: string,
+        handler: (e: { payload: unknown }) => void,
+      ) => {
+        handler({
+          payload: { id: "ptm", accelerator: "Space", state: "pressed" },
+        });
+        return () => {
+          /* unlisten */
+        };
+      },
+    );
+    await subscribeGlobalShortcut((event) => {
+      captured = event;
+    });
+    expect(listenMock).toHaveBeenCalled();
+    expect(listenMock.mock.calls[0]?.[0]).toBe("global-shortcut");
+    expect(captured).toMatchObject({ id: "ptm", state: "pressed" });
   });
 
   it("subscribeLevels listens on audio-levels and forwards payloads", async () => {

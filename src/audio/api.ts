@@ -227,3 +227,48 @@ export async function stopSoundboardClip(clipId: string): Promise<void> {
 export async function stopAllSoundboardClips(): Promise<void> {
   await invoke("stop_all_soundboard_clips");
 }
+
+// ---- Virtual mic (VB-Cable) ----
+
+export interface VirtualMicStatus {
+  detected: boolean;
+  cableInputDevice: DeviceInfo | null;
+  cableOutputDevice: DeviceInfo | null;
+  downloadUrl: string;
+}
+
+export async function detectVirtualMic(): Promise<VirtualMicStatus> {
+  return invoke<VirtualMicStatus>("detect_virtual_mic");
+}
+
+// ---- Global hotkeys ----
+
+/** Periodic event payload emitted by the backend on every press / release. */
+export interface GlobalShortcutEvent {
+  id: string;
+  accelerator: string;
+  state: "pressed" | "released";
+}
+
+export async function registerGlobalShortcut(
+  id: string,
+  accelerator: string,
+): Promise<void> {
+  await invoke("register_global_shortcut", { id, accelerator });
+}
+
+export async function unregisterGlobalShortcut(id: string): Promise<void> {
+  await invoke("unregister_global_shortcut", { id });
+}
+
+export async function unregisterAllGlobalShortcuts(): Promise<void> {
+  await invoke("unregister_all_global_shortcuts");
+}
+
+/** Subscribe to global-shortcut press / release events. Returns the
+ *  Tauri unlisten function. */
+export async function subscribeGlobalShortcut(
+  handler: (event: GlobalShortcutEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<GlobalShortcutEvent>("global-shortcut", (e) => handler(e.payload));
+}

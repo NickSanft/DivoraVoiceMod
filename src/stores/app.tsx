@@ -25,12 +25,14 @@ import { createStore, type SetStoreFunction } from "solid-js/store";
 import {
   ZERO_LEVELS,
   deleteUserPreset as deleteUserPresetCmd,
+  detectVirtualMic as detectVirtualMicCmd,
   exportPresetJson as exportPresetJsonCmd,
   listInputDevices,
   listOutputDevices,
   listPresets,
   pickSoundboardFolder as pickSoundboardFolderCmd,
   playSoundboardClip as playSoundboardClipCmd,
+  registerGlobalShortcut as registerGlobalShortcutCmd,
   saveUserPreset as saveUserPresetCmd,
   scanSoundboardFolder as scanSoundboardFolderCmd,
   setAudioMonitor as setAudioMonitorCmd,
@@ -41,11 +43,13 @@ import {
   stopAllSoundboardClips as stopAllSoundboardClipsCmd,
   stopAudioEngine,
   stopSoundboardClip as stopSoundboardClipCmd,
+  unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
   type Levels,
   type SoundboardTile,
   type StreamInfo,
+  type VirtualMicStatus,
   type WirePreset,
 } from "../audio/api";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
@@ -98,6 +102,15 @@ export interface AbSnapshots {
   A: ChainEntry[];
   B: ChainEntry[];
 }
+
+/** Stable id used for the system-wide hotkeys we register. */
+export type HotkeyAction = "ptm" | "panic" | "monitor";
+
+const DEFAULT_HOTKEY_BINDINGS: Record<HotkeyAction, string> = {
+  ptm: "Space",
+  panic: "",
+  monitor: "",
+};
 
 const cloneChain = (entries: ChainEntry[]): ChainEntry[] =>
   entries.map((c) => ({ ...c, vals: { ...c.vals } }));
@@ -223,6 +236,19 @@ export interface AppState {
   clearTileHotkey: (clipId: string) => void;
   /** Triggered by SoundboardScreen when a tile finishes naturally. */
   markClipFinished: (clipId: string) => void;
+
+  // Virtual mic / VB-Cable
+  virtualMicStatus: () => VirtualMicStatus | null;
+  setVirtualMicStatus: Setter<VirtualMicStatus | null>;
+  refreshVirtualMicStatus: () => Promise<void>;
+
+  // Global hotkeys (system-level, registered via tauri-plugin-global-shortcut)
+  hotkeyBindings: Record<HotkeyAction, string>;
+  setHotkeyBindings: SetStoreFunction<Record<HotkeyAction, string>>;
+  setHotkeyBinding: (action: HotkeyAction, accelerator: string) => Promise<void>;
+  clearHotkeyBinding: (action: HotkeyAction) => Promise<void>;
+  /** Push all currently-set bindings into the backend. Idempotent. */
+  syncHotkeyBindings: () => Promise<void>;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -690,6 +716,65 @@ export function createAppState(): AppState {
     setPlayingClips(clipId, undefined as unknown as PlayingClip);
   };
 
+  // Virtual mic (VB-Cable detection).
+
+  const [virtualMicStatus, setVirtualMicStatus] = createSignal<VirtualMicStatus | null>(null);
+
+  const refreshVirtualMicStatus = async (): Promise<void> => {
+    try {
+      const status = await detectVirtualMicCmd();
+      setVirtualMicStatus(status);
+    } catch (err) {
+      console.warn("[virtual-mic] detect failed", err);
+      setVirtualMicStatus(null);
+    }
+  };
+
+  // Global hotkeys.
+
+  const [hotkeyBindings, setHotkeyBindings] = createStore<Record<HotkeyAction, string>>({
+    ...DEFAULT_HOTKEY_BINDINGS,
+  });
+
+  const setHotkeyBinding = async (
+    action: HotkeyAction,
+    accelerator: string,
+  ): Promise<void> => {
+    setHotkeyBindings(action, accelerator);
+    // PTM also drives the in-app fallback listener via ui.ptmKey.
+    if (action === "ptm") {
+      setUi("ptmKey", accelerator || "Space");
+    }
+    if (!accelerator) {
+      try {
+        await unregisterGlobalShortcutCmd(action);
+      } catch (err) {
+        console.warn("[hotkey] unregister failed", err);
+      }
+      return;
+    }
+    try {
+      await registerGlobalShortcutCmd(action, accelerator);
+    } catch (err) {
+      console.warn("[hotkey] register failed", err);
+    }
+  };
+
+  const clearHotkeyBinding = (action: HotkeyAction): Promise<void> =>
+    setHotkeyBinding(action, "");
+
+  const syncHotkeyBindings = async (): Promise<void> => {
+    for (const action of Object.keys(hotkeyBindings) as HotkeyAction[]) {
+      const accelerator = hotkeyBindings[action];
+      if (!accelerator) continue;
+      try {
+        await registerGlobalShortcutCmd(action, accelerator);
+      } catch (err) {
+        console.warn(`[hotkey] sync failed for ${action}`, err);
+      }
+    }
+  };
+
   return {
     nav,
     setNav,
@@ -779,6 +864,16 @@ export function createAppState(): AppState {
     bindTileHotkey,
     clearTileHotkey,
     markClipFinished,
+
+    virtualMicStatus,
+    setVirtualMicStatus,
+    refreshVirtualMicStatus,
+
+    hotkeyBindings,
+    setHotkeyBindings,
+    setHotkeyBinding,
+    clearHotkeyBinding,
+    syncHotkeyBindings,
 
     selectedEffect,
     setSelectedEffect,

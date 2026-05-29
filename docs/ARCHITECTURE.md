@@ -490,6 +490,106 @@ Subsequent plays of the same clip do zero file I/O.
 
 A `createEffect` watches `playingClips` and runs an rAF loop while any clip is active. Each tick advances `clockTick` and removes any clips whose `performance.now() - startedAt` has exceeded their duration.
 
-## Phase 6+ — (placeholders)
+## Phase 6 — virtual mic bridge + global hotkeys + full Settings
+
+### Module layout (added)
+
+```
+divora-core/src/
+└── audio/
+    └── virtual_mic.rs     # detect_virtual_mic() + VirtualMicStatus + name matchers
+
+src-tauri/src/lib.rs       # AppState.shortcuts: Mutex<HashMap<String, Shortcut>>
+                           # global_shortcut_handler(); 4 new Tauri commands
+src-tauri/Cargo.toml       # +tauri-plugin-global-shortcut = "2"
+src-tauri/capabilities/    # +global-shortcut:default + allow-register/unregister/...
+    default.json
+
+src/
+├── audio/api.ts           # +VirtualMicStatus + GlobalShortcutEvent types
+│                          # +detectVirtualMic / register/unregister/subscribe wrappers
+├── stores/app.tsx         # +HotkeyAction type + DEFAULT_HOTKEY_BINDINGS
+│                          # +virtualMicStatus signal + refreshVirtualMicStatus
+│                          # +hotkeyBindings store + set/clear/syncHotkeyBindings
+├── screens/SettingsScreen.tsx  # full screen: AudioDevices + VirtualMic + Hotkeys +
+│                               # GlyphCasting + Appearance (all knobs) + About
+└── App.tsx                # subscribes to "global-shortcut" events;
+                           # in-app PTM fallback now reads ui.ptmKey
+```
+
+### VB-Cable detection
+
+Detection is pure name-matching against the cpal device lists — we never open the cable, never poke at the registry. Both heuristics fire case-insensitively:
+
+```
+looks_like_cable_input(name)  := "cable input"  ⊂ name  OR  ("vb-audio" ⊂ name AND "input"  ⊂ name)
+looks_like_cable_output(name) := "cable output" ⊂ name  OR  ("vb-audio" ⊂ name AND "output" ⊂ name)
+```
+
+This recognises:
+- Canonical `CABLE Input (VB-Audio Virtual Cable)` / `CABLE Output (…)`
+- `VB-Audio Hi-Fi Cable Input` / `VB-Audio Voicemeeter VAIO3 Output`
+
+And rejects unrelated devices (`Blue Yeti X`, `HyperX Cloud II`, `Realtek HD Audio`, etc.).
+
+`detect_virtual_mic()` returns `VirtualMicStatus { detected, cableInputDevice, cableOutputDevice, downloadUrl }` where `detected` is the conjunction of both fields being `Some`. The download URL (`https://vb-audio.com/Cable/`) is a hard-coded `&'static str` — never user-overridable, never fetched from the network.
+
+### Global hotkey architecture
+
+`tauri-plugin-global-shortcut` registers OS-wide hotkeys per Tauri window. The plugin's handler receives `(app_handle, shortcut, event)` and our wrapper looks up the registered id by reverse-mapping `shortcuts: Mutex<HashMap<String, Shortcut>>`, then emits a Tauri event with the canonical payload:
+
+```rust
+GlobalShortcutEvent { id, accelerator, state }  // state: "pressed" | "released"
+```
+
+Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id:
+
+```
+event.id  | event.state | action
+----------|-------------|-------------------------------
+"ptm"     | "pressed"   | setUi("pressed", true)
+"ptm"     | "released"  | setUi("pressed", false)
+"panic"   | "pressed"   | panicSoundboard()
+"monitor" | "pressed"   | toggleMonitor()
+```
+
+`syncHotkeyBindings()` is called once after subscribe; it re-registers every persisted accelerator so a Windows restart doesn't lose the bindings (Tauri's plugin loses its registrations when the process exits).
+
+### Why two PTM listeners?
+
+The OS-level hotkey works while the app is unfocused but **does not** swallow the keypress from the focused app. So if a user is typing in Discord with PTM = Space, Discord still gets the spaces. To handle that, `App.tsx` also keeps an in-app `window.addEventListener("keydown")` that triggers the same `ui.pressed` flip when our window has focus AND the event target is `document.body`. Both listeners converge on the same store mutation; the user can't tell which fired.
+
+### Hotkey accelerator format
+
+`HotkeyCapture` (the component) reads keys as a `string[]` (one chip per key). The store keeps a single Tauri accelerator string. SettingsScreen converts at the boundary:
+
+```
+acceleratorToKeys("Ctrl+Shift+P") = ["Ctrl", "Shift", "P"]
+keysToAccelerator(["Ctrl", "Shift", "P"]) = "Ctrl+Shift+P"
+```
+
+An empty string means "no binding"; `setHotkeyBinding(action, "")` calls `unregister_global_shortcut(action)` instead of `register_…`.
+
+### Frontend store extensions
+
+| Field | Kind | Purpose |
+|---|---|---|
+| `virtualMicStatus` / `setVirtualMicStatus` | signal | Last result of `detect_virtual_mic`, or `null` before first refresh |
+| `refreshVirtualMicStatus` | action | Calls backend; swallows errors (logs + stays `null`) |
+| `hotkeyBindings` / `setHotkeyBindings` | store | `Record<HotkeyAction, string>` — Tauri accelerator strings |
+| `setHotkeyBinding(action, accel)` | action | Empty string → unregister; non-empty → register; PTM also mirrors to `ui.ptmKey` |
+| `clearHotkeyBinding(action)` | action | Shorthand for `setHotkeyBinding(action, "")` |
+| `syncHotkeyBindings` | action | Re-register every non-empty binding (idempotent; used on startup) |
+
+### Settings screen sections (Phase 6 final shape)
+
+1. **Audio devices** (Phase 2) — input/output selects + meter + start/stop + monitor toggle.
+2. **Virtual microphone** — coloured status banner (success-bg or warning-bg), routing hint when detected, Download button + warning when not. Re-scan ghost button. Three call-app instruction cards (Discord / Zoom / OBS) appear once detected.
+3. **Hotkeys** — three rows (PTM / panic / monitor) with `HotkeyCapture` chips + Clear button.
+4. **Glyph casting** — Triangle / Inverted triangle / Square / Circle rows, each with a preset Select. Stores into `app.glyphs[shape]`.
+5. **Appearance** — mood / accent / motion (from Phase 1) + mystical (subtle / balanced / rich) + parchment grain toggle + vignette toggle.
+6. **About** — DMark + version + license + GitHub button + 3 pillar cards + Replay setup button (flips `wizardOpen` for the Phase 7 wizard).
+
+## Phase 7+ — (placeholders)
 
 To be filled in as each phase lands.
