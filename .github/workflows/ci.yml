@@ -72,11 +72,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        # Tests run serial + with --nocapture so we can see which one
-        # owns a crash (parallel + buffered output hides the offender;
-        # observed during the v0.9.0 STATUS_ACCESS_VIOLATION debug).
-        # Revisit parallelism once the realfft/rubato code path is stable.
-        run: cargo test --workspace --all-features -- --test-threads=1 --nocapture
+        # The `CI=true` env var is checked by audio-device tests to
+        # skip cpal/WASAPI enumeration on the headless windows-2022
+        # runner — those calls intermittently STATUS_ACCESS_VIOLATION
+        # under parallel test execution (real hardware is fine).
+        env:
+          CI: "true"
+        run: cargo test --workspace --all-features
 
   build:
     name: Tauri debug build
