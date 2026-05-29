@@ -22,7 +22,13 @@ import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { clearWizardSeenFlag } from "../components/Wizard";
-import { useApp, type HotkeyAction } from "../stores/app";
+import {
+  MYSTICAL_BALANCED,
+  MYSTICAL_RICH,
+  MYSTICAL_SUBTLE,
+  useApp,
+  type HotkeyAction,
+} from "../stores/app";
 import type { GlyphId, TweaksState } from "../types";
 
 const VERSION = "v0.6.0";
@@ -759,11 +765,13 @@ interface AppearanceProps {
 
 function AppearanceSection(props: AppearanceProps): JSX.Element {
   const app = useApp();
+  // Threshold midpoints between the three discrete mystical values
+  // (0.3 / 0.7 / 1.0) — so the segmented control snaps to the closest.
   const mysticalSegment = (): "subtle" | "balanced" | "rich" => {
     const m = app.tweaks.mystical;
-    if (m <= 0.25) return "subtle";
-    if (m >= 0.75) return "rich";
-    return "balanced";
+    if (m <= 0.4) return "subtle";
+    if (m <= 0.85) return "balanced";
+    return "rich";
   };
   return (
     <section>
@@ -835,7 +843,11 @@ function AppearanceSection(props: AppearanceProps): JSX.Element {
             onChange={(v) =>
               app.setTweaks(
                 "mystical",
-                v === "subtle" ? 0 : v === "balanced" ? 0.5 : 1,
+                v === "subtle"
+                  ? MYSTICAL_SUBTLE
+                  : v === "balanced"
+                    ? MYSTICAL_BALANCED
+                    : MYSTICAL_RICH,
               )
             }
           />

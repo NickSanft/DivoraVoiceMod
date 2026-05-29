@@ -56,6 +56,15 @@ function Shell(): JSX.Element {
     // it via the prefers-reduced-motion media query.
     applyRootAttr("data-motion-user", "true");
   });
+  // Phase 11.1: surface the mystical level as both a data attribute
+  // (for category-style CSS rules) and a `--mystical` numeric CSS
+  // variable (for things that want a smooth scalar like opacity).
+  createEffect(() => {
+    const m = app.tweaks.mystical;
+    const tier = m <= 0.4 ? "subtle" : m <= 0.85 ? "balanced" : "rich";
+    applyRootAttr("data-mystical", tier);
+    document.documentElement.style.setProperty("--mystical", String(m));
+  });
   createEffect(() => {
     document.body.classList.toggle("grain", app.tweaks.grain);
     document.body.classList.toggle("vignette", app.tweaks.vignette);

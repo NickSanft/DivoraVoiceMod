@@ -161,6 +161,22 @@
   --motion: 1;
 }
 
+/* Phase 11.1: make Motion = functional actually quiet the whole app
+   (not just the Spell Circle). Decorative animations + most
+   transitions go effectively-instant. Spell-circle JS still has its
+   own `motion > 0` gating that prevents the orbit / particles from
+   doing any work at all; this rule covers things like the cast
+   reveal, hotkey-capture shimmer, and component hover transitions
+   that previously kept playing in functional mode. */
+:root[data-motion="functional"] *,
+:root[data-motion="functional"] *::before,
+:root[data-motion="functional"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+}
+
 /* ============================================================
    RESET / BASE
    ============================================================ */

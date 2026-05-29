@@ -4,6 +4,28 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-05-29 — Settings → Appearance: Mystical + Motion actually do something
+
+Field report: "the Motion and Mystical Appearance options don't seem to be working as expected from the mockup."
+
+### Fixed
+
+- **`Mystical` levels mapped to the wrong numbers.** The prototype's `tweaks.jsx` maps `subtle / balanced / rich → 0.3 / 0.7 / 1.0`. Our code shipped `0 / 0.5 / 1.0`. With `balanced = 0.5`, the SpellCircle's `mystical >= 0.5` cut treated balanced as borderline-rich and `subtle = 0` looked harsh (every decoration off). Aligned to the prototype values via three exported constants (`MYSTICAL_SUBTLE`, `MYSTICAL_BALANCED`, `MYSTICAL_RICH`) used by both the store and the SettingsScreen segmented control. Snap thresholds in `mysticalSegment()` updated to `0.4 / 0.85` (midpoints of the new triplet).
+- **Default `mystical` was `1.0` ("rich")** instead of the prototype's `0.7` ("balanced"). Defaulting at the top of the range meant moving the slider only ever produced *less*; coming back to the centre felt like "did nothing change?" Default now matches the prototype.
+- **`Motion = functional` did nothing outside the Spell Circle.** The `--motion` CSS variable was defined under `:root[data-motion="…"]` but **no rule consumed it anywhere in `styles.css`**. So picking "Functional" disabled the Spell Circle's orbit / particles (gated in JS) but the hotkey-capture shimmer, the SPELL CAST reveal, and every component transition kept playing. Added a universal `:root[data-motion="functional"] *` rule that pins animation + transition durations to 0.001 ms. The spell-circle JS gating still skips work entirely (saving CPU), while the CSS rule covers the rest of the app.
+- **`Tweaks` didn't persist across restarts.** Every reload reset Mystical / Motion / Mood / etc. to defaults, which made it feel like the controls weren't sticking. Tweaks are now serialised to `localStorage["divora.tweaks"]` on every `setTweaks` call, partial-merged onto defaults on init so adding a new tweak field in a future phase doesn't blow up old payloads.
+- **No global `--mystical` CSS variable.** Mystical was a JS-only signal consumed exclusively by the SpellCircle. Added `--mystical: <0..1>` and a discrete `data-mystical="subtle|balanced|rich"` root attribute so future components can react without prop-drilling.
+
+### Tests
+
+- **Frontend**: 175 → 179 (+4).
+  - 1 updated Phase 6 test (default mystical is 0.7, not 1).
+  - 4 new tests in a `Phase 11.1 tweak persistence + mystical values` group: default mystical equals 0.7; `setTweaks` writes to `localStorage["divora.tweaks"]`; values persist across a store re-init; partial-merge tolerates old payloads missing newer fields.
+
+### Why it matters
+
+The Tweaks panel is the user's most visible knob for what the app *looks* like. When the knobs don't move anything outside one screen and reset every restart, the whole "personalise your spellcraft" pitch falls apart. v0.11.1 makes Mystical + Motion actually reach the rest of the app, persist your choices, and start from a centred default the way the prototype always intended.
+
 ## [0.11.0] — 2026-05-29 — Phase 11: live device switching + cast polish + soundboard verification
 
 Three field reports rolled into one polish phase.

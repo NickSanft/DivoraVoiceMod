@@ -1052,9 +1052,12 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
     );
   });
 
-  it("tweaks default to mystical=1, grain=false, vignette=false (Phase 6 fields)", () => {
+  it("tweaks default to mystical=0.7 (balanced, per prototype), grain=false, vignette=false", () => {
+    // v0.11.1 aligned the mystical default with the prototype's
+    // `balanced = 0.7`. Earlier code shipped `1` which was the wrong
+    // baseline (always rich; segmented control felt non-functional).
     const { result } = setupApp();
-    expect(result.tweaks.mystical).toBe(1);
+    expect(result.tweaks.mystical).toBeCloseTo(0.7, 5);
     expect(result.tweaks.grain).toBe(false);
     expect(result.tweaks.vignette).toBe(false);
   });
@@ -1075,5 +1078,58 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
     expect(result.glyphs.circle).toBe("clean");
     result.setGlyphs("triangle", "static-wraith");
     expect(result.glyphs.triangle).toBe("static-wraith");
+  });
+});
+
+describe("app store — Phase 11.1 tweak persistence + mystical values", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("default mystical is 0.7 ('balanced'), matching the prototype default", () => {
+    const { result } = setupApp();
+    expect(result.tweaks.mystical).toBeCloseTo(0.7, 5);
+  });
+
+  it("setTweaks persists Tweaks state to localStorage", () => {
+    const { result } = setupApp();
+    result.setTweaks("mystical", 0.3);
+    result.setTweaks("mood", "midnight");
+    const raw = window.localStorage.getItem("divora.tweaks");
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed.mystical).toBeCloseTo(0.3, 5);
+    expect(parsed.mood).toBe("midnight");
+  });
+
+  it("persisted Tweaks survive a re-init of the store", () => {
+    // Set in one instance, then create another to mimic an app restart.
+    const a = setupApp();
+    a.result.setTweaks("mystical", 1.0);
+    a.result.setTweaks("accent", "ember");
+    const b = setupApp();
+    expect(b.result.tweaks.mystical).toBeCloseTo(1.0, 5);
+    expect(b.result.tweaks.accent).toBe("ember");
+  });
+
+  it("persisted payload is partial-merged onto defaults — new tweak fields don't blow up old data", () => {
+    // Pretend an older app version saved only `mood` and never knew
+    // about `vignette`. The current store should fill in defaults for
+    // every missing field.
+    window.localStorage.setItem(
+      "divora.tweaks",
+      JSON.stringify({ mood: "ink" }),
+    );
+    const { result } = setupApp();
+    expect(result.tweaks.mood).toBe("ink");
+    // The default for vignette is false; for mystical 0.7.
+    expect(result.tweaks.vignette).toBe(false);
+    expect(result.tweaks.mystical).toBeCloseTo(0.7, 5);
   });
 });

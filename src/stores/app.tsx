@@ -72,8 +72,20 @@ const prefersReducedMotion = (): boolean => {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 };
 
+// Per the prototype (docs/mockups/prototype/divora/tweaks.jsx):
+//   subtle  → 0.3
+//   balanced → 0.7  (default)
+//   rich    → 1.0
+// The earlier 0 / 0.5 / 1.0 mapping made balanced ride right on the
+// SpellCircle's `mystical >= 0.5` threshold so it looked like rich,
+// and `subtle` (0) read as "everything off" which was harsher than
+// the design intended.
+export const MYSTICAL_SUBTLE = 0.3;
+export const MYSTICAL_BALANCED = 0.7;
+export const MYSTICAL_RICH = 1.0;
+
 const defaultTweaks = (): TweaksState => ({
-  mystical: 1,
+  mystical: MYSTICAL_BALANCED,
   motion: prefersReducedMotion() ? 0 : 1,
   mood: "violet",
   accent: "brand",
@@ -112,6 +124,7 @@ const STORAGE_KEYS = {
   tileOrder: "divora.tileOrder",
   tileHotkeys: "divora.tileHotkeys",
   recentFolders: "divora.recentFolders",
+  tweaks: "divora.tweaks",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -349,7 +362,23 @@ export function createAppState(): AppState {
   );
   const [ui, setUi] = createStore<UiState>(defaultUi());
   const [wizardOpen, setWizardOpen] = createSignal(true);
-  const [tweaks, setTweaks] = createStore<TweaksState>(defaultTweaks());
+  // Persist Tweaks across sessions — without this every restart resets
+  // the Mystical/Motion/etc. choices, which made the controls feel
+  // broken. Load is partial-merged onto defaults so adding new tweak
+  // fields in a future phase doesn't blow up on old payloads.
+  const persistedTweaks = loadJson<Partial<TweaksState>>(
+    STORAGE_KEYS.tweaks,
+    {},
+  );
+  const [tweaks, setTweaksRaw] = createStore<TweaksState>({
+    ...defaultTweaks(),
+    ...persistedTweaks,
+  });
+  const setTweaks: SetStoreFunction<TweaksState> = ((...args: unknown[]) => {
+    // Re-dispatch into the underlying setter, then snapshot for save.
+    (setTweaksRaw as (...a: unknown[]) => void)(...args);
+    saveJson(STORAGE_KEYS.tweaks, { ...tweaks });
+  }) as SetStoreFunction<TweaksState>;
   const [glyphs, setGlyphs] = createStore<Record<GlyphId, string>>({ ...defaultGlyphs });
 
   // Audio engine signals.
