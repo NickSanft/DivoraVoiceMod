@@ -456,6 +456,32 @@ export function createAppState(): AppState {
 
   const toggleMonitor = (): Promise<void> => setMonitor(!engineMonitoring());
 
+  // Phase 11: live device switching. When the user picks a different
+  // input or output device in Settings while the engine is running,
+  // restart the engine so the new device takes effect immediately.
+  // Without this, only the displayed selection updates — the running
+  // streams still point at the OLD devices, and the user sees no
+  // change in behavior until they manually Stop / Start.
+  //
+  // `defer: true` prevents the effect from firing on creation; the
+  // first call happens only when one of the signals actually changes.
+  createEffect(
+    on(
+      [selectedInput, selectedOutput],
+      ([newIn, newOut], prev) => {
+        if (prev === undefined) return; // initial run guard (belt + suspenders with defer)
+        const [prevIn, prevOut] = prev;
+        if (newIn === prevIn && newOut === prevOut) return;
+        if (!engineRunning()) return;
+        void (async () => {
+          await stopEngine();
+          await startEngine();
+        })();
+      },
+      { defer: true },
+    ),
+  );
+
   // Inspector selection — defaults to the first effect of the active chain.
   const [selectedEffect, setSelectedEffect] = createSignal<EffectId | null>(
     (firstPreset.chain[0]?.id as EffectId | undefined) ?? null,

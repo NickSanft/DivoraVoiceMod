@@ -4,6 +4,46 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-05-29 — Phase 11: live device switching + cast polish + soundboard verification
+
+Three field reports rolled into one polish phase.
+
+### Added
+
+- **Live input + output device switching.** Picking a different device in Settings now restarts the engine onto the new device automatically. The store grows a `createEffect(on([selectedInput, selectedOutput], …))` with `defer: true` and an `engineRunning` guard — if the engine is running and either selection actually changed, it stops + starts within one effect tick. No-op when stopped, and re-selecting the same value is a no-op too.
+- **Glyph-cast trail of sparks.** `GlyphCastOverlay` emits two short-lived sparks per pointer-move event during a cast. Each spark has random ±0.8 px/frame velocity, gentle damping, a hint of gravity, and fades over 700 ms. A capped pool (96 sparks max) plus a single rAF loop keep the effect cheap.
+- **"◆ SPELL CAST ◆" ceremonial reveal** (`SpellCastReveal` component) — after a successful cast, the bound preset's glyph blooms in its brand colour with a breathing radial glow, the preset name displays in the same colour, the `Bundled / User` tag sits below in mono. Three CSS keyframes drive the choreography: `spell-cast-veil` (backdrop fade), `spell-cast-reveal` (panel pop-in + hold + fade), `spell-cast-breathe` (glyph glow pulse). Auto-dismisses after 1.4 s.
+- **Soundboard-mic confirmation hint** on the Soundboard header (only shown once a folder is picked): a small `info`-toned chip reading *"Clips play through your selected output device — including your modulated mic, so Discord / Zoom / OBS callers hear them."*
+- **Engine architecture clarification** — the `chain.process` + `soundboard.mix_into` pair was extracted into a free function `mix_voice_and_soundboard(mono, chain, soundboard, sr)`. The output callback now calls that helper, and a doc comment on the helper explains *why* the order matters (effects on the user's voice; clips on top, as-is; both into the same mono buffer the fan-out consumes). The new function is unit-testable in isolation.
+
+### Tests
+
+- **Rust**: 102 → 104 (+2).
+  - `audio::engine::soundboard_clips_land_in_the_same_output_buffer_as_the_mic` — feeds a 4096-sample constant-0.25 clip + a 480-sample mic buffer of constant 0.10 into `mix_voice_and_soundboard`; expects every output sample to equal 0.35 (additive mix). Direct regression for "do soundboard clips reach the modulated output?"
+  - `audio::engine::mic_only_passes_through_when_no_clip_is_playing` — same scaffolding without the clip; expects untouched 0.10 throughout.
+- **Frontend**: 167 → 175 (+8).
+  - 4 store tests (`app store — Phase 2`): changing `selectedInput` while running restarts the engine on the new device; same for `selectedOutput`; no-op when stopped; no-op when the value didn't actually change.
+  - 4 `SpellCastReveal` component tests: renders preset name + tag + "SPELL CAST" eyebrow; applies the preset's brand colour to the name; fires `onDone` after `REVEAL_DURATION_MS`; is keyboard-accessible via `role="status"` + `aria-live="polite"` + an aria-label naming the preset.
+
+### Architecture notes
+
+- **Why a store-level effect for device switching, not a Settings-component effect**: the engine restart must happen whether the user changes devices via Settings, an automated test, or a future hotkey. Putting it in the store keeps the rule in one place.
+- **Why sparks + reveal are two separate components** instead of one mega-overlay: `GlyphCastOverlay` is for input (drag + classify). `SpellCastReveal` is for output (animation + preset announcement). They never coexist (overlay closes before reveal starts), so coupling them would only complicate the lifecycle. Plus the reveal is now reusable — Phase 12 (AI voice conversion) might surface a similar reveal when a converted-voice preset matches.
+- **Why an info chip about soundboard routing** rather than a tooltip: users were *uncertain* whether clips reached call participants. A tooltip on a tile wouldn't surface unless they hovered. The chip sits at the top of the screen the moment a folder is picked, where the question naturally arises.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (104)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (175)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The device-switching bug was the largest "does this app even work?" issue still present in v0.10. Now picking a new mic Just Works. The cast reveal is the missing celebratory beat that turns gesture recognition from "did it pick the right preset?" into "yes, *Hollow King*." And the soundboard chip closes a documentation gap that was causing real confusion in calls.
+
 ## [0.10.0] — 2026-05-29 — Phase 10: polish (RNNoise denoiser + README rewrite)
 
 ### Added

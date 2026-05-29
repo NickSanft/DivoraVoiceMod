@@ -203,9 +203,10 @@ Auxiliary rules:
 | **7.x** ✓ | v0.7.1 | Bug fixes from initial user feedback (PTM Space steal, Sigil DOM sharing, #root height anchor) | All critical issues closed |
 | **8** | v0.8.0 | **Soundboard polish + cast alignment**: glyph-cast trace alignment, tile drag-reorder + persistence, per-tile colors, recent-folders history, global soundboard hotkeys (per-tile, system-wide via existing tauri-plugin-global-shortcut) | Drag tiles to reorder; right-click a tile to pick its color; recent folders dropdown switches between soundboards; hotkey-bound clips fire even while DivoraVoice is unfocused |
 | **9** | v0.9.0 | **DSP quality**: real pitch-preserving shifter (phase vocoder or PSOLA), formant warping via LPC envelope, rubato resampling at device boundaries so mismatched sample rates no longer hard-fail | Pitch slider preserves formants + tempo; formant slider doesn't pitch-shift; mic + output at different sample rates Just Works |
-| **10** | v0.10.0 | **Polish + signed installer**: manual test pass, RNNoise noise suppression, code-signing cert (if budget), sand off rough edges | Public v0.10 release advertised as "feature complete v1" |
-| **11** | v0.11.0 | **AI voice conversion** via LLVC | "Deep Narrator AI" works real-time on CPU |
-| **1.0** | v1.0.0 | Cut after at least one quiet 0.11.x patch cycle. Stamps the stable surface | API/preset format stable for back-compat |
+| **10** ✓ | v0.10.0 | **Polish + signed installer**: manual test pass, RNNoise noise suppression, code-signing cert (if budget), sand off rough edges | Public v0.10 release advertised as "feature complete v1" |
+| **11** | v0.11.0 | **Live device switching + cast polish + soundboard verification**: changing the input/output device while the engine runs should restart it cleanly; the glyph-cast trail gets sparks + a "SPELL CAST" preset-name reveal in the bound preset's colour; verify (and document) that soundboard clips reach the modulated output | Picking a new mic in Settings restarts the engine to that mic; drawing a triangle shows sparks + "◆ SPELL CAST ◆ Velvet Demon" before the preset takes effect; soundboard tile played mid-call is audible to call participants |
+| **12** | v0.12.0 | **AI voice conversion** via LLVC | "Deep Narrator AI" works real-time on CPU |
+| **1.0** | v1.0.0 | Cut after at least one quiet 0.12.x patch cycle. Stamps the stable surface | API/preset format stable for back-compat |
 
 After v1.0, additional features (VST3 host, Stream Deck integration, OBS WebSocket, etc.) follow standard semver.
 

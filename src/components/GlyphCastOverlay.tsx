@@ -4,12 +4,16 @@
 // which glyph it was, and the overlay calls back with the result.
 //
 // Visual: a translucent dusk-violet veil over the Mixer with a glowing
-// stroke that traces the user's path. While idle (cursor down, no
-// drag yet), an instruction blurb floats centred. Esc cancels.
+// stroke that traces the user's path. Phase 11 adds a particle spark
+// trail behind the cursor while drawing — every pointermove emits a
+// pair of sparks with small random velocities; a rAF loop fades them
+// over ~700 ms. While idle (cursor down, no drag yet), an instruction
+// blurb floats centred. Esc cancels.
 
 import {
   createMemo,
   createSignal,
+  For,
   onCleanup,
   onMount,
   Show,
@@ -18,6 +22,25 @@ import {
 import { classifyGlyph, type Point } from "../data/glyphs";
 import { Sigil } from "./Sigil";
 import type { GlyphId } from "../types";
+
+/** Lifespan of each spark, in ms. */
+const SPARK_LIFE_MS = 700;
+/** Hard cap on simultaneous sparks (cheap pruning when over). */
+const SPARK_CAP = 96;
+/** Sparks emitted per pointermove. */
+const SPARK_BURST = 2;
+
+interface Spark {
+  /** Stable id for the SolidJS For key. */
+  id: number;
+  x: number;
+  y: number;
+  /** Pixel velocity per frame (~16 ms). */
+  vx: number;
+  vy: number;
+  /** `performance.now()` of birth — drives the fade. */
+  born: number;
+}
 
 export interface GlyphCastOverlayProps {
   /** Called on release with the classified glyph (null if unrecognised). */
@@ -49,12 +72,71 @@ export function localPoint(
 export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
   const [points, setPoints] = createSignal<Point[]>([]);
   const [drawing, setDrawing] = createSignal(false);
+  const [sparks, setSparks] = createSignal<Spark[]>([]);
   // We track the SVG dimensions so the `viewBox` matches the painted
   // area exactly (not the whole window). That way `localPoint` lands
   // in the SVG's own coord frame.
   const [size, setSize] = createSignal({ w: 1, h: 1 });
   let rootRef: HTMLDivElement | undefined;
   let svgRef: SVGSVGElement | undefined;
+  let sparkId = 0;
+  let rafId = 0;
+
+  const emitSparks = (x: number, y: number): void => {
+    const now = performance.now();
+    const next: Spark[] = [];
+    for (let i = 0; i < SPARK_BURST; i++) {
+      sparkId += 1;
+      next.push({
+        id: sparkId,
+        x,
+        y,
+        vx: (Math.random() - 0.5) * 1.6,
+        vy: (Math.random() - 0.5) * 1.6 - 0.3, // bias slightly upward
+        born: now,
+      });
+    }
+    const existing = sparks();
+    const combined =
+      existing.length + next.length > SPARK_CAP
+        ? [
+            ...existing.slice(existing.length + next.length - SPARK_CAP),
+            ...next,
+          ]
+        : [...existing, ...next];
+    setSparks(combined);
+  };
+
+  const tickSparks = (): void => {
+    const now = performance.now();
+    const alive: Spark[] = [];
+    for (const s of sparks()) {
+      const age = now - s.born;
+      if (age >= SPARK_LIFE_MS) continue;
+      alive.push({
+        id: s.id,
+        x: s.x + s.vx,
+        y: s.y + s.vy,
+        vx: s.vx * 0.985, // gentle damping
+        vy: s.vy * 0.985 + 0.04, // tiny gravity
+        born: s.born,
+      });
+    }
+    if (alive.length !== sparks().length || alive.length > 0) {
+      setSparks(alive);
+    }
+    if (alive.length > 0 || drawing()) {
+      rafId = requestAnimationFrame(tickSparks);
+    } else {
+      rafId = 0;
+    }
+  };
+
+  const ensureRaf = (): void => {
+    if (rafId === 0) {
+      rafId = requestAnimationFrame(tickSparks);
+    }
+  };
 
   const pathD = createMemo<string>(() => {
     const pts = points();
@@ -79,14 +161,19 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     measure();
-    setPoints([localPoint(svgRef ?? null, e)]);
+    const p = localPoint(svgRef ?? null, e);
+    setPoints([p]);
     setDrawing(true);
+    emitSparks(p.x, p.y);
+    ensureRaf();
   };
 
   const onPointerMove = (e: PointerEvent): void => {
     if (!drawing()) return;
     e.preventDefault();
-    setPoints([...points(), localPoint(svgRef ?? null, e)]);
+    const p = localPoint(svgRef ?? null, e);
+    setPoints([...points(), p]);
+    emitSparks(p.x, p.y);
   };
 
   const onPointerUp = (e: PointerEvent): void => {
@@ -118,6 +205,10 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
     onCleanup(() => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("resize", onResize);
+      if (rafId !== 0) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
     });
   });
 
@@ -156,6 +247,34 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
         }}
         aria-hidden="true"
       >
+        {/* Spark particles trailing behind the cursor. Each spark
+            fades out over SPARK_LIFE_MS; the rAF tick in tickSparks
+            walks them per frame. */}
+        <For each={sparks()}>
+          {(s) => {
+            const age = (): number => {
+              // Read drawing() to keep this memo re-running while the
+              // animation loop ticks (sparks() updates drive it).
+              void sparks();
+              return performance.now() - s.born;
+            };
+            const t = (): number =>
+              Math.min(1, Math.max(0, age() / SPARK_LIFE_MS));
+            const r = (): number => 3 * (1 - t()) + 0.4;
+            const opacity = (): number => Math.max(0, 1 - t());
+            return (
+              <circle
+                cx={s.x}
+                cy={s.y}
+                r={r()}
+                fill="url(#glyph-cast-grad)"
+                opacity={opacity()}
+                style={{ filter: "blur(0.4px)" }}
+              />
+            );
+          }}
+        </For>
+
         <Show when={pathD()}>
           <path
             d={pathD()}

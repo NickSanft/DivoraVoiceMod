@@ -169,6 +169,112 @@ describe("app store — Phase 2 audio actions", () => {
     await result.toggleMonitor();
     expect(result.engineMonitoring()).toBe(true);
   });
+
+  // ---- Phase 11: live device switching ---------------------------------
+
+  it("changing selectedInput while running restarts the engine on the new device", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_audio_engine") {
+        const a = args as { inputName: string | null; outputName: string | null };
+        return {
+          inputName: a.inputName ?? "?",
+          outputName: a.outputName ?? "?",
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    result.setSelectedOutput("Headphones");
+    await result.startEngine();
+    expect(result.engineRunning()).toBe(true);
+
+    invokeMock.mockClear();
+    result.setSelectedInput("Mic B");
+    // Settle the createEffect microtask + the inner async chain.
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.objectContaining({ inputName: "Mic B" }),
+    );
+  });
+
+  it("changing selectedOutput while running restarts the engine on the new device", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_audio_engine") {
+        const a = args as { inputName: string | null; outputName: string | null };
+        return {
+          inputName: a.inputName ?? "?",
+          outputName: a.outputName ?? "?",
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    result.setSelectedOutput("Headphones");
+    await result.startEngine();
+    invokeMock.mockClear();
+    result.setSelectedOutput("CABLE Input (VB-Audio Virtual Cable)");
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.objectContaining({
+        outputName: "CABLE Input (VB-Audio Virtual Cable)",
+      }),
+    );
+  });
+
+  it("device-change effect is a no-op when the engine is stopped", async () => {
+    invokeMock.mockImplementation(async () => null);
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    // Engine has never been started; engineRunning() is false.
+    invokeMock.mockClear();
+    result.setSelectedInput("Mic B");
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.anything(),
+    );
+  });
+
+  it("device-change effect is a no-op when nothing actually changed", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_audio_engine") {
+        const a = args as { inputName: string | null; outputName: string | null };
+        return {
+          inputName: a.inputName ?? "?",
+          outputName: a.outputName ?? "?",
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    await result.startEngine();
+    invokeMock.mockClear();
+    // Re-set the SAME value: no restart should happen.
+    result.setSelectedInput("Mic A");
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
+  });
 });
 
 describe("app store — Phase 4 preset actions", () => {

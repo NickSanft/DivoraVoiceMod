@@ -161,6 +161,34 @@ export function SoundboardScreen(): JSX.Element {
             </div>
           )}
         </Show>
+
+        {/* Phase 11: tell the user where soundboard clips actually go.
+            The output callback runs the DSP chain on the mic first,
+            then `soundboard.mix_into` on the SAME mono buffer, then
+            fans out to the output device. Routing the engine output
+            into CABLE Input therefore carries the clips to call
+            participants alongside the modulated mic. */}
+        <Show when={app.soundboardFolder()}>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s2)",
+              padding: "6px var(--s3)",
+              "border-radius": "var(--r-md)",
+              background: "var(--info-bg)",
+              border: "1px solid rgba(88, 198, 242, 0.25)",
+              "font-size": "var(--t-xs)",
+              color: "var(--text-mid)",
+            }}
+          >
+            <Sigil name="info" size={13} style={{ color: "var(--info)" }} />
+            <span>
+              Clips play through your selected output device — including
+              your modulated mic, so Discord / Zoom / OBS callers hear them.
+            </span>
+          </div>
+        </Show>
       </div>
 
       <div

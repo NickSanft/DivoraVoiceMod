@@ -158,6 +158,29 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Vignette on → soft darkening around the window edges.
 - [ ] Vignette off → uniform surface brightness.
 
+## Live device switching (Phase 11)
+
+- [ ] With the engine running, open Settings → Audio devices. Change the input device dropdown to a different mic. The engine should restart on the new device within ~200 ms; the IN meter responds to the new mic. No manual Stop / Start needed.
+- [ ] Repeat with the output device — switch from `Headphones` to `CABLE Input (VB-Audio Virtual Cable)`. The engine restarts; subsequent speech routes through the cable, and a Discord client listening on `CABLE Output` hears it.
+- [ ] Stop the engine. Change devices in Settings. No restart should happen (the engine stays stopped); the next manual Start uses the new selections.
+- [ ] Re-select the *same* device from the dropdown — no restart (no audible click; engine stays running on the same stream).
+
+## Cast trail + SPELL CAST reveal (Phase 11)
+
+- [ ] On the Mixer, click Cast (or press G). Start drawing a triangle. As you drag, sparks should trail behind the cursor, fading out over ~700 ms.
+- [ ] On release, if the classifier matches the bound preset, a centred panel pops in over the Mixer: the preset's glyph (large, in its brand colour) above the preset name (also in its colour) above the `Bundled` / `User` tag. The "◆ SPELL CAST ◆" eyebrow shows above. The panel breathes for ~1 s then fades.
+- [ ] After the reveal dismisses, you're back on the Mixer with the new preset's chain loaded.
+- [ ] Draw a glyph that's unrecognised. The flash toast at the bottom reads "Glyph not recognised — try again"; no reveal animation.
+- [ ] Unbind a glyph in Settings → Glyph casting and cast it. Flash reads "No preset bound to *glyph*"; no reveal.
+
+## Soundboard → microphone (Phase 11)
+
+- [ ] Pick a folder of soundboard clips. A small info-toned chip below the header reads "Clips play through your selected output device — including your modulated mic, so Discord / Zoom / OBS callers hear them."
+- [ ] In Settings → Audio devices, set output to `CABLE Input (VB-Audio Virtual Cable)`.
+- [ ] Join a Discord call with another person. Set your Discord input to `CABLE Output`.
+- [ ] Play a soundboard clip. The other party hears it, mixed with your modulated voice. Speak over the clip — both reach the other end.
+- [ ] Stop the clip via Stop-all. The other party stops hearing the clip immediately.
+
 ## RNNoise denoiser (Phase 10)
 
 - [ ] Pick a 48 kHz input device (most USB mics). Make sure the engine reports `Running at 48000 Hz` in Settings.

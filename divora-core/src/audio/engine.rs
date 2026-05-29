@@ -531,10 +531,19 @@ fn build_output_stream(
 
                 // Run the DSP chain over the mic mono buffer first, so
                 // effects apply only to the user's voice…
-                chain.process(&mut mono[..native_frames], input_rate);
                 // …then mix soundboard voices in alongside the
                 // already-effected voice. Clips play "as-is" (no DSP).
-                soundboard.mix_into(&mut mono[..native_frames], input_rate);
+                // Both write into the same `mono` buffer that the
+                // resampler / fan-out consume below, so the soundboard
+                // mix lands on whatever output device is selected —
+                // including CABLE Input, which is what makes the clips
+                // audible to call participants.
+                mix_voice_and_soundboard(
+                    &mut mono[..native_frames],
+                    &mut chain,
+                    &mut soundboard,
+                    input_rate,
+                );
 
                 // Now hand the native-rate buffer to the output
                 // pipeline. Either a passthrough (rates match) or via
@@ -583,9 +592,29 @@ fn build_output_stream(
     Ok(stream)
 }
 
+/// Run the DSP chain on the mic mono buffer, then mix soundboard
+/// voices in over the top of the already-effected signal. Extracted
+/// from the output callback so the order — "DSP first, then
+/// soundboard on top" — is unit-testable in isolation. (The order
+/// matters: it means effects apply only to the user's voice, and
+/// clips play as-is on whatever output device is selected, including
+/// the virtual mic.)
+fn mix_voice_and_soundboard(
+    mono: &mut [f32],
+    chain: &mut EffectChain,
+    soundboard: &mut SoundboardMixer,
+    sample_rate: u32,
+) {
+    chain.process(mono, sample_rate);
+    soundboard.mix_into(mono, sample_rate);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AudioEngine;
+    use super::{mix_voice_and_soundboard, AudioEngine};
+    use crate::dsp::EffectChain;
+    use crate::soundboard::{SoundboardCommand, SoundboardMixer};
+    use std::sync::Arc;
 
     #[test]
     fn engine_starts_and_stops_cleanly_even_without_audio_hardware() {
@@ -610,5 +639,53 @@ mod tests {
         assert_eq!(input.peak, 0.0);
         assert_eq!(output.rms, 0.0);
         assert_eq!(output.peak, 0.0);
+    }
+
+    /// Phase 11 regression — confirm that the engine's output
+    /// callback mixes the soundboard ON TOP of the DSP-processed mic
+    /// buffer (rather than into a separate stream or only the monitor
+    /// path). The function is small but the assertion is the property
+    /// users care about: if the user routes the engine output into
+    /// CABLE Input, the clips reach the call.
+    #[test]
+    fn soundboard_clips_land_in_the_same_output_buffer_as_the_mic() {
+        let mut chain = EffectChain::new(); // empty → mic samples pass through
+        let mut sb = SoundboardMixer::new();
+        // Inject a 4096-sample clip of constant 0.25 at 48 kHz so the
+        // voice doesn't run dry within the 480-sample mix window.
+        let clip = Arc::new(vec![0.25_f32; 4096]);
+        sb.apply(SoundboardCommand::Play {
+            clip_id: "test".to_string(),
+            samples: clip,
+            sample_rate: 48_000,
+        });
+        // Pretend the mic delivered a 480-sample buffer of constant 0.10.
+        let mut mono = vec![0.10_f32; 480];
+        mix_voice_and_soundboard(&mut mono, &mut chain, &mut sb, 48_000);
+        // Each output sample should now hold the sum: 0.10 (mic, passed
+        // through the empty chain) + 0.25 (clip mixed in) = 0.35.
+        // Linear-interpolation between same-value neighbours is exact.
+        for (i, &s) in mono.iter().enumerate() {
+            assert!(
+                (s - 0.35).abs() < 1e-5,
+                "expected mic + clip to sum at i={i}, got {s}"
+            );
+        }
+    }
+
+    /// Same scenario without a playing clip: the mic samples reach the
+    /// output untouched by the (empty) soundboard mix.
+    #[test]
+    fn mic_only_passes_through_when_no_clip_is_playing() {
+        let mut chain = EffectChain::new();
+        let mut sb = SoundboardMixer::new();
+        let mut mono = vec![0.10_f32; 480];
+        mix_voice_and_soundboard(&mut mono, &mut chain, &mut sb, 48_000);
+        for &s in &mono {
+            assert!(
+                (s - 0.10).abs() < 1e-6,
+                "mic-only path mutated the sample, got {s}"
+            );
+        }
     }
 }

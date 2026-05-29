@@ -12,11 +12,12 @@ import { Kbd } from "../components/Kbd";
 import { VMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
 import { Sigil, type SigilName } from "../components/Sigil";
+import { SpellCastReveal } from "../components/SpellCastReveal";
 import { SpellCircle } from "../components/SpellCircle";
 import { Toggle } from "../components/Toggle";
 import { statusMeta } from "../shell/statusMeta";
 import { useApp } from "../stores/app";
-import type { EffectId, GlyphId, PtmMode } from "../types";
+import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
 export function MixerScreen(): JSX.Element {
   const app = useApp();
@@ -24,6 +25,9 @@ export function MixerScreen(): JSX.Element {
   const totalCount = () => app.chain().length;
   const [castOpen, setCastOpen] = createSignal(false);
   const [castMessage, setCastMessage] = createSignal<string | null>(null);
+  /** Active SPELL CAST reveal — populated when a glyph matches a bound
+   *  preset; cleared once the reveal animation finishes. */
+  const [reveal, setReveal] = createSignal<Preset | null>(null);
   let messageTimeout: number | undefined;
 
   const flashMessage = (text: string): void => {
@@ -49,8 +53,11 @@ export function MixerScreen(): JSX.Element {
       flashMessage(`No preset bound to ${glyph}`);
       return;
     }
+    // Switch the preset immediately (so the chain is correct by the
+    // time the reveal animation finishes) and trigger the SPELL CAST
+    // ceremony over the Mixer.
     app.usePreset(target.id);
-    flashMessage(`${glyph} → ${target.name}`);
+    setReveal(target);
   };
 
   // Keyboard shortcut "G" enters cast mode unless a field is focused.
@@ -98,6 +105,17 @@ export function MixerScreen(): JSX.Element {
           onClassified={onClassified}
           onCancel={() => setCastOpen(false)}
         />
+      </Show>
+      <Show when={reveal()} keyed>
+        {(target) => (
+          <SpellCastReveal
+            glyph={target.glyph as SigilName}
+            name={target.name}
+            color={target.color}
+            tag={target.tag}
+            onDone={() => setReveal(null)}
+          />
+        )}
       </Show>
       <Show when={castMessage()} keyed>
         {(text) => <CastFlash text={text} />}

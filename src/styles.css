@@ -1050,4 +1050,48 @@
     z-index: 59;
     box-shadow: inset 0 0 160px 30px rgba(0, 0, 0, 0.55);
   }
+
+  /* Phase 11: glyph cast reveal animations.
+     - `spell-cast-veil` fades the backdrop dim in / out so the reveal
+       breathes against the Mixer instead of slapping over it.
+     - `spell-cast-reveal` brings the centre panel from 0.75 scale +
+       slight rise to natural rest, then holds, then fades.
+     - `spell-cast-breathe` pulses the glyph's radial glow over the
+       same window. */
+  @keyframes spell-cast-veil {
+    0%   { background: rgba(13, 10, 22, 0.0); }
+    20%  { background: rgba(13, 10, 22, 0.55); }
+    80%  { background: rgba(13, 10, 22, 0.55); }
+    100% { background: rgba(13, 10, 22, 0.0); }
+  }
+
+  @keyframes spell-cast-reveal {
+    0% {
+      opacity: 0;
+      transform: scale(0.75) translateY(12px);
+    }
+    18% {
+      opacity: 1;
+      transform: scale(1.04) translateY(-4px);
+    }
+    28% {
+      transform: scale(1.0) translateY(0);
+    }
+    78% {
+      opacity: 1;
+      transform: scale(1.0) translateY(0);
+    }
+    100% {
+      opacity: 0;
+      transform: scale(1.02) translateY(-4px);
+    }
+  }
+
+  @keyframes spell-cast-breathe {
+    0%   { filter: drop-shadow(0 0 0 transparent); transform: scale(0.95); }
+    25%  { filter: drop-shadow(0 0 22px currentColor); transform: scale(1.06); }
+    50%  { filter: drop-shadow(0 0 16px currentColor); transform: scale(1.02); }
+    75%  { filter: drop-shadow(0 0 26px currentColor); transform: scale(1.04); }
+    100% { filter: drop-shadow(0 0 6px transparent); transform: scale(1.0); }
+  }
 }

@@ -926,6 +926,92 @@ Per call to `process(buffer, sample_rate)`:
 - `Denoiser` is a learned model that suppresses spectral content recognised as noise. It works on the actual *texture* of the signal.
 - Stacking gate → denoiser at the head of the chain handles both ends: the gate kills the truly-silent moments, and `RNNoise` cleans the spectrum of what's left. Either alone would either over-process (gate too aggressive) or leave audible breath / fan noise through (denoiser alone).
 
-## Phase 11+ — (placeholders)
+## Phase 11 — live device switching + cast polish + soundboard verification
+
+### Module layout (added / changed)
+
+```
+divora-core/src/
+└── audio/
+    └── engine.rs               # +fn mix_voice_and_soundboard (extracted from
+                                # the output callback so the chain → soundboard
+                                # order is unit-testable); +2 tests proving
+                                # clips land in the same buffer as the mic
+
+src/
+├── components/
+│   ├── GlyphCastOverlay.tsx    # +spark particle system: emitSparks per
+│   │                           # pointermove, capped pool + rAF tick
+│   ├── SpellCastReveal.tsx     # NEW — "◆ SPELL CAST ◆" reveal in the
+│   │                           # preset's brand colour
+│   └── SpellCastReveal.test.tsx # 4 tests
+├── screens/
+│   ├── MixerScreen.tsx         # reveal signal + render + onClassified
+│   │                           # switches preset immediately then shows reveal
+│   └── SoundboardScreen.tsx    # +info chip "Clips play through your output
+│                               # device — including the modulated mic"
+├── stores/app.tsx              # +createEffect(on([selectedInput,
+│                               # selectedOutput], …)) auto-restarts engine
+└── styles.css                  # +@keyframes spell-cast-veil / -reveal /
+                                # -breathe
+```
+
+### Live device switching
+
+```
+                                        ┌──────────────────────────────┐
+selectedInput()  ───┬───────►│ createEffect on ([in, out])  │
+                    │        │  ─ defer:true                │
+selectedOutput() ───┘        │  ─ skip if prev unchanged    │
+                             │  ─ skip if !engineRunning()  │
+                             └────────────┬─────────────────┘
+                                          ▼
+                              await stopEngine();
+                              await startEngine();  // re-reads selectedInput / Output
+```
+
+Result: dropdown change in Settings causes a near-instant device swap with no manual Stop / Start.
+
+### Cast spark particles
+
+Each pointermove during a cast emits `SPARK_BURST` (= 2) particles at the cursor position with random `±0.8 px/frame` velocity. A single `requestAnimationFrame` loop advances every spark per tick (position + velocity damping + a touch of gravity) and prunes ones older than `SPARK_LIFE_MS` (= 700 ms). The pool is capped at `SPARK_CAP` (= 96); when over, the oldest sparks are pruned to make room. SVG renders each spark as a circle with `opacity = 1 − age/life` and `r = 3 × (1 − age/life) + 0.4`. All driven by the existing `glyph-cast-grad` linear-gradient.
+
+### SPELL CAST reveal
+
+Choreography over 1400 ms:
+
+| Time | What happens |
+|---|---|
+| 0 – 18% | Backdrop fades in to 0.55 dark; panel scales from 0.75 → 1.04 and rises 12 → −4 px |
+| 18 – 28% | Panel settles to 1.0 / 0 px (overshoot relaxes) |
+| 28 – 78% | Hold; glyph glow breathes (`spell-cast-breathe` keyframe) |
+| 78 – 100% | Panel fades out + drifts up 4 px; backdrop fades back to transparent |
+
+The preset name, the glyph chip, and the "◆ SPELL CAST ◆" eyebrow all share the preset's `color` field. After 1400 ms, `onDone` clears the reveal signal in `MixerScreen` and the user is back on the Mixer with the new chain active. The preset switch happens *immediately* on classification (not at the end of the reveal) so audio behavior is in sync with what the user is about to see written on screen.
+
+### Soundboard → mic invariant
+
+The output callback's audio path:
+
+```
+mic ring → mono buffer ───┐
+                          ▼
+            mix_voice_and_soundboard(mono, chain, soundboard, sr):
+              chain.process(mono, sr);       // mic, modulated
+              soundboard.mix_into(mono, sr); // clips added on top
+                          │
+                          ▼
+                  (optional resampler)
+                          │
+                          ▼
+                fan-out to output channels
+                          │
+                          ▼
+            output device (e.g. CABLE Input → Discord)
+```
+
+The two helper tests directly assert this: `mix_voice_and_soundboard` over a constant-0.10 mic buffer and a constant-0.25 playing clip yields constant-0.35 output; without the clip it yields constant-0.10. The chip on the Soundboard header surfaces this to the user.
+
+## Phase 12+ — (placeholders)
 
 To be filled in as each phase lands.
