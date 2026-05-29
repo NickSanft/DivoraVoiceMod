@@ -72,7 +72,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-features
+        # Tests run serial + with --nocapture so we can see which one
+        # owns a crash (parallel + buffered output hides the offender;
+        # observed during the v0.9.0 STATUS_ACCESS_VIOLATION debug).
+        # Revisit parallelism once the realfft/rubato code path is stable.
+        run: cargo test --workspace --all-features -- --test-threads=1 --nocapture
 
   build:
     name: Tauri debug build
