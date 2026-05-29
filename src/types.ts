@@ -76,14 +76,21 @@ export interface DeviceOption {
   sub: string;
 }
 
-/** Soundboard tile (sample data; Phase 5 reads from disk). */
-export interface SoundboardTile {
-  id: number;
-  label: string;
-  emoji: string;
-  color: string;
-  key: string[] | null;
-  dur: number;
+/**
+ * Soundboard tile — comes from the backend (`scan_soundboard_folder`) at
+ * runtime. See `src/audio/api.ts` for the canonical wire definition; this
+ * alias keeps imports tidy from non-API call sites.
+ */
+export type { SoundboardTile } from "./audio/api";
+
+/** UI overlay describing a currently-playing clip. */
+export interface PlayingClip {
+  /** Tile id (matches `SoundboardTile.id`). */
+  clipId: string;
+  /** `performance.now()` milliseconds when play started. */
+  startedAt: number;
+  /** Duration in seconds, as reported by the backend on play. */
+  durationSecs: number;
 }
 
 /** Tweaks visual variations. */

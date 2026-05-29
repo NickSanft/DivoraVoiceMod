@@ -8,6 +8,7 @@
 pub mod audio;
 pub mod dsp;
 pub mod presets;
+pub mod soundboard;
 
 /// Returns the project name. Useful as a smoke test for the workspace build.
 #[must_use]

@@ -367,6 +367,135 @@ describe("app store — Phase 4 preset actions", () => {
   });
 });
 
+describe("app store — Phase 5 soundboard actions", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+  });
+
+  function sampleTile(id: string, label = `clip-${id}`) {
+    return {
+      id,
+      path: `/tmp/${label}.wav`,
+      label,
+      extension: "wav",
+      sizeBytes: 1024,
+    };
+  }
+
+  it("scanCurrentSoundboardFolder is a no-op when no folder is picked", async () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.scanCurrentSoundboardFolder();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "scan_soundboard_folder",
+      expect.anything(),
+    );
+  });
+
+  it("scanCurrentSoundboardFolder records tiles + clears error", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_soundboard_folder") {
+        return [sampleTile("a"), sampleTile("b")];
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSoundboardFolder("/tmp/sb");
+    result.setSoundboardError("stale");
+    await result.scanCurrentSoundboardFolder();
+    expect(result.soundboardTiles()).toHaveLength(2);
+    expect(result.soundboardError()).toBeNull();
+  });
+
+  it("scanCurrentSoundboardFolder records error on failure", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_soundboard_folder") throw new Error("no folder");
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSoundboardFolder("/tmp/sb");
+    await result.scanCurrentSoundboardFolder();
+    expect(result.soundboardError()).toContain("no folder");
+    expect(result.soundboardTiles()).toEqual([]);
+  });
+
+  it("playClip records a PlayingClip with duration", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") return 4.2;
+      return null;
+    });
+    const { result } = setupApp();
+    const tile = sampleTile("bell");
+    await result.playClip(tile);
+    expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
+      clipId: "bell",
+      path: tile.path,
+    });
+    expect(result.playingClips[tile.id]).toBeDefined();
+    expect(result.playingClips[tile.id]!.durationSecs).toBe(4.2);
+  });
+
+  it("playClip surfaces backend errors via soundboardError", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") throw new Error("file missing");
+      return null;
+    });
+    const { result } = setupApp();
+    await result.playClip(sampleTile("ghost"));
+    expect(result.soundboardError()).toContain("file missing");
+  });
+
+  it("stopClip clears the playingClips entry even if backend errors", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") return 1.0;
+      if (cmd === "stop_soundboard_clip") throw new Error("nope");
+      return null;
+    });
+    const { result } = setupApp();
+    const tile = sampleTile("z");
+    await result.playClip(tile);
+    expect(result.playingClips[tile.id]).toBeDefined();
+    await result.stopClip(tile.id);
+    expect(result.playingClips[tile.id]).toBeUndefined();
+  });
+
+  it("panicSoundboard clears every playing clip", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") return 1.0;
+      if (cmd === "stop_all_soundboard_clips") return undefined;
+      return null;
+    });
+    const { result } = setupApp();
+    await result.playClip(sampleTile("a"));
+    await result.playClip(sampleTile("b"));
+    await result.playClip(sampleTile("c"));
+    expect(Object.keys(result.playingClips).length).toBe(3);
+    await result.panicSoundboard();
+    expect(Object.keys(result.playingClips).length).toBe(0);
+  });
+
+  it("markClipFinished removes a single clip", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") return 1.0;
+      return null;
+    });
+    const { result } = setupApp();
+    await result.playClip(sampleTile("a"));
+    expect(result.playingClips["a"]).toBeDefined();
+    result.markClipFinished("a");
+    expect(result.playingClips["a"]).toBeUndefined();
+  });
+
+  it("bindTileHotkey records the binding; clear removes it", () => {
+    const { result } = setupApp();
+    result.bindTileHotkey("a", ["F", "1"]);
+    expect(result.tileHotkeys["a"]).toEqual(["F", "1"]);
+    result.clearTileHotkey("a");
+    expect(result.tileHotkeys["a"]).toBeUndefined();
+  });
+});
+
 describe("app store — Phase 3 DSP chain", () => {
   beforeEach(() => {
     invokeMock.mockReset();

@@ -16,7 +16,9 @@ cpal = "0.15"
 ringbuf = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+symphonia = { version = "0.5", features = ["wav", "mp3", "vorbis", "ogg", "flac", "pcm"] }
 thiserror = "1"
 tracing = "0.1"
+walkdir = "2"
 
 [dev-dependencies]

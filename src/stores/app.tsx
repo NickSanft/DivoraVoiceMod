@@ -29,16 +29,22 @@ import {
   listInputDevices,
   listOutputDevices,
   listPresets,
+  pickSoundboardFolder as pickSoundboardFolderCmd,
+  playSoundboardClip as playSoundboardClipCmd,
   saveUserPreset as saveUserPresetCmd,
+  scanSoundboardFolder as scanSoundboardFolderCmd,
   setAudioMonitor as setAudioMonitorCmd,
   setEffectChain as setEffectChainCmd,
   setEffectEnabled as setEffectEnabledCmd,
   setEffectParam as setEffectParamCmd,
   startAudioEngine,
+  stopAllSoundboardClips as stopAllSoundboardClipsCmd,
   stopAudioEngine,
+  stopSoundboardClip as stopSoundboardClipCmd,
   type DeviceInfo,
   type EffectSpec,
   type Levels,
+  type SoundboardTile,
   type StreamInfo,
   type WirePreset,
 } from "../audio/api";
@@ -49,6 +55,7 @@ import type {
   EffectId,
   GlyphId,
   NavId,
+  PlayingClip,
   Preset,
   PtmMode,
   TweaksState,
@@ -189,6 +196,33 @@ export interface AppState {
   exportPreset: (preset: Preset) => Promise<string>;
   /** Snapshot the current `chain()` into the active preset's record. Used by Save. */
   presetWithCurrentChain: (id: string) => Preset | null;
+
+  // Soundboard
+  soundboardFolder: () => string | null;
+  setSoundboardFolder: Setter<string | null>;
+  soundboardTiles: () => SoundboardTile[];
+  setSoundboardTiles: Setter<SoundboardTile[]>;
+  soundboardLoading: () => boolean;
+  soundboardError: () => string | null;
+  setSoundboardError: Setter<string | null>;
+  playingClips: Record<string, PlayingClip>;
+  setPlayingClips: SetStoreFunction<Record<string, PlayingClip>>;
+  tileHotkeys: Record<string, string[]>;
+  setTileHotkeys: SetStoreFunction<Record<string, string[]>>;
+  soundboardSearch: () => string;
+  setSoundboardSearch: Setter<string>;
+  clockTick: () => number;
+
+  // Soundboard actions
+  pickSoundboardFolder: () => Promise<void>;
+  scanCurrentSoundboardFolder: () => Promise<void>;
+  playClip: (tile: SoundboardTile) => Promise<void>;
+  stopClip: (clipId: string) => Promise<void>;
+  panicSoundboard: () => Promise<void>;
+  bindTileHotkey: (clipId: string, keys: string[]) => void;
+  clearTileHotkey: (clipId: string) => void;
+  /** Triggered by SoundboardScreen when a tile finishes naturally. */
+  markClipFinished: (clipId: string) => void;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -546,6 +580,116 @@ export function createAppState(): AppState {
     }
   };
 
+  // Soundboard state.
+
+  const [soundboardFolder, setSoundboardFolder] = createSignal<string | null>(null);
+  const [soundboardTiles, setSoundboardTiles] = createSignal<SoundboardTile[]>([]);
+  const [soundboardLoading, setSoundboardLoading] = createSignal(false);
+  const [soundboardError, setSoundboardError] = createSignal<string | null>(null);
+  const [playingClips, setPlayingClips] = createStore<Record<string, PlayingClip>>({});
+  const [tileHotkeys, setTileHotkeys] = createStore<Record<string, string[]>>({});
+  const [soundboardSearch, setSoundboardSearch] = createSignal("");
+  const [clockTick, setClockTick] = createSignal(0);
+
+  // Tick the clock at ~30 Hz whenever any clip is playing. Components
+  // read `clockTick()` to re-render progress rings without each tile
+  // owning its own animation frame.
+  createEffect(() => {
+    const anyPlaying = Object.keys(playingClips).length > 0;
+    if (!anyPlaying || typeof window === "undefined") return;
+    let cancelled = false;
+    let rafId = 0;
+    const tick = () => {
+      if (cancelled) return;
+      setClockTick((n) => n + 1);
+      const now = performance.now();
+      for (const id of Object.keys(playingClips)) {
+        const clip = playingClips[id];
+        if (clip && (now - clip.startedAt) / 1000 >= clip.durationSecs) {
+          setPlayingClips(id, undefined as unknown as PlayingClip);
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafId);
+    };
+  });
+
+  const scanCurrentSoundboardFolder = async (): Promise<void> => {
+    const folder = soundboardFolder();
+    if (!folder) return;
+    setSoundboardLoading(true);
+    setSoundboardError(null);
+    try {
+      const tiles = await scanSoundboardFolderCmd(folder);
+      setSoundboardTiles(tiles);
+    } catch (err) {
+      setSoundboardError(`scan failed: ${String(err)}`);
+      setSoundboardTiles([]);
+    } finally {
+      setSoundboardLoading(false);
+    }
+  };
+
+  const pickSoundboardFolder = async (): Promise<void> => {
+    const path = await pickSoundboardFolderCmd();
+    if (!path) return;
+    setSoundboardFolder(path);
+    await scanCurrentSoundboardFolder();
+  };
+
+  const playClip = async (tile: SoundboardTile): Promise<void> => {
+    try {
+      const durationSecs = await playSoundboardClipCmd(tile.id, tile.path);
+      setPlayingClips(tile.id, {
+        clipId: tile.id,
+        startedAt: typeof performance !== "undefined" ? performance.now() : Date.now(),
+        durationSecs,
+      });
+    } catch (err) {
+      setSoundboardError(`play failed: ${String(err)}`);
+    }
+  };
+
+  const stopClip = async (clipId: string): Promise<void> => {
+    try {
+      await stopSoundboardClipCmd(clipId);
+    } catch (err) {
+      // The local "not playing" state is what users see; record the
+      // backend failure but don't re-throw — stop should always succeed
+      // from the UI's perspective.
+      setSoundboardError(`stop failed: ${String(err)}`);
+    }
+    setPlayingClips(clipId, undefined as unknown as PlayingClip);
+  };
+
+  const panicSoundboard = async (): Promise<void> => {
+    try {
+      await stopAllSoundboardClipsCmd();
+    } finally {
+      // Replace the whole playing-clips store with an empty record.
+      const ids = Object.keys(playingClips);
+      for (const id of ids) {
+        setPlayingClips(id, undefined as unknown as PlayingClip);
+      }
+    }
+  };
+
+  const bindTileHotkey = (clipId: string, keys: string[]): void => {
+    setTileHotkeys(clipId, keys);
+  };
+
+  const clearTileHotkey = (clipId: string): void => {
+    setTileHotkeys(clipId, undefined as unknown as string[]);
+  };
+
+  const markClipFinished = (clipId: string): void => {
+    setPlayingClips(clipId, undefined as unknown as PlayingClip);
+  };
+
   return {
     nav,
     setNav,
@@ -611,6 +755,30 @@ export function createAppState(): AppState {
     deletePreset,
     exportPreset,
     presetWithCurrentChain,
+
+    soundboardFolder,
+    setSoundboardFolder,
+    soundboardTiles,
+    setSoundboardTiles,
+    soundboardLoading,
+    soundboardError,
+    setSoundboardError,
+    playingClips,
+    setPlayingClips,
+    tileHotkeys,
+    setTileHotkeys,
+    soundboardSearch,
+    setSoundboardSearch,
+    clockTick,
+
+    pickSoundboardFolder,
+    scanCurrentSoundboardFolder,
+    playClip,
+    stopClip,
+    panicSoundboard,
+    bindTileHotkey,
+    clearTileHotkey,
+    markClipFinished,
 
     selectedEffect,
     setSelectedEffect,

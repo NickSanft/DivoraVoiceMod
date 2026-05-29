@@ -4,6 +4,57 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-28 — Phase 5: soundboard
+
+### Added
+
+- **`divora-core::soundboard` module** — `scanner.rs` (`scan_folder`), `decoder.rs` (`decode_clip` via symphonia), `mixer.rs` (`SoundboardMixer` + `SoundboardCommand` + `PlayingClipSnapshot`), `mod.rs` (`SoundboardError`).
+- **`scanner::scan_folder(&Path)`** walks the chosen directory (one level deep), picks out `.wav` / `.mp3` / `.ogg` / `.oga` / `.flac` / `.opus`, returns `SoundboardTile { id, path, label, extension, sizeBytes, modifiedSecs }` sorted by label. IDs are stable hex hashes of the canonicalised path so they survive renames.
+- **`decoder::decode_clip(&Path)`** decodes any supported format into a mono f32 buffer plus the native sample rate. Multi-channel audio is summed to mono; integer PCM is normalised to `[-1, 1]`.
+- **`SoundboardMixer`** — fixed-size 16-voice pool. Commands flow through SPSC mpsc from the engine; `play` steals the oldest voice when full, `stop` / `stop_all` deactivate matching voices. `mix_into(&mut [f32], engine_rate)` adds every active voice (with linear-interpolation sample-rate matching), so 44.1 kHz clips on a 48 kHz engine play at the right pitch instead of chipmunked.
+- **AudioEngine integration**: new `Command::Soundboard(SoundboardCommand)` variant routes UI → engine_thread → live output callback via a fresh sb channel per stream start. The output callback now runs the DSP chain on the mic mono buffer, then mixes soundboard voices on top before fanning to channels. Effects apply only to the user's voice; soundboard clips play as-is.
+- **`AudioEngine::send_soundboard(cmd)`** — non-blocking handle for soundboard commands.
+- **Tauri commands**: `scan_soundboard_folder`, `play_soundboard_clip`, `stop_soundboard_clip`, `stop_all_soundboard_clips`. `play_soundboard_clip` returns the clip's duration in seconds and caches the decoded buffer (`Mutex<HashMap<String, DecodedClip>>` on `AppState`) so hot tiles never decode twice.
+- **`tauri-plugin-dialog`** wired in for the native folder picker; capability extended with `dialog:default` + `dialog:allow-open`.
+- **Frontend audio API extensions** (`src/audio/api.ts`): `SoundboardTile` wire type + `pickSoundboardFolder` (lazy-loads `@tauri-apps/plugin-dialog`), `scanSoundboardFolder`, `playSoundboardClip`, `stopSoundboardClip`, `stopAllSoundboardClips`.
+- **Store signals**: `soundboardFolder`, `soundboardTiles`, `soundboardLoading`, `soundboardError`, `playingClips` (store), `tileHotkeys` (store), `soundboardSearch`, `clockTick`.
+- **Store actions**: `pickSoundboardFolder`, `scanCurrentSoundboardFolder`, `playClip`, `stopClip`, `panicSoundboard`, `bindTileHotkey`, `clearTileHotkey`, `markClipFinished`. A `createEffect` runs an rAF loop while any clip is playing — increments `clockTick` for live progress rings and auto-removes clips that have run past their duration.
+- **`SoundboardScreen.tsx`** full implementation:
+  - Header: eyebrow + folder path + Change folder ghost button on the left; Search input (260 px) + Stop all (danger, solid when active, dimmed when nothing plays) on the right.
+  - Empty states for "no folder picked", "loading", "no tiles match", "no audio files in folder".
+  - Grid of tiles (auto-fill 180 px+, 120 px tall, rounded, surface-2 background). Each tile: emoji top-left (derived from label initial), hotkey `Kbd` chip top-right when bound, label + colour dot + file size at the bottom. Playing tiles get a coloured 1.5 px border + glow, a larger emoji, an SVG progress ring (`stroke-dashoffset` animated via `clockTick`), and a `—Xs` countdown.
+  - In-app keydown listener routes hotkeys to `playClip(tile)`. Global registration (works while window unfocused) is Phase 6.
+
+### Changed
+
+- `src/types.ts` removes the Phase 1 sample-data `SoundboardTile` interface and re-exports the canonical wire type from `src/audio/api.ts`. Adds a new `PlayingClip` interface (clip id + `startedAt` + duration).
+- `src/data/soundboard.ts` (mock data) removed — the soundboard list now comes entirely from the backend.
+
+### Tests
+
+- **Rust**: 54 → 70. New: 6 scanner (missing folder errors, empty folder, picks supported extensions, sorts by label, id is stable across scans, label strips extension, ignores nested subdirs) + 10 mixer (empty mixer is a no-op, play adds into output, voice deactivates at buffer end, stop deactivates matching voice, stop_all clears voices, sample-rate mismatch interpolated, polyphony sums voices, max-voices steals oldest, snapshot reports duration + progress).
+- **Frontend**: 73 → 86. New: 5 API wrappers (`scanSoundboardFolder`, `playSoundboardClip`, `stopSoundboardClip`, `stopAllSoundboardClips`, error-propagation) + 9 store actions (scan no-folder no-op, scan success, scan error, playClip records duration, playClip records error, stopClip swallows backend error, panicSoundboard clears all, markClipFinished removes a single clip, bind / clear hotkey).
+
+### Architecture notes
+
+- The decoded-clip cache lives on the Tauri shell, not in `divora-core`. The engine only ever sees `Arc<Vec<f32>>` payloads — no path lookups happen in the audio callback.
+- The voice pool's "newest play wins via oldest-steal" matches every commercial soundboard's behaviour and avoids the alternative (drop-on-full) that would silently miss clicks during a busy moment.
+- Progress tracking is purely UI-side. The audio callback emits no per-voice events; the frontend's `clockTick` rAF loop derives positions from `(performance.now() - startedAt) / durationSecs`. This keeps the audio thread completely allocation-free.
+- The current implementation only enumerates the chosen folder's direct children (no recursion). Recursive scan is an easy follow-up if users want subfolders to count.
+
+### Pre-push checklist (local, 2026-05-28)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (70 in divora-core)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (86)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The mic + soundboard collide into the same output stream the virtual mic eventually drains. That means when Phase 6 wires VB-Cable routing, sound effects appear on the *other* end of Discord / Zoom / OBS calls without any extra plumbing. The audio architecture for streamer-style "play this clip into the call" is now done; what remains is the cable.
+
 ## [0.4.0] — 2026-05-28 — Phase 4: presets + A/B compare
 
 ### Added

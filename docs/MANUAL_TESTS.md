@@ -84,14 +84,30 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Click Save .json → browser/system save dialog with default file name = preset name; file content matches the modal.
 - [ ] Close the modal (× or backdrop click) → modal dismisses.
 
-## Soundboard
+## Soundboard (Phase 5)
 
-- [ ] Pick a folder with ~20 audio files (mixed mp3, wav, ogg).
-- [ ] Every file appears as a tile with correct label.
-- [ ] Clicking a tile plays the sound mixed with modulated mic.
-- [ ] Hotkey bound to a tile triggers it while window is unfocused.
-- [ ] `Esc` panic button stops all currently playing clips.
-- [ ] Trigger 8 clips simultaneously — no audio dropout.
+- [ ] Open the Soundboard screen on first run → empty-state "No folder picked yet" shows with a Pick a folder button.
+- [ ] Click Pick a folder → native OS folder picker opens.
+- [ ] Pick a folder with ~20 audio files (mixed mp3, wav, ogg, flac) → every supported file appears as a tile with the file's stem as the label.
+- [ ] Tiles are sorted alphabetically.
+- [ ] Tiles for unsupported files (e.g. `.txt`, `.png`) do not appear.
+- [ ] The folder path is shown in the header next to the folder sigil.
+- [ ] Click a tile → backend decodes (first play), playback starts, tile gets a coloured border + glow, emoji scales up, a circular progress ring fills clockwise, a `Xs` countdown shows in the corner.
+- [ ] Clip plays through the engine output (mixed with the modulated mic if the engine is running).
+- [ ] Click the same tile again before the first play finishes → cached buffer plays a second voice; both should be audible (8+ voices supported).
+- [ ] Trigger 8 clips simultaneously → all play without dropouts; the Stop-all button shows "Stop all (8)".
+- [ ] Click Stop-all → every voice silences within ~5 ms; the Stop-all button becomes disabled; all tiles reset to idle.
+- [ ] Search "bell" (or whatever matches) → grid filters to matching labels.
+- [ ] Clear the search → all tiles return.
+- [ ] Switch folders via Change folder → previous tiles disappear, new ones appear.
+- [ ] Change folder to a directory with no audio files → "No audio files in this folder" empty state shows.
+- [ ] Delete a clip file from the folder while DivoraVoice is open → next folder scan removes it from the grid; queued plays of that id continue to play from cache until they finish.
+- [ ] (Phase 5 limitation) Binding a tile hotkey only fires while DivoraVoice is the focused window. Global hotkeys arrive in Phase 6.
+
+## Soundboard — sample-rate handling
+
+- [ ] Drop a 44.1 kHz WAV into the folder, play it on a 48 kHz engine → playback pitch matches the original (not chipmunked).
+- [ ] Drop a 22.05 kHz file → playback still pitch-correct, with mild interpolation softness.
 
 ## Virtual mic
 

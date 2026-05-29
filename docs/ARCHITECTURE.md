@@ -416,6 +416,80 @@ user clicks "A":
 
 Picking a different preset (`usePreset(id)`) resets `abSlots[id]` to two copies of the new chain and sets `ui.ab` back to A.
 
-## Phase 5+ — (placeholders)
+## Phase 5 — soundboard
+
+### Module layout (added)
+
+```
+divora-core/src/
+└── soundboard/
+    ├── mod.rs           # SoundboardError; re-exports
+    ├── scanner.rs       # SoundboardTile + scan_folder(&Path)
+    ├── decoder.rs       # decode_clip(&Path) -> DecodedClip (mono f32)
+    └── mixer.rs         # SoundboardMixer + SoundboardCommand + PlayingClipSnapshot
+
+src/
+├── screens/SoundboardScreen.tsx       # header + search + tile grid + progress rings
+└── (types + api in existing files; no new top-level module)
+```
+
+### Audio pipeline (Phase 5)
+
+```
+mic device ──► input callback ──► mono ring buffer ──┐
+                                                     ▼
+                                       output callback drains:
+                                       1. dsp_rx (effect-chain edits)
+                                       2. sb_rx  (play/stop/panic)
+                                       3. consumer.pop_slice(&mut mono)
+                                       4. chain.process(&mut mono, sr)        ← mic with effects
+                                       5. soundboard.mix_into(&mut mono, sr)  ← + clips
+                                       6. fan-out to device channels
+```
+
+Effects apply only to the voice. Soundboard clips play at their natural amplitude; if they distort the user can reduce levels at the clip source. The virtual-mic routing in Phase 6 will see the combined `mono` so call participants hear *both* the modulated voice and the soundboard.
+
+### Sample-rate handling
+
+Each `Voice` holds the clip's native sample rate. During `mix_into(engine_rate)` the read position advances by `clip_rate / engine_rate` per output sample and adjacent samples are linearly interpolated. This handles common mismatches (44.1 kHz clip on a 48 kHz device) without chipmunking, at the cost of mild aliasing. A proper resampler (rubato) is a future polish job.
+
+### Voice pool
+
+| Field | Purpose |
+|---|---|
+| `MAX_VOICES = 16` | Hard cap on simultaneous voices |
+| `play` | Find an idle voice; if none, steal the one with the lowest `started_at` |
+| `stop(clip_id)` | Deactivate every voice with matching id |
+| `stop_all` | Mark every voice idle |
+| `mix_into(output, engine_rate)` | Add every active voice's interpolated sample to `output`; auto-deactivate at end-of-buffer |
+| `snapshot(engine_rate)` | Build a `Vec<PlayingClipSnapshot>` for the UI |
+
+### Cache + commands
+
+The Tauri shell owns the decoded-clip cache (`Mutex<HashMap<String, DecodedClip>>` on `AppState`). `play_soundboard_clip(clipId, path)`:
+
+1. Locks the cache.
+2. If `clip_id` is present, clones the `DecodedClip` (cheap — `Arc<Vec<f32>>`) and returns.
+3. Otherwise calls `decode_clip(path)`, inserts, returns.
+4. Forwards `SoundboardCommand::Play { clip_id, samples, sample_rate }` to the engine.
+
+Subsequent plays of the same clip do zero file I/O.
+
+### Frontend state
+
+| Field | Kind | Purpose |
+|---|---|---|
+| `soundboardFolder` / `setSoundboardFolder` | signal | Currently selected folder absolute path |
+| `soundboardTiles` / `setSoundboardTiles` | signal | Current scan result |
+| `soundboardLoading` | signal | True while a scan is in flight |
+| `soundboardError` | signal | Last scan or play failure message |
+| `playingClips` / `setPlayingClips` | store | `Record<clipId, PlayingClip>` (with `startedAt` + duration) |
+| `tileHotkeys` / `setTileHotkeys` | store | Per-tile keyboard binding (`Record<clipId, string[]>`) |
+| `soundboardSearch` | signal | Live filter text |
+| `clockTick` | signal | rAF-driven counter that re-renders progress rings without each tile owning its own loop |
+
+A `createEffect` watches `playingClips` and runs an rAF loop while any clip is active. Each tick advances `clockTick` and removes any clips whose `performance.now() - startedAt` has exceeded their duration.
+
+## Phase 6+ — (placeholders)
 
 To be filled in as each phase lands.

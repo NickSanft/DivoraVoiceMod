@@ -24,6 +24,7 @@ use super::level::LevelMeter;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
 use crate::dsp::{DspCommand, EffectChain};
+use crate::soundboard::{SoundboardCommand, SoundboardMixer};
 
 /// Capacity of the SPSC ring buffer used between input and output
 /// callbacks. ~170 ms at 48 kHz; ample headroom for OS scheduling jitter.
@@ -54,6 +55,7 @@ enum Command {
     Stop,
     SetMonitor(bool),
     Dsp(DspCommand),
+    Soundboard(SoundboardCommand),
     Shutdown,
 }
 
@@ -122,6 +124,12 @@ impl AudioEngine {
         let _ = self.tx.send(Command::Dsp(cmd));
     }
 
+    /// Send a soundboard command (play / stop / stop-all). Forwarded
+    /// through the engine thread to the live output callback.
+    pub fn send_soundboard(&self, cmd: SoundboardCommand) {
+        let _ = self.tx.send(Command::Soundboard(cmd));
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Acquire)
@@ -168,6 +176,7 @@ struct RunningStreams {
 fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<Sender<DspCommand>> = None;
+    let mut sb_tx: Option<Sender<SoundboardCommand>> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Start {
@@ -178,14 +187,16 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                 // Drop any existing streams before building new ones.
                 drop(current.take());
                 drop(dsp_tx.take());
+                drop(sb_tx.take());
                 state.running.store(false, Ordering::Release);
 
                 let result =
                     start_streams(input_name.as_deref(), output_name.as_deref(), state.clone());
                 current = match result {
-                    Ok((streams, info, new_dsp_tx)) => {
+                    Ok((streams, info, new_dsp_tx, new_sb_tx)) => {
                         state.running.store(true, Ordering::Release);
                         dsp_tx = Some(new_dsp_tx);
+                        sb_tx = Some(new_sb_tx);
                         let _ = reply.send(Ok(info));
                         Some(streams)
                     }
@@ -198,6 +209,7 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             Command::Stop => {
                 drop(current.take());
                 drop(dsp_tx.take());
+                drop(sb_tx.take());
                 state.running.store(false, Ordering::Release);
                 state.store_input(Levels::default());
                 state.store_output(Levels::default());
@@ -210,9 +222,15 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                     let _ = tx.send(dsp_cmd);
                 }
             }
+            Command::Soundboard(sb_cmd) => {
+                if let Some(tx) = &sb_tx {
+                    let _ = tx.send(sb_cmd);
+                }
+            }
             Command::Shutdown => {
                 drop(current.take());
                 drop(dsp_tx.take());
+                drop(sb_tx.take());
                 state.running.store(false, Ordering::Release);
                 break;
             }
@@ -261,11 +279,20 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
 }
 
 #[allow(clippy::needless_pass_by_value)] // state is cloned into both stream closures
+#[allow(clippy::type_complexity)] // four-tuple is clearer than a struct here
 fn start_streams(
     input_name: Option<&str>,
     output_name: Option<&str>,
     state: Arc<EngineState>,
-) -> Result<(RunningStreams, StreamInfo, Sender<DspCommand>), AudioEngineError> {
+) -> Result<
+    (
+        RunningStreams,
+        StreamInfo,
+        Sender<DspCommand>,
+        Sender<SoundboardCommand>,
+    ),
+    AudioEngineError,
+> {
     let input_device = find_device(Direction::Input, input_name)?;
     let output_device = find_device(Direction::Output, output_name)?;
 
@@ -300,6 +327,7 @@ fn start_streams(
     let (producer, consumer) = rb.split();
 
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
+    let (sb_tx, sb_rx) = channel::<SoundboardCommand>();
 
     let input_stream = build_input_stream(
         &input_device,
@@ -317,6 +345,7 @@ fn start_streams(
         consumer,
         state.clone(),
         dsp_rx,
+        sb_rx,
         input_rate,
     )?;
 
@@ -341,6 +370,7 @@ fn start_streams(
         },
         info,
         dsp_tx,
+        sb_tx,
     ))
 }
 
@@ -419,6 +449,7 @@ fn build_output_stream(
     mut consumer: RingConsumer,
     state: Arc<EngineState>,
     dsp_rx: Receiver<DspCommand>,
+    sb_rx: Receiver<SoundboardCommand>,
     sample_rate: u32,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
@@ -435,6 +466,7 @@ fn build_output_stream(
 
     let mut meter = LevelMeter::new();
     let mut chain = EffectChain::new();
+    let mut soundboard = SoundboardMixer::new();
     let channels = channels as usize;
     let state_for_callback = state.clone();
 
@@ -445,9 +477,13 @@ fn build_output_stream(
                 if data.is_empty() || channels == 0 {
                     return;
                 }
-                // Drain any pending DSP commands before processing audio.
+                // Drain any pending DSP + soundboard commands before
+                // processing audio.
                 while let Ok(cmd) = dsp_rx.try_recv() {
                     chain.apply(cmd);
+                }
+                while let Ok(cmd) = sb_rx.try_recv() {
+                    soundboard.apply(cmd);
                 }
                 let monitoring = state_for_callback.monitor.load(Ordering::Acquire);
                 let frames = data.len() / channels;
@@ -458,8 +494,12 @@ fn build_output_stream(
                 for slot in &mut mono[zero_from..frames] {
                     *slot = 0.0;
                 }
-                // Run the DSP chain over the mono buffer.
+                // Run the DSP chain over the mic mono buffer first, so
+                // effects apply only to the user's voice…
                 chain.process(&mut mono[..frames], sample_rate);
+                // …then mix soundboard voices in alongside the
+                // already-effected voice. Clips play "as-is" (no DSP).
+                soundboard.mix_into(&mut mono[..frames], sample_rate);
                 // Fan out mono -> all output channels, or silence if not
                 // monitoring.
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {

@@ -172,3 +172,58 @@ export async function exportPresetJson(preset: WirePreset): Promise<string> {
 export async function presetStorePath(): Promise<string> {
   return invoke<string>("preset_store_path");
 }
+
+// ---- Soundboard ----
+
+/** Wire format for one soundboard tile (output of `scan_soundboard_folder`). */
+export interface SoundboardTile {
+  id: string;
+  path: string;
+  label: string;
+  extension: string;
+  sizeBytes: number;
+  modifiedSecs?: number;
+}
+
+/**
+ * Open the native folder-picker dialog and return the selected absolute
+ * path (or `null` if the user cancelled). Loads the dialog plugin lazily
+ * so tests that mock `@tauri-apps/api/core` don't need to mock it too.
+ */
+export async function pickSoundboardFolder(): Promise<string | null> {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const result = await open({
+      directory: true,
+      multiple: false,
+      title: "Pick a soundboard folder",
+    });
+    if (typeof result === "string") return result;
+    return null;
+  } catch (err) {
+    console.warn("[soundboard] folder picker unavailable", err);
+    return null;
+  }
+}
+
+export async function scanSoundboardFolder(
+  folder: string,
+): Promise<SoundboardTile[]> {
+  return invoke<SoundboardTile[]>("scan_soundboard_folder", { folder });
+}
+
+/** Play a clip; returns the clip's duration in seconds. */
+export async function playSoundboardClip(
+  clipId: string,
+  path: string,
+): Promise<number> {
+  return invoke<number>("play_soundboard_clip", { clipId, path });
+}
+
+export async function stopSoundboardClip(clipId: string): Promise<void> {
+  await invoke("stop_soundboard_clip", { clipId });
+}
+
+export async function stopAllSoundboardClips(): Promise<void> {
+  await invoke("stop_all_soundboard_clips");
+}

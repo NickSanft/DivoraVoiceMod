@@ -18,14 +18,18 @@ import {
   listInputDevices,
   listOutputDevices,
   listPresets,
+  playSoundboardClip,
   presetStorePath,
   saveUserPreset,
+  scanSoundboardFolder,
   setAudioMonitor,
   setEffectChain,
   setEffectEnabled,
   setEffectParam,
   startAudioEngine,
+  stopAllSoundboardClips,
   stopAudioEngine,
+  stopSoundboardClip,
   subscribeLevels,
 } from "./api";
 
@@ -210,6 +214,48 @@ describe("audio api", () => {
     const p = await presetStorePath();
     expect(invokeMock).toHaveBeenCalledWith("preset_store_path");
     expect(p).toContain("presets");
+  });
+
+  it("scanSoundboardFolder forwards the folder path", async () => {
+    invokeMock.mockResolvedValueOnce([
+      {
+        id: "abc",
+        path: "C:/clips/bell.wav",
+        label: "bell",
+        extension: "wav",
+        sizeBytes: 12_345,
+      },
+    ]);
+    const tiles = await scanSoundboardFolder("C:/clips");
+    expect(invokeMock).toHaveBeenCalledWith("scan_soundboard_folder", {
+      folder: "C:/clips",
+    });
+    expect(tiles).toHaveLength(1);
+    expect(tiles[0]!.label).toBe("bell");
+  });
+
+  it("playSoundboardClip forwards id + path and returns duration", async () => {
+    invokeMock.mockResolvedValueOnce(3.5);
+    const d = await playSoundboardClip("abc", "C:/clips/bell.wav");
+    expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
+      clipId: "abc",
+      path: "C:/clips/bell.wav",
+    });
+    expect(d).toBe(3.5);
+  });
+
+  it("stopSoundboardClip forwards clipId", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await stopSoundboardClip("abc");
+    expect(invokeMock).toHaveBeenCalledWith("stop_soundboard_clip", {
+      clipId: "abc",
+    });
+  });
+
+  it("stopAllSoundboardClips invokes stop_all_soundboard_clips", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await stopAllSoundboardClips();
+    expect(invokeMock).toHaveBeenCalledWith("stop_all_soundboard_clips");
   });
 
   it("subscribeLevels listens on audio-levels and forwards payloads", async () => {

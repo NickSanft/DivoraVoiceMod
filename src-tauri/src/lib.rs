@@ -7,7 +7,9 @@
 // see through the attribute macro and flags every command.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use divora_core::audio::{
@@ -16,6 +18,9 @@ use divora_core::audio::{
 };
 use divora_core::dsp::{DspCommand, EffectSpec};
 use divora_core::presets::{bundled_presets, Preset, PresetStore};
+use divora_core::soundboard::{
+    decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -41,11 +46,12 @@ struct EngineStatus {
     output: Levels,
 }
 
-/// Tauri-managed shared state. Holds the live audio engine and the
-/// user preset store; commands access these through `tauri::State`.
+/// Tauri-managed shared state. Holds the live audio engine, the user
+/// preset store, and the decoded-clip cache (keyed by `tile id`).
 struct AppState {
     engine: Arc<AudioEngine>,
     preset_store: Arc<PresetStore>,
+    clip_cache: Mutex<HashMap<String, DecodedClip>>,
 }
 
 #[tauri::command]
@@ -154,6 +160,58 @@ fn preset_store_path(state: State<'_, AppState>) -> String {
     state.preset_store.base_dir().to_string_lossy().into_owned()
 }
 
+#[tauri::command]
+fn scan_soundboard_folder(folder: String) -> Result<Vec<SoundboardTile>, String> {
+    let path = PathBuf::from(&folder);
+    scan_folder(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn play_soundboard_clip(
+    state: State<'_, AppState>,
+    clip_id: String,
+    path: String,
+) -> Result<f32, String> {
+    let decoded = decode_or_cache(&state, &clip_id, Path::new(&path))?;
+    state.engine.send_soundboard(SoundboardCommand::Play {
+        clip_id: clip_id.clone(),
+        samples: decoded.samples.clone(),
+        sample_rate: decoded.sample_rate,
+    });
+    Ok(decoded.duration_secs)
+}
+
+#[tauri::command]
+fn stop_soundboard_clip(state: State<'_, AppState>, clip_id: String) {
+    state
+        .engine
+        .send_soundboard(SoundboardCommand::Stop { clip_id });
+}
+
+#[tauri::command]
+fn stop_all_soundboard_clips(state: State<'_, AppState>) {
+    state.engine.send_soundboard(SoundboardCommand::StopAll);
+}
+
+/// Decode a clip on first play; subsequent plays reuse the cached
+/// `Arc<Vec<f32>>` so a hot soundboard doesn't decode anything twice.
+fn decode_or_cache(
+    state: &State<'_, AppState>,
+    clip_id: &str,
+    path: &Path,
+) -> Result<DecodedClip, String> {
+    {
+        let cache = state.clip_cache.lock().map_err(|e| e.to_string())?;
+        if let Some(clip) = cache.get(clip_id) {
+            return Ok(clip.clone());
+        }
+    }
+    let clip = decode_clip(path).map_err(|e| e.to_string())?;
+    let mut cache = state.clip_cache.lock().map_err(|e| e.to_string())?;
+    cache.insert(clip_id.to_owned(), clip.clone());
+    Ok(clip)
+}
+
 /// Spawn a background thread that emits `audio-levels` events to the
 /// frontend at ~30 Hz. The frontend uses these to drive live meters
 /// and the status pill without polling commands.
@@ -180,6 +238,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let engine = Arc::new(AudioEngine::new());
             spawn_level_emitter(app.handle().clone(), engine.clone());
@@ -205,6 +264,7 @@ pub fn run() {
             app.manage(AppState {
                 engine,
                 preset_store,
+                clip_cache: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -226,6 +286,10 @@ pub fn run() {
             delete_user_preset,
             export_preset_json,
             preset_store_path,
+            scan_soundboard_folder,
+            play_soundboard_clip,
+            stop_soundboard_clip,
+            stop_all_soundboard_clips,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");
