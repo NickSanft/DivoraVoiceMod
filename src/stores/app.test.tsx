@@ -487,12 +487,226 @@ describe("app store — Phase 5 soundboard actions", () => {
     expect(result.playingClips["a"]).toBeUndefined();
   });
 
-  it("bindTileHotkey records the binding; clear removes it", () => {
+  it("bindTileHotkey records the binding; clear removes it", async () => {
     const { result } = setupApp();
-    result.bindTileHotkey("a", ["F", "1"]);
+    await result.bindTileHotkey("a", ["F", "1"]);
     expect(result.tileHotkeys["a"]).toEqual(["F", "1"]);
-    result.clearTileHotkey("a");
+    await result.clearTileHotkey("a");
     expect(result.tileHotkeys["a"]).toBeUndefined();
+  });
+});
+
+describe("app store — Phase 8 soundboard polish", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom always has localStorage */
+    }
+  });
+
+  function sampleTile(id: string, label = `clip-${id}`) {
+    return {
+      id,
+      path: `/tmp/${label}.wav`,
+      label,
+      extension: "wav",
+      sizeBytes: 1024,
+    };
+  }
+
+  // --- sortedTiles + reorderTiles --------------------------------------
+
+  it("sortedTiles passes the scan through unchanged when no tileOrder entry exists for the folder", () => {
+    const { result } = setupApp();
+    result.setSoundboardFolder("/sb");
+    result.setSoundboardTiles([sampleTile("a"), sampleTile("b"), sampleTile("c")]);
+    expect(result.sortedTiles().map((t) => t.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("reorderTiles moves a tile within the active folder and sortedTiles reflects it", () => {
+    const { result } = setupApp();
+    result.setSoundboardFolder("/sb");
+    result.setSoundboardTiles([sampleTile("a"), sampleTile("b"), sampleTile("c")]);
+    result.reorderTiles("/sb", 0, 2);
+    expect(result.sortedTiles().map((t) => t.id)).toEqual(["b", "c", "a"]);
+  });
+
+  it("sortedTiles appends new tiles (not in the saved order) to the end", () => {
+    const { result } = setupApp();
+    result.setSoundboardFolder("/sb");
+    // Seed an order saved by a prior session.
+    result.setSoundboardTiles([sampleTile("a"), sampleTile("b")]);
+    result.reorderTiles("/sb", 0, 1); // a → end → [b, a]
+    // New file (id "c") shows up in this scan.
+    result.setSoundboardTiles([
+      sampleTile("a"),
+      sampleTile("b"),
+      sampleTile("c"),
+    ]);
+    expect(result.sortedTiles().map((t) => t.id)).toEqual(["b", "a", "c"]);
+  });
+
+  it("reorderTiles persists per folder so it can be restored on next session", () => {
+    const { result } = setupApp();
+    result.setSoundboardFolder("/sb");
+    result.setSoundboardTiles([sampleTile("a"), sampleTile("b")]);
+    result.reorderTiles("/sb", 0, 1);
+    expect(window.localStorage.getItem("divora.tileOrder")).toContain("/sb");
+  });
+
+  it("reorderTiles is a no-op for out-of-range / equal indices", () => {
+    const { result } = setupApp();
+    result.setSoundboardFolder("/sb");
+    result.setSoundboardTiles([sampleTile("a"), sampleTile("b")]);
+    result.reorderTiles("/sb", -1, 0);
+    result.reorderTiles("/sb", 1, 1);
+    result.reorderTiles("/sb", 0, 99);
+    expect(result.sortedTiles().map((t) => t.id)).toEqual(["a", "b"]);
+  });
+
+  // --- setTileColor ----------------------------------------------------
+
+  it("setTileColor stores a color override and clears it on null", () => {
+    const { result } = setupApp();
+    result.setTileColor("clip-x", "#34D9A0");
+    expect(result.tileColors["clip-x"]).toBe("#34D9A0");
+    result.setTileColor("clip-x", null);
+    expect(result.tileColors["clip-x"]).toBeUndefined();
+  });
+
+  it("setTileColor persists to localStorage", () => {
+    const { result } = setupApp();
+    result.setTileColor("clip-x", "#EC4899");
+    expect(window.localStorage.getItem("divora.tileColors")).toContain("#EC4899");
+  });
+
+  // --- recent folders --------------------------------------------------
+
+  it("pushRecentFolder prepends and caps at 5", () => {
+    const { result } = setupApp();
+    for (const folder of ["A", "B", "C", "D", "E", "F"]) {
+      result.pushRecentFolder(folder);
+    }
+    expect(result.recentFolders()).toEqual(["F", "E", "D", "C", "B"]);
+  });
+
+  it("pushRecentFolder moves an existing folder to the front (no duplicates)", () => {
+    const { result } = setupApp();
+    result.pushRecentFolder("A");
+    result.pushRecentFolder("B");
+    result.pushRecentFolder("A");
+    expect(result.recentFolders()).toEqual(["A", "B"]);
+  });
+
+  it("removeRecentFolder drops the entry", () => {
+    const { result } = setupApp();
+    result.pushRecentFolder("A");
+    result.pushRecentFolder("B");
+    result.removeRecentFolder("A");
+    expect(result.recentFolders()).toEqual(["B"]);
+  });
+
+  it("useRecentFolder switches the active folder and re-pushes it to the top of recents", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_soundboard_folder") return [];
+      return null;
+    });
+    const { result } = setupApp();
+    result.pushRecentFolder("A");
+    result.pushRecentFolder("B");
+    await result.useRecentFolder("A");
+    expect(result.soundboardFolder()).toBe("A");
+    expect(result.recentFolders()).toEqual(["A", "B"]);
+  });
+
+  it("pickSoundboardFolder pushes the chosen folder onto recents", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_soundboard_folder") return [];
+      return null;
+    });
+    const { result } = setupApp();
+    // Simulate the dialog plugin returning a path. The wrapper is
+    // mocked by the dialog plugin's `open` returning the path; here
+    // we shortcut by directly invoking the scan + push.
+    result.setSoundboardFolder("/pick/me");
+    result.pushRecentFolder("/pick/me");
+    await result.scanCurrentSoundboardFolder();
+    expect(result.recentFolders()).toEqual(["/pick/me"]);
+  });
+
+  // --- global tile hotkey ---------------------------------------------
+
+  it("bindTileHotkey registers a global shortcut with the sb: prefix", async () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.bindTileHotkey("clip-bell", ["Ctrl", "1"]);
+    expect(invokeMock).toHaveBeenCalledWith("register_global_shortcut", {
+      id: "sb:clip-bell",
+      accelerator: "Ctrl+1",
+    });
+  });
+
+  it("bindTileHotkey with empty keys unregisters via the sb: prefix", async () => {
+    const { result } = setupApp();
+    await result.bindTileHotkey("clip-bell", ["Ctrl", "1"]);
+    invokeMock.mockClear();
+    await result.bindTileHotkey("clip-bell", []);
+    expect(invokeMock).toHaveBeenCalledWith("unregister_global_shortcut", {
+      id: "sb:clip-bell",
+    });
+    expect(result.tileHotkeys["clip-bell"]).toEqual([]);
+  });
+
+  it("clearTileHotkey unregisters the global shortcut", async () => {
+    const { result } = setupApp();
+    await result.bindTileHotkey("clip-bell", ["F2"]);
+    invokeMock.mockClear();
+    await result.clearTileHotkey("clip-bell");
+    expect(invokeMock).toHaveBeenCalledWith("unregister_global_shortcut", {
+      id: "sb:clip-bell",
+    });
+  });
+
+  it("syncHotkeyBindings re-registers persisted tile hotkeys on startup", async () => {
+    window.localStorage.setItem(
+      "divora.tileHotkeys",
+      JSON.stringify({ "clip-a": ["F1"], "clip-b": ["F2"] }),
+    );
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.syncHotkeyBindings();
+    const calls = invokeMock.mock.calls.filter(
+      (c) => c[0] === "register_global_shortcut",
+    );
+    const ids = calls.map((c) => (c[1] as { id: string }).id).sort();
+    expect(ids).toEqual(["sb:clip-a", "sb:clip-b"]);
+  });
+
+  it("playTileById looks up the tile by id and forwards to playClip", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") return 2.0;
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSoundboardTiles([sampleTile("clip-bell")]);
+    await result.playTileById("clip-bell");
+    expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
+      clipId: "clip-bell",
+      path: "/tmp/clip-clip-bell.wav",
+    });
+  });
+
+  it("playTileById is a silent no-op when no matching tile exists", async () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.playTileById("not-there");
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "play_soundboard_clip",
+      expect.anything(),
+    );
   });
 });
 

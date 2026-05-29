@@ -200,10 +200,12 @@ Auxiliary rules:
 | **5** | v0.5.0 | **Soundboard**: folder picker, tile grid with search, per-tile hotkeys, progress rings on playing clips, panic "stop all" | Sound from folder plays while modulated mic is active; 8 simultaneous clips play without dropout |
 | **6** | v0.6.0 | **Settings + virtual mic**: full Settings screen, Audio devices section, Virtual microphone with VB-Cable detection card, Discord/Zoom/OBS screenshot cards, HotkeyCapture rows, Glyph casting binding UI, Appearance with full Tweaks (Mystical / Motion / Mood / Accent / Texture), About | Discord call receives modulated voice; user can rebind any hotkey; Tweaks knobs change visuals live |
 | **7** | v0.7.0 | **First-run wizard + glyph casting**: 4-step wizard with ceremonial panel, spark canvas + RDP shape recognizer + on-canvas reveal + bound preset switch | Fresh install shows wizard; drawing ▲ ▽ ▢ ◯ casts bound presets with sparks + "SPELL CAST" reveal |
-| **7.x** | v0.7.x | Bug fixes from initial user feedback | All critical issues closed |
-| **8** | v0.8.0 | **Polish + signed installer**: manual test pass, RNNoise noise suppression, code-signing cert (if budget), sand off rough edges | Public v0.8 release advertised as "feature complete v1" |
-| **9** | v0.9.0 | **AI voice conversion** via LLVC | "Deep Narrator AI" works real-time on CPU |
-| **1.0** | v1.0.0 | Cut after at least one quiet 0.7.x patch cycle. Stamps the stable surface | API/preset format stable for back-compat |
+| **7.x** ✓ | v0.7.1 | Bug fixes from initial user feedback (PTM Space steal, Sigil DOM sharing, #root height anchor) | All critical issues closed |
+| **8** | v0.8.0 | **Soundboard polish + cast alignment**: glyph-cast trace alignment, tile drag-reorder + persistence, per-tile colors, recent-folders history, global soundboard hotkeys (per-tile, system-wide via existing tauri-plugin-global-shortcut) | Drag tiles to reorder; right-click a tile to pick its color; recent folders dropdown switches between soundboards; hotkey-bound clips fire even while DivoraVoice is unfocused |
+| **9** | v0.9.0 | **DSP quality**: real pitch-preserving shifter (phase vocoder or PSOLA), formant warping via LPC envelope, rubato resampling at device boundaries so mismatched sample rates no longer hard-fail | Pitch slider preserves formants + tempo; formant slider doesn't pitch-shift; mic + output at different sample rates Just Works |
+| **10** | v0.10.0 | **Polish + signed installer**: manual test pass, RNNoise noise suppression, code-signing cert (if budget), sand off rough edges | Public v0.10 release advertised as "feature complete v1" |
+| **11** | v0.11.0 | **AI voice conversion** via LLVC | "Deep Narrator AI" works real-time on CPU |
+| **1.0** | v1.0.0 | Cut after at least one quiet 0.11.x patch cycle. Stamps the stable surface | API/preset format stable for back-compat |
 
 After v1.0, additional features (VST3 host, Stream Deck integration, OBS WebSocket, etc.) follow standard semver.
 
@@ -353,8 +355,8 @@ Jobs:
 
 ## Code Signing
 
-- **Phase 0–7:** unsigned. README explains SmartScreen warning + "More info → Run anyway" workaround.
-- **Phase 8+:** consider purchasing an EV cert (~$200/year via Sectigo or DigiCert) to bypass SmartScreen entirely.
+- **Phase 0–9:** unsigned. README explains SmartScreen warning + "More info → Run anyway" workaround.
+- **Phase 10+:** consider purchasing an EV cert (~$200/year via Sectigo or DigiCert) to bypass SmartScreen entirely.
 
 ## Risks & Mitigations
 
@@ -362,7 +364,7 @@ Jobs:
 |---|---|
 | WASAPI latency varies across hardware | Build latency benchmark in Phase 2, test on 3+ machines |
 | VB-Cable license disallows redistribution | Detect-and-prompt (not bundle) — chose this explicitly |
-| SmartScreen scares users away | Document workaround; add signing in Phase 8 |
+| SmartScreen scares users away | Document workaround; add signing in Phase 10 |
 | LLVC quality lower than commercial RVC | Frame as "free local AI"; advanced users can drop in their own ONNX |
 | Sample-rate mismatches between devices | Force internal 48 kHz, resample at boundaries with `rubato` |
 | Spell-circle animation performance | Use CSS transforms + opacity (GPU-composited), throttle particle count, expose Motion=functional fallback |

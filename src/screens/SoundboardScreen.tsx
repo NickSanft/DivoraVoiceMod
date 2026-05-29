@@ -1,10 +1,18 @@
-// Soundboard — Phase 5 lights up the tile grid backed by a real folder
-// on disk. Click a tile to play; click the Stop-all button to panic;
-// search filters by label; per-tile in-app hotkeys play whatever clip
-// they're bound to (global hotkeys are Phase 6).
+// Soundboard — Phase 8 brings:
+//   • Tile drag-reorder (HTML5 native, persisted per folder).
+//   • Per-tile colors via a right-click palette popover.
+//   • Recent-folders dropdown next to "Change folder" so users with
+//     multiple soundboards can hop between them in one click.
+//   • Global tile hotkeys — `bindTileHotkey` now registers with the
+//     `tauri-plugin-global-shortcut` so clips fire even when
+//     DivoraVoice isn't the focused window. The in-app keydown
+//     listener that was here in Phase 5 has been removed; the global
+//     path handles both focused and unfocused use, which avoided the
+//     double-fire that would otherwise happen when both layers ran.
 
 import {
   createMemo,
+  createSignal,
   For,
   onCleanup,
   onMount,
@@ -31,7 +39,19 @@ const COLORS = [
   "#EC4899",
 ];
 
-function tileColor(id: string): string {
+/** Palette offered in the per-tile right-click color picker. */
+const TILE_PALETTE: { color: string; label: string }[] = [
+  { color: "#7C5CF6", label: "Indigo" },
+  { color: "#EC4899", label: "Pink" },
+  { color: "#58C6F2", label: "Cyan" },
+  { color: "#34D9A0", label: "Emerald" },
+  { color: "#E9B14C", label: "Gold" },
+  { color: "#F2567A", label: "Crimson" },
+  { color: "#A99FC4", label: "Lilac" },
+  { color: "#6E6590", label: "Slate" },
+];
+
+function defaultTileColor(id: string): string {
   let h = 0;
   for (let i = 0; i < id.length; i++) {
     h = (h * 31 + id.charCodeAt(i)) >>> 0;
@@ -41,36 +61,11 @@ function tileColor(id: string): string {
 
 function tileEmoji(label: string): string {
   const ch = label.trim().charAt(0).toUpperCase();
-  // Map first letter to a vaguely sound-themed emoji set; otherwise fall
-  // back to a music note. Purely decorative — users can rebind in a
-  // future phase.
   const mapping: Record<string, string> = {
-    A: "🜂",
-    B: "🔔",
-    C: "🐦",
-    D: "😈",
-    E: "👁",
-    F: "🔥",
-    G: "👻",
-    H: "🫀",
-    I: "💡",
-    J: "🎷",
-    K: "🔑",
-    L: "🍃",
-    M: "🌙",
-    N: "🜄",
-    O: "🦉",
-    P: "🌀",
-    Q: "⚙️",
-    R: "🔮",
-    S: "✨",
-    T: "⚡",
-    U: "🜁",
-    V: "🌬",
-    W: "🌊",
-    X: "❌",
-    Y: "🟡",
-    Z: "💤",
+    A: "🜂", B: "🔔", C: "🐦", D: "😈", E: "👁", F: "🔥", G: "👻", H: "🫀",
+    I: "💡", J: "🎷", K: "🔑", L: "🍃", M: "🌙", N: "🜄", O: "🦉", P: "🌀",
+    Q: "⚙️", R: "🔮", S: "✨", T: "⚡", U: "🜁", V: "🌬", W: "🌊", X: "❌",
+    Y: "🟡", Z: "💤",
   };
   return mapping[ch] ?? "🎵";
 }
@@ -82,49 +77,41 @@ function fmtBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+interface ContextMenuState {
+  clipId: string;
+  x: number;
+  y: number;
+}
+
 export function SoundboardScreen(): JSX.Element {
   const app = useApp();
+  const [menu, setMenu] = createSignal<ContextMenuState | null>(null);
 
-  // In-app hotkey listener — Phase 6 will move this to a global Tauri
-  // hotkey registration so soundboard hotkeys work while the window is
-  // unfocused. For Phase 5 the document listener is enough.
-  onMount(() => {
-    const handler = (e: KeyboardEvent) => {
-      // Skip when typing into a field.
-      const target = e.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
-      const pressed = describeKey(e);
-      if (!pressed) return;
-      for (const tile of app.soundboardTiles()) {
-        const binding = app.tileHotkeys[tile.id];
-        if (!binding || binding.length === 0) continue;
-        if (binding.join("+") === pressed) {
-          e.preventDefault();
-          void app.playClip(tile);
-          return;
-        }
-      }
-    };
-    window.addEventListener("keydown", handler);
-    onCleanup(() => window.removeEventListener("keydown", handler));
-  });
-
+  // Filter (search) the already-sorted tile list so per-folder order
+  // survives across searches.
   const filtered = createMemo<SoundboardTile[]>(() => {
     const q = app.soundboardSearch().trim().toLowerCase();
-    if (!q) return app.soundboardTiles();
-    return app
-      .soundboardTiles()
-      .filter((t) => t.label.toLowerCase().includes(q));
+    const tiles = app.sortedTiles();
+    if (!q) return tiles;
+    return tiles.filter((t) => t.label.toLowerCase().includes(q));
   });
 
   const playingCount = () => Object.keys(app.playingClips).length;
+
+  const dismissMenu = (): void => {
+    setMenu(null);
+  };
+
+  // Click anywhere outside the menu closes it.
+  onMount(() => {
+    const handler = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest("[data-tile-context-menu]")) return;
+      setMenu(null);
+    };
+    window.addEventListener("pointerdown", handler);
+    onCleanup(() => window.removeEventListener("pointerdown", handler));
+  });
 
   return (
     <div
@@ -176,8 +163,6 @@ export function SoundboardScreen(): JSX.Element {
         </Show>
       </div>
 
-      {/* Dedicated scroll container — sits above the Show chain so its
-          flex sizing doesn't depend on which branch renders. */}
       <div
         style={{
           flex: 1,
@@ -225,7 +210,14 @@ export function SoundboardScreen(): JSX.Element {
                   </EmptyState>
                 }
               >
-                <TileGrid tiles={filtered()} />
+                <TileGrid
+                  tiles={filtered()}
+                  onReorder={(from, to) => {
+                    const folder = app.soundboardFolder();
+                    if (folder) app.reorderTiles(folder, from, to);
+                  }}
+                  onContext={(clipId, x, y) => setMenu({ clipId, x, y })}
+                />
               </Show>
             }
           >
@@ -233,6 +225,17 @@ export function SoundboardScreen(): JSX.Element {
           </Show>
         </Show>
       </div>
+
+      <Show when={menu()} keyed>
+        {(m) => (
+          <ColorContextMenu
+            clipId={m.clipId}
+            x={m.x}
+            y={m.y}
+            onDismiss={dismissMenu}
+          />
+        )}
+      </Show>
     </div>
   );
 }
@@ -245,7 +248,22 @@ interface HeaderProps {
 
 function Header(props: HeaderProps): JSX.Element {
   const app = useApp();
+  const [recentOpen, setRecentOpen] = createSignal(false);
+  let recentRef: HTMLDivElement | undefined;
+
   const folder = () => app.soundboardFolder() ?? "No folder";
+
+  // Click outside the recent menu closes it.
+  onMount(() => {
+    const handler = (e: PointerEvent) => {
+      if (recentRef && !recentRef.contains(e.target as Node)) {
+        setRecentOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handler);
+    onCleanup(() => document.removeEventListener("pointerdown", handler));
+  });
+
   return (
     <div
       style={{
@@ -276,6 +294,82 @@ function Header(props: HeaderProps): JSX.Element {
           <Button variant="ghost" size="sm" onClick={props.onPickFolder}>
             Change folder
           </Button>
+          <Show when={app.recentFolders().length > 0}>
+            <div ref={recentRef} style={{ position: "relative" }}>
+              <Button
+                variant="ghost"
+                size="sm"
+                iconR="chevronD"
+                onClick={() => setRecentOpen(!recentOpen())}
+                aria-haspopup="menu"
+                aria-expanded={recentOpen()}
+              >
+                Recent
+              </Button>
+              <Show when={recentOpen()}>
+                <div
+                  class="dropdown"
+                  role="menu"
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 6px)",
+                    right: 0,
+                    "min-width": "320px",
+                    "z-index": 30,
+                  }}
+                >
+                  <For each={app.recentFolders()}>
+                    {(path) => (
+                      <div
+                        class={`dropdown-opt ${path === app.soundboardFolder() ? "is-selected" : ""}`}
+                        role="menuitem"
+                        onClick={() => {
+                          setRecentOpen(false);
+                          void app.useRecentFolder(path);
+                        }}
+                      >
+                        <Sigil
+                          name="folder"
+                          size={14}
+                          style={{ color: "var(--text-lo)" }}
+                        />
+                        <div style={{ flex: 1, "min-width": 0 }}>
+                          <div
+                            class="mono"
+                            style={{
+                              "font-size": "var(--t-xs)",
+                              color: "var(--text-hi)",
+                              overflow: "hidden",
+                              "text-overflow": "ellipsis",
+                              "white-space": "nowrap",
+                            }}
+                            title={path}
+                          >
+                            {path}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          aria-label="Remove from recent"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            app.removeRecentFolder(path);
+                          }}
+                          style={{
+                            width: "24px",
+                            height: "24px",
+                          }}
+                        >
+                          <Sigil name="x" size={12} />
+                        </button>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
         </div>
       </div>
       <div style={{ flex: 1 }} />
@@ -310,6 +404,8 @@ function Header(props: HeaderProps): JSX.Element {
 
 interface TileGridProps {
   tiles: SoundboardTile[];
+  onReorder: (from: number, to: number) => void;
+  onContext: (clipId: string, x: number, y: number) => void;
 }
 
 function TileGrid(props: TileGridProps): JSX.Element {
@@ -322,23 +418,37 @@ function TileGrid(props: TileGridProps): JSX.Element {
         "align-content": "start",
       }}
     >
-      <For each={props.tiles}>{(tile) => <Tile tile={tile} />}</For>
+      <For each={props.tiles}>
+        {(tile, idx) => (
+          <Tile
+            tile={tile}
+            index={idx()}
+            onReorder={props.onReorder}
+            onContext={props.onContext}
+          />
+        )}
+      </For>
     </div>
   );
 }
 
 interface TileProps {
   tile: SoundboardTile;
+  index: number;
+  onReorder: (from: number, to: number) => void;
+  onContext: (clipId: string, x: number, y: number) => void;
 }
 
 function Tile(props: TileProps): JSX.Element {
   const app = useApp();
-  const color = createMemo(() => tileColor(props.tile.id));
+  const color = createMemo(
+    () => app.tileColors[props.tile.id] ?? defaultTileColor(props.tile.id),
+  );
   const emoji = createMemo(() => tileEmoji(props.tile.label));
   const hotkey = () => app.tileHotkeys[props.tile.id];
+  const [dragOver, setDragOver] = createSignal(false);
 
   const playing = createMemo(() => {
-    // Read clockTick so this memo refreshes during playback.
     void app.clockTick();
     return app.playingClips[props.tile.id] ?? null;
   });
@@ -362,21 +472,61 @@ function Tile(props: TileProps): JSX.Element {
     return `${left.toFixed(1)}s`;
   });
 
+  const onDragStart = (e: DragEvent): void => {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", String(props.index));
+  };
+  const onDragOver = (e: DragEvent): void => {
+    if (!e.dataTransfer) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOver(true);
+  };
+  const onDragLeave = (): void => {
+    setDragOver(false);
+  };
+  const onDrop = (e: DragEvent): void => {
+    e.preventDefault();
+    setDragOver(false);
+    const from = Number(e.dataTransfer?.getData("text/plain") ?? "");
+    if (Number.isFinite(from) && from !== props.index) {
+      props.onReorder(from, props.index);
+    }
+  };
+
+  const onContextMenu = (e: MouseEvent): void => {
+    e.preventDefault();
+    props.onContext(props.tile.id, e.clientX, e.clientY);
+  };
+
   return (
     <button
       type="button"
+      draggable={true}
       onClick={() => void app.playClip(props.tile)}
-      title={props.tile.path}
+      onContextMenu={onContextMenu}
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+      title={`${props.tile.path}\nRight-click for color`}
       style={{
         position: "relative",
         height: "120px",
         padding: "var(--s3) var(--s3) var(--s3)",
         "border-radius": "14px",
         background: "var(--surface-2)",
-        border: playing()
-          ? `1.5px solid ${color()}`
-          : "1px solid var(--line)",
-        "box-shadow": playing() ? `0 0 18px ${color()}66` : undefined,
+        border: dragOver()
+          ? `1.5px dashed ${color()}`
+          : playing()
+            ? `1.5px solid ${color()}`
+            : "1px solid var(--line)",
+        "box-shadow": dragOver()
+          ? `0 0 18px ${color()}55`
+          : playing()
+            ? `0 0 18px ${color()}66`
+            : undefined,
         color: "var(--text-hi)",
         display: "flex",
         "flex-direction": "column",
@@ -466,7 +616,7 @@ function Tile(props: TileProps): JSX.Element {
 
 interface ProgressRingProps {
   color: string;
-  progress: number; // 0..1
+  progress: number;
   durationSecs: number;
 }
 
@@ -501,17 +651,90 @@ function ProgressRing(props: ProgressRingProps): JSX.Element {
   );
 }
 
-/** Translate a keydown event into the same dotted form `bindTileHotkey` uses. */
-function describeKey(e: KeyboardEvent): string | null {
-  const parts: string[] = [];
-  if (e.ctrlKey) parts.push("Ctrl");
-  if (e.altKey) parts.push("Alt");
-  if (e.shiftKey) parts.push("Shift");
-  if (e.metaKey) parts.push("Win");
-  let k = e.key;
-  if (k === " ") k = "Space";
-  else if (k.length === 1) k = k.toUpperCase();
-  if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return null;
-  parts.push(k);
-  return parts.join("+");
+interface ColorContextMenuProps {
+  clipId: string;
+  x: number;
+  y: number;
+  onDismiss: () => void;
+}
+
+function ColorContextMenu(props: ColorContextMenuProps): JSX.Element {
+  const app = useApp();
+  const current = () => app.tileColors[props.clipId];
+
+  return (
+    <div
+      data-tile-context-menu
+      role="menu"
+      style={{
+        position: "fixed",
+        top: `${Math.min(props.y, window.innerHeight - 220)}px`,
+        left: `${Math.min(props.x, window.innerWidth - 240)}px`,
+        "z-index": 100,
+        padding: "var(--s3)",
+        "border-radius": "var(--r-md)",
+        background: "var(--surface-2)",
+        border: "1px solid var(--line-glow)",
+        "box-shadow": "var(--shadow-3)",
+        "min-width": "220px",
+      }}
+    >
+      <div
+        class="eyebrow"
+        style={{ "margin-bottom": "var(--s2)", color: "var(--text-lo)" }}
+      >
+        Tile color
+      </div>
+      <div
+        style={{
+          display: "grid",
+          "grid-template-columns": "repeat(4, 1fr)",
+          gap: "var(--s2)",
+        }}
+      >
+        <For each={TILE_PALETTE}>
+          {(swatch) => (
+            <button
+              type="button"
+              title={swatch.label}
+              aria-label={swatch.label}
+              onClick={() => {
+                app.setTileColor(props.clipId, swatch.color);
+                props.onDismiss();
+              }}
+              style={{
+                width: "40px",
+                height: "32px",
+                "border-radius": "var(--r-sm)",
+                background: swatch.color,
+                border:
+                  current() === swatch.color
+                    ? "2px solid #fff"
+                    : "1px solid var(--line)",
+                cursor: "pointer",
+                "box-shadow":
+                  current() === swatch.color
+                    ? `0 0 12px ${swatch.color}88`
+                    : "none",
+                transition: "box-shadow 0.15s, border-color 0.15s",
+              }}
+            />
+          )}
+        </For>
+      </div>
+      <Show when={current()}>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          style={{ width: "100%", "margin-top": "var(--s3)" }}
+          onClick={() => {
+            app.setTileColor(props.clipId, null);
+            props.onDismiss();
+          }}
+        >
+          Reset to default
+        </button>
+      </Show>
+    </div>
+  );
 }

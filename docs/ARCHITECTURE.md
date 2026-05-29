@@ -674,6 +674,104 @@ When `GlyphCastOverlay` reports a classification:
 
 The flash is a pill-shaped toast at the bottom of the Mixer; it auto-fades and is pointer-events:none so it doesn't block clicks.
 
-## Phase 8+ — (placeholders)
+## Phase 8 — cast alignment + soundboard polish
+
+### Module layout (added / changed)
+
+```
+src/
+├── components/
+│   ├── GlyphCastOverlay.tsx      # +localPoint(svg, e), +size signal, viewBox now SVG-local
+│   └── GlyphCastOverlay.test.tsx # 4 new tests
+├── screens/
+│   └── SoundboardScreen.tsx      # drag-reorder + right-click color picker + recent dropdown
+└── stores/
+    └── app.tsx                   # +tileColors / tileOrder / sortedTiles / reorderTiles /
+                                  #  recentFolders + push / remove / useRecentFolder /
+                                  #  playTileById + sb:-namespaced global hotkey registration
+```
+
+### Cast alignment
+
+The glyph cast overlay sits inside the content-area `<div>` of the app shell, which is offset from the viewport by the titlebar height (~36 px) and the sidebar width (~80 px). In Phase 7 we stored raw `clientX/clientY` and used a `window.innerWidth × window.innerHeight` SVG `viewBox`, which painted the trace in viewport coordinates inside a shifted box — the path always lagged the cursor by the offset.
+
+```
+                viewport (0,0)
+                ┌──────────────────────────────┐
+                │  Titlebar                    │
+                │ ┌──────────────────────────┐ │
+                │ │S│ Content area (offset!) │ │
+                │ │i│ ┌────────────────────┐ │ │
+                │ │d│ │                    │ │ │
+                │ │e│ │      Overlay       │ │ │  ← `localPoint(svg, e)` translates
+                │ │b│ │                    │ │ │     event.clientX/Y into SVG-local
+                │ │a│ │                    │ │ │     coords by subtracting
+                │ │r│ │                    │ │ │     svg.getBoundingClientRect()
+                │ └─┴─┴────────────────────┘ │ │
+                └──────────────────────────────┘
+```
+
+`localPoint` is exported so the test can pin it without DOM render — it's a pure function of the SVG's bounding rect + the event's `clientX/clientY`. The component also tracks `size()` so the SVG `viewBox` matches the SVG's actual rendered size; that way 1 SVG unit = 1 CSS pixel and the trace stays where the user expects.
+
+### Soundboard tile metadata
+
+Three pieces of per-tile metadata, each persisted to its own localStorage key under the `divora.` prefix:
+
+| Key | Shape | Purpose |
+|---|---|---|
+| `divora.tileOrder` | `Record<folderPath, clipId[]>` | Display order per folder |
+| `divora.tileColors` | `Record<clipId, hex>` | Override the default per-id palette colour |
+| `divora.tileHotkeys` | `Record<clipId, string[]>` | Global hotkey chip set (also re-registered with the OS) |
+| `divora.recentFolders` | `string[]` (cap 5, MRU) | Header dropdown |
+
+clipIds are stable hex hashes of the canonicalised file path (Phase 5 scanner), so they're unique across folders — only the order needs to be keyed by folder.
+
+### sortedTiles
+
+```
+sortedTiles = createMemo:
+  folder = soundboardFolder()
+  tiles  = soundboardTiles()
+  order  = tileOrder[folder]
+  if no folder or no order → return tiles unchanged
+  partition tiles into [withOrder, without]
+    withOrder = tiles whose id appears in `order`, sorted by order index
+    without   = tiles not in `order` (new files since last scan)
+  return [...withOrder, ...without]
+```
+
+This memo plus the search filter is what the grid renders. New files always show up at the end — the user can drag them into place.
+
+### Global tile hotkey lifecycle
+
+```
+bindTileHotkey(clipId, ["Ctrl", "F1"])
+  ├─► setTileHotkeys(clipId, keys)
+  ├─► saveJson("divora.tileHotkeys", …)
+  └─► register_global_shortcut(id="sb:<clipId>", accelerator="Ctrl+F1")
+
+OS-wide hotkey fires
+  └─► emit Tauri event "global-shortcut" { id: "sb:<clipId>", state: "pressed" }
+       └─► App.tsx subscribeGlobalShortcut listener
+            └─► if id.startsWith("sb:") → playTileById(id.slice(3))
+                 └─► find tile by id in soundboardTiles() → playClip(tile)
+
+clearTileHotkey(clipId)
+  ├─► setTileHotkeys(clipId, undefined)
+  ├─► saveJson("divora.tileHotkeys", …)
+  └─► unregister_global_shortcut(id="sb:<clipId>")
+
+App restart
+  └─► App.tsx onMount → syncHotkeyBindings()
+       └─► for each (clipId, keys) in tileHotkeys → register_global_shortcut(sb:<clipId>, keys.join("+"))
+```
+
+The `sb:` prefix keeps tile ids out of the PTM / panic / monitor namespace.
+
+### Recent folders
+
+`pushRecentFolder(path)` prepends with dedup (move-to-front semantics) and caps the list at 5. Called from both `pickSoundboardFolder` (user picked one via the native dialog) and `useRecentFolder` (user picked one from the dropdown). The dropdown UI is a simple `<For>` over `recentFolders()` with a per-row × button that calls `removeRecentFolder`.
+
+## Phase 9+ — (placeholders)
 
 To be filled in as each phase lands.

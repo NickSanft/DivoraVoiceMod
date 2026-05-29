@@ -4,6 +4,54 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-29 — Phase 8: cast alignment + soundboard polish
+
+### Added
+
+- **Glyph cast trace now lines up with the cursor.** `GlyphCastOverlay.tsx` translates every pointer event through a new `localPoint(svg, e)` helper that subtracts the SVG's `getBoundingClientRect()` top-left from the event's viewport coordinates. The SVG `viewBox` is set from a `size()` signal that tracks the SVG's actual rendered dimensions (re-measured on mount, after each pointerdown, and on window resize) instead of the previous `window.innerWidth × window.innerHeight` viewport hack — so 1 SVG unit = 1 CSS pixel and the trace stays under the cursor regardless of titlebar / sidebar offset.
+
+- **Soundboard tile drag-reorder, persisted per folder.** Each `<Tile>` is HTML5-draggable; drop on another tile reorders the local sequence. Order is saved as a `tileOrder: Record<folderPath, clipId[]>` map in `localStorage["divora.tileOrder"]`. New tiles that appear in a later scan (files added since the saved order) fall to the end in scanner-default alphabetical order via the new `sortedTiles()` memo.
+
+- **Per-tile color palette.** Right-click a tile to open a small popover with 8 brand-aware swatches (Indigo / Pink / Cyan / Emerald / Gold / Crimson / Lilac / Slate) plus a "Reset to default" button. Selection persists to `localStorage["divora.tileColors"]` and overrides the default per-id color hash on the active tile (border glow, status dot, progress ring, countdown).
+
+- **Recent folders dropdown.** Header gains a "Recent" ghost button next to "Change folder" that opens a menu of up to 5 most-recently-used folders. Click an entry to switch folders instantly (no native picker round-trip). Per-entry × button removes one. Backed by `localStorage["divora.recentFolders"]`, MRU-ordered, capped at 5.
+
+- **Global per-tile hotkeys via `tauri-plugin-global-shortcut`.** `bindTileHotkey(clipId, keys)` now registers each binding under the `sb:<clipId>` id namespace so soundboard clips fire even when DivoraVoice isn't the focused window. `clearTileHotkey` unregisters. `syncHotkeyBindings` (run on `App.tsx` mount) re-registers every persisted tile binding so they survive restarts. The Phase 5 in-app `keydown` listener was removed — the global path covers both focused and unfocused use and removes the double-fire risk.
+
+### Changed
+
+- Store: new exports `tileColors` / `setTileColor`, `tileOrder` / `reorderTiles`, `sortedTiles`, `recentFolders` / `pushRecentFolder` / `removeRecentFolder` / `useRecentFolder`, `playTileById`. `bindTileHotkey` + `clearTileHotkey` are now async (they await the global-shortcut register / unregister calls).
+- Persistence helpers `loadJson`/`saveJson` + `STORAGE_KEYS` constant centralise localStorage I/O for Phase 8 metadata.
+- `pickSoundboardFolder` now pushes the chosen folder to recents.
+- `App.tsx` global-shortcut dispatcher routes any event whose `id` starts with `sb:` to `playTileById(id.slice(3))`.
+
+### Tests
+
+- **Frontend**: 136 → 158 (+22).
+  - 4 new `GlyphCastOverlay.localPoint` tests (offset SVG, origin-anchored SVG, null-ref fallback, fractional offsets).
+  - 18 new store tests (sortedTiles passthrough + reorder, new-tile append, persistence, no-op clamping; `setTileColor` set + clear + persistence; recent folders MRU/cap/dedup/remove; `useRecentFolder` scans; `pickSoundboardFolder` re-uses pushRecentFolder; `bindTileHotkey` sb:-prefixed registration + clear; `syncHotkeyBindings` re-registers persisted tile hotkeys; `playTileById` looks up by id and no-ops cleanly when missing).
+- **Rust**: 80 (unchanged — Phase 8 is frontend / store only).
+
+### Architecture notes
+
+- **Why localStorage for tile metadata (not a Tauri app-config plugin)**: tile order + colors + recent folders are pure UI preferences. If they vanish, the next scan still works (orders restore to alphabetical, colors restore to the per-id default hash, recents restore to whatever the user picks next). The state never needs to be migrated, encrypted, synced, or backed up — file-based storage would just add a Tauri command surface and a new permission for no user-visible win.
+- **Why `sb:<clipId>` instead of just the clipId**: the global-shortcut backend keeps a single id → Shortcut map shared between the PTM/panic/monitor namespace and every tile. Prefixing tile ids prevents an unlikely future collision and gives the dispatcher in `App.tsx` a free fast-path discriminator (`event.id.startsWith("sb:")`).
+- **Why the in-app tile-hotkey listener was removed**: in Phase 7's model, the in-app `keydown` listener AND the global-shortcut handler would both fire whenever DivoraVoice was focused, leading to double `playClip` calls. Removing the in-app listener and trusting the global hotkey path keeps both modes (focused / unfocused) playing exactly one voice.
+- **Cast alignment fix is purely a coordinate-frame change** — no classifier work needed because the classifier is translation-invariant (it operates on the trace's bounding box and turning angles, not absolute positions).
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (80)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (158)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The cast trace lining up makes the spellcraft gesture feel like it's actually responding to the user, not approximating. The soundboard set — drag to organise, color to organise visually, hop between sound folders without re-picking, hotkey-trigger clips while you're in a game/call — turns the screen from "browse and click" into a real performance surface. The hotkey work is the most consequential: it's the difference between "remember to alt-tab back" and "trigger the bell-sound mid-conversation."
+
 ## [0.7.1] — 2026-05-29 — Field bugs from v0.7.0: PTM steal, blank sigils, no scroll
 
 Four reports from v0.7.0 that, taken together, made the app feel broken in normal use.

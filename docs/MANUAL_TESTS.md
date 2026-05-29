@@ -158,6 +158,50 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Vignette on → soft darkening around the window edges.
 - [ ] Vignette off → uniform surface brightness.
 
+## Cast cursor alignment (Phase 8)
+
+- [ ] On the Mixer, click Cast (or press G).
+- [ ] Start dragging from anywhere on the overlay. The glowing trace stays directly under the cursor — no left/down offset, no titlebar/sidebar drift.
+- [ ] Drag a clear square. The classifier resolves it to "square" and the bound preset switches.
+- [ ] Resize the window mid-cast (or before opening) — the trace still tracks the cursor without re-snap.
+- [ ] Open cast at the top of the window, drag near the very top: the trace starts at the cursor (not 36 px below it).
+
+## Soundboard tile reordering (Phase 8)
+
+- [ ] Pick a folder with ≥ 6 audio clips. Tiles appear sorted alphabetically.
+- [ ] Drag tile A onto tile D — the drop target shows a dashed border + accent glow.
+- [ ] Release: the order updates immediately (A is now in D's slot, D and intermediate tiles shift up).
+- [ ] Restart the app. The custom order survives.
+- [ ] Drop a new audio file into the folder, click Change folder (re-pick the same folder). The new file appears at the end of the grid; the saved order isn't disturbed.
+- [ ] Hover or hold-drag does not start playback — clicks alone trigger play.
+
+## Per-tile colors (Phase 8)
+
+- [ ] Right-click a tile. A small palette popover appears at the click point with 8 swatches.
+- [ ] Click "Pink" → the tile's dot, glowing border (when playing), and progress ring all switch to pink immediately.
+- [ ] Right-click again, click "Reset to default" → tile returns to the per-id hashed default colour.
+- [ ] Click outside the popover → it dismisses without changing anything.
+- [ ] Restart the app — color choices survive.
+
+## Recent folders (Phase 8)
+
+- [ ] Pick three different soundboard folders in sequence. The most-recently-picked one is active.
+- [ ] Header now shows a "Recent" ghost button next to "Change folder".
+- [ ] Click Recent — dropdown lists the three folders, most-recent at top.
+- [ ] Click any entry — the folder switches and the scan runs (without invoking the native dialog).
+- [ ] Click the × next to a folder in the dropdown — that entry vanishes.
+- [ ] Pick a 6th folder — the oldest of the previous 5 falls off the bottom (cap = 5).
+- [ ] Restart — the recent list survives.
+
+## Global tile hotkeys (Phase 8)
+
+- [ ] Pick a soundboard folder with a clip.
+- [ ] Click the tile and bind a global hotkey (e.g. Ctrl+F1) — the Kbd chip appears on the tile.
+- [ ] Alt-tab to Notepad (or any other focused app). Press Ctrl+F1. The clip plays through the engine (and into VB-Cable if installed).
+- [ ] Restart the app. Without re-binding, press Ctrl+F1 again from Notepad — clip still plays (the binding was re-registered on `syncHotkeyBindings`).
+- [ ] Clear the hotkey from the tile — pressing Ctrl+F1 from Notepad no longer fires the clip.
+- [ ] No double-fire: with DivoraVoice focused, pressing the bound hotkey plays the clip exactly once.
+
 ## About (Phase 6)
 
 - [ ] Settings → About shows the DMark + "DivoraVoice v0.6.0" + "MIT License · Tauri + SolidJS".

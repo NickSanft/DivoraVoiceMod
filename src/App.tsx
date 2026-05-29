@@ -118,6 +118,10 @@ function Shell(): JSX.Element {
             void app.panicSoundboard();
           } else if (event.id === "monitor") {
             void app.toggleMonitor();
+          } else if (event.id.startsWith("sb:")) {
+            // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
+            // current scan still has it.
+            void app.playTileById(event.id.slice(3));
           }
         });
       } catch (err) {

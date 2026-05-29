@@ -106,6 +106,39 @@ export interface AbSnapshots {
 /** Stable id used for the system-wide hotkeys we register. */
 export type HotkeyAction = "ptm" | "panic" | "monitor";
 
+/** localStorage keys for Phase 8 persistence (tile metadata + recent folders). */
+const STORAGE_KEYS = {
+  tileColors: "divora.tileColors",
+  tileOrder: "divora.tileOrder",
+  tileHotkeys: "divora.tileHotkeys",
+  recentFolders: "divora.recentFolders",
+} as const;
+
+/** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
+function loadJson<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return fallback;
+    const parsed = JSON.parse(raw) as unknown;
+    return (parsed ?? fallback) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJson(key: string, value: unknown): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* quota, private mode, etc — non-fatal */
+  }
+}
+
+/** Most-recently-used cap for the recent-folders dropdown. */
+const RECENT_FOLDERS_MAX = 5;
+
 /**
  * Default hotkey bindings are intentionally EMPTY — registering any
  * accelerator (especially a plain key like "Space") via
@@ -242,16 +275,35 @@ export interface AppState {
   setSoundboardSearch: Setter<string>;
   clockTick: () => number;
 
+  // Phase 8 tile metadata (persisted to localStorage).
+  /** clipId → hex color override. Missing entry = default palette colour. */
+  tileColors: Record<string, string>;
+  setTileColor: (clipId: string, color: string | null) => void;
+  /** folderPath → ordered list of clipIds. Tiles not in the list (e.g.
+   * new files since last scan) fall to the end in alphabetical order. */
+  tileOrder: Record<string, string[]>;
+  reorderTiles: (folder: string, from: number, to: number) => void;
+  /** `soundboardTiles()` with the per-folder order applied. */
+  sortedTiles: () => SoundboardTile[];
+
+  // Phase 8 recent folders (most-recently-used, capped at 5).
+  recentFolders: () => string[];
+  pushRecentFolder: (folder: string) => void;
+  removeRecentFolder: (folder: string) => void;
+  useRecentFolder: (folder: string) => Promise<void>;
+
   // Soundboard actions
   pickSoundboardFolder: () => Promise<void>;
   scanCurrentSoundboardFolder: () => Promise<void>;
   playClip: (tile: SoundboardTile) => Promise<void>;
   stopClip: (clipId: string) => Promise<void>;
   panicSoundboard: () => Promise<void>;
-  bindTileHotkey: (clipId: string, keys: string[]) => void;
-  clearTileHotkey: (clipId: string) => void;
+  bindTileHotkey: (clipId: string, keys: string[]) => Promise<void>;
+  clearTileHotkey: (clipId: string) => Promise<void>;
   /** Triggered by SoundboardScreen when a tile finishes naturally. */
   markClipFinished: (clipId: string) => void;
+  /** Map a global-shortcut event (id = clipId) to a playClip call. */
+  playTileById: (clipId: string) => Promise<void>;
 
   // Virtual mic / VB-Cable
   virtualMicStatus: () => VirtualMicStatus | null;
@@ -629,9 +681,22 @@ export function createAppState(): AppState {
   const [soundboardLoading, setSoundboardLoading] = createSignal(false);
   const [soundboardError, setSoundboardError] = createSignal<string | null>(null);
   const [playingClips, setPlayingClips] = createStore<Record<string, PlayingClip>>({});
-  const [tileHotkeys, setTileHotkeys] = createStore<Record<string, string[]>>({});
+  const [tileHotkeys, setTileHotkeys] = createStore<Record<string, string[]>>(
+    loadJson<Record<string, string[]>>(STORAGE_KEYS.tileHotkeys, {}),
+  );
   const [soundboardSearch, setSoundboardSearch] = createSignal("");
   const [clockTick, setClockTick] = createSignal(0);
+
+  // Phase 8 tile metadata.
+  const [tileColors, setTileColors] = createStore<Record<string, string>>(
+    loadJson<Record<string, string>>(STORAGE_KEYS.tileColors, {}),
+  );
+  const [tileOrder, setTileOrder] = createStore<Record<string, string[]>>(
+    loadJson<Record<string, string[]>>(STORAGE_KEYS.tileOrder, {}),
+  );
+  const [recentFolders, setRecentFolders] = createSignal<string[]>(
+    loadJson<string[]>(STORAGE_KEYS.recentFolders, []),
+  );
 
   // Tick the clock at ~30 Hz whenever any clip is playing. Components
   // read `clockTick()` to re-render progress rings without each tile
@@ -660,6 +725,30 @@ export function createAppState(): AppState {
     };
   });
 
+  /**
+   * Apply the persisted per-folder order to the freshly scanned tile
+   * list. Tiles whose id isn't in the saved order (new files since the
+   * last scan) fall to the end in their scanner-default alphabetical
+   * order.
+   */
+  const sortedTiles = createMemo<SoundboardTile[]>(() => {
+    const folder = soundboardFolder();
+    const tiles = soundboardTiles();
+    if (!folder) return tiles;
+    const order = tileOrder[folder];
+    if (!order || order.length === 0) return tiles;
+    const orderIndex = new Map<string, number>();
+    order.forEach((id, i) => orderIndex.set(id, i));
+    const withOrder: SoundboardTile[] = [];
+    const without: SoundboardTile[] = [];
+    for (const tile of tiles) {
+      if (orderIndex.has(tile.id)) withOrder.push(tile);
+      else without.push(tile);
+    }
+    withOrder.sort((a, b) => orderIndex.get(a.id)! - orderIndex.get(b.id)!);
+    return [...withOrder, ...without];
+  });
+
   const scanCurrentSoundboardFolder = async (): Promise<void> => {
     const folder = soundboardFolder();
     if (!folder) return;
@@ -676,11 +765,77 @@ export function createAppState(): AppState {
     }
   };
 
+  // Push a folder to the recents list and persist. Move-to-front
+  // semantics; cap at RECENT_FOLDERS_MAX.
+  const pushRecentFolder = (folder: string): void => {
+    if (!folder) return;
+    const next = [folder, ...recentFolders().filter((p) => p !== folder)].slice(
+      0,
+      RECENT_FOLDERS_MAX,
+    );
+    setRecentFolders(next);
+    saveJson(STORAGE_KEYS.recentFolders, next);
+  };
+
+  const removeRecentFolder = (folder: string): void => {
+    const next = recentFolders().filter((p) => p !== folder);
+    if (next.length === recentFolders().length) return;
+    setRecentFolders(next);
+    saveJson(STORAGE_KEYS.recentFolders, next);
+  };
+
+  const useRecentFolder = async (folder: string): Promise<void> => {
+    setSoundboardFolder(folder);
+    pushRecentFolder(folder);
+    await scanCurrentSoundboardFolder();
+  };
+
   const pickSoundboardFolder = async (): Promise<void> => {
     const path = await pickSoundboardFolderCmd();
     if (!path) return;
     setSoundboardFolder(path);
+    pushRecentFolder(path);
     await scanCurrentSoundboardFolder();
+  };
+
+  const setTileColor = (clipId: string, color: string | null): void => {
+    if (color === null || color === "") {
+      setTileColors(clipId, undefined as unknown as string);
+    } else {
+      setTileColors(clipId, color);
+    }
+    // Persist the post-mutation snapshot (un-proxied via spread).
+    const snapshot: Record<string, string> = {};
+    for (const k of Object.keys(tileColors)) {
+      const v = tileColors[k];
+      if (v !== undefined) snapshot[k] = v;
+    }
+    saveJson(STORAGE_KEYS.tileColors, snapshot);
+  };
+
+  const reorderTiles = (folder: string, from: number, to: number): void => {
+    if (!folder) return;
+    // Source list = currently displayed order (sortedTiles when this
+    // folder is active, falls back to the saved order or the raw scan
+    // for other folders).
+    const isCurrent = folder === soundboardFolder();
+    const current = isCurrent
+      ? sortedTiles().map((t) => t.id)
+      : tileOrder[folder] ?? [];
+    if (
+      from === to ||
+      from < 0 ||
+      to < 0 ||
+      from >= current.length ||
+      to >= current.length
+    ) {
+      return;
+    }
+    const next = current.slice();
+    const [moved] = next.splice(from, 1);
+    if (moved !== undefined) next.splice(to, 0, moved);
+    setTileOrder(folder, next);
+    saveJson(STORAGE_KEYS.tileOrder, { ...tileOrder, [folder]: next });
   };
 
   const playClip = async (tile: SoundboardTile): Promise<void> => {
@@ -720,12 +875,51 @@ export function createAppState(): AppState {
     }
   };
 
-  const bindTileHotkey = (clipId: string, keys: string[]): void => {
+  /**
+   * Per-tile hotkey id used when talking to `tauri-plugin-global-
+   * shortcut`. The plugin's id namespace is shared between PTM /
+   * panic / monitor and every tile, so we prefix tiles to keep them
+   * out of the action namespace.
+   */
+  const tileHotkeyId = (clipId: string): string => `sb:${clipId}`;
+
+  const bindTileHotkey = async (
+    clipId: string,
+    keys: string[],
+  ): Promise<void> => {
     setTileHotkeys(clipId, keys);
+    saveJson(STORAGE_KEYS.tileHotkeys, { ...tileHotkeys });
+    const accelerator = keys.join("+");
+    if (!accelerator) {
+      try {
+        await unregisterGlobalShortcutCmd(tileHotkeyId(clipId));
+      } catch (err) {
+        console.warn("[soundboard] unregister hotkey failed", err);
+      }
+      return;
+    }
+    try {
+      await registerGlobalShortcutCmd(tileHotkeyId(clipId), accelerator);
+    } catch (err) {
+      console.warn("[soundboard] register hotkey failed", err);
+    }
   };
 
-  const clearTileHotkey = (clipId: string): void => {
+  const clearTileHotkey = async (clipId: string): Promise<void> => {
     setTileHotkeys(clipId, undefined as unknown as string[]);
+    saveJson(STORAGE_KEYS.tileHotkeys, { ...tileHotkeys });
+    try {
+      await unregisterGlobalShortcutCmd(tileHotkeyId(clipId));
+    } catch (err) {
+      console.warn("[soundboard] unregister hotkey failed", err);
+    }
+  };
+
+  /** Look up a tile by id from the active scan and fire `playClip`. */
+  const playTileById = async (clipId: string): Promise<void> => {
+    const tile = soundboardTiles().find((t) => t.id === clipId);
+    if (!tile) return;
+    await playClip(tile);
   };
 
   const markClipFinished = (clipId: string): void => {
@@ -787,6 +981,18 @@ export function createAppState(): AppState {
         await registerGlobalShortcutCmd(action, accelerator);
       } catch (err) {
         console.warn(`[hotkey] sync failed for ${action}`, err);
+      }
+    }
+    // Re-register tile hotkeys too — they live in `tileHotkeys` and
+    // their `sb:` namespaced ids round-trip back through the
+    // global-shortcut listener in App.tsx.
+    for (const [clipId, keys] of Object.entries(tileHotkeys)) {
+      if (!keys || keys.length === 0) continue;
+      const accelerator = keys.join("+");
+      try {
+        await registerGlobalShortcutCmd(tileHotkeyId(clipId), accelerator);
+      } catch (err) {
+        console.warn(`[soundboard] sync tile hotkey failed for ${clipId}`, err);
       }
     }
   };
@@ -880,6 +1086,20 @@ export function createAppState(): AppState {
     bindTileHotkey,
     clearTileHotkey,
     markClipFinished,
+    playTileById,
+
+    // Phase 8 tile metadata
+    tileColors,
+    setTileColor,
+    tileOrder,
+    reorderTiles,
+    sortedTiles,
+
+    // Phase 8 recent folders
+    recentFolders,
+    pushRecentFolder,
+    removeRecentFolder,
+    useRecentFolder,
 
     virtualMicStatus,
     setVirtualMicStatus,

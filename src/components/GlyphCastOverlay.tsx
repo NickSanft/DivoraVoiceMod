@@ -26,10 +26,35 @@ export interface GlyphCastOverlayProps {
   onCancel: () => void;
 }
 
+/**
+ * Translate a pointer event's viewport coordinates into the SVG's local
+ * coordinate frame. The overlay is `position: absolute` inside the
+ * content area (which itself sits below the titlebar and to the right
+ * of the sidebar), so `clientX/clientY` are offset from the SVG's
+ * origin by exactly the SVG's bounding-rect top-left. Subtracting that
+ * keeps the painted trace under the cursor.
+ *
+ * Exported for unit testing — `localPoint(svg, e)` is pure given the
+ * SVG's `getBoundingClientRect()` and the event.
+ */
+export function localPoint(
+  svg: SVGSVGElement | null,
+  e: { clientX: number; clientY: number },
+): Point {
+  if (!svg) return { x: e.clientX, y: e.clientY };
+  const rect = svg.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
 export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
   const [points, setPoints] = createSignal<Point[]>([]);
   const [drawing, setDrawing] = createSignal(false);
+  // We track the SVG dimensions so the `viewBox` matches the painted
+  // area exactly (not the whole window). That way `localPoint` lands
+  // in the SVG's own coord frame.
+  const [size, setSize] = createSignal({ w: 1, h: 1 });
   let rootRef: HTMLDivElement | undefined;
+  let svgRef: SVGSVGElement | undefined;
 
   const pathD = createMemo<string>(() => {
     const pts = points();
@@ -43,18 +68,25 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
     return d;
   });
 
+  const measure = (): void => {
+    if (!svgRef) return;
+    const rect = svgRef.getBoundingClientRect();
+    setSize({ w: Math.max(1, rect.width), h: Math.max(1, rect.height) });
+  };
+
   const onPointerDown = (e: PointerEvent): void => {
     if (e.button !== 0) return;
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    setPoints([{ x: e.clientX, y: e.clientY }]);
+    measure();
+    setPoints([localPoint(svgRef ?? null, e)]);
     setDrawing(true);
   };
 
   const onPointerMove = (e: PointerEvent): void => {
     if (!drawing()) return;
     e.preventDefault();
-    setPoints([...points(), { x: e.clientX, y: e.clientY }]);
+    setPoints([...points(), localPoint(svgRef ?? null, e)]);
   };
 
   const onPointerUp = (e: PointerEvent): void => {
@@ -73,14 +105,20 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
   };
 
   onMount(() => {
+    measure();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         props.onCancel();
       }
     };
+    const onResize = (): void => measure();
     window.addEventListener("keydown", onKey);
-    onCleanup(() => window.removeEventListener("keydown", onKey));
+    window.addEventListener("resize", onResize);
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", onResize);
+    });
   });
 
   return (
@@ -103,11 +141,14 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {/* Trace */}
+      {/* Trace. The viewBox matches the SVG's CSS size so 1 SVG unit
+          = 1 CSS pixel — `localPoint()` already maps the pointer event
+          into this space. */}
       <svg
+        ref={svgRef}
         width="100%"
         height="100%"
-        viewBox={`0 0 ${typeof window !== "undefined" ? window.innerWidth : 1200} ${typeof window !== "undefined" ? window.innerHeight : 800}`}
+        viewBox={`0 0 ${size().w} ${size().h}`}
         style={{
           position: "absolute",
           inset: 0,
