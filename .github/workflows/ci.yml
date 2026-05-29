@@ -43,6 +43,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # symphonia-adapter-libopus → opusic-sys vendors libopus and builds
+      # it from C source via cmake. windows-2022 ships cmake by default
+      # but this guarantees it's on PATH if the image base changes.
+      - uses: lukka/get-cmake@latest
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -77,6 +82,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # See `rust` job above — libopus → cmake.
+      - uses: lukka/get-cmake@latest
 
       - uses: Swatinem/rust-cache@v2
         with:

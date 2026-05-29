@@ -17,6 +17,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # symphonia-adapter-libopus → opusic-sys builds libopus from C
+      # source via cmake. windows-2022 ships cmake, but this pins it.
+      - uses: lukka/get-cmake@latest
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."

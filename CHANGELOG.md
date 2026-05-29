@@ -4,6 +4,33 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-05-28 — Soundboard scroll + OGG-Opus decode
+
+### Fixed
+
+- **Soundboard scrolling never engaged when more tiles existed than fit on screen.** The `flex:1 / overflow:auto` lived on `TileGrid`, nested under two `<Show>` blocks that broke its flex sizing. Lifted the scroll container above the Show chain so it's the same DOM element regardless of which branch (folder picked / loading / no tiles / tiles) renders inside.
+- **OGG-Opus files (Discord voice clip exports) failed to play with `unsupported feature: core (codec):unsupported codec`.** symphonia 0.5 demuxed the OGG container fine but had no Opus decoder. Upgraded to symphonia 0.6, switched to its new `Probe`/`CodecRegistry`/`AudioDecoder` API, and registered `symphonia-adapter-libopus`'s `OpusDecoder` alongside every default codec. libopus is vendored via the adapter's `bundled` feature (`opusic-sys` builds it from source on the Windows MSVC runner; cmake is now an explicit step in CI/Release workflows).
+
+### Changed
+
+- `divora-core::soundboard::decoder` — full rewrite for symphonia 0.6:
+  - Custom `Probe` (via `register_enabled_formats`) and `CodecRegistry` (via `register_enabled_codecs` + manual `OpusDecoder` registration), both behind `OnceLock`s.
+  - `probe.probe()` (replaces `format()`), `format.default_track(TrackType::Audio)`, `format.next_packet()` now returns `Result<Option<Packet>>`, `track.codec_params.audio()`, `make_audio_decoder(audio_params, &opts)`.
+  - Decoded buffers come back as `GenericAudioBufferRef` — we call `copy_to_vec_interleaved::<f32>` (symphonia handles every integer → float normalisation internally), then mix to mono.
+- `.github/workflows/ci.yml` + `release.yml` — added `lukka/get-cmake@latest` before the rust toolchain step so libopus's cmake-driven build never breaks if the runner image's cmake moves.
+
+### Tests
+
+- **Rust**: 76 → 80. New decoder unit tests:
+  - `codec_registry_includes_opus_decoder` — regression for the exact v0.6.0 bug; asserts the registry no longer returns "unsupported codec" for `CODEC_ID_OPUS`.
+  - `codec_registry_keeps_all_default_audio_decoders` — sanity check that adding Opus didn't drop Vorbis / FLAC / MP3 / PCM.
+  - `probe_registry_is_non_empty_after_seeding` — touches the probe `OnceLock` to confirm seeding doesn't panic.
+  - `decode_clip_reports_a_friendly_error_for_missing_files` — verifies the "open" error path still surfaces a clean message.
+
+### Why it matters
+
+These two bugs were the lived experience of v0.6.0 for anyone trying to use the soundboard with a folder of more than ~6 clips OR with Discord recordings (which are the most common ".ogg" files in the wild). Both fixes are tiny in code but huge in usability — they're the difference between "neat demo" and "actually works."
+
 ## [0.6.0] — 2026-05-28 — Phase 6: virtual mic + global hotkeys + full Settings
 
 ### Added

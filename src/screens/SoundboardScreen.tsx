@@ -132,91 +132,107 @@ export function SoundboardScreen(): JSX.Element {
         height: "100%",
         display: "flex",
         "flex-direction": "column",
-        padding: "20px 24px",
-        gap: "var(--s5)",
         "min-height": 0,
       }}
     >
-      <Header
-        playingCount={playingCount()}
-        onPickFolder={() => void app.pickSoundboardFolder()}
-        onPanic={() => void app.panicSoundboard()}
-      />
-
-      <Show
-        when={app.soundboardError()}
-        keyed
+      <div
+        style={{
+          padding: "20px 24px 0",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s5)",
+          "flex-shrink": 0,
+        }}
       >
-        {(err) => (
-          <div
-            class="card"
-            style={{
-              padding: "var(--s3) var(--s4)",
-              background: "var(--danger-bg)",
-              "border-color": "rgba(242, 86, 122, 0.4)",
-              color: "var(--danger)",
-              display: "flex",
-              "align-items": "center",
-              gap: "var(--s3)",
-            }}
-          >
-            <Sigil name="warning" size={16} />
-            <span style={{ flex: 1, "font-size": "var(--t-xs)" }}>{err}</span>
-            <IconButton
-              icon="x"
-              onClick={() => app.setSoundboardError(null)}
-              tip="Dismiss"
-            />
-          </div>
-        )}
-      </Show>
+        <Header
+          playingCount={playingCount()}
+          onPickFolder={() => void app.pickSoundboardFolder()}
+          onPanic={() => void app.panicSoundboard()}
+        />
 
-      <Show
-        when={app.soundboardFolder()}
-        fallback={
-          <EmptyState icon="folder" title="No folder picked yet">
-            <p>
-              Pick a folder of audio files (WAV, MP3, OGG, FLAC, Opus) and
-              they'll appear here as clickable tiles. Click one to play it
-              into the modulated mic feed.
-            </p>
-            <Button
-              variant="primary"
-              icon="folder"
-              onClick={() => void app.pickSoundboardFolder()}
+        <Show when={app.soundboardError()} keyed>
+          {(err) => (
+            <div
+              class="card"
+              style={{
+                padding: "var(--s3) var(--s4)",
+                background: "var(--danger-bg)",
+                "border-color": "rgba(242, 86, 122, 0.4)",
+                color: "var(--danger)",
+                display: "flex",
+                "align-items": "center",
+                gap: "var(--s3)",
+              }}
             >
-              Pick a folder
-            </Button>
-          </EmptyState>
-        }
+              <Sigil name="warning" size={16} />
+              <span style={{ flex: 1, "font-size": "var(--t-xs)" }}>{err}</span>
+              <IconButton
+                icon="x"
+                onClick={() => app.setSoundboardError(null)}
+                tip="Dismiss"
+              />
+            </div>
+          )}
+        </Show>
+      </div>
+
+      {/* Dedicated scroll container — sits above the Show chain so its
+          flex sizing doesn't depend on which branch renders. */}
+      <div
+        style={{
+          flex: 1,
+          "min-height": 0,
+          overflow: "auto",
+          padding: "var(--s5) 24px 24px",
+        }}
       >
         <Show
-          when={app.soundboardLoading()}
+          when={app.soundboardFolder()}
           fallback={
-            <Show
-              when={filtered().length > 0}
-              fallback={
-                <EmptyState
-                  icon="search"
-                  title={
-                    app.soundboardSearch().length > 0
-                      ? "No tiles match your search"
-                      : "No audio files in this folder"
-                  }
-                >
-                  {app.soundboardSearch().length > 0
-                    ? "Try a different query, or clear the search."
-                    : "WAV, MP3, OGG, FLAC, and Opus files are picked up."}
-                </EmptyState>
-              }
-            >
-              <TileGrid tiles={filtered()} />
-            </Show>
+            <EmptyState icon="folder" title="No folder picked yet">
+              <p>
+                Pick a folder of audio files (WAV, MP3, OGG, FLAC, Opus) and
+                they'll appear here as clickable tiles. Click one to play it
+                into the modulated mic feed.
+              </p>
+              <Button
+                variant="primary"
+                icon="folder"
+                onClick={() => void app.pickSoundboardFolder()}
+              >
+                Pick a folder
+              </Button>
+            </EmptyState>
           }
         >
-          <EmptyState icon="refresh" title="Scanning folder…" />
+          <Show
+            when={app.soundboardLoading()}
+            fallback={
+              <Show
+                when={filtered().length > 0}
+                fallback={
+                  <EmptyState
+                    icon="search"
+                    title={
+                      app.soundboardSearch().length > 0
+                        ? "No tiles match your search"
+                        : "No audio files in this folder"
+                    }
+                  >
+                    {app.soundboardSearch().length > 0
+                      ? "Try a different query, or clear the search."
+                      : "WAV, MP3, OGG, FLAC, and Opus files are picked up."}
+                  </EmptyState>
+                }
+              >
+                <TileGrid tiles={filtered()} />
+              </Show>
+            }
+          >
+            <EmptyState icon="refresh" title="Scanning folder…" />
+          </Show>
         </Show>
-      </Show>
+      </div>
     </div>
   );
 }
@@ -300,14 +316,10 @@ function TileGrid(props: TileGridProps): JSX.Element {
   return (
     <div
       style={{
-        flex: 1,
-        "min-height": 0,
-        overflow: "auto",
         display: "grid",
         "grid-template-columns": "repeat(auto-fill, minmax(180px, 1fr))",
         gap: "var(--s4)",
         "align-content": "start",
-        "padding-bottom": "var(--s5)",
       }}
     >
       <For each={props.tiles}>{(tile) => <Tile tile={tile} />}</For>
