@@ -163,7 +163,46 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Settings → About shows the DMark + "DivoraVoice v0.6.0" + "MIT License · Tauri + SolidJS".
 - [ ] Click View on GitHub → default browser opens https://github.com/NickSanft/DivoraVoiceMod.
 - [ ] Three pillar cards visible: No telemetry, No account, Free forever.
-- [ ] Click Replay setup → `wizardOpen` flips true (Phase 7 wizard shows up once it ships).
+- [ ] Click Replay setup → wizard ceremony re-opens.
+
+## First-run wizard (Phase 7)
+
+- [ ] Fresh install (or wipe `localStorage.divora.wizardSeen`). Launch DivoraVoice → the wizard appears as a full-screen overlay over the Mixer.
+- [ ] The ceremonial left rail shows: DMark + "DivoraVoice", a breathing sigil in the middle that updates icon per step (clean → output → mic → modulated), and a step pill list with the current step highlighted.
+- [ ] Step 1 (Welcome): "Your voice, transmuted in real time." display headline + 4 pillar cards (Local-first, Private, Free, Real-time). Continue button advances.
+- [ ] Step 2 (Virtual cable): VB-Cable detection card. Without VB-Cable, banner is gold "VB-Cable not found" + Download button. With VB-Cable installed, banner is emerald "VB-Cable is installed" + routing hint listing the cable's device name.
+- [ ] Step 2: Click Download → default browser opens https://vb-audio.com/Cable/.
+- [ ] Step 2: Install VB-Cable then click Re-scan → banner flips to emerald.
+- [ ] Step 3 (Devices): Microphone and Modulated-out selects appear with the same devices as Settings → Audio devices. Hearing-you HMeter responds to mic input. Switching devices here affects the live engine.
+- [ ] Step 4 (Ready): emerald checkmark, "You're ready." headline, Discord routing card with 3 numbered steps. "Enter Divora" button finishes.
+- [ ] Click Skip setup on any step → wizard closes, `localStorage.divora.wizardSeen = "true"`.
+- [ ] Click Enter Divora on the last step → wizard closes, `divora.wizardSeen = "true"`.
+- [ ] Restart the app → the wizard does NOT re-appear.
+- [ ] Settings → About → Replay setup → wizard re-appears at Step 1.
+- [ ] Back button on any step > 1 walks the user backward.
+- [ ] Escape key from the wizard does NOT close it (use Skip / Enter Divora instead — this is intentional to avoid accidental dismissal).
+
+## Glyph casting (Phase 7)
+
+- [ ] In Settings → Glyph casting, bind:
+  - Triangle → Static Wraith
+  - Inverted triangle → Hollow King
+  - Square → Velvet Demon
+  - Circle → Clean Passthrough
+- [ ] On the Mixer, the preset header shows a "Cast" ghost button next to the Compare A/B toggle.
+- [ ] Click Cast → a dusk-violet veil covers the Mixer; a floating card reads "Cast a glyph — press and drag to trace one of: triangle, inverted triangle, square, or circle. Releases switches to the bound preset. Press Esc to cancel."
+- [ ] Press and drag a triangle (apex up): on release, active preset becomes Static Wraith; a "triangle → Static Wraith" flash toast pops at the bottom of the Mixer for ~2.4 s.
+- [ ] Press and drag an inverted triangle (apex down): preset becomes Hollow King; toast confirms.
+- [ ] Press and drag a square: preset becomes Velvet Demon.
+- [ ] Press and drag a circle: preset becomes Clean Passthrough.
+- [ ] Draw something ambiguous (e.g. an open curve, a tight scribble): toast reads "Glyph not recognised — try again". The active preset does not change.
+- [ ] Unbind triangle in Settings (clear the dropdown) then cast a triangle: toast reads "No preset bound to triangle".
+- [ ] Press Esc during a cast → overlay dismisses without classifying.
+- [ ] Click outside any active drag (without dragging) → cast overlay stays open (the user can try again).
+- [ ] Press G with the Mixer focused and no input field active → cast overlay opens, same as the button.
+- [ ] Press G while typing in the Soundboard search box → does NOT open the overlay (text input takes precedence).
+- [ ] Trace a glyph that goes off-screen: classification still works (only the visible-ish portion is captured).
+- [ ] Cast back-to-back: each cast resets state cleanly; the overlay opens fresh every time.
 
 ## Stress
 

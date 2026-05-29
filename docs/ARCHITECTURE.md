@@ -590,6 +590,90 @@ An empty string means "no binding"; `setHotkeyBinding(action, "")` calls `unregi
 5. **Appearance** — mood / accent / motion (from Phase 1) + mystical (subtle / balanced / rich) + parchment grain toggle + vignette toggle.
 6. **About** — DMark + version + license + GitHub button + 3 pillar cards + Replay setup button (flips `wizardOpen` for the Phase 7 wizard).
 
-## Phase 7+ — (placeholders)
+## Phase 7 — first-run wizard + glyph casting
+
+### Module layout (added)
+
+```
+src/
+├── components/
+│   ├── Wizard.tsx              # 4-step ceremony + clearWizardSeenFlag export
+│   ├── Wizard.test.tsx
+│   ├── GlyphCastOverlay.tsx    # pointer-trace SVG overlay with classifier callback
+│   └── (existing primitives unchanged)
+├── data/
+│   ├── glyphs.ts               # classifier + helpers
+│   └── glyphs.test.ts          # 17 unit tests
+└── screens/
+    └── MixerScreen.tsx         # +"Cast" button + G hotkey + flash toast
+```
+
+### Wizard
+
+Modal overlay rendered inside the existing content area (`position: absolute; inset: 0; z-index: 100`). Open/closed state lives on the store as `wizardOpen()` (already plumbed through the AppProvider since Phase 1).
+
+| Step | Title | Content |
+|---|---|---|
+| 0 | Welcome | Display headline + 4 pillar cards (Local-first / Private / Free / Real-time) |
+| 1 | Virtual cable | VB-Cable detection card (auto-refreshed on entry) + Download / Re-scan |
+| 2 | Devices | Mic + output selects + live HMeter ("Hearing you") |
+| 3 | Ready | Discord routing instructions card |
+
+The ceremonial left rail (372 px) breathes a radial-gradient sigil that swaps icon per step and shows step pills with checkmarks. The footer has Skip / Back / Continue (Continue becomes "Enter Divora" on the last step).
+
+### First-run gating
+
+- `localStorage["divora.wizardSeen"]` — set to `"true"` on Finish or Skip.
+- On mount: `Wizard` reads the flag; if present, calls `app.setWizardOpen(false)` immediately so first-launch users see the ceremony exactly once.
+- `Settings → About → Replay setup` calls the exported `clearWizardSeenFlag()` AND `app.setWizardOpen(true)` so the wizard reappears.
+- `createEffect(on(wizardOpen, …))` re-runs `refreshDevices` + `refreshVirtualMicStatus` every time the wizard opens, so each entry gets fresh state.
+
+### Glyph classifier (`src/data/glyphs.ts`)
+
+A deliberately simple geometric classifier — no ML, no template-matching DLLs. Returns `GlyphId | null` (one of triangle / invtriangle / square / circle, or null when the trace is too small / open / unrecognisable).
+
+Pipeline:
+
+```
+raw points
+  ├─► dedupe              consecutive duplicates removed
+  ├─► boundingBox         bail if width < 40 or height < 40
+  ├─► resamplePath(48)    uniform arc-length resampling
+  ├─► smooth(0)           off by default (natural sampling already smooth enough)
+  ├─► endpointGap         classify as "closed" if gap < 0.35 × bbox diagonal
+  ├─► turningAngles       cyclic when closed; per-point absolute turn
+  └─► findCorners         peaks above ~35°, min separation = N/8, cyclic dedup
+```
+
+Decision:
+
+- **0 corners** ⇒ circle
+- **4 corners** ⇒ square
+- **3 corners** ⇒ triangle vs invtriangle — apex is the corner whose Y is most distant from the median Y of the three corners; apex above the median ⇒ ▲, below ⇒ ▽.
+- **anything else** ⇒ null
+
+Tunables live in `CLASSIFIER_DEFAULTS` and are accepted as a partial `config` parameter so tests and future tuning work without forking the module.
+
+### GlyphCastOverlay
+
+Full-screen pointer-capture surface (`position: absolute; inset: 0; z-index: 90`). Captures `pointerdown` (button 0), accumulates `pointermove` into a points array, renders a glowing dusk-violet SVG stroke as the trace grows. On `pointerup` calls `classifyGlyph(points)` and fires the `onClassified` callback with the result. Escape calls `onCancel`.
+
+The overlay shows a floating instruction card while idle ("Cast a glyph — press and drag to trace one of ▲ ▽ □ ○"); the card disappears once the user starts drawing.
+
+### Mixer wire-up
+
+`MixerScreen.tsx` owns a `castOpen` signal and a `castMessage` signal (cleared after 2.4 s by a window timeout). The "Cast" button in the preset header opens the overlay; pressing **G** when no input field is focused also opens it.
+
+When `GlyphCastOverlay` reports a classification:
+
+| Result | Action |
+|---|---|
+| null | flash "Glyph not recognised — try again" |
+| glyph with bound preset | `app.usePreset(presetId)` + flash "{glyph} → {preset name}" |
+| glyph bound to a now-deleted preset | flash "No preset bound to {glyph}" |
+
+The flash is a pill-shaped toast at the bottom of the Mixer; it auto-fades and is pointer-events:none so it doesn't block clicks.
+
+## Phase 8+ — (placeholders)
 
 To be filled in as each phase lands.

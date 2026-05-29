@@ -15,6 +15,7 @@ import {
 } from "solid-js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { subscribeGlobalShortcut, subscribeLevels } from "./audio/api";
+import { Wizard } from "./components/Wizard";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
 import { MixerScreen } from "./screens/MixerScreen";
@@ -222,6 +223,7 @@ function Shell(): JSX.Element {
               <SettingsScreen />
             </Match>
           </Switch>
+          <Wizard />
         </div>
       </div>
     </div>

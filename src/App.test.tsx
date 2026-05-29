@@ -41,9 +41,9 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 describe("App shell", () => {
-  it("renders the DivoraVoice wordmark in the titlebar", () => {
-    const { getByText } = render(() => <App />);
-    expect(getByText("DivoraVoice")).toBeInTheDocument();
+  it("renders the DivoraVoice wordmark (titlebar + first-run wizard)", () => {
+    const { getAllByText } = render(() => <App />);
+    expect(getAllByText("DivoraVoice").length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows the persistent LOCAL · NO ACCOUNT affirmation", () => {

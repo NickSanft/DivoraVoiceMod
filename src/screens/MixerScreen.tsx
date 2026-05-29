@@ -3,8 +3,10 @@
 // connect enabled effects to the core; the inspector lets the user
 // tweak the focused effect live.
 
-import { Show, type JSX } from "solid-js";
+import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
+import { Button } from "../components/Button";
+import { GlyphCastOverlay } from "../components/GlyphCastOverlay";
 import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
 import { VMeter } from "../components/Meters";
@@ -14,12 +16,67 @@ import { SpellCircle } from "../components/SpellCircle";
 import { Toggle } from "../components/Toggle";
 import { statusMeta } from "../shell/statusMeta";
 import { useApp } from "../stores/app";
-import type { EffectId, PtmMode } from "../types";
+import type { EffectId, GlyphId, PtmMode } from "../types";
 
 export function MixerScreen(): JSX.Element {
   const app = useApp();
   const activeCount = () => app.chain().filter((c) => c.enabled).length;
   const totalCount = () => app.chain().length;
+  const [castOpen, setCastOpen] = createSignal(false);
+  const [castMessage, setCastMessage] = createSignal<string | null>(null);
+  let messageTimeout: number | undefined;
+
+  const flashMessage = (text: string): void => {
+    setCastMessage(text);
+    if (messageTimeout !== undefined) {
+      window.clearTimeout(messageTimeout);
+    }
+    messageTimeout = window.setTimeout(() => {
+      setCastMessage(null);
+      messageTimeout = undefined;
+    }, 2400);
+  };
+
+  const onClassified = (glyph: GlyphId | null): void => {
+    setCastOpen(false);
+    if (!glyph) {
+      flashMessage("Glyph not recognised — try again");
+      return;
+    }
+    const presetId = app.glyphs[glyph];
+    const target = app.presets().find((p) => p.id === presetId);
+    if (!target) {
+      flashMessage(`No preset bound to ${glyph}`);
+      return;
+    }
+    app.usePreset(target.id);
+    flashMessage(`${glyph} → ${target.name}`);
+  };
+
+  // Keyboard shortcut "G" enters cast mode unless a field is focused.
+  onMount(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "g" && e.key !== "G") return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setCastOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKey);
+      if (messageTimeout !== undefined) {
+        window.clearTimeout(messageTimeout);
+      }
+    });
+  });
 
   return (
     <div
@@ -31,7 +88,20 @@ export function MixerScreen(): JSX.Element {
         gap: "var(--s5)",
       }}
     >
-      <PresetHeader activeCount={activeCount()} totalCount={totalCount()} />
+      <PresetHeader
+        activeCount={activeCount()}
+        totalCount={totalCount()}
+        onCast={() => setCastOpen(true)}
+      />
+      <Show when={castOpen()}>
+        <GlyphCastOverlay
+          onClassified={onClassified}
+          onCancel={() => setCastOpen(false)}
+        />
+      </Show>
+      <Show when={castMessage()} keyed>
+        {(text) => <CastFlash text={text} />}
+      </Show>
       <div
         style={{
           flex: 1,
@@ -102,6 +172,31 @@ export function MixerScreen(): JSX.Element {
 interface PresetHeaderProps {
   activeCount: number;
   totalCount: number;
+  onCast: () => void;
+}
+
+function CastFlash(props: { text: string }): JSX.Element {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        bottom: "var(--s7)",
+        left: "50%",
+        transform: "translateX(-50%)",
+        "z-index": 80,
+        padding: "var(--s3) var(--s5)",
+        "border-radius": "var(--r-pill)",
+        background: "var(--surface-2)",
+        border: "1px solid var(--line-glow)",
+        "box-shadow": "var(--shadow-2)",
+        "font-size": "var(--t-sm)",
+        color: "var(--text-hi)",
+        "pointer-events": "none",
+      }}
+    >
+      {props.text}
+    </div>
+  );
 }
 
 function PresetHeader(props: PresetHeaderProps): JSX.Element {
@@ -146,6 +241,15 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
         </div>
       </div>
       <div style={{ flex: 1 }} />
+      <Button
+        variant="ghost"
+        size="sm"
+        icon="bolt"
+        onClick={props.onCast}
+        title="Cast a glyph (G)"
+      >
+        Cast
+      </Button>
       <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}>
         <span class="eyebrow">Compare</span>
         <Segmented

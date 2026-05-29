@@ -21,6 +21,7 @@ import { Segmented } from "../components/Segmented";
 import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
+import { clearWizardSeenFlag } from "../components/Wizard";
 import { useApp, type HotkeyAction } from "../stores/app";
 import type { GlyphId, TweaksState } from "../types";
 
@@ -1002,7 +1003,10 @@ function AboutSection(): JSX.Element {
           <Button
             variant="ghost"
             icon="refresh"
-            onClick={() => app.setWizardOpen(true)}
+            onClick={() => {
+              clearWizardSeenFlag();
+              app.setWizardOpen(true);
+            }}
           >
             Replay setup
           </Button>

@@ -4,6 +4,50 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-29 — Phase 7: first-run wizard + glyph casting
+
+### Added
+
+- **First-run wizard** (`src/components/Wizard.tsx`): a four-step ceremony shown automatically the first time DivoraVoice is launched.
+  - **Welcome** — display headline, four pillar cards (Local-first / Private / Free / Real-time).
+  - **Virtual cable** — auto-refreshes `virtualMicStatus` on entry; emerald banner when VB-Cable is detected, gold warning + Download button (opens `https://vb-audio.com/Cable/` via the Tauri shell plugin) when missing. Re-scan ghost button.
+  - **Devices** — auto-refreshes inputs + outputs on entry; Microphone/Modulated-out selects backed by the same store as Settings; live HMeter under "Hearing you".
+  - **Ready** — emerald checkmark, "You're ready" headline, Discord routing instructions card.
+  - Ceremonial left rail with the DMark, a breathing radial-gradient sigil that swaps icon per step (`clean` → `output` → `mic` → `modulated`), and a step pill list with check-marks for completed steps.
+  - Persistent first-run gating via `localStorage["divora.wizardSeen"]`. Finish or skip writes the flag; `Settings → About → Replay setup` clears it and re-opens.
+- **Glyph casting on the Mixer** — pointer-trace gesture that switches the active preset based on which of four glyphs (▲ ▽ □ ○) the user draws.
+  - New `src/data/glyphs.ts` classifier:
+    - `dedupe` / `boundingBox` / `pathLength` / `resamplePath` (uniform arc-length resampling to 48 points) / `smooth` (3-tap moving average, off by default) / `turningAngles` (cyclic-aware) / `findCorners` (cyclic peak detection with minimum-separation dedup) / `endpointGap` (closed-path detector).
+    - `classifyGlyph(points, config?)` → `"triangle" | "invtriangle" | "square" | "circle" | null`. Pipeline: dedupe → bbox check → resample → smooth → check closedness → cyclic turning-angle pass → cyclic corner search. Decision tree: 0 corners ⇒ circle; 4 corners ⇒ square; 3 corners ⇒ triangle vs invtriangle via median-Y apex test (the corner whose Y is most distant from the median Y is the apex; apex above the median ⇒ ▲, apex below ⇒ ▽). Open paths and corner counts outside {0, 3, 4} return null.
+  - New `src/components/GlyphCastOverlay.tsx` — full-screen pointer-capture surface with a glowing dusk-violet stroke that traces the user's path. Floating instruction card while idle; Escape cancels.
+  - `MixerScreen.tsx` — new "Cast" button in the preset header opens the overlay; pressing `G` (when no field is focused) also opens it. On classification, calls `app.usePreset(app.glyphs[shape])` and surfaces a 2.4 s pill-shaped flash toast (`{glyph} → {preset name}` on success, "Glyph not recognised — try again" on null, "No preset bound to {glyph}" when the glyph maps to a missing preset).
+
+### Tests
+
+- **Frontend**: 105 → 129 (+24).
+  - 17 new classifier tests: `dedupe` / `boundingBox` / `pathLength` / `resamplePath` / `smooth` / `turningAngles` / `findCorners` / `endpointGap` + classify a clean circle, a noisy circle, a square, an upright triangle, an inverted triangle, plus null cases (tiny trace, too few points, single direction change) and custom-config overrides.
+  - 7 new wizard tests: first-launch renders welcome step, seen-flag auto-closes on mount, `clearWizardSeenFlag` erases the flag, Continue advances through every step + finish writes seen flag, Back walks backward, Skip closes and marks seen, opening the wizard re-runs the device + virtual-mic refresh effects.
+
+### Architecture notes
+
+- **Why a custom classifier instead of a library**: the four target glyphs are simple closed convex shapes and the user is drawing them quickly with a mouse / finger. The full `$1 Unistroke Recognizer` template-matching pipeline (rotation invariance, golden-section search) would be overkill; corner-counting on a cyclic turning-angle series catches every target with one tunable threshold. The classifier ships as a pure-function module so we can extend it (e.g. add pentagon / spiral) without touching React/Solid code.
+- **Why cyclic angles**: a glyph trace starts and ends at the same point; the corner at the seam would otherwise vanish because the endpoint-trim left both ends at 0 turning angle. Cyclic mode wraps neighbour lookups so the seam corner registers like any other, and the cyclic dedup in `findCorners` collapses the inevitable double-detection at the wrap.
+- **localStorage rather than the Tauri app-config plugin**: the wizard seen-flag is a UI preference, not user data. It's fine if it disappears (re-running setup is harmless), and we avoid pulling in another Tauri plugin / capability just for one boolean.
+- **`G` hotkey lives in `MixerScreen.tsx`, not the global shortcut store**: glyph casting only makes sense while the Mixer is visible. The local listener is cheap, scoped, and won't fight with system-level hotkeys the user may have bound to G.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (80 in divora-core)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (129)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The wizard turns "I downloaded this app and don't know where to start" into a three-minute guided rite that ends with audio actually routing into Discord. Glyph casting turns the Mixer from a static preset picker into a tactile spellcraft surface — draw a triangle, the chain swaps. Both features were on the design's must-have list since Phase 1; v0.7.0 makes them real.
+
 ## [0.6.1] — 2026-05-28 — Soundboard scroll + OGG-Opus decode
 
 ### Fixed
