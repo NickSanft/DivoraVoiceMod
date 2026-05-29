@@ -4,6 +4,47 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-29 — Field bugs from v0.7.0: PTM steal, blank sigils, no scroll
+
+Four reports from v0.7.0 that, taken together, made the app feel broken in normal use.
+
+### Fixed
+
+- **Push-to-modulate stole Space from every other app.** `DEFAULT_HOTKEY_BINDINGS.ptm` was `"Space"` and `App.tsx` called `syncHotkeyBindings()` on mount, which registered Space via `tauri-plugin-global-shortcut` — capturing the key system-wide so Discord, browsers, and games never saw it. Defaulted PTM to `""`. The in-app focused-window listener still handles Space because `ui.ptmKey` keeps its `"Space"` default, so PTM works while DivoraVoice is the active window without burning the key globally. Users who want a true OS-wide PTM can still bind one explicitly in Settings → Hotkeys.
+- **Mixer icon in the sidebar was blank.** SolidJS gotcha — the `SIGILS` map in `src/components/Sigil.tsx` stored *pre-evaluated* JSX elements (real DOM nodes built at module load). When two `<Sigil name="mixer">` components were mounted simultaneously (the sidebar nav + the wizard's "Real-time" pillar card), they shared a single DOM node; Solid moved it to the most recently mounted location and the earlier site went empty. Converted every entry in `SIGILS` to a factory (`() => JSX.Element`) and invoke at the use site (`SIGILS[props.name]()`), so each `<Sigil>` instance gets its own freshly built subtree.
+- **Presets icon disappeared after clicking Settings.** Same shared-DOM root cause as the Mixer bug — Settings → Glyph Casting renders four `<Select icon="presets">` rows, each of which mounts a `<Sigil name="presets">`. Navigating to Settings instantiated them and yanked the shared DOM node away from the sidebar. Fixed by the same `SIGILS` factory conversion.
+- **Scrolling didn't work in any tall screen** (Settings, Presets editor, etc.). `#root` had no CSS rules; the App's outer `<div>` set `height: 100%`, which then had no parent height to resolve against and collapsed the entire flex chain. Tall screens rendered at content-size, which exceeded the viewport, and `body { overflow: hidden }` clipped the excess silently. Added `#root { height: 100% }` to anchor the chain. (The v0.6.1 SoundboardScreen restructure fixed the *internal* layout there; this is the missing *outer* anchor that affected every other screen.)
+
+### Tests
+
+- **Frontend**: 129 → 136 (+7).
+  - 3 new Sigil tests: two `<Sigil>` instances with the same name render independent SVG subtrees (the regression catch for bugs 2 + 3) for both `presets` and `mixer`, plus a mixed-glyph render test.
+  - 2 new `styles.css` source-level tests: `#root { height: 100% }` is present (the regression catch for bug 4); `html, body { height: 100% }` + `body { overflow: hidden }` survive future edits.
+  - 2 updated store tests: `hotkeyBindings.ptm` now defaults to `""` (regression catch for bug 1) and `syncHotkeyBindings` with an empty default produces zero `register_global_shortcut` calls. Added a positive test that `ui.ptmKey` still defaults to `"Space"` so the in-app fallback works.
+- **Rust**: 80 (unchanged — no Rust changes in this patch).
+
+### Build / tooling
+
+- Added `@types/node` devDependency so test files can use `node:fs` / `node:path` / `node:url` for source-level assertions like the styles.css inspection.
+
+### Architecture notes
+
+- **Why `SIGILS` as a factory map and not a `<Switch>` of literals**: factories keep every glyph definition co-located with its name in a single object literal, which is what `SIGIL_NAMES` enumerates for tests and pickers. A `<Switch>` would scatter the same definitions and break that enumeration.
+- **Why the in-app PTM fallback is enough as the default**: Discord / OBS / browsers are where users want PTM to feel responsive, and DivoraVoice has to be focused to do anything useful (you're picking a preset, adjusting effects, or watching the spell circle). If you Alt-Tab away DivoraVoice goes quiet, which is the expected behaviour. Users who genuinely want PTM-while-game-focused are a smaller cohort and they can bind a modifier-chord (Ctrl+Space, Right Alt) in Settings.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (80)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (136)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+v0.7.0 was technically feature-complete but felt broken: the wizard launched, the sidebar showed blank icons, you couldn't scroll Settings, and Space was hijacked from your other apps. Four small fixes restore the baseline experience. Phase 8 picks back up with new features (likely soundboard hotkeys / tile reordering / additional DSP) once we've confirmed v0.7.1 is solid.
+
 ## [0.7.0] — 2026-05-29 — Phase 7: first-run wizard + glyph casting
 
 ### Added

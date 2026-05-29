@@ -28,6 +28,7 @@
     "@solidjs/testing-library": "^0.8.10",
     "@tauri-apps/cli": "^2.1.0",
     "@testing-library/jest-dom": "^6.6.0",
+    "@types/node": "^25.9.1",
     "@vitest/coverage-v8": "^2.1.0",
     "autoprefixer": "^10.4.20",
     "jsdom": "^25.0.0",
@@ -43,6 +44,8 @@
   },
   "packageManager": "pnpm@10.32.1",
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

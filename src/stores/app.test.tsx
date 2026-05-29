@@ -634,11 +634,20 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
     expect(result.virtualMicStatus()).toBeNull();
   });
 
-  it("hotkeyBindings default to Space for PTM and empty for panic + monitor", () => {
+  it("hotkeyBindings default to empty for every action so we don't steal keys system-wide", () => {
+    // v0.7.1 fix: the previous Space-as-default PTM was registered via
+    // tauri-plugin-global-shortcut and captured Space from every other
+    // app on Windows. The in-app focused-window listener still handles
+    // Space (via ui.ptmKey, which stays "Space") so PTM works in-app.
     const { result } = setupApp();
-    expect(result.hotkeyBindings.ptm).toBe("Space");
+    expect(result.hotkeyBindings.ptm).toBe("");
     expect(result.hotkeyBindings.panic).toBe("");
     expect(result.hotkeyBindings.monitor).toBe("");
+  });
+
+  it("ui.ptmKey defaults to Space so the in-app focused-window PTM still works", () => {
+    const { result } = setupApp();
+    expect(result.ui.ptmKey).toBe("Space");
   });
 
   it("setHotkeyBinding stores the accelerator and forwards to the backend", async () => {
@@ -699,7 +708,7 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
 
   it("syncHotkeyBindings registers every non-empty binding (and skips empty ones)", async () => {
     const { result } = setupApp();
-    // PTM defaults to "Space"; set panic + leave monitor empty.
+    // Bind panic + leave PTM and monitor empty (defaults are empty in v0.7.1).
     await result.setHotkeyBinding("panic", "Ctrl+Shift+P");
     invokeMock.mockClear();
     await result.syncHotkeyBindings();
@@ -707,7 +716,20 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
       (c) => c[0] === "register_global_shortcut",
     );
     const ids = calls.map((c) => (c[1] as { id: string }).id).sort();
-    expect(ids).toEqual(["panic", "ptm"]);
+    expect(ids).toEqual(["panic"]);
+  });
+
+  it("syncHotkeyBindings is a no-op when every binding is empty (the default)", async () => {
+    // v0.7.1 fix: makes sure the default state never registers any
+    // system-wide hotkey. Otherwise the bug where Space gets captured
+    // from every other app would silently come back.
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.syncHotkeyBindings();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "register_global_shortcut",
+      expect.anything(),
+    );
   });
 
   it("tweaks default to mystical=1, grain=false, vignette=false (Phase 6 fields)", () => {

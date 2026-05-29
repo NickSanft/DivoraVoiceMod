@@ -106,8 +106,24 @@ export interface AbSnapshots {
 /** Stable id used for the system-wide hotkeys we register. */
 export type HotkeyAction = "ptm" | "panic" | "monitor";
 
+/**
+ * Default hotkey bindings are intentionally EMPTY — registering any
+ * accelerator (especially a plain key like "Space") via
+ * `tauri-plugin-global-shortcut` captures it system-wide, meaning
+ * Discord / games / browsers never see the keypress while DivoraVoice
+ * runs. That's a bad default for a tool a user might leave open in the
+ * background.
+ *
+ * The in-app focused-window PTM listener in `App.tsx` reads
+ * `ui.ptmKey` (which still defaults to "Space" via `defaultUi()`) and
+ * only fires while DivoraVoice is the active window — so Space-to-
+ * modulate still works in-app, without stealing the key globally.
+ *
+ * Users who want a true global hotkey (e.g. to PTM while a game is
+ * focused) can bind one explicitly in Settings → Hotkeys.
+ */
 const DEFAULT_HOTKEY_BINDINGS: Record<HotkeyAction, string> = {
-  ptm: "Space",
+  ptm: "",
   panic: "",
   monitor: "",
 };

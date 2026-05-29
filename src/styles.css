@@ -174,6 +174,16 @@
     margin: 0;
   }
 
+  /* SolidJS mounts the App into #root. Without an explicit height the
+     App's `height: 100%` has no anchor to resolve against — the flex
+     chain collapses, screens get content-sized, and tall screens get
+     clipped silently by `body { overflow: hidden }` (looks like
+     "scrolling doesn't work"). Anchoring #root to viewport height
+     restores the chain. */
+  #root {
+    height: 100%;
+  }
+
   body {
     background: var(--bg);
     color: var(--text-hi);
