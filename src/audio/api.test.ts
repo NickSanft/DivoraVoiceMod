@@ -11,10 +11,14 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  clearEffectChain,
   getEngineStatus,
   listInputDevices,
   listOutputDevices,
   setAudioMonitor,
+  setEffectChain,
+  setEffectEnabled,
+  setEffectParam,
   startAudioEngine,
   stopAudioEngine,
   subscribeLevels,
@@ -93,6 +97,45 @@ describe("audio api", () => {
     const status = await getEngineStatus();
     expect(invokeMock).toHaveBeenCalledWith("audio_engine_status");
     expect(status.running).toBe(true);
+  });
+
+  it("setEffectChain forwards the spec list", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await setEffectChain([
+      { kind: "gate", enabled: true, params: { thresh: -48 } },
+      { kind: "reverb", enabled: false, params: { size: 40, mix: 25 } },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("set_effect_chain", {
+      specs: [
+        { kind: "gate", enabled: true, params: { thresh: -48 } },
+        { kind: "reverb", enabled: false, params: { size: 40, mix: 25 } },
+      ],
+    });
+  });
+
+  it("setEffectParam forwards index/key/value", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await setEffectParam(2, "shift", -5);
+    expect(invokeMock).toHaveBeenCalledWith("set_effect_param", {
+      index: 2,
+      key: "shift",
+      value: -5,
+    });
+  });
+
+  it("setEffectEnabled forwards index + enabled flag", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await setEffectEnabled(1, false);
+    expect(invokeMock).toHaveBeenCalledWith("set_effect_enabled", {
+      index: 1,
+      enabled: false,
+    });
+  });
+
+  it("clearEffectChain invokes clear_effect_chain", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await clearEffectChain();
+    expect(invokeMock).toHaveBeenCalledWith("clear_effect_chain");
   });
 
   it("subscribeLevels listens on audio-levels and forwards payloads", async () => {

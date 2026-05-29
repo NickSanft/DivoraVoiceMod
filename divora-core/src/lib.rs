@@ -6,6 +6,7 @@
 //! virtual-mic routing all build on top of this in later phases.
 
 pub mod audio;
+pub mod dsp;
 
 /// Returns the project name. Useful as a smoke test for the workspace build.
 #[must_use]

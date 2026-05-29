@@ -7,8 +7,10 @@
 
 import {
   createContext,
+  createEffect,
   createMemo,
   createSignal,
+  on,
   type JSX,
   type Setter,
   useContext,
@@ -19,9 +21,13 @@ import {
   listInputDevices,
   listOutputDevices,
   setAudioMonitor as setAudioMonitorCmd,
+  setEffectChain as setEffectChainCmd,
+  setEffectEnabled as setEffectEnabledCmd,
+  setEffectParam as setEffectParamCmd,
   startAudioEngine,
   stopAudioEngine,
   type DeviceInfo,
+  type EffectSpec,
   type Levels,
   type StreamInfo,
 } from "../audio/api";
@@ -29,6 +35,7 @@ import { PRESETS } from "../data/presets";
 import type {
   AbSlot,
   ChainEntry,
+  EffectId,
   GlyphId,
   NavId,
   Preset,
@@ -134,6 +141,16 @@ export interface AppState {
   toggleMonitor: () => Promise<void>;
   setMonitor: (enabled: boolean) => Promise<void>;
 
+  // DSP / chain editing — local store mutation + backend sync.
+  setChainParam: (effectIndex: number, key: string, value: number) => void;
+  setChainEnabled: (effectIndex: number, enabled: boolean) => void;
+  toggleEffectById: (id: EffectId) => void;
+  syncChain: () => void;
+
+  // Currently selected rune (effect) for the inspector.
+  selectedEffect: () => EffectId | null;
+  setSelectedEffect: Setter<EffectId | null>;
+
   // Derived
   hasEnabled: () => boolean;
   effectiveModulated: () => boolean;
@@ -221,6 +238,64 @@ export function createAppState(): AppState {
 
   const toggleMonitor = (): Promise<void> => setMonitor(!engineMonitoring());
 
+  // Inspector selection — defaults to the first effect of the active chain.
+  const [selectedEffect, setSelectedEffect] = createSignal<EffectId | null>(
+    (firstPreset.chain[0]?.id as EffectId | undefined) ?? null,
+  );
+
+  // Whenever the active preset changes, reset selection to its first effect.
+  createEffect(
+    on(presetId, () => {
+      const first = chain()[0]?.id ?? null;
+      setSelectedEffect(first);
+    }, { defer: true }),
+  );
+
+  const chainToSpecs = (entries: ChainEntry[]): EffectSpec[] =>
+    entries.map((e) => ({
+      kind: e.id,
+      enabled: e.enabled,
+      params: { ...e.vals },
+    }));
+
+  const syncChain = (): void => {
+    if (!engineRunning()) return;
+    void setEffectChainCmd(chainToSpecs(chain()));
+  };
+
+  // Send a full SetChain when either the active preset changes or the
+  // engine starts up. Per-param / per-toggle updates go through the
+  // explicit helpers below to avoid rebuilding the chain on every drag.
+  createEffect(
+    on([presetId, engineRunning], ([, running]) => {
+      if (running) {
+        void setEffectChainCmd(chainToSpecs(chain()));
+      }
+    }, { defer: true }),
+  );
+
+  const setChainParam = (effectIndex: number, key: string, value: number): void => {
+    setChains(presetId(), effectIndex, "vals", key, value);
+    if (engineRunning()) {
+      void setEffectParamCmd(effectIndex, key, value);
+    }
+  };
+
+  const setChainEnabled = (effectIndex: number, enabled: boolean): void => {
+    setChains(presetId(), effectIndex, "enabled", enabled);
+    if (engineRunning()) {
+      void setEffectEnabledCmd(effectIndex, enabled);
+    }
+  };
+
+  const toggleEffectById = (id: EffectId): void => {
+    const idx = chain().findIndex((c) => c.id === id);
+    if (idx < 0) return;
+    const entry = chain()[idx];
+    if (!entry) return;
+    setChainEnabled(idx, !entry.enabled);
+  };
+
   return {
     nav,
     setNav,
@@ -265,6 +340,14 @@ export function createAppState(): AppState {
     stopEngine,
     toggleMonitor,
     setMonitor,
+
+    setChainParam,
+    setChainEnabled,
+    toggleEffectById,
+    syncChain,
+
+    selectedEffect,
+    setSelectedEffect,
 
     hasEnabled,
     effectiveModulated,

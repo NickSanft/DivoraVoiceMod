@@ -170,3 +170,94 @@ describe("app store — Phase 2 audio actions", () => {
     expect(result.engineMonitoring()).toBe(true);
   });
 });
+
+describe("app store — Phase 3 DSP chain", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+  });
+
+  it("setChainParam updates the local chain entry", () => {
+    const { result } = setupApp();
+    const beforeIdx = result.chain().findIndex((c) => c.id === "gate");
+    expect(beforeIdx).toBeGreaterThanOrEqual(0);
+    result.setChainParam(beforeIdx, "thresh", -30);
+    const after = result.chain()[beforeIdx]!;
+    expect(after.vals.thresh).toBe(-30);
+  });
+
+  it("setChainParam does NOT call backend when engine is stopped", () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    result.setChainParam(0, "thresh", -40);
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_effect_param",
+      expect.anything(),
+    );
+  });
+
+  it("setChainParam forwards to backend when engine is running", () => {
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    invokeMock.mockClear();
+    result.setChainParam(0, "thresh", -42);
+    expect(invokeMock).toHaveBeenCalledWith("set_effect_param", {
+      index: 0,
+      key: "thresh",
+      value: -42,
+    });
+  });
+
+  it("setChainEnabled flips the local flag", () => {
+    const { result } = setupApp();
+    // Store entries are reactive proxies; snapshot the primitive before
+    // mutating so the comparison isn't reading the post-mutation value.
+    const wasEnabled = result.chain()[0]!.enabled;
+    result.setChainEnabled(0, !wasEnabled);
+    expect(result.chain()[0]!.enabled).toBe(!wasEnabled);
+  });
+
+  it("toggleEffectById finds by id and flips", () => {
+    const { result } = setupApp();
+    const gateIdx = result.chain().findIndex((c) => c.id === "gate");
+    const wasEnabled = result.chain()[gateIdx]!.enabled;
+    result.toggleEffectById("gate");
+    expect(result.chain()[gateIdx]!.enabled).toBe(!wasEnabled);
+  });
+
+  it("syncChain is a no-op when engine is stopped", () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    result.syncChain();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_effect_chain",
+      expect.anything(),
+    );
+  });
+
+  it("syncChain sends SetChain when engine is running", () => {
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    invokeMock.mockClear();
+    result.syncChain();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_effect_chain",
+      expect.objectContaining({ specs: expect.any(Array) }),
+    );
+  });
+
+  it("changing presetId resets the inspector selection", () => {
+    const { result } = setupApp();
+    result.setSelectedEffect("reverb");
+    expect(result.selectedEffect()).toBe("reverb");
+    // Pick the second preset; its first effect should be the new selection.
+    const next = result.preset(); // current
+    // Pick any other preset id.
+    const otherId = "static-wraith";
+    result.setPresetId(otherId);
+    // Selection updates via the createEffect on presetId.
+    // The first effect of static-wraith is "gate".
+    expect(result.selectedEffect()).not.toBe("reverb");
+    expect(next.id).not.toBe(otherId);
+  });
+});

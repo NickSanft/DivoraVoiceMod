@@ -247,6 +247,78 @@ hook and reads from the same `Arc<AudioEngine>` that commands mutate.
   placeholder, right rail with Voice status / Push-to-modulate /
   Monitor cards + engine error / offline cards as needed.
 
-## Phase 3+ — (placeholders)
+## Phase 3 — DSP effect chain + spell circle
+
+### Module layout (added)
+
+```
+divora-core/src/dsp/
+├── mod.rs         # AudioEffect trait + EffectChain + EffectKind + EffectSpec + DspCommand
+├── gate.rs        # NoiseGate (hysteresis envelope follower)
+├── eq.rs          # 3-band EQ (low-shelf 200 Hz / peak 1 kHz / high-shelf 5 kHz, biquad)
+├── distortion.rs  # tanh soft-clip + drive normalisation
+├── echo.rs        # circular delay + feedback
+├── reverb.rs      # Schroeder-style: 4 parallel combs + 2 series allpasses
+├── robot.rs       # ring modulator + sine carrier
+├── pitch.rs       # dual-read varispeed shifter (Phase 3 stub)
+└── formant.rs     # 3 parallel band-passes at vowel formants (Phase 3 stub)
+
+src/
+├── components/
+│   ├── SpellCircle.tsx    # signature SVG visualization + nodePositions helper
+│   └── Inspector.tsx      # selected-rune card
+└── screens/MixerScreen.tsx  # composes preset header + meters + SpellCircle + right rail + Inspector
+```
+
+### DSP architecture
+
+- `EffectChain` is owned by the audio output callback. No locks; no contention with the UI thread.
+- The UI sends `DspCommand`s through a SPSC `mpsc` channel that's recreated on every engine start. The callback drains the channel at the top of each buffer.
+- `EffectChain::apply(cmd)` is the single mutation point. `SetChain` allocates (rebuilds the `Vec<Box<dyn AudioEffect>>`); `SetParam` / `SetEnabled` mutate in place.
+- Engine restarts (Stop → Start) clear the chain; the frontend re-sends `SetChain` via a `createEffect` on `(presetId, engineRunning)`.
+
+### Frontend chain sync
+
+```
+Inspector slider drag
+    └─ app.setChainParam(idx, key, value)
+        ├─ setChains(presetId, idx, "vals", key, value)   (local reactive update)
+        └─ setEffectParam(idx, key, value)                (Tauri → audio thread)
+
+SpellCircle double-click on node
+    └─ app.toggleEffectById(id)
+        └─ app.setChainEnabled(idx, !enabled)
+            ├─ setChains(presetId, idx, "enabled", !enabled)
+            └─ setEffectEnabled(idx, !enabled)
+
+User picks a different preset (Phase 4 will surface this)
+    └─ app.setPresetId(id)
+        └─ createEffect(on([presetId, engineRunning])) fires
+            └─ setEffectChain(chainToSpecs(chain()))     (full SetChain)
+```
+
+### Spell circle geometry
+
+`nodePositions(n)` distributes `n` nodes evenly around a circle of radius 158 centred at (220, 220), starting at -90° (top). Stack contents (back to front):
+
+1. Ambient radial-gradient glow (`url(#sc-coreGlow)`).
+2. Pulse rings (motion-gated, two phase-offset rings using `pulse-ring` keyframe).
+3. Outer decorative ring + runic tick marks (mystical-gated, counter-rotating).
+4. Constellation dots (rich-mystical only).
+5. Mid orbit dashes (rotating).
+6. Orbiting spark (motion-gated).
+7. Threads from core to each effect (animated `dash-flow` when modulated).
+8. Core rings + filled core.
+9. Particles drifting up (modulated + motion).
+10. Centre label (voice sigil + status text).
+11. Effect node buttons (click selects; double-click toggles).
+
+### Phase 3 quality caveats
+
+- Pitch / Formant are placeholders that respond to sliders but don't preserve formants / harmonic structure. Real algorithms (phase vocoder, LPC) land in a later phase.
+- `SetChain` allocates on the audio callback. Acceptable for Phase 3; can be moved off-thread in Phase 8 polish.
+- No global hotkey yet; PTM still goes through the in-app `Space` listener. Global hotkey registration via `tauri-plugin-global-shortcut` lands with the Settings hotkey UI.
+
+## Phase 4+ — (placeholders)
 
 To be filled in as each phase lands.

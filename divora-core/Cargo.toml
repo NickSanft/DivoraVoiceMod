@@ -11,6 +11,7 @@ description = "Audio engine and DSP primitives for Divora"
 workspace = true
 
 [dependencies]
+biquad = "0.5"
 cpal = "0.15"
 ringbuf = "0.4"
 serde = { version = "1", features = ["derive"] }

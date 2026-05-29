@@ -1,25 +1,23 @@
-// Mixer (Phase 2 — half-real).
-//
-// Phase 2 lights up the IN/OUT vertical meters (driven by real audio
-// when the engine is running) and the right rail's voice status,
-// push-to-modulate, and monitor toggle cards. The spell circle in the
-// middle is a Phase 3 deliverable; until then a calm placeholder fills
-// that space without breaking the layout from the design screenshots.
+// Mixer — Phase 3 lights up the spell circle and the selected-rune
+// inspector. Effects orbit a glowing voice core; threads of light
+// connect enabled effects to the core; the inspector lets the user
+// tweak the focused effect live.
 
 import { Show, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
+import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
 import { VMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
-import { Sigil } from "../components/Sigil";
+import { Sigil, type SigilName } from "../components/Sigil";
+import { SpellCircle } from "../components/SpellCircle";
 import { Toggle } from "../components/Toggle";
 import { statusMeta } from "../shell/statusMeta";
 import { useApp } from "../stores/app";
-import type { PtmMode } from "../types";
+import type { EffectId, PtmMode } from "../types";
 
 export function MixerScreen(): JSX.Element {
   const app = useApp();
-  const meta = () => statusMeta(app.status());
   const activeCount = () => app.chain().filter((c) => c.enabled).length;
   const totalCount = () => app.chain().length;
 
@@ -68,7 +66,15 @@ export function MixerScreen(): JSX.Element {
             "justify-content": "center",
           }}
         >
-          <SpellCirclePlaceholder color={meta().color} />
+          <SpellCircle
+            chain={app.chain()}
+            status={app.status()}
+            motion={app.tweaks.motion}
+            mystical={app.tweaks.mystical}
+            selected={app.selectedEffect()}
+            onSelect={(id) => app.setSelectedEffect(id)}
+            onToggle={(id) => app.toggleEffectById(id)}
+          />
         </div>
         <div
           style={{
@@ -121,33 +127,21 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
           color: app.preset().color,
         }}
       >
-        <Sigil name={app.preset().glyph as import("../components/Sigil").SigilName} size={22} />
+        <Sigil name={app.preset().glyph as SigilName} size={22} />
       </div>
       <div style={{ display: "flex", "flex-direction": "column", gap: "2px" }}>
         <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}>
-          <h2
-            class="display"
-            style={{ "font-size": "26px", "font-weight": 700 }}
-          >
+          <h2 class="display" style={{ "font-size": "26px", "font-weight": 700 }}>
             {app.preset().name}
           </h2>
           <Badge tone={app.preset().tag === "Bundled" ? "accent" : "info"}>
             {app.preset().tag}
           </Badge>
         </div>
-        <div
-          style={{
-            "font-size": "var(--t-sm)",
-            color: "var(--text-lo)",
-          }}
-        >
+        <div style={{ "font-size": "var(--t-sm)", color: "var(--text-lo)" }}>
           {props.activeCount} of {props.totalCount} runes active
           <Show when={app.streamInfo()}>
-            {(info) => (
-              <span>
-                {" "}· routed via {info().outputName}
-              </span>
-            )}
+            {(info) => <span> · routed via {info().outputName}</span>}
           </Show>
         </div>
       </div>
@@ -160,43 +154,6 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
           onChange={(v) => app.setUi("ab", v as "A" | "B")}
           accent
         />
-      </div>
-    </div>
-  );
-}
-
-function SpellCirclePlaceholder(props: { color: string }): JSX.Element {
-  return (
-    <div
-      style={{
-        width: "min(440px, 100%)",
-        "aspect-ratio": "1 / 1",
-        "border-radius": "50%",
-        border: `1px dashed ${props.color}55`,
-        position: "relative",
-        display: "grid",
-        "place-items": "center",
-        background: `radial-gradient(circle at center, ${props.color}11, transparent 70%)`,
-        animation: "breathe calc(3.2s / max(var(--motion), 0.001)) ease-in-out infinite",
-      }}
-    >
-      <div style={{ "text-align": "center", color: "var(--text-lo)" }}>
-        <div class="eyebrow" style={{ "margin-bottom": "8px" }}>
-          Spell circle
-        </div>
-        <div
-          style={{
-            "font-family": "var(--font-display)",
-            "font-size": "var(--t-h2)",
-            color: "var(--text-mid)",
-            "font-weight": 600,
-          }}
-        >
-          Arrives in Phase 3
-        </div>
-        <div style={{ "font-size": "var(--t-xs)", "margin-top": "6px" }}>
-          Effects orbit a glowing voice core, threaded with light.
-        </div>
       </div>
     </div>
   );
@@ -218,6 +175,7 @@ function RightRail(): JSX.Element {
       <VoiceStatusCard />
       <PushToModulateCard />
       <MonitorCard />
+      <Inspector />
       <Show when={app.engineError()}>
         {(err) => (
           <div
@@ -344,7 +302,7 @@ function PushToModulateCard(): JSX.Element {
       />
       <button
         type="button"
-        class={`btn btn-secondary btn-block ${pressed() ? "" : ""}`}
+        class="btn btn-secondary btn-block"
         style={{
           "margin-top": "var(--s3)",
           height: "44px",
@@ -429,3 +387,6 @@ function DbReadout(props: DbReadoutProps): JSX.Element {
     </div>
   );
 }
+
+// Silence unused-import lint when Phase 3 hasn't wired ID inference yet.
+void (null as EffectId | null);

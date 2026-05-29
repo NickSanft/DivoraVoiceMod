@@ -88,3 +88,46 @@ export async function subscribeLevels(
 
 /** Empty level snapshot. Useful as a default when the engine isn't running. */
 export const ZERO_LEVELS: Levels = { rms: 0, peak: 0 };
+
+// ---- DSP ----
+
+/** Mirrors `EffectKind` in `divora-core::dsp`. Lowercase to match the serde rename. */
+export type EffectKindWire =
+  | "gate"
+  | "pitch"
+  | "formant"
+  | "eq"
+  | "robot"
+  | "distortion"
+  | "echo"
+  | "reverb";
+
+/** Wire format for one effect in the chain. */
+export interface EffectSpec {
+  kind: EffectKindWire;
+  enabled: boolean;
+  params: Record<string, number>;
+}
+
+export async function setEffectChain(specs: EffectSpec[]): Promise<void> {
+  await invoke("set_effect_chain", { specs });
+}
+
+export async function setEffectParam(
+  index: number,
+  key: string,
+  value: number,
+): Promise<void> {
+  await invoke("set_effect_param", { index, key, value });
+}
+
+export async function setEffectEnabled(
+  index: number,
+  enabled: boolean,
+): Promise<void> {
+  await invoke("set_effect_enabled", { index, enabled });
+}
+
+export async function clearEffectChain(): Promise<void> {
+  await invoke("clear_effect_chain");
+}

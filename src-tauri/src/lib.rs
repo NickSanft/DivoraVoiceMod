@@ -14,6 +14,7 @@ use divora_core::audio::{
     list_input_devices as list_input_devices_core, list_output_devices as list_output_devices_core,
     AudioEngine, DeviceInfo, Levels, StreamInfo,
 };
+use divora_core::dsp::{DspCommand, EffectSpec};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -97,6 +98,30 @@ fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
     }
 }
 
+#[tauri::command]
+fn set_effect_chain(state: State<'_, AppState>, specs: Vec<EffectSpec>) {
+    state.engine.send_dsp(DspCommand::SetChain { specs });
+}
+
+#[tauri::command]
+fn set_effect_param(state: State<'_, AppState>, index: usize, key: String, value: f32) {
+    state
+        .engine
+        .send_dsp(DspCommand::SetParam { index, key, value });
+}
+
+#[tauri::command]
+fn set_effect_enabled(state: State<'_, AppState>, index: usize, enabled: bool) {
+    state
+        .engine
+        .send_dsp(DspCommand::SetEnabled { index, enabled });
+}
+
+#[tauri::command]
+fn clear_effect_chain(state: State<'_, AppState>) {
+    state.engine.send_dsp(DspCommand::Clear);
+}
+
 /// Spawn a background thread that emits `audio-levels` events to the
 /// frontend at ~30 Hz. The frontend uses these to drive live meters
 /// and the status pill without polling commands.
@@ -138,6 +163,10 @@ pub fn run() {
             stop_audio_engine,
             set_audio_monitor,
             audio_engine_status,
+            set_effect_chain,
+            set_effect_param,
+            set_effect_enabled,
+            clear_effect_chain,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");

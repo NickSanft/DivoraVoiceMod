@@ -33,6 +33,24 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] When engine is stopped, Mixer shows "Engine offline" card with a clickable Settings link.
 - [ ] Sample-rate mismatch test: pick devices with different default sample rates (e.g., 44.1 kHz mic + 48 kHz output) → start fails with a clear "sample-rate mismatch" error message.
 
+## Effects + Spell Circle (Phase 3)
+
+- [ ] Open Mixer; spell circle is drawn with all effects orbiting the voice core.
+- [ ] Enabled effects show light-gradient threads to the core; disabled effects show dashed grey threads.
+- [ ] Click an effect node → it gets a focus ring + the right-rail Inspector updates to show its sigil + name + parameters.
+- [ ] Double-click an effect node → enabled flag flips; the thread style switches accordingly.
+- [ ] Voice core says "Clean" by default; hold Space → flips to "Modulated"; the core breathes and threads animate dash-flow; particles drift up.
+- [ ] In the Inspector, drag the Gate threshold slider → audible change within ~5 ms; OUT meter responds.
+- [ ] In the Inspector, drag the EQ Low slider → audible bass boost / cut.
+- [ ] In the Inspector, drag the Distortion drive → audible saturation that doesn't clip past unity.
+- [ ] In the Inspector, drag the Reverb mix → tail builds smoothly.
+- [ ] In the Inspector, drag the Echo time → repeats spacing changes.
+- [ ] In the Inspector, drag the Robot mix → voice gains the carrier tone.
+- [ ] Toggle an effect off in the Inspector → instant bypass; sound passes through cleanly.
+- [ ] Switch Tweaks → Mystical between subtle / balanced / rich → outer ring + tick marks + constellation dots appear/disappear.
+- [ ] Switch Tweaks → Motion to functional → animations stop; rich → animations run.
+- [ ] Switch the Color mood → spell circle colours follow.
+
 ## Presets
 
 - [ ] Default preset list loads on first run.

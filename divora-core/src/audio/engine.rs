@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::level::LevelMeter;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
+use crate::dsp::{DspCommand, EffectChain};
 
 /// Capacity of the SPSC ring buffer used between input and output
 /// callbacks. ~170 ms at 48 kHz; ample headroom for OS scheduling jitter.
@@ -52,6 +53,7 @@ enum Command {
     },
     Stop,
     SetMonitor(bool),
+    Dsp(DspCommand),
     Shutdown,
 }
 
@@ -114,6 +116,12 @@ impl AudioEngine {
         let _ = self.tx.send(Command::SetMonitor(enabled));
     }
 
+    /// Send a DSP command (chain build, parameter sweep, etc.). The
+    /// audio thread drains these at the top of each output buffer.
+    pub fn send_dsp(&self, cmd: DspCommand) {
+        let _ = self.tx.send(Command::Dsp(cmd));
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Acquire)
@@ -159,6 +167,7 @@ struct RunningStreams {
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
 fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
     let mut current: Option<RunningStreams> = None;
+    let mut dsp_tx: Option<Sender<DspCommand>> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Start {
@@ -168,13 +177,15 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             } => {
                 // Drop any existing streams before building new ones.
                 drop(current.take());
+                drop(dsp_tx.take());
                 state.running.store(false, Ordering::Release);
 
                 let result =
                     start_streams(input_name.as_deref(), output_name.as_deref(), state.clone());
                 current = match result {
-                    Ok((streams, info)) => {
+                    Ok((streams, info, new_dsp_tx)) => {
                         state.running.store(true, Ordering::Release);
+                        dsp_tx = Some(new_dsp_tx);
                         let _ = reply.send(Ok(info));
                         Some(streams)
                     }
@@ -186,6 +197,7 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             }
             Command::Stop => {
                 drop(current.take());
+                drop(dsp_tx.take());
                 state.running.store(false, Ordering::Release);
                 state.store_input(Levels::default());
                 state.store_output(Levels::default());
@@ -193,8 +205,14 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             Command::SetMonitor(enabled) => {
                 state.monitor.store(enabled, Ordering::Release);
             }
+            Command::Dsp(dsp_cmd) => {
+                if let Some(tx) = &dsp_tx {
+                    let _ = tx.send(dsp_cmd);
+                }
+            }
             Command::Shutdown => {
                 drop(current.take());
+                drop(dsp_tx.take());
                 state.running.store(false, Ordering::Release);
                 break;
             }
@@ -247,7 +265,7 @@ fn start_streams(
     input_name: Option<&str>,
     output_name: Option<&str>,
     state: Arc<EngineState>,
-) -> Result<(RunningStreams, StreamInfo), AudioEngineError> {
+) -> Result<(RunningStreams, StreamInfo, Sender<DspCommand>), AudioEngineError> {
     let input_device = find_device(Direction::Input, input_name)?;
     let output_device = find_device(Direction::Output, output_name)?;
 
@@ -281,6 +299,8 @@ fn start_streams(
     let rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
     let (producer, consumer) = rb.split();
 
+    let (dsp_tx, dsp_rx) = channel::<DspCommand>();
+
     let input_stream = build_input_stream(
         &input_device,
         &input_config,
@@ -296,6 +316,8 @@ fn start_streams(
         output_channels,
         consumer,
         state.clone(),
+        dsp_rx,
+        input_rate,
     )?;
 
     input_stream
@@ -318,6 +340,7 @@ fn start_streams(
             _output: output_stream,
         },
         info,
+        dsp_tx,
     ))
 }
 
@@ -387,6 +410,7 @@ fn build_input_stream(
     Ok(stream)
 }
 
+#[allow(clippy::too_many_arguments)] // builder-style; each arg is necessary
 fn build_output_stream(
     device: &Device,
     config: &StreamConfig,
@@ -394,6 +418,8 @@ fn build_output_stream(
     channels: u16,
     mut consumer: RingConsumer,
     state: Arc<EngineState>,
+    dsp_rx: Receiver<DspCommand>,
+    sample_rate: u32,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -408,6 +434,7 @@ fn build_output_stream(
     };
 
     let mut meter = LevelMeter::new();
+    let mut chain = EffectChain::new();
     let channels = channels as usize;
     let state_for_callback = state.clone();
 
@@ -418,6 +445,10 @@ fn build_output_stream(
                 if data.is_empty() || channels == 0 {
                     return;
                 }
+                // Drain any pending DSP commands before processing audio.
+                while let Ok(cmd) = dsp_rx.try_recv() {
+                    chain.apply(cmd);
+                }
                 let monitoring = state_for_callback.monitor.load(Ordering::Acquire);
                 let frames = data.len() / channels;
                 let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
@@ -427,6 +458,8 @@ fn build_output_stream(
                 for slot in &mut mono[zero_from..frames] {
                     *slot = 0.0;
                 }
+                // Run the DSP chain over the mono buffer.
+                chain.process(&mut mono[..frames], sample_rate);
                 // Fan out mono -> all output channels, or silence if not
                 // monitoring.
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {

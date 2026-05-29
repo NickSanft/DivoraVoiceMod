@@ -4,6 +4,50 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-28 — Phase 3: DSP effect chain + spell circle
+
+### Added
+
+- **`divora-core::dsp` module** — eight effects (`NoiseGate`, `Eq`, `Distortion`, `Echo`, `Reverb`, `Robot`, `PitchShift`, `FormantShift`) implementing the new `AudioEffect` trait plus an `EffectChain` that runs them in order over a mono buffer.
+- **`DspCommand` enum** — `SetChain { specs }`, `SetParam { index, key, value }`, `SetEnabled { index, enabled }`, `Clear`. Routed UI → engine thread → audio output callback via a fresh SPSC channel per stream start.
+- **AudioEngine.send_dsp(cmd)** — non-blocking handle through which the Tauri shell pushes chain edits.
+- **Tauri commands**: `set_effect_chain`, `set_effect_param`, `set_effect_enabled`, `clear_effect_chain`.
+- **`src/audio/api.ts`** — typed wrappers + `EffectSpec` / `EffectKindWire` types.
+- **Store extensions** in `src/stores/app.tsx`: `setChainParam`, `setChainEnabled`, `toggleEffectById`, `syncChain` actions; `selectedEffect` / `setSelectedEffect` signals; `createEffect`s that auto-send `SetChain` when the active preset or `engineRunning` flips, and per-param updates via the helper actions.
+- **`SpellCircle` component** (`src/components/SpellCircle.tsx`) — full SVG visualization ported from the prototype: ambient core glow, pulse rings, outer decorative ring with runic tick marks (`mystical >= 0.5`), constellation dots (`mystical >= 0.9`), rotating mid-orbit dashes, orbiting spark, gradient threads from core to enabled effects (animated `dash-flow` when modulated), breathing voice core with state-coloured ring + status sigil, drifting particles (when modulated). Effect nodes are clickable (select) and double-clickable (toggle enabled).
+- **`Inspector` component** — selected-rune card with sigil + name + enable toggle + description + one slider per parameter (bipolar variant for signed params). Sliders write straight through to `setChainParam` so live drag updates the audio thread on the next buffer.
+- **Mixer screen upgraded** — replaces the Phase 2 spell-circle placeholder with the real `SpellCircle`; Inspector slots into the right rail.
+
+### Quality scope for Phase 3
+
+- Gate, EQ, distortion, echo, reverb, robot are real algorithms.
+- **Pitch** ships a dual-read varispeed shifter — moves the slider, tracks the chain, audible artefacts on harmonic content. Real phase-vocoder lands later.
+- **Formant** ships a parallel band-pass colouring (three filters at typical vowel formants, scaled by `2^(shift/12)`). Real LPC-based formant warp lands later.
+
+### Tests
+
+- **Rust**: 36 tests (was 14). New: 5 chain tests, 3 gate, 3 distortion, 2 echo, 2 reverb, 2 robot, 2 EQ, 2 pitch, 1 formant.
+- **Frontend**: 55 tests (was 38). New: 5 SpellCircle math, 4 DSP API wrappers, 8 chain editing actions.
+
+### Pre-push checklist (local, 2026-05-28)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (36)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (55)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Architecture notes
+
+- DSP chain is **owned by the audio output callback** — no locks, no contention. Param updates land on the next buffer (~5 ms at 256 frames / 48 kHz).
+- `SetChain` allocates (`Box::new` per effect) in the audio callback. Acceptable for Phase 3; Phase 8 polish can move chain building off the audio thread.
+- `EffectChain::apply` is the single point of mutation called from the audio callback.
+
+### Why it matters
+
+The chain plumbing is now real. Phase 4 lands the preset editor and A/B compare on top of the same `SetChain` / `SetParam` / `SetEnabled` surface. The spell circle is the visual that pays off the dusk-violet design direction — every later phase plugs into it (preset switching, glyph casting, etc.).
+
 ## [0.2.0] — 2026-05-28 — Phase 2: Audio passthrough + real meters
 
 ### Added
