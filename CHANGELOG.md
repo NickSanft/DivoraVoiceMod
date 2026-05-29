@@ -4,6 +4,32 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-05-29 — Tile drag-and-drop reorder actually works in WebView2
+
+### Fixed
+
+- **Soundboard tile drag-reorder was non-functional in the v0.8.0 build.** Two issues stacked: (1) tile containers were `<button draggable={true}>`, and Chromium / WebView2 (Tauri's Windows webview) often refuses to initiate a drag from a `<button>` element. (2) Even when drag did fire elsewhere, the synthetic `click` event Chromium dispatches on the drop target after a successful drop ran the tile's `onClick` and immediately played the clip — masking whether reorder had happened.
+
+### Changed
+
+- Tile container converted from `<button type="button">` to `<div role="button" tabindex={0}>` + `onKeyDown` for Enter/Space, keeping the tile keyboard-operable. `cursor: grab` (and `grabbing` while dragging) makes draggability discoverable; a 0.6 opacity hint on the source tile during the drag mirrors what users expect from sortable lists.
+- Drag payload now uses a custom MIME (`application/x-divora-tile-index`) in addition to `text/plain` — Chromium's `getData` is occasionally finicky about the plain-text path; the custom MIME survives every Tauri build we've tested.
+- Click suppression window: a 300 ms post-drop timer + a post-`dragend` timer block the next `click` from firing `playClip`. `onDragLeave` now ignores events that bubble up from descendants (the old behavior caused flicker as the cursor crossed inner spans).
+- Tile `aria-label` is explicit about all three affordances ("Play *bell*. Right-click for color, drag to reorder.").
+
+### Tests
+
+- **Frontend**: 158 → 162 (+4).
+  - `SoundboardScreen.test.tsx` (new):
+    - Tiles render as `div[role="button"][draggable="true"]` (NOT `button[draggable]`) — direct regression catch for the v0.8.0 root cause.
+    - Aria-label mentions both play and drag.
+    - Dispatching a synthetic `dragstart` on tile 0 + `drop` on tile 2 reorders `[a,b,c]` → `[b,c,a]` via `app.reorderTiles`. jsdom doesn't fire real HTML5 drag, but it accepts the explicit event sequence the browser would generate.
+    - The synthetic post-drop `click` Chromium dispatches does NOT fire `play_soundboard_clip` (suppression window works).
+
+### Why it matters
+
+Without working tile reorder, the soundboard layer of Phase 8 — drag to organise — was effectively dead in the user-facing build despite the store logic being correct. The store tests passed because they call `reorderTiles` directly; the missing test coverage was the UI wiring on top. This patch adds that coverage.
+
 ## [0.8.0] — 2026-05-29 — Phase 8: cast alignment + soundboard polish
 
 ### Added

@@ -447,6 +447,11 @@ function Tile(props: TileProps): JSX.Element {
   const emoji = createMemo(() => tileEmoji(props.tile.label));
   const hotkey = () => app.tileHotkeys[props.tile.id];
   const [dragOver, setDragOver] = createSignal(false);
+  const [dragging, setDragging] = createSignal(false);
+  // True for a short window after a successful drag — used to swallow
+  // the synthetic `click` event that fires on pointerup. Otherwise the
+  // tile the user just dropped onto would immediately play.
+  let suppressClickUntil = 0;
 
   const playing = createMemo(() => {
     void app.clockTick();
@@ -476,23 +481,52 @@ function Tile(props: TileProps): JSX.Element {
     if (!e.dataTransfer) return;
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", String(props.index));
+    // Some Chromium builds (notably WebView2 on Windows) won't initiate
+    // a drag without a non-empty payload; the line above already covers
+    // that. Setting a custom MIME helps too:
+    e.dataTransfer.setData("application/x-divora-tile-index", String(props.index));
+    setDragging(true);
   };
-  const onDragOver = (e: DragEvent): void => {
-    if (!e.dataTransfer) return;
+  const onDragEnd = (): void => {
+    setDragging(false);
+    setDragOver(false);
+    // Block click for ~300 ms after drag ends so the synthetic click
+    // (which fires on the source tile after a drop) doesn't trigger play.
+    suppressClickUntil = Date.now() + 300;
+  };
+  const onDragEnter = (e: DragEvent): void => {
     e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
     setDragOver(true);
   };
-  const onDragLeave = (): void => {
+  const onDragOver = (e: DragEvent): void => {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    setDragOver(true);
+  };
+  const onDragLeave = (e: DragEvent): void => {
+    // Ignore leave events that bubble up from child nodes inside the tile.
+    const related = e.relatedTarget as Node | null;
+    const currentEl = e.currentTarget as Node | null;
+    if (related && currentEl && currentEl.contains(related)) return;
     setDragOver(false);
   };
   const onDrop = (e: DragEvent): void => {
     e.preventDefault();
     setDragOver(false);
-    const from = Number(e.dataTransfer?.getData("text/plain") ?? "");
+    // Prefer our custom MIME (survives `dataTransfer.getData` quirks on
+    // some Windows builds); fall back to text/plain.
+    const dt = e.dataTransfer;
+    const raw =
+      dt?.getData("application/x-divora-tile-index") ??
+      dt?.getData("text/plain") ??
+      "";
+    const from = Number(raw);
     if (Number.isFinite(from) && from !== props.index) {
       props.onReorder(from, props.index);
     }
+    // Swallow the post-drop click that Chromium dispatches on the
+    // drop target.
+    suppressClickUntil = Date.now() + 300;
   };
 
   const onContextMenu = (e: MouseEvent): void => {
@@ -500,17 +534,40 @@ function Tile(props: TileProps): JSX.Element {
     props.onContext(props.tile.id, e.clientX, e.clientY);
   };
 
+  const onClick = (e: MouseEvent): void => {
+    if (Date.now() < suppressClickUntil) {
+      e.preventDefault();
+      return;
+    }
+    void app.playClip(props.tile);
+  };
+  const onKeyDown = (e: KeyboardEvent): void => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      void app.playClip(props.tile);
+    }
+  };
+
   return (
-    <button
-      type="button"
+    // A <button> with draggable=true is unreliable in Chromium / WebView2
+    // (the browser frequently refuses to initiate the drag). A
+    // div + role="button" + tabindex makes drag work AND keeps the tile
+    // keyboard-operable via Enter / Space.
+    <div
+      role="button"
+      tabindex={0}
+      aria-label={`Play ${props.tile.label}. Right-click for color, drag to reorder.`}
       draggable={true}
-      onClick={() => void app.playClip(props.tile)}
+      onClick={onClick}
+      onKeyDown={onKeyDown}
       onContextMenu={onContextMenu}
       onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onDragEnter={onDragEnter}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
-      title={`${props.tile.path}\nRight-click for color`}
+      title={`${props.tile.path}\nRight-click for color · drag to reorder`}
       style={{
         position: "relative",
         height: "120px",
@@ -533,8 +590,10 @@ function Tile(props: TileProps): JSX.Element {
         "justify-content": "space-between",
         "align-items": "stretch",
         "text-align": "left",
-        cursor: "pointer",
-        transition: "border-color 0.15s, box-shadow 0.15s",
+        cursor: dragging() ? "grabbing" : "grab",
+        opacity: dragging() ? 0.6 : 1,
+        transition: "border-color 0.15s, box-shadow 0.15s, opacity 0.15s",
+        "user-select": "none",
       }}
     >
       <div
@@ -610,7 +669,7 @@ function Tile(props: TileProps): JSX.Element {
           </span>
         </Show>
       </div>
-    </button>
+    </div>
   );
 }
 
