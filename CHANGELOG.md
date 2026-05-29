@@ -4,6 +4,47 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-05-29 — SpellCircle keyframes + drag-from-empty-space cast
+
+Follow-up to v0.11.1. Two field reports:
+
+> "The 'Motion' and 'Mystical' Appearance options are still not working as expected from the mockup. Additionally, the drawing effects are not the same and require pressing the 'cast' button still unlike the mockup."
+
+v0.11.1 fixed the *values* and *persistence* of the Tweaks knobs, but on inspection the SpellCircle was driving six animation names — `breathe`, `spin-slow`, `spin-rev`, `pulse-ring`, `dash-flow`, `float-up` — that were referenced from the JS but **never defined as `@keyframes` in `styles.css`**. So the orbit didn't rotate, the pulse rings didn't pulse, the constellation didn't drift, and the particles didn't float. Motion appeared "broken" because there was literally nothing for the duration multiplier to scale. Mystical appeared "broken" because the visuals it gated (outer ring, ticks, constellation) were sitting in CSS that never animated even at `rich`.
+
+Separately, PLAN.md's Phase 11 spec for the cast called for "left-click drag on empty space (not on UI controls) starts capturing pointer trail" — but the only invocation paths shipped were the explicit Cast button and the `G` hotkey. The mockup expects the drag itself to *be* the gesture.
+
+### Fixed
+
+- **Missing SpellCircle `@keyframes` ported 1:1 from the prototype.** Added `breathe`, `spin-slow`, `spin-rev`, `pulse-ring`, `dash-flow`, `float-up` (and `shimmer`, used in future polish) as top-level rules in `src/styles.css`. Placed outside any `@layer` so animation-name lookups are unambiguous regardless of cascade order. The `breathe` keyframe additionally consumes `var(--motion)` directly so a low motion setting visibly damps both the opacity floor and the breathe amplitude even when `animation-duration` isn't overridden.
+
+### Added
+
+- **Drag-from-empty-space cast invocation.** A `pointerdown` on the Mixer's outer container now opens the cast overlay and immediately seeds it with the originating pointer, so the user's existing drag continues without a second mouse press. The Cast button + `G` hotkey remain unchanged as alternatives — this is purely additive.
+  - The MixerScreen exports `isInteractiveAncestor(target, root)` which walks up from the pointer target stopping at the cast root. Any `<button>`, `<input>`, `<select>`, `<textarea>`, `<a>`, `role="button|slider|switch"`, `contenteditable`, `.card`, or `data-cast-block` ancestor short-circuits the cast trigger so clicks on controls still go to the control. The walk halts at the root so chrome ancestors (titlebar, sidebar) don't false-positive.
+  - `GlyphCastOverlay` accepts an optional `seedPointer: { pointerId, clientX, clientY }` prop. When supplied, on mount it calls `setPointerCapture(pointerId)` on its root, pre-fills `points[0]` with the local-coord-mapped seed, sets `drawing=true`, and starts the rAF spark loop. A `try { … } catch` around capture means a fast click+release (pointer already up) degrades to "overlay open, idle blurb visible" instead of throwing.
+
+### Tests
+
+- **Frontend**: 179 → 209 (+30).
+  - 7 new tests in `styles.css > SpellCircle keyframes (v0.11.2)` — one per missing keyframe asserting `@keyframes <name>` is present, plus a regression test that `breathe` references `var(--motion)`.
+  - 1 new test asserting the `:root[data-motion="functional"] *` global rule still pins animation-duration + transition-duration to 0.001ms (v0.11.1's coverage was incomplete).
+  - 17 new tests in `MixerScreen > isInteractiveAncestor` — root-itself empty space; plain descendants; `<button>` direct + nested; `<input>` / `<select>` / `<textarea>` / `<a>`; `role="button|slider|switch"`; `.card`; `data-cast-block` opt-out; `contenteditable="true"` accepted + `"false"` ignored; walk terminates at the cast root; null start is defensive.
+  - 5 new tests in `GlyphCastOverlay seedPointer (v0.11.2)` — captures the seed pointer id on mount; enters drawing mode immediately (hides the idle blurb); without a seed does NOT call setPointerCapture; without a seed still shows the idle blurb (existing behavior preserved); survives a setPointerCapture failure without throwing.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (104)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (209)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+v0.11.1 made the *knobs* correct; v0.11.2 makes the *visuals they control* exist. Without the six SpellCircle keyframes, the Mixer's signature element was a static SVG no matter where Motion / Mystical were set — a clear "did anything actually happen?" UX failure. And drag-from-empty-space restores the mockup's headline gesture: the Mixer *is* the casting surface, not a screen with a Cast button stapled to it.
+
 ## [0.11.1] — 2026-05-29 — Settings → Appearance: Mystical + Motion actually do something
 
 Field report: "the Motion and Mystical Appearance options don't seem to be working as expected from the mockup."

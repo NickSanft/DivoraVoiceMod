@@ -293,6 +293,85 @@
 }
 
 /* ============================================================
+   ANIMATIONS
+   Top-level keyframes consumed by the SpellCircle and other
+   ambient visuals. Kept OUT of @layer so animation-name lookups
+   are unambiguous regardless of cascade order. Durations are
+   scaled per-element via the `dur()` helper in TS; the breathe
+   keyframe also reads `--motion` directly so a low motion setting
+   visibly damps both the opacity floor and the breathe amplitude
+   even without changing the duration.
+
+   Ported 1:1 from docs/mockups/prototype/divora/styles.css.
+   ============================================================ */
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: calc(0.55 + 0.1 * var(--motion));
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(calc(1 + 0.03 * var(--motion)));
+  }
+}
+
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes spin-rev {
+  to {
+    transform: rotate(-360deg);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes float-up {
+  0% {
+    transform: translateY(0) scale(1);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-46px) scale(0.4);
+    opacity: 0;
+  }
+}
+
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+
+@keyframes dash-flow {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
+/* ============================================================
    COMPONENT CLASSES
    Ported from docs/mockups/prototype/divora/components.css
    ============================================================ */

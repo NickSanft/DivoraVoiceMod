@@ -47,6 +47,18 @@ export interface GlyphCastOverlayProps {
   onClassified: (glyph: GlyphId | null, raw: Point[]) => void;
   /** Called when the user dismisses the overlay (Esc or backdrop click). */
   onCancel: () => void;
+  /**
+   * Optional seed event for drag-from-empty-space invocation. When the
+   * user starts a drag on the Mixer's empty space (i.e. not on a UI
+   * control), the Mixer passes the originating pointer event here so
+   * the overlay can take pointer capture and begin drawing immediately,
+   * without forcing the user to release and click again.
+   *
+   * The overlay attempts `setPointerCapture(pointerId)` on its root in
+   * onMount. If capture fails (pointer already up, browser policy),
+   * the overlay still renders and the user can re-press normally.
+   */
+  seedPointer?: { pointerId: number; clientX: number; clientY: number };
 }
 
 /**
@@ -193,6 +205,29 @@ export function GlyphCastOverlay(props: GlyphCastOverlayProps): JSX.Element {
 
   onMount(() => {
     measure();
+
+    // Drag-from-empty-space seeding: if the Mixer handed us an
+    // originating pointer event, take capture and pre-fill the trail
+    // so the user's existing drag flows straight into the overlay.
+    // Capture must happen on the SAME root we expect future pointer
+    // events to flow through.
+    const seed = props.seedPointer;
+    if (seed && rootRef) {
+      try {
+        rootRef.setPointerCapture(seed.pointerId);
+      } catch (err) {
+        // Pointer may have already ended (very fast click + release)
+        // or the browser may have rejected capture transfer. The
+        // overlay still renders and the user can re-press to draw.
+        console.warn("[cast] seed pointer capture failed", err);
+      }
+      const p = localPoint(svgRef ?? null, seed);
+      setPoints([p]);
+      setDrawing(true);
+      emitSparks(p.x, p.y);
+      ensureRaf();
+    }
+
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();

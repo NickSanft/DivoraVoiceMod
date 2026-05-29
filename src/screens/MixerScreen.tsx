@@ -19,16 +19,68 @@ import { statusMeta } from "../shell/statusMeta";
 import { useApp } from "../stores/app";
 import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
+/**
+ * True when a pointerdown's target should NOT trigger a cast gesture.
+ *
+ * The mockup says drag on EMPTY space starts the cast. We walk up from
+ * the event target, stopping when we hit either the cast root or any
+ * interactive ancestor (button, input, slider, contenteditable, card,
+ * or anything explicitly tagged `data-cast-block`). If we find one,
+ * the click belongs to that control — leave it alone.
+ *
+ * Exported so the empty-space-cast unit test can drive it directly
+ * without spinning up a full app store.
+ */
+export function isInteractiveAncestor(
+  start: Element | null,
+  stopAt: Element,
+): boolean {
+  let cur: Element | null = start;
+  while (cur && cur !== stopAt) {
+    const tag = cur.tagName;
+    if (
+      tag === "BUTTON" ||
+      tag === "INPUT" ||
+      tag === "SELECT" ||
+      tag === "TEXTAREA" ||
+      tag === "A"
+    ) {
+      return true;
+    }
+    const role = cur.getAttribute("role");
+    if (role === "button" || role === "slider" || role === "switch") {
+      return true;
+    }
+    // Read both the live `isContentEditable` getter (browsers) and the
+    // raw attribute (jsdom + defensive coverage when the host element
+    // is missing the HTMLElement prototype methods).
+    if (cur instanceof HTMLElement && cur.isContentEditable) return true;
+    const ce = cur.getAttribute("contenteditable");
+    if (ce !== null && ce !== "false") return true;
+    if (cur.classList?.contains("card")) return true;
+    if (cur.hasAttribute("data-cast-block")) return true;
+    cur = cur.parentElement;
+  }
+  return false;
+}
+
 export function MixerScreen(): JSX.Element {
   const app = useApp();
   const activeCount = () => app.chain().filter((c) => c.enabled).length;
   const totalCount = () => app.chain().length;
   const [castOpen, setCastOpen] = createSignal(false);
   const [castMessage, setCastMessage] = createSignal<string | null>(null);
+  /** Pointer seed forwarded to the overlay when the user starts the
+   *  cast by dragging on the Mixer's empty space rather than pressing
+   *  the explicit Cast button / G hotkey. Cleared on classify/cancel. */
+  const [seedPointer, setSeedPointer] = createSignal<
+    { pointerId: number; clientX: number; clientY: number } | null
+  >(null);
   /** Active SPELL CAST reveal — populated when a glyph matches a bound
    *  preset; cleared once the reveal animation finishes. */
   const [reveal, setReveal] = createSignal<Preset | null>(null);
   let messageTimeout: number | undefined;
+  let castRootRef: HTMLDivElement | undefined;
 
   const flashMessage = (text: string): void => {
     setCastMessage(text);
@@ -43,6 +95,7 @@ export function MixerScreen(): JSX.Element {
 
   const onClassified = (glyph: GlyphId | null): void => {
     setCastOpen(false);
+    setSeedPointer(null);
     if (!glyph) {
       flashMessage("Glyph not recognised — try again");
       return;
@@ -58,6 +111,38 @@ export function MixerScreen(): JSX.Element {
     // ceremony over the Mixer.
     app.usePreset(target.id);
     setReveal(target);
+  };
+
+  const onCancelCast = (): void => {
+    setCastOpen(false);
+    setSeedPointer(null);
+  };
+
+  /**
+   * Drag-from-empty-space cast trigger. Matches the prototype: any
+   * left-button pointerdown that doesn't land on a UI control opens
+   * the cast overlay and immediately seeds it with the originating
+   * pointer event so the user's drag continues without a second
+   * mouse press.
+   *
+   * No-ops if the overlay is already open (the cast button / G hotkey
+   * just opened it) or the user is clicking inside an interactive
+   * element identified by `isInteractiveAncestor`.
+   */
+  const onMixerPointerDown = (e: PointerEvent): void => {
+    if (castOpen()) return;
+    if (e.button !== 0) return;
+    if (!castRootRef) return;
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    if (isInteractiveAncestor(target, castRootRef)) return;
+    e.preventDefault();
+    setSeedPointer({
+      pointerId: e.pointerId,
+      clientX: e.clientX,
+      clientY: e.clientY,
+    });
+    setCastOpen(true);
   };
 
   // Keyboard shortcut "G" enters cast mode unless a field is focused.
@@ -87,13 +172,18 @@ export function MixerScreen(): JSX.Element {
 
   return (
     <div
+      ref={castRootRef}
       style={{
         height: "100%",
         display: "flex",
         "flex-direction": "column",
         padding: "20px 24px",
         gap: "var(--s5)",
+        // Drag on empty space to cast — the pointerdown handler walks
+        // up from `e.target` to filter out controls before firing.
+        "touch-action": "none",
       }}
+      onPointerDown={onMixerPointerDown}
     >
       <PresetHeader
         activeCount={activeCount()}
@@ -103,7 +193,8 @@ export function MixerScreen(): JSX.Element {
       <Show when={castOpen()}>
         <GlyphCastOverlay
           onClassified={onClassified}
-          onCancel={() => setCastOpen(false)}
+          onCancel={onCancelCast}
+          seedPointer={seedPointer() ?? undefined}
         />
       </Show>
       <Show when={reveal()} keyed>
