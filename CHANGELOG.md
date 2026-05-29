@@ -4,6 +4,58 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-05-29 — Canvas-based cast: drag anywhere, mockup-faithful omen
+
+Follow-up to v0.11.2. Three field reports:
+
+> "Remove the cast button and allow drawing anywhere like the mockup. Change the drag animation to match the mockup. Have the same stylized glyph animation as the mockup."
+
+v0.11.2 added drag-from-empty-space as a *third* invocation path beside the Cast button and `G` hotkey. The mockup design has *no* button at all — drag IS the cast — and the spark trail + post-cast "omen" animation are richer than our SVG fallbacks could ever be.
+
+### Changed
+
+- **Cast button removed from the Mixer header.** The right-side controls now only carry the `Compare A/B` segmented (matching the prototype's `screen_mixer.jsx`). The `G` hotkey is gone too — there's no overlay to open anymore.
+- **`SparkLayer` (new, canvas-based) replaces `GlyphCastOverlay` + `SpellCastReveal`.** A single transparent `<canvas>` sits over the Mixer at all times with `pointer-events: none` and `z-index: 58`. It listens at the window level with capture-phase pointer events, draws sparks and the post-cast omen via `requestAnimationFrame`, and is sized DPR-aware for crisp strokes on hi-DPI displays.
+  - **Sparks (drag animation)** — `parts.length` capped at 1600; gravity (`vy += 0.012`), friction (`vx *= 0.985`, `vy *= 0.985`), per-spark decay `0.012 + Math.random() * 0.02`, direction-following emission (`1 + min(6, d/6)` sparks per move, biased toward stroke direction), 4-color trail palette `["#7C5CF6", "#EC4899", "#9F7CFF", "#C9B8FF"]`, `shadowBlur=10` glow.
+  - **Omen (post-cast glyph animation)** — when a shape matches a bound preset, the SparkLayer:
+    1. Sprays sparks along the recognised shape outline (along the corners for polygons, along the radius for circles) in the preset's brand color.
+    2. Bursts 110 omnidirectional sparks at the centroid.
+    3. Draws a 2.5-second omen over three phases: pop-in (0-280 ms, alpha + 0.6→1.0 scale), hold (full alpha), fade (last 650 ms). Renders an expanding halo ring (1.12× → 1.67× radius), the canonical shape outline in the preset color with `shadowBlur=22` glow, the preset name in Bricolage Grotesque 19 px under it, and "◆ S P E L L C A S T ◆" in Space Mono 10 px below that.
+
+### Added
+
+- **`detectShape()` in `data/glyphs.ts`** — returns rich geometry `{ type, cx, cy, size, corners?, r? }` instead of just a `GlyphId`. Ported 1:1 from the prototype's `spark_canvas.jsx`: Ramer–Douglas–Peucker line simplification + radial uniformity (stdR/meanR) + corner-count voting + polygon-area threshold per shape. The existing `classifyGlyph` stays untouched (different algorithm, different tuning) since the canvas pipeline wants the geometry to draw the recognised outline.
+- **`isCastBlocker(target)`** — predicate exported from `SparkLayer` that the capture-phase pointer handler uses to decide whether to ignore a pointerdown (control) or capture it (empty space). Uses `Element.closest()` with a single CSS selector: `button, a, input, select, textarea, [role="button"], [role="slider"], [role="switch"], [role="tab"], [role="radio"], [role="radiogroup"], .card, .seg, .kbd, [data-cast-block]`.
+
+### Removed
+
+- `src/components/GlyphCastOverlay.tsx` + test file — replaced by `SparkLayer`. The SVG-based overlay couldn't render the canvas-style spark cloud or the omen ring anyway.
+- `src/components/SpellCastReveal.tsx` + test file — replaced by the canvas-based omen. The HTML reveal panel is gone.
+- `src/screens/MixerScreen.test.tsx` (v0.11.2) — its `isInteractiveAncestor` predicate moved into `SparkLayer.isCastBlocker` with a tighter CSS-selector implementation; tests moved to `SparkLayer.test.tsx`.
+- `@keyframes spell-cast-veil`, `spell-cast-reveal`, `spell-cast-breathe` in `styles.css` — orphaned by `SpellCastReveal` deletion.
+- `G` hotkey for cast — no overlay, no open-cast verb, no need for a hotkey.
+
+### Tests
+
+- **Frontend**: 209 → 215 (+6 net; +24 new, −18 deleted).
+  - 9 new in `glyph classifier > detectShape` — short paths rejected; tiny strokes rejected; open paths rejected; triangle / inv-triangle / square / circle all matched with correct corners / radius / centroid; arbitrary scribbles rejected.
+  - 3 new in `glyph classifier > rdp` — line endpoints preserved; interior corner preserved when above epsilon; `< 3` points returned as-is.
+  - 24 new in `SparkLayer.isCastBlocker` — element + 5 tags + 6 roles + 3 classes + `data-cast-block` + deep-nested targets + null defensiveness.
+  - −18 deleted across `GlyphCastOverlay.test.tsx` (9), `SpellCastReveal.test.tsx` (4), `MixerScreen.test.tsx` (17 — superseded by `SparkLayer.test.tsx`).
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (104)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (215)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The cast is the most distinctive interaction in the app — and until v0.11.3 it had a button stapled to it, an SVG overlay that didn't quite feel like the mockup, and a reveal that lived in a different visual layer than the sparks that summoned it. Folding all three into one canvas matches the prototype byte-for-byte: drag anywhere on the Mixer, sparks chase the cursor with weight + glow + gravity, and on release the bound preset's glyph blooms in its brand color over the same canvas. No "open the cast overlay" step. No layer switch. Just drawing.
+
 ## [0.11.2] — 2026-05-29 — SpellCircle keyframes + drag-from-empty-space cast
 
 Follow-up to v0.11.1. Two field reports:

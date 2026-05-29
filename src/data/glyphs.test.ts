@@ -4,9 +4,11 @@ import {
   CLASSIFIER_DEFAULTS,
   classifyGlyph,
   dedupe,
+  detectShape,
   endpointGap,
   findCorners,
   pathLength,
+  rdp,
   resamplePath,
   smooth,
   turningAngles,
@@ -222,5 +224,165 @@ describe("glyph classifier — shape recognition", () => {
         cornerAngleThreshold: CLASSIFIER_DEFAULTS.cornerAngleThreshold,
       }),
     ).toBe("circle");
+  });
+});
+
+// v0.11.3 — detectShape returns rich geometry for the canvas-based
+// SparkLayer's "omen" render. We exercise the same algorithm the
+// prototype ships (RDP simplification + radial uniformity), so the
+// thresholds (diag ≥ 110 px, endpoint gap ≤ 30 %, etc.) need synthetic
+// strokes that comfortably clear them.
+describe("rdp (Ramer–Douglas–Peucker)", () => {
+  it("keeps endpoints for a straight line at any epsilon", () => {
+    const pts: Point[] = Array.from({ length: 20 }, (_, i) => ({
+      x: i * 10,
+      y: i * 10,
+    }));
+    const out = rdp(pts, 1);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({ x: 0, y: 0 });
+    expect(out[1]).toEqual({ x: 190, y: 190 });
+  });
+
+  it("preserves a sharp interior corner when above epsilon", () => {
+    const pts: Point[] = [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 10, y: 0 }, // corner here
+      { x: 10, y: 5 },
+      { x: 10, y: 10 },
+    ];
+    const out = rdp(pts, 1);
+    // Start, corner, end.
+    expect(out.length).toBe(3);
+    expect(out[1]).toEqual({ x: 10, y: 0 });
+  });
+
+  it("returns the input slice unchanged for < 3 points", () => {
+    expect(rdp([], 1)).toEqual([]);
+    expect(rdp([{ x: 0, y: 0 }], 1)).toEqual([{ x: 0, y: 0 }]);
+    expect(rdp([{ x: 0, y: 0 }, { x: 1, y: 1 }], 1)).toEqual([
+      { x: 0, y: 0 },
+      { x: 1, y: 1 },
+    ]);
+  });
+});
+
+describe("detectShape", () => {
+  // The prototype demands diag ≥ 110 px and "closed" within 30 % of
+  // diag. We pick a 200×200 bbox so all four canonical shapes clear
+  // the diagonal floor (≈ 283 px).
+
+  it("returns null for very short paths (< 12 points)", () => {
+    const tooShort: Point[] = [
+      { x: 0, y: 0 },
+      { x: 50, y: 0 },
+      { x: 50, y: 50 },
+      { x: 0, y: 50 },
+    ];
+    expect(detectShape(tooShort)).toBeNull();
+  });
+
+  it("returns null for tiny strokes (diag < 110 px)", () => {
+    const tiny = polygon(
+      [
+        { x: 0, y: 0 },
+        { x: 50, y: 0 },
+        { x: 50, y: 50 },
+        { x: 0, y: 50 },
+      ],
+      8,
+    );
+    expect(detectShape(tiny)).toBeNull();
+  });
+
+  it("returns null when the stroke is not closed", () => {
+    // A long open arc — endpoint gap > 30 % of diag.
+    const halfCircle = arcPoints(150, 150, 120, 0, Math.PI, 30);
+    expect(detectShape(halfCircle)).toBeNull();
+  });
+
+  it("detects a triangle (apex up) with corners + centroid + size", () => {
+    const tri = polygon(
+      [
+        { x: 150, y: 0 }, // apex
+        { x: 280, y: 200 },
+        { x: 20, y: 200 },
+      ],
+      14,
+    );
+    const out = detectShape(tri);
+    expect(out).not.toBeNull();
+    expect(out!.type).toBe("triangle");
+    expect(out!.corners).toBeDefined();
+    expect(out!.corners!.length).toBe(3);
+    expect(out!.cx).toBeGreaterThan(100);
+    expect(out!.cx).toBeLessThan(200);
+    expect(out!.size).toBeGreaterThan(110);
+  });
+
+  it("detects an inverted triangle (apex down)", () => {
+    const inv = polygon(
+      [
+        { x: 20, y: 0 },
+        { x: 280, y: 0 },
+        { x: 150, y: 200 }, // apex
+      ],
+      14,
+    );
+    const out = detectShape(inv);
+    expect(out).not.toBeNull();
+    expect(out!.type).toBe("invtriangle");
+    expect(out!.corners).toBeDefined();
+    expect(out!.corners!.length).toBe(3);
+  });
+
+  it("detects a square with 4 corners", () => {
+    const sq = polygon(
+      [
+        { x: 0, y: 0 },
+        { x: 200, y: 0 },
+        { x: 200, y: 200 },
+        { x: 0, y: 200 },
+      ],
+      14,
+    );
+    const out = detectShape(sq);
+    expect(out).not.toBeNull();
+    expect(out!.type).toBe("square");
+    expect(out!.corners).toBeDefined();
+    expect(out!.corners!.length).toBe(4);
+  });
+
+  it("detects a circle and reports a mean radius (not corners)", () => {
+    const circ = arcPoints(150, 150, 100, 0, 2 * Math.PI, 48);
+    const out = detectShape(circ);
+    expect(out).not.toBeNull();
+    expect(out!.type).toBe("circle");
+    expect(out!.corners).toBeUndefined();
+    expect(out!.r).toBeDefined();
+    expect(out!.r!).toBeGreaterThan(80);
+    expect(out!.r!).toBeLessThan(120);
+  });
+
+  it("centroid for a centered circle ≈ the centre of the bbox", () => {
+    const circ = arcPoints(300, 200, 90, 0, 2 * Math.PI, 64);
+    const out = detectShape(circ);
+    expect(out).not.toBeNull();
+    expect(out!.cx).toBeCloseTo(300, 0);
+    expect(out!.cy).toBeCloseTo(200, 0);
+  });
+
+  it("returns null for an arbitrary scribble that closes too loosely", () => {
+    // A wandering path that ends nowhere near the start — should fail
+    // the endpoint-gap ≤ 30 % of diag check.
+    const wander: Point[] = [];
+    for (let i = 0; i < 40; i++) {
+      wander.push({
+        x: 50 + i * 6,
+        y: 50 + Math.sin(i * 0.4) * 30 + i * 2,
+      });
+    }
+    expect(detectShape(wander)).toBeNull();
   });
 });

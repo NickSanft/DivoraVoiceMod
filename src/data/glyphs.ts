@@ -355,3 +355,171 @@ export function classifyGlyph(
   // 1, 2, or 5+ corners — not a glyph we recognise.
   return null;
 }
+
+/**
+ * v0.11.3: rich shape detection used by the canvas-based SparkLayer.
+ *
+ * Returns NOT just the glyph id but also the centroid, characteristic
+ * size (bounding-box diagonal), and either the polygon corners (for
+ * triangle/inv-triangle/square) or the mean radius (for circle). That
+ * geometry is what the omen-render code uses to outline the shape in
+ * sparks at the actual stroke's center + scale.
+ *
+ * Ported 1:1 from `docs/mockups/prototype/divora/spark_canvas.jsx`
+ * (`detectShape`). The prototype's algorithm uses Ramer–Douglas–Peucker
+ * line simplification + radial uniformity + corner-count voting. It is
+ * a deliberately different algorithm from `classifyGlyph` (which is a
+ * turning-angle classifier with a different threshold scheme). They
+ * coexist — `classifyGlyph` keeps its existing unit tests since other
+ * code paths (and the `localPoint` helper) still use it; `detectShape`
+ * is purpose-built for the cast pipeline.
+ */
+export interface DetectedShape {
+  type: GlyphId;
+  /** Centroid X (mean of trace samples). */
+  cx: number;
+  /** Centroid Y. */
+  cy: number;
+  /** Bounding-box diagonal (px). */
+  size: number;
+  /** Polygon corners after RDP simplification; absent for circles. */
+  corners?: Point[];
+  /** Mean radius from the centroid; only set for circles. */
+  r?: number;
+}
+
+/** Perpendicular distance from `p` to the line through `a` and `b`. */
+function perpDist(p: Point, a: Point, b: Point): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return Math.abs((p.x - a.x) * dy - (p.y - a.y) * dx) / len;
+}
+
+/**
+ * Ramer–Douglas–Peucker line simplification. Returns a subset of `pts`
+ * that approximates the same path with perpendicular error ≤ `eps`.
+ */
+export function rdp(pts: Point[], eps: number): Point[] {
+  if (pts.length < 3) return pts.slice();
+  let dmax = 0;
+  let idx = 0;
+  const a = pts[0]!;
+  const b = pts[pts.length - 1]!;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d = perpDist(pts[i]!, a, b);
+    if (d > dmax) {
+      dmax = d;
+      idx = i;
+    }
+  }
+  if (dmax > eps) {
+    const l = rdp(pts.slice(0, idx + 1), eps);
+    const r = rdp(pts.slice(idx), eps);
+    return l.slice(0, -1).concat(r);
+  }
+  return [a, b];
+}
+
+/** Absolute polygon area via the shoelace formula. */
+function polyArea(p: Point[]): number {
+  let s = 0;
+  for (let i = 0; i < p.length; i++) {
+    const q = p[(i + 1) % p.length]!;
+    s += p[i]!.x * q.y - q.x * p[i]!.y;
+  }
+  return Math.abs(s / 2);
+}
+
+/**
+ * Detect one of the four target shapes (triangle, invtriangle, square,
+ * circle) in a free-hand pointer trace and return its geometry, or
+ * `null` if the trace is too short, too small, or doesn't match.
+ *
+ * The prototype's tuning constants are preserved verbatim so the cast
+ * gesture feels identical to the mockup:
+ *
+ *   - bounding-box diagonal ≥ 110 px (anything smaller is "not a draw")
+ *   - endpoint gap ≤ 30 % of diag (must be closed)
+ *   - RDP epsilon = 9 % of diag
+ *   - circle test: 5+ corners after RDP, radial stddev / mean < 0.17,
+ *     and aspect ratio > 0.7
+ *   - triangle: 3 RDP corners with polygon area ≥ 16 % of bbox area
+ *   - square: 4 RDP corners with polygon area ≥ 40 % of bbox area
+ *   - fallback circle (looser): 5+ corners, circ < 0.24, aspect > 0.6
+ */
+export function detectShape(path: Point[]): DetectedShape | null {
+  if (path.length < 12) return null;
+  // Defensive copy; we also strip any trailing duplicate close-loop
+  // samples (some pointer devices repeat the seam point).
+  let pts = path.slice();
+  while (
+    pts.length > 3 &&
+    Math.hypot(
+      pts[0]!.x - pts[pts.length - 1]!.x,
+      pts[0]!.y - pts[pts.length - 1]!.y,
+    ) < 3
+  ) {
+    pts.pop();
+  }
+  const xs = pts.map((p) => p.x);
+  const ys = pts.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const w = maxX - minX;
+  const h = maxY - minY;
+  const diag = Math.hypot(w, h);
+  if (diag < 110) return null;
+  const s = pts[0]!;
+  const e = pts[pts.length - 1]!;
+  if (Math.hypot(e.x - s.x, e.y - s.y) > diag * 0.3) return null;
+  const cx = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const cy = ys.reduce((a, b) => a + b, 0) / ys.length;
+  // Radial uniformity — low stdR/meanR → circular.
+  const radii = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
+  const meanR = radii.reduce((a, b) => a + b, 0) / radii.length;
+  const stdR = Math.sqrt(
+    radii.reduce((a, b) => a + (b - meanR) ** 2, 0) / radii.length,
+  );
+  const circ = meanR ? stdR / meanR : 1;
+  const aspect = Math.min(w, h) / Math.max(w, h);
+  // RDP corner count.
+  let simp = rdp(pts, diag * 0.09);
+  while (
+    simp.length > 3 &&
+    Math.hypot(
+      simp[0]!.x - simp[simp.length - 1]!.x,
+      simp[0]!.y - simp[simp.length - 1]!.y,
+    ) <
+      diag * 0.2
+  ) {
+    simp.pop();
+  }
+  const n = simp.length;
+
+  if (n >= 5 && circ < 0.17 && aspect > 0.7) {
+    return { type: "circle", cx, cy, size: diag, r: meanR };
+  }
+  if (n === 3) {
+    if (polyArea(simp) < w * h * 0.16) return null;
+    const tcy = (simp[0]!.y + simp[1]!.y + simp[2]!.y) / 3;
+    const above = simp.filter((p) => p.y < tcy).length;
+    return {
+      type: above === 1 ? "triangle" : "invtriangle",
+      cx,
+      cy,
+      size: diag,
+      corners: simp,
+    };
+  }
+  if (n === 4) {
+    if (polyArea(simp) < w * h * 0.4) return null;
+    return { type: "square", cx, cy, size: diag, corners: simp };
+  }
+  if (n >= 5 && circ < 0.24 && aspect > 0.6) {
+    return { type: "circle", cx, cy, size: diag, r: meanR };
+  }
+  return null;
+}

@@ -2,85 +2,33 @@
 // inspector. Effects orbit a glowing voice core; threads of light
 // connect enabled effects to the core; the inspector lets the user
 // tweak the focused effect live.
+//
+// v0.11.3: the explicit Cast button is gone. The user drags anywhere
+// on the Mixer (except on UI controls) to draw a glyph; the always-
+// mounted SparkLayer renders the spark trail + canvas-based "omen"
+// (shape outline + preset name + "◆ SPELL CAST ◆"). Matches the
+// prototype's headline gesture: the Mixer *is* the casting surface.
 
-import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { createSignal, onCleanup, Show, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
-import { Button } from "../components/Button";
-import { GlyphCastOverlay } from "../components/GlyphCastOverlay";
 import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
 import { VMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
 import { Sigil, type SigilName } from "../components/Sigil";
-import { SpellCastReveal } from "../components/SpellCastReveal";
+import { SparkLayer } from "../components/SparkLayer";
 import { SpellCircle } from "../components/SpellCircle";
 import { Toggle } from "../components/Toggle";
 import { statusMeta } from "../shell/statusMeta";
 import { useApp } from "../stores/app";
 import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
-/**
- * True when a pointerdown's target should NOT trigger a cast gesture.
- *
- * The mockup says drag on EMPTY space starts the cast. We walk up from
- * the event target, stopping when we hit either the cast root or any
- * interactive ancestor (button, input, slider, contenteditable, card,
- * or anything explicitly tagged `data-cast-block`). If we find one,
- * the click belongs to that control — leave it alone.
- *
- * Exported so the empty-space-cast unit test can drive it directly
- * without spinning up a full app store.
- */
-export function isInteractiveAncestor(
-  start: Element | null,
-  stopAt: Element,
-): boolean {
-  let cur: Element | null = start;
-  while (cur && cur !== stopAt) {
-    const tag = cur.tagName;
-    if (
-      tag === "BUTTON" ||
-      tag === "INPUT" ||
-      tag === "SELECT" ||
-      tag === "TEXTAREA" ||
-      tag === "A"
-    ) {
-      return true;
-    }
-    const role = cur.getAttribute("role");
-    if (role === "button" || role === "slider" || role === "switch") {
-      return true;
-    }
-    // Read both the live `isContentEditable` getter (browsers) and the
-    // raw attribute (jsdom + defensive coverage when the host element
-    // is missing the HTMLElement prototype methods).
-    if (cur instanceof HTMLElement && cur.isContentEditable) return true;
-    const ce = cur.getAttribute("contenteditable");
-    if (ce !== null && ce !== "false") return true;
-    if (cur.classList?.contains("card")) return true;
-    if (cur.hasAttribute("data-cast-block")) return true;
-    cur = cur.parentElement;
-  }
-  return false;
-}
-
 export function MixerScreen(): JSX.Element {
   const app = useApp();
   const activeCount = () => app.chain().filter((c) => c.enabled).length;
   const totalCount = () => app.chain().length;
-  const [castOpen, setCastOpen] = createSignal(false);
   const [castMessage, setCastMessage] = createSignal<string | null>(null);
-  /** Pointer seed forwarded to the overlay when the user starts the
-   *  cast by dragging on the Mixer's empty space rather than pressing
-   *  the explicit Cast button / G hotkey. Cleared on classify/cancel. */
-  const [seedPointer, setSeedPointer] = createSignal<
-    { pointerId: number; clientX: number; clientY: number } | null
-  >(null);
-  /** Active SPELL CAST reveal — populated when a glyph matches a bound
-   *  preset; cleared once the reveal animation finishes. */
-  const [reveal, setReveal] = createSignal<Preset | null>(null);
   let messageTimeout: number | undefined;
-  let castRootRef: HTMLDivElement | undefined;
 
   const flashMessage = (text: string): void => {
     setCastMessage(text);
@@ -93,121 +41,42 @@ export function MixerScreen(): JSX.Element {
     }, 2400);
   };
 
-  const onClassified = (glyph: GlyphId | null): void => {
-    setCastOpen(false);
-    setSeedPointer(null);
-    if (!glyph) {
-      flashMessage("Glyph not recognised — try again");
-      return;
-    }
+  /** Look up the preset bound to a recognised glyph. Returns null when
+   *  the glyph has no binding — the SparkLayer then surfaces a flash. */
+  const resolvePreset = (glyph: GlyphId): Preset | null => {
     const presetId = app.glyphs[glyph];
-    const target = app.presets().find((p) => p.id === presetId);
-    if (!target) {
-      flashMessage(`No preset bound to ${glyph}`);
-      return;
+    return app.presets().find((p) => p.id === presetId) ?? null;
+  };
+
+  /** Apply the cast — switch to the bound preset. The SparkLayer has
+   *  already started the omen animation by the time we land here. */
+  const onCast = (preset: Preset): void => {
+    app.usePreset(preset.id);
+  };
+
+  onCleanup(() => {
+    if (messageTimeout !== undefined) {
+      window.clearTimeout(messageTimeout);
     }
-    // Switch the preset immediately (so the chain is correct by the
-    // time the reveal animation finishes) and trigger the SPELL CAST
-    // ceremony over the Mixer.
-    app.usePreset(target.id);
-    setReveal(target);
-  };
-
-  const onCancelCast = (): void => {
-    setCastOpen(false);
-    setSeedPointer(null);
-  };
-
-  /**
-   * Drag-from-empty-space cast trigger. Matches the prototype: any
-   * left-button pointerdown that doesn't land on a UI control opens
-   * the cast overlay and immediately seeds it with the originating
-   * pointer event so the user's drag continues without a second
-   * mouse press.
-   *
-   * No-ops if the overlay is already open (the cast button / G hotkey
-   * just opened it) or the user is clicking inside an interactive
-   * element identified by `isInteractiveAncestor`.
-   */
-  const onMixerPointerDown = (e: PointerEvent): void => {
-    if (castOpen()) return;
-    if (e.button !== 0) return;
-    if (!castRootRef) return;
-    const target = e.target;
-    if (!(target instanceof Element)) return;
-    if (isInteractiveAncestor(target, castRootRef)) return;
-    e.preventDefault();
-    setSeedPointer({
-      pointerId: e.pointerId,
-      clientX: e.clientX,
-      clientY: e.clientY,
-    });
-    setCastOpen(true);
-  };
-
-  // Keyboard shortcut "G" enters cast mode unless a field is focused.
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "g" && e.key !== "G") return;
-      const target = e.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      setCastOpen(true);
-    };
-    window.addEventListener("keydown", onKey);
-    onCleanup(() => {
-      window.removeEventListener("keydown", onKey);
-      if (messageTimeout !== undefined) {
-        window.clearTimeout(messageTimeout);
-      }
-    });
   });
 
   return (
     <div
-      ref={castRootRef}
       style={{
         height: "100%",
         display: "flex",
         "flex-direction": "column",
         padding: "20px 24px",
         gap: "var(--s5)",
-        // Drag on empty space to cast — the pointerdown handler walks
-        // up from `e.target` to filter out controls before firing.
-        "touch-action": "none",
+        position: "relative",
       }}
-      onPointerDown={onMixerPointerDown}
     >
-      <PresetHeader
-        activeCount={activeCount()}
-        totalCount={totalCount()}
-        onCast={() => setCastOpen(true)}
+      <PresetHeader activeCount={activeCount()} totalCount={totalCount()} />
+      <SparkLayer
+        resolvePreset={resolvePreset}
+        onCast={onCast}
+        onMessage={flashMessage}
       />
-      <Show when={castOpen()}>
-        <GlyphCastOverlay
-          onClassified={onClassified}
-          onCancel={onCancelCast}
-          seedPointer={seedPointer() ?? undefined}
-        />
-      </Show>
-      <Show when={reveal()} keyed>
-        {(target) => (
-          <SpellCastReveal
-            glyph={target.glyph as SigilName}
-            name={target.name}
-            color={target.color}
-            tag={target.tag}
-            onDone={() => setReveal(null)}
-          />
-        )}
-      </Show>
       <Show when={castMessage()} keyed>
         {(text) => <CastFlash text={text} />}
       </Show>
@@ -281,7 +150,6 @@ export function MixerScreen(): JSX.Element {
 interface PresetHeaderProps {
   activeCount: number;
   totalCount: number;
-  onCast: () => void;
 }
 
 function CastFlash(props: { text: string }): JSX.Element {
@@ -350,15 +218,6 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
         </div>
       </div>
       <div style={{ flex: 1 }} />
-      <Button
-        variant="ghost"
-        size="sm"
-        icon="bolt"
-        onClick={props.onCast}
-        title="Cast a glyph (G)"
-      >
-        Cast
-      </Button>
       <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}>
         <span class="eyebrow">Compare</span>
         <Segmented
