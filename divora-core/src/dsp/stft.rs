@@ -50,15 +50,21 @@ pub struct Frame<'a> {
 
 /// Streaming STFT processor. One per audio path (i.e. each `PitchShift`
 /// instance owns one; each `FormantShift` owns one).
+// IMPORTANT: every multi-KB buffer lives on the heap. Inline arrays
+// (`[f32; WINDOW]` on the struct) push the Stft past ~9 KB, which we
+// observed crashing the Windows-2022 CI runner with
+// `STATUS_ACCESS_VIOLATION` when several tests construct Stft instances
+// in parallel. Heap-allocated `Vec` storage costs us nothing in steady
+// state — they're created once at construction.
 pub struct Stft {
-    /// Pre-computed Hann window.
-    window: [f32; WINDOW],
+    /// Pre-computed Hann window (heap).
+    window: Vec<f32>,
     /// `realfft` planner is just a factory; the actual FFT objects below.
     fft_fwd: Arc<dyn RealToComplex<f32>>,
     fft_inv: Arc<dyn ComplexToReal<f32>>,
     /// Input ring — holds the most recent `WINDOW` samples we've seen,
     /// shifted left by `HOP` each time a new frame is analysed.
-    in_ring: [f32; WINDOW],
+    in_ring: Vec<f32>,
     /// How many samples are queued in `in_ring` since the last frame.
     in_fill: usize,
     /// Output overlap-add buffer. Each synthesised window is added at
@@ -68,6 +74,11 @@ pub struct Stft {
     /// FFT scratch buffers (kept around to avoid allocating per call).
     time_buf: Vec<f32>,
     freq_buf: Vec<Complex32>,
+    /// Per-frame scratch for the user closure (mag + phase), heap-
+    /// allocated so the closure call doesn't push a ~4 KB BINS array
+    /// onto the `run_frame` stack.
+    mag_scratch: Vec<f32>,
+    phase_scratch: Vec<f32>,
 }
 
 impl Stft {
@@ -77,7 +88,7 @@ impl Stft {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft_fwd = planner.plan_fft_forward(WINDOW);
         let fft_inv = planner.plan_fft_inverse(WINDOW);
-        let mut window = [0f32; WINDOW];
+        let mut window = vec![0f32; WINDOW];
         for (i, w) in window.iter_mut().enumerate() {
             // Hann window. With HOP = WINDOW / 4 this gives a constant-
             // overlap-add factor of 1.5 (each output sample is the sum
@@ -90,11 +101,13 @@ impl Stft {
             window,
             fft_fwd,
             fft_inv,
-            in_ring: [0.0; WINDOW],
+            in_ring: vec![0.0; WINDOW],
             in_fill: 0,
             out_ring: vec![0.0; WINDOW + HOP],
             time_buf: vec![0.0; WINDOW],
             freq_buf: vec![Complex32::default(); BINS],
+            mag_scratch: vec![0.0; BINS],
+            phase_scratch: vec![0.0; BINS],
         }
     }
 
@@ -102,7 +115,9 @@ impl Stft {
     /// chain's `reset()` plumbing wires this in when the engine restarts.
     #[allow(dead_code)] // used by tests; not part of `AudioEffect::reset` yet
     pub fn reset(&mut self) {
-        self.in_ring = [0.0; WINDOW];
+        for s in &mut self.in_ring {
+            *s = 0.0;
+        }
         self.in_fill = 0;
         for s in &mut self.out_ring {
             *s = 0.0;
@@ -155,25 +170,25 @@ impl Stft {
         // Forward FFT.
         let _ = self.fft_fwd.process(&mut self.time_buf, &mut self.freq_buf);
 
-        // Decompose into magnitude + phase, hand to the user.
-        let mut mag = [0f32; BINS];
-        let mut phase = [0f32; BINS];
+        // Decompose into magnitude + phase using the heap-allocated
+        // scratch arrays so the per-frame work doesn't push two
+        // BINS-sized arrays onto the call stack.
         for i in 0..BINS {
             let c = self.freq_buf[i];
-            mag[i] = (c.re * c.re + c.im * c.im).sqrt();
-            phase[i] = c.im.atan2(c.re);
+            self.mag_scratch[i] = (c.re * c.re + c.im * c.im).sqrt();
+            self.phase_scratch[i] = c.im.atan2(c.re);
         }
         let mut frame = Frame {
-            mag: &mut mag,
-            phase: &mut phase,
+            mag: &mut self.mag_scratch,
+            phase: &mut self.phase_scratch,
             bin_hz,
         };
         modify(&mut frame);
 
         // Re-combine and inverse FFT.
         for i in 0..BINS {
-            let m = mag[i];
-            let p = phase[i];
+            let m = self.mag_scratch[i];
+            let p = self.phase_scratch[i];
             self.freq_buf[i] = Complex32::new(m * p.cos(), m * p.sin());
         }
         let _ = self.fft_inv.process(&mut self.freq_buf, &mut self.time_buf);
