@@ -86,7 +86,8 @@ function Shell(): JSX.Element {
   // Audio engine bootstrap.
   // 1) Enumerate devices.
   // 2) Subscribe to `audio-levels` events from the backend.
-  // 3) Attempt to auto-start with the selected (default) devices.
+  // 3) Refresh the preset list from the backend (bundled + user JSON).
+  // 4) Attempt to auto-start with the selected (default) devices.
   // Each step is wrapped to fail gracefully — we may be running in a
   // browser preview without the Tauri bridge.
   onMount(() => {
@@ -110,6 +111,10 @@ function Shell(): JSX.Element {
       } catch (err) {
         app.setEngineError(`level subscription failed: ${String(err)}`);
       }
+
+      // Pull the live preset list (bundled + user) from the backend.
+      // Failures keep the fallback bundled list seeded in the store.
+      await app.refreshPresets();
 
       if (cancelled) return;
       // Only auto-start when we have something to talk to.

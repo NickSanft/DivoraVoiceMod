@@ -1,0 +1,16 @@
+{
+  "id": "hollow-king",
+  "version": 1,
+  "name": "Hollow King",
+  "color": "#7C5CF6",
+  "glyph": "reverb",
+  "tag": "Bundled",
+  "desc": "Cavernous, regal, distant. A voice from the throne of an empty hall.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -48 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -5 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": -3 } },
+    { "id": "eq", "enabled": true, "vals": { "low": 3, "mid": -2, "high": 1 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 78, "mix": 42 } }
+  ]
+}

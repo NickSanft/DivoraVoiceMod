@@ -51,12 +51,38 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Switch Tweaks → Motion to functional → animations stop; rich → animations run.
 - [ ] Switch the Color mood → spell circle colours follow.
 
-## Presets
+## Presets (Phase 4)
 
-- [ ] Default preset list loads on first run.
-- [ ] Switching between presets is glitch-free (no clicks, no momentary silence).
-- [ ] Edit a preset, save it, restart app — changes persist.
-- [ ] User-edited preset is not overwritten by an app update (simulate by manually replacing bundled file).
+- [ ] Default preset list loads on first run — 5 bundled presets visible in the left list under "Bundled · 5", "User · 0".
+- [ ] Clicking a different preset in the list immediately switches the active preset (left dot moves; Mixer header updates).
+- [ ] Switching between presets is glitch-free (no clicks, no momentary silence — DSP graph swap on next buffer).
+- [ ] Right editor shows the active preset's header (glyph chip, name, Bundled/User badge, "In use" badge, description) and chain cards.
+- [ ] Each ChainCard shows the effect's sigil, name, current readout, and an enable toggle.
+- [ ] Enabling a chain card expands it to show parameter sliders; disabling collapses them.
+- [ ] Drag a chain card's handle onto another card → drop target highlights indigo → release reorders the chain and the audio engine updates within one buffer.
+- [ ] Save button is disabled on Bundled presets.
+- [ ] Delete button is disabled on Bundled presets.
+- [ ] Duplicate on a Bundled preset creates a User preset with " Copy" appended; switches to it; left list shows it under "User".
+- [ ] Edit a duplicated preset (move a slider), click Save → preset persists; restart app → changes survive.
+- [ ] Delete a user preset → file disappears from `%APPDATA%\DivoraVoice\presets\`; left list updates; active preset falls back to the first remaining one.
+- [ ] Manually replacing a bundled JSON file via a build does not overwrite any user preset.
+- [ ] Manually corrupting a user preset JSON does not crash the app — it's silently skipped from the list.
+
+## A/B compare (Phase 4)
+
+- [ ] On the Mixer, the A/B segmented control starts on A.
+- [ ] Edit some parameters in slot A.
+- [ ] Click B → audio reverts to the unedited chain; visually the spell circle's threads + Inspector update.
+- [ ] Edit different parameters in slot B.
+- [ ] Click A → the original slot A edits return; slot B's are now banked.
+- [ ] Switching presets resets A/B back to A with both slots equal to the new preset's chain.
+
+## Export JSON (Phase 4)
+
+- [ ] Click Export JSON on the Presets editor → modal opens with the preset serialised as pretty JSON.
+- [ ] Click Copy → toast / inline indicator confirms; pasting into a text editor produces the exact JSON.
+- [ ] Click Save .json → browser/system save dialog with default file name = preset name; file content matches the modal.
+- [ ] Close the modal (× or backdrop click) → modal dismisses.
 
 ## Soundboard
 

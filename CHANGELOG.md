@@ -4,6 +4,58 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-28 — Phase 4: presets + A/B compare
+
+### Added
+
+- **`divora-core::presets` module** — `Preset` / `PresetChainEntry` / `PresetTag` types + `PresetStore` (file-backed user preset I/O) + `bundled_presets()` (compile-time-embedded defaults).
+- **5 bundled preset JSON files** in `divora-core/src/presets/bundled/`: `hollow-king.json`, `static-wraith.json`, `velvet-demon.json`, `choir-of-ash.json`, `clean.json`. They mirror the previous frontend mock data exactly; editing a file and rebuilding ships new defaults.
+- **User preset persistence**: `PresetStore` writes/reads JSON under `%APPDATA%\DivoraVoice\presets\` (or platform equivalent). Each user preset is `<id>.json`. The id is sanitised (`[a-z0-9_-]+`) so it can't escape the directory. Corrupt files are logged and skipped — a single bad preset can't take down the whole list.
+- **Tauri commands**: `list_presets`, `save_user_preset`, `delete_user_preset`, `export_preset_json`, `preset_store_path`. Bundled presets are read-only (saving one returns `BundledIsReadOnly`).
+- **Frontend audio API extensions** (`src/audio/api.ts`): `WirePreset` / `WireChainEntry` types + `listPresets`, `saveUserPreset`, `deleteUserPreset`, `exportPresetJson`, `presetStorePath` wrappers.
+- **Reactive presets in the store**: `presets()` signal seeded with the frontend's `FALLBACK_PRESETS` and replaced after `refreshPresets()` pulls the live list. `presetsLoaded()` flips true on the first successful load.
+- **A/B compare snapshots** (`abSlots: Record<string, { A, B }>`): per-preset two-slot store. `setAbSlot(slot)` snapshots the live chain into the current slot, restores the destination slot, syncs to the audio thread, and updates `ui.ab`. `resetAbSlots()` collapses both slots to the current chain.
+- **Preset actions in the store**: `usePreset(id)` switches the active preset (and resets A/B); `savePreset(preset)`, `duplicatePreset(sourceId)`, `deletePreset(id)`, `exportPreset(preset)`. Bundled presets refuse `savePreset` / `deletePreset` and ask the user to duplicate instead.
+- **Chain reorder**: `reorderChainEntries(from, to)` moves an effect within the active chain and re-syncs to the audio thread.
+- **`PresetsScreen.tsx`** full implementation:
+  - Left panel (248 px): bundled list + user list, each row clickable → `usePreset(id)`. Active row gets the accent-bg + indigo border + emerald "in use" dot.
+  - Right editor: header (color glyph chip + display-font name + Bundled/User badge + "in use" badge + description + Use button), action row (Duplicate / Export JSON / Save / Delete), and a vertical list of `ChainCard`s.
+  - Each `ChainCard` has a drag handle (HTML5 drag/drop), effect sigil chip, name + live readout, enable toggle. Enabled cards expand to a 1- or 2-column grid of parameter sliders with bipolar variant for signed params.
+  - Drop-target highlighting (indigo border + accent glow) when dragging.
+  - Save / Delete are disabled for bundled presets; action errors land in an inline banner.
+- **`ExportPresetModal.tsx`** — full-screen overlay with the preset serialised as JSON, Copy + Save .json buttons. Copy uses `navigator.clipboard`; Save .json uses a `Blob` + anchor download. Both fail gracefully when the API is unavailable.
+- **Mixer A/B segmented control** is now wired to `setAbSlot` so toggling actually swaps snapshots and sends a fresh `SetChain` to the audio thread.
+- **`src/App.tsx` `onMount`** now calls `refreshPresets()` alongside the device/level bootstrap.
+
+### Changed
+
+- `src/data/presets.ts` is now `FALLBACK_PRESETS` (5 bundled). The two original "User" defaults (Deep Warden, Glass Oracle) are no longer shipped — user presets are now created on demand by the user.
+- Original `PRESETS` export remains as a deprecated alias for back-compat.
+
+### Tests
+
+- **Rust**: 39 → 54 tests. New: 3 bundled-preset integrity (parse, unique ids, Hollow King shape) + 11 `PresetStore` (empty dir, save / list round-trip, overwrite by id, rejects bundled tag, rejects unsafe ids, delete, NotFound, skip non-JSON, skip corrupt JSON, rewrites bundled-on-disk to user) + 1 helper (is_safe_id).
+- **Frontend**: 55 → 73 tests. New: 5 audio API wrappers (`listPresets`, `saveUserPreset`, `deleteUserPreset`, `exportPresetJson`, `presetStorePath`) + 13 store action tests (refresh / fallback / use / A-B swap / save / duplicate / delete / export / reorder / clamping / resetAbSlots).
+
+### Architecture notes
+
+- `Preset.tag` is the single source of truth for "can I save this?". The wire format flows backend ↔ frontend without translation; serde uses the same `PascalCase` `Bundled` / `User` discriminator both sides.
+- A/B compare lives entirely in the frontend — backend isn't asked to remember anything between toggles. The `SetChain` it receives is whatever's currently active. This keeps the audio thread simple and lets us extend A/B (more slots, named snapshots) without touching Rust.
+- Drag-reorder is HTML5 native (`text/plain` index, no library). Dropping outside the cards just leaves the chain unchanged.
+
+### Pre-push checklist (local, 2026-05-28)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (54 in divora-core)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (73)
+- `pnpm tauri build --debug --no-bundle` — pass (11 MB, JS 101 KB / gzip 32 KB)
+
+### Why it matters
+
+The chain is now a thing you can *shape and keep*. Bundled presets give every new user a starting point; saving / duplicating turns the bundled set into a personal library; A/B compare lets users diff two takes without committing. The wire format is stable enough that future phases (preset sharing, community registry, preset export over the network) plug into the same `WirePreset` shape without revisiting persistence.
+
 ## [0.3.1] — 2026-05-28 — fix: pitch shifter passthrough
 
 ### Fixed

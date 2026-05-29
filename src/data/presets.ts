@@ -1,10 +1,17 @@
-// Bundled and user-default presets.
-// Ported from docs/mockups/prototype/divora/data.jsx.
+// Fallback / browser-preview preset definitions.
+//
+// In Tauri the real preset list arrives from the backend (`list_presets`
+// command — bundled JSON + on-disk user presets). These constants are
+// used when the backend isn't reachable (e.g. running `pnpm dev` in a
+// browser tab without the Tauri shell).
+//
+// They mirror the bundled JSON files in
+// `divora-core/src/presets/bundled/*.json` exactly.
 
 import type { Preset } from "../types";
 import { fx } from "./effects";
 
-export const PRESETS: Preset[] = [
+export const FALLBACK_PRESETS: Preset[] = [
   {
     id: "hollow-king",
     name: "Hollow King",
@@ -65,34 +72,6 @@ export const PRESETS: Preset[] = [
     ],
   },
   {
-    id: "deep-warden",
-    name: "Deep Warden",
-    color: "#34D9A0",
-    glyph: "eq",
-    tag: "User",
-    desc: "Authoritative narration voice. Warm and grounded.",
-    chain: [
-      fx("gate", true, { thresh: -54 }),
-      fx("pitch", true, { shift: -2 }),
-      fx("eq", true, { low: 4, mid: 1, high: -1 }),
-      fx("reverb", true, { size: 22, mix: 12 }),
-    ],
-  },
-  {
-    id: "glass-oracle",
-    name: "Glass Oracle",
-    color: "#A99FC4",
-    glyph: "echo",
-    tag: "User",
-    desc: "Crystalline, prophetic shimmer with long tails.",
-    chain: [
-      fx("pitch", true, { shift: 7 }),
-      fx("formant", true, { shift: 2 }),
-      fx("echo", true, { time: 320, fb: 52 }),
-      fx("reverb", true, { size: 88, mix: 56 }),
-    ],
-  },
-  {
     id: "clean",
     name: "Clean Passthrough",
     color: "#6E6590",
@@ -102,3 +81,34 @@ export const PRESETS: Preset[] = [
     chain: [fx("gate", true, { thresh: -56 })],
   },
 ];
+
+/**
+ * Deprecated alias used by the original Phase 1–3 store. New code should
+ * use `FALLBACK_PRESETS` or the store's reactive `presets()` signal.
+ */
+export const PRESETS = FALLBACK_PRESETS;
+
+/** Coerce a backend wire preset into the frontend `Preset` shape. */
+export function presetFromWire(wire: {
+  id: string;
+  name: string;
+  color: string;
+  glyph: string;
+  tag: "Bundled" | "User";
+  desc: string;
+  chain: { id: string; enabled: boolean; vals: Record<string, number> }[];
+}): Preset {
+  return {
+    id: wire.id,
+    name: wire.name,
+    color: wire.color,
+    glyph: wire.glyph,
+    tag: wire.tag,
+    desc: wire.desc,
+    chain: wire.chain.map((c) => ({
+      id: c.id as import("../types").EffectId,
+      enabled: c.enabled,
+      vals: { ...c.vals },
+    })),
+  };
+}

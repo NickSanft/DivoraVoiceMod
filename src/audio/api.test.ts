@@ -12,9 +12,14 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   clearEffectChain,
+  deleteUserPreset,
+  exportPresetJson,
   getEngineStatus,
   listInputDevices,
   listOutputDevices,
+  listPresets,
+  presetStorePath,
+  saveUserPreset,
   setAudioMonitor,
   setEffectChain,
   setEffectEnabled,
@@ -136,6 +141,75 @@ describe("audio api", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await clearEffectChain();
     expect(invokeMock).toHaveBeenCalledWith("clear_effect_chain");
+  });
+
+  it("listPresets invokes list_presets and returns wire presets", async () => {
+    invokeMock.mockResolvedValueOnce([
+      {
+        id: "hollow-king",
+        version: 1,
+        name: "Hollow King",
+        color: "#7C5CF6",
+        glyph: "reverb",
+        tag: "Bundled",
+        desc: "Cavernous.",
+        chain: [
+          { id: "gate", enabled: true, vals: { thresh: -48 } },
+        ],
+      },
+    ]);
+    const presets = await listPresets();
+    expect(invokeMock).toHaveBeenCalledWith("list_presets");
+    expect(presets).toHaveLength(1);
+    expect(presets[0]!.tag).toBe("Bundled");
+  });
+
+  it("saveUserPreset forwards the preset", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    const preset = {
+      id: "my-voice",
+      version: 1,
+      name: "My Voice",
+      color: "#34D9A0",
+      glyph: "eq",
+      tag: "User" as const,
+      desc: "Custom.",
+      chain: [],
+    };
+    await saveUserPreset(preset);
+    expect(invokeMock).toHaveBeenCalledWith("save_user_preset", { preset });
+  });
+
+  it("deleteUserPreset forwards the id", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await deleteUserPreset("my-voice");
+    expect(invokeMock).toHaveBeenCalledWith("delete_user_preset", {
+      id: "my-voice",
+    });
+  });
+
+  it("exportPresetJson returns the backend's serialised string", async () => {
+    invokeMock.mockResolvedValueOnce("{ pretty json }");
+    const preset = {
+      id: "x",
+      version: 1,
+      name: "X",
+      color: "#fff",
+      glyph: "clean",
+      tag: "User" as const,
+      desc: "",
+      chain: [],
+    };
+    const json = await exportPresetJson(preset);
+    expect(invokeMock).toHaveBeenCalledWith("export_preset_json", { preset });
+    expect(json).toBe("{ pretty json }");
+  });
+
+  it("presetStorePath invokes preset_store_path", async () => {
+    invokeMock.mockResolvedValueOnce("C:\\Users\\nick\\AppData\\presets");
+    const p = await presetStorePath();
+    expect(invokeMock).toHaveBeenCalledWith("preset_store_path");
+    expect(p).toContain("presets");
   });
 
   it("subscribeLevels listens on audio-levels and forwards payloads", async () => {

@@ -1,9 +1,15 @@
 // Top-level app state for DivoraVoice.
 //
-// Mirrors the prototype's `app.jsx` state shape (presetId, chains, ui,
-// tweaks, glyphs) using SolidJS signals + stores. Phase 2 adds the
-// audio engine signals (device lists, selected devices, engine status,
-// live levels, last error) and wraps the Tauri command surface.
+// Phases 1–3 used a hardcoded PRESETS array. Phase 4 makes the preset
+// list reactive — initially seeded with the FALLBACK_PRESETS bundled in
+// the frontend, then replaced by the live list from the backend
+// (`list_presets` Tauri command, which merges compile-time bundled JSON
+// with on-disk user JSON). Phase 4 also adds:
+//
+//   - A/B compare snapshots per preset (`abSlots`)
+//   - `usePreset`, `savePreset`, `duplicatePreset`, `deletePreset`,
+//     `exportPresetJson` actions
+//   - `refreshPresets` to pull the backend list
 
 import {
   createContext,
@@ -18,8 +24,12 @@ import {
 import { createStore, type SetStoreFunction } from "solid-js/store";
 import {
   ZERO_LEVELS,
+  deleteUserPreset as deleteUserPresetCmd,
+  exportPresetJson as exportPresetJsonCmd,
   listInputDevices,
   listOutputDevices,
+  listPresets,
+  saveUserPreset as saveUserPresetCmd,
   setAudioMonitor as setAudioMonitorCmd,
   setEffectChain as setEffectChainCmd,
   setEffectEnabled as setEffectEnabledCmd,
@@ -30,8 +40,9 @@ import {
   type EffectSpec,
   type Levels,
   type StreamInfo,
+  type WirePreset,
 } from "../audio/api";
-import { PRESETS } from "../data/presets";
+import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import type {
   AbSlot,
   ChainEntry,
@@ -59,14 +70,6 @@ const defaultTweaks = (): TweaksState => ({
   vignette: false,
 });
 
-const initialChains = (): Record<string, ChainEntry[]> =>
-  Object.fromEntries(
-    PRESETS.map((p) => [
-      p.id,
-      p.chain.map((c) => ({ ...c, vals: { ...c.vals } })),
-    ]),
-  );
-
 const defaultGlyphs: Record<GlyphId, string> = {
   triangle: "velvet-demon",
   invtriangle: "glass-oracle",
@@ -83,10 +86,34 @@ const defaultUi = (): UiState => ({
   pressed: false,
 });
 
+/** Per-preset A/B comparison snapshots. */
+export interface AbSnapshots {
+  A: ChainEntry[];
+  B: ChainEntry[];
+}
+
+const cloneChain = (entries: ChainEntry[]): ChainEntry[] =>
+  entries.map((c) => ({ ...c, vals: { ...c.vals } }));
+
+const initialChainsFor = (presets: Preset[]): Record<string, ChainEntry[]> =>
+  Object.fromEntries(presets.map((p) => [p.id, cloneChain(p.chain)]));
+
+const initialAbSlotsFor = (presets: Preset[]): Record<string, AbSnapshots> =>
+  Object.fromEntries(
+    presets.map((p) => [p.id, { A: cloneChain(p.chain), B: cloneChain(p.chain) }]),
+  );
+
 export interface AppState {
   // Nav
   nav: () => NavId;
   setNav: Setter<NavId>;
+
+  // Presets
+  presets: () => Preset[];
+  setPresets: Setter<Preset[]>;
+  refreshPresets: () => Promise<void>;
+  /** True once at least one successful backend list has populated `presets`. */
+  presetsLoaded: () => boolean;
 
   // Active preset + chain
   presetId: () => string;
@@ -95,6 +122,12 @@ export interface AppState {
   chains: Record<string, ChainEntry[]>;
   setChains: SetStoreFunction<Record<string, ChainEntry[]>>;
   chain: () => ChainEntry[];
+
+  // A/B compare snapshots
+  abSlots: Record<string, AbSnapshots>;
+  setAbSlots: SetStoreFunction<Record<string, AbSnapshots>>;
+  setAbSlot: (slot: AbSlot) => void;
+  resetAbSlots: () => void;
 
   // UI state
   ui: UiState;
@@ -146,6 +179,16 @@ export interface AppState {
   setChainEnabled: (effectIndex: number, enabled: boolean) => void;
   toggleEffectById: (id: EffectId) => void;
   syncChain: () => void;
+  reorderChainEntries: (from: number, to: number) => void;
+
+  // Preset actions
+  usePreset: (id: string) => void;
+  savePreset: (preset: Preset) => Promise<void>;
+  duplicatePreset: (sourceId: string) => Promise<Preset | null>;
+  deletePreset: (id: string) => Promise<void>;
+  exportPreset: (preset: Preset) => Promise<string>;
+  /** Snapshot the current `chain()` into the active preset's record. Used by Save. */
+  presetWithCurrentChain: (id: string) => Preset | null;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -159,10 +202,23 @@ export interface AppState {
 
 export function createAppState(): AppState {
   const [nav, setNav] = createSignal<NavId>("mixer");
-  const firstPreset = PRESETS[0];
-  if (!firstPreset) throw new Error("PRESETS must contain at least one preset");
+
+  // Presets are reactive: initially the fallback bundled list, replaced
+  // by the backend list after `refreshPresets`.
+  const [presets, setPresets] = createSignal<Preset[]>(FALLBACK_PRESETS);
+  const [presetsLoaded, setPresetsLoaded] = createSignal(false);
+
+  const firstPreset = FALLBACK_PRESETS[0];
+  if (!firstPreset) {
+    throw new Error("FALLBACK_PRESETS must contain at least one preset");
+  }
   const [presetId, setPresetId] = createSignal<string>(firstPreset.id);
-  const [chains, setChains] = createStore<Record<string, ChainEntry[]>>(initialChains());
+  const [chains, setChains] = createStore<Record<string, ChainEntry[]>>(
+    initialChainsFor(FALLBACK_PRESETS),
+  );
+  const [abSlots, setAbSlots] = createStore<Record<string, AbSnapshots>>(
+    initialAbSlotsFor(FALLBACK_PRESETS),
+  );
   const [ui, setUi] = createStore<UiState>(defaultUi());
   const [wizardOpen, setWizardOpen] = createSignal(true);
   const [tweaks, setTweaks] = createStore<TweaksState>(defaultTweaks());
@@ -181,7 +237,7 @@ export function createAppState(): AppState {
   const [outputLevels, setOutputLevels] = createSignal<Levels>(ZERO_LEVELS);
 
   const preset = createMemo<Preset>(
-    () => PRESETS.find((p) => p.id === presetId()) ?? firstPreset,
+    () => presets().find((p) => p.id === presetId()) ?? presets()[0] ?? firstPreset,
   );
   const chain = createMemo<ChainEntry[]>(() => chains[presetId()] ?? []);
 
@@ -192,6 +248,40 @@ export function createAppState(): AppState {
   const status = createMemo<VoiceStatus>(() =>
     ui.muted ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
   );
+
+  // When the preset list changes (e.g. backend load adds user presets),
+  // seed `chains` and `abSlots` for any preset not yet tracked.
+  createEffect(() => {
+    for (const p of presets()) {
+      if (!chains[p.id]) {
+        setChains(p.id, cloneChain(p.chain));
+      }
+      if (!abSlots[p.id]) {
+        setAbSlots(p.id, { A: cloneChain(p.chain), B: cloneChain(p.chain) });
+      }
+    }
+  });
+
+  const refreshPresets = async (): Promise<void> => {
+    try {
+      const wire = await listPresets();
+      if (!Array.isArray(wire)) {
+        // Defensive: a mock or partial response shouldn't crash.
+        return;
+      }
+      const next: Preset[] = wire.map(presetFromWire);
+      if (next.length > 0) {
+        setPresets(next);
+        setPresetsLoaded(true);
+      }
+    } catch (err) {
+      // Browser preview / Tauri unreachable — keep the fallback.
+      console.warn(
+        "[presets] listPresets failed; keeping fallback bundled set",
+        err,
+      );
+    }
+  };
 
   const refreshDevices = async (): Promise<void> => {
     const [ins, outs] = await Promise.all([
@@ -264,8 +354,7 @@ export function createAppState(): AppState {
   };
 
   // Send a full SetChain when either the active preset changes or the
-  // engine starts up. Per-param / per-toggle updates go through the
-  // explicit helpers below to avoid rebuilding the chain on every drag.
+  // engine starts up.
   createEffect(
     on([presetId, engineRunning], ([, running]) => {
       if (running) {
@@ -296,15 +385,184 @@ export function createAppState(): AppState {
     setChainEnabled(idx, !entry.enabled);
   };
 
+  const reorderChainEntries = (from: number, to: number): void => {
+    const current = chain();
+    if (
+      from === to ||
+      from < 0 ||
+      to < 0 ||
+      from >= current.length ||
+      to >= current.length
+    ) {
+      return;
+    }
+    const next = current.slice();
+    const [moved] = next.splice(from, 1);
+    if (moved !== undefined) next.splice(to, 0, moved);
+    setChains(presetId(), next);
+    if (engineRunning()) {
+      void setEffectChainCmd(chainToSpecs(next));
+    }
+  };
+
+  // A/B compare actions.
+
+  const setAbSlot = (slot: AbSlot): void => {
+    const current = ui.ab;
+    if (current === slot) return;
+    const id = presetId();
+    // Snapshot the current chain into the slot we're leaving.
+    setAbSlots(id, current, cloneChain(chain()));
+    // Load the destination slot's chain into the active chain.
+    const next = abSlots[id]?.[slot] ?? chain();
+    setChains(id, cloneChain(next));
+    setUi("ab", slot);
+    if (engineRunning()) {
+      void setEffectChainCmd(chainToSpecs(next));
+    }
+  };
+
+  const resetAbSlots = (): void => {
+    const id = presetId();
+    const c = chain();
+    setAbSlots(id, { A: cloneChain(c), B: cloneChain(c) });
+    setUi("ab", "A");
+  };
+
+  // Preset actions.
+
+  const presetWithCurrentChain = (id: string): Preset | null => {
+    const p = presets().find((q) => q.id === id);
+    if (!p) return null;
+    const c = chains[id];
+    if (!c) return p;
+    return { ...p, chain: cloneChain(c) };
+  };
+
+  const usePreset = (id: string): void => {
+    if (!presets().some((p) => p.id === id)) return;
+    setPresetId(id);
+    // Reset A/B for the new preset (both slots = current chain).
+    const c = chains[id] ?? [];
+    setAbSlots(id, { A: cloneChain(c), B: cloneChain(c) });
+    setUi("ab", "A");
+    if (engineRunning()) {
+      void setEffectChainCmd(chainToSpecs(c));
+    }
+  };
+
+  const presetToWire = (p: Preset): WirePreset => ({
+    id: p.id,
+    version: 1,
+    name: p.name,
+    color: p.color,
+    glyph: p.glyph,
+    tag: p.tag,
+    desc: p.desc,
+    chain: p.chain.map((c) => ({
+      id: c.id,
+      enabled: c.enabled,
+      vals: { ...c.vals },
+    })),
+  });
+
+  const savePreset = async (preset: Preset): Promise<void> => {
+    if (preset.tag !== "User") {
+      throw new Error(
+        `cannot save bundled preset "${preset.id}" directly — use Save as`,
+      );
+    }
+    await saveUserPresetCmd(presetToWire(preset));
+    // Reflect into local state immediately.
+    const idx = presets().findIndex((p) => p.id === preset.id);
+    if (idx >= 0) {
+      const next = presets().slice();
+      next[idx] = preset;
+      setPresets(next);
+    } else {
+      setPresets([...presets(), preset]);
+    }
+    setChains(preset.id, cloneChain(preset.chain));
+    setAbSlots(preset.id, {
+      A: cloneChain(preset.chain),
+      B: cloneChain(preset.chain),
+    });
+  };
+
+  const slugifyName = (name: string, existingIds: Set<string>): string => {
+    const base = name
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .replace(/-+/g, "-");
+    const safe = base.length > 0 ? base : "preset";
+    if (!existingIds.has(safe)) return safe;
+    let i = 2;
+    while (existingIds.has(`${safe}-${i}`)) i += 1;
+    return `${safe}-${i}`;
+  };
+
+  const duplicatePreset = async (sourceId: string): Promise<Preset | null> => {
+    const source = presets().find((p) => p.id === sourceId);
+    if (!source) return null;
+    const liveChain = chains[sourceId] ?? source.chain;
+    const existing = new Set(presets().map((p) => p.id));
+    const newName = `${source.name} Copy`;
+    const newId = slugifyName(newName, existing);
+    const copy: Preset = {
+      id: newId,
+      name: newName,
+      color: source.color,
+      glyph: source.glyph,
+      tag: "User",
+      desc: source.desc,
+      chain: cloneChain(liveChain),
+    };
+    await savePreset(copy);
+    return copy;
+  };
+
+  const deletePreset = async (id: string): Promise<void> => {
+    const target = presets().find((p) => p.id === id);
+    if (!target) return;
+    if (target.tag !== "User") {
+      throw new Error(`cannot delete bundled preset "${id}"`);
+    }
+    await deleteUserPresetCmd(id);
+    setPresets(presets().filter((p) => p.id !== id));
+    // If we just deleted the active preset, fall back to the first one.
+    if (presetId() === id) {
+      const next = presets()[0] ?? firstPreset;
+      setPresetId(next.id);
+    }
+  };
+
+  const exportPreset = async (preset: Preset): Promise<string> => {
+    try {
+      return await exportPresetJsonCmd(presetToWire(preset));
+    } catch {
+      // Fall back to JSON.stringify when the backend isn't reachable.
+      return `${JSON.stringify(presetToWire(preset), null, 2)}\n`;
+    }
+  };
+
   return {
     nav,
     setNav,
+    presets,
+    setPresets,
+    refreshPresets,
+    presetsLoaded,
     presetId,
     setPresetId,
     preset,
     chains,
     setChains,
     chain,
+    abSlots,
+    setAbSlots,
+    setAbSlot,
+    resetAbSlots,
     ui,
     setUi,
     wizardOpen,
@@ -345,6 +603,14 @@ export function createAppState(): AppState {
     setChainEnabled,
     toggleEffectById,
     syncChain,
+    reorderChainEntries,
+
+    usePreset,
+    savePreset,
+    duplicatePreset,
+    deletePreset,
+    exportPreset,
+    presetWithCurrentChain,
 
     selectedEffect,
     setSelectedEffect,

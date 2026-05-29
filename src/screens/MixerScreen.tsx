@@ -151,7 +151,7 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
         <Segmented
           options={["A", "B"]}
           value={app.ui.ab}
-          onChange={(v) => app.setUi("ab", v as "A" | "B")}
+          onChange={(v) => app.setAbSlot(v as "A" | "B")}
           accent
         />
       </div>

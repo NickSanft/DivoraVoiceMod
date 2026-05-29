@@ -171,6 +171,202 @@ describe("app store — Phase 2 audio actions", () => {
   });
 });
 
+describe("app store — Phase 4 preset actions", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+  });
+
+  it("refreshPresets replaces the list with the backend response", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_presets") {
+        return [
+          {
+            id: "my-voice",
+            version: 1,
+            name: "My Voice",
+            color: "#34D9A0",
+            glyph: "eq",
+            tag: "User",
+            desc: "Custom.",
+            chain: [
+              { id: "gate", enabled: true, vals: { thresh: -45 } },
+            ],
+          },
+        ];
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    expect(result.presetsLoaded()).toBe(false);
+    await result.refreshPresets();
+    expect(result.presetsLoaded()).toBe(true);
+    expect(result.presets()).toHaveLength(1);
+    expect(result.presets()[0]!.id).toBe("my-voice");
+  });
+
+  it("refreshPresets keeps the fallback when the backend response is empty", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_presets") return [];
+      return null;
+    });
+    const { result } = setupApp();
+    const fallbackCount = result.presets().length;
+    await result.refreshPresets();
+    expect(result.presets().length).toBe(fallbackCount);
+    expect(result.presetsLoaded()).toBe(false);
+  });
+
+  it("usePreset switches the active id and resets A/B to A", () => {
+    const { result } = setupApp();
+    const other = result
+      .presets()
+      .find((p) => p.id !== result.presetId());
+    expect(other).toBeDefined();
+    result.setUi("ab", "B");
+    result.usePreset(other!.id);
+    expect(result.presetId()).toBe(other!.id);
+    expect(result.ui.ab).toBe("A");
+  });
+
+  it("setAbSlot snapshots the current chain into the old slot and swaps", () => {
+    const { result } = setupApp();
+    const idx = result.chain().findIndex((c) => c.id === "gate");
+    // Edit in slot A
+    result.setChainParam(idx, "thresh", -30);
+    expect(result.chain()[idx]!.vals.thresh).toBe(-30);
+    // Switch to slot B — A snapshot captures the -30 edit
+    result.setAbSlot("B");
+    expect(result.ui.ab).toBe("B");
+    // The chain shown is now slot B (which started equal to the
+    // preset defaults), so the gate threshold is back to the bundled
+    // value, not -30.
+    expect(result.chain()[idx]!.vals.thresh).not.toBe(-30);
+    // Edit in slot B
+    result.setChainParam(idx, "thresh", -20);
+    // Toggle back to A — restores -30
+    result.setAbSlot("A");
+    expect(result.chain()[idx]!.vals.thresh).toBe(-30);
+  });
+
+  it("savePreset rejects bundled presets and forwards user ones", async () => {
+    const { result } = setupApp();
+    const bundled = result.presets().find((p) => p.tag === "Bundled")!;
+    await expect(result.savePreset(bundled)).rejects.toThrow(/bundled/i);
+
+    const user = {
+      ...bundled,
+      id: "my-copy",
+      name: "My Copy",
+      tag: "User" as const,
+    };
+    await result.savePreset(user);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "save_user_preset",
+      expect.objectContaining({
+        preset: expect.objectContaining({ id: "my-copy", tag: "User" }),
+      }),
+    );
+    expect(result.presets().some((p) => p.id === "my-copy")).toBe(true);
+  });
+
+  it("duplicatePreset writes a new user preset with a slugged id", async () => {
+    const { result } = setupApp();
+    const before = new Set(result.presets().map((p) => p.id));
+    const source = result.preset();
+    const copy = await result.duplicatePreset(source.id);
+    expect(copy).not.toBeNull();
+    expect(copy!.tag).toBe("User");
+    expect(copy!.name.toLowerCase()).toContain("copy");
+    expect(before.has(copy!.id)).toBe(false);
+    expect(result.presets().some((p) => p.id === copy!.id)).toBe(true);
+  });
+
+  it("deletePreset rejects bundled and removes user", async () => {
+    const { result } = setupApp();
+    const bundled = result.presets().find((p) => p.tag === "Bundled")!;
+    await expect(result.deletePreset(bundled.id)).rejects.toThrow(/bundled/i);
+
+    // Add a user preset, then delete it
+    const user = {
+      ...bundled,
+      id: "deletable",
+      name: "Deletable",
+      tag: "User" as const,
+    };
+    await result.savePreset(user);
+    expect(result.presets().some((p) => p.id === "deletable")).toBe(true);
+    await result.deletePreset("deletable");
+    expect(invokeMock).toHaveBeenCalledWith("delete_user_preset", {
+      id: "deletable",
+    });
+    expect(result.presets().some((p) => p.id === "deletable")).toBe(false);
+  });
+
+  it("exportPreset returns the backend-serialised JSON", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "export_preset_json") return "{ exported }";
+      return null;
+    });
+    const { result } = setupApp();
+    const out = await result.exportPreset(result.preset());
+    expect(invokeMock).toHaveBeenCalledWith(
+      "export_preset_json",
+      expect.objectContaining({ preset: expect.any(Object) }),
+    );
+    expect(out).toBe("{ exported }");
+  });
+
+  it("exportPreset falls back to JSON.stringify when backend is unreachable", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "export_preset_json") throw new Error("no tauri");
+      return null;
+    });
+    const { result } = setupApp();
+    const out = await result.exportPreset(result.preset());
+    expect(out).toContain(result.preset().id);
+    expect(out).toContain(result.preset().name);
+  });
+
+  it("reorderChainEntries swaps positions in the active chain", () => {
+    const { result } = setupApp();
+    const before = result.chain().map((c) => c.id);
+    if (before.length < 2) return; // safety
+    result.reorderChainEntries(0, 1);
+    const after = result.chain().map((c) => c.id);
+    expect(after[0]).toBe(before[1]);
+    expect(after[1]).toBe(before[0]);
+  });
+
+  it("reorderChainEntries is a no-op when from === to", () => {
+    const { result } = setupApp();
+    const before = result.chain().map((c) => c.id);
+    result.reorderChainEntries(1, 1);
+    const after = result.chain().map((c) => c.id);
+    expect(after).toEqual(before);
+  });
+
+  it("reorderChainEntries clamps out-of-range indices to a no-op", () => {
+    const { result } = setupApp();
+    const before = result.chain().map((c) => c.id);
+    result.reorderChainEntries(-1, 0);
+    result.reorderChainEntries(0, 99);
+    const after = result.chain().map((c) => c.id);
+    expect(after).toEqual(before);
+  });
+
+  it("resetAbSlots makes both slots match the current chain", () => {
+    const { result } = setupApp();
+    const id = result.presetId();
+    const idx = result.chain().findIndex((c) => c.id === "gate");
+    result.setChainParam(idx, "thresh", -25);
+    result.resetAbSlots();
+    expect(result.abSlots[id]!.A[idx]!.vals.thresh).toBe(-25);
+    expect(result.abSlots[id]!.B[idx]!.vals.thresh).toBe(-25);
+    expect(result.ui.ab).toBe("A");
+  });
+});
+
 describe("app store — Phase 3 DSP chain", () => {
   beforeEach(() => {
     invokeMock.mockReset();

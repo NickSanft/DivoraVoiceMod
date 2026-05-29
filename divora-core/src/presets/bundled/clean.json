@@ -1,0 +1,12 @@
+{
+  "id": "clean",
+  "version": 1,
+  "name": "Clean Passthrough",
+  "color": "#6E6590",
+  "glyph": "clean",
+  "tag": "Bundled",
+  "desc": "Your true voice. No effects, gate only.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -56 } }
+  ]
+}

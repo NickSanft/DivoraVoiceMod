@@ -1,0 +1,15 @@
+{
+  "id": "choir-of-ash",
+  "version": 1,
+  "name": "Choir of Ash",
+  "color": "#E9B14C",
+  "glyph": "formant",
+  "tag": "Bundled",
+  "desc": "Layered, breathy, sacred. Many voices from one.",
+  "chain": [
+    { "id": "pitch", "enabled": true, "vals": { "shift": 5 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 4 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 0, "high": 4 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 64, "mix": 50 } }
+  ]
+}

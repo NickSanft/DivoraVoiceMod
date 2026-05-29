@@ -319,6 +319,103 @@ User picks a different preset (Phase 4 will surface this)
 - `SetChain` allocates on the audio callback. Acceptable for Phase 3; can be moved off-thread in Phase 8 polish.
 - No global hotkey yet; PTM still goes through the in-app `Space` listener. Global hotkey registration via `tauri-plugin-global-shortcut` lands with the Settings hotkey UI.
 
-## Phase 4+ — (placeholders)
+## Phase 4 — presets + A/B compare
+
+### Module layout (added)
+
+```
+divora-core/src/
+└── presets/
+    ├── mod.rs              # Preset / PresetChainEntry / PresetTag types
+    ├── bundled.rs          # include_str! loader for the 5 bundled JSONs
+    ├── bundled/            # JSON sources
+    │   ├── hollow-king.json
+    │   ├── static-wraith.json
+    │   ├── velvet-demon.json
+    │   ├── choir-of-ash.json
+    │   └── clean.json
+    └── store.rs            # PresetStore (user preset I/O + corruption-tolerant listing)
+
+src/
+├── components/
+│   └── ExportPresetModal.tsx   # JSON view + Copy + Save .json
+├── screens/
+│   └── PresetsScreen.tsx       # left list + right editor + ChainCards
+└── data/
+    └── presets.ts              # FALLBACK_PRESETS + presetFromWire
+```
+
+### Preset persistence
+
+```
+%APPDATA%\DivoraVoice\presets\
+├── my-voice.json           ← user preset (Tag: User)
+├── radio-host.json         ← user preset
+└── ...
+```
+
+- IDs must match `[a-z0-9_-]+` so they can't traverse paths or hit Windows reserved names.
+- Loading is corruption-tolerant: a malformed or non-JSON file is logged and skipped, never propagated as an error.
+- Bundled presets are embedded into the binary via `include_str!` and can't be saved or deleted; the UI hides those actions on bundled rows.
+
+### Wire format
+
+```jsonc
+{
+  "id": "hollow-king",
+  "version": 1,
+  "name": "Hollow King",
+  "color": "#7C5CF6",
+  "glyph": "reverb",
+  "tag": "Bundled",       // or "User"
+  "desc": "…",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -48 } }
+  ]
+}
+```
+
+Same struct on both sides; serde + TypeScript types stay in lockstep via `WirePreset` / `WireChainEntry`. The `version` field is the migration handle for future schema changes (back-compat via `serde(default)` on each new field).
+
+### Frontend store extensions
+
+| Field | Kind | Purpose |
+|---|---|---|
+| `presets` / `setPresets` | signal | The reactive preset list, seeded from `FALLBACK_PRESETS`, replaced by backend list |
+| `presetsLoaded` | signal | True once `refreshPresets()` succeeds |
+| `refreshPresets` | action | Calls `list_presets`; failure keeps fallback |
+| `abSlots` / `setAbSlots` | store | Per-preset `{ A, B }` chain snapshots |
+| `setAbSlot(slot)` | action | Snapshot current → old slot, restore new slot, sync to engine |
+| `resetAbSlots` | action | Collapse both slots to the current chain |
+| `usePreset(id)` | action | Switch active preset; reset A/B; resync |
+| `savePreset(p)` | action | Refuse bundled; save user via backend |
+| `duplicatePreset(id)` | action | Slug-generates new id; saves as User |
+| `deletePreset(id)` | action | Refuse bundled; deletes user via backend |
+| `exportPreset(p)` | action | Backend `to_string_pretty` with `JSON.stringify` fallback |
+| `reorderChainEntries(from, to)` | action | Move within active chain + resync |
+
+### A/B compare flow
+
+```
+ui.ab = "A"
+chains[presetId]  = live A chain (writable by Inspector + ChainCards)
+abSlots[presetId] = { A: snapshot, B: snapshot }
+
+user clicks "B" segmented:
+  abSlots[presetId].A := clone(chain())   // snapshot the live edits
+  chains[presetId]    := clone(abSlots[presetId].B)
+  ui.ab               := "B"
+  SetChain(spec)                          // fresh chain to audio thread
+
+user clicks "A":
+  abSlots[presetId].B := clone(chain())
+  chains[presetId]    := clone(abSlots[presetId].A)
+  ui.ab               := "A"
+  SetChain(spec)
+```
+
+Picking a different preset (`usePreset(id)`) resets `abSlots[id]` to two copies of the new chain and sets `ui.ab` back to A.
+
+## Phase 5+ — (placeholders)
 
 To be filled in as each phase lands.

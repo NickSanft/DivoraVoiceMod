@@ -131,3 +131,44 @@ export async function setEffectEnabled(
 export async function clearEffectChain(): Promise<void> {
   await invoke("clear_effect_chain");
 }
+
+// ---- Presets ----
+
+/** Wire format for one chain entry inside a preset. Matches divora-core::presets. */
+export interface WireChainEntry {
+  id: string;
+  enabled: boolean;
+  vals: Record<string, number>;
+}
+
+/** Wire format for one preset, both bundled and user. */
+export interface WirePreset {
+  id: string;
+  version: number;
+  name: string;
+  color: string;
+  glyph: string;
+  tag: "Bundled" | "User";
+  desc: string;
+  chain: WireChainEntry[];
+}
+
+export async function listPresets(): Promise<WirePreset[]> {
+  return invoke<WirePreset[]>("list_presets");
+}
+
+export async function saveUserPreset(preset: WirePreset): Promise<void> {
+  await invoke("save_user_preset", { preset });
+}
+
+export async function deleteUserPreset(id: string): Promise<void> {
+  await invoke("delete_user_preset", { id });
+}
+
+export async function exportPresetJson(preset: WirePreset): Promise<string> {
+  return invoke<string>("export_preset_json", { preset });
+}
+
+export async function presetStorePath(): Promise<string> {
+  return invoke<string>("preset_store_path");
+}

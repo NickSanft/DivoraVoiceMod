@@ -15,6 +15,7 @@ use divora_core::audio::{
     AudioEngine, DeviceInfo, Levels, StreamInfo,
 };
 use divora_core::dsp::{DspCommand, EffectSpec};
+use divora_core::presets::{bundled_presets, Preset, PresetStore};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -40,10 +41,11 @@ struct EngineStatus {
     output: Levels,
 }
 
-/// Tauri-managed shared state. Holds the live audio engine; commands
-/// access it through `tauri::State<AppState>`.
+/// Tauri-managed shared state. Holds the live audio engine and the
+/// user preset store; commands access these through `tauri::State`.
 struct AppState {
     engine: Arc<AudioEngine>,
+    preset_store: Arc<PresetStore>,
 }
 
 #[tauri::command]
@@ -122,6 +124,36 @@ fn clear_effect_chain(state: State<'_, AppState>) {
     state.engine.send_dsp(DspCommand::Clear);
 }
 
+#[tauri::command]
+fn list_presets(state: State<'_, AppState>) -> Vec<Preset> {
+    let mut all = bundled_presets();
+    match state.preset_store.list_user() {
+        Ok(user) => all.extend(user),
+        Err(e) => tracing::warn!(?e, "failed to enumerate user presets"),
+    }
+    all
+}
+
+#[tauri::command]
+fn save_user_preset(state: State<'_, AppState>, preset: Preset) -> Result<(), String> {
+    state.preset_store.save(&preset).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_user_preset(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.preset_store.delete(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_preset_json(preset: Preset) -> Result<String, String> {
+    serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preset_store_path(state: State<'_, AppState>) -> String {
+    state.preset_store.base_dir().to_string_lossy().into_owned()
+}
+
 /// Spawn a background thread that emits `audio-levels` events to the
 /// frontend at ~30 Hz. The frontend uses these to drive live meters
 /// and the status pill without polling commands.
@@ -151,7 +183,29 @@ pub fn run() {
         .setup(|app| {
             let engine = Arc::new(AudioEngine::new());
             spawn_level_emitter(app.handle().clone(), engine.clone());
-            app.manage(AppState { engine });
+
+            // Locate %APPDATA%\DivoraVoice\presets\ (or platform equivalent)
+            // and prepare the user preset store. Failures here are logged
+            // but non-fatal — the bundled presets still ship.
+            let presets_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join("presets"),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; falling back to temp for presets");
+                    std::env::temp_dir().join("DivoraVoice").join("presets")
+                }
+            };
+            let preset_store =
+                Arc::new(PresetStore::new(presets_dir.clone()).unwrap_or_else(|e| {
+                    tracing::warn!(?e, "preset store init failed; using temp fallback");
+                    let fallback = std::env::temp_dir().join("DivoraVoice").join("presets");
+                    PresetStore::new(fallback).expect("temp preset store must init")
+                }));
+            tracing::info!(path = %preset_store.base_dir().display(), "preset store ready");
+
+            app.manage(AppState {
+                engine,
+                preset_store,
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -167,6 +221,11 @@ pub fn run() {
             set_effect_param,
             set_effect_enabled,
             clear_effect_chain,
+            list_presets,
+            save_user_preset,
+            delete_user_preset,
+            export_preset_json,
+            preset_store_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");

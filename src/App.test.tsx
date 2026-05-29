@@ -18,6 +18,8 @@ vi.mock("@tauri-apps/api/core", () => ({
           input: { rms: 0, peak: 0 },
           output: { rms: 0, peak: 0 },
         };
+      case "list_presets":
+        return [];
       default:
         return null;
     }

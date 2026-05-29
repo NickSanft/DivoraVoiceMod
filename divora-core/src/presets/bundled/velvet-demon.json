@@ -1,0 +1,16 @@
+{
+  "id": "velvet-demon",
+  "version": 1,
+  "name": "Velvet Demon",
+  "color": "#F2567A",
+  "glyph": "robot",
+  "tag": "Bundled",
+  "desc": "Smooth, low, and wrong in the best way. Sub-octave menace.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -50 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -7 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": -5 } },
+    { "id": "robot", "enabled": true, "vals": { "freq": 90, "mix": 32 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 30, "mix": 18 } }
+  ]
+}
