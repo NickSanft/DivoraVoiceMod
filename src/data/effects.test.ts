@@ -39,6 +39,27 @@ describe("EFFECTS catalog", () => {
     expect(p?.max).toBe(12);
     expect(p?.bipolar).toBe(true);
   });
+
+  it("denoiser exposes a mix param in 0..100 (Phase 10)", () => {
+    expect(EFFECTS.denoiser).toBeDefined();
+    const m = EFFECTS.denoiser.params.find((p) => p.key === "mix");
+    expect(m).toBeDefined();
+    expect(m!.min).toBe(0);
+    expect(m!.max).toBe(100);
+    expect(m!.unit).toBe("%");
+  });
+
+  it("denoiser sits between gate and pitch in EFFECT_ORDER", () => {
+    // The placement matters: gate is a hard threshold; denoiser is a
+    // learned model; both belong at the head of the chain, with the
+    // denoiser running on the gated stream.
+    const gateIdx = EFFECT_ORDER.indexOf("gate");
+    const denoIdx = EFFECT_ORDER.indexOf("denoiser");
+    const pitchIdx = EFFECT_ORDER.indexOf("pitch");
+    expect(gateIdx).toBeGreaterThanOrEqual(0);
+    expect(denoIdx).toBeGreaterThan(gateIdx);
+    expect(pitchIdx).toBeGreaterThan(denoIdx);
+  });
 });
 
 describe("fx helper", () => {

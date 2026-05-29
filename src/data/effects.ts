@@ -99,11 +99,22 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.thresh ?? 0} dB`,
   },
+  denoiser: {
+    id: "denoiser",
+    name: "Denoiser",
+    sigil: "shield",
+    desc: "RNNoise-based suppression. Only active at 48 kHz; 10 ms latency.",
+    params: [
+      { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 80 },
+    ],
+    readout: (v) => `${v.mix ?? 0}%`,
+  },
 };
 
 /** Default order effects appear in pickers and the spell circle. */
 export const EFFECT_ORDER: EffectId[] = [
   "gate",
+  "denoiser",
   "pitch",
   "formant",
   "eq",

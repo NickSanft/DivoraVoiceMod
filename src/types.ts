@@ -9,7 +9,8 @@ export type EffectId =
   | "robot"
   | "distortion"
   | "echo"
-  | "gate";
+  | "gate"
+  | "denoiser";
 
 export type NavId = "mixer" | "soundboard" | "presets" | "settings";
 

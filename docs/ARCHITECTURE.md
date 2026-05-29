@@ -858,6 +858,74 @@ Engine picks `engine_rate = input_rate`. The DSP chain and soundboard mix both r
 | Resampler delay | ~64 | 1.3 ms (only when rates differ) |
 | **Total** | | **~26 ms** (under 30 ms goal) |
 
-## Phase 10+ — (placeholders)
+## Phase 10 — polish (RNNoise denoiser + README rewrite)
+
+### Module layout (added / changed)
+
+```
+divora-core/
+├── Cargo.toml                # +nnnoiseless (default-features = false)
+└── src/
+    └── dsp/
+        ├── mod.rs            # EffectKind: +Denoiser variant;
+        │                     # build_effect: +Denoiser → RnnDenoiser
+        └── denoiser.rs       # streaming RNNoise wrapper + 7 tests
+
+src/
+├── audio/api.ts              # EffectKindWire +"denoiser"
+├── data/effects.ts           # +denoiser EFFECTS entry + EFFECT_ORDER slot
+├── data/effects.test.ts      # +2 new denoiser tests
+└── types.ts                  # EffectId +"denoiser"
+
+README.md                     # status pillar / install / SmartScreen rewrite
+```
+
+### Streaming RNNoise wrapper
+
+```
+┌──────────┐      ┌────────────────┐      ┌──────────┐
+│  buffer  ├─────►│   in_queue     │      │  output  │
+│  (any    │      │  (VecDeque)    │      │  buffer  │
+│   size)  │      └───────┬────────┘      └────▲─────┘
+└──────────┘              │ when ≥ 480          │
+                          ▼                     │
+                ┌──────────────────┐            │
+                │ DenoiseState     │            │
+                │ ::process_frame  │            │
+                └────────┬─────────┘            │
+                         │                      │
+              ┌──────────┴──────────┐           │
+              ▼                     ▼           │
+        ┌──────────┐         ┌──────────┐       │
+        │ out_queue│         │dry_delay │       │
+        │(denoised)│         │(matched  │       │
+        └────┬─────┘         │  dry)    │       │
+             │               └────┬─────┘       │
+             └──────────┬─────────┘             │
+                        ▼                       │
+            mix·wet + (1-mix)·dry  ─────────────┘
+            (or silence during warm-up)
+```
+
+Per call to `process(buffer, sample_rate)`:
+
+1. **Bypass paths**: if disabled, off-rate, or `mix < 1e-4`, skip the wet pipeline (the `mix=0` path still drains frames so the model stays warm for a later mix change).
+2. **Accumulate** every input sample into `in_queue`.
+3. **Drain frames** — while `in_queue.len() ≥ 480`, pop a 480-sample frame, scale to int16-range f32, call `DenoiseState::process_frame`, scale back to ±1, push 480 samples each to `out_queue` and `dry_delay`.
+4. **Emit** — for each output slot, pop the head of `out_queue` and `dry_delay` and write `mix * wet + (1-mix) * dry`. When the queues are empty (warm-up), emit silence; the dry signal must NOT pass through during warm-up or the wet stream will audibly repeat those samples on the next call.
+
+### Latency + sample rate
+
+- `RNNoise` is locked to **48 kHz**. Off-rate input bypasses the effect (no allocation, no state drift).
+- The wet stream lags the input by `FRAME_SIZE - chunk_size` samples — `max(0, 480 − N)` where `N` is the cpal callback size. For a 256-sample callback that's 224 samples of warm-up silence on the very first frame, then steady-state zero added latency per call (the wet output for *frame K* arrives in the same call that fills *frame K*).
+- Wet/dry mix is sample-aligned via `dry_delay` so `mix = 0` outputs the dry stream without re-introducing the warm-up delay; the `mix = 0` shortcut just skips writing wet entirely.
+
+### Why `Denoiser` is a separate effect from `Gate`
+
+- `Gate` is a per-sample hysteresis threshold — surgical "shut up when below −52 dB."
+- `Denoiser` is a learned model that suppresses spectral content recognised as noise. It works on the actual *texture* of the signal.
+- Stacking gate → denoiser at the head of the chain handles both ends: the gate kills the truly-silent moments, and `RNNoise` cleans the spectrum of what's left. Either alone would either over-process (gate too aggressive) or leave audible breath / fan noise through (denoiser alone).
+
+## Phase 11+ — (placeholders)
 
 To be filled in as each phase lands.

@@ -13,6 +13,10 @@ workspace = true
 [dependencies]
 biquad = "0.5"
 cpal = "0.15"
+# Phase 10: RNNoise-based noise suppression. `nnnoiseless` is a pure-
+# Rust port of Xiph's RNNoise; default features pull in CLI deps
+# (anyhow, clap, hound) we don't need, so disable them.
+nnnoiseless = { version = "0.5", default-features = false }
 ringbuf = "0.4"
 # Phase 9: phase-vocoder pitch + formant shifting via STFT.
 realfft = "3"

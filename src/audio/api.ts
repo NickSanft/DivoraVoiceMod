@@ -94,6 +94,7 @@ export const ZERO_LEVELS: Levels = { rms: 0, peak: 0 };
 /** Mirrors `EffectKind` in `divora-core::dsp`. Lowercase to match the serde rename. */
 export type EffectKindWire =
   | "gate"
+  | "denoiser"
   | "pitch"
   | "formant"
   | "eq"

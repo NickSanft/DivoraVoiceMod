@@ -20,6 +20,7 @@
 //! later phase. Formant ships a parallel band-pass colouring; the real
 //! LPC-based formant warp also lands later.
 
+mod denoiser;
 mod distortion;
 mod echo;
 mod eq;
@@ -30,6 +31,7 @@ mod reverb;
 mod robot;
 mod stft;
 
+pub use denoiser::RnnDenoiser;
 pub use distortion::Distortion;
 pub use echo::Echo;
 pub use eq::Eq;
@@ -48,6 +50,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum EffectKind {
     Gate,
+    /// Phase 10: RNNoise-based noise suppression. Distinct from `Gate`
+    /// (which is a hard threshold) — `Denoiser` is a learned model.
+    Denoiser,
     Pitch,
     Formant,
     Eq,
@@ -191,6 +196,7 @@ impl Default for EffectChain {
 fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
     let mut effect: Box<dyn AudioEffect> = match spec.kind {
         EffectKind::Gate => Box::new(NoiseGate::new()),
+        EffectKind::Denoiser => Box::new(RnnDenoiser::new()),
         EffectKind::Pitch => Box::new(PitchShift::new()),
         EffectKind::Formant => Box::new(FormantShift::new()),
         EffectKind::Eq => Box::new(Eq::new()),

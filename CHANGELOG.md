@@ -4,6 +4,54 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-05-29 — Phase 10: polish (RNNoise denoiser + README rewrite)
+
+### Added
+
+- **RNNoise-based denoiser effect** (`divora-core::dsp::denoiser`). Wraps the pure-Rust `nnnoiseless` port (BSD-3-Clause, derived from Xiph's RNNoise). Streaming pipeline:
+  - Accumulate native-rate input into a `VecDeque`.
+  - Every full 480-sample frame (= 10 ms at 48 kHz), hand to `DenoiseState::process_frame`. Push the denoised result onto an output queue + a delay-matched dry copy.
+  - On each call, write the head of the output queue back into the buffer with the wet/dry mix; output silence during the sub-frame warm-up so the dry signal can't audibly repeat once the wet stream catches up.
+  - Hard 48 kHz constraint (model assumes that rate); off-rate input bypasses with no allocation. Users with a 44.1 kHz mic should pick a 48 kHz device for now — the rubato resampler around the denoiser is a future polish job.
+- **`Denoiser` effect kind** registered in `EffectKind` + `EffectChain::build_effect`. Distinct from `Gate` (the hysteresis-threshold effect) — both can stack.
+- **Frontend EFFECTS catalog entry** for `denoiser` with the `shield` sigil, a single `mix` param (0–100 %, default 80 %), and a description that names the 48 kHz / 10 ms latency caveats. `EFFECT_ORDER` places denoiser between `gate` and `pitch` so the chain runs cleaning steps first.
+- **Wire types**: `EffectKindWire` adds `"denoiser"` to mirror the backend serde rename.
+
+### Changed
+
+- `divora-core::dsp::mod` — `EffectKind` gains the `Denoiser` variant; `build_effect` constructs a `RnnDenoiser` for it.
+- `divora-core/Cargo.toml` — `+nnnoiseless = "0.5"` with `default-features = false` (we don't need the CLI deps that the `bin` feature pulls in).
+- **README rewrite**. The prior README still claimed `"Status: Phase 0 — scaffold. Not yet usable."` Restored truthfulness: shipped feature list, install steps from the Releases page, SmartScreen workaround, build prerequisites (now including cmake for libopus + libnnnoiseless), architecture pointer.
+
+### Tests
+
+- **Rust**: 95 → 102 (+7).
+  - 7 `dsp::denoiser`: passthrough when disabled, off-rate bypass, sub-frame chunks silent until frame is full, post-warmup output is non-zero and finite, disable clears the pipeline so re-enable starts in warm-up, `mix` clamps to 0..1 + unknown-key ignore, `mix = 0` leaves the buffer untouched.
+- **Frontend**: 165 → 167 (+2).
+  - 2 `EFFECTS catalog` (denoiser has a `mix` param in 0..100 with `%` unit; denoiser sits between gate and pitch in `EFFECT_ORDER`).
+
+### Architecture notes
+
+- **Why a learned model on top of the noise gate**: the Phase 3 noise gate silences input below a hard threshold — surgical but binary. `RNNoise` works on the *spectrum* of speech, suppressing background components without crushing dynamics. Stacking gate (chops the truly-silent moments) then denoiser (cleans what's left) gives the cleanest output without either step doing too much on its own.
+- **Why 48 kHz only for v1**: `nnnoiseless` is a port of an RNN trained on 48 kHz data with a fixed 480-sample frame and a hard-coded filterbank that assumes that rate. Running off-rate input through the model's filterbank produces unstable output. Our existing `MonoResampler` from Phase 9 could bridge the rate, but each "44.1 → 48 → process → 48 → 44.1" round adds latency + cost. For Phase 10 we keep it simple: bypass at non-48 kHz, document the constraint. Phase 11 polish can revisit.
+- **Why 10 ms warm-up silence (instead of passthrough)**: the denoiser produces output for *frame N* once it has *frame N* of input. If we passthrough during accumulation, those input samples are emitted as dry audio — and then the denoised version of the same samples arrives one buffer later, audibly repeating the audio. Silence during warm-up is a one-time event when the engine starts (or when the user toggles denoiser on); the user hears ~10 ms of nothing, then crisp audio.
+- **Why `mix = 0` shortcut**: the wet path costs CPU and queues memory. When the user wants the dry signal anyway, skip the wet pipeline but still queue inputs through `drain_frames` so `state` stays warm — toggling mix > 0 mid-session doesn't have to reseed the model.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (102)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (167)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+`RNNoise` makes the voice-modulation pipeline actually sound clean in calls. The previous gate-only path passed everything above the threshold straight through, so room noise / fan hum / mechanical-keyboard chatter rode along with the voice. Denoising at the head of the chain means every downstream effect (pitch, formant, reverb) operates on a clean signal — pitch shifts of noise no longer sound like wobbly noise; reverb on noise doesn't sound like a foggy room with a person in it.
+
+The README rewrite is the second half of Phase 10's "polish" mandate: the project page now matches what's actually shipped. v1.0 is a quiet patch cycle away.
+
 ## [0.9.0] — 2026-05-29 — Phase 9: DSP quality (real pitch + formant + rubato resampling)
 
 ### Added

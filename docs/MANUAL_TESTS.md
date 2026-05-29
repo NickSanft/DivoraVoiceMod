@@ -158,6 +158,18 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Vignette on → soft darkening around the window edges.
 - [ ] Vignette off → uniform surface brightness.
 
+## RNNoise denoiser (Phase 10)
+
+- [ ] Pick a 48 kHz input device (most USB mics). Make sure the engine reports `Running at 48000 Hz` in Settings.
+- [ ] On the Mixer, edit any preset to add `denoiser` to the chain with `mix = 80%`. Enable it.
+- [ ] Make a deliberately noisy environment: room fan on, mechanical keyboard typing, dishwasher in the background. Speak normally.
+- [ ] Listen on the monitor — the voice should sound noticeably cleaner with the denoiser on vs. off; the background noise floor drops by ~6–12 dB without the voice sounding muffled.
+- [ ] Toggle the denoiser off in the chain — noise floor returns immediately.
+- [ ] Switch to a 44.1 kHz input device. The denoiser should bypass automatically (no effect). Settings still shows the chain entry with denoiser enabled, but the voice is unaffected. (Phase 11 will add a resampler around it.)
+- [ ] Sweep `mix` from 0 → 100 %. At 0, the voice is fully dry (no denoising). At 100, fully wet. Intermediate values produce smooth fade between the two.
+- [ ] Disable the denoiser and re-enable. The first ~10 ms after re-enable should be silent (warm-up); then steady-state denoised audio.
+- [ ] Stack denoiser with the existing noise gate. Both should compose without artifacts: gate cuts the truly-silent bits, denoiser cleans what's left.
+
 ## Pitch shifter (Phase 9)
 
 - [ ] Pick the **Hollow King** preset on the Mixer (defaults to pitch −5 st).
