@@ -21,6 +21,7 @@ use ringbuf::HeapRb;
 use serde::{Deserialize, Serialize};
 
 use super::level::LevelMeter;
+use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
 use crate::dsp::{DspCommand, EffectChain};
@@ -308,12 +309,10 @@ fn start_streams(
 
     let input_rate = input_default.sample_rate().0;
     let output_rate = output_default.sample_rate().0;
-    if input_rate != output_rate {
-        return Err(AudioEngineError::SampleRateMismatch {
-            input: input_rate,
-            output: output_rate,
-        });
-    }
+    // Phase 9 replaces the hard SampleRateMismatch error with a
+    // `MonoResampler` in the output callback when the two rates
+    // disagree. DSP runs at `input_rate` (the engine rate); the
+    // resampler bridges to `output_rate` just before fan-out.
 
     let input_channels = input_default.channels();
     let output_channels = output_default.channels();
@@ -347,6 +346,7 @@ fn start_streams(
         dsp_rx,
         sb_rx,
         input_rate,
+        output_rate,
     )?;
 
     input_stream
@@ -450,7 +450,8 @@ fn build_output_stream(
     state: Arc<EngineState>,
     dsp_rx: Receiver<DspCommand>,
     sb_rx: Receiver<SoundboardCommand>,
-    sample_rate: u32,
+    input_rate: u32,
+    output_rate: u32,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -470,6 +471,15 @@ fn build_output_stream(
     let channels = channels as usize;
     let state_for_callback = state.clone();
 
+    // When input + output rates disagree we drop a streaming
+    // `MonoResampler` into the callback. It buffers native-rate samples
+    // from the engine and produces output-rate samples on demand.
+    let mut resampler: Option<MonoResampler> = if input_rate == output_rate {
+        None
+    } else {
+        Some(MonoResampler::new(input_rate, output_rate, 256)?)
+    };
+
     let stream = device
         .build_output_stream(
             config,
@@ -486,36 +496,75 @@ fn build_output_stream(
                     soundboard.apply(cmd);
                 }
                 let monitoring = state_for_callback.monitor.load(Ordering::Acquire);
-                let frames = data.len() / channels;
+                let out_frames = data.len() / channels;
+                let out_frames = out_frames.min(MAX_FRAMES_PER_CALLBACK);
                 let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
-                let frames = frames.min(mono.len());
-                let popped = consumer.pop_slice(&mut mono[..frames]);
+
+                // How many native-rate frames do we need this round?
+                // With no resampler: out_frames (1:1). With a
+                // resampler: ceil(out_frames * input_rate / output_rate)
+                // — but we read in chunks of `resampler.input_frames_next()`
+                // so the cumulative size approaches the right total.
+                let native_frames = if let Some(r) = resampler.as_ref() {
+                    // Aim for slightly more native frames than strictly
+                    // needed so the resampler always has a fresh chunk
+                    // ready. We size by the input ratio plus the
+                    // resampler's own next-needed count.
+                    let ratio_num = u64::from(input_rate);
+                    let ratio_den = u64::from(output_rate);
+                    let scaled = u64::try_from(out_frames)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(ratio_num)
+                        / ratio_den.max(1);
+                    let approx = usize::try_from(scaled).unwrap_or(MAX_FRAMES_PER_CALLBACK)
+                        + r.input_frames_next();
+                    approx.min(MAX_FRAMES_PER_CALLBACK)
+                } else {
+                    out_frames
+                };
+
+                let popped = consumer.pop_slice(&mut mono[..native_frames]);
                 let zero_from = popped;
-                for slot in &mut mono[zero_from..frames] {
+                for slot in &mut mono[zero_from..native_frames] {
                     *slot = 0.0;
                 }
+
                 // Run the DSP chain over the mic mono buffer first, so
                 // effects apply only to the user's voice…
-                chain.process(&mut mono[..frames], sample_rate);
+                chain.process(&mut mono[..native_frames], input_rate);
                 // …then mix soundboard voices in alongside the
                 // already-effected voice. Clips play "as-is" (no DSP).
-                soundboard.mix_into(&mut mono[..frames], sample_rate);
+                soundboard.mix_into(&mut mono[..native_frames], input_rate);
+
+                // Now hand the native-rate buffer to the output
+                // pipeline. Either a passthrough (rates match) or via
+                // the resampler.
+                let mut output_mono = [0f32; MAX_FRAMES_PER_CALLBACK];
+                let written_out = if let Some(r) = resampler.as_mut() {
+                    r.push_input(&mono[..native_frames]);
+                    r.process(&mut output_mono[..out_frames])
+                } else {
+                    let n = native_frames.min(out_frames);
+                    output_mono[..n].copy_from_slice(&mono[..n]);
+                    n
+                };
+
                 // Fan out mono -> all output channels, or silence if not
                 // monitoring.
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
-                    if i >= frames {
+                    if i >= written_out {
                         for s in frame {
                             *s = 0.0;
                         }
                         continue;
                     }
-                    let sample = if monitoring { mono[i] } else { 0.0 };
+                    let sample = if monitoring { output_mono[i] } else { 0.0 };
                     for s in frame {
                         *s = sample;
                     }
                 }
                 // Meter reflects what we actually sent to the device.
-                let metered = &mono[..frames];
+                let metered = &output_mono[..written_out];
                 if monitoring {
                     meter.process(metered);
                 } else {

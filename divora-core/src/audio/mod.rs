@@ -14,12 +14,14 @@
 mod devices;
 mod engine;
 mod level;
+mod resampler;
 mod state;
 mod virtual_mic;
 
 pub use devices::{list_input_devices, list_output_devices, DeviceInfo};
 pub use engine::{AudioEngine, StreamInfo};
 pub use level::LevelMeter;
+pub use resampler::MonoResampler;
 pub use state::Levels;
 pub use virtual_mic::{detect_virtual_mic, VirtualMicStatus};
 
@@ -44,6 +46,13 @@ pub enum AudioEngineError {
         "sample-rate mismatch: input {input} Hz, output {output} Hz. Phase 2 requires matching rates; resampling lands in a later phase."
     )]
     SampleRateMismatch { input: u32, output: u32 },
+
+    #[error("failed to build resampler ({input} → {output} Hz): {message}")]
+    ResamplerBuild {
+        input: u32,
+        output: u32,
+        message: String,
+    },
 
     #[error("unsupported sample format on {device}: {format}")]
     UnsupportedSampleFormat { device: String, format: String },

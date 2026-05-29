@@ -158,6 +158,28 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Vignette on → soft darkening around the window edges.
 - [ ] Vignette off → uniform surface brightness.
 
+## Pitch shifter (Phase 9)
+
+- [ ] Pick the **Hollow King** preset on the Mixer (defaults to pitch −5 st).
+- [ ] Start the engine, speak. Your voice should sound roughly half an octave lower **without** the "hearing yourself twice" doubling that v0.3.0 had.
+- [ ] Switch to **Static Wraith** (pitch +2 st). Voice should sound *slightly* higher; no doubling, no audible warbling on sustained vowels.
+- [ ] In Presets editor, open any preset with pitch enabled; sweep the slider from −12 to +12 in 1-st increments. Each change should produce an audible pitch step without crackles.
+- [ ] Disable pitch (toggle off). Voice should immediately return to original pitch — no STFT latency, no reconstruction noise.
+
+## Formant shifter (Phase 9)
+
+- [ ] In Presets editor, open Velvet Demon (formant −5). Speak — voice should sound *darker / heavier* but the fundamental should not move.
+- [ ] Switch to Choir of Ash (formant +4). Voice should sound *brighter / lighter* without moving up in pitch.
+- [ ] Sweep formant from −10 to +10 on a single preset. The colour change should be smooth; no clicks, no NaN / silence dropouts.
+- [ ] Combine pitch and formant on the same chain (Hollow King: pitch −5, formant −3). Each stage should compose without interfering: the pitch goes down AND the formant darkens, separately.
+
+## Sample-rate mismatch (Phase 9)
+
+- [ ] Pick an input device at 48 kHz (most USB mics) and an output device at 44.1 kHz (laptop speakers often are). v0.8.x would have refused to start with `SampleRateMismatch`. v0.9 should start cleanly and you should hear yourself in monitor mode.
+- [ ] Switch input to a 44.1 kHz device with the output still 44.1 kHz — engine should restart without going through the resampler (no extra latency).
+- [ ] Switch back to a 48 kHz input — engine should restart with the resampler engaged; latency should still feel sub-30 ms.
+- [ ] Engine status pill at the top should read "Running at <input_rate> Hz" — i.e. the engine rate is the input rate.
+
 ## Cast cursor alignment (Phase 8)
 
 - [ ] On the Mixer, click Cast (or press G).

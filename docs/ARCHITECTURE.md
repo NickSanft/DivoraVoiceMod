@@ -772,6 +772,92 @@ The `sb:` prefix keeps tile ids out of the PTM / panic / monitor namespace.
 
 `pushRecentFolder(path)` prepends with dedup (move-to-front semantics) and caps the list at 5. Called from both `pickSoundboardFolder` (user picked one via the native dialog) and `useRecentFolder` (user picked one from the dropdown). The dropdown UI is a simple `<For>` over `recentFolders()` with a per-row × button that calls `removeRecentFolder`.
 
-## Phase 9+ — (placeholders)
+## Phase 9 — DSP quality (real pitch + formant + rubato resampling)
+
+### Module layout (added / changed)
+
+```
+divora-core/
+├── Cargo.toml                 # +rubato, +realfft
+└── src/
+    ├── audio/
+    │   ├── mod.rs             # +resampler submodule, +MonoResampler re-export,
+    │   │                      #  +ResamplerBuild error variant
+    │   ├── engine.rs          # build_output_stream now takes input_rate +
+    │   │                      #  output_rate; constructs a MonoResampler when
+    │   │                      #  they disagree and bridges native → output rate
+    │   │                      #  in the callback
+    │   └── resampler.rs       # MonoResampler wrapper around SincFixedOut +
+    │                          #  4 tests
+    └── dsp/
+        ├── mod.rs             # +stft submodule
+        ├── stft.rs            # streaming STFT with overlap-add resynthesis +
+        │                      #  4 tests
+        ├── pitch.rs           # phase-vocoder pitch shifter + 6 tests
+        │                      #  (replaces v0.3.1 passthrough)
+        └── formant.rs         # spectrum-warping formant shifter + 7 tests
+                               #  (replaces 3-bandpass coloration)
+```
+
+### Phase vocoder math (pitch shifter)
+
+```
+For each STFT frame at hop H = 256, window N = 1024:
+
+  1. Analysis bin k true frequency:
+       expected_advance = 2π · k · H / N
+       actual_advance   = phase_now[k] − last_in_phase[k]
+       Δ                = wrap_pi(actual_advance − expected_advance)
+       true_freq[k]     = (k + Δ · N / (2π · H)) · (sr / N)
+
+  2. Synthesis bin k_out at pitch ratio r = 2^(semitones/12):
+       k_src = k_out / r                     (fractional)
+       synth_mag[k_out]   = lerp(mag[k_src], mag[k_src+1], frac)
+       phase_advance      = (true_freq[k_src] · r) · 2π · H / sr
+       synth_phase[k_out] = last_out_phase[k_out] + phase_advance
+       last_out_phase[k_out] = synth_phase[k_out]
+```
+
+The vocoder maintains its own `last_in_phase` / `last_out_phase` buffers (not the STFT's) so the closure passed to `Stft::process` can mutate them without aliasing the STFT's internal state. Bypass-at-zero-shift means the chain pays zero added latency when the slider is centred.
+
+### Spectrum-warp math (formant shifter)
+
+```
+For each STFT frame:
+
+  1. envelope[k]   = mean(mag[k - half .. k + half])     (Hann-style smoother)
+  2. excitation[k] = mag[k] / envelope[k]                (clamp env ≥ 1e-6)
+  3. warped_env[k] = lerp(envelope[k_src], envelope[k_src+1], frac)
+                     where k_src = k / r
+  4. new_mag[k]    = warped_env[k] · excitation[k]
+```
+
+Phases pass through untouched — formant shifting moves the *shape* of the spectrum, not the per-bin energy across bins. End result: vowel colour darkens / brightens without the fundamental moving.
+
+### Rubato resampler integration
+
+```
+                      input_rate = 48 kHz                       output_rate = 44.1 kHz
+   ┌──────────┐        ┌──────────────────┐  ┌──────────────────────────┐  ┌──────────┐
+   │ Mic      ├───────►│ SPSC ring buffer ├─►│ DSP chain @ input_rate  ├─►│ Resampler│ ──► out
+   │ (48 kHz) │        │ (RING_BUFFER_FRAMES)│ │ + Soundboard mix         │  │ (Sinc 128│
+   └──────────┘        └──────────────────┘  └──────────────────────────┘  │ tap, B-H │
+                                                                            │ window)  │
+                                                                            └──────────┘
+```
+
+Engine picks `engine_rate = input_rate`. The DSP chain and soundboard mix both run at `engine_rate`. The output callback feeds the chain's mono output into the resampler when needed; if rates match, the resampler is `None` and samples pass through directly.
+
+### Latency budget
+
+| Stage | Samples | Time @ 48 kHz |
+|---|---|---|
+| cpal input buffer | ~256 | 5.3 ms |
+| Internal SPSC ring | depends on jitter | ~0–10 ms |
+| STFT analysis window | 1024 | 21.3 ms (only when pitch / formant active) |
+| Resampler delay | ~64 | 1.3 ms (only when rates differ) |
+| **Total** | | **~26 ms** (under 30 ms goal) |
+
+## Phase 10+ — (placeholders)
 
 To be filled in as each phase lands.

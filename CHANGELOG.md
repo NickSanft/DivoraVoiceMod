@@ -4,6 +4,62 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-29 — Phase 9: DSP quality (real pitch + formant + rubato resampling)
+
+### Added
+
+- **Real phase-vocoder pitch shifter** (`divora-core::dsp::pitch`) replaces the v0.3.1 passthrough stub. Runs a 1024-sample / 256-hop Hann-windowed STFT; for each frame:
+  1. Compute the *true instantaneous frequency* per analysis bin from the actual phase advance vs. the expected hop advance.
+  2. Build the synthesis spectrum by sampling magnitude at `k_out / ratio` (linear interpolation between adjacent bins).
+  3. Evolve the per-bin synthesis phase by `(true_freq × ratio) × 2π × HOP / sr` so the output stays phase-coherent across hops.
+  4. ISFFT and overlap-add.
+  The "hearing yourself twice" varispeed bug from v0.3.0 can't recur — the vocoder never pulls from two unrelated points in time. Up-shift by 12 st measurably doubles the steady-state zero-crossing rate of a 440 Hz sine; down-shift by 12 st halves it. Zero-shift and disabled both still bypass to bit-identical passthrough.
+- **Formant shifter via spectrum warping** (`divora-core::dsp::formant`) replaces the three-bandpass coloration. For each STFT frame:
+  1. Estimate the spectral envelope by moving-averaging the magnitude spectrum on the frequency axis (33-bin Hann-style smoother).
+  2. Compute the excitation as `magnitude / envelope` — the harmonic fine structure.
+  3. Warp the envelope on the frequency axis by the formant ratio (linear interp).
+  4. Re-impose the original excitation on the warped envelope.
+  Result: vowel colour darkens / brightens *without* the fundamental moving. Pure sines pass straight through (no formants to warp); a formant-shifted 440 Hz tone retains a 440 Hz fundamental within ±25 % of zero-crossing rate.
+- **Streaming STFT helper** (`divora-core::dsp::stft`) — shared by pitch and formant. Pre-allocated Hann window + realfft analysis / synthesis + overlap-add output ring. The user supplies a closure that mutates the `(magnitude, phase)` of each frame.
+- **`MonoResampler`** (`divora-core::audio::resampler`) wraps `rubato::SincFixedOut` with a `push_input` / `process` API. 128-tap sinc, Blackman-Harris window, 0.95 cutoff, 128× oversampling — high-fidelity but realtime-friendly (allocates only at construction).
+- **Sample-rate mismatch is no longer a hard error.** The engine constructs a `MonoResampler` whenever input and output device rates differ; DSP runs at the input rate and the resampler bridges to the output rate just before fan-out. The `SampleRateMismatch` error variant remains for backward compatibility but is no longer produced. A new `ResamplerBuild` error covers the (rare) case where rubato refuses a particular rate pair.
+
+### Changed
+
+- `divora-core::dsp::mod.rs` — registered the new `stft` submodule alongside the existing eight effects.
+- `divora-core::audio::mod.rs` — registered `resampler` submodule + re-exported `MonoResampler`. New `ResamplerBuild { input, output, message }` error variant.
+- `divora-core::audio::engine` — `build_output_stream` now takes both `input_rate` and `output_rate`; the output callback chooses between direct passthrough and `MonoResampler::process` based on whether the rates match. DSP runs at the input rate either way.
+- `divora-core::Cargo.toml` — `+rubato = "0.16"`, `+realfft = "3"`.
+
+### Tests
+
+- **Rust**: 80 → 95 (+15).
+  - 4 `audio::resampler`: identity 48k → 48k, 44.1k → 48k produces ~48k frames, 48k → 44.1k produces ~44.1k frames, `reset` clears pending without panicking.
+  - 4 `dsp::stft`: identity modifier reconstructs input after warm-up, DC stays finite, zeroing the spectrum silences output, `reset` brings output back to zero.
+  - 6 `dsp::pitch` (replacing 5 passthrough tests): zero-shift bit-identical bypass, disabled bypass, +12 st doubles the dominant frequency of a 440 Hz sine, −12 st halves the dominant frequency of an 880 Hz sine, clamp + unknown-key behavior, DC stability.
+  - 7 `dsp::formant` (replacing 1 stability test): zero-shift bypass, disabled bypass, shifted output stays finite, DC under shift stays finite, formant shift does NOT move the fundamental frequency (sanity-check the whole point of formant shifting), `smooth_spectrum` preserves DC, clamp.
+- **Frontend**: 165 (unchanged).
+
+### Architecture notes
+
+- **Why a phase vocoder instead of WSOLA / PSOLA**: WSOLA gives slightly better quality on voice at small shifts but needs a pitch detector to lock the OLA cut points, and the cut-point search is non-trivial to test. The phase vocoder is the textbook algorithm, well-covered by acceptance tests (frequency doubling / halving), and shares all of its STFT infrastructure with formant warping.
+- **Why moving-average envelope instead of LPC**: LPC envelope warping is the "right" formant algorithm but adds Levinson-Durbin recursion + residual computation + re-synthesis — a lot more code with comparable end-result quality for ±12 st shifts on speech. We can swap in LPC later without breaking the public effect surface.
+- **21 ms latency budget**: the STFT window is 1024 samples ≈ 21 ms at 48 kHz. Added on top of the ~5 ms cpal buffer this puts the engine at ~26 ms end-to-end — still under the 30 ms Phase 2 goal. The bypass-at-zero-shift policy means uneffected paths see zero added latency.
+- **Resampler placement**: chose to run DSP at the input rate (not at a fixed internal 48 kHz) because input rates ≥ 44.1 kHz are universally common and the resampler's quality cost only applies to the output side. Resampling at the internal boundary would have meant resampling *every* signal regardless of device match.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (95)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (165)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+Phase 9 turns three "looks present but doesn't actually do anything" sliders into three working DSP effects. Pitch finally shifts pitch without doubling the voice; formant finally moves vowel colour without pitch; and "your mic and speakers are running different rates" stops being a wall the user hits — the engine just resamples. The phase vocoder + rubato infrastructure also unlocks future work (better quality formants via LPC, on-device AI voice conversion in Phase 11) without further architectural change.
+
 ## [0.8.2] — 2026-05-29 — Chain-card drag in Presets editor actually works
 
 ### Fixed

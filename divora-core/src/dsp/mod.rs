@@ -28,6 +28,7 @@ mod gate;
 mod pitch;
 mod reverb;
 mod robot;
+mod stft;
 
 pub use distortion::Distortion;
 pub use echo::Echo;

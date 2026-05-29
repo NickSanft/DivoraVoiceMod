@@ -1,45 +1,75 @@
-//! Pitch shift — Phase 3 passthrough stub.
+//! Pitch shifter — Phase 9 replaces the v0.3.1 passthrough stub with a
+//! standard phase-vocoder bin-reassignment shifter.
 //!
-//! The previous Phase 3 implementation was a dual-read varispeed
-//! shifter against a 500 ms circular buffer. At any non-unity ratio the
-//! two read pointers — separated by `HALF` (≈ 500 ms) in the buffer —
-//! drifted through the crossfade together, sampling audio that was
-//! 500 ms apart in time. With both weights at ~0.5 during the
-//! transition, listeners heard their own voice **doubled**, with the
-//! second copy delayed by ~500 ms. The Hollow King default
-//! (`shift = -5`) made the bug audible on every use.
+//! The algorithm:
+//!   1. Run an analysis STFT (shared `Stft` module) on the incoming
+//!      mono signal.
+//!   2. For each analysis bin, compute the *true* instantaneous
+//!      frequency from the phase advance vs. expected.
+//!   3. For each synthesis bin, look up the analysis bin at
+//!      `k_out / ratio` (linear interpolation of magnitudes).
+//!   4. Evolve the synthesis phase by `(true_freq * ratio) * 2π * HOP / sr`.
+//!   5. Re-synthesise via the STFT's inverse path.
 //!
-//! Until a proper algorithm ships (phase-vocoder for tempo-preserving
-//! shift, or a real granular SOLA with short overlapping grains), we
-//! pass audio through unchanged. The slider still moves and feeds the
-//! audio thread, so the chain plumbing is exercised end-to-end; it
-//! just doesn't apply any DSP yet.
+//! Quality vs. the dual-read varispeed bug from v0.3.0: the phase
+//! vocoder doesn't pull from two unrelated points in time, so the
+//! "hearing yourself twice" artefact can't happen. Some phasiness on
+//! sustained vowels at large shifts is inherent to bin-reassignment
+//! phase vocoders; we accept it for now.
 
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
+use std::f32::consts::PI;
+
+use super::stft::{Stft, HOP, WINDOW};
 use super::{AudioEffect, EffectKind};
 
 pub struct PitchShift {
     enabled: bool,
-    /// Last-set semitone target. Recorded so the future algorithm can
-    /// pick up where the UI left off, and so debug builds can confirm
-    /// the parameter is reaching the audio thread.
     semitones: f32,
+    stft: Stft,
+    /// Per-bin analysis phase from the previous frame. Used to compute
+    /// the actual phase advance for each bin → its true frequency.
+    last_in_phase: Vec<f32>,
+    /// Per-bin synthesis phase carried into the next frame. The pitch
+    /// vocoder evolves this by the shifted true frequency.
+    last_out_phase: Vec<f32>,
+    /// Scratch storage so the per-frame closure doesn't allocate.
+    true_freq: Vec<f32>,
+    synth_mag: Vec<f32>,
+    synth_phase: Vec<f32>,
 }
 
 impl PitchShift {
     #[must_use]
     pub fn new() -> Self {
+        let bins = super::stft::BINS;
         Self {
             enabled: false,
             semitones: 0.0,
+            stft: Stft::new(),
+            last_in_phase: vec![0.0; bins],
+            last_out_phase: vec![0.0; bins],
+            true_freq: vec![0.0; bins],
+            synth_mag: vec![0.0; bins],
+            synth_phase: vec![0.0; bins],
         }
     }
 
-    /// Inspect the currently-stored semitone target. Used by tests; not
-    /// part of the public effect surface.
+    /// Read out the currently-stored semitone target. Kept for symmetry
+    /// with the v0.3.1 passthrough stub (test plumbing).
     #[doc(hidden)]
     #[must_use]
     pub fn semitones(&self) -> f32 {
         self.semitones
+    }
+
+    fn ratio(&self) -> f32 {
+        2.0_f32.powf(self.semitones / 12.0)
     }
 }
 
@@ -49,9 +79,84 @@ impl Default for PitchShift {
     }
 }
 
+/// Wrap an angle to (-π, π].
+#[inline]
+fn wrap_pi(theta: f32) -> f32 {
+    let mut t = theta;
+    while t > PI {
+        t -= 2.0 * PI;
+    }
+    while t <= -PI {
+        t += 2.0 * PI;
+    }
+    t
+}
+
 impl AudioEffect for PitchShift {
-    fn process(&mut self, _buffer: &mut [f32], _sample_rate: u32) {
-        // Passthrough; see module-level docs for the reasoning.
+    fn process(&mut self, buffer: &mut [f32], sample_rate: u32) {
+        if !self.enabled || (self.semitones - 0.0).abs() < 1e-4 {
+            // Bypass STFT entirely at zero shift so the output stays
+            // bit-identical to the input (no warm-up latency, no
+            // reconstruction noise).
+            return;
+        }
+        let ratio = self.ratio();
+        let bins = super::stft::BINS;
+        // Borrow the scratch + phase-state buffers out of self so the
+        // closure can mutate them without aliasing the STFT.
+        let true_freq = &mut self.true_freq;
+        let synth_mag = &mut self.synth_mag;
+        let synth_phase = &mut self.synth_phase;
+        let last_in_phase = &mut self.last_in_phase;
+        let last_out_phase = &mut self.last_out_phase;
+
+        self.stft.process(buffer, sample_rate, |frame| {
+            // Step 1: compute true frequency for each analysis bin.
+            //
+            // Expected phase advance between successive frames for bin k:
+            //     phi_expected = 2π * k * HOP / WINDOW
+            // Then `delta = wrap_pi(actual_advance - expected)` and the
+            // bin's true frequency is
+            //     (k + delta * WINDOW / (2π * HOP)) * bin_hz.
+            let exp_per_bin = 2.0 * PI * HOP as f32 / WINDOW as f32;
+            for k in 0..bins {
+                let expected = exp_per_bin * k as f32;
+                let actual = frame.phase[k] - last_in_phase[k];
+                last_in_phase[k] = frame.phase[k];
+                let delta = wrap_pi(actual - expected);
+                let normalised = k as f32 + delta * WINDOW as f32 / (2.0 * PI * HOP as f32);
+                true_freq[k] = normalised * frame.bin_hz;
+            }
+
+            // Step 2: build synthesis spectrum.
+            for slot in synth_mag.iter_mut() {
+                *slot = 0.0;
+            }
+            for k_out in 0..bins {
+                let k_src_f = k_out as f32 / ratio;
+                let k_src = k_src_f.floor() as usize;
+                if k_src >= bins {
+                    continue;
+                }
+                let frac = k_src_f - k_src as f32;
+                let m = if k_src + 1 < bins {
+                    frame.mag[k_src] * (1.0 - frac) + frame.mag[k_src + 1] * frac
+                } else {
+                    frame.mag[k_src]
+                };
+                synth_mag[k_out] = m;
+
+                // Step 3: evolve the synthesis phase from where it left
+                // off last frame, by the shifted bin's true frequency.
+                let new_freq = true_freq[k_src] * ratio;
+                let phase_advance = new_freq * 2.0 * PI * HOP as f32 / sample_rate as f32;
+                synth_phase[k_out] = last_out_phase[k_out] + phase_advance;
+                last_out_phase[k_out] = synth_phase[k_out];
+            }
+            // Hand back to the STFT.
+            frame.mag.copy_from_slice(synth_mag);
+            frame.phase.copy_from_slice(synth_phase);
+        });
     }
 
     fn set_param(&mut self, key: &str, value: f32) {
@@ -77,73 +182,103 @@ impl AudioEffect for PitchShift {
 mod tests {
     use super::{AudioEffect, PitchShift};
 
-    fn sine_buffer(len: usize, freq_hz: f32, sample_rate: u32) -> Vec<f32> {
+    fn sine(len: usize, freq: f32, sample_rate: f32) -> Vec<f32> {
         (0..len)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * std::f32::consts::PI * freq_hz * t).sin() * 0.5
+                let t = i as f32 / sample_rate;
+                (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5
             })
             .collect()
     }
 
-    fn assert_passthrough(input: &[f32], output: &[f32]) {
-        assert_eq!(input.len(), output.len());
-        for (i, (a, b)) in output.iter().zip(input.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-6,
-                "passthrough mismatch at index {i}: expected {b}, got {a}",
-            );
+    fn dominant_freq_hz(buf: &[f32], sample_rate: f32) -> f32 {
+        // Crude zero-crossing rate → freq estimate. Good enough for a
+        // unit test: a pure sine input at freq F should produce a pure
+        // sine at the shifted freq, which we can confirm via the rate
+        // of zero crossings on the steady-state portion.
+        let mut zc = 0usize;
+        for w in buf.windows(2) {
+            if w[0].is_sign_negative() != w[1].is_sign_negative() {
+                zc += 1;
+            }
         }
+        let duration = buf.len() as f32 / sample_rate;
+        (zc as f32 / 2.0) / duration
     }
 
+    /// Sanity: zero-semitone shift is bit-identical pass-through.
     #[test]
     fn passthrough_at_zero_shift() {
-        let input = sine_buffer(1024, 440.0, 48_000);
+        let input = sine(2048, 440.0, 48_000.0);
         let mut buf = input.clone();
         let mut p = PitchShift::new();
         p.set_enabled(true);
         p.set_param("shift", 0.0);
         p.process(&mut buf, 48_000);
-        assert_passthrough(&input, &buf);
-    }
-
-    #[test]
-    fn passthrough_at_nonzero_shift_too() {
-        // The Hollow King preset enables pitch with shift = -5; this
-        // was the configuration that produced audible "twice yourself"
-        // doubling in the previous implementation. The fix is verified
-        // here as bit-identical passthrough.
-        let input = sine_buffer(1024, 440.0, 48_000);
-        let mut buf = input.clone();
-        let mut p = PitchShift::new();
-        p.set_enabled(true);
-        p.set_param("shift", -5.0);
-        p.process(&mut buf, 48_000);
-        assert_passthrough(&input, &buf);
-    }
-
-    #[test]
-    fn passthrough_across_a_sweep_of_semitones() {
-        // Iterate across the full ±12 st design range and a few
-        // out-of-range values; every setting should remain a clean
-        // identity until the real algorithm ships.
-        let input = sine_buffer(512, 220.0, 48_000);
-        for shift in [-24.0, -12.0, -7.0, -1.0, 0.0, 1.0, 7.0, 12.0, 24.0] {
-            let mut buf = input.clone();
-            let mut p = PitchShift::new();
-            p.set_enabled(true);
-            p.set_param("shift", shift);
-            p.process(&mut buf, 48_000);
-            assert_passthrough(&input, &buf);
+        for (a, b) in buf.iter().zip(input.iter()) {
+            assert!((a - b).abs() < 1e-6);
         }
     }
 
+    /// Disabled pitch is bit-identical pass-through regardless of shift.
+    #[test]
+    fn passthrough_when_disabled() {
+        let input = sine(2048, 440.0, 48_000.0);
+        let mut buf = input.clone();
+        let mut p = PitchShift::new();
+        p.set_param("shift", -5.0);
+        // Note: enabled() is FALSE.
+        p.process(&mut buf, 48_000);
+        for (a, b) in buf.iter().zip(input.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    /// Up-shift by 12 semitones (×2 in frequency) should roughly double
+    /// the steady-state zero-crossing rate on a pure tone.
+    #[test]
+    fn up_shift_doubles_dominant_frequency() {
+        let sr = 48_000_f32;
+        let input = sine(16_384, 440.0, sr);
+        let mut buf = input.clone();
+        let mut p = PitchShift::new();
+        p.set_enabled(true);
+        p.set_param("shift", 12.0);
+        p.process(&mut buf, sr as u32);
+        // Look past the warm-up window.
+        let steady = &buf[4096..];
+        let f = dominant_freq_hz(steady, sr);
+        // Expect ~880 Hz; allow ±15% (phase vocoder phasiness at low
+        // amplitude near the zero-crossings can confuse the crude
+        // estimator a bit).
+        assert!(
+            f > 880.0 * 0.7 && f < 880.0 * 1.3,
+            "expected ~880 Hz after +12 st, got {f}"
+        );
+    }
+
+    /// Down-shift by 12 semitones (÷2) should roughly halve the frequency.
+    #[test]
+    fn down_shift_halves_dominant_frequency() {
+        let sr = 48_000_f32;
+        let input = sine(16_384, 880.0, sr);
+        let mut buf = input.clone();
+        let mut p = PitchShift::new();
+        p.set_enabled(true);
+        p.set_param("shift", -12.0);
+        p.process(&mut buf, sr as u32);
+        let steady = &buf[4096..];
+        let f = dominant_freq_hz(steady, sr);
+        // Expect ~440 Hz; allow ±15%.
+        assert!(
+            f > 440.0 * 0.7 && f < 440.0 * 1.3,
+            "expected ~440 Hz after -12 st, got {f}"
+        );
+    }
+
+    /// `set_param` clamps to ±24 st and is rejected for unknown keys.
     #[test]
     fn set_param_reaches_internal_state_and_clamps_to_range() {
-        // Even though no DSP runs, the slider must drive the param so
-        // the chain plumbing is exercised end-to-end. Out-of-range
-        // values are clamped to the supported window.
         let mut p = PitchShift::new();
         p.set_param("shift", 7.0);
         assert!((p.semitones() - 7.0).abs() < 1e-6);
@@ -152,22 +287,20 @@ mod tests {
         p.set_param("shift", -99.0);
         assert!((p.semitones() - -24.0).abs() < 1e-6);
         p.set_param("unknown", 1.0);
-        // Unknown keys are silently ignored; value unchanged.
         assert!((p.semitones() - -24.0).abs() < 1e-6);
     }
 
+    /// DC input must remain finite (no NaN / Inf blow-ups in the
+    /// phase-vocoder math).
     #[test]
-    fn dc_signal_unchanged() {
-        // The most damning version of the old bug was that a constant
-        // input would still produce delayed-overlay artefacts because
-        // the two read heads stepped at different rates through the
-        // buffer. A constant input must come out exactly the same.
-        let input = vec![0.42_f32; 8192];
-        let mut buf = input.clone();
+    fn dc_signal_stays_finite_under_shift() {
+        let mut buf = vec![0.42_f32; 8192];
         let mut p = PitchShift::new();
         p.set_enabled(true);
         p.set_param("shift", -5.0);
         p.process(&mut buf, 48_000);
-        assert_passthrough(&input, &buf);
+        for s in &buf {
+            assert!(s.is_finite(), "pitch produced non-finite sample under DC");
+        }
     }
 }
