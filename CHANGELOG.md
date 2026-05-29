@@ -4,6 +4,35 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-05-29 — Chain-card drag in Presets editor actually works
+
+### Fixed
+
+- **Effect-card drag-reorder in the Presets editor was non-functional.** The card was `<div draggable={true}>` but it contained interactive children (the effect Toggle button + parameter Sliders). HTML5 drag refuses to initiate when the pointer-down lands on any interactive descendant, so dragging anywhere except the small drag-handle sigil silently did nothing — and even *that* was unreliable in WebView2.
+
+### Changed
+
+- `PresetsScreen` `ChainCard` switched to the explicit drag-handle pattern:
+  - The card itself drops `draggable={true}` and only acts as a **drop target** (`onDragEnter` / `onDragOver` / `onDragLeave` / `onDrop`).
+  - The drag-handle `<span>` (the existing drag sigil) takes on `draggable={true}` + `onDragStart` + `onDragEnd`, plus `role="button" tabindex={0}` and an explicit `aria-label` ("Drag to reorder *<effect>*. Currently at position *N* of *M*."). The user must grab the visible drag handle to initiate — which matches the existing visual affordance.
+- Same WebView2-friendly polish as v0.8.1: cursor switches `grab → grabbing` while dragging; 0.6 opacity on the dragging source; custom MIME `application/x-divora-chain-index` in addition to `text/plain`; `onDragLeave` ignores events that bubble up from descendants (no border flicker as the cursor crosses inner spans).
+
+### Tests
+
+- **Frontend**: 162 → 165 (+3).
+  - `PresetsScreen.test.tsx` (new):
+    - Card itself is NOT directly draggable (regression catch for the Phase 4 / v0.8.0 implementation).
+    - The drag handle `<span>` carries `draggable="true"` + `role="button"` + an aria-label that mentions "drag".
+    - Dispatching `dragstart` on the handle of card 0 + `drop` on card 2 actually reorders the chain through `app.reorderChainEntries` — the first entry slides to position 2, the others shift up.
+
+### Architecture notes
+
+- **Why drag handles instead of "draggable card + draggable={false} on every child"**: the second pattern works in theory but breaks down when the card grows new interactive elements (every future Toggle / Slider / Select inside a ChainCard would have to remember the opt-out). The drag-handle pattern moves the affordance to a single named place that's already visually distinguished. Net cost is the user *must* grab the handle — which is what the visual design wanted anyway.
+
+### Why it matters
+
+The chain editor is the whole point of the Presets screen — without working reorder, "Save with the runes in a different order" was a UI lie. The fix is small (~30 LoC) but unblocks the screen's promise.
+
 ## [0.8.1] — 2026-05-29 — Tile drag-and-drop reorder actually works in WebView2
 
 ### Fixed

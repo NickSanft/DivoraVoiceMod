@@ -498,23 +498,58 @@ interface ChainCardProps {
 function ChainCard(props: ChainCardProps): JSX.Element {
   const def = () => EFFECTS[props.entry.id as EffectId];
   const [dragOver, setDragOver] = createSignal(false);
+  const [dragging, setDragging] = createSignal(false);
 
-  const onDragStart = (e: DragEvent) => {
+  // EXPLICIT DRAG HANDLE PATTERN (v0.8.2). The card contains interactive
+  // children (Toggle button + parameter Sliders), and HTML5 drag will
+  // refuse to initiate when the pointer-down lands on any of those.
+  // Plus <div draggable> in WebView2 is finicky enough that we want one
+  // unambiguous drag source. The drag-handle <span> below carries
+  // `draggable={true}` and `onDragStart`; the card itself only acts as
+  // a drop target (no `draggable`, no dragstart). End result: drag only
+  // starts from the visible drag-handle sigil and lands anywhere on
+  // any sibling card.
+
+  const onDragStart = (e: DragEvent): void => {
     if (!e.dataTransfer) return;
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", String(props.index));
+    // Custom MIME survives Chromium's occasional getData quirks.
+    e.dataTransfer.setData(
+      "application/x-divora-chain-index",
+      String(props.index),
+    );
+    setDragging(true);
   };
-  const onDragOver = (e: DragEvent) => {
-    if (!e.dataTransfer) return;
+  const onDragEnd = (): void => {
+    setDragging(false);
+    setDragOver(false);
+  };
+  const onDragEnter = (e: DragEvent): void => {
     e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
     setDragOver(true);
   };
-  const onDragLeave = () => setDragOver(false);
-  const onDrop = (e: DragEvent) => {
+  const onDragOver = (e: DragEvent): void => {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    setDragOver(true);
+  };
+  const onDragLeave = (e: DragEvent): void => {
+    // Ignore leave events bubbling from descendants inside the card.
+    const related = e.relatedTarget as Node | null;
+    const currentEl = e.currentTarget as Node | null;
+    if (related && currentEl && currentEl.contains(related)) return;
+    setDragOver(false);
+  };
+  const onDrop = (e: DragEvent): void => {
     e.preventDefault();
     setDragOver(false);
-    const from = Number(e.dataTransfer?.getData("text/plain") ?? "");
+    const dt = e.dataTransfer;
+    const raw =
+      dt?.getData("application/x-divora-chain-index") ??
+      dt?.getData("text/plain") ??
+      "";
+    const from = Number(raw);
     if (Number.isFinite(from) && from !== props.index) {
       props.onReorder(from, props.index);
     }
@@ -530,8 +565,7 @@ function ChainCard(props: ChainCardProps): JSX.Element {
   return (
     <div
       class="card"
-      draggable={true}
-      onDragStart={onDragStart}
+      onDragEnter={onDragEnter}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
@@ -544,7 +578,8 @@ function ChainCard(props: ChainCardProps): JSX.Element {
         "box-shadow": dragOver()
           ? "0 0 0 3px rgba(124, 92, 246, 0.25)"
           : undefined,
-        transition: "border-color 0.12s, box-shadow 0.12s",
+        opacity: dragging() ? 0.6 : 1,
+        transition: "border-color 0.12s, box-shadow 0.12s, opacity 0.12s",
       }}
     >
       <div
@@ -555,11 +590,22 @@ function ChainCard(props: ChainCardProps): JSX.Element {
         }}
       >
         <span
+          draggable={true}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+          role="button"
+          tabindex={0}
+          aria-label={`Drag to reorder ${def().name}. Currently at position ${props.index + 1} of ${props.total}.`}
           style={{
             color: "var(--text-lo)",
-            cursor: "grab",
+            cursor: dragging() ? "grabbing" : "grab",
             display: "grid",
             "place-items": "center",
+            padding: "4px",
+            margin: "-4px",
+            "border-radius": "var(--r-sm)",
+            "user-select": "none",
+            "touch-action": "none",
           }}
           title={`Position ${props.index + 1} of ${props.total} — drag to reorder`}
         >
