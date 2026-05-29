@@ -1,22 +1,28 @@
-//! Pitch shift — Phase 3 ships a dual-read varispeed shifter against a
-//! short circular buffer. It tracks the slider and produces audible
-//! shifting, with some artefacts (smearing, comb-flutter on harmonic
-//! content). A real phase-vocoder lands in a later phase.
+//! Pitch shift — Phase 3 passthrough stub.
+//!
+//! The previous Phase 3 implementation was a dual-read varispeed
+//! shifter against a 500 ms circular buffer. At any non-unity ratio the
+//! two read pointers — separated by `HALF` (≈ 500 ms) in the buffer —
+//! drifted through the crossfade together, sampling audio that was
+//! 500 ms apart in time. With both weights at ~0.5 during the
+//! transition, listeners heard their own voice **doubled**, with the
+//! second copy delayed by ~500 ms. The Hollow King default
+//! (`shift = -5`) made the bug audible on every use.
+//!
+//! Until a proper algorithm ships (phase-vocoder for tempo-preserving
+//! shift, or a real granular SOLA with short overlapping grains), we
+//! pass audio through unchanged. The slider still moves and feeds the
+//! audio thread, so the chain plumbing is exercised end-to-end; it
+//! just doesn't apply any DSP yet.
 
 use super::{AudioEffect, EffectKind};
 
-/// 500 ms grain history at 96 kHz. Enough to keep both read heads
-/// inside the window for any sane sample rate.
-const BUFFER_FRAMES: usize = 48_000;
-const HALF: usize = BUFFER_FRAMES / 2;
-
 pub struct PitchShift {
     enabled: bool,
+    /// Last-set semitone target. Recorded so the future algorithm can
+    /// pick up where the UI left off, and so debug builds can confirm
+    /// the parameter is reaching the audio thread.
     semitones: f32,
-    buffer: Vec<f32>,
-    write_pos: usize,
-    read_pos_a: f32,
-    read_pos_b: f32,
 }
 
 impl PitchShift {
@@ -25,12 +31,15 @@ impl PitchShift {
         Self {
             enabled: false,
             semitones: 0.0,
-            buffer: vec![0.0; BUFFER_FRAMES],
-            write_pos: 0,
-            read_pos_a: 0.0,
-            #[allow(clippy::cast_precision_loss)]
-            read_pos_b: HALF as f32,
         }
+    }
+
+    /// Inspect the currently-stored semitone target. Used by tests; not
+    /// part of the public effect surface.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn semitones(&self) -> f32 {
+        self.semitones
     }
 }
 
@@ -40,64 +49,9 @@ impl Default for PitchShift {
     }
 }
 
-fn read_interpolated(buf: &[f32], pos: f32) -> f32 {
-    let n = buf.len();
-    #[allow(clippy::cast_precision_loss)]
-    let len = n as f32;
-    let mut p = pos % len;
-    if p < 0.0 {
-        p += len;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let i = p as usize % n;
-    let frac = p - p.floor();
-    let next = (i + 1) % n;
-    buf[i] * (1.0 - frac) + buf[next] * frac
-}
-
-fn window_weight(read_pos: f32, write_pos: usize) -> f32 {
-    // Triangular window: weight peaks when the read head is one HALF
-    // behind the write head, falls to zero at the boundaries.
-    #[allow(clippy::cast_precision_loss)]
-    let len = BUFFER_FRAMES as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let dist = (read_pos - write_pos as f32 + len) % len;
-    #[allow(clippy::cast_precision_loss)]
-    let half = HALF as f32;
-    let offset = (dist - half).abs();
-    ((half - offset) / half).max(0.0)
-}
-
 impl AudioEffect for PitchShift {
-    fn process(&mut self, buffer: &mut [f32], _sample_rate: u32) {
-        let ratio = 2.0_f32.powf(self.semitones / 12.0);
-        for sample in buffer.iter_mut() {
-            // Write incoming sample.
-            self.buffer[self.write_pos] = *sample;
-
-            let va = read_interpolated(&self.buffer, self.read_pos_a);
-            let vb = read_interpolated(&self.buffer, self.read_pos_b);
-            let wa = window_weight(self.read_pos_a, self.write_pos);
-            let wb = window_weight(self.read_pos_b, self.write_pos);
-            let total = wa + wb;
-            *sample = if total > 1e-6 {
-                (va * wa + vb * wb) / total
-            } else {
-                0.0
-            };
-
-            self.read_pos_a += ratio;
-            self.read_pos_b += ratio;
-            #[allow(clippy::cast_precision_loss)]
-            let len = BUFFER_FRAMES as f32;
-            if self.read_pos_a >= len {
-                self.read_pos_a -= len;
-            }
-            if self.read_pos_b >= len {
-                self.read_pos_b -= len;
-            }
-            self.write_pos = (self.write_pos + 1) % BUFFER_FRAMES;
-        }
+    fn process(&mut self, _buffer: &mut [f32], _sample_rate: u32) {
+        // Passthrough; see module-level docs for the reasoning.
     }
 
     fn set_param(&mut self, key: &str, value: f32) {
@@ -123,38 +77,97 @@ impl AudioEffect for PitchShift {
 mod tests {
     use super::{AudioEffect, PitchShift};
 
-    #[test]
-    fn zero_shift_does_not_blow_up() {
-        let mut p = PitchShift::new();
-        p.set_enabled(true);
-        p.set_param("shift", 0.0);
-        let mut buf = vec![0.0_f32; 1024];
-        for (i, s) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            let t = i as f32 / 48000.0;
-            *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+    fn sine_buffer(len: usize, freq_hz: f32, sample_rate: u32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * std::f32::consts::PI * freq_hz * t).sin() * 0.5
+            })
+            .collect()
+    }
+
+    fn assert_passthrough(input: &[f32], output: &[f32]) {
+        assert_eq!(input.len(), output.len());
+        for (i, (a, b)) in output.iter().zip(input.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "passthrough mismatch at index {i}: expected {b}, got {a}",
+            );
         }
-        p.process(&mut buf, 48000);
-        let max = buf.iter().copied().fold(f32::MIN, f32::max);
-        assert!(max.is_finite());
-        assert!(max <= 1.1);
     }
 
     #[test]
-    fn shift_changes_output_energy() {
-        let mut neutral = PitchShift::new();
-        neutral.set_enabled(true);
-        let mut shifted = PitchShift::new();
-        shifted.set_enabled(true);
-        shifted.set_param("shift", 7.0);
-        let mut a = vec![0.5_f32; 1024];
-        let mut b = vec![0.5_f32; 1024];
-        neutral.process(&mut a, 48000);
-        shifted.process(&mut b, 48000);
-        // The shifted version reads at a faster rate, so its short-term
-        // energy after this window is different from the neutral one.
-        let rms_a: f32 = a.iter().map(|s| s * s).sum::<f32>().sqrt();
-        let rms_b: f32 = b.iter().map(|s| s * s).sum::<f32>().sqrt();
-        assert!((rms_a - rms_b).abs() > 1e-3 || rms_b.is_finite());
+    fn passthrough_at_zero_shift() {
+        let input = sine_buffer(1024, 440.0, 48_000);
+        let mut buf = input.clone();
+        let mut p = PitchShift::new();
+        p.set_enabled(true);
+        p.set_param("shift", 0.0);
+        p.process(&mut buf, 48_000);
+        assert_passthrough(&input, &buf);
+    }
+
+    #[test]
+    fn passthrough_at_nonzero_shift_too() {
+        // The Hollow King preset enables pitch with shift = -5; this
+        // was the configuration that produced audible "twice yourself"
+        // doubling in the previous implementation. The fix is verified
+        // here as bit-identical passthrough.
+        let input = sine_buffer(1024, 440.0, 48_000);
+        let mut buf = input.clone();
+        let mut p = PitchShift::new();
+        p.set_enabled(true);
+        p.set_param("shift", -5.0);
+        p.process(&mut buf, 48_000);
+        assert_passthrough(&input, &buf);
+    }
+
+    #[test]
+    fn passthrough_across_a_sweep_of_semitones() {
+        // Iterate across the full ±12 st design range and a few
+        // out-of-range values; every setting should remain a clean
+        // identity until the real algorithm ships.
+        let input = sine_buffer(512, 220.0, 48_000);
+        for shift in [-24.0, -12.0, -7.0, -1.0, 0.0, 1.0, 7.0, 12.0, 24.0] {
+            let mut buf = input.clone();
+            let mut p = PitchShift::new();
+            p.set_enabled(true);
+            p.set_param("shift", shift);
+            p.process(&mut buf, 48_000);
+            assert_passthrough(&input, &buf);
+        }
+    }
+
+    #[test]
+    fn set_param_reaches_internal_state_and_clamps_to_range() {
+        // Even though no DSP runs, the slider must drive the param so
+        // the chain plumbing is exercised end-to-end. Out-of-range
+        // values are clamped to the supported window.
+        let mut p = PitchShift::new();
+        p.set_param("shift", 7.0);
+        assert!((p.semitones() - 7.0).abs() < 1e-6);
+        p.set_param("shift", 99.0);
+        assert!((p.semitones() - 24.0).abs() < 1e-6);
+        p.set_param("shift", -99.0);
+        assert!((p.semitones() - -24.0).abs() < 1e-6);
+        p.set_param("unknown", 1.0);
+        // Unknown keys are silently ignored; value unchanged.
+        assert!((p.semitones() - -24.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dc_signal_unchanged() {
+        // The most damning version of the old bug was that a constant
+        // input would still produce delayed-overlay artefacts because
+        // the two read heads stepped at different rates through the
+        // buffer. A constant input must come out exactly the same.
+        let input = vec![0.42_f32; 8192];
+        let mut buf = input.clone();
+        let mut p = PitchShift::new();
+        p.set_enabled(true);
+        p.set_param("shift", -5.0);
+        p.process(&mut buf, 48_000);
+        assert_passthrough(&input, &buf);
     }
 }

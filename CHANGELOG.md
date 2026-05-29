@@ -4,6 +4,21 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-28 — fix: pitch shifter passthrough
+
+### Fixed
+
+- **Pitch effect no longer produces audible doubling at non-unity ratios.** The Phase 3 dual-read varispeed shifter kept a 500 ms circular buffer with two read pointers separated by `HALF` (≈ 500 ms). At any non-unity ratio (so anything other than `shift = 0`), the two pointers drifted through the crossfade together, sampling buffer contents from two distinct times ~500 ms apart. With both weights at ~0.5 during the transition, listeners heard their own voice with a half-second echo of itself — the "I hear myself twice" the user reported on the Hollow King preset (which enables pitch with `shift = -5`).
+- The Phase 3 CHANGELOG already documented pitch as a stub awaiting a real phase-vocoder. The previous implementation was an attempted dual-read varispeed that didn't work for the reasons above. v0.3.1 ships an honest passthrough until the real algorithm lands: the slider still moves and feeds the audio thread (chain plumbing exercised end-to-end), but no DSP is applied.
+
+### Tests
+
+- `pitch::tests::passthrough_at_zero_shift` — identity check at `shift = 0`.
+- `pitch::tests::passthrough_at_nonzero_shift_too` — same identity check at `shift = -5` (the Hollow King default that exposed the bug).
+- `pitch::tests::passthrough_across_a_sweep_of_semitones` — full ±12 st design range plus out-of-range values, every setting passes through bit-exact.
+- `pitch::tests::set_param_reaches_internal_state_and_clamps_to_range` — guards that the slider still drives the parameter (and clamps out-of-range values) so the chain plumbing is exercised end-to-end.
+- `pitch::tests::dc_signal_unchanged` — the most damning version of the original bug had DC input producing delayed-overlay artefacts; we now assert bit-exact passthrough of constant input.
+
 ## [0.3.0] — 2026-05-28 — Phase 3: DSP effect chain + spell circle
 
 ### Added
