@@ -201,6 +201,58 @@ function Shell(): JSX.Element {
     });
   });
 
+  // v0.11.4: re-enumerate audio devices whenever the user returns focus
+  // to the app. cpal's `Host::devices()` only reflects the system list
+  // at the moment of the call — there's no cross-platform "device
+  // arrived" notification we can subscribe to without dropping into
+  // WASAPI's `IMMNotificationClient` (Windows-only, COM-heavy). The
+  // common workflow when plugging in a mic is:
+  //
+  //   1) user plugs the device in
+  //   2) user alt-tabs back to DivoraVoice
+  //   3) user opens Settings to pick it
+  //
+  // Refreshing on every focus catches step 2 transparently. The Tauri
+  // window-level `onFocusChanged` event is the source of truth on the
+  // OS-window level; we also listen to the browser-level `focus` event
+  // as a belt-and-suspenders fallback (covers browser preview / older
+  // Tauri builds where the plugin import fails).
+  onMount(() => {
+    let unlistenTauri: UnlistenFn | null = null;
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/window");
+        const w = mod.getCurrentWindow();
+        const fn = await w.onFocusChanged(({ payload: focused }) => {
+          if (!focused) return;
+          void app.refreshDevices();
+        });
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenTauri = fn;
+        }
+      } catch (err) {
+        // Browser preview or older Tauri without the window plugin —
+        // the window-level "focus" listener below still fires.
+        console.warn("[devices] Tauri focus subscription failed", err);
+      }
+    })();
+
+    const onFocus = (): void => {
+      void app.refreshDevices();
+    };
+    window.addEventListener("focus", onFocus);
+
+    onCleanup(() => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+      if (unlistenTauri) unlistenTauri();
+    });
+  });
+
   return (
     <div
       style={{

@@ -4,6 +4,40 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.11.4] — 2026-05-29 — Live device enumeration: refresh on focus + Settings entry + manual button
+
+Field report:
+
+> "When adding a new input device (and potentially output device) after starting the app it does not update."
+
+cpal's `Host::devices()` is a snapshot — it only reflects the system list at the moment of the call. There's no cross-platform "device arrived" notification we can subscribe to without dropping into Windows-specific COM (`IMMNotificationClient`). v0.11.0's live-switching effect handled the "user changed the SELECTION" case, but not the "user plugged in a NEW device" case — so v0.11.4 covers it with three converging refresh paths.
+
+### Added
+
+- **Auto-refresh on window focus.** `App` now subscribes to Tauri's `getCurrentWindow().onFocusChanged` (the source of truth on the OS-window level) and re-runs `refreshDevices()` every time `focused === true`. A browser-level `window.focus` listener runs in parallel as a belt-and-suspenders fallback for browser preview / older Tauri builds where the plugin import fails. The common workflow — plug device in → alt-tab back to DivoraVoice — now updates the device list transparently.
+- **Auto-refresh on Settings entry.** `SettingsScreen`'s `onMount` calls `refreshDevices()` alongside the existing `refreshVirtualMicStatus()`. Catches the "user navigates straight to Settings after plugging in" path.
+- **Manual `Refresh` button** at the top of the Audio devices section (`Sigil.refresh` + ghost button). Sets a transient `refreshing` signal so the button renders `Scanning…` and disables itself while in flight — guards against double-clicks.
+
+### Tests
+
+- **Frontend**: 215 → 222 (+7).
+  - 3 in `App shell — focus device refresh (v0.11.4)`: re-enumerates devices when Tauri `onFocusChanged({ payload: true })` fires; ignores blur events (`payload: false`); falls back to `window.focus` when the Tauri path is unavailable.
+  - 4 in a new `SettingsScreen — audio device refresh (v0.11.4)` test file: re-enumerates on mount; renders the `Refresh` button labelled `Refresh` when idle; clicking it triggers a fresh enumeration; the `Audio devices` section eyebrow renders alongside the control.
+  - The `getCurrentWindow` mock in `App.test.tsx` now includes an `onFocusChanged` stub that registers callbacks in a module-level array, so tests can drive focus changes directly.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (222)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The user's workflow when a new mic or headset arrives is: plug it in, switch to DivoraVoice, open Settings, pick it. Until v0.11.4, that last step quietly didn't work — the device dropdown still showed whatever was around at app launch. Refreshing on every focus change makes the new device appear without any "re-scan" interaction, while the manual button covers the few edge cases where focus never changed.
+
 ## [0.11.3] — 2026-05-29 — Canvas-based cast: drag anywhere, mockup-faithful omen
 
 Follow-up to v0.11.2. Three field reports:

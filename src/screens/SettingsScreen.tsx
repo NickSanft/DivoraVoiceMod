@@ -11,7 +11,7 @@
 //   • About (DMark + version + license + GitHub + three pillar cards +
 //     Replay setup button that re-opens the first-run wizard)
 
-import { createMemo, For, onMount, Show, type JSX } from "solid-js";
+import { createMemo, createSignal, For, onMount, Show, type JSX } from "solid-js";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { HotkeyCapture } from "../components/HotkeyCapture";
@@ -66,9 +66,14 @@ export function SettingsScreen(): JSX.Element {
     m === 0 ? "functional" : m < 0.8 ? "ambient" : "rich";
 
   // Run a VB-Cable detection on first mount so the section can paint a
-  // real status without the user having to click Re-scan.
+  // real status without the user having to click Re-scan. Also re-poll
+  // audio devices so the Settings list reflects anything plugged in
+  // since the app started — App-level focus refresh covers the alt-tab
+  // case, but this catches the "user navigated to Settings *first*
+  // thing after plugging in a device" path.
   onMount(() => {
     void app.refreshVirtualMicStatus();
+    void app.refreshDevices();
   });
 
   const inputOptions = createMemo<SelectOption[]>(() =>
@@ -152,6 +157,7 @@ interface AudioDevicesProps {
 
 function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
   const app = useApp();
+  const [refreshing, setRefreshing] = createSignal(false);
   const inputCount = () => app.audioInputs().length;
   const outputCount = () => app.audioOutputs().length;
   const statusLabel = () => {
@@ -164,10 +170,51 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
     return "Stopped";
   };
 
+  /**
+   * Manual re-enumeration. We mirror the focus-event path: the Settings
+   * screen also re-polls on mount and on window focus, so this button
+   * is the explicit fallback for the user who plugged in a device but
+   * never lost focus (e.g. an internal switch that doesn't pop a system
+   * tray, or running in a headless preview).
+   *
+   * Sets a transient `refreshing` flag so the button can render its
+   * own progress affordance without locking up. cpal enumeration is
+   * fast on Windows (~10 ms typical) but the network of awaits goes
+   * through the IPC bridge, so the flag also guards against
+   * double-clicks.
+   */
+  const onRefresh = async (): Promise<void> => {
+    if (refreshing()) return;
+    setRefreshing(true);
+    try {
+      await app.refreshDevices();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   return (
     <section>
-      <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
-        Audio devices
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+          "margin-bottom": "var(--s3)",
+        }}
+      >
+        <div class="eyebrow">Audio devices</div>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon="refresh"
+          onClick={() => void onRefresh()}
+          disabled={refreshing()}
+          title="Re-scan input + output devices (plugged in something?)"
+        >
+          {refreshing() ? "Scanning…" : "Refresh"}
+        </Button>
       </div>
       <div
         class="panel"
