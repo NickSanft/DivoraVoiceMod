@@ -4,6 +4,45 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.12.4] — 2026-05-30 — Installer bundles voice conversion (out-of-the-box AI)
+
+The release installer now ships `onnxruntime.dll` + the LLVC narrator model, so a fresh install does AI voice conversion with **zero manual setup** — no Python, no copying DLLs.
+
+### Added
+
+- **Bundled voice assets in the MSI/NSIS installer.** A config overlay (`src-tauri/tauri.bundle.conf.json`) adds `bundle.resources` for the runtime DLL + model; the release workflow fetches them and builds with `--config` that overlay. Verified locally: both installers build with the assets staged to `<resource_dir>/onnxruntime.dll` + `<resource_dir>/voices/llvc-narrator.onnx`.
+- **Runtime bundled-asset discovery** (`src-tauri/src/lib.rs` setup): on startup the app points `ORT_DYLIB_PATH` at the bundled `onnxruntime.dll` (unless already set / a dev DLL sits next to the exe), and exposes the bundled `voices/` dir.
+- **`list_voices` now merges user + bundled voices** via a new `scan_voice_dir` helper. A user-installed `<id>.onnx` shadows a bundled voice of the same id, so users can override shipped voices.
+- **`scripts/fetch-voice-assets.ps1`** — downloads the binaries from the `voice-assets-v1` GitHub release into `src-tauri/resources/` (gitignored). Run before a full local `pnpm tauri build`.
+- **`voice-assets-v1` GitHub release** hosting `onnxruntime.dll` (ONNX Runtime 1.26, MIT) + `llvc-narrator.onnx` (LLVC, MIT; LibriSpeech narrator target). Marked prerelease so it stays out of the "Latest" slot.
+
+### Why a separate overlay config
+
+Tauri validates `bundle.resources` paths during the **build script**, so any reference in the base `tauri.conf.json` would break every `cargo build` / `cargo clippy` / `cargo test` / `--no-bundle` CI run that doesn't have the ~31 MB of binaries. Keeping the resources in an overlay that only the release build applies means the entire normal CI matrix stays green **without fetching anything** — only `release.yml` (which runs on `v*.*.*` tags) fetches + bundles.
+
+### Tests
+
+- **Rust**: 119 → 122 (+3 in a new `lib.rs` test module): `scan_voice_dir` lists `.onnx` only; user voices shadow bundled ones by id (and the retained path is the user copy); a missing dir is a no-op.
+
+### Verified locally (2026-05-30)
+
+- Base config: `cargo check`/`--no-bundle` build **pass with `src-tauri/resources/` absent** (CI scenario) — confirms normal CI won't need the assets.
+- Overlay config + assets present: `pnpm tauri build --config src-tauri/tauri.bundle.conf.json` produced `DivoraVoice_0.0.0_x64_en-US.msi` (24.9 MB) + `DivoraVoice_0.0.0_x64-setup.exe` (20.6 MB) with resources staged to the expected layout.
+- The fetch script pulls both assets from the release into `src-tauri/resources/`.
+
+### Pre-push checklist (local, 2026-05-30)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (122, +1 ignored LLVC integration test)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (230)
+- `pnpm tauri build --debug --no-bundle` — pass (base config, CI command)
+
+### Not verified in-session
+
+Installing the produced MSI/NSIS and launching the *installed* app — that needs a system install. The bundling config, staged layout, runtime wiring, and the end-to-end conversion path (v0.12.3) are all verified; only the final "double-click the installer" step is manual.
+
 ## [0.12.3] — 2026-05-30 — LLVC wired up: real AI voice conversion runs end-to-end
 
 The ONNX path is no longer hypothetical. LLVC (KoeAI's MIT-licensed Low-latency Low-resource Voice Conversion) is exported to ONNX, validated, and confirmed converting audio through the actual `VoiceConverter` → `ort` → ONNX Runtime path on a dev machine.

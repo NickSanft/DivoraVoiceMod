@@ -62,6 +62,10 @@ struct AppState {
     /// models into (`%APPDATA%/DivoraVoice/voices/`). Created at
     /// startup; surfaced to the UI so it can list + open it.
     voices_dir: PathBuf,
+    /// Phase 12.4: read-only directory of voices shipped in the
+    /// installer's resource bundle. `None` in dev builds / when no
+    /// resources were bundled. Listed alongside `voices_dir`.
+    bundled_voices_dir: Option<PathBuf>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -210,11 +214,27 @@ fn voices_dir(state: State<'_, AppState>) -> String {
 
 /// Enumerate `*.onnx` models in the voices directory. Missing dir →
 /// empty list (not an error — the user just hasn't installed any).
+///
+/// Scans the user voices dir first, then the bundled resource voices
+/// dir (installer-shipped models). A user-installed voice with the same
+/// id shadows a bundled one, so users can override a shipped voice by
+/// dropping their own `<id>.onnx` into the user dir.
 #[tauri::command]
 fn list_voices(state: State<'_, AppState>) -> Vec<VoiceInfo> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&state.voices_dir) else {
-        return out;
+    let mut out: Vec<VoiceInfo> = Vec::new();
+    scan_voice_dir(&state.voices_dir, &mut out);
+    if let Some(bundled) = state.bundled_voices_dir.as_ref() {
+        scan_voice_dir(bundled, &mut out);
+    }
+    out.sort_by_key(|v| v.name.to_lowercase());
+    out
+}
+
+/// Append `*.onnx` voices from `dir` into `out`, skipping ids already
+/// present (first dir wins → user voices shadow bundled ones).
+fn scan_voice_dir(dir: &Path, out: &mut Vec<VoiceInfo>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -225,7 +245,7 @@ fn list_voices(state: State<'_, AppState>) -> Vec<VoiceInfo> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if id.is_empty() {
+        if id.is_empty() || out.iter().any(|v| v.id == id) {
             continue;
         }
         let size_bytes = entry.metadata().map_or(0, |m| m.len());
@@ -236,8 +256,6 @@ fn list_voices(state: State<'_, AppState>) -> Vec<VoiceInfo> {
             size_bytes,
         });
     }
-    out.sort_by_key(|v| v.name.to_lowercase());
-    out
 }
 
 /// Runtime + voices-dir status for the Settings panel.
@@ -469,12 +487,39 @@ pub fn run() {
             }
             tracing::info!(path = %voices_dir.display(), "voices dir ready");
 
+            // Phase 12.4: discover bundled voice assets shipped in the
+            // installer's resource dir (onnxruntime.dll + voices/*.onnx).
+            // Two things to wire:
+            //   1. Point `ort` (load-dynamic) at the bundled runtime DLL
+            //      via ORT_DYLIB_PATH — unless the user already set it,
+            //      or the DLL sits next to the exe (dev builds). This is
+            //      also what divora-core's `onnx_runtime_available()`
+            //      probe checks, so the Voice library reports "detected".
+            //   2. Expose the bundled voices dir so `list_voices` lists
+            //      the shipped model alongside user-installed ones.
+            let bundled_voices_dir = match app.path().resource_dir() {
+                Ok(res) => {
+                    let dll = res.join("onnxruntime.dll");
+                    if dll.is_file() && std::env::var_os("ORT_DYLIB_PATH").is_none() {
+                        std::env::set_var("ORT_DYLIB_PATH", &dll);
+                        tracing::info!(path = %dll.display(), "ORT_DYLIB_PATH set to bundled runtime");
+                    }
+                    let vdir = res.join("voices");
+                    vdir.is_dir().then_some(vdir)
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "no resource dir; bundled voices unavailable");
+                    None
+                }
+            };
+
             app.manage(AppState {
                 engine,
                 preset_store,
                 clip_cache: Mutex::new(HashMap::new()),
                 shortcuts: Mutex::new(HashMap::new()),
                 voices_dir,
+                bundled_voices_dir,
             });
             Ok(())
         })
@@ -511,4 +556,74 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_voice_dir, VoiceInfo};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Unique scratch dir under the OS temp area.
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("divora-voices-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(dir: &Path, name: &str) {
+        fs::write(dir.join(name), b"fake-onnx").unwrap();
+    }
+
+    #[test]
+    fn scan_voice_dir_lists_onnx_only_and_skips_others() {
+        let dir = scratch("ext");
+        touch(&dir, "alpha.onnx");
+        touch(&dir, "notes.txt");
+        touch(&dir, "beta.onnx");
+        let mut out: Vec<VoiceInfo> = Vec::new();
+        scan_voice_dir(&dir, &mut out);
+        let mut ids: Vec<_> = out.iter().map(|v| v.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["alpha", "beta"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_voices_shadow_bundled_by_id() {
+        let user = scratch("user");
+        let bundled = scratch("bundled");
+        touch(&user, "alpha.onnx");
+        touch(&user, "shared.onnx");
+        touch(&bundled, "shared.onnx"); // same id — should be shadowed
+        touch(&bundled, "gamma.onnx");
+
+        let mut out: Vec<VoiceInfo> = Vec::new();
+        scan_voice_dir(&user, &mut out); // user first → wins
+        scan_voice_dir(&bundled, &mut out);
+
+        let mut ids: Vec<_> = out.iter().map(|v| v.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["alpha", "gamma", "shared"]);
+        // The retained `shared` must be the USER copy, not the bundled one.
+        let shared = out.iter().find(|v| v.id == "shared").unwrap();
+        assert!(
+            shared.path.contains("divora-voices-user-"),
+            "shared should come from the user dir, got {}",
+            shared.path
+        );
+        fs::remove_dir_all(&user).ok();
+        fs::remove_dir_all(&bundled).ok();
+    }
+
+    #[test]
+    fn scan_missing_dir_is_a_no_op() {
+        let mut out: Vec<VoiceInfo> = Vec::new();
+        scan_voice_dir(&PathBuf::from("/no/such/voices/dir"), &mut out);
+        assert!(out.is_empty());
+    }
 }

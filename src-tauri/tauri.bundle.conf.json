@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "resources/onnxruntime.dll": "onnxruntime.dll",
+      "resources/voices/llvc-narrator.onnx": "voices/llvc-narrator.onnx"
+    }
+  }
+}

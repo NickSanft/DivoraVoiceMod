@@ -58,18 +58,45 @@ self-pads to a multiple of L=16, so 4096-sample chunks need no boundary
 padding) with `dynamo=False` for a predictable graph, then checks ORT
 output vs PyTorch (expect `max|diff| < 1e-3`).
 
-## Installing on Windows
+## Installing
 
-1. **Model** → `%APPDATA%\com.divora.voicemod\voices\llvc-narrator.onnx`
-   (the folder the app's *Settings → Voice library* "Open folder" button
-   opens).
+### From a release installer (v0.12.4+)
+
+The MSI/NSIS installer **bundles `onnxruntime.dll` + `llvc-narrator.onnx`**
+— voice conversion works out of the box. Install, launch, open
+*Settings → Voice library* ("ONNX Runtime detected", `llvc-narrator`
+listed), select the voice, and pick the *Deep Narrator* preset.
+
+### Manual (dev builds / your own model)
+
+1. **Model** → `%APPDATA%\com.divora.voicemod\voices\<id>.onnx`
+   (the folder *Settings → Voice library* "Open folder" opens). User
+   voices here shadow a bundled voice with the same id.
 2. **ONNX Runtime DLL** → copy `onnxruntime.dll` next to the app
-   executable (`onnxruntime`'s pip wheel ships it at
-   `.venv/Lib/site-packages/onnxruntime/capi/onnxruntime.dll`). The app
-   probes its own directory and `ORT_DYLIB_PATH`.
-3. Launch DivoraVoice → **Settings → Voice library** shows "ONNX Runtime
-   detected" and lists the voice → select it → enable **Voice Convert**
-   (the *Deep Narrator* preset already includes it).
+   executable, or set `ORT_DYLIB_PATH` to it (`onnxruntime`'s pip wheel
+   ships it at `.venv/Lib/site-packages/onnxruntime/capi/onnxruntime.dll`).
+3. Launch → select the voice → enable **Voice Convert**.
+
+## Bundling pipeline (maintainers)
+
+The binaries are **not** in git. They live on the `voice-assets-v1`
+GitHub release and are fetched at release-build time:
+
+- `scripts/fetch-voice-assets.ps1` downloads them into
+  `src-tauri/resources/` (gitignored).
+- `src-tauri/tauri.bundle.conf.json` is a config **overlay** that adds
+  `bundle.resources` mapping them to `<resource_dir>/onnxruntime.dll` +
+  `<resource_dir>/voices/llvc-narrator.onnx`. It's kept separate from
+  the base `tauri.conf.json` because Tauri validates resource paths at
+  build-script time — referencing them in the base config would break
+  every `cargo build` / CI run that lacks the assets.
+- `release.yml` runs the fetch, then
+  `pnpm tauri build --config src-tauri/tauri.bundle.conf.json`.
+- At runtime the app sets `ORT_DYLIB_PATH` to the bundled DLL and
+  `list_voices` merges the bundled `voices/` dir with the user dir.
+
+To refresh the hosted assets (new model / runtime version), re-run the
+export, then `gh release upload voice-assets-v1 <files> --clobber`.
 
 ## Notes
 

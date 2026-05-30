@@ -13,6 +13,11 @@ src-tauri/target/
 src-tauri/WixTools/
 src-tauri/gen/schemas/
 
+# Phase 12: bundled voice-conversion assets (onnxruntime.dll + *.onnx).
+# Fetched from the `voice-assets-v1` GitHub release by
+# scripts/fetch-voice-assets.ps1 — never committed (binaries, ~31 MB).
+src-tauri/resources/
+
 # Frontend build outputs
 dist/
 .vite/
