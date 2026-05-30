@@ -10,7 +10,12 @@ export type EffectId =
   | "distortion"
   | "echo"
   | "gate"
-  | "denoiser";
+  | "denoiser"
+  /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active
+   *  voice is identified by the `voice` param (matched to a file in the
+   *  Tauri-managed voices directory). Falls back to passthrough when no
+   *  voice is selected or the model file is missing. */
+  | "voice_convert";
 
 export type NavId = "mixer" | "soundboard" | "presets" | "settings";
 

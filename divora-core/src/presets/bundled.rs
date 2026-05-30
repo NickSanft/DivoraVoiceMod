@@ -30,6 +30,10 @@ const BUNDLED: &[BundledSource] = &[
         id: "clean",
         json: include_str!("bundled/clean.json"),
     },
+    BundledSource {
+        id: "deep-narrator-ai",
+        json: include_str!("bundled/deep-narrator-ai.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's

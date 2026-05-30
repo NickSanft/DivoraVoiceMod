@@ -4,6 +4,53 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-05-29 — Phase 12: AI voice conversion framework (ONNX Runtime + `VoiceConvert` effect)
+
+The plan's headline Phase 12 goal is on-device AI voice conversion ("Deep Narrator AI works real-time on CPU"). This is the first ship of that work: the **ONNX Runtime integration, the streaming `VoiceConvert` effect, and the chain/preset/UI wiring**. The model file + bundled `onnxruntime.dll` follow in v0.12.x patches (the user pre-accepted that Phase 12 "may take multiple commits to land green").
+
+### Added
+
+- **`ort` (ONNX Runtime 1.24 wrapper) + `ndarray`** in `divora-core`. Pinned to `=2.0.0-rc.12` with `default-features = false` + `["load-dynamic", "ndarray", "std", "api-24"]`. `load-dynamic` means the runtime DLL is resolved lazily at first use rather than linked at build time — so CI and machines without the runtime still compile and run. (`api-24` is required: without it `ort`'s vitis EP module fails to compile against the `load-dynamic` `OrtApi` struct.)
+- **`VoiceConverter` streaming effect** (`divora-core/src/dsp/voice_convert.rs`). Full real-time pipeline:
+  - Buffers native-rate (48 kHz) input → resamples to **16 kHz** (the rate published voice-conversion models assume) via `rubato::SincFixedOut`.
+  - Accumulates a **4096-sample (≈256 ms) chunk**, runs it through the loaded ONNX session, and resamples the result back to 48 kHz.
+  - Delay-matched **wet/dry mix** (`mix` param, 0–100 %) so users can blend converted + original voice without phase artifacts.
+- **`EffectKind::VoiceConvert`** wired into `EffectChain::build_effect`. The `EffectKind` serde rename changed from `lowercase` → `snake_case` so the new multi-word variant round-trips as `voice_convert` (all existing single-word variants are unchanged).
+- **Frontend**: `voice_convert` added to `EffectId`, `EffectKindWire`, and the `EFFECTS` catalog (mix param, `wave` sigil), positioned after the cleanup effects (gate → denoiser → **voice_convert** → pitch → …) so it converts a clean, gated, denoised signal.
+- **"Deep Narrator AI" bundled preset** (`deep-narrator-ai.json`): gate → denoiser → voice_convert → EQ low-shelf → ceremonial reverb. Works as a polished clean voice today; becomes true AI conversion once a model + runtime are installed.
+
+### Safety: graceful degradation, never a hang
+
+The effect is built to run on **every** machine, model or no model:
+
+- **No `onnxruntime.dll`** (every CI runner, every fresh install) → `load_session` returns `None` *before touching `ort`* → effect is a clean passthrough.
+- **No `.onnx` model file** → same; no session, passthrough.
+- **Off-rate input (≠ 48 kHz)** → bypass.
+- **Inference error mid-stream** → that chunk echoes dry; the session stays loaded for the next chunk.
+
+Critically, `load_session` checks that **both the model file and the runtime dylib physically exist** (`ORT_DYLIB_PATH` or a platform-default filename next to the exe, cached via `OnceLock`) before calling `Session::builder()`. This is load-bearing: with `load-dynamic`, the first `ort` call *blocks* rather than errors when the DLL is missing — so calling it unconditionally hung `cargo test` (and would hang CI for hours, since there's no per-test timeout). Gating on physical presence means `ort` is only ever invoked when the runtime is genuinely installed.
+
+### Tests
+
+- **Rust**: 104 → 113 (+9 in `dsp::voice_convert`): kind id; default-disabled; passthrough when disabled / when enabled-but-no-model / when model path cleared; missing-file does-not-panic-or-hang; off-rate bypass; mix clamp; enable/disable pipeline clear. All complete in <1 ms (the missing-file test previously hung 60 s+ before the presence-gate fix).
+- **Frontend**: 224 → 226 (+2): `voice_convert` exposes a 0–100 % mix param; its chain position sits after `denoiser` and before `pitch`.
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (113, no hang)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (226)
+- `pnpm tauri build --debug --no-bundle` — pass (ort links cleanly)
+
+### Still to come in v0.12.x
+
+- Bundle `onnxruntime.dll` with the installer (Tauri `externalBin` / resources).
+- Source + ship a compatible LLVC ONNX model and a "Deep Narrator" speaker.
+- Settings → **Voice library** UI: install/select voices, model-status indicator, background (off-audio-thread) model loading.
+- Firm up the model I/O tensor contract once a real model is in hand.
+
 ## [0.11.5] — 2026-05-29 — Restore titlebar drag (regression from v0.11.3)
 
 Field report:

@@ -30,6 +30,7 @@ mod pitch;
 mod reverb;
 mod robot;
 mod stft;
+mod voice_convert;
 
 pub use denoiser::RnnDenoiser;
 pub use distortion::Distortion;
@@ -40,6 +41,7 @@ pub use gate::NoiseGate;
 pub use pitch::PitchShift;
 pub use reverb::Reverb;
 pub use robot::Robot;
+pub use voice_convert::VoiceConverter;
 
 use std::collections::HashMap;
 
@@ -47,7 +49,7 @@ use serde::{Deserialize, Serialize};
 
 /// Identifier of an effect kind; mirrors the frontend's `EffectId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum EffectKind {
     Gate,
     /// Phase 10: RNNoise-based noise suppression. Distinct from `Gate`
@@ -60,6 +62,11 @@ pub enum EffectKind {
     Distortion,
     Echo,
     Reverb,
+    /// Phase 12: ONNX-backed voice conversion (LLVC-style). Loads a
+    /// `.onnx` model from the voices directory and streams 48 kHz mono
+    /// through a 16 kHz inference chunk. Falls back to passthrough
+    /// when the runtime DLL or the model file is missing.
+    VoiceConvert,
 }
 
 /// Trait every effect implements. The audio thread holds a `Box<dyn
@@ -204,6 +211,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::Distortion => Box::new(Distortion::new()),
         EffectKind::Echo => Box::new(Echo::new()),
         EffectKind::Reverb => Box::new(Reverb::new()),
+        EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
     };
     effect.set_enabled(spec.enabled);
     for (key, value) in &spec.params {

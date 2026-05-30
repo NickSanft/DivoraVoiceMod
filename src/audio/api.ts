@@ -91,7 +91,8 @@ export const ZERO_LEVELS: Levels = { rms: 0, peak: 0 };
 
 // ---- DSP ----
 
-/** Mirrors `EffectKind` in `divora-core::dsp`. Lowercase to match the serde rename. */
+/** Mirrors `EffectKind` in `divora-core::dsp`. Snake-case from v0.12.0
+ *  on so multi-word variants (`voice_convert`) round-trip cleanly. */
 export type EffectKindWire =
   | "gate"
   | "denoiser"
@@ -101,7 +102,8 @@ export type EffectKindWire =
   | "robot"
   | "distortion"
   | "echo"
-  | "reverb";
+  | "reverb"
+  | "voice_convert";
 
 /** Wire format for one effect in the chain. */
 export interface EffectSpec {

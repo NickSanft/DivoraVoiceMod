@@ -109,12 +109,23 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.mix ?? 0}%`,
   },
+  voice_convert: {
+    id: "voice_convert",
+    name: "Voice Convert",
+    sigil: "wave",
+    desc: "ONNX-backed AI voice conversion (LLVC). Pick a voice in Settings → Voice library, then dial in wet/dry mix. Falls back to passthrough when the ONNX Runtime DLL or chosen voice model isn't installed.",
+    params: [
+      { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 90 },
+    ],
+    readout: (v) => `${v.mix ?? 0}%`,
+  },
 };
 
 /** Default order effects appear in pickers and the spell circle. */
 export const EFFECT_ORDER: EffectId[] = [
   "gate",
   "denoiser",
+  "voice_convert",
   "pitch",
   "formant",
   "eq",

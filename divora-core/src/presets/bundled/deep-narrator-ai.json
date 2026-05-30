@@ -1,0 +1,16 @@
+{
+  "id": "deep-narrator-ai",
+  "version": 1,
+  "name": "Deep Narrator AI",
+  "color": "#34D9A0",
+  "glyph": "wave",
+  "tag": "Bundled",
+  "desc": "ONNX-backed voice conversion to a deep narrator timbre. Requires a compatible LLVC model + onnxruntime.dll; falls back to a clean voice with a subtle low-end shelf and ceremonial reverb when neither is installed.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -50 } },
+    { "id": "denoiser", "enabled": true, "vals": { "mix": 70 } },
+    { "id": "voice_convert", "enabled": true, "vals": { "mix": 90 } },
+    { "id": "eq", "enabled": true, "vals": { "low": 3, "mid": 0, "high": -1 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 35, "mix": 15 } }
+  ]
+}

@@ -60,6 +60,26 @@ describe("EFFECTS catalog", () => {
     expect(denoIdx).toBeGreaterThan(gateIdx);
     expect(pitchIdx).toBeGreaterThan(denoIdx);
   });
+
+  it("voice_convert exposes a mix param in 0..100 (Phase 12)", () => {
+    expect(EFFECTS.voice_convert).toBeDefined();
+    const m = EFFECTS.voice_convert.params.find((p) => p.key === "mix");
+    expect(m).toBeDefined();
+    expect(m!.min).toBe(0);
+    expect(m!.max).toBe(100);
+    expect(m!.unit).toBe("%");
+  });
+
+  it("voice_convert runs after the cleanup effects but before pitch", () => {
+    // Voice conversion wants a clean, gated, denoised signal as input;
+    // it sits after gate + denoiser. Downstream tone-shaping (pitch,
+    // eq, reverb) then colours the converted voice.
+    const denoIdx = EFFECT_ORDER.indexOf("denoiser");
+    const vcIdx = EFFECT_ORDER.indexOf("voice_convert");
+    const pitchIdx = EFFECT_ORDER.indexOf("pitch");
+    expect(vcIdx).toBeGreaterThan(denoIdx);
+    expect(pitchIdx).toBeGreaterThan(vcIdx);
+  });
 });
 
 describe("fx helper", () => {
