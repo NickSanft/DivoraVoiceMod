@@ -4,6 +4,45 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.12.3] — 2026-05-30 — LLVC wired up: real AI voice conversion runs end-to-end
+
+The ONNX path is no longer hypothetical. LLVC (KoeAI's MIT-licensed Low-latency Low-resource Voice Conversion) is exported to ONNX, validated, and confirmed converting audio through the actual `VoiceConverter` → `ort` → ONNX Runtime path on a dev machine.
+
+### Changed
+
+- **`run_inference` now speaks LLVC's real tensor contract**: input `audio` `[1, 1, T]` f32 → first output `[1, 1, T]` f32 (was a placeholder `[1, N]`). `T` is dynamic; the engine feeds 4096-sample 16 kHz chunks (a clean multiple of LLVC's internal stride L=16, so no boundary padding). Mismatched models still degrade to passthrough rather than crashing.
+
+### Added
+
+- **`docs/voice-models/`** — a reproducible recipe + the export/validation scripts:
+  - `export_onnx.py` traces LLVC's non-streaming `Net.forward` (`dynamo=False` for predictable graph io) and checks ORT-vs-PyTorch parity.
+  - `validate_chunked.py` runs a real speech clip through the ONNX in 4096-sample chunks (mirroring the engine) and gates on finite, audible, non-clipping output.
+  - `README.md` documents the model I/O contract, the minimal dep set (**no fairseq** — only torch/torchaudio/speechbrain), the speechbrain `PositionalEncoding` vendoring needed for export, and Windows install (model → voices dir, `onnxruntime.dll` → next to the exe).
+- **Gated end-to-end test** `llvc_model_converts_a_chunk` (`#[ignore]`d so CI + plain `cargo test` skip it — they have no model/DLL). On a dev box with the model installed it points `ORT_DYLIB_PATH` at the runtime, loads the model, and asserts a chunk comes back finite, full-length, and changed.
+
+### Verified on a dev machine (not in CI — needs the binary assets)
+
+- Export: ONNX vs PyTorch `max|diff| = 6.2e-06`.
+- Chunked real-speech conversion: 15×4096 chunks, rms 0.0197 → 0.0210, no clipping.
+- Rust end-to-end: model loads via `ort` 2.0-rc.12 against the **onnxruntime 1.26** DLL (api-24 forward-compat confirmed), `run_inference` returns a transformed chunk (`mean|delta| = 0.19`).
+
+### Not in this release (deliberately)
+
+- The **model file (~14 MB ONNX) and `onnxruntime.dll` (~17 MB) are not committed** — they're reproducible via `docs/voice-models/` and are installed locally on the dev machine. Bundling them into the installer (so end users get voice conversion out-of-the-box) remains future packaging work.
+
+### Pre-push checklist (local, 2026-05-30)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (119, +1 ignored LLVC integration test)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (230)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### How to hear it (on the dev machine)
+
+Settings → Voice library now shows "ONNX Runtime detected" and lists `llvc-narrator`. Select it, then pick the **Deep Narrator** preset (or enable **Voice Convert** in any chain): the mic is converted to the LLVC target voice, layered under the DSP shaping.
+
 ## [0.12.2] — 2026-05-30 — Deep Narrator that actually sounds deep (DSP), AI as bring-your-own
 
 Field report:

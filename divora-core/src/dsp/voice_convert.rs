@@ -530,22 +530,33 @@ fn onnx_runtime_present() -> bool {
 
 /// Run a single chunk of 16 kHz audio through the loaded model.
 ///
-/// Returns the model's `CHUNK_16K`-length output. On failure (or no
-/// session), echoes the input — the streaming-merge logic still keeps
-/// the wet/dry buffers aligned.
+/// Returns the model's converted samples. On failure (or no session),
+/// echoes the input — the streaming-merge logic still keeps the wet/dry
+/// buffers aligned.
 ///
-/// **Important**: the actual input/output tensor names + shapes are
-/// model-specific. For LLVC the model exposes `audio` (1 × N) → `audio`
-/// (1 × N). This implementation tries that shape; if it doesn't match
-/// the loaded model, the inference fails and we echo. v0.12.x patches
-/// will firm up the supported model contract once we bundle one.
+/// ### Model I/O contract (LLVC)
+///
+/// We exported `KoeAI`'s LLVC `Net` (non-streaming forward) to ONNX with:
+///   - input  `audio`     : f32 `[1, 1, T]` (batch, 1 channel, samples)
+///   - output `audio_out` : f32 `[1, 1, T]` (same length)
+///
+/// `T` is dynamic but the model self-pads to a multiple of its internal
+/// stride (L = 16); we always feed `CHUNK_16K` (4096), a clean multiple,
+/// so no boundary padding is introduced. Each chunk is converted
+/// independently (the non-streaming forward re-inits its internal
+/// buffers per call); LLVC's tiny lookahead keeps seam artifacts
+/// negligible at this chunk size.
+///
+/// If the loaded model's shape/names don't match (a different model
+/// dropped into the voices folder), inference errors and we echo —
+/// the effect degrades to passthrough rather than crashing the engine.
 fn run_inference(session: Option<&mut Session>, chunk: &[f32]) -> Vec<f32> {
     let Some(session) = session else {
         return chunk.to_vec();
     };
-    // Try the LLVC streaming shape: `(1, N)` f32 audio.
-    let shape = (1_usize, chunk.len());
-    let Ok(tensor) = ndarray::Array2::from_shape_vec(shape, chunk.to_vec()) else {
+    // LLVC wants `[1, 1, T]` (batch, mono channel, samples).
+    let shape = (1_usize, 1_usize, chunk.len());
+    let Ok(tensor) = ndarray::Array3::from_shape_vec(shape, chunk.to_vec()) else {
         return chunk.to_vec();
     };
     let Ok(value) = ort::value::Tensor::from_array(tensor) else {
@@ -555,7 +566,7 @@ fn run_inference(session: Option<&mut Session>, chunk: &[f32]) -> Vec<f32> {
     let Ok(outputs) = session.run(inputs) else {
         return chunk.to_vec();
     };
-    // First output, named `audio` per the LLVC convention.
+    // First (only) output — `[1, 1, T]`, flattened back to a sample run.
     let Some((_, value)) = outputs.iter().next() else {
         return chunk.to_vec();
     };
@@ -718,5 +729,77 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(!vc.is_model_loaded());
+    }
+
+    // Real end-to-end conversion check against the exported LLVC model.
+    // `#[ignore]` so it never runs on CI or a plain `cargo test` (which
+    // have no model + no onnxruntime.dll). Run on a dev box that did the
+    // export with:
+    //
+    //   cargo test -p divora-core --all-features -- --ignored \
+    //       llvc_model_converts_a_chunk
+    //
+    // It points `ORT_DYLIB_PATH` at the workspace `target/debug` DLL and
+    // loads the model from the app's voices dir, then asserts a 4096-
+    // sample chunk comes back finite, full-length, and *changed*.
+    #[test]
+    #[ignore = "needs the exported LLVC model + onnxruntime.dll installed locally"]
+    // `std::env::set_var` is unsafe in edition 2024; this is a single-
+    // threaded, ignored, dev-only integration test setting the dylib path
+    // before any ort init — no data race possible.
+    #[allow(unsafe_code)]
+    fn llvc_model_converts_a_chunk() {
+        use std::path::PathBuf;
+
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .expect("home dir");
+        let model = PathBuf::from(&home)
+            .join("AppData")
+            .join("Roaming")
+            .join("com.divora.voicemod")
+            .join("voices")
+            .join("llvc-narrator.onnx");
+        if !model.exists() {
+            eprintln!("skip: {} not present", model.display());
+            return;
+        }
+        // Point ort at the DLL we copied next to the dev binary.
+        let dll = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .join("debug")
+            .join("onnxruntime.dll");
+        if dll.exists() {
+            // SAFETY: single-threaded test setup before any ort init.
+            unsafe {
+                std::env::set_var("ORT_DYLIB_PATH", &dll);
+            }
+        }
+
+        let mut session = super::load_session(&model);
+        assert!(session.is_some(), "LLVC model should load via ort");
+
+        // A 4096-sample 16 kHz sine — stand-in for one engine chunk.
+        let chunk: Vec<f32> = (0..super::CHUNK_16K)
+            .map(|i| (i as f32 * 0.05).sin() * 0.3)
+            .collect();
+        let out = super::run_inference(session.as_mut(), &chunk);
+
+        assert_eq!(out.len(), chunk.len(), "output length preserved");
+        assert!(out.iter().all(|s| s.is_finite()), "all output finite");
+        let max_abs = out.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(max_abs <= 1.01, "no clipping (max {max_abs})");
+        let diff: f32 = out
+            .iter()
+            .zip(&chunk)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / chunk.len() as f32;
+        assert!(
+            diff > 1e-4,
+            "output must differ from input (mean|d|={diff})"
+        );
+        eprintln!("LLVC conversion OK: mean|delta|={diff:.4}, peak={max_abs:.4}");
     }
 }
