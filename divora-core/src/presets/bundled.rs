@@ -89,4 +89,43 @@ mod tests {
         assert_eq!(hk.chain.len(), 5);
         assert_eq!(hk.chain[0].id, "gate");
     }
+
+    // v0.12.2: the Deep Narrator preset must actually *sound* deep via
+    // DSP — it can't lean on the (passthrough-until-a-model-is-installed)
+    // voice_convert effect for its audible character. Lock in the
+    // pitch-down + formant-down that do the work, so a future edit can't
+    // silently flatten it back to a clean voice.
+    #[test]
+    fn deep_narrator_lowers_the_voice_via_dsp() {
+        let presets = bundled_presets();
+        let dn = presets.iter().find(|p| p.id == "deep-narrator-ai").unwrap();
+        assert_eq!(dn.name, "Deep Narrator");
+
+        let pitch = dn
+            .chain
+            .iter()
+            .find(|e| e.id == "pitch")
+            .expect("deep narrator must include a pitch effect");
+        assert!(pitch.enabled, "pitch must be enabled");
+        let shift = pitch.vals.get("shift").copied().unwrap_or(0.0);
+        assert!(shift < 0.0, "pitch must shift DOWN (got {shift})");
+
+        let formant = dn
+            .chain
+            .iter()
+            .find(|e| e.id == "formant")
+            .expect("deep narrator must include a formant effect");
+        assert!(formant.enabled, "formant must be enabled");
+        let fshift = formant.vals.get("shift").copied().unwrap_or(0.0);
+        assert!(fshift < 0.0, "formant must shift DOWN (got {fshift})");
+
+        // The bring-your-own-AI slot is present + enabled so a selected
+        // voice activates without re-editing the chain.
+        assert!(
+            dn.chain
+                .iter()
+                .any(|e| e.id == "voice_convert" && e.enabled),
+            "deep narrator keeps an enabled voice_convert slot for BYO models"
+        );
+    }
 }

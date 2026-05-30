@@ -4,6 +4,47 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-05-30 — Deep Narrator that actually sounds deep (DSP), AI as bring-your-own
+
+Field report:
+
+> "I see the new Voice Convert option, but I am not hearing that it actually sounds different than my normal voice."
+
+Right — and it won't until a real ONNX model + the runtime are installed (v0.12.0/v0.12.1 shipped the framework, not a model). Rather than block the audible payoff on a model I can't source/verify here, this release makes **"Deep Narrator" sound dramatically deep right now using DSP**, and keeps the ONNX `VoiceConvert` effect as an optional bring-your-own-model layer on top. (User picked this path.)
+
+### Changed
+
+- **"Deep Narrator AI" → "Deep Narrator", rebuilt as a real DSP deep-voice.** The v0.12.0 version leaned entirely on the passthrough `VoiceConvert` for its character, so it was nearly inaudible. The new chain does the work with proven DSP:
+  - `gate` (−50 dB) + `denoiser` (60%) → clean studio input
+  - `voice_convert` (enabled, 90% mix) → the bring-your-own-AI slot; a true no-op (zero added latency) until a model is selected in Settings → Voice library
+  - `pitch` −4 st + `formant` −3 → drops the voice into the chest, "bigger throat" resonance
+  - `eq` low +5 / mid +1 / high −2 → body + presence, tamed sibilance
+  - `reverb` size 38 / mix 14 → intimate room gravitas (deliberately *not* cavernous like "Hollow King")
+
+  Preset id (`deep-narrator-ai`) is unchanged, so A/B snapshots and any references keep working; only the display name + chain changed.
+
+### How the two voice paths relate now
+
+- **Deep Narrator (DSP)** — works on every machine today, no model or runtime needed. This is the audible "deep voice."
+- **Voice Convert (ONNX)** — still the real-AI path; passthrough until you install `onnxruntime.dll` + drop an `.onnx` model into the voices folder and select it. When you do, it layers *on top* of the DSP chain (it runs before pitch/formant in the chain).
+
+### Tests
+
+- **Rust**: 118 → 119 (+1): `deep_narrator_lowers_the_voice_via_dsp` locks the preset's audible character — asserts pitch + formant are enabled and shift *down*, and that the enabled `voice_convert` BYO slot is retained. Guards against a future edit silently flattening it back to a clean voice.
+
+### Pre-push checklist (local, 2026-05-30)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (119)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (230)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Why it matters
+
+The whole point of Phase 12 is "make my voice sound different." The AI route is real but gated on assets that need a deliberate sourcing decision; meanwhile DivoraVoice already has a tested phase-vocoder pitch shifter, LPC formant warp, parametric EQ, and reverb. Composing them into a genuinely deep, warm narrator delivers the payoff today — and the ONNX slot is right there in the same preset for when a model arrives.
+
 ## [0.12.1] — 2026-05-29 — Voice library: select voices, background loading, runtime status
 
 Follow-up to v0.12.0. The framework shipped, but the `VoiceConvert` effect had no way to be pointed at a model and no UI — so it was always a silent passthrough. v0.12.1 wires the **selection path end-to-end**: a Settings → Voice library panel, off-audio-thread model loading, and runtime-presence reporting. (The bundled `onnxruntime.dll` + a shipped model are still v0.12.2 — until then the panel honestly reports "Runtime not installed.")
