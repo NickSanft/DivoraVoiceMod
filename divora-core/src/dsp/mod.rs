@@ -41,7 +41,7 @@ pub use gate::NoiseGate;
 pub use pitch::PitchShift;
 pub use reverb::Reverb;
 pub use robot::Robot;
-pub use voice_convert::VoiceConverter;
+pub use voice_convert::{onnx_runtime_available, VoiceConverter};
 
 use std::collections::HashMap;
 
@@ -86,6 +86,13 @@ pub trait AudioEffect: Send {
     fn set_enabled(&mut self, enabled: bool);
 
     fn kind(&self) -> EffectKind;
+
+    /// Set a string-valued resource on the effect — e.g. the file path
+    /// of the ONNX model the `VoiceConvert` effect should load. `f32`
+    /// params go through `set_param`; this carries the things that
+    /// aren't numbers. `None` clears the resource. Default no-op, so
+    /// only effects that actually have a string resource override it.
+    fn set_resource(&mut self, _key: &str, _value: Option<&str>) {}
 }
 
 /// Declarative description of an effect — what the UI sends to (re)build
@@ -114,6 +121,13 @@ pub enum DspCommand {
     SetEnabled {
         index: usize,
         enabled: bool,
+    },
+    /// Set a string-valued resource on one effect (e.g. the active
+    /// voice model path for `VoiceConvert`). `value: None` clears it.
+    SetResource {
+        index: usize,
+        key: String,
+        value: Option<String>,
     },
     Clear,
 }
@@ -157,6 +171,11 @@ impl EffectChain {
             DspCommand::SetEnabled { index, enabled } => {
                 if let Some(effect) = self.effects.get_mut(index) {
                     effect.set_enabled(enabled);
+                }
+            }
+            DspCommand::SetResource { index, key, value } => {
+                if let Some(effect) = self.effects.get_mut(index) {
+                    effect.set_resource(&key, value.as_deref());
                 }
             }
             DspCommand::Clear => {

@@ -17,7 +17,7 @@ use divora_core::audio::{
     list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, Levels, StreamInfo,
     VirtualMicStatus,
 };
-use divora_core::dsp::{DspCommand, EffectSpec};
+use divora_core::dsp::{onnx_runtime_available, DspCommand, EffectSpec};
 use divora_core::presets::{bundled_presets, Preset, PresetStore};
 use divora_core::soundboard::{
     decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
@@ -58,6 +58,31 @@ struct AppState {
     /// Maps a stable id (chosen by the frontend, e.g. "ptm") to the
     /// `Shortcut` we registered for it. Used to unregister cleanly.
     shortcuts: Mutex<HashMap<String, Shortcut>>,
+    /// Phase 12: directory the user drops voice-conversion `.onnx`
+    /// models into (`%APPDATA%/DivoraVoice/voices/`). Created at
+    /// startup; surfaced to the UI so it can list + open it.
+    voices_dir: PathBuf,
+}
+
+/// One installed voice model. `id` (and `name`) are the file stem; the
+/// `VoiceConverter` derives the same id from the path it loads.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceInfo {
+    id: String,
+    name: String,
+    path: String,
+    size_bytes: u64,
+}
+
+/// Whether voice conversion can actually run on this machine, plus the
+/// directory where models live (for the Settings panel's guidance).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnnxRuntimeStatus {
+    /// True when an `onnxruntime` shared library is locatable.
+    runtime_available: bool,
+    voices_dir: String,
 }
 
 /// Wire payload emitted by `global-shortcut` events.
@@ -173,6 +198,67 @@ fn export_preset_json(preset: Preset) -> Result<String, String> {
 #[tauri::command]
 fn preset_store_path(state: State<'_, AppState>) -> String {
     state.preset_store.base_dir().to_string_lossy().into_owned()
+}
+
+// ---- Phase 12: voice library ----
+
+/// Absolute path of the voices directory (for "open folder" + guidance).
+#[tauri::command]
+fn voices_dir(state: State<'_, AppState>) -> String {
+    state.voices_dir.to_string_lossy().into_owned()
+}
+
+/// Enumerate `*.onnx` models in the voices directory. Missing dir →
+/// empty list (not an error — the user just hasn't installed any).
+#[tauri::command]
+fn list_voices(state: State<'_, AppState>) -> Vec<VoiceInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&state.voices_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("onnx") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let size_bytes = entry.metadata().map_or(0, |m| m.len());
+        out.push(VoiceInfo {
+            name: id.clone(),
+            id,
+            path: path.to_string_lossy().into_owned(),
+            size_bytes,
+        });
+    }
+    out.sort_by_key(|v| v.name.to_lowercase());
+    out
+}
+
+/// Runtime + voices-dir status for the Settings panel.
+#[tauri::command]
+fn onnx_runtime_status(state: State<'_, AppState>) -> OnnxRuntimeStatus {
+    OnnxRuntimeStatus {
+        runtime_available: onnx_runtime_available(),
+        voices_dir: state.voices_dir.to_string_lossy().into_owned(),
+    }
+}
+
+/// Point the `VoiceConvert` effect at `index` in the chain at a model
+/// file (or `None` to clear → passthrough). The actual load happens on
+/// a background thread inside the effect, so this returns immediately.
+#[tauri::command]
+fn set_voice_model(state: State<'_, AppState>, index: usize, path: Option<String>) {
+    state.engine.send_dsp(DspCommand::SetResource {
+        index,
+        key: "model".to_string(),
+        value: path,
+    });
 }
 
 #[tauri::command]
@@ -368,11 +454,27 @@ pub fn run() {
                 }));
             tracing::info!(path = %preset_store.base_dir().display(), "preset store ready");
 
+            // Phase 12: voices directory. Best-effort create; a failure
+            // here just means the library lists empty until the dir
+            // exists.
+            let voices_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join("voices"),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; falling back to temp for voices");
+                    std::env::temp_dir().join("DivoraVoice").join("voices")
+                }
+            };
+            if let Err(e) = std::fs::create_dir_all(&voices_dir) {
+                tracing::warn!(?e, path = %voices_dir.display(), "could not create voices dir");
+            }
+            tracing::info!(path = %voices_dir.display(), "voices dir ready");
+
             app.manage(AppState {
                 engine,
                 preset_store,
                 clip_cache: Mutex::new(HashMap::new()),
                 shortcuts: Mutex::new(HashMap::new()),
+                voices_dir,
             });
             Ok(())
         })
@@ -394,6 +496,10 @@ pub fn run() {
             delete_user_preset,
             export_preset_json,
             preset_store_path,
+            voices_dir,
+            list_voices,
+            onnx_runtime_status,
+            set_voice_model,
             scan_soundboard_folder,
             play_soundboard_clip,
             stop_soundboard_clip,

@@ -30,6 +30,8 @@ import {
   listInputDevices,
   listOutputDevices,
   listPresets,
+  listVoices as listVoicesCmd,
+  onnxRuntimeStatus as onnxRuntimeStatusCmd,
   pickSoundboardFolder as pickSoundboardFolderCmd,
   playSoundboardClip as playSoundboardClipCmd,
   registerGlobalShortcut as registerGlobalShortcutCmd,
@@ -39,6 +41,7 @@ import {
   setEffectChain as setEffectChainCmd,
   setEffectEnabled as setEffectEnabledCmd,
   setEffectParam as setEffectParamCmd,
+  setVoiceModel as setVoiceModelCmd,
   startAudioEngine,
   stopAllSoundboardClips as stopAllSoundboardClipsCmd,
   stopAudioEngine,
@@ -47,9 +50,11 @@ import {
   type DeviceInfo,
   type EffectSpec,
   type Levels,
+  type OnnxRuntimeStatus,
   type SoundboardTile,
   type StreamInfo,
   type VirtualMicStatus,
+  type VoiceInfo,
   type WirePreset,
 } from "../audio/api";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
@@ -125,6 +130,7 @@ const STORAGE_KEYS = {
   tileHotkeys: "divora.tileHotkeys",
   recentFolders: "divora.recentFolders",
   tweaks: "divora.tweaks",
+  activeVoice: "divora.activeVoice",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -262,6 +268,13 @@ export interface AppState {
   toggleEffectById: (id: EffectId) => void;
   syncChain: () => void;
   reorderChainEntries: (from: number, to: number) => void;
+
+  // Voice library (Phase 12)
+  voices: () => VoiceInfo[];
+  onnxStatus: () => OnnxRuntimeStatus | null;
+  activeVoiceId: () => string | null;
+  setActiveVoice: (id: string | null) => void;
+  refreshVoiceLibrary: () => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -534,6 +547,7 @@ export function createAppState(): AppState {
   const syncChain = (): void => {
     if (!engineRunning()) return;
     void setEffectChainCmd(chainToSpecs(chain()));
+    applyActiveVoice();
   };
 
   // Send a full SetChain when either the active preset changes or the
@@ -542,9 +556,75 @@ export function createAppState(): AppState {
     on([presetId, engineRunning], ([, running]) => {
       if (running) {
         void setEffectChainCmd(chainToSpecs(chain()));
+        // A SetChain rebuilds every effect from scratch — including the
+        // VoiceConvert, which comes back with no model. Re-point it at
+        // the active voice so the selection survives preset switches.
+        applyActiveVoice();
       }
     }, { defer: true }),
   );
+
+  // ---- Phase 12: voice library ----
+
+  const [voices, setVoices] = createSignal<VoiceInfo[]>([]);
+  const [onnxStatus, setOnnxStatus] = createSignal<OnnxRuntimeStatus | null>(
+    null,
+  );
+  const [activeVoiceId, setActiveVoiceIdRaw] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.activeVoice, null),
+  );
+
+  /** Path of the active voice, looked up in the current `voices` list. */
+  const activeVoicePath = (): string | null => {
+    const id = activeVoiceId();
+    if (!id) return null;
+    return voices().find((v) => v.id === id)?.path ?? null;
+  };
+
+  /** Index of the (first) VoiceConvert effect in the live chain, or -1. */
+  const voiceConvertIndex = (): number =>
+    chain().findIndex((c) => c.id === "voice_convert");
+
+  /**
+   * Push the active voice's model path to the backend's VoiceConvert
+   * effect. No-op when the engine is stopped or the chain has no
+   * VoiceConvert entry. Sending `null` clears it to passthrough.
+   */
+  const applyActiveVoice = (): void => {
+    if (!engineRunning()) return;
+    const idx = voiceConvertIndex();
+    if (idx < 0) return;
+    void setVoiceModelCmd(idx, activeVoicePath());
+  };
+
+  const refreshVoiceLibrary = async (): Promise<void> => {
+    try {
+      const [list, status] = await Promise.all([
+        listVoicesCmd(),
+        onnxRuntimeStatusCmd(),
+      ]);
+      // Defensive: a stubbed/!Tauri bridge can hand back null; never
+      // let `voices()` become non-array (the UI calls `.length`/`.find`).
+      setVoices(Array.isArray(list) ? list : []);
+      setOnnxStatus(status ?? null);
+      // If the persisted active voice no longer exists on disk, clear
+      // it so the UI doesn't claim a missing model is selected.
+      const id = activeVoiceId();
+      if (id && !voices().some((v) => v.id === id)) {
+        setActiveVoiceIdRaw(null);
+        saveJson(STORAGE_KEYS.activeVoice, null);
+        applyActiveVoice();
+      }
+    } catch (err) {
+      console.warn("[voices] refresh failed", err);
+    }
+  };
+
+  const setActiveVoice = (id: string | null): void => {
+    setActiveVoiceIdRaw(id);
+    saveJson(STORAGE_KEYS.activeVoice, id);
+    applyActiveVoice();
+  };
 
   const setChainParam = (effectIndex: number, key: string, value: number): void => {
     setChains(presetId(), effectIndex, "vals", key, value);
@@ -1110,6 +1190,12 @@ export function createAppState(): AppState {
     toggleEffectById,
     syncChain,
     reorderChainEntries,
+
+    voices,
+    onnxStatus,
+    activeVoiceId,
+    setActiveVoice,
+    refreshVoiceLibrary,
 
     usePreset,
     savePreset,

@@ -4,6 +4,41 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-05-29 — Voice library: select voices, background loading, runtime status
+
+Follow-up to v0.12.0. The framework shipped, but the `VoiceConvert` effect had no way to be pointed at a model and no UI — so it was always a silent passthrough. v0.12.1 wires the **selection path end-to-end**: a Settings → Voice library panel, off-audio-thread model loading, and runtime-presence reporting. (The bundled `onnxruntime.dll` + a shipped model are still v0.12.2 — until then the panel honestly reports "Runtime not installed.")
+
+### Added
+
+- **Settings → Voice library** section: a live ONNX-runtime status indicator (green "detected" / amber "not installed" with install guidance), a selectable voice list (radio-style rows, "None — pass my voice through" first), the voices folder path with an **Open folder** button, and a **Refresh** button. Empty + missing-runtime states are spelled out rather than left blank.
+- **Tauri commands**: `voices_dir`, `list_voices` (scans `%APPDATA%/DivoraVoice/voices/*.onnx` → id/name/path/size), `onnx_runtime_status` (runtime locatable? + voices dir), `set_voice_model` (routes a model path to the `VoiceConvert` effect by chain index). The voices directory is created at startup alongside the preset store.
+- **`DspCommand::SetResource { index, key, value }`** + a default-no-op `AudioEffect::set_resource` trait method. `VoiceConvert` overrides it: `key == "model"` loads the given path (voice name derived from the file stem), `None`/empty clears to passthrough.
+- **Store**: `voices()`, `onnxStatus()`, `activeVoiceId()`, `setActiveVoice()`, `refreshVoiceLibrary()`. The active voice id persists to `localStorage` and is re-applied whenever the chain is (re)sent — so a `SetChain` (which rebuilds the `VoiceConvert` fresh) doesn't silently drop the selection. A persisted voice that's no longer on disk is cleared on refresh.
+
+### Changed
+
+- **Model loading moved off the audio thread.** `VoiceConverter::set_model_path` now spawns a background loader thread and hands the `Session` back through an `mpsc` channel; `process` picks it up with a non-blocking `try_recv`. The audio callback never blocks on `Session::builder` (which can be slow, and — without the runtime — could otherwise stall). Switching voices mid-stream just swaps sessions on the next callback.
+
+### Tests
+
+- **Rust**: 113 → 118 (+5 in `dsp::voice_convert`): `set_resource` derives the voice name from the file stem; `None`/empty clears it; an unknown key is a no-op; a missing-file `set_resource` stays in passthrough across 50 callbacks without hanging (exercises the background-loader poll path).
+- **Frontend**: 226 → 230 (+4 in a new `SettingsScreen — Voice library` block): queries voices + runtime status on mount; renders the section + not-installed guidance; offers the "None" passthrough option; shows the empty hint with no models. The two v0.11.4 Audio-devices Refresh tests were retargeted by button title (there are now two Refresh buttons).
+
+### Pre-push checklist (local, 2026-05-29)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (118, no hang)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (230)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Still to come in v0.12.x
+
+- Bundle `onnxruntime.dll` with the installer (Tauri resources/externalBin) so voice conversion works out of the box.
+- Source + ship a compatible LLVC ONNX model and a "Deep Narrator" voice → first audible conversion.
+- Firm up the model I/O tensor contract once a real model is in hand.
+
 ## [0.12.0] — 2026-05-29 — Phase 12: AI voice conversion framework (ONNX Runtime + `VoiceConvert` effect)
 
 The plan's headline Phase 12 goal is on-device AI voice conversion ("Deep Narrator AI works real-time on CPU"). This is the first ship of that work: the **ONNX Runtime integration, the streaming `VoiceConvert` effect, and the chain/preset/UI wiring**. The model file + bundled `onnxruntime.dll` follow in v0.12.x patches (the user pre-accepted that Phase 12 "may take multiple commits to land green").

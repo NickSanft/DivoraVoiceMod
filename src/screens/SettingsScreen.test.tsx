@@ -34,6 +34,10 @@ vi.mock("@tauri-apps/api/core", () => ({
         return [];
       case "detect_virtual_mic":
         return { installed: false, name: null };
+      case "list_voices":
+        return [];
+      case "onnx_runtime_status":
+        return { runtimeAvailable: false, voicesDir: "/tmp/DivoraVoice/voices" };
       default:
         return null;
     }
@@ -83,18 +87,22 @@ describe("SettingsScreen — audio device refresh (v0.11.4)", () => {
     expect(outputs.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("renders a Refresh button labelled 'Refresh' when idle", async () => {
-    const { getByText } = mount();
+  it("renders the Audio-devices Refresh button when idle", async () => {
+    const { getByTitle } = mount();
     await flush();
-    expect(getByText(/^Refresh$/)).toBeInTheDocument();
+    // There are two Refresh buttons now (Audio devices + Voice library);
+    // target the Audio-devices one by its title.
+    expect(
+      getByTitle(/Re-scan input \+ output devices/i),
+    ).toBeInTheDocument();
   });
 
-  it("clicking the Refresh button triggers a fresh enumeration", async () => {
-    const { getByText } = mount();
+  it("clicking the Audio-devices Refresh triggers a fresh enumeration", async () => {
+    const { getByTitle } = mount();
     await flush();
     invokeCalls.length = 0;
 
-    const btn = getByText(/^Refresh$/);
+    const btn = getByTitle(/Re-scan input \+ output devices/i);
     fireEvent.click(btn);
     await flush();
     // Click triggers an async refresh; wait for the IPC fan-out.
@@ -114,5 +122,40 @@ describe("SettingsScreen — audio device refresh (v0.11.4)", () => {
     const { getByText } = mount();
     await flush();
     expect(getByText(/Audio devices/i)).toBeInTheDocument();
+  });
+});
+
+// v0.12.1 — Voice library section: lists installed voices, surfaces the
+// ONNX runtime status, and lets the user pick the active voice (which
+// drives the VoiceConvert effect).
+describe("SettingsScreen — Voice library (v0.12.1)", () => {
+  const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+  it("queries voices + runtime status on mount", async () => {
+    invokeCalls.length = 0;
+    mount();
+    await flush();
+    expect(invokeCalls.some((c) => c.cmd === "list_voices")).toBe(true);
+    expect(invokeCalls.some((c) => c.cmd === "onnx_runtime_status")).toBe(true);
+  });
+
+  it("renders the Voice library section + runtime-not-installed guidance", async () => {
+    const { getByText } = mount();
+    await flush();
+    expect(getByText(/Voice library/i)).toBeInTheDocument();
+    // Mock returns runtimeAvailable: false → passthrough warning shown.
+    expect(getByText(/ONNX Runtime not installed/i)).toBeInTheDocument();
+  });
+
+  it("offers a 'None — pass my voice through' option selected by default", async () => {
+    const { getByText } = mount();
+    await flush();
+    expect(getByText(/pass my voice through/i)).toBeInTheDocument();
+  });
+
+  it("shows an empty hint when no voice models are installed", async () => {
+    const { getByText } = mount();
+    await flush();
+    expect(getByText(/No voice models found/i)).toBeInTheDocument();
   });
 });

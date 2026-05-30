@@ -176,6 +176,48 @@ export async function presetStorePath(): Promise<string> {
   return invoke<string>("preset_store_path");
 }
 
+// ---- Voice library (Phase 12) ----
+
+/** One installed voice-conversion model (`*.onnx` in the voices dir). */
+export interface VoiceInfo {
+  /** File stem — also the id the backend derives when loading. */
+  id: string;
+  name: string;
+  path: string;
+  sizeBytes: number;
+}
+
+/** Whether voice conversion can run + where models live. */
+export interface OnnxRuntimeStatus {
+  /** True when an onnxruntime shared library is locatable. */
+  runtimeAvailable: boolean;
+  voicesDir: string;
+}
+
+export async function voicesDir(): Promise<string> {
+  return invoke<string>("voices_dir");
+}
+
+export async function listVoices(): Promise<VoiceInfo[]> {
+  return invoke<VoiceInfo[]>("list_voices");
+}
+
+export async function onnxRuntimeStatus(): Promise<OnnxRuntimeStatus> {
+  return invoke<OnnxRuntimeStatus>("onnx_runtime_status");
+}
+
+/**
+ * Point the `VoiceConvert` effect at `index` in the live chain at a
+ * model file path, or `null` to clear (passthrough). The backend loads
+ * the model on a background thread, so this resolves immediately.
+ */
+export async function setVoiceModel(
+  index: number,
+  path: string | null,
+): Promise<void> {
+  await invoke("set_voice_model", { index, path });
+}
+
 // ---- Soundboard ----
 
 /** Wire format for one soundboard tile (output of `scan_soundboard_folder`). */

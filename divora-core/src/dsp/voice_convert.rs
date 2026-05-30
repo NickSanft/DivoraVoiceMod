@@ -51,7 +51,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{mpsc, OnceLock},
 };
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -79,11 +79,14 @@ pub struct VoiceConverter {
     /// Currently active voice name (matched against files in the voices
     /// directory). `None` means passthrough.
     voice: Option<String>,
-    /// Absolute path of the loaded model, used to detect reloads.
+    /// Absolute path of the active model, used to detect redundant
+    /// reloads of the same file.
     loaded_path: Option<PathBuf>,
-    /// Path to load on the next `process` call. Setting it deferred-
-    /// loads on the audio thread; the UI just calls `set_model_path`.
-    pending_path: Option<PathBuf>,
+    /// Receiver for an in-flight background load. A voice change spawns
+    /// a loader thread (so the audio thread never blocks on
+    /// `Session::builder`) and stashes the rx here; `process` polls it
+    /// with `try_recv` each callback until the session arrives.
+    loader: Option<mpsc::Receiver<Option<Session>>>,
     /// ONNX session — `None` when no model is loaded or load failed.
     session: Option<Session>,
     /// 48 kHz → 16 kHz pre-inference resampler.
@@ -114,7 +117,7 @@ impl VoiceConverter {
             mix: 1.0,
             voice: None,
             loaded_path: None,
-            pending_path: None,
+            loader: None,
             session: None,
             down: None,
             up: None,
@@ -127,16 +130,58 @@ impl VoiceConverter {
         }
     }
 
-    /// Switch to a different voice model. Effective on the next audio
-    /// callback — the load itself happens on the audio thread to keep
-    /// the UI responsive. Pass `None` to clear (passthrough).
+    /// Switch to a different voice model. The ONNX session is built on
+    /// a background thread — `load_session` can be slow (graph
+    /// optimization) or, with a missing runtime DLL, can even block, so
+    /// it must never run on the audio thread. The result lands via
+    /// `try_recv` in `process`. Pass `None` to clear (passthrough).
     pub fn set_model_path(&mut self, voice: Option<String>, path: Option<PathBuf>) {
         self.voice = voice;
-        self.pending_path = path;
-        // Clear queues so the next chunk starts fresh — otherwise a
-        // half-converted segment from the previous voice would leak
-        // through the crossfade.
+        // Drop the current session immediately so we don't keep
+        // converting with the old voice while the new one loads.
+        self.session = None;
         self.clear_pipeline();
+
+        match path {
+            Some(p) if Some(&p) != self.loaded_path.as_ref() => {
+                self.loaded_path = Some(p.clone());
+                let (tx, rx) = mpsc::channel();
+                // Detached loader thread; if the user switches again
+                // before it finishes, we just drop this rx and the
+                // send becomes a no-op (rx hung up).
+                std::thread::spawn(move || {
+                    let _ = tx.send(load_session(&p));
+                });
+                self.loader = Some(rx);
+            }
+            Some(_) => {
+                // Same path already loaded/loading — nothing to do.
+            }
+            None => {
+                self.loaded_path = None;
+                self.loader = None;
+            }
+        }
+    }
+
+    /// Poll the background loader (if any). Cheap `try_recv`; called at
+    /// the top of every `process`.
+    fn poll_loader(&mut self) {
+        if let Some(rx) = self.loader.as_ref() {
+            match rx.try_recv() {
+                Ok(session) => {
+                    self.session = session;
+                    self.loader = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Still loading; stay in passthrough this callback.
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Loader thread vanished without a value — give up.
+                    self.loader = None;
+                }
+            }
+        }
     }
 
     /// Name of the active voice, or `None` if passthrough.
@@ -162,27 +207,6 @@ impl VoiceConverter {
         }
         if let Some(u) = self.up.as_mut() {
             u.reset();
-        }
-    }
-
-    /// Apply any deferred path change. Runs on the audio thread; load
-    /// failures are stored as `session = None` (passthrough) — they do
-    /// NOT panic the engine.
-    fn settle_pending_load(&mut self) {
-        let pending = self.pending_path.take();
-        match (pending, self.loaded_path.as_ref()) {
-            (Some(p), Some(loaded)) if &p == loaded => {
-                // Already loaded; nothing to do.
-            }
-            (Some(p), _) => {
-                self.session = load_session(&p);
-                self.loaded_path = Some(p);
-            }
-            (None, _) => {
-                // Cleared — drop the session.
-                self.session = None;
-                self.loaded_path = None;
-            }
         }
     }
 
@@ -225,9 +249,9 @@ impl Default for VoiceConverter {
 
 impl AudioEffect for VoiceConverter {
     fn process(&mut self, buffer: &mut [f32], sample_rate: u32) {
-        // Settle any UI-requested voice change first.
-        if self.pending_path.is_some() || (self.session.is_none() && self.loaded_path.is_some()) {
-            self.settle_pending_load();
+        // Pick up a background-loaded session if one just finished.
+        if self.loader.is_some() {
+            self.poll_loader();
         }
 
         // Bypass conditions: disabled, no model, off-rate input.
@@ -343,6 +367,21 @@ impl AudioEffect for VoiceConverter {
     fn kind(&self) -> EffectKind {
         EffectKind::VoiceConvert
     }
+
+    /// `key == "model"` sets the active ONNX model path. The voice name
+    /// shown in the UI is derived from the file stem. `None` clears
+    /// back to passthrough.
+    fn set_resource(&mut self, key: &str, value: Option<&str>) {
+        if key != "model" {
+            return;
+        }
+        let path = value.filter(|s| !s.is_empty()).map(PathBuf::from);
+        let voice = path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned());
+        self.set_model_path(voice, path);
+    }
 }
 
 /// Thin wrapper around `SincFixedOut` matching the shape we use here.
@@ -455,6 +494,14 @@ fn load_session(path: &Path) -> Option<Session> {
 /// Cached after the first probe — the answer can't change within a
 /// process lifetime, and we never want to re-walk the filesystem on
 /// the audio thread.
+/// Public probe of [`onnx_runtime_present`] for the Tauri layer, so the
+/// Settings → Voice library panel can tell the user whether voice
+/// conversion can actually run on this machine.
+#[must_use]
+pub fn onnx_runtime_available() -> bool {
+    onnx_runtime_present()
+}
+
 fn onnx_runtime_present() -> bool {
     static PRESENT: OnceLock<bool> = OnceLock::new();
     *PRESENT.get_or_init(|| {
@@ -622,5 +669,54 @@ mod tests {
         // public path; no panic.
         vc.set_enabled(false);
         assert!(!vc.enabled());
+    }
+
+    #[test]
+    fn set_resource_model_derives_voice_name_from_file_stem() {
+        let mut vc = VoiceConverter::new();
+        vc.set_resource("model", Some("/voices/deep-narrator.onnx"));
+        assert_eq!(vc.voice(), Some("deep-narrator"));
+    }
+
+    #[test]
+    fn set_resource_model_none_clears_voice() {
+        let mut vc = VoiceConverter::new();
+        vc.set_resource("model", Some("/voices/whisper.onnx"));
+        assert_eq!(vc.voice(), Some("whisper"));
+        vc.set_resource("model", None);
+        assert!(vc.voice().is_none());
+    }
+
+    #[test]
+    fn set_resource_empty_string_clears_voice() {
+        let mut vc = VoiceConverter::new();
+        vc.set_resource("model", Some("/voices/whisper.onnx"));
+        vc.set_resource("model", Some(""));
+        assert!(vc.voice().is_none());
+    }
+
+    #[test]
+    fn set_resource_unknown_key_is_a_no_op() {
+        let mut vc = VoiceConverter::new();
+        vc.set_resource("model", Some("/voices/sage.onnx"));
+        vc.set_resource("nonsense", Some("/voices/other.onnx"));
+        // The bogus key must not change the active voice.
+        assert_eq!(vc.voice(), Some("sage"));
+    }
+
+    #[test]
+    fn set_resource_missing_file_stays_passthrough_and_never_hangs() {
+        let mut vc = VoiceConverter::new();
+        vc.set_enabled(true);
+        vc.set_resource("model", Some("/tmp/does-not-exist.onnx"));
+        // Spin a few callbacks so the background loader thread (which
+        // returns None for a missing file) has time to land. The poll
+        // must never block; the effect stays in passthrough.
+        let mut buf = [0.25_f32; 64];
+        for _ in 0..50 {
+            vc.process(&mut buf, NATIVE_RATE);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!vc.is_model_loaded());
     }
 }

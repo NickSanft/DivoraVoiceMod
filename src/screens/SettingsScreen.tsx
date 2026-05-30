@@ -74,6 +74,7 @@ export function SettingsScreen(): JSX.Element {
   onMount(() => {
     void app.refreshVirtualMicStatus();
     void app.refreshDevices();
+    void app.refreshVoiceLibrary();
   });
 
   const inputOptions = createMemo<SelectOption[]>(() =>
@@ -133,6 +134,8 @@ export function SettingsScreen(): JSX.Element {
         outputOptions={outputOptions()}
         startStop={startStop}
       />
+
+      <VoiceLibrarySection />
 
       <VirtualMicSection />
 
@@ -332,6 +335,253 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
         </div>
       </div>
     </section>
+  );
+}
+
+// ---------- Voice library (Phase 12) ----------
+
+function fmtBytes(bytes: number): string {
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  if (bytes >= 1000) return `${Math.round(bytes / 1000)} KB`;
+  return `${bytes} B`;
+}
+
+function VoiceLibrarySection(): JSX.Element {
+  const app = useApp();
+  const [refreshing, setRefreshing] = createSignal(false);
+  const status = () => app.onnxStatus();
+  const runtimeOk = () => status()?.runtimeAvailable ?? false;
+  const dir = () => status()?.voicesDir ?? "";
+  const voices = () => app.voices();
+
+  const onRefresh = async (): Promise<void> => {
+    if (refreshing()) return;
+    setRefreshing(true);
+    try {
+      await app.refreshVoiceLibrary();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const openFolder = (): void => {
+    const d = dir();
+    if (d) void openExternal(d);
+  };
+
+  return (
+    <section>
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+          "margin-bottom": "var(--s3)",
+        }}
+      >
+        <div class="eyebrow">Voice library</div>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon="refresh"
+          onClick={() => void onRefresh()}
+          disabled={refreshing()}
+          title="Re-scan the voices folder + ONNX runtime"
+        >
+          {refreshing() ? "Scanning…" : "Refresh"}
+        </Button>
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s5)",
+        }}
+      >
+        {/* Runtime status */}
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+          }}
+        >
+          <span
+            style={{
+              width: "10px",
+              height: "10px",
+              "border-radius": "50%",
+              flex: "none",
+              background: runtimeOk() ? "var(--success)" : "var(--warning)",
+              "box-shadow": `0 0 8px ${runtimeOk() ? "var(--success)" : "var(--warning)"}`,
+            }}
+          />
+          <div style={{ flex: 1 }}>
+            <div style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)" }}>
+              {runtimeOk()
+                ? "ONNX Runtime detected — voice conversion can run."
+                : "ONNX Runtime not installed — Voice Convert stays in passthrough."}
+            </div>
+            <Show when={!runtimeOk()}>
+              <div
+                style={{
+                  "font-size": "var(--t-xs)",
+                  color: "var(--text-lo)",
+                  "margin-top": "2px",
+                }}
+              >
+                Place <span class="mono">onnxruntime.dll</span> next to the app
+                executable (or set <span class="mono">ORT_DYLIB_PATH</span>).
+                Bundled installer support is coming in a later 0.12.x update.
+              </div>
+            </Show>
+          </div>
+        </div>
+
+        {/* Active voice selection */}
+        <FieldRow label="Active voice">
+          <div
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              gap: "var(--s2)",
+            }}
+          >
+            <VoiceRow
+              label="None — pass my voice through"
+              sub="Voice Convert acts as a bypass."
+              selected={app.activeVoiceId() === null}
+              onSelect={() => app.setActiveVoice(null)}
+            />
+            <For each={voices()}>
+              {(v) => (
+                <VoiceRow
+                  label={v.name}
+                  sub={`${fmtBytes(v.sizeBytes)} · ${v.id}.onnx`}
+                  selected={app.activeVoiceId() === v.id}
+                  onSelect={() => app.setActiveVoice(v.id)}
+                />
+              )}
+            </For>
+            <Show when={voices().length === 0}>
+              <EmptyHint>
+                No voice models found. Drop <span class="mono">.onnx</span> files
+                into the voices folder, then Refresh.
+              </EmptyHint>
+            </Show>
+          </div>
+        </FieldRow>
+
+        {/* Voices folder */}
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s4)",
+          }}
+        >
+          <div style={{ "min-width": 0 }}>
+            <div class="eyebrow" style={{ "margin-bottom": "4px" }}>
+              Voices folder
+            </div>
+            <div
+              class="mono"
+              style={{
+                "font-size": "var(--t-xs)",
+                color: "var(--text-lo)",
+                "white-space": "nowrap",
+                overflow: "hidden",
+                "text-overflow": "ellipsis",
+              }}
+              title={dir()}
+            >
+              {dir() || "—"}
+            </div>
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="folder"
+            onClick={openFolder}
+            disabled={!dir()}
+          >
+            Open folder
+          </Button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+interface VoiceRowProps {
+  label: string;
+  sub: string;
+  selected: boolean;
+  onSelect: () => void;
+}
+
+function VoiceRow(props: VoiceRowProps): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={props.onSelect}
+      style={{
+        display: "flex",
+        "align-items": "center",
+        gap: "var(--s3)",
+        padding: "var(--s3) var(--s4)",
+        "border-radius": "var(--r-md)",
+        border: props.selected
+          ? "1px solid var(--line-glow)"
+          : "1px solid var(--line)",
+        background: props.selected ? "var(--accent-bg)" : "var(--surface-1)",
+        cursor: "pointer",
+        "text-align": "left",
+        width: "100%",
+      }}
+    >
+      <span
+        style={{
+          width: "16px",
+          height: "16px",
+          "border-radius": "50%",
+          flex: "none",
+          border: props.selected
+            ? "5px solid var(--indigo)"
+            : "2px solid var(--line-strong)",
+          background: "var(--surface-0)",
+          transition: "all 0.15s",
+        }}
+      />
+      <span style={{ flex: 1, "min-width": 0 }}>
+        <span
+          style={{
+            display: "block",
+            "font-size": "var(--t-sm)",
+            color: props.selected ? "var(--text-hi)" : "var(--text-mid)",
+            "font-weight": props.selected ? 600 : 400,
+          }}
+        >
+          {props.label}
+        </span>
+        <span
+          style={{
+            display: "block",
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+            "white-space": "nowrap",
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+          }}
+        >
+          {props.sub}
+        </span>
+      </span>
+    </button>
   );
 }
 
