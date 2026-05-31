@@ -39,6 +39,8 @@ struct LevelUpdate {
     monitoring: bool,
     /// Phase 14: latency added by the active DSP chain, in ms.
     dsp_latency_ms: f32,
+    /// Phase 16: true while the modulated output is being recorded.
+    recording: bool,
 }
 
 /// One-shot status snapshot used by the frontend at startup and after
@@ -51,6 +53,8 @@ struct EngineStatus {
     input: Levels,
     output: Levels,
     dsp_latency_ms: f32,
+    /// Phase 16: true while the modulated output is being recorded.
+    recording: bool,
 }
 
 /// Tauri-managed shared state. Holds the live audio engine, the user
@@ -71,6 +75,10 @@ struct AppState {
     /// installer's resource bundle. `None` in dev builds / when no
     /// resources were bundled. Listed alongside `voices_dir`.
     bundled_voices_dir: Option<PathBuf>,
+    /// Phase 16: directory recordings are written to
+    /// (`%APPDATA%/DivoraVoice/recordings/`). Created at startup;
+    /// surfaced to the UI so it can open it + show where files land.
+    recordings_dir: PathBuf,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -158,6 +166,7 @@ fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
         input: state.engine.input_levels(),
         output: state.engine.output_levels(),
         dsp_latency_ms: state.engine.dsp_latency_ms(),
+        recording: state.engine.is_recording(),
     }
 }
 
@@ -288,6 +297,43 @@ fn set_voice_model(state: State<'_, AppState>, index: usize, path: Option<String
         key: "model".to_string(),
         value: path,
     });
+}
+
+// ---- Phase 16: recording the modulated output ----
+
+/// Absolute path of the recordings directory (for "open folder" + the
+/// "saved to …" hint). Created at startup.
+#[tauri::command]
+fn recordings_dir(state: State<'_, AppState>) -> String {
+    state.recordings_dir.to_string_lossy().into_owned()
+}
+
+/// Begin recording the modulated output to a WAV file. `filename` is the
+/// desired name (the frontend builds it from the local time, e.g.
+/// `divora-2026-05-31_14-30-00.wav`); only its final path component is
+/// honored and a `.wav` extension is forced, so it can never escape the
+/// recordings dir. Returns the full destination path so the UI can show
+/// where the file lands. No-op until the next start if the engine isn't
+/// running (the writer thread only exists while streams are live).
+#[tauri::command]
+fn start_recording(state: State<'_, AppState>, filename: String) -> Result<String, String> {
+    let stem = Path::new(&filename)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "divora-recording.wav".to_string());
+    let mut dest = state.recordings_dir.join(stem);
+    dest.set_extension("wav");
+
+    std::fs::create_dir_all(&state.recordings_dir).map_err(|e| e.to_string())?;
+    state.engine.start_recording(dest.clone());
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Stop the current recording and finalize the WAV file.
+#[tauri::command]
+fn stop_recording(state: State<'_, AppState>) {
+    state.engine.stop_recording();
 }
 
 #[tauri::command]
@@ -453,6 +499,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
                 running: engine.is_running(),
                 monitoring: engine.is_monitoring(),
                 dsp_latency_ms: engine.dsp_latency_ms(),
+                recording: engine.is_recording(),
             };
             if app.emit("audio-levels", &payload).is_err() {
                 // App is shutting down (no receivers / window gone).
@@ -566,6 +613,20 @@ pub fn run() {
             }
             tracing::info!(path = %voices_dir.display(), "voices dir ready");
 
+            // Phase 16: recordings directory. Best-effort create; the
+            // start_recording command also ensures it before writing.
+            let recordings_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join("recordings"),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; falling back to temp for recordings");
+                    std::env::temp_dir().join("DivoraVoice").join("recordings")
+                }
+            };
+            if let Err(e) = std::fs::create_dir_all(&recordings_dir) {
+                tracing::warn!(?e, path = %recordings_dir.display(), "could not create recordings dir");
+            }
+            tracing::info!(path = %recordings_dir.display(), "recordings dir ready");
+
             // Phase 12.4: discover bundled voice assets shipped in the
             // installer's resource dir (onnxruntime.dll + voices/*.onnx).
             // Two things to wire:
@@ -599,6 +660,7 @@ pub fn run() {
                 shortcuts: Mutex::new(HashMap::new()),
                 voices_dir,
                 bundled_voices_dir,
+                recordings_dir,
             });
             Ok(())
         })
@@ -624,6 +686,9 @@ pub fn run() {
             list_voices,
             onnx_runtime_status,
             set_voice_model,
+            recordings_dir,
+            start_recording,
+            stop_recording,
             scan_soundboard_folder,
             play_soundboard_clip,
             stop_soundboard_clip,

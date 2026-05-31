@@ -170,6 +170,51 @@ describe("app store — Phase 2 audio actions", () => {
     expect(result.engineMonitoring()).toBe(true);
   });
 
+  // ---- Phase 16: recording ---------------------------------------------
+
+  it("toggleRecording refuses to start while the engine is stopped", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    expect(result.engineRunning()).toBe(false);
+    await result.toggleRecording();
+    expect(result.isRecording()).toBe(false);
+    expect(result.engineError()).toContain("Start the engine");
+    expect(invokeMock).not.toHaveBeenCalledWith("start_recording", expect.anything());
+  });
+
+  it("toggleRecording starts then stops recording while the engine runs", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_audio_engine") {
+        return {
+          inputName: "Mic",
+          outputName: "CABLE Input",
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      if (cmd === "start_recording") return "C:/rec/divora-test.wav";
+      return null;
+    });
+    const { result } = setupApp();
+    await result.startEngine();
+    expect(result.engineRunning()).toBe(true);
+
+    await result.toggleRecording();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_recording",
+      expect.objectContaining({
+        filename: expect.stringMatching(/^divora-.*\.wav$/),
+      }),
+    );
+    expect(result.isRecording()).toBe(true);
+    expect(result.recordingPath()).toBe("C:/rec/divora-test.wav");
+
+    await result.toggleRecording();
+    expect(invokeMock).toHaveBeenCalledWith("stop_recording");
+    expect(result.isRecording()).toBe(false);
+  });
+
   // ---- Phase 11: live device switching ---------------------------------
 
   it("changing selectedInput while running restarts the engine on the new device", async () => {

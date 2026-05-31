@@ -40,6 +40,8 @@ export interface EngineStatus {
   output: Levels;
   /** Phase 14: latency added by the active DSP chain, in ms. */
   dspLatencyMs: number;
+  /** Phase 16: true while the modulated output is being recorded. */
+  recording: boolean;
 }
 
 /** Periodic update emitted by the backend at ~30 Hz. */
@@ -50,6 +52,8 @@ export interface LevelUpdate {
   monitoring: boolean;
   /** Phase 14: latency added by the active DSP chain, in ms. */
   dspLatencyMs: number;
+  /** Phase 16: true while the modulated output is being recorded. */
+  recording: boolean;
 }
 
 export async function listInputDevices(): Promise<DeviceInfo[]> {
@@ -224,6 +228,28 @@ export async function setVoiceModel(
   path: string | null,
 ): Promise<void> {
   await invoke("set_voice_model", { index, path });
+}
+
+// ---- Recording (Phase 16) ----
+
+/** Absolute path of the recordings directory. */
+export async function recordingsDir(): Promise<string> {
+  return invoke<string>("recordings_dir");
+}
+
+/**
+ * Begin recording the modulated output. `filename` is the desired file
+ * name (built from the local time); the backend sanitizes it to a single
+ * path component, forces a `.wav` extension, and returns the full
+ * destination path. Only takes effect while the engine is running.
+ */
+export async function startRecording(filename: string): Promise<string> {
+  return invoke<string>("start_recording", { filename });
+}
+
+/** Stop the current recording and finalize the WAV file. */
+export async function stopRecording(): Promise<void> {
+  await invoke("stop_recording");
 }
 
 // ---- Soundboard ----

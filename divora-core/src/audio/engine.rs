@@ -9,10 +9,12 @@
 //! which fans them back out across the output channels (or writes zero
 //! when monitor is off). DSP graph slots in between in Phase 3.
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
@@ -61,7 +63,17 @@ enum Command {
     SetMonitor(bool),
     Dsp(DspCommand),
     Soundboard(SoundboardCommand),
+    StartRecording {
+        path: PathBuf,
+    },
+    StopRecording,
     Shutdown,
+}
+
+/// Commands to the recording writer thread (drains the recording ring).
+enum RecordingCommand {
+    Start { path: PathBuf },
+    Stop,
 }
 
 /// Public handle to the audio engine. Construct once at app startup;
@@ -137,6 +149,22 @@ impl AudioEngine {
         let _ = self.tx.send(Command::Soundboard(cmd));
     }
 
+    /// Phase 16: begin recording the modulated output to a WAV file at
+    /// `path`. No-op (until next start) if the engine isn't running.
+    pub fn start_recording(&self, path: PathBuf) {
+        let _ = self.tx.send(Command::StartRecording { path });
+    }
+
+    /// Stop the current recording and finalize the WAV file.
+    pub fn stop_recording(&self) {
+        let _ = self.tx.send(Command::StopRecording);
+    }
+
+    #[must_use]
+    pub fn is_recording(&self) -> bool {
+        self.state.recording.load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Acquire)
@@ -188,11 +216,42 @@ struct RunningStreams {
     _monitor: Option<Stream>,
 }
 
+/// Everything `start_streams` hands back: the live streams plus the
+/// command senders + the recording writer's join handle.
+struct StartedStreams {
+    streams: RunningStreams,
+    info: StreamInfo,
+    dsp_tx: Sender<DspCommand>,
+    sb_tx: Sender<SoundboardCommand>,
+    recording_tx: Sender<RecordingCommand>,
+    writer: JoinHandle<()>,
+}
+
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
 fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<Sender<DspCommand>> = None;
     let mut sb_tx: Option<Sender<SoundboardCommand>> = None;
+    let mut recording_tx: Option<Sender<RecordingCommand>> = None;
+    let mut writer: Option<JoinHandle<()>> = None;
+
+    // Tear down the current session's streams + recording writer.
+    // Dropping `recording_tx` disconnects the writer's channel, which
+    // makes it finalize any open WAV and exit; we then join it.
+    macro_rules! teardown {
+        () => {{
+            drop(current.take());
+            drop(dsp_tx.take());
+            drop(sb_tx.take());
+            state.recording.store(false, Ordering::Release);
+            drop(recording_tx.take());
+            if let Some(h) = writer.take() {
+                let _ = h.join();
+            }
+            state.running.store(false, Ordering::Release);
+        }};
+    }
+
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Start {
@@ -201,12 +260,7 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                 monitor_name,
                 reply,
             } => {
-                // Drop any existing streams before building new ones.
-                drop(current.take());
-                drop(dsp_tx.take());
-                drop(sb_tx.take());
-                state.running.store(false, Ordering::Release);
-
+                teardown!();
                 let result = start_streams(
                     input_name.as_deref(),
                     output_name.as_deref(),
@@ -214,12 +268,14 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                     state.clone(),
                 );
                 current = match result {
-                    Ok((streams, info, new_dsp_tx, new_sb_tx)) => {
+                    Ok(started) => {
                         state.running.store(true, Ordering::Release);
-                        dsp_tx = Some(new_dsp_tx);
-                        sb_tx = Some(new_sb_tx);
-                        let _ = reply.send(Ok(info));
-                        Some(streams)
+                        dsp_tx = Some(started.dsp_tx);
+                        sb_tx = Some(started.sb_tx);
+                        recording_tx = Some(started.recording_tx);
+                        writer = Some(started.writer);
+                        let _ = reply.send(Ok(started.info));
+                        Some(started.streams)
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e));
@@ -228,10 +284,7 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                 };
             }
             Command::Stop => {
-                drop(current.take());
-                drop(dsp_tx.take());
-                drop(sb_tx.take());
-                state.running.store(false, Ordering::Release);
+                teardown!();
                 state.store_input(Levels::default());
                 state.store_output(Levels::default());
                 state.store_dsp_latency_ms(0.0);
@@ -249,11 +302,21 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                     let _ = tx.send(sb_cmd);
                 }
             }
+            Command::StartRecording { path } => {
+                // Only if a session is live (the writer exists).
+                if let Some(tx) = &recording_tx {
+                    state.recording.store(true, Ordering::Release);
+                    let _ = tx.send(RecordingCommand::Start { path });
+                }
+            }
+            Command::StopRecording => {
+                state.recording.store(false, Ordering::Release);
+                if let Some(tx) = &recording_tx {
+                    let _ = tx.send(RecordingCommand::Stop);
+                }
+            }
             Command::Shutdown => {
-                drop(current.take());
-                drop(dsp_tx.take());
-                drop(sb_tx.take());
-                state.running.store(false, Ordering::Release);
+                teardown!();
                 break;
             }
         }
@@ -300,23 +363,14 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
     }
 }
 
-#[allow(clippy::needless_pass_by_value)] // state is cloned into both stream closures
-#[allow(clippy::type_complexity)] // four-tuple is clearer than a struct here
+#[allow(clippy::needless_pass_by_value)] // state is cloned into the stream closures
 #[allow(clippy::too_many_lines)] // linear device/stream setup; splitting hurts readability
 fn start_streams(
     input_name: Option<&str>,
     output_name: Option<&str>,
     monitor_name: Option<&str>,
     state: Arc<EngineState>,
-) -> Result<
-    (
-        RunningStreams,
-        StreamInfo,
-        Sender<DspCommand>,
-        Sender<SoundboardCommand>,
-    ),
-    AudioEngineError,
-> {
+) -> Result<StartedStreams, AudioEngineError> {
     let input_device = find_device(Direction::Input, input_name)?;
     let output_device = find_device(Direction::Output, output_name)?;
 
@@ -375,6 +429,14 @@ fn start_streams(
         (None, None)
     };
 
+    // Phase 16: recording tap ring. Always created; the output callback
+    // pushes the processed input-rate mono into it only while
+    // `state.recording` is set. A dedicated writer thread drains it to
+    // a WAV file so no file I/O ever touches the audio thread.
+    let rec_rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
+    let (recording_producer, recording_consumer) = rec_rb.split();
+    let (recording_tx, recording_rx) = channel::<RecordingCommand>();
+
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
     let (sb_tx, sb_rx) = channel::<SoundboardCommand>();
 
@@ -399,6 +461,7 @@ fn start_streams(
         output_rate,
         monitor_producer,
         has_monitor,
+        recording_producer,
     )?;
 
     // Build the monitor stream last so the tap producer is already wired
@@ -444,8 +507,17 @@ fn start_streams(
         input_channels,
         output_channels,
     };
-    Ok((
-        RunningStreams {
+    // Phase 16: spawn the recording writer thread. It owns the ring's
+    // consumer end + the command channel, parks draining nothing until a
+    // `Start { path }` arrives, and exits when `recording_tx` drops at
+    // teardown (the channel disconnect is its shutdown signal).
+    let writer = std::thread::Builder::new()
+        .name("divora-recording".into())
+        .spawn(move || recording_writer(recording_consumer, recording_rx, input_rate))
+        .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
+
+    Ok(StartedStreams {
+        streams: RunningStreams {
             _input: input_stream,
             _output: output_stream,
             _monitor: monitor_stream,
@@ -453,7 +525,9 @@ fn start_streams(
         info,
         dsp_tx,
         sb_tx,
-    ))
+        recording_tx,
+        writer,
+    })
 }
 
 type RingProducer = <HeapRb<f32> as Split>::Prod;
@@ -542,6 +616,10 @@ fn build_output_stream(
     // signals the tap is wired.
     mut monitor_producer: Option<RingProducer>,
     has_monitor: bool,
+    // Phase 16: the same processed, input-rate mono is tapped into this
+    // ring while `state.recording` is set; a writer thread drains it to
+    // a WAV file. Always wired — recording can begin mid-session.
+    mut recording_producer: RingProducer,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -652,6 +730,15 @@ fn build_output_stream(
                 // underruns to silence momentarily.
                 if let Some(mp) = monitor_producer.as_mut() {
                     let _ = mp.push_slice(&mono[..native_frames]);
+                }
+
+                // Phase 16: tap the same processed mono into the
+                // recording ring while recording is active. The writer
+                // thread drains it to a WAV; a full ring just drops
+                // samples (a brief gap in the file) rather than stalling
+                // the audio thread with file I/O.
+                if state_for_callback.recording.load(Ordering::Acquire) {
+                    let _ = recording_producer.push_slice(&mono[..native_frames]);
                 }
 
                 // Now hand the native-rate buffer to the output
@@ -835,11 +922,108 @@ fn mix_voice_and_soundboard(
     soundboard.mix_into(mono, sample_rate);
 }
 
+/// The WAV writer the recording thread holds while a file is open.
+type RecordingFile = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
+
+/// Pop everything currently in the recording ring and write it as
+/// 16-bit PCM. f32 samples are clamped to [-1, 1] before scaling so a
+/// hot signal saturates cleanly instead of wrapping.
+fn drain_recording(
+    consumer: &mut RingConsumer,
+    buf: &mut [f32; MAX_FRAMES_PER_CALLBACK],
+    writer: &mut RecordingFile,
+) {
+    loop {
+        let n = consumer.pop_slice(buf);
+        if n == 0 {
+            break;
+        }
+        for &s in &buf[..n] {
+            #[allow(clippy::cast_possible_truncation)] // clamped to i16 range
+            let v = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            let _ = writer.write_sample(v);
+        }
+    }
+}
+
+/// Phase 16: recording writer thread body. Owns the consumer end of the
+/// recording ring plus a command channel. On `Start { path }` it opens a
+/// 16-bit PCM mono WAV at `sample_rate`; while a file is open it drains
+/// the ring (f32 → i16) into it. `Stop` flushes the tail and finalizes.
+/// A disconnected command channel (engine teardown) finalizes any open
+/// file and exits. All file I/O lives here so the audio callback never
+/// touches the disk.
+#[allow(clippy::needless_pass_by_value)] // owns the receiver for the thread's lifetime
+fn recording_writer(mut consumer: RingConsumer, rx: Receiver<RecordingCommand>, sample_rate: u32) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer: Option<RecordingFile> = None;
+    let mut buf = [0f32; MAX_FRAMES_PER_CALLBACK];
+
+    loop {
+        // Apply all pending commands first.
+        loop {
+            match rx.try_recv() {
+                Ok(RecordingCommand::Start { path }) => {
+                    // Finalize any in-progress file before starting anew.
+                    if let Some(w) = writer.take() {
+                        let _ = w.finalize();
+                    }
+                    match hound::WavWriter::create(&path, spec) {
+                        Ok(w) => writer = Some(w),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                path = %path.display(),
+                                "failed to create recording WAV"
+                            );
+                        }
+                    }
+                }
+                Ok(RecordingCommand::Stop) => {
+                    if let Some(mut w) = writer.take() {
+                        drain_recording(&mut consumer, &mut buf, &mut w);
+                        let _ = w.finalize();
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Engine teardown: flush the tail, finalize, exit.
+                    if let Some(mut w) = writer.take() {
+                        drain_recording(&mut consumer, &mut buf, &mut w);
+                        let _ = w.finalize();
+                    }
+                    return;
+                }
+            }
+        }
+
+        if let Some(w) = writer.as_mut() {
+            drain_recording(&mut consumer, &mut buf, w);
+        } else {
+            // Not recording: discard ring contents so stale audio never
+            // leaks into the next file.
+            while consumer.pop_slice(&mut buf) > 0 {}
+        }
+
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{main_output_plays, mix_voice_and_soundboard, AudioEngine};
+    use super::{
+        drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine,
+        MAX_FRAMES_PER_CALLBACK, RING_BUFFER_FRAMES,
+    };
     use crate::dsp::EffectChain;
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
+    use ringbuf::traits::{Producer, Split};
+    use ringbuf::HeapRb;
     use std::sync::Arc;
 
     /// Phase 13 gating truth table: the main output (the "send") always
@@ -867,6 +1051,51 @@ mod tests {
         engine.stop();
         engine.set_monitor(false);
         drop(engine);
+    }
+
+    /// Phase 16: the recording drain converts f32 → 16-bit PCM, clamping
+    /// hot samples to the i16 range instead of wrapping, and writes a
+    /// valid mono WAV that hound can read back. This is the property
+    /// users care about: a saved take matches what they heard (and a
+    /// clipped signal saturates cleanly rather than glitching).
+    #[test]
+    fn drain_recording_writes_clamped_pcm() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("divora-rec-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("take.wav");
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+
+        let rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
+        let (mut prod, mut cons) = rb.split();
+        let mut buf = [0f32; MAX_FRAMES_PER_CALLBACK];
+
+        // Zero, normal, and over-unity samples (the last two must clamp).
+        let pushed = prod.push_slice(&[0.0, 0.5, -0.5, 2.0, -2.0]);
+        assert_eq!(pushed, 5);
+
+        drain_recording(&mut cons, &mut buf, &mut writer);
+        writer.finalize().unwrap();
+
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, 48_000);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        let samples: Vec<i16> = reader.into_samples::<i16>().map(Result::unwrap).collect();
+        // 0.5 * 32767 = 16383.5 → truncates to 16383; ±2.0 clamps to ±1.0.
+        assert_eq!(samples, vec![0, 16383, -16383, 32767, -32767]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -253,6 +253,7 @@ function RightRail(): JSX.Element {
       <VoiceStatusCard />
       <PushToModulateCard />
       <MonitorCard />
+      <RecordCard />
       <Inspector />
       <Show when={app.engineError()}>
         {(err) => (
@@ -438,6 +439,84 @@ function MonitorCard(): JSX.Element {
         onChange={(next) => void app.setMonitor(next)}
         ariaLabel="Sidetone monitor"
       />
+    </div>
+  );
+}
+
+// Phase 16: one-click capture of the post-chain output to a WAV file.
+// Recording rides the same processed mono the main output sends, so the
+// file is exactly what call participants hear. Only available while the
+// engine is running (the writer thread lives for the session).
+function RecordCard(): JSX.Element {
+  const app = useApp();
+  const recording = () => app.isRecording();
+  const canRecord = () => app.engineRunning();
+  return (
+    <div
+      class="card"
+      style={{
+        padding: "var(--s4)",
+        display: "flex",
+        "align-items": "center",
+        "justify-content": "space-between",
+        gap: "var(--s3)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          gap: "var(--s3)",
+          color: "var(--text-mid)",
+        }}
+      >
+        <span
+          aria-hidden="true"
+          style={{
+            width: "14px",
+            height: "14px",
+            "border-radius": "var(--r-pill)",
+            flex: "none",
+            background: recording() ? "var(--danger)" : "var(--surface-3)",
+            border: recording() ? "none" : "1px solid var(--line)",
+            "box-shadow": recording() ? "0 0 10px var(--danger)" : "none",
+            animation: recording() ? "breathe 1.4s ease-in-out infinite" : "none",
+          }}
+        />
+        <div>
+          <div style={{ "font-size": "var(--t-sm)", "font-weight": 600 }}>
+            {recording() ? "Recording…" : "Record"}
+          </div>
+          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+            {recording()
+              ? "Capturing the modulated output"
+              : "Save the modulated output to a WAV"}
+          </div>
+        </div>
+      </div>
+      <button
+        type="button"
+        class="btn btn-secondary"
+        disabled={!canRecord() && !recording()}
+        title={
+          canRecord() || recording()
+            ? "Toggle recording the modulated output"
+            : "Start the engine to record"
+        }
+        style={{
+          height: "38px",
+          ...(recording()
+            ? {
+                background: "var(--danger-bg)",
+                "border-color": "rgba(242, 86, 122, 0.5)",
+                color: "var(--danger)",
+              }
+            : {}),
+        }}
+        onClick={() => void app.toggleRecording()}
+      >
+        {recording() ? "Stop" : "Record"}
+      </button>
     </div>
   );
 }

@@ -21,6 +21,7 @@ import {
   listPresets,
   playSoundboardClip,
   presetStorePath,
+  recordingsDir,
   registerGlobalShortcut,
   saveUserPreset,
   scanSoundboardFolder,
@@ -29,8 +30,10 @@ import {
   setEffectEnabled,
   setEffectParam,
   startAudioEngine,
+  startRecording,
   stopAllSoundboardClips,
   stopAudioEngine,
+  stopRecording,
   stopSoundboardClip,
   subscribeGlobalShortcut,
   subscribeLevels,
@@ -264,6 +267,28 @@ describe("audio api", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await stopAllSoundboardClips();
     expect(invokeMock).toHaveBeenCalledWith("stop_all_soundboard_clips");
+  });
+
+  it("recordingsDir invokes recordings_dir", async () => {
+    invokeMock.mockResolvedValueOnce("C:/Users/me/AppData/Roaming/DivoraVoice/recordings");
+    const dir = await recordingsDir();
+    expect(invokeMock).toHaveBeenCalledWith("recordings_dir");
+    expect(dir).toContain("recordings");
+  });
+
+  it("startRecording forwards filename and returns the destination path", async () => {
+    invokeMock.mockResolvedValueOnce("C:/rec/divora-2026-05-31_14-30-00.wav");
+    const dest = await startRecording("divora-2026-05-31_14-30-00.wav");
+    expect(invokeMock).toHaveBeenCalledWith("start_recording", {
+      filename: "divora-2026-05-31_14-30-00.wav",
+    });
+    expect(dest).toMatch(/\.wav$/);
+  });
+
+  it("stopRecording invokes stop_recording", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await stopRecording();
+    expect(invokeMock).toHaveBeenCalledWith("stop_recording");
   });
 
   it("detectVirtualMic invokes detect_virtual_mic and returns the status", async () => {

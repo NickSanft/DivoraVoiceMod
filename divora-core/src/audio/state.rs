@@ -18,6 +18,9 @@ pub struct Levels {
 pub struct EngineState {
     pub running: AtomicBool,
     pub monitor: AtomicBool,
+    /// Phase 16: true while the modulated output is being recorded to a
+    /// WAV file. Gates the output callback's push into the recording ring.
+    pub recording: AtomicBool,
     pub input_rms_bits: AtomicU32,
     pub input_peak_bits: AtomicU32,
     pub output_rms_bits: AtomicU32,

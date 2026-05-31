@@ -4,6 +4,35 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-05-31 — Phase 16: record the modulated output
+
+One-click capture of exactly what your listeners hear — voice effects, soundboard, and all — to a timestamped WAV file.
+
+### Added
+
+- **Record button** on the Mixer (right rail). While the engine is running, hit **Record** to start capturing the post-chain output; the dot pulses red and the button turns into **Stop**. Files are written as 16-bit PCM mono WAV at the engine's sample rate.
+- **Recordings folder** — files land in `%APPDATA%/DivoraVoice/recordings/`, named `divora-<date>_<time>.wav`. A new **Recordings** section in Settings shows the folder path, an **Open folder** button, and the name of your most recent take.
+- **Engine plumbing** — recording reuses the existing processed-mono tap (the same signal sent to the main output / VB-Cable), so a saved take matches the call audio sample-for-sample. A dedicated **writer thread** drains a lock-free ring to disk, so no file I/O ever runs on the real-time audio callback. Hot samples clamp to the i16 range instead of wrapping.
+- New backend commands `start_recording` / `stop_recording` / `recordings_dir`, a `recording` flag on the `audio-levels` event + status snapshot, and `AudioEngine::{start_recording, stop_recording, is_recording}`.
+
+### Tests
+
+- **Rust**: 128 → 129 (+1): the recording drain converts f32 → 16-bit PCM, clamps over-unity samples to ±full-scale (no wrap), and writes a valid mono WAV that hound reads back.
+- **Frontend**: 237 → 242 (+5): `recordings_dir` / `start_recording` (forwards the filename, returns the path) / `stop_recording` command wrappers; the store's `toggleRecording` refuses to start while stopped, and starts → stops with a timestamped filename while running.
+
+### Note
+
+The live capture writes through a real device callback, so the end-to-end recording is best confirmed on the desktop; the drain/format correctness and the command wiring are covered by the unit tests above.
+
+### Pre-push checklist (local, 2026-05-31)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (129, +1 ignored LLVC test)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (242)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [0.15.0] — 2026-05-31 — Phase 15: soundboard volume, folder persistence, system tray
 
 Three requested quality-of-life items.

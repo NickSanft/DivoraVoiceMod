@@ -144,6 +144,8 @@ export function SettingsScreen(): JSX.Element {
 
       <VoiceLibrarySection />
 
+      <RecordingsSection />
+
       <VirtualMicSection />
 
       <HotkeysSection />
@@ -543,6 +545,101 @@ function VoiceLibrarySection(): JSX.Element {
             Open folder
           </Button>
         </div>
+      </div>
+    </section>
+  );
+}
+
+// ---------- Recordings (Phase 16) ----------
+
+function RecordingsSection(): JSX.Element {
+  const app = useApp();
+  const [dir, setDir] = createSignal("");
+
+  onMount(() => {
+    void app
+      .getRecordingsDir()
+      .then(setDir)
+      .catch((err) => console.warn("[settings] recordings dir unavailable", err));
+  });
+
+  const openFolder = (): void => {
+    const d = dir();
+    if (d) void openExternal(d);
+  };
+
+  return (
+    <section>
+      <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
+        Recordings
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s4)",
+        }}
+      >
+        <p style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", margin: 0 }}>
+          Use the <strong>Record</strong> button on the Mixer to capture the
+          modulated output (exactly what listeners hear) to a WAV file. Files
+          land in this folder, timestamped.
+        </p>
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s4)",
+          }}
+        >
+          <div style={{ "min-width": 0 }}>
+            <div class="eyebrow" style={{ "margin-bottom": "4px" }}>
+              Recordings folder
+            </div>
+            <div
+              class="mono"
+              style={{
+                "font-size": "var(--t-xs)",
+                color: "var(--text-lo)",
+                "white-space": "nowrap",
+                overflow: "hidden",
+                "text-overflow": "ellipsis",
+              }}
+              title={dir()}
+            >
+              {dir() || "—"}
+            </div>
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="folder"
+            onClick={openFolder}
+            disabled={!dir()}
+          >
+            Open folder
+          </Button>
+        </div>
+        <Show when={app.recordingPath()}>
+          {(path) => (
+            <div
+              style={{
+                "font-size": "var(--t-xs)",
+                color: "var(--text-lo)",
+                "border-top": "1px solid var(--line)",
+                "padding-top": "var(--s3)",
+              }}
+            >
+              Last recording:{" "}
+              <span class="mono" title={path()}>
+                {path().split(/[\\/]/).pop()}
+              </span>
+            </div>
+          )}
+        </Show>
       </div>
     </section>
   );

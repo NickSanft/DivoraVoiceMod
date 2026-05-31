@@ -34,6 +34,7 @@ import {
   onnxRuntimeStatus as onnxRuntimeStatusCmd,
   pickSoundboardFolder as pickSoundboardFolderCmd,
   playSoundboardClip as playSoundboardClipCmd,
+  recordingsDir as recordingsDirCmd,
   registerGlobalShortcut as registerGlobalShortcutCmd,
   saveUserPreset as saveUserPresetCmd,
   scanSoundboardFolder as scanSoundboardFolderCmd,
@@ -44,8 +45,10 @@ import {
   setSoundboardMasterGain as setSoundboardMasterGainCmd,
   setVoiceModel as setVoiceModelCmd,
   startAudioEngine,
+  startRecording as startRecordingCmd,
   stopAllSoundboardClips as stopAllSoundboardClipsCmd,
   stopAudioEngine,
+  stopRecording as stopRecordingCmd,
   stopSoundboardClip as stopSoundboardClipCmd,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
@@ -265,6 +268,11 @@ export interface AppState {
   /** Phase 14: latency added by the active DSP chain, in ms. */
   dspLatencyMs: () => number;
   setDspLatencyMs: Setter<number>;
+  /** Phase 16: true while the modulated output is being recorded. */
+  isRecording: () => boolean;
+  setIsRecording: Setter<boolean>;
+  /** Phase 16: full path of the most recent recording (for the hint). */
+  recordingPath: () => string | null;
 
   // Audio actions
   refreshDevices: () => Promise<void>;
@@ -272,6 +280,10 @@ export interface AppState {
   stopEngine: () => Promise<void>;
   toggleMonitor: () => Promise<void>;
   setMonitor: (enabled: boolean) => Promise<void>;
+  /** Phase 16: toggle recording the modulated output to a WAV file. */
+  toggleRecording: () => Promise<void>;
+  /** Phase 16: absolute path of the recordings directory. */
+  getRecordingsDir: () => Promise<string>;
 
   // DSP / chain editing — local store mutation + backend sync.
   setChainParam: (effectIndex: number, key: string, value: number) => void;
@@ -436,6 +448,11 @@ export function createAppState(): AppState {
   // Phase 14: latency added by the active DSP chain (ms), driven by the
   // ~30 Hz level event so it moves live as effects toggle.
   const [dspLatencyMs, setDspLatencyMs] = createSignal(0);
+  // Phase 16: recording state. `isRecording` is confirmed by the ~30 Hz
+  // level event (backend is source of truth), but we also set it
+  // optimistically on toggle for instant button feedback.
+  const [isRecording, setIsRecording] = createSignal(false);
+  const [recordingPath, setRecordingPath] = createSignal<string | null>(null);
 
   const preset = createMemo<Preset>(
     () => presets().find((p) => p.id === presetId()) ?? presets()[0] ?? firstPreset,
@@ -529,6 +546,9 @@ export function createAppState(): AppState {
     setStreamInfo(null);
     setInputLevels(ZERO_LEVELS);
     setOutputLevels(ZERO_LEVELS);
+    // Stopping the engine tears down the recording writer, so the
+    // backend already finalized any open file — reflect that at once.
+    setIsRecording(false);
   };
 
   const setMonitor = async (enabled: boolean): Promise<void> => {
@@ -537,6 +557,42 @@ export function createAppState(): AppState {
   };
 
   const toggleMonitor = (): Promise<void> => setMonitor(!engineMonitoring());
+
+  // Phase 16: toggle recording the modulated output to a WAV file.
+  // Starting builds a timestamped filename; the backend sanitizes it,
+  // forces a `.wav` extension, and returns the final destination path.
+  // The writer thread only exists while the engine is running, so we
+  // refuse to start when stopped (surfaced via engineError).
+  const toggleRecording = async (): Promise<void> => {
+    if (isRecording()) {
+      setIsRecording(false); // optimistic; confirmed by the level event
+      try {
+        await stopRecordingCmd();
+      } catch (err) {
+        console.warn("[recording] stop failed", err);
+      }
+      return;
+    }
+    if (!engineRunning()) {
+      setEngineError("Start the engine before recording.");
+      return;
+    }
+    const pad = (n: number): string => String(n).padStart(2, "0");
+    const d = new Date();
+    const filename =
+      `divora-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+      `_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}.wav`;
+    try {
+      const dest = await startRecordingCmd(filename);
+      setRecordingPath(dest);
+      setIsRecording(true); // optimistic; confirmed by the level event
+    } catch (err) {
+      setIsRecording(false);
+      setEngineError(String(err));
+    }
+  };
+
+  const getRecordingsDir = (): Promise<string> => recordingsDirCmd();
 
   // Phase 11: live device switching. When the user picks a different
   // input or output device in Settings while the engine is running,
@@ -1252,12 +1308,17 @@ export function createAppState(): AppState {
     setOutputLevels,
     dspLatencyMs,
     setDspLatencyMs,
+    isRecording,
+    setIsRecording,
+    recordingPath,
 
     refreshDevices,
     startEngine,
     stopEngine,
     toggleMonitor,
     setMonitor,
+    toggleRecording,
+    getRecordingsDir,
 
     setChainParam,
     setChainEnabled,
