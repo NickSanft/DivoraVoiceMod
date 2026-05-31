@@ -4,6 +4,16 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.12.5] — 2026-05-30 — Installers carry the real version number
+
+### Fixed
+
+- **Release installers are now named `DivoraVoice_<version>_…`** (e.g. `DivoraVoice_0.12.5_x64_en-US.msi`) instead of `0.0.0`, and the installed exe reports the real version. `release.yml` gains a "Stamp version from tag" step that writes the tag's version (stripped of the leading `v`) into `tauri.conf.json` + `Cargo.toml` on the CI runner **before** building. The committed files stay at `0.0.0` — git tags remain the single version source of truth; the stamp only edits the ephemeral CI checkout.
+
+### Notes
+
+- CI-only change: no app code touched. The stamp regex was dry-run locally against both files (replaces exactly one `0.0.0` in each). Validation that the published installer carries the version is inherent in this release — the v0.12.5 installers will be named `0.12.5`.
+
 ## [0.12.4] — 2026-05-30 — Installer bundles voice conversion (out-of-the-box AI)
 
 The release installer now ships `onnxruntime.dll` + the LLVC narrator model, so a fresh install does AI voice conversion with **zero manual setup** — no Python, no copying DLLs.

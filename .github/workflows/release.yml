@@ -47,6 +47,24 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/fetch-voice-assets.ps1
 
+      # Phase 12.5: stamp the tag's version into the build so the
+      # installer is named DivoraVoice_<ver>_... instead of 0.0.0, and
+      # the exe reports the real version. The committed files stay at
+      # 0.0.0 (git tags are the version source of truth) — this only
+      # edits the ephemeral CI checkout.
+      - name: Stamp version from tag
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "tag '$ver' is not semver" }
+          $tj = "src-tauri/tauri.conf.json"
+          (Get-Content $tj -Raw) -replace '"version": "0\.0\.0"', ('"version": "' + $ver + '"') |
+            Set-Content $tj -NoNewline -Encoding utf8
+          $ct = "Cargo.toml"
+          (Get-Content $ct -Raw) -replace 'version = "0\.0\.0"', ('version = "' + $ver + '"') |
+            Set-Content $ct -NoNewline -Encoding utf8
+          Write-Host "Stamped version $ver into tauri.conf.json + Cargo.toml"
+
       - name: tauri build (release, with bundled voice assets)
         run: pnpm tauri build --config src-tauri/tauri.bundle.conf.json
 
