@@ -176,6 +176,11 @@ impl AudioEffect for PitchShift {
     fn kind(&self) -> EffectKind {
         EffectKind::Pitch
     }
+
+    fn latency_samples(&self, _sample_rate: u32) -> usize {
+        // Phase-vocoder STFT analysis/synthesis delay = one window.
+        WINDOW
+    }
 }
 
 #[cfg(test)]

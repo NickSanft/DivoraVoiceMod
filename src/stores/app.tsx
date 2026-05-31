@@ -258,6 +258,9 @@ export interface AppState {
   setInputLevels: Setter<Levels>;
   outputLevels: () => Levels;
   setOutputLevels: Setter<Levels>;
+  /** Phase 14: latency added by the active DSP chain, in ms. */
+  dspLatencyMs: () => number;
+  setDspLatencyMs: Setter<number>;
 
   // Audio actions
   refreshDevices: () => Promise<void>;
@@ -421,6 +424,9 @@ export function createAppState(): AppState {
   const [streamInfo, setStreamInfo] = createSignal<StreamInfo | null>(null);
   const [inputLevels, setInputLevels] = createSignal<Levels>(ZERO_LEVELS);
   const [outputLevels, setOutputLevels] = createSignal<Levels>(ZERO_LEVELS);
+  // Phase 14: latency added by the active DSP chain (ms), driven by the
+  // ~30 Hz level event so it moves live as effects toggle.
+  const [dspLatencyMs, setDspLatencyMs] = createSignal(0);
 
   const preset = createMemo<Preset>(
     () => presets().find((p) => p.id === presetId()) ?? presets()[0] ?? firstPreset,
@@ -1200,6 +1206,8 @@ export function createAppState(): AppState {
     setInputLevels,
     outputLevels,
     setOutputLevels,
+    dspLatencyMs,
+    setDspLatencyMs,
 
     refreshDevices,
     startEngine,

@@ -164,6 +164,17 @@ impl AudioEffect for RnnDenoiser {
     fn kind(&self) -> EffectKind {
         EffectKind::Denoiser
     }
+
+    fn latency_samples(&self, sample_rate: u32) -> usize {
+        // One 480-sample frame (≈ 10 ms @ 48 kHz) of buffering delay,
+        // and only at the rate the model runs — off-rate the effect
+        // bypasses entirely, adding nothing.
+        if sample_rate == RNN_RATE {
+            FRAME_SIZE
+        } else {
+            0
+        }
+    }
 }
 
 impl RnnDenoiser {

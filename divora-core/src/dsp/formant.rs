@@ -161,6 +161,11 @@ impl AudioEffect for FormantShift {
     fn kind(&self) -> EffectKind {
         EffectKind::Formant
     }
+
+    fn latency_samples(&self, _sample_rate: u32) -> usize {
+        // Phase-vocoder STFT analysis/synthesis delay = one window.
+        super::stft::WINDOW
+    }
 }
 
 #[cfg(test)]

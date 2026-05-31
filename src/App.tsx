@@ -178,6 +178,7 @@ function Shell(): JSX.Element {
           app.setOutputLevels(update.output);
           app.setEngineRunning(update.running);
           app.setEngineMonitoring(update.monitoring);
+          app.setDspLatencyMs(update.dspLatencyMs);
         });
       } catch (err) {
         app.setEngineError(`level subscription failed: ${String(err)}`);

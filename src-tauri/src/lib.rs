@@ -35,6 +35,8 @@ struct LevelUpdate {
     output: Levels,
     running: bool,
     monitoring: bool,
+    /// Phase 14: latency added by the active DSP chain, in ms.
+    dsp_latency_ms: f32,
 }
 
 /// One-shot status snapshot used by the frontend at startup and after
@@ -46,6 +48,7 @@ struct EngineStatus {
     monitoring: bool,
     input: Levels,
     output: Levels,
+    dsp_latency_ms: f32,
 }
 
 /// Tauri-managed shared state. Holds the live audio engine, the user
@@ -152,6 +155,7 @@ fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
         monitoring: state.engine.is_monitoring(),
         input: state.engine.input_levels(),
         output: state.engine.output_levels(),
+        dsp_latency_ms: state.engine.dsp_latency_ms(),
     }
 }
 
@@ -436,6 +440,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
                 output: engine.output_levels(),
                 running: engine.is_running(),
                 monitoring: engine.is_monitoring(),
+                dsp_latency_ms: engine.dsp_latency_ms(),
             };
             if app.emit("audio-levels", &payload).is_err() {
                 // App is shutting down (no receivers / window gone).

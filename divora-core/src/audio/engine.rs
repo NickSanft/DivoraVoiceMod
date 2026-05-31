@@ -156,6 +156,13 @@ impl AudioEngine {
     pub fn output_levels(&self) -> Levels {
         self.state.load_output()
     }
+
+    /// Phase 14: latency added by the active DSP chain, in milliseconds.
+    /// 0 when stopped or when no latency-adding effects are enabled.
+    #[must_use]
+    pub fn dsp_latency_ms(&self) -> f32 {
+        self.state.load_dsp_latency_ms()
+    }
 }
 
 impl Default for AudioEngine {
@@ -227,6 +234,7 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                 state.running.store(false, Ordering::Release);
                 state.store_input(Levels::default());
                 state.store_output(Levels::default());
+                state.store_dsp_latency_ms(0.0);
             }
             Command::SetMonitor(enabled) => {
                 state.monitor.store(enabled, Ordering::Release);
@@ -577,6 +585,15 @@ fn build_output_stream(
                 while let Ok(cmd) = sb_rx.try_recv() {
                     soundboard.apply(cmd);
                 }
+
+                // Phase 14: publish the chain's added latency (ms) for
+                // the UI readout. Cheap — just sums enabled effects'
+                // fixed delays — and reflects the live chain, so it
+                // moves the moment Voice Convert / denoiser toggle.
+                #[allow(clippy::cast_precision_loss)]
+                let lat_ms = chain.latency_samples(input_rate) as f32 / input_rate as f32 * 1000.0;
+                state_for_callback.store_dsp_latency_ms(lat_ms);
+
                 let monitoring = state_for_callback.monitor.load(Ordering::Acquire);
                 let out_frames = data.len() / channels;
                 let out_frames = out_frames.min(MAX_FRAMES_PER_CALLBACK);

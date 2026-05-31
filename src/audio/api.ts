@@ -38,6 +38,8 @@ export interface EngineStatus {
   monitoring: boolean;
   input: Levels;
   output: Levels;
+  /** Phase 14: latency added by the active DSP chain, in ms. */
+  dspLatencyMs: number;
 }
 
 /** Periodic update emitted by the backend at ~30 Hz. */
@@ -46,6 +48,8 @@ export interface LevelUpdate {
   output: Levels;
   running: boolean;
   monitoring: boolean;
+  /** Phase 14: latency added by the active DSP chain, in ms. */
+  dspLatencyMs: number;
 }
 
 export async function listInputDevices(): Promise<DeviceInfo[]> {

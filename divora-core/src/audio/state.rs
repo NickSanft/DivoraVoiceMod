@@ -22,6 +22,9 @@ pub struct EngineState {
     pub input_peak_bits: AtomicU32,
     pub output_rms_bits: AtomicU32,
     pub output_peak_bits: AtomicU32,
+    /// Phase 14: latency ADDED by the active DSP chain, in milliseconds
+    /// (f32 bit pattern). Written by the output callback each buffer.
+    pub dsp_latency_ms_bits: AtomicU32,
 }
 
 impl EngineState {
@@ -51,6 +54,16 @@ impl EngineState {
             rms: f32::from_bits(self.output_rms_bits.load(Ordering::Acquire)),
             peak: f32::from_bits(self.output_peak_bits.load(Ordering::Acquire)),
         }
+    }
+
+    pub fn store_dsp_latency_ms(&self, ms: f32) {
+        self.dsp_latency_ms_bits
+            .store(ms.to_bits(), Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn load_dsp_latency_ms(&self) -> f32 {
+        f32::from_bits(self.dsp_latency_ms_bits.load(Ordering::Acquire))
     }
 }
 

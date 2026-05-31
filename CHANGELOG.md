@@ -4,6 +4,40 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-05-30 — Phase 14: live latency readout
+
+Voice Convert adds ~256 ms; the denoiser 10 ms; pitch/formant ~21 ms each. Now you can see it: the Mixer shows how much latency the active effects are adding, updating the instant you toggle one.
+
+### Added
+
+- **`AudioEffect::latency_samples(sample_rate)`** (default 0) + **`EffectChain::latency_samples`** which sums the *enabled* effects' fixed delays. Implemented for the effects that actually buffer:
+  - **Voice Convert**: the 16 kHz inference chunk (≈ 256 ms), and only when a model is loaded (passthrough adds nothing).
+  - **Denoiser**: one 480-sample frame (10 ms), and only at 48 kHz (off-rate it bypasses).
+  - **Pitch** / **Formant**: the phase-vocoder STFT window (1024 samples ≈ 21 ms each).
+  - Gate / EQ / robot / distortion add 0 (sample-by-sample); echo / reverb add 0 to the dry-path latency (they're wet tails).
+- The engine publishes the chain's added latency (ms) via the `EngineState` + the ~30 Hz `audio-levels` event, and the **Mixer header shows "· +N ms latency"** while running (with a tooltip explaining the contributors). It moves live as effects toggle.
+
+### Tests
+
+- **Rust**: 120 → 125 (+5): empty chain = 0; sums enabled effects (denoiser 480 + pitch 1024); disabled effects add 0; denoiser latency only at 48 kHz; Voice Convert adds 0 without a model.
+
+### Deferred
+
+- The **buffer-size selector** from the original Phase 14 sketch is deferred — WASAPI shared mode largely ignores requested buffer sizes, so it can't reliably "change the latency." The readout (the genuinely useful part) ships now.
+
+### Pre-push checklist (local, 2026-05-30)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (125, +1 ignored LLVC test)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (233)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### Roadmap
+
+Per request, the next phase (**15**) bundles soundboard + tray polish — per-tile/master soundboard volume, persisting the soundboard folder across restarts, and minimize-to-system-tray. Recording moves to Phase 16; v1.0 after.
+
 ## [0.13.0] — 2026-05-30 — Phase 13: monitor output routing (hear yourself + route to VB-Cable)
 
 Field report:

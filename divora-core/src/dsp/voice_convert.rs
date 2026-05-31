@@ -382,6 +382,17 @@ impl AudioEffect for VoiceConverter {
             .map(|s| s.to_string_lossy().into_owned());
         self.set_model_path(voice, path);
     }
+
+    fn latency_samples(&self, sample_rate: u32) -> usize {
+        // The dominant latency in the app: a full 16 kHz inference chunk
+        // (≈ 256 ms), expressed at the engine's rate. Only incurred when
+        // a model is actually loaded — passthrough adds nothing.
+        if self.session.is_some() {
+            (u64::from(sample_rate) * CHUNK_16K as u64 / u64::from(MODEL_RATE)) as usize
+        } else {
+            0
+        }
+    }
 }
 
 /// Thin wrapper around `SincFixedOut` matching the shape we use here.

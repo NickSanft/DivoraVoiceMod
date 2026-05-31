@@ -93,6 +93,16 @@ pub trait AudioEffect: Send {
     /// aren't numbers. `None` clears the resource. Default no-op, so
     /// only effects that actually have a string resource override it.
     fn set_resource(&mut self, _key: &str, _value: Option<&str>) {}
+
+    /// Phase 14: the algorithmic latency this effect ADDS to the signal
+    /// path, in samples at `sample_rate`, when it's actively processing.
+    /// Block-based effects (denoiser frame, voice-conversion chunk,
+    /// STFT window) return their buffering delay; sample-by-sample
+    /// effects (gate, EQ, distortion) and wet-tail effects (echo,
+    /// reverb — the dry path isn't delayed) return 0. Default 0.
+    fn latency_samples(&self, _sample_rate: u32) -> usize {
+        0
+    }
 }
 
 /// Declarative description of an effect — what the UI sends to (re)build
@@ -191,6 +201,18 @@ impl EffectChain {
                 effect.process(buffer, sample_rate);
             }
         }
+    }
+
+    /// Phase 14: total algorithmic latency added by the ENABLED effects
+    /// in the chain, in samples at `sample_rate`. Effects are serial, so
+    /// their latencies sum. Drives the live "added latency" readout.
+    #[must_use]
+    pub fn latency_samples(&self, sample_rate: u32) -> usize {
+        self.effects
+            .iter()
+            .filter(|e| e.enabled())
+            .map(|e| e.latency_samples(sample_rate))
+            .sum()
     }
 
     #[must_use]
@@ -326,5 +348,51 @@ mod tests {
         });
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.kind_at(0), Some(EffectKind::Echo));
+    }
+
+    fn spec(kind: EffectKind, enabled: bool) -> EffectSpec {
+        EffectSpec {
+            kind,
+            enabled,
+            params: HashMap::new(),
+        }
+    }
+
+    // Phase 14: the chain's added latency is the sum of enabled effects'
+    // fixed delays — pitch/formant STFT window (1024), denoiser frame
+    // (480 @ 48 kHz), voice-convert chunk (only with a model loaded).
+    #[test]
+    fn empty_chain_has_zero_latency() {
+        assert_eq!(EffectChain::new().latency_samples(48_000), 0);
+    }
+
+    #[test]
+    fn chain_latency_sums_enabled_effects() {
+        let chain = EffectChain::from_specs(&[
+            spec(EffectKind::Denoiser, true), // 480 @ 48k
+            spec(EffectKind::Pitch, true),    // 1024 (STFT window)
+            spec(EffectKind::Gate, true),     // 0 (sample-by-sample)
+        ]);
+        assert_eq!(chain.latency_samples(48_000), 480 + 1024);
+    }
+
+    #[test]
+    fn disabled_effects_add_no_latency() {
+        let chain = EffectChain::from_specs(&[spec(EffectKind::Pitch, false)]);
+        assert_eq!(chain.latency_samples(48_000), 0);
+    }
+
+    #[test]
+    fn denoiser_latency_only_applies_at_48k() {
+        let chain = EffectChain::from_specs(&[spec(EffectKind::Denoiser, true)]);
+        assert_eq!(chain.latency_samples(48_000), 480);
+        assert_eq!(chain.latency_samples(44_100), 0);
+    }
+
+    #[test]
+    fn voice_convert_adds_no_latency_without_a_model() {
+        // Passthrough (no model loaded) → no buffering delay.
+        let chain = EffectChain::from_specs(&[spec(EffectKind::VoiceConvert, true)]);
+        assert_eq!(chain.latency_samples(48_000), 0);
     }
 }
