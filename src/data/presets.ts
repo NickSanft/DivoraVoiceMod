@@ -72,6 +72,20 @@ export const FALLBACK_PRESETS: Preset[] = [
     ],
   },
   {
+    id: "the-oracle",
+    name: "The Oracle",
+    color: "#7C83F2",
+    glyph: "eye",
+    tag: "Bundled",
+    desc: "Calm, resonant, and certain — the voice that already knows.",
+    chain: [
+      fx("gate", true, { thresh: -52 }),
+      fx("formant", true, { shift: 2 }),
+      fx("eq", true, { low: -1, mid: 3, high: 2 }),
+      fx("reverb", true, { size: 55, mix: 30 }),
+    ],
+  },
+  {
     id: "clean",
     name: "Clean Passthrough",
     color: "#6E6590",
@@ -79,6 +93,23 @@ export const FALLBACK_PRESETS: Preset[] = [
     tag: "Bundled",
     desc: "Your true voice. No effects, gate only.",
     chain: [fx("gate", true, { thresh: -56 })],
+  },
+  {
+    id: "deep-narrator-ai",
+    name: "Deep Narrator",
+    color: "#34D9A0",
+    glyph: "wave",
+    tag: "Bundled",
+    desc: "Deep, warm, close-mic narrator — pitch + formant lower the voice into the chest, an EQ shelf adds body and tames sibilance, and a touch of room gives gravitas. Drop an ONNX model in Settings → Voice library to layer AI voice conversion on top.",
+    chain: [
+      fx("gate", true, { thresh: -50 }),
+      fx("denoiser", true, { mix: 60 }),
+      fx("voice_convert", true, { mix: 90 }),
+      fx("pitch", true, { shift: -4 }),
+      fx("formant", true, { shift: -3 }),
+      fx("eq", true, { low: 5, mid: 1, high: -2 }),
+      fx("reverb", true, { size: 38, mix: 14 }),
+    ],
   },
 ];
 

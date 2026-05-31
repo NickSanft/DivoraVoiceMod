@@ -17,7 +17,7 @@ export type EffectId =
    *  voice is selected or the model file is missing. */
   | "voice_convert";
 
-export type NavId = "mixer" | "soundboard" | "presets" | "settings";
+export type NavId = "mixer" | "coven" | "soundboard" | "presets" | "settings";
 
 export type VoiceStatus = "clean" | "modulated" | "muted";
 

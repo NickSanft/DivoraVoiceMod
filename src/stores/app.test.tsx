@@ -457,6 +457,23 @@ describe("app store — Phase 4 preset actions", () => {
     expect(result.ui.ab).toBe("A");
   });
 
+  // ---- The Coven (v1.1.0) ----------------------------------------------
+
+  it("summon applies a DSP cast member's preset and clears any active model", () => {
+    const { result } = setupApp();
+    result.setActiveVoice("some-model"); // pretend a model was selected
+    result.summon("velvet-demon"); // DSP character → no model
+    expect(result.presetId()).toBe("velvet-demon");
+    expect(result.activeVoiceId()).toBeNull();
+  });
+
+  it("summon applies the narrator preset and loads its conversion model", () => {
+    const { result } = setupApp();
+    result.summon("deep-narrator-ai", "llvc-narrator");
+    expect(result.presetId()).toBe("deep-narrator-ai");
+    expect(result.activeVoiceId()).toBe("llvc-narrator");
+  });
+
   it("setAbSlot snapshots the current chain into the old slot and swaps", () => {
     const { result } = setupApp();
     const idx = result.chain().findIndex((c) => c.id === "gate");

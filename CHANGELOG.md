@@ -4,6 +4,36 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-05-31 — The Coven (voice cast)
+
+A curated cast of character voices, browsable in one place and summoned with a click.
+
+### Added
+
+- **The Coven** — a new **Coven** screen (sidebar, second slot) presenting Divora's character voices as a gallery. Each card shows the character's sigil (in its color), name, a **DSP** / **AI Voice** badge, and a lore blurb; **Summon** applies that voice live and highlights the active member. For the AI narrator, Summon also loads its conversion model — and when the model isn't installed, it falls back to the deep DSP voice with a clear hint (never hangs).
+- **The Oracle** — a new fifth DSP character: calm, resonant, natural-pitch. The cast is now Velvet Demon · Hollow King · Choir of Ash · Static Wraith · The Oracle, plus the LLVC **Deep Narrator** (AI).
+- A `summon(presetId, modelId?)` store action that applies a cast member's chain and sets (or clears) its conversion model in one step.
+
+### Notes
+
+- The cast curation lives in the frontend (`src/data/coven.ts`) as a thin layer over the existing bundled presets — **no new backend command and no preset-schema change**, so it stays entirely within the v1.0 frozen surface. The `kind: "dsp" | "model"` + `modelId` seam is in place so realistic, model-backed voices (the v1.3 zero-shot work) drop in as new entries.
+- Per-character ear-tuning and a `chorus`/doubler effect for a lusher Choir of Ash are deferred to a v1.1.x refinement pass (the recipes already work; tuning is best done by ear).
+- Roadmap reordered: **v1.1 Coven → v1.2 streaming LLVC → v1.3 zero-shot + personal voice**.
+
+### Tests
+
+- **Rust**: divora-core 132 → 133 (+1: locks The Oracle's calm/resonant character).
+- **Frontend**: 242 → 249 (+7: cast-data integrity ×5, `summon` behavior ×2).
+
+### Pre-push checklist (local, 2026-05-31)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (140 across crates, +1 ignored LLVC)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (249)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.0.0] — 2026-05-31 — Stable release
 
 First stable release. No new features over 0.16.1 — this is the **surface cut**: the Tauri command + preset-JSON contract documented in [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md) is now frozen and **additive-only** across the 1.x line (guarded by serialization tests in CI), and the manual test pass ([docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)) is complete.

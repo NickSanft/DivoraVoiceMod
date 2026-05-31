@@ -19,6 +19,7 @@ import { Wizard } from "./components/Wizard";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
 import { MixerScreen } from "./screens/MixerScreen";
+import { CovenScreen } from "./screens/CovenScreen";
 import { SoundboardScreen } from "./screens/SoundboardScreen";
 import { PresetsScreen } from "./screens/PresetsScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
@@ -286,6 +287,9 @@ function Shell(): JSX.Element {
           <Switch>
             <Match when={app.nav() === "mixer"}>
               <MixerScreen />
+            </Match>
+            <Match when={app.nav() === "coven"}>
+              <CovenScreen />
             </Match>
             <Match when={app.nav() === "soundboard"}>
               <SoundboardScreen />

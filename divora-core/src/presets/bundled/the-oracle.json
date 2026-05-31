@@ -1,0 +1,15 @@
+{
+  "id": "the-oracle",
+  "version": 1,
+  "name": "The Oracle",
+  "color": "#7C83F2",
+  "glyph": "eye",
+  "tag": "Bundled",
+  "desc": "Calm, resonant, and certain — the voice that already knows.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -52 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 2 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -1, "mid": 3, "high": 2 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 55, "mix": 30 } }
+  ]
+}

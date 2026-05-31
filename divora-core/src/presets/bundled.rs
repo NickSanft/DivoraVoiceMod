@@ -27,6 +27,10 @@ const BUNDLED: &[BundledSource] = &[
         json: include_str!("bundled/choir-of-ash.json"),
     },
     BundledSource {
+        id: "the-oracle",
+        json: include_str!("bundled/the-oracle.json"),
+    },
+    BundledSource {
         id: "clean",
         json: include_str!("bundled/clean.json"),
     },
@@ -88,6 +92,36 @@ mod tests {
         assert_eq!(hk.name, "Hollow King");
         assert_eq!(hk.chain.len(), 5);
         assert_eq!(hk.chain[0].id, "gate");
+    }
+
+    // v1.1.0 (The Coven): the Oracle is the calm/resonant cast member —
+    // natural pitch (no shift, unlike the rest of the cast), a resonant
+    // mid bump, and spacious reverb. Lock that character in.
+    #[test]
+    fn the_oracle_is_calm_and_resonant() {
+        let presets = bundled_presets();
+        let o = presets
+            .iter()
+            .find(|p| p.id == "the-oracle")
+            .expect("the-oracle must be bundled");
+        assert_eq!(o.name, "The Oracle");
+        assert!(
+            o.chain.iter().all(|e| e.id != "pitch"),
+            "Oracle keeps natural pitch (no pitch effect)"
+        );
+        assert!(
+            o.chain.iter().any(|e| e.id == "reverb" && e.enabled),
+            "Oracle is spacious (reverb enabled)"
+        );
+        let eq = o
+            .chain
+            .iter()
+            .find(|e| e.id == "eq")
+            .expect("Oracle shapes tone with EQ");
+        assert!(
+            eq.vals.get("mid").copied().unwrap_or(0.0) > 0.0,
+            "Oracle has a resonant mid bump"
+        );
     }
 
     // v0.12.2: the Deep Narrator preset must actually *sound* deep via

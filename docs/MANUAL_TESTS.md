@@ -55,7 +55,7 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## Presets (Phase 4)
 
-- [ ] Default preset list loads on first run — 5 bundled presets visible in the left list under "Bundled · 5", "User · 0".
+- [ ] Default preset list loads on first run — the bundled presets visible in the left list under "Bundled · N", "User · 0" (N = the bundled count, currently 7 incl. the cast + Clean Passthrough + Deep Narrator).
 - [ ] Clicking a different preset in the list immediately switches the active preset (left dot moves; Mixer header updates).
 - [ ] Switching between presets is glitch-free (no clicks, no momentary silence — DSP graph swap on next buffer).
 - [ ] Right editor shows the active preset's header (glyph chip, name, Bundled/User badge, "In use" badge, description) and chain cards.
@@ -357,6 +357,18 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Stop the engine while recording → the in-progress file is finalized and is playable (not truncated/corrupt); the Record indicator clears.
 - [ ] Start a second recording → it writes a new timestamped file without disturbing the first.
 - [ ] Shout into the mic (clip the input) → the recorded file saturates cleanly (no wrap-around static).
+
+## The Coven — voice cast (v1.1.0)
+
+- [ ] The sidebar shows a **Coven** nav item (second, after Mixer). Click it → a gallery of character cards appears.
+- [ ] Six cards are present: **Velvet Demon · Hollow King · Choir of Ash · Static Wraith · The Oracle · Deep Narrator**, each with its sigil (in its color), name, a DSP / AI Voice badge, and a lore blurb.
+- [ ] Start the engine on the Mixer, return to the Coven, click **Summon** on *Velvet Demon* → your voice instantly takes on the demon character; the card shows an "Active" badge + colored glow, and the button reads "Summoned".
+- [ ] Summon a different member → the active highlight moves; the new character applies live.
+- [ ] The Mixer header reflects the summoned preset (name + active rune count) — Coven and Mixer stay in sync.
+- [ ] **Deep Narrator** card: with the AI model installed, Summon converts via the model; **without** the model, the card shows "AI model not installed — Summon uses the DSP voice," and Summon still applies the deep DSP character (no hang).
+- [ ] Summon a DSP character after the narrator → the AI model is cleared (Settings → Voice library shows no active voice); summon the narrator again → the model reloads.
+- [ ] Summon works while the engine is **stopped** too — it sets the active voice; starting the engine then applies it.
+- [ ] **The Oracle** sounds calm/resonant at natural pitch (distinct from the pitched characters).
 
 ## Stress
 

@@ -301,6 +301,8 @@ export interface AppState {
 
   // Preset actions
   usePreset: (id: string) => void;
+  /** The Coven: apply a cast member's preset + (un)set its conversion model. */
+  summon: (presetId: string, modelId?: string | null) => void;
   savePreset: (preset: Preset) => Promise<void>;
   duplicatePreset: (sourceId: string) => Promise<Preset | null>;
   deletePreset: (id: string) => Promise<void>;
@@ -808,6 +810,15 @@ export function createAppState(): AppState {
     if (engineRunning()) {
       void setEffectChainCmd(chainToSpecs(c));
     }
+  };
+
+  // The Coven (v1.1.0): summon a cast member — apply its preset chain and
+  // set the conversion model (model-backed members like the narrator) or
+  // clear it (DSP characters). Ordering matters: `usePreset` switches the
+  // chain first so `setActiveVoice` finds the live `voice_convert` slot.
+  const summon = (presetId: string, modelId: string | null = null): void => {
+    usePreset(presetId);
+    setActiveVoice(modelId);
   };
 
   const presetToWire = (p: Preset): WirePreset => ({
@@ -1333,6 +1344,7 @@ export function createAppState(): AppState {
     refreshVoiceLibrary,
 
     usePreset,
+    summon,
     savePreset,
     duplicatePreset,
     deletePreset,
