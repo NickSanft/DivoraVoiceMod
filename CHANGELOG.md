@@ -4,9 +4,24 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
-### Planned — 1.0.0 (stable surface cut)
+## [1.0.0] — 2026-05-31 — Stable release
 
-No new features. Freeze the Tauri command + preset-JSON surface for back-compat (documented in [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)), complete the full manual test pass ([docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)), and ship. Cut after a quiet 0.16.x soak; everything in §STABLE-SURFACE then becomes additive-only for the 1.x line.
+First stable release. No new features over 0.16.1 — this is the **surface cut**: the Tauri command + preset-JSON contract documented in [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md) is now frozen and **additive-only** across the 1.x line (guarded by serialization tests in CI), and the manual test pass ([docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)) is complete.
+
+### What's in 1.0
+
+- **Real-time voice modulation** — eight DSP effects (gate, denoiser, pitch, formant, EQ, robot, distortion, echo, reverb) in a live, reorderable chain with per-effect parameters, plus a live "added latency" readout.
+- **AI voice conversion** — an ONNX-Runtime `VoiceConvert` effect with a bundled LLVC narrator voice and bring-your-own `.onnx` model support; degrades to passthrough (never hangs) when no model or runtime is present.
+- **Monitor output routing** — an independent second output so the main send can go to VB-Cable (→ Discord / games) while you still hear yourself on headphones.
+- **Soundboard** — folder-based clips with per-tile + master volume, drag-reorder, per-tile colors, recent folders, and system-wide hotkeys that fire even while unfocused.
+- **Recording** — one-click capture of the modulated output to a timestamped WAV.
+- **Presets** — five bundled + unlimited user presets, A/B compare, JSON export/import, and glyph-cast switching.
+- **System tray** — minimize to tray so audio keeps running in the background during calls/games.
+- **Local-first** — no telemetry, no account, no cloud. Windows + VB-Cable.
+
+### Stability guarantee
+
+From 1.0 on, the contracts in [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md) — commands, events, wire-type shapes, the preset JSON schema, `localStorage` keys, and the on-disk layout — change in an additive-only way. Presets saved or exported under 1.0 keep loading across the 1.x line.
 
 ## [0.16.1] — 2026-05-31 — v1.0 prep: surface freeze + audit
 
