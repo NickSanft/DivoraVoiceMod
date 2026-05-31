@@ -25,6 +25,8 @@ export interface Levels {
 export interface StreamInfo {
   inputName: string;
   outputName: string;
+  /** Phase 13: separate monitor ("hear yourself") device, if active. */
+  monitorName: string | null;
   sampleRate: number;
   inputChannels: number;
   outputChannels: number;
@@ -57,10 +59,12 @@ export async function listOutputDevices(): Promise<DeviceInfo[]> {
 export async function startAudioEngine(
   inputName: string | null = null,
   outputName: string | null = null,
+  monitorName: string | null = null,
 ): Promise<StreamInfo> {
   return invoke<StreamInfo>("start_audio_engine", {
     inputName,
     outputName,
+    monitorName,
   });
 }
 

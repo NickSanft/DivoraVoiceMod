@@ -123,10 +123,15 @@ fn start_audio_engine(
     state: State<'_, AppState>,
     input_name: Option<String>,
     output_name: Option<String>,
+    monitor_name: Option<String>,
 ) -> Result<StreamInfo, String> {
     state
         .engine
-        .start(input_name.as_deref(), output_name.as_deref())
+        .start(
+            input_name.as_deref(),
+            output_name.as_deref(),
+            monitor_name.as_deref(),
+        )
         .map_err(|e| e.to_string())
 }
 

@@ -67,10 +67,11 @@ describe("audio api", () => {
       inputChannels: 1,
       outputChannels: 2,
     });
-    await startAudioEngine("Mic 1", "Headphones");
+    await startAudioEngine("Mic 1", "Headphones", "Speakers");
     expect(invokeMock).toHaveBeenCalledWith("start_audio_engine", {
       inputName: "Mic 1",
       outputName: "Headphones",
+      monitorName: "Speakers",
     });
   });
 
@@ -86,6 +87,7 @@ describe("audio api", () => {
     expect(invokeMock).toHaveBeenCalledWith("start_audio_engine", {
       inputName: null,
       outputName: null,
+      monitorName: null,
     });
   });
 

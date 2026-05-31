@@ -95,6 +95,12 @@ export function SettingsScreen(): JSX.Element {
       }`,
     })),
   );
+  // Phase 13: monitor picker = "None" + every output device. "None"
+  // (value "") means monitoring rides the main output (legacy behavior).
+  const monitorOptions = createMemo<SelectOption[]>(() => [
+    { value: "", label: "None — use main output", sub: "no separate monitor" },
+    ...outputOptions(),
+  ]);
 
   const startStop = () => {
     if (app.engineRunning()) {
@@ -132,6 +138,7 @@ export function SettingsScreen(): JSX.Element {
       <AudioDevicesSection
         inputOptions={inputOptions()}
         outputOptions={outputOptions()}
+        monitorOptions={monitorOptions()}
         startStop={startStop}
       />
 
@@ -155,6 +162,7 @@ export function SettingsScreen(): JSX.Element {
 interface AudioDevicesProps {
   inputOptions: SelectOption[];
   outputOptions: SelectOption[];
+  monitorOptions: SelectOption[];
   startStop: () => void;
 }
 
@@ -271,6 +279,29 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
               onChange={(v) => app.setSelectedOutput(v)}
             />
           </Show>
+        </FieldRow>
+
+        <FieldRow label="Monitor output (hear yourself)">
+          <Select
+            icon="monitor"
+            value={app.selectedMonitor() ?? ""}
+            options={props.monitorOptions}
+            onChange={(v) => app.setSelectedMonitor(v === "" ? null : v)}
+          />
+          <div
+            style={{
+              "font-size": "var(--t-xs)",
+              color: "var(--text-lo)",
+              "margin-top": "6px",
+              "line-height": 1.5,
+            }}
+          >
+            Pick a second device (e.g. your headphones) to hear yourself
+            while the main output routes elsewhere — set Output to CABLE
+            Input for Discord/games and Monitor to your headphones. The
+            Monitor toggle below mutes only this device, never the main
+            send. Soundboard clips play here too.
+          </div>
         </FieldRow>
 
         <div

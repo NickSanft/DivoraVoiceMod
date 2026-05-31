@@ -235,6 +235,83 @@ describe("app store — Phase 2 audio actions", () => {
     );
   });
 
+  it("startEngine passes the selected monitor device (Phase 13)", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_audio_engine") {
+        const a = args as {
+          inputName: string | null;
+          outputName: string | null;
+          monitorName: string | null;
+        };
+        return {
+          inputName: a.inputName ?? "?",
+          outputName: a.outputName ?? "?",
+          monitorName: a.monitorName,
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    result.setSelectedOutput("CABLE Input (VB-Audio Virtual Cable)");
+    result.setSelectedMonitor("Headphones");
+    await result.startEngine();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.objectContaining({
+        outputName: "CABLE Input (VB-Audio Virtual Cable)",
+        monitorName: "Headphones",
+      }),
+    );
+  });
+
+  it("changing selectedMonitor while running restarts the engine (Phase 13)", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_audio_engine") {
+        const a = args as { monitorName: string | null };
+        return {
+          inputName: "Mic A",
+          outputName: "CABLE",
+          monitorName: a.monitorName,
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    result.setSelectedOutput("CABLE");
+    // Reset to a known baseline first — localStorage persists across
+    // tests in this file, so a prior test may have left a monitor set.
+    result.setSelectedMonitor(null);
+    await result.startEngine();
+    invokeMock.mockClear();
+    result.setSelectedMonitor("Headphones");
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.objectContaining({ monitorName: "Headphones" }),
+    );
+  });
+
+  it("setSelectedMonitor persists to localStorage (Phase 13)", () => {
+    const { result } = setupApp();
+    result.setSelectedMonitor("Headphones");
+    expect(window.localStorage.getItem("divora.monitorDevice")).toContain(
+      "Headphones",
+    );
+    // Clearing back to null persists null (no separate monitor).
+    result.setSelectedMonitor(null);
+    expect(window.localStorage.getItem("divora.monitorDevice")).toBe("null");
+  });
+
   it("device-change effect is a no-op when the engine is stopped", async () => {
     invokeMock.mockImplementation(async () => null);
     const { result } = setupApp();

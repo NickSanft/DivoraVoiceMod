@@ -42,6 +42,9 @@ const MAX_FRAMES_PER_CALLBACK: usize = 4096;
 pub struct StreamInfo {
     pub input_name: String,
     pub output_name: String,
+    /// Phase 13: separate monitor ("hear yourself") output device, if
+    /// one is active. `None` when monitoring rides the main output.
+    pub monitor_name: Option<String>,
     pub sample_rate: u32,
     pub input_channels: u16,
     pub output_channels: u16,
@@ -51,6 +54,7 @@ enum Command {
     Start {
         input_name: Option<String>,
         output_name: Option<String>,
+        monitor_name: Option<String>,
         reply: Sender<Result<StreamInfo, AudioEngineError>>,
     },
     Stop,
@@ -96,12 +100,14 @@ impl AudioEngine {
         &self,
         input_name: Option<&str>,
         output_name: Option<&str>,
+        monitor_name: Option<&str>,
     ) -> Result<StreamInfo, AudioEngineError> {
         let (reply_tx, reply_rx) = channel();
         self.tx
             .send(Command::Start {
                 input_name: input_name.map(str::to_owned),
                 output_name: output_name.map(str::to_owned),
+                monitor_name: monitor_name.map(str::to_owned),
                 reply: reply_tx,
             })
             .map_err(|_| AudioEngineError::ThreadGone)?;
@@ -171,6 +177,8 @@ impl Drop for AudioEngine {
 struct RunningStreams {
     _input: Stream,
     _output: Stream,
+    /// Phase 13: optional second output to a separate monitor device.
+    _monitor: Option<Stream>,
 }
 
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
@@ -183,6 +191,7 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             Command::Start {
                 input_name,
                 output_name,
+                monitor_name,
                 reply,
             } => {
                 // Drop any existing streams before building new ones.
@@ -191,8 +200,12 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                 drop(sb_tx.take());
                 state.running.store(false, Ordering::Release);
 
-                let result =
-                    start_streams(input_name.as_deref(), output_name.as_deref(), state.clone());
+                let result = start_streams(
+                    input_name.as_deref(),
+                    output_name.as_deref(),
+                    monitor_name.as_deref(),
+                    state.clone(),
+                );
                 current = match result {
                     Ok((streams, info, new_dsp_tx, new_sb_tx)) => {
                         state.running.store(true, Ordering::Release);
@@ -281,9 +294,11 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
 
 #[allow(clippy::needless_pass_by_value)] // state is cloned into both stream closures
 #[allow(clippy::type_complexity)] // four-tuple is clearer than a struct here
+#[allow(clippy::too_many_lines)] // linear device/stream setup; splitting hurts readability
 fn start_streams(
     input_name: Option<&str>,
     output_name: Option<&str>,
+    monitor_name: Option<&str>,
     state: Arc<EngineState>,
 ) -> Result<
     (
@@ -299,6 +314,21 @@ fn start_streams(
 
     let input_name_str = input_device.name().unwrap_or_default();
     let output_name_str = output_device.name().unwrap_or_default();
+
+    // Phase 13: resolve the optional monitor device. Skip it when it's
+    // unset or names the same device as the main output (there's nothing
+    // to gain from a second stream on the same device — the main output
+    // already plays it).
+    let monitor_device = match monitor_name {
+        Some(n) if !n.is_empty() && n != output_name_str => {
+            Some(find_device(Direction::Output, Some(n))?)
+        }
+        _ => None,
+    };
+    let monitor_name_str = monitor_device
+        .as_ref()
+        .map(|d| d.name().unwrap_or_default());
+    let has_monitor = monitor_device.is_some();
 
     let input_default = input_device
         .default_input_config()
@@ -325,6 +355,18 @@ fn start_streams(
     let rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
     let (producer, consumer) = rb.split();
 
+    // Monitor tap ring: the main output callback pushes the processed,
+    // input-rate mono (voice + soundboard, post-DSP) into it; the
+    // monitor stream resamples that to its own device rate. Only created
+    // when a separate monitor device is active.
+    let (monitor_producer, monitor_consumer) = if has_monitor {
+        let mrb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
+        let (mp, mc) = mrb.split();
+        (Some(mp), Some(mc))
+    } else {
+        (None, None)
+    };
+
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
     let (sb_tx, sb_rx) = channel::<SoundboardCommand>();
 
@@ -347,7 +389,37 @@ fn start_streams(
         sb_rx,
         input_rate,
         output_rate,
+        monitor_producer,
+        has_monitor,
     )?;
+
+    // Build the monitor stream last so the tap producer is already wired
+    // into the main output above.
+    let monitor_stream = if let (Some(md), Some(mc)) = (monitor_device, monitor_consumer) {
+        let m_default = md
+            .default_output_config()
+            .map_err(|e| AudioEngineError::DefaultConfig(e.to_string()))?;
+        let m_rate = m_default.sample_rate().0;
+        let m_channels = m_default.channels();
+        let m_format = m_default.sample_format();
+        let m_config: StreamConfig = m_default.into();
+        let stream = build_monitor_stream(
+            &md,
+            &m_config,
+            m_format,
+            m_channels,
+            mc,
+            state.clone(),
+            input_rate,
+            m_rate,
+        )?;
+        stream
+            .play()
+            .map_err(|e| AudioEngineError::StreamPlay(e.to_string()))?;
+        Some(stream)
+    } else {
+        None
+    };
 
     input_stream
         .play()
@@ -359,6 +431,7 @@ fn start_streams(
     let info = StreamInfo {
         input_name: input_name_str,
         output_name: output_name_str,
+        monitor_name: monitor_name_str,
         sample_rate: input_rate,
         input_channels,
         output_channels,
@@ -367,6 +440,7 @@ fn start_streams(
         RunningStreams {
             _input: input_stream,
             _output: output_stream,
+            _monitor: monitor_stream,
         },
         info,
         dsp_tx,
@@ -441,6 +515,7 @@ fn build_input_stream(
 }
 
 #[allow(clippy::too_many_arguments)] // builder-style; each arg is necessary
+#[allow(clippy::too_many_lines)] // single realtime callback; clearer inline
 fn build_output_stream(
     device: &Device,
     config: &StreamConfig,
@@ -452,6 +527,13 @@ fn build_output_stream(
     sb_rx: Receiver<SoundboardCommand>,
     input_rate: u32,
     output_rate: u32,
+    // Phase 13: when a separate monitor device is active, the processed
+    // input-rate mono is tapped into this ring for the monitor stream,
+    // and the main output plays unconditionally (it's the send to e.g.
+    // VB-Cable). `has_monitor` therefore both selects that gating and
+    // signals the tap is wired.
+    mut monitor_producer: Option<RingProducer>,
+    has_monitor: bool,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -545,6 +627,16 @@ fn build_output_stream(
                     input_rate,
                 );
 
+                // Phase 13: tap the processed, input-rate mono into the
+                // monitor ring (if a monitor device is active) BEFORE
+                // this device's own resample. The monitor stream then
+                // resamples it to the headphone device's rate. Dropping
+                // samples on a full ring is fine — the monitor just
+                // underruns to silence momentarily.
+                if let Some(mp) = monitor_producer.as_mut() {
+                    let _ = mp.push_slice(&mono[..native_frames]);
+                }
+
                 // Now hand the native-rate buffer to the output
                 // pipeline. Either a passthrough (rates match) or via
                 // the resampler.
@@ -558,8 +650,17 @@ fn build_output_stream(
                     n
                 };
 
+                // Phase 13 gating: when a separate monitor device is
+                // active, the main output is the *send* (e.g. to
+                // VB-Cable) and plays unconditionally so the far end
+                // always hears the voice — the monitor toggle then only
+                // governs the headphone (monitor) stream. With no
+                // separate monitor device, the toggle gates this output
+                // directly, exactly as before.
+                let play = main_output_plays(has_monitor, monitoring);
+
                 // Fan out mono -> all output channels, or silence if not
-                // monitoring.
+                // playing.
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
                     if i >= written_out {
                         for s in frame {
@@ -567,14 +668,14 @@ fn build_output_stream(
                         }
                         continue;
                     }
-                    let sample = if monitoring { output_mono[i] } else { 0.0 };
+                    let sample = if play { output_mono[i] } else { 0.0 };
                     for s in frame {
                         *s = sample;
                     }
                 }
                 // Meter reflects what we actually sent to the device.
                 let metered = &output_mono[..written_out];
-                if monitoring {
+                if play {
                     meter.process(metered);
                 } else {
                     meter.process(&[]);
@@ -590,6 +691,114 @@ fn build_output_stream(
         .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
 
     Ok(stream)
+}
+
+/// Phase 13: the monitor ("hear yourself") output stream. Unlike the
+/// main output, it does NO DSP or soundboard work — it only drains the
+/// monitor tap ring (already-processed, input-rate mono fed by the main
+/// output callback), resamples it to this device's rate, and fans it
+/// out. Gated by the monitor atomic, so the toggle mutes only the
+/// headphones, never the main send.
+#[allow(clippy::too_many_arguments)] // builder-style; each arg is necessary
+fn build_monitor_stream(
+    device: &Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    channels: u16,
+    mut consumer: RingConsumer,
+    state: Arc<EngineState>,
+    input_rate: u32,
+    monitor_rate: u32,
+) -> Result<Stream, AudioEngineError> {
+    let device_name = device.name().unwrap_or_default();
+    if sample_format != SampleFormat::F32 {
+        return Err(AudioEngineError::UnsupportedSampleFormat {
+            device: device_name,
+            format: format!("{sample_format:?}"),
+        });
+    }
+    let err_label = device_name;
+    let err_fn = move |err: cpal::StreamError| {
+        tracing::error!(?err, device = %err_label, "monitor stream error");
+    };
+
+    let channels = channels as usize;
+    let mut resampler: Option<MonoResampler> = if input_rate == monitor_rate {
+        None
+    } else {
+        Some(MonoResampler::new(input_rate, monitor_rate, 256)?)
+    };
+
+    let stream = device
+        .build_output_stream(
+            config,
+            move |data: &mut [f32], _info| {
+                if data.is_empty() || channels == 0 {
+                    return;
+                }
+                let monitoring = state.monitor.load(Ordering::Acquire);
+                let out_frames = (data.len() / channels).min(MAX_FRAMES_PER_CALLBACK);
+
+                // Match the main output's native-frame sizing so the
+                // resampler is fed a consistent amount per round.
+                let native_frames = if let Some(r) = resampler.as_ref() {
+                    let scaled = u64::try_from(out_frames)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::from(input_rate))
+                        / u64::from(monitor_rate).max(1);
+                    let approx = usize::try_from(scaled).unwrap_or(MAX_FRAMES_PER_CALLBACK)
+                        + r.input_frames_next();
+                    approx.min(MAX_FRAMES_PER_CALLBACK)
+                } else {
+                    out_frames
+                };
+
+                let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
+                let popped = consumer.pop_slice(&mut mono[..native_frames]);
+                for slot in &mut mono[popped..native_frames] {
+                    *slot = 0.0;
+                }
+
+                let mut output_mono = [0f32; MAX_FRAMES_PER_CALLBACK];
+                let written_out = if let Some(r) = resampler.as_mut() {
+                    r.push_input(&mono[..native_frames]);
+                    r.process(&mut output_mono[..out_frames])
+                } else {
+                    let n = native_frames.min(out_frames);
+                    output_mono[..n].copy_from_slice(&mono[..n]);
+                    n
+                };
+
+                for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
+                    let sample = if i < written_out && monitoring {
+                        output_mono[i]
+                    } else {
+                        0.0
+                    };
+                    for s in frame {
+                        *s = sample;
+                    }
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
+
+    Ok(stream)
+}
+
+/// Whether the MAIN output device should emit audio this callback.
+///
+/// Phase 13 semantics: with a separate monitor device active
+/// (`has_monitor`), the main output is the *send* (e.g. to VB-Cable)
+/// and always plays so the far end keeps hearing the voice — the
+/// monitor toggle only governs the headphone stream. With no separate
+/// monitor device, the toggle gates this output directly (legacy
+/// behavior). Extracted so the truth table is unit-tested.
+#[must_use]
+fn main_output_plays(has_monitor: bool, monitoring: bool) -> bool {
+    has_monitor || monitoring
 }
 
 /// Run the DSP chain on the mic mono buffer, then mix soundboard
@@ -611,10 +820,24 @@ fn mix_voice_and_soundboard(
 
 #[cfg(test)]
 mod tests {
-    use super::{mix_voice_and_soundboard, AudioEngine};
+    use super::{main_output_plays, mix_voice_and_soundboard, AudioEngine};
     use crate::dsp::EffectChain;
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
     use std::sync::Arc;
+
+    /// Phase 13 gating truth table: the main output (the "send") always
+    /// plays when a separate monitor device exists, so routing to
+    /// VB-Cable keeps reaching Discord regardless of the monitor toggle;
+    /// with no monitor device the toggle gates the output (legacy).
+    #[test]
+    fn main_output_gating_truth_table() {
+        // No separate monitor → toggle gates the output (legacy).
+        assert!(!main_output_plays(false, false));
+        assert!(main_output_plays(false, true));
+        // Separate monitor → main output is the send, always plays.
+        assert!(main_output_plays(true, false));
+        assert!(main_output_plays(true, true));
+    }
 
     #[test]
     fn engine_starts_and_stops_cleanly_even_without_audio_hardware() {

@@ -131,6 +131,7 @@ const STORAGE_KEYS = {
   recentFolders: "divora.recentFolders",
   tweaks: "divora.tweaks",
   activeVoice: "divora.activeVoice",
+  monitorDevice: "divora.monitorDevice",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -242,6 +243,9 @@ export interface AppState {
   setSelectedInput: Setter<string | null>;
   selectedOutput: () => string | null;
   setSelectedOutput: Setter<string | null>;
+  /** Phase 13: separate monitor output device (null = none). */
+  selectedMonitor: () => string | null;
+  setSelectedMonitor: (name: string | null) => void;
   engineRunning: () => boolean;
   setEngineRunning: Setter<boolean>;
   engineMonitoring: () => boolean;
@@ -399,6 +403,18 @@ export function createAppState(): AppState {
   const [audioOutputs, setAudioOutputs] = createSignal<DeviceInfo[]>([]);
   const [selectedInput, setSelectedInput] = createSignal<string | null>(null);
   const [selectedOutput, setSelectedOutput] = createSignal<string | null>(null);
+  // Phase 13: optional separate monitor ("hear yourself") output device.
+  // null = no separate monitor (monitoring rides the main output, as
+  // before). Persisted because it's an explicit opt-in the user
+  // shouldn't have to re-pick each launch.
+  const [selectedMonitorRaw, setSelectedMonitorRaw] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.monitorDevice, null),
+  );
+  const selectedMonitor = selectedMonitorRaw;
+  const setSelectedMonitor = (name: string | null): void => {
+    setSelectedMonitorRaw(name);
+    saveJson(STORAGE_KEYS.monitorDevice, name);
+  };
   const [engineRunning, setEngineRunning] = createSignal(false);
   const [engineMonitoring, setEngineMonitoring] = createSignal(true);
   const [engineError, setEngineError] = createSignal<string | null>(null);
@@ -472,7 +488,11 @@ export function createAppState(): AppState {
 
   const startEngine = async (): Promise<void> => {
     try {
-      const info = await startAudioEngine(selectedInput(), selectedOutput());
+      const info = await startAudioEngine(
+        selectedInput(),
+        selectedOutput(),
+        selectedMonitor(),
+      );
       setStreamInfo(info);
       setEngineRunning(true);
       setEngineError(null);
@@ -509,11 +529,11 @@ export function createAppState(): AppState {
   // first call happens only when one of the signals actually changes.
   createEffect(
     on(
-      [selectedInput, selectedOutput],
-      ([newIn, newOut], prev) => {
+      [selectedInput, selectedOutput, selectedMonitor],
+      ([newIn, newOut, newMon], prev) => {
         if (prev === undefined) return; // initial run guard (belt + suspenders with defer)
-        const [prevIn, prevOut] = prev;
-        if (newIn === prevIn && newOut === prevOut) return;
+        const [prevIn, prevOut, prevMon] = prev;
+        if (newIn === prevIn && newOut === prevOut && newMon === prevMon) return;
         if (!engineRunning()) return;
         void (async () => {
           await stopEngine();
@@ -1166,6 +1186,8 @@ export function createAppState(): AppState {
     setSelectedInput,
     selectedOutput,
     setSelectedOutput,
+    selectedMonitor,
+    setSelectedMonitor,
     engineRunning,
     setEngineRunning,
     engineMonitoring,

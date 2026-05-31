@@ -4,6 +4,43 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-05-30 — Phase 13: monitor output routing (hear yourself + route to VB-Cable)
+
+Field report:
+
+> "When I change the current output to VB Cable I cannot hear it anymore. Can you add an option to choose a monitor output, and hear the soundboard on it too?"
+
+Exactly right: with one output stream, routing to VB-Cable sent the voice to Discord but left nothing playing to your ears. v0.13.0 adds a **second, independent output** so you can route the main output to VB-Cable *and* hear yourself (plus soundboard clips) on headphones.
+
+### Added
+
+- **Monitor output device** — Settings → Audio devices gains a "Monitor output (hear yourself)" picker (with a "None — use main output" default). Pick your headphones there, set the main Output to CABLE Input, and you hear your modulated voice while Discord/games receive it.
+- A **second cpal output stream** to the monitor device. The main output callback runs the DSP + soundboard mix once and **taps the processed audio into a monitor ring**; the monitor stream resamples that to its own device rate and plays it. So the soundboard is audible on the monitor for free (it's mixed in before the tap).
+
+### Changed
+
+- **Gating semantics** (`main_output_plays`): with a separate monitor device active, the **main output always plays** (it's the send to VB-Cable — Discord must keep hearing you), and the **Monitor toggle mutes only the headphone stream**. With no separate monitor device, the toggle gates the main output exactly as before — fully backward compatible.
+- The monitor device persists to `localStorage` (`divora.monitorDevice`) and is wired into the live device-switch effect, so changing it restarts the engine cleanly (like input/output).
+- `StreamInfo` gains `monitorName`; `start_audio_engine` + `AudioEngine::start` take a monitor device argument.
+
+### Tests
+
+- **Rust**: 119 → 120 (+1): `main_output_gating_truth_table` locks the four gating cases (no-monitor → toggle gates output; monitor → output always sends).
+- **Frontend**: 230 → 233 (+3): `startEngine` passes the monitor device; changing the monitor while running restarts the engine; `setSelectedMonitor` persists to `localStorage`. (Two `api.test` assertions updated for the new `monitorName` arg.)
+
+### Pre-push checklist (local, 2026-05-30)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (120, +1 ignored LLVC test)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (233)
+- `pnpm tauri build --debug --no-bundle` — pass
+
+### How to use it (for Discord/games)
+
+Settings → Audio devices: **Output** = `CABLE Input (VB-Audio Virtual Cable)`, **Monitor output** = your headphones. In Discord, set the mic to `CABLE Output`. You'll hear your modulated voice + soundboard on headphones; Discord hears it through the cable. The Monitor toggle mutes only your headphones.
+
 ## [0.12.5] — 2026-05-30 — Installers carry the real version number
 
 ### Fixed
