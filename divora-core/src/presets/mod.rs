@@ -75,3 +75,73 @@ impl Preset {
         matches!(self.tag, PresetTag::Bundled)
     }
 }
+
+#[cfg(test)]
+mod schema_freeze_tests {
+    //! v1.0 back-compat freeze. The preset JSON is persisted to disk and
+    //! shared between users via export, so its shape is a stable contract.
+    //! These tests lock the field names + tag casing; any post-v1.0
+    //! addition must be optional (`serde(default)`), never a rename or
+    //! removal. See `docs/STABLE-SURFACE.md`.
+
+    use super::{Preset, PresetChainEntry, PresetTag};
+    use std::collections::HashMap;
+
+    fn sorted_keys(v: &serde_json::Value) -> Vec<String> {
+        let mut k: Vec<String> = v
+            .as_object()
+            .expect("expected a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn preset_json_schema_is_frozen() {
+        let p = Preset {
+            id: "x".into(),
+            version: 1,
+            name: "X".into(),
+            color: "#fff".into(),
+            glyph: "eq".into(),
+            tag: PresetTag::User,
+            desc: "d".into(),
+            chain: vec![PresetChainEntry {
+                id: "gate".into(),
+                enabled: true,
+                vals: HashMap::from([("thresh".to_string(), -45.0)]),
+            }],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            sorted_keys(&v),
+            ["chain", "color", "desc", "glyph", "id", "name", "tag", "version"]
+        );
+        assert_eq!(sorted_keys(&v["chain"][0]), ["enabled", "id", "vals"]);
+        // Tag casing is part of the on-disk contract.
+        assert_eq!(v["tag"], serde_json::json!("User"));
+        assert_eq!(
+            serde_json::to_value(PresetTag::Bundled).unwrap(),
+            serde_json::json!("Bundled")
+        );
+    }
+
+    #[test]
+    fn preset_loads_legacy_json_and_ignores_unknown_fields() {
+        // A pre-`version` file with an unknown future field must still
+        // load: version defaults to 1, the extra field is ignored. This
+        // is the forward/back-compat guarantee we freeze at v1.0.
+        let legacy = r##"{
+            "id":"old","name":"Old","color":"#fff","glyph":"eq",
+            "tag":"User","desc":"",
+            "chain":[{"id":"gate","enabled":true,"vals":{}}],
+            "futureFieldAddedAfterV1": 123
+        }"##;
+        let p: Preset = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.version, 1);
+        assert_eq!(p.id, "old");
+        assert_eq!(p.chain.len(), 1);
+    }
+}

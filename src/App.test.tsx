@@ -9,8 +9,6 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
     invokeCalls.push({ cmd, args });
     switch (cmd) {
-      case "ping":
-        return "pong";
       case "list_audio_input_devices":
         return [];
       case "list_audio_output_devices":

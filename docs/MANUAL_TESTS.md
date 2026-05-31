@@ -2,6 +2,8 @@
 
 Run this checklist before tagging any release that touches audio capture, output routing, or virtual mic detection. CI cannot exercise these flows because they require real hardware and live calls.
 
+> **v1.0 release gate:** before cutting `v1.0.0`, the *entire* checklist must pass on a clean Windows machine — it's the manual test pass the roadmap calls for. The per-feature sections below cover Phases 2–16; the [STABLE-SURFACE.md](STABLE-SURFACE.md) contract is what we're committing to keep working across the 1.x line.
+
 ## Setup
 
 - [ ] Fresh install on a clean machine (or wipe `%APPDATA%\DivoraVoice\`).
@@ -261,7 +263,7 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## About (Phase 6)
 
-- [ ] Settings → About shows the DMark + "DivoraVoice v0.6.0" + "MIT License · Tauri + SolidJS".
+- [ ] Settings → About shows the DMark + "DivoraVoice v<current build version>" — the real version stamped into the build (e.g. `v1.0.0`), **not** a hardcoded string — + "MIT License · Tauri + SolidJS". In a `tauri dev` build it reads `v0.0.0`; that's expected.
 - [ ] Click View on GitHub → default browser opens https://github.com/NickSanft/DivoraVoiceMod.
 - [ ] Three pillar cards visible: No telemetry, No account, Free forever.
 - [ ] Click Replay setup → wizard ceremony re-opens.
@@ -304,6 +306,57 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Press G while typing in the Soundboard search box → does NOT open the overlay (text input takes precedence).
 - [ ] Trace a glyph that goes off-screen: classification still works (only the visible-ish portion is captured).
 - [ ] Cast back-to-back: each cast resets state cleanly; the overlay opens fresh every time.
+
+## AI voice conversion (Phase 12)
+
+- [ ] Settings → Voice library. With **no** `onnxruntime.dll` present and no model installed, the runtime status reads "not detected" and the voice list is empty — the app still runs (Voice Convert is a passthrough).
+- [ ] Install build that bundles `onnxruntime.dll` + the LLVC narrator model → runtime status flips to "detected"; the bundled voice appears in the list.
+- [ ] Drop a `<name>.onnx` into the voices folder, click Refresh → it appears; a user file with the same id shadows a bundled one.
+- [ ] Add `voice_convert` to a chain and select a model → after a brief background load, your voice converts to the target voice; there is **no** UI hang while the model loads.
+- [ ] Select a model file that doesn't exist / is invalid → the effect degrades to passthrough and never hangs (no 60 s freeze).
+- [ ] Disable Voice Convert → voice returns to the pre-conversion signal immediately.
+- [ ] Confirm the converted audio reaches a Discord call when output = CABLE Input.
+
+## Monitor output routing (Phase 13)
+
+- [ ] Settings → Audio devices shows a **Monitor output** picker with a "None — use main output" option.
+- [ ] Set output = `CABLE Input (VB-Audio Virtual Cable)`, monitor = your headphones. Speak: you hear your modulated voice **on the headphones** while a Discord client on `CABLE Output` also hears it.
+- [ ] Toggle Monitor **off** → the headphones go silent, but Discord still receives the voice (the main send is unaffected).
+- [ ] Toggle Monitor **on** → headphones resume.
+- [ ] Play a soundboard clip → it's audible **both** on the headphones (monitor) and to the Discord side.
+- [ ] Set monitor = "None" → behaviour reverts to the legacy single-output monitor toggle (toggle mutes the main output).
+- [ ] Pick a monitor device with a different sample rate than the input → no pitch shift, no crackle (the monitor path resamples).
+
+## Latency readout (Phase 14)
+
+- [ ] With the engine running and an empty/sample-by-sample chain, the Mixer header shows no latency suffix (or `+0 ms`).
+- [ ] Enable **Voice Convert** (model loaded) → header shows roughly `+256 ms` within a second.
+- [ ] Enable the **denoiser** at 48 kHz → adds ~10 ms; enable **pitch** or **formant** → ~21 ms each. The number updates the instant you toggle an effect.
+- [ ] Disable all latency-adding effects → the readout returns to ~0.
+- [ ] Hover the readout → tooltip explains the contributors.
+
+## Soundboard volume + system tray (Phase 15)
+
+- [ ] Soundboard toolbar has a **master volume** slider. Lower it → all clips get quieter; raise it → louder (no clipping/distortion at the top).
+- [ ] Right-click a tile → its context menu has a **per-tile volume** slider. Set one tile loud, another quiet → each plays at its own level × master.
+- [ ] Restart the app → per-tile gains and the master gain survive (persisted).
+- [ ] Restart the app → the last picked soundboard folder is restored automatically with its tiles + per-tile hotkeys (no re-pick needed).
+- [ ] Minimize or close the window → the app **hides to a system-tray icon** instead of quitting; audio (and the VB-Cable route) keeps running.
+- [ ] Left-click the tray icon (or "Show DivoraVoice") → the window restores + focuses.
+- [ ] Tray menu **Quit** → the app actually exits (streams torn down, gone from the Volume Mixer).
+- [ ] While hidden to tray, a bound global soundboard hotkey still fires the clip.
+
+## Recording the modulated output (Phase 16)
+
+- [ ] Mixer right rail shows a **Record** card. While the engine is **stopped**, the Record button is disabled (tooltip: "Start the engine to record").
+- [ ] Start the engine → Record becomes enabled. Click **Record** → the dot turns red and pulses; the button switches to **Stop**.
+- [ ] Speak for ~5 s with an effect chain active, then click **Stop**.
+- [ ] Settings → Recordings shows the folder path + the last take's name. Click **Open folder** → the recordings folder opens.
+- [ ] Open the `divora-<date>_<time>.wav` in a player → it plays back the **modulated** voice (effects applied), mono, no glitches, correct duration.
+- [ ] Play a soundboard clip while recording → the clip is present in the recorded file (recording matches the call audio).
+- [ ] Stop the engine while recording → the in-progress file is finalized and is playable (not truncated/corrupt); the Record indicator clears.
+- [ ] Start a second recording → it writes a new timestamped file without disturbing the first.
+- [ ] Shout into the mic (clip the input) → the recorded file saturates cleanly (no wrap-around static).
 
 ## Stress
 

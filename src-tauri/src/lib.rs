@@ -112,16 +112,6 @@ struct GlobalShortcutEvent {
 }
 
 #[tauri::command]
-fn ping() -> &'static str {
-    "pong"
-}
-
-#[tauri::command]
-fn project_name() -> &'static str {
-    divora_core::project_name()
-}
-
-#[tauri::command]
 fn list_audio_input_devices() -> Vec<DeviceInfo> {
     list_input_devices_core()
 }
@@ -665,8 +655,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            ping,
-            project_name,
             list_audio_input_devices,
             list_audio_output_devices,
             start_audio_engine,
@@ -705,9 +693,106 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_voice_dir, VoiceInfo};
+    use super::{scan_voice_dir, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, VoiceInfo};
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    fn sorted_keys(v: &serde_json::Value) -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    // ---- v1.0 freeze: IPC payload shapes -------------------------------
+    // These structs cross the Tauri bridge (the `audio-levels` event +
+    // command returns) and the frontend reads them by camelCase key, so
+    // the shapes are a back-compat contract. Renames/removals break the
+    // UI silently; additions after v1.0 must be optional. See
+    // `docs/STABLE-SURFACE.md`.
+
+    #[test]
+    fn engine_status_json_keys_are_frozen() {
+        let s = EngineStatus {
+            running: true,
+            monitoring: false,
+            input: Levels {
+                rms: 0.0,
+                peak: 0.0,
+            },
+            output: Levels {
+                rms: 0.0,
+                peak: 0.0,
+            },
+            dsp_latency_ms: 0.0,
+            recording: false,
+        };
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&s).unwrap()),
+            [
+                "dspLatencyMs",
+                "input",
+                "monitoring",
+                "output",
+                "recording",
+                "running"
+            ]
+        );
+    }
+
+    #[test]
+    fn level_update_json_keys_are_frozen() {
+        let u = LevelUpdate {
+            input: Levels {
+                rms: 0.0,
+                peak: 0.0,
+            },
+            output: Levels {
+                rms: 0.0,
+                peak: 0.0,
+            },
+            running: false,
+            monitoring: true,
+            dsp_latency_ms: 0.0,
+            recording: false,
+        };
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&u).unwrap()),
+            [
+                "dspLatencyMs",
+                "input",
+                "monitoring",
+                "output",
+                "recording",
+                "running"
+            ]
+        );
+    }
+
+    #[test]
+    fn voice_info_json_keys_are_frozen() {
+        let v = VoiceInfo {
+            id: "a".into(),
+            name: "A".into(),
+            path: "C:/a.onnx".into(),
+            size_bytes: 1,
+        };
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&v).unwrap()),
+            ["id", "name", "path", "sizeBytes"]
+        );
+    }
+
+    #[test]
+    fn onnx_runtime_status_json_keys_are_frozen() {
+        let s = OnnxRuntimeStatus {
+            runtime_available: true,
+            voices_dir: "C:/voices".into(),
+        };
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&s).unwrap()),
+            ["runtimeAvailable", "voicesDir"]
+        );
+    }
 
     /// Unique scratch dir under the OS temp area.
     fn scratch(tag: &str) -> PathBuf {

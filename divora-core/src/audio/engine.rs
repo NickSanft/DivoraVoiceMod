@@ -1017,7 +1017,7 @@ fn recording_writer(mut consumer: RingConsumer, rx: Receiver<RecordingCommand>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine,
+        drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine, StreamInfo,
         MAX_FRAMES_PER_CALLBACK, RING_BUFFER_FRAMES,
     };
     use crate::dsp::EffectChain;
@@ -1038,6 +1038,35 @@ mod tests {
         // Separate monitor → main output is the send, always plays.
         assert!(main_output_plays(true, false));
         assert!(main_output_plays(true, true));
+    }
+
+    /// v1.0 freeze: `StreamInfo` is returned from `start_audio_engine`
+    /// and consumed by the frontend, so its camelCase JSON keys are a
+    /// stable contract. See `docs/STABLE-SURFACE.md`.
+    #[test]
+    fn stream_info_json_keys_are_frozen() {
+        let info = StreamInfo {
+            input_name: "in".into(),
+            output_name: "out".into(),
+            monitor_name: Some("mon".into()),
+            sample_rate: 48_000,
+            input_channels: 1,
+            output_channels: 2,
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "inputChannels",
+                "inputName",
+                "monitorName",
+                "outputChannels",
+                "outputName",
+                "sampleRate"
+            ]
+        );
     }
 
     #[test]

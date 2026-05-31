@@ -31,7 +31,6 @@ import {
 } from "../stores/app";
 import type { GlyphId, TweaksState } from "../types";
 
-const VERSION = "v0.6.0";
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
 
 // Open a URL in the user's default browser. Lazy-loads the Tauri shell
@@ -1324,6 +1323,21 @@ const PILLARS: PillarDef[] = [
 
 function AboutSection(): JSX.Element {
   const app = useApp();
+  // Pull the real app version stamped into the build (release.yml writes
+  // the tag's version into tauri.conf.json; dev builds report 0.0.0).
+  // Lazy-import + catch so the browser preview (no Tauri bridge) and the
+  // jsdom test env degrade to a blank version instead of throwing.
+  const [version, setVersion] = createSignal("");
+  onMount(() => {
+    void (async () => {
+      try {
+        const { getVersion } = await import("@tauri-apps/api/app");
+        setVersion(`v${await getVersion()}`);
+      } catch (err) {
+        console.warn("[settings] app version unavailable", err);
+      }
+    })();
+  });
   return (
     <section>
       <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
@@ -1351,7 +1365,11 @@ function AboutSection(): JSX.Element {
               class="display"
               style={{ "font-size": "var(--t-h2)", "font-weight": 700 }}
             >
-              DivoraVoice <span class="mono" style={{ color: "var(--text-lo)" }}>{VERSION}</span>
+              DivoraVoice
+              <Show when={version()}>
+                {" "}
+                <span class="mono" style={{ color: "var(--text-lo)" }}>{version()}</span>
+              </Show>
             </div>
             <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
               MIT License · Tauri + SolidJS

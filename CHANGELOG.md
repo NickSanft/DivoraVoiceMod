@@ -4,6 +4,42 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Planned — 1.0.0 (stable surface cut)
+
+No new features. Freeze the Tauri command + preset-JSON surface for back-compat (documented in [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)), complete the full manual test pass ([docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)), and ship. Cut after a quiet 0.16.x soak; everything in §STABLE-SURFACE then becomes additive-only for the 1.x line.
+
+## [0.16.1] — 2026-05-31 — v1.0 prep: surface freeze + audit
+
+Groundwork for the v1.0 stable cut — no behavior changes for end users beyond the About version fix. Audited the full IPC + preset surface (it was in good shape), then locked it down.
+
+### Changed
+
+- **About shows the real build version.** Replaced the long-stale hardcoded `v0.6.0` in Settings → About with the version stamped into the build via Tauri `getVersion()`. Release builds now show the actual release (e.g. `v1.0.0`); a `tauri dev` build reads `v0.0.0`.
+
+### Removed
+
+- Dropped two vestigial Phase-0 IPC commands — `ping` and `project_name` — that the frontend never called, trimming dead surface before the freeze. (The `divora_core::project_name()` library fn stays.)
+
+### Added
+
+- **[docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)** — the v1.0 back-compat contract: every Tauri command (args/returns), the two events, all wire-type JSON shapes, the preset JSON schema + forward-compat rules, the `localStorage` keys, and the on-disk layout — plus the additive-only rule for the 1.x line.
+- **Freeze-guard serialization tests** so an accidental break fails CI: the preset JSON schema + `Bundled`/`User` tag casing + legacy-file load (missing `version`, unknown fields), and the camelCase keys of `StreamInfo` / `EngineStatus` / `LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus`.
+- Extended **[docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)** with Phase 12–16 sections (AI voice conversion, monitor routing, latency readout, soundboard volume + tray, recording) and a v1.0 release-gate note.
+
+### Tests
+
+- **Rust**: divora-core 129 → 132 (+3 freeze-guard); src-tauri 3 → 7 (+4 IPC-shape lock).
+- **Frontend**: 242 (removed the dead `ping` mock case; no count change).
+
+### Pre-push checklist (local, 2026-05-31)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (139 across crates, +1 ignored LLVC)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (242)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [0.16.0] — 2026-05-31 — Phase 16: record the modulated output
 
 One-click capture of exactly what your listeners hear — voice effects, soundboard, and all — to a timestamped WAV file.
