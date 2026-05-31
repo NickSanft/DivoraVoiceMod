@@ -41,6 +41,7 @@ import {
   setEffectChain as setEffectChainCmd,
   setEffectEnabled as setEffectEnabledCmd,
   setEffectParam as setEffectParamCmd,
+  setSoundboardMasterGain as setSoundboardMasterGainCmd,
   setVoiceModel as setVoiceModelCmd,
   startAudioEngine,
   stopAllSoundboardClips as stopAllSoundboardClipsCmd,
@@ -132,6 +133,9 @@ const STORAGE_KEYS = {
   tweaks: "divora.tweaks",
   activeVoice: "divora.activeVoice",
   monitorDevice: "divora.monitorDevice",
+  soundboardFolder: "divora.soundboardFolder",
+  tileGains: "divora.tileGains",
+  soundboardMasterGain: "divora.soundboardMasterGain",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -294,7 +298,7 @@ export interface AppState {
 
   // Soundboard
   soundboardFolder: () => string | null;
-  setSoundboardFolder: Setter<string | null>;
+  setSoundboardFolder: (folder: string | null) => void;
   soundboardTiles: () => SoundboardTile[];
   setSoundboardTiles: Setter<SoundboardTile[]>;
   soundboardLoading: () => boolean;
@@ -312,6 +316,11 @@ export interface AppState {
   /** clipId → hex color override. Missing entry = default palette colour. */
   tileColors: Record<string, string>;
   setTileColor: (clipId: string, color: string | null) => void;
+  /** Phase 15: per-tile + master soundboard volume (linear gain). */
+  tileGain: (clipId: string) => number;
+  setTileGain: (clipId: string, gain: number) => void;
+  soundboardMasterGain: () => number;
+  setSoundboardMasterGain: (gain: number) => void;
   /** folderPath → ordered list of clipIds. Tiles not in the list (e.g.
    * new files since last scan) fall to the end in alphabetical order. */
   tileOrder: Record<string, string[]>;
@@ -502,6 +511,11 @@ export function createAppState(): AppState {
       setStreamInfo(info);
       setEngineRunning(true);
       setEngineError(null);
+      // Phase 15: a fresh engine session builds a new SoundboardMixer
+      // (master gain = unity), so re-apply the persisted master gain.
+      if (soundboardMasterGain() !== 1.0) {
+        void setSoundboardMasterGainCmd(soundboardMasterGain());
+      }
     } catch (err) {
       setEngineRunning(false);
       setStreamInfo(null);
@@ -837,7 +851,16 @@ export function createAppState(): AppState {
 
   // Soundboard state.
 
-  const [soundboardFolder, setSoundboardFolder] = createSignal<string | null>(null);
+  // Phase 15: the active soundboard folder persists across restarts so
+  // the user doesn't have to re-pick it every launch.
+  const [soundboardFolderRaw, setSoundboardFolderRaw] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.soundboardFolder, null),
+  );
+  const soundboardFolder = soundboardFolderRaw;
+  const setSoundboardFolder = (folder: string | null): void => {
+    setSoundboardFolderRaw(folder);
+    saveJson(STORAGE_KEYS.soundboardFolder, folder);
+  };
   const [soundboardTiles, setSoundboardTiles] = createSignal<SoundboardTile[]>([]);
   const [soundboardLoading, setSoundboardLoading] = createSignal(false);
   const [soundboardError, setSoundboardError] = createSignal<string | null>(null);
@@ -852,6 +875,23 @@ export function createAppState(): AppState {
   const [tileColors, setTileColors] = createStore<Record<string, string>>(
     loadJson<Record<string, string>>(STORAGE_KEYS.tileColors, {}),
   );
+  // Phase 15: per-tile gain (linear, 1.0 = unchanged) + master gain.
+  const [tileGains, setTileGains] = createStore<Record<string, number>>(
+    loadJson<Record<string, number>>(STORAGE_KEYS.tileGains, {}),
+  );
+  const [soundboardMasterGain, setSoundboardMasterGainRaw] = createSignal<number>(
+    loadJson<number>(STORAGE_KEYS.soundboardMasterGain, 1.0),
+  );
+  const tileGain = (clipId: string): number => tileGains[clipId] ?? 1.0;
+  const setTileGain = (clipId: string, gain: number): void => {
+    setTileGains(clipId, gain);
+    saveJson(STORAGE_KEYS.tileGains, { ...tileGains });
+  };
+  const setSoundboardMasterGain = (gain: number): void => {
+    setSoundboardMasterGainRaw(gain);
+    saveJson(STORAGE_KEYS.soundboardMasterGain, gain);
+    void setSoundboardMasterGainCmd(gain);
+  };
   const [tileOrder, setTileOrder] = createStore<Record<string, string[]>>(
     loadJson<Record<string, string[]>>(STORAGE_KEYS.tileOrder, {}),
   );
@@ -1001,7 +1041,11 @@ export function createAppState(): AppState {
 
   const playClip = async (tile: SoundboardTile): Promise<void> => {
     try {
-      const durationSecs = await playSoundboardClipCmd(tile.id, tile.path);
+      const durationSecs = await playSoundboardClipCmd(
+        tile.id,
+        tile.path,
+        tileGain(tile.id),
+      );
       setPlayingClips(tile.id, {
         clipId: tile.id,
         startedAt: typeof performance !== "undefined" ? performance.now() : Date.now(),
@@ -1262,6 +1306,10 @@ export function createAppState(): AppState {
     // Phase 8 tile metadata
     tileColors,
     setTileColor,
+    tileGain,
+    setTileGain,
+    soundboardMasterGain,
+    setSoundboardMasterGain,
     tileOrder,
     reorderTiles,
     sortedTiles,

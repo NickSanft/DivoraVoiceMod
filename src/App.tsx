@@ -188,6 +188,13 @@ function Shell(): JSX.Element {
       // Failures keep the fallback bundled list seeded in the store.
       await app.refreshPresets();
 
+      // Phase 15: re-scan the persisted soundboard folder (restored from
+      // localStorage) so its tiles + per-tile hotkeys are live without
+      // the user re-picking the folder each launch.
+      if (app.soundboardFolder()) {
+        await app.scanCurrentSoundboardFolder();
+      }
+
       if (cancelled) return;
       // Only auto-start when we have something to talk to.
       if (app.selectedInput() && app.selectedOutput()) {

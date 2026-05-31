@@ -23,7 +23,9 @@ use divora_core::soundboard::{
     decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 /// Payload of the periodic `audio-levels` event. Frontend listens with
@@ -299,12 +301,14 @@ fn play_soundboard_clip(
     state: State<'_, AppState>,
     clip_id: String,
     path: String,
+    gain: Option<f32>,
 ) -> Result<f32, String> {
     let decoded = decode_or_cache(&state, &clip_id, Path::new(&path))?;
     state.engine.send_soundboard(SoundboardCommand::Play {
         clip_id: clip_id.clone(),
         samples: decoded.samples.clone(),
         sample_rate: decoded.sample_rate,
+        gain: gain.unwrap_or(1.0),
     });
     Ok(decoded.duration_secs)
 }
@@ -319,6 +323,14 @@ fn stop_soundboard_clip(state: State<'_, AppState>, clip_id: String) {
 #[tauri::command]
 fn stop_all_soundboard_clips(state: State<'_, AppState>) {
     state.engine.send_soundboard(SoundboardCommand::StopAll);
+}
+
+/// Phase 15: set the master soundboard gain (linear, 1.0 = unity).
+#[tauri::command]
+fn set_soundboard_master_gain(state: State<'_, AppState>, gain: f32) {
+    state
+        .engine
+        .send_soundboard(SoundboardCommand::SetMasterGain(gain));
 }
 
 #[tauri::command]
@@ -450,7 +462,51 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
         .expect("spawning the level-emitter thread should not fail");
 }
 
+/// Reveal + focus the main window (from a tray click / "Show" menu).
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Phase 15: build the system-tray icon + menu so the app can run in the
+/// background (e.g. while gaming / on a Discord call). Left-click the
+/// tray icon or "Show" to restore the window; "Quit" exits for real.
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let show = MenuItem::with_id(app, "show", "Show DivoraVoice", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("divora-tray")
+        .tooltip("DivoraVoice")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[allow(clippy::too_many_lines)] // builder chain + setup closure; clearer inline
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -460,7 +516,20 @@ pub fn run() {
                 .with_handler(global_shortcut_handler)
                 .build(),
         )
+        // Phase 15: closing the window hides it to the tray instead of
+        // quitting, so audio (and Discord routing) keep running in the
+        // background. "Quit" in the tray menu exits for real.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
+            if let Err(e) = setup_tray(app) {
+                tracing::warn!(?e, "failed to set up system tray");
+            }
+
             let engine = Arc::new(AudioEngine::new());
             spawn_level_emitter(app.handle().clone(), engine.clone());
 
@@ -559,6 +628,7 @@ pub fn run() {
             play_soundboard_clip,
             stop_soundboard_clip,
             stop_all_soundboard_clips,
+            set_soundboard_master_gain,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,

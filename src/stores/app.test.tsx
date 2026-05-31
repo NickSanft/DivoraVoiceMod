@@ -614,6 +614,7 @@ describe("app store — Phase 5 soundboard actions", () => {
     expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
       clipId: "bell",
       path: tile.path,
+      gain: 1,
     });
     expect(result.playingClips[tile.id]).toBeDefined();
     expect(result.playingClips[tile.id]!.durationSecs).toBe(4.2);
@@ -766,6 +767,58 @@ describe("app store — Phase 8 soundboard polish", () => {
     expect(window.localStorage.getItem("divora.tileColors")).toContain("#EC4899");
   });
 
+  // --- Phase 15: folder persistence + soundboard volume ---------------
+
+  it("setSoundboardFolder persists to localStorage", () => {
+    const { result } = setupApp();
+    result.setSoundboardFolder("C:/clips");
+    expect(window.localStorage.getItem("divora.soundboardFolder")).toContain(
+      "C:/clips",
+    );
+  });
+
+  it("tileGain defaults to 1.0 and setTileGain persists", () => {
+    const { result } = setupApp();
+    expect(result.tileGain("clip-x")).toBe(1.0);
+    result.setTileGain("clip-x", 0.5);
+    expect(result.tileGain("clip-x")).toBe(0.5);
+    expect(window.localStorage.getItem("divora.tileGains")).toContain("0.5");
+  });
+
+  it("setSoundboardMasterGain persists + sends the backend command", () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    result.setSoundboardMasterGain(0.75);
+    expect(result.soundboardMasterGain()).toBe(0.75);
+    expect(window.localStorage.getItem("divora.soundboardMasterGain")).toContain(
+      "0.75",
+    );
+    expect(invokeMock).toHaveBeenCalledWith("set_soundboard_master_gain", {
+      gain: 0.75,
+    });
+  });
+
+  it("playClip passes the tile's gain to the backend", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "play_soundboard_clip") return 1.5; // duration
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setTileGain("clip-x", 0.25);
+    await result.playClip({
+      id: "clip-x",
+      path: "C:/clips/x.wav",
+      label: "x",
+      extension: "wav",
+      sizeBytes: 1,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
+      clipId: "clip-x",
+      path: "C:/clips/x.wav",
+      gain: 0.25,
+    });
+  });
+
   // --- recent folders --------------------------------------------------
 
   it("pushRecentFolder prepends and caps at 5", () => {
@@ -879,6 +932,7 @@ describe("app store — Phase 8 soundboard polish", () => {
     expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
       clipId: "clip-bell",
       path: "/tmp/clip-clip-bell.wav",
+      gain: 1,
     });
   });
 

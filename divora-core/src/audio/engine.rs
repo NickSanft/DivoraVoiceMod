@@ -898,6 +898,7 @@ mod tests {
             clip_id: "test".to_string(),
             samples: clip,
             sample_rate: 48_000,
+            gain: 1.0,
         });
         // Pretend the mic delivered a 480-sample buffer of constant 0.10.
         let mut mono = vec![0.10_f32; 480];

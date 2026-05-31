@@ -28,11 +28,16 @@ pub enum SoundboardCommand {
         clip_id: String,
         samples: Arc<Vec<f32>>,
         sample_rate: u32,
+        /// Phase 15: per-tile linear gain (1.0 = unchanged). Applied
+        /// per voice on top of the master gain.
+        gain: f32,
     },
     Stop {
         clip_id: String,
     },
     StopAll,
+    /// Phase 15: set the master soundboard gain (linear, 1.0 = unity).
+    SetMasterGain(f32),
 }
 
 /// Wire-format snapshot of a playing voice for the UI's progress UI.
@@ -49,6 +54,8 @@ struct Voice {
     clip_id: String,
     samples: Arc<Vec<f32>>,
     sample_rate: u32,
+    /// Per-tile linear gain captured at play time.
+    gain: f32,
     /// Float position into `samples` (so the mixer can interpolate
     /// across engine-rate vs. clip-rate mismatches).
     position: f64,
@@ -64,6 +71,7 @@ impl Voice {
             clip_id: String::new(),
             samples: Arc::new(Vec::new()),
             sample_rate: 48_000,
+            gain: 1.0,
             position: 0.0,
             active: false,
             started_at: 0,
@@ -74,6 +82,8 @@ impl Voice {
 pub struct SoundboardMixer {
     voices: [Voice; MAX_VOICES],
     counter: u64,
+    /// Master gain applied to every voice (linear, 1.0 = unity).
+    master_gain: f32,
 }
 
 impl SoundboardMixer {
@@ -82,6 +92,7 @@ impl SoundboardMixer {
         Self {
             voices: std::array::from_fn(|_| Voice::idle()),
             counter: 0,
+            master_gain: 1.0,
         }
     }
 
@@ -93,15 +104,20 @@ impl SoundboardMixer {
                 clip_id,
                 samples,
                 sample_rate,
-            } => self.play(clip_id, samples, sample_rate),
+                gain,
+            } => self.play(clip_id, samples, sample_rate, gain),
             SoundboardCommand::Stop { clip_id } => self.stop(&clip_id),
             SoundboardCommand::StopAll => self.stop_all(),
+            SoundboardCommand::SetMasterGain(g) => {
+                self.master_gain = g.clamp(0.0, 4.0);
+            }
         }
     }
 
-    fn play(&mut self, clip_id: String, samples: Arc<Vec<f32>>, sample_rate: u32) {
+    fn play(&mut self, clip_id: String, samples: Arc<Vec<f32>>, sample_rate: u32, gain: f32) {
         self.counter = self.counter.wrapping_add(1);
         let started_at = self.counter;
+        let gain = gain.clamp(0.0, 4.0);
         // Prefer an idle slot.
         for v in &mut self.voices {
             if !v.active {
@@ -109,6 +125,7 @@ impl SoundboardMixer {
                     clip_id,
                     samples,
                     sample_rate,
+                    gain,
                     position: 0.0,
                     active: true,
                     started_at,
@@ -122,6 +139,7 @@ impl SoundboardMixer {
                 clip_id,
                 samples,
                 sample_rate,
+                gain,
                 position: 0.0,
                 active: true,
                 started_at,
@@ -157,11 +175,13 @@ impl SoundboardMixer {
         }
         #[allow(clippy::cast_precision_loss)]
         let engine_rate_f = f64::from(engine_rate);
+        let master = self.master_gain;
         for v in &mut self.voices {
             if !v.active {
                 continue;
             }
             let step = f64::from(v.sample_rate) / engine_rate_f;
+            let voice_gain = v.gain * master;
             let buf = v.samples.as_ref();
             let len = buf.len();
             if len < 2 {
@@ -177,7 +197,7 @@ impl SoundboardMixer {
                 #[allow(clippy::cast_possible_truncation)]
                 let frac = (v.position - idx as f64) as f32;
                 let sample = buf[idx] * (1.0 - frac) + buf[idx + 1] * frac;
-                *slot += sample;
+                *slot += sample * voice_gain;
                 v.position += step;
             }
         }
@@ -241,6 +261,7 @@ mod tests {
             clip_id: "a".into(),
             samples: Arc::new(vec![0.5_f32; 128]),
             sample_rate: 48_000,
+            gain: 1.0,
         });
         let mut out = vec![0.0_f32; 64];
         m.mix_into(&mut out, 48_000);
@@ -256,6 +277,7 @@ mod tests {
             clip_id: "a".into(),
             samples: Arc::new(vec![0.5_f32; 32]),
             sample_rate: 48_000,
+            gain: 1.0,
         });
         assert_eq!(m.active_voice_count(), 1);
         let mut out = vec![0.0_f32; 128];
@@ -270,11 +292,13 @@ mod tests {
             clip_id: "keep".into(),
             samples: Arc::new(vec![0.5_f32; 1024]),
             sample_rate: 48_000,
+            gain: 1.0,
         });
         m.apply(SoundboardCommand::Play {
             clip_id: "kill".into(),
             samples: Arc::new(vec![0.5_f32; 1024]),
             sample_rate: 48_000,
+            gain: 1.0,
         });
         assert_eq!(m.active_voice_count(), 2);
         m.apply(SoundboardCommand::Stop {
@@ -291,6 +315,7 @@ mod tests {
                 clip_id: format!("v{i}"),
                 samples: Arc::new(vec![0.5_f32; 1024]),
                 sample_rate: 48_000,
+                gain: 1.0,
             });
         }
         assert_eq!(m.active_voice_count(), 4);
@@ -309,6 +334,7 @@ mod tests {
             clip_id: "slow".into(),
             samples: clip.clone(),
             sample_rate: 24_000,
+            gain: 1.0,
         });
         let mut out = vec![0.0_f32; 1_000];
         m.mix_into(&mut out, 48_000);
@@ -326,6 +352,7 @@ mod tests {
                 clip_id: "x".into(),
                 samples: Arc::new(vec![0.3_f32; 1024]),
                 sample_rate: 48_000,
+                gain: 1.0,
             });
         }
         let mut out = vec![0.0_f32; 64];
@@ -346,6 +373,7 @@ mod tests {
                 clip_id: format!("voice-{i}"),
                 samples: Arc::new(vec![0.1_f32; 4096]),
                 sample_rate: 48_000,
+                gain: 1.0,
             });
         }
         assert_eq!(m.active_voice_count(), MAX_VOICES);
@@ -354,6 +382,7 @@ mod tests {
             clip_id: "voice-new".into(),
             samples: Arc::new(vec![0.1_f32; 4096]),
             sample_rate: 48_000,
+            gain: 1.0,
         });
         assert_eq!(m.active_voice_count(), MAX_VOICES);
         let snap = m.snapshot(48_000);
@@ -363,12 +392,67 @@ mod tests {
     }
 
     #[test]
+    fn per_voice_gain_scales_output() {
+        let mut m = SoundboardMixer::new();
+        m.apply(SoundboardCommand::Play {
+            clip_id: "g".into(),
+            samples: Arc::new(vec![0.5_f32; 128]),
+            sample_rate: 48_000,
+            gain: 0.5,
+        });
+        let mut out = vec![0.0_f32; 64];
+        m.mix_into(&mut out, 48_000);
+        for s in &out {
+            assert!(
+                (s - 0.25).abs() < 1e-3,
+                "0.5 sample × 0.5 gain = 0.25, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn master_gain_scales_every_voice() {
+        let mut m = SoundboardMixer::new();
+        m.apply(SoundboardCommand::SetMasterGain(0.5));
+        m.apply(SoundboardCommand::Play {
+            clip_id: "g".into(),
+            samples: Arc::new(vec![0.4_f32; 128]),
+            sample_rate: 48_000,
+            gain: 1.0,
+        });
+        let mut out = vec![0.0_f32; 64];
+        m.mix_into(&mut out, 48_000);
+        for s in &out {
+            assert!((s - 0.2).abs() < 1e-3, "0.4 × master 0.5 = 0.2, got {s}");
+        }
+    }
+
+    #[test]
+    fn gains_clamp_to_safe_range() {
+        let mut m = SoundboardMixer::new();
+        m.apply(SoundboardCommand::SetMasterGain(99.0)); // clamps to 4.0
+        m.apply(SoundboardCommand::Play {
+            clip_id: "g".into(),
+            samples: Arc::new(vec![0.1_f32; 128]),
+            sample_rate: 48_000,
+            gain: 99.0, // clamps to 4.0
+        });
+        let mut out = vec![0.0_f32; 64];
+        m.mix_into(&mut out, 48_000);
+        // 0.1 × 4.0 (gain) × 4.0 (master) = 1.6 — clamped, not exploded.
+        for s in &out {
+            assert!((s - 1.6).abs() < 1e-3, "clamped gains → 1.6, got {s}");
+        }
+    }
+
+    #[test]
     fn snapshot_reports_duration_and_progress() {
         let mut m = SoundboardMixer::new();
         m.apply(SoundboardCommand::Play {
             clip_id: "progress".into(),
             samples: Arc::new(vec![0.1_f32; 9_600]),
             sample_rate: 48_000,
+            gain: 1.0,
         });
         let mut out = vec![0.0_f32; 480]; // 10 ms at 48 kHz
         m.mix_into(&mut out, 48_000);

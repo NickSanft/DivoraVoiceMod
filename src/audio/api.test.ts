@@ -243,10 +243,11 @@ describe("audio api", () => {
 
   it("playSoundboardClip forwards id + path and returns duration", async () => {
     invokeMock.mockResolvedValueOnce(3.5);
-    const d = await playSoundboardClip("abc", "C:/clips/bell.wav");
+    const d = await playSoundboardClip("abc", "C:/clips/bell.wav", 0.5);
     expect(invokeMock).toHaveBeenCalledWith("play_soundboard_clip", {
       clipId: "abc",
       path: "C:/clips/bell.wav",
+      gain: 0.5,
     });
     expect(d).toBe(3.5);
   });

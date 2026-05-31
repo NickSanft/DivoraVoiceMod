@@ -4,6 +4,37 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-05-31 — Phase 15: soundboard volume, folder persistence, system tray
+
+Three requested quality-of-life items.
+
+### Added
+
+- **Soundboard volume** — per-tile and master gain. The mixer's `SoundboardCommand::Play` now carries a per-voice `gain`, plus a new `SetMasterGain` command; `mix_into` multiplies each voice by `voice_gain × master_gain` (both clamped 0–4). UI: a **master volume slider** in the soundboard toolbar and a **per-tile volume** slider in each tile's right-click menu. Both persist to `localStorage` (`divora.tileGains`, `divora.soundboardMasterGain`); the master gain is re-applied after an engine restart (a fresh session resets the mixer to unity).
+- **Minimize to system tray** — closing/minimizing the window now **hides to a tray icon** instead of quitting, so audio (and the Discord/VB-Cable route) keeps running in the background — same as Discord itself. Left-click the tray icon (or "Show DivoraVoice") to restore; **"Quit"** exits for real. (`tray-icon` Tauri feature + a `WindowEvent::CloseRequested` → `prevent_close` + `hide`.)
+
+### Fixed
+
+- **Soundboard folder now persists across restarts.** It was held in a non-persisted signal, so every launch started with no folder. It's now saved to `localStorage` (`divora.soundboardFolder`) and re-scanned at startup — your tiles + per-tile hotkeys come back automatically.
+
+### Tests
+
+- **Rust**: 125 → 128 (+3 mixer): per-voice gain scales output; master gain scales every voice; gains clamp to a safe range (no runaway levels).
+- **Frontend**: 233 → 237 (+4 store): soundboard folder persists; `tileGain` defaults to 1.0 + `setTileGain` persists; `setSoundboardMasterGain` persists + sends the backend command; `playClip` passes the tile's gain. (Existing play assertions updated for the new `gain` arg.)
+
+### Note
+
+The tray + close-to-tray behavior can't be exercised headless, so it's verified by compile + build; the live tray interaction is best confirmed on the desktop.
+
+### Pre-push checklist (local, 2026-05-31)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (128, +1 ignored LLVC test)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (237)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [0.14.0] — 2026-05-30 — Phase 14: live latency readout
 
 Voice Convert adds ~256 ms; the denoiser 10 ms; pitch/formant ~21 ms each. Now you can see it: the Mixer shows how much latency the active effects are adding, updating the instant you toggle one.

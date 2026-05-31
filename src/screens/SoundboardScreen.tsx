@@ -417,6 +417,34 @@ function Header(props: HeaderProps): JSX.Element {
           "font-size": "var(--t-sm)",
         }}
       />
+      <div
+        style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}
+        title="Master soundboard volume"
+      >
+        <Sigil name="soundboard" size={16} style={{ color: "var(--text-lo)" }} />
+        <input
+          type="range"
+          min="0"
+          max="200"
+          step="5"
+          aria-label="Master soundboard volume"
+          value={Math.round(app.soundboardMasterGain() * 100)}
+          onInput={(e) =>
+            app.setSoundboardMasterGain(Number(e.currentTarget.value) / 100)
+          }
+          style={{ width: "110px" }}
+        />
+        <span
+          class="mono tnum"
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-mid)",
+            width: "40px",
+          }}
+        >
+          {Math.round(app.soundboardMasterGain() * 100)}%
+        </span>
+      </div>
       <Button
         variant="danger"
         solid={props.playingCount > 0}
@@ -755,7 +783,7 @@ function ColorContextMenu(props: ColorContextMenuProps): JSX.Element {
       role="menu"
       style={{
         position: "fixed",
-        top: `${Math.min(props.y, window.innerHeight - 220)}px`,
+        top: `${Math.min(props.y, window.innerHeight - 320)}px`,
         left: `${Math.min(props.x, window.innerWidth - 240)}px`,
         "z-index": 100,
         padding: "var(--s3)",
@@ -766,9 +794,44 @@ function ColorContextMenu(props: ColorContextMenuProps): JSX.Element {
         "min-width": "220px",
       }}
     >
+      {/* Phase 15: per-tile volume */}
       <div
         class="eyebrow"
         style={{ "margin-bottom": "var(--s2)", color: "var(--text-lo)" }}
+      >
+        Volume
+      </div>
+      <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}>
+        <input
+          type="range"
+          min="0"
+          max="200"
+          step="5"
+          aria-label="Tile volume"
+          value={Math.round(app.tileGain(props.clipId) * 100)}
+          onInput={(e) =>
+            app.setTileGain(props.clipId, Number(e.currentTarget.value) / 100)
+          }
+          style={{ flex: 1 }}
+        />
+        <span
+          class="mono tnum"
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-mid)",
+            width: "40px",
+          }}
+        >
+          {Math.round(app.tileGain(props.clipId) * 100)}%
+        </span>
+      </div>
+      <div
+        class="eyebrow"
+        style={{
+          "margin-bottom": "var(--s2)",
+          "margin-top": "var(--s3)",
+          color: "var(--text-lo)",
+        }}
       >
         Tile color
       </div>

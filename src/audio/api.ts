@@ -269,8 +269,9 @@ export async function scanSoundboardFolder(
 export async function playSoundboardClip(
   clipId: string,
   path: string,
+  gain = 1.0,
 ): Promise<number> {
-  return invoke<number>("play_soundboard_clip", { clipId, path });
+  return invoke<number>("play_soundboard_clip", { clipId, path, gain });
 }
 
 export async function stopSoundboardClip(clipId: string): Promise<void> {
@@ -279,6 +280,11 @@ export async function stopSoundboardClip(clipId: string): Promise<void> {
 
 export async function stopAllSoundboardClips(): Promise<void> {
   await invoke("stop_all_soundboard_clips");
+}
+
+/** Phase 15: master soundboard gain (linear, 1.0 = unity). */
+export async function setSoundboardMasterGain(gain: number): Promise<void> {
+  await invoke("set_soundboard_master_gain", { gain });
 }
 
 // ---- Virtual mic (VB-Cable) ----
