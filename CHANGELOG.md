@@ -4,6 +4,37 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-05-31 — device persistence + Coven tuning
+
+Bug fix + first pass of Coven voice tuning from real-world feedback.
+
+### Fixed
+
+- **Input & output device selections now persist across restarts.** They lived in non-persisted signals (only the monitor device was saved), so every launch reset to the host defaults. Both are now stored in `localStorage` and restored on startup; if a saved device is gone (unplugged since last run), it falls back to the host default instead of failing to start.
+
+### Changed — voice tuning
+
+- **Velvet Demon** — more reverb (size 30 → 48, mix 18 → 34) for a roomier, wetter menace.
+- **Static Wraith** — dropped the upward pitch (+2 → −2) so it reads as an eerie specter instead of "just a higher-pitched voice."
+- **Deep Narrator** — actually deep now: stronger pitch (−4 → −7) and formant (−3 → −5) shifts, so it lands low even when the AI conversion target sits higher than your voice.
+
+### Tests
+
+- **Frontend**: 249 → 252 (+3: device selections persist, restore on a fresh store, and fall back when a saved device is gone).
+
+### Notes
+
+- **Choir of Ash** still sounds like a single (high) voice — a real choir needs an ensemble/doubler, so the new **chorus effect + Choir rebuild lands in v1.2.0**. Hollow King and The Oracle were reported good and are unchanged.
+
+### Pre-push checklist (local, 2026-05-31)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (140 across crates, +1 ignored LLVC)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (252)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.1.0] — 2026-05-31 — The Coven (voice cast)
 
 A curated cast of character voices, browsable in one place and summoned with a click.

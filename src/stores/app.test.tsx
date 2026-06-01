@@ -69,6 +69,13 @@ describe("app store — Phase 1", () => {
 describe("app store — Phase 2 audio actions", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    // Device selections now persist to localStorage; clear it so a
+    // selection set in one test doesn't leak into the next.
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom always has localStorage */
+    }
   });
 
   it("refreshDevices populates input + output lists and pre-selects defaults", async () => {
@@ -92,6 +99,51 @@ describe("app store — Phase 2 audio actions", () => {
     expect(result.audioOutputs()).toHaveLength(1);
     expect(result.selectedInput()).toBe("Mic B");
     expect(result.selectedOutput()).toBe("Headphones");
+  });
+
+  // v1.1.1: device selections persist across restarts (bug fix).
+  it("persists device selections to localStorage", () => {
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    result.setSelectedOutput("Headphones");
+    expect(window.localStorage.getItem("divora.inputDevice")).toContain("Mic A");
+    expect(window.localStorage.getItem("divora.outputDevice")).toContain(
+      "Headphones",
+    );
+  });
+
+  it("restores persisted device selections on a fresh store", () => {
+    window.localStorage.setItem("divora.inputDevice", JSON.stringify("Saved Mic"));
+    window.localStorage.setItem("divora.outputDevice", JSON.stringify("Saved Out"));
+    const { result } = setupApp();
+    expect(result.selectedInput()).toBe("Saved Mic");
+    expect(result.selectedOutput()).toBe("Saved Out");
+  });
+
+  it("refreshDevices keeps a valid restored device, falls back when it's gone", async () => {
+    window.localStorage.setItem("divora.inputDevice", JSON.stringify("Mic A"));
+    window.localStorage.setItem(
+      "divora.outputDevice",
+      JSON.stringify("Unplugged Output"),
+    );
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_audio_input_devices") {
+        return [
+          { name: "Mic A", isDefault: false, defaultSampleRate: 48000, channels: 1 },
+          { name: "Mic B", isDefault: true, defaultSampleRate: 48000, channels: 1 },
+        ];
+      }
+      if (cmd === "list_audio_output_devices") {
+        return [
+          { name: "Speakers", isDefault: true, defaultSampleRate: 48000, channels: 2 },
+        ];
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    await result.refreshDevices();
+    expect(result.selectedInput()).toBe("Mic A"); // still present → kept
+    expect(result.selectedOutput()).toBe("Speakers"); // gone → default
   });
 
   it("startEngine records StreamInfo + sets running on success", async () => {

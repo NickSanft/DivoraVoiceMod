@@ -36,7 +36,7 @@ export const FALLBACK_PRESETS: Preset[] = [
     desc: "Broken-radio specter. Bit-crushed whispers riding interference.",
     chain: [
       fx("gate", true, { thresh: -44 }),
-      fx("pitch", true, { shift: 2 }),
+      fx("pitch", true, { shift: -2 }),
       fx("distortion", true, { drive: 58 }),
       fx("eq", true, { low: -4, mid: 3, high: 5 }),
       fx("echo", true, { time: 180, fb: 48 }),
@@ -54,7 +54,7 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("pitch", true, { shift: -7 }),
       fx("formant", true, { shift: -5 }),
       fx("robot", true, { freq: 90, mix: 32 }),
-      fx("reverb", true, { size: 30, mix: 18 }),
+      fx("reverb", true, { size: 48, mix: 34 }),
     ],
   },
   {
@@ -105,8 +105,8 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("gate", true, { thresh: -50 }),
       fx("denoiser", true, { mix: 60 }),
       fx("voice_convert", true, { mix: 90 }),
-      fx("pitch", true, { shift: -4 }),
-      fx("formant", true, { shift: -3 }),
+      fx("pitch", true, { shift: -7 }),
+      fx("formant", true, { shift: -5 }),
       fx("eq", true, { low: 5, mid: 1, high: -2 }),
       fx("reverb", true, { size: 38, mix: 14 }),
     ],

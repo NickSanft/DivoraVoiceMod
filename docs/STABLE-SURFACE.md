@@ -185,6 +185,8 @@ to defaults (never throw).
 |---|---|
 | `divora.tweaks` | appearance (mystical / motion / mood / accent / grain / vignette) |
 | `divora.activeVoice` | selected voice-model id (or null) |
+| `divora.inputDevice` | selected input device name (or null) |
+| `divora.outputDevice` | selected output device name (or null) |
 | `divora.monitorDevice` | monitor output device name (or null) |
 | `divora.soundboardFolder` | last picked soundboard folder path |
 | `divora.recentFolders` | recent soundboard folders (cap 5) |

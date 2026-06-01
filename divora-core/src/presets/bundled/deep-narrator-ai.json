@@ -10,8 +10,8 @@
     { "id": "gate", "enabled": true, "vals": { "thresh": -50 } },
     { "id": "denoiser", "enabled": true, "vals": { "mix": 60 } },
     { "id": "voice_convert", "enabled": true, "vals": { "mix": 90 } },
-    { "id": "pitch", "enabled": true, "vals": { "shift": -4 } },
-    { "id": "formant", "enabled": true, "vals": { "shift": -3 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -7 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": -5 } },
     { "id": "eq", "enabled": true, "vals": { "low": 5, "mid": 1, "high": -2 } },
     { "id": "reverb", "enabled": true, "vals": { "size": 38, "mix": 14 } }
   ]

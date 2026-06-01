@@ -8,7 +8,7 @@
   "desc": "Broken-radio specter. Bit-crushed whispers riding interference.",
   "chain": [
     { "id": "gate", "enabled": true, "vals": { "thresh": -44 } },
-    { "id": "pitch", "enabled": true, "vals": { "shift": 2 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -2 } },
     { "id": "distortion", "enabled": true, "vals": { "drive": 58 } },
     { "id": "eq", "enabled": true, "vals": { "low": -4, "mid": 3, "high": 5 } },
     { "id": "echo", "enabled": true, "vals": { "time": 180, "fb": 48 } }

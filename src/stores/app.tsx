@@ -135,6 +135,8 @@ const STORAGE_KEYS = {
   recentFolders: "divora.recentFolders",
   tweaks: "divora.tweaks",
   activeVoice: "divora.activeVoice",
+  inputDevice: "divora.inputDevice",
+  outputDevice: "divora.outputDevice",
   monitorDevice: "divora.monitorDevice",
   soundboardFolder: "divora.soundboardFolder",
   tileGains: "divora.tileGains",
@@ -247,9 +249,9 @@ export interface AppState {
   audioOutputs: () => DeviceInfo[];
   setAudioOutputs: Setter<DeviceInfo[]>;
   selectedInput: () => string | null;
-  setSelectedInput: Setter<string | null>;
+  setSelectedInput: (name: string | null) => void;
   selectedOutput: () => string | null;
-  setSelectedOutput: Setter<string | null>;
+  setSelectedOutput: (name: string | null) => void;
   /** Phase 13: separate monitor output device (null = none). */
   selectedMonitor: () => string | null;
   setSelectedMonitor: (name: string | null) => void;
@@ -427,8 +429,23 @@ export function createAppState(): AppState {
   // Audio engine signals.
   const [audioInputs, setAudioInputs] = createSignal<DeviceInfo[]>([]);
   const [audioOutputs, setAudioOutputs] = createSignal<DeviceInfo[]>([]);
-  const [selectedInput, setSelectedInput] = createSignal<string | null>(null);
-  const [selectedOutput, setSelectedOutput] = createSignal<string | null>(null);
+  // Persisted so device choices survive a restart. Restored here;
+  // refreshDevices() validates the saved name still exists and falls
+  // back to the host default if it was unplugged.
+  const [selectedInput, setSelectedInputRaw] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.inputDevice, null),
+  );
+  const setSelectedInput = (name: string | null): void => {
+    setSelectedInputRaw(name);
+    saveJson(STORAGE_KEYS.inputDevice, name);
+  };
+  const [selectedOutput, setSelectedOutputRaw] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.outputDevice, null),
+  );
+  const setSelectedOutput = (name: string | null): void => {
+    setSelectedOutputRaw(name);
+    saveJson(STORAGE_KEYS.outputDevice, name);
+  };
   // Phase 13: optional separate monitor ("hear yourself") output device.
   // null = no separate monitor (monitoring rides the main output, as
   // before). Persisted because it's an explicit opt-in the user
@@ -510,11 +527,17 @@ export function createAppState(): AppState {
     ]);
     setAudioInputs(ins);
     setAudioOutputs(outs);
-    if (!selectedInput()) {
+    // Pick a default when nothing is selected OR the restored selection
+    // is no longer present (device unplugged since last run). Never
+    // clobber a valid saved choice, and don't reset on a transiently
+    // empty enumeration.
+    const curIn = selectedInput();
+    if ((!curIn || !ins.some((d) => d.name === curIn)) && ins.length > 0) {
       const def = ins.find((d) => d.isDefault) ?? ins[0];
       if (def) setSelectedInput(def.name);
     }
-    if (!selectedOutput()) {
+    const curOut = selectedOutput();
+    if ((!curOut || !outs.some((d) => d.name === curOut)) && outs.length > 0) {
       const def = outs.find((d) => d.isDefault) ?? outs[0];
       if (def) setSelectedOutput(def.name);
     }
