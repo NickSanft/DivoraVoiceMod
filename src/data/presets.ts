@@ -65,8 +65,9 @@ export const FALLBACK_PRESETS: Preset[] = [
     tag: "Bundled",
     desc: "Layered, breathy, sacred. Many voices from one.",
     chain: [
-      fx("pitch", true, { shift: 5 }),
-      fx("formant", true, { shift: 4 }),
+      fx("pitch", true, { shift: 2 }),
+      fx("formant", true, { shift: 3 }),
+      fx("chorus", true, { mix: 80, depth: 65 }),
       fx("eq", true, { low: -2, mid: 0, high: 4 }),
       fx("reverb", true, { size: 64, mix: 50 }),
     ],

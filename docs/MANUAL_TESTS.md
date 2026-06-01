@@ -369,6 +369,8 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Summon a DSP character after the narrator → the AI model is cleared (Settings → Voice library shows no active voice); summon the narrator again → the model reloads.
 - [ ] Summon works while the engine is **stopped** too — it sets the active voice; starting the engine then applies it.
 - [ ] **The Oracle** sounds calm/resonant at natural pitch (distinct from the pitched characters).
+- [ ] **Choir of Ash** (v1.2.0) sounds like an *ensemble* — multiple detuned voices, not one high voice — thanks to the new chorus layer.
+- [ ] The **Chorus** effect is selectable in the Presets chain editor (Mix + Depth params); enabling it on any preset audibly thickens/doubles the voice; Mix = 0 is a clean passthrough.
 
 ## Stress
 

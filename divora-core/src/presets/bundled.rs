@@ -124,6 +124,22 @@ mod tests {
         );
     }
 
+    // v1.2.0 (The Coven): Choir of Ash gets its "many voices from one"
+    // ensemble from the chorus/doubler effect — lock it in so a future
+    // edit can't quietly drop it back to a single (high) voice.
+    #[test]
+    fn choir_of_ash_layers_a_chorus() {
+        let presets = bundled_presets();
+        let choir = presets
+            .iter()
+            .find(|p| p.id == "choir-of-ash")
+            .expect("choir-of-ash must be bundled");
+        assert!(
+            choir.chain.iter().any(|e| e.id == "chorus" && e.enabled),
+            "Choir of Ash should layer an enabled chorus for the ensemble"
+        );
+    }
+
     // v0.12.2: the Deep Narrator preset must actually *sound* deep via
     // DSP — it can't lean on the (passthrough-until-a-model-is-installed)
     // voice_convert effect for its audible character. Lock in the

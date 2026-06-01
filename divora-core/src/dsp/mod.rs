@@ -20,6 +20,7 @@
 //! later phase. Formant ships a parallel band-pass colouring; the real
 //! LPC-based formant warp also lands later.
 
+mod chorus;
 mod denoiser;
 mod distortion;
 mod echo;
@@ -32,6 +33,7 @@ mod robot;
 mod stft;
 mod voice_convert;
 
+pub use chorus::Chorus;
 pub use denoiser::RnnDenoiser;
 pub use distortion::Distortion;
 pub use echo::Echo;
@@ -62,6 +64,10 @@ pub enum EffectKind {
     Distortion,
     Echo,
     Reverb,
+    /// v1.2.0 (The Coven): chorus / doubler — modulated multi-tap delay
+    /// summed with the dry signal for an ensemble ("many voices from
+    /// one"). Powers the richer "Choir of Ash" voice.
+    Chorus,
     /// Phase 12: ONNX-backed voice conversion (LLVC-style). Loads a
     /// `.onnx` model from the voices directory and streams 48 kHz mono
     /// through a 16 kHz inference chunk. Falls back to passthrough
@@ -252,6 +258,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::Distortion => Box::new(Distortion::new()),
         EffectKind::Echo => Box::new(Echo::new()),
         EffectKind::Reverb => Box::new(Reverb::new()),
+        EffectKind::Chorus => Box::new(Chorus::new()),
         EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
     };
     effect.set_enabled(spec.enabled);

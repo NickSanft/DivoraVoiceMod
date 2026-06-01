@@ -9,6 +9,7 @@ export type EffectId =
   | "robot"
   | "distortion"
   | "echo"
+  | "chorus"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

@@ -4,6 +4,33 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-06-01 — Coven ensemble: the chorus effect
+
+Choir of Ash finally sounds like a choir.
+
+### Added
+
+- **Chorus effect** — a new DSP effect: several short, LFO-modulated delay taps summed with the dry signal. The continuously-varying delays detune each tap slightly, so one voice reads as an ensemble ("many voices from one"). Selectable in any chain with **Mix** + **Depth** params; it's a wet tail on the dry path, so it adds no latency. (`EffectKind::Chorus` — an additive addition to the frozen effect set.)
+- **Choir of Ash rebuilt** around it: the pitch is eased (+5 → +2 st, less chipmunk) and a chorus is layered in, so it now reads as a true ensemble instead of a single high voice — directly addressing the "only sounds like one voice" feedback.
+
+### Tests
+
+- **Rust**: 133 → 137 (+4: chorus is a passthrough at mix 0, produces delayed ensemble copies, adds zero latency; Choir of Ash layers an enabled chorus).
+- **Frontend**: 252 → 254 (+2: chorus is in the effect catalog; Choir of Ash uses it).
+
+### Notes
+
+- Roadmap shifts out by one: **streaming LLVC → v1.3.0**, zero-shot + personal voice → v1.4.0, loudness → v1.5.0.
+
+### Pre-push checklist (local, 2026-06-01)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (144 across crates, +1 ignored LLVC)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (254)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.1.1] — 2026-05-31 — device persistence + Coven tuning
 
 Bug fix + first pass of Coven voice tuning from real-world feedback.

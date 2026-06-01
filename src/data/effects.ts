@@ -109,6 +109,17 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.mix ?? 0}%`,
   },
+  chorus: {
+    id: "chorus",
+    name: "Chorus",
+    sigil: "wave",
+    desc: "Detuned doubler — stacks modulated copies into an ensemble ('many voices from one').",
+    params: [
+      { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 70 },
+      { key: "depth", label: "Depth", min: 0, max: 100, step: 1, unit: "%", default: 60 },
+    ],
+    readout: (v) => `${v.mix ?? 0}% · ${v.depth ?? 0}%`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -133,6 +144,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "distortion",
   "echo",
   "reverb",
+  "chorus",
 ];
 
 /** Build a chain entry with sensible defaults, optionally overriding values. */
