@@ -9,18 +9,39 @@ public-domain audiobook narrator.
 
 ## Model I/O contract
 
-The Rust engine (`divora-core/src/dsp/voice_convert.rs`) feeds the
-model **4096-sample, 16 kHz mono chunks** and expects:
+`divora-core/src/dsp/voice_convert.rs` supports **two** contracts and
+picks per loaded model (a model is "streaming" if it has an `enc_buf`
+input).
 
-| | name | shape | dtype |
-|---|---|---|---|
-| input | `audio` | `[1, 1, T]` | f32 |
-| output | (first output) | `[1, 1, T]` | f32 |
+### Streaming (v1.3.0+, the bundled narrator) — ~13 ms latency
 
-`T` is dynamic; the engine always sends `T = 4096`. Any ONNX model
-matching this contract works — drop a different one in and select it.
-If the shapes/names don't match, inference errors and the effect
-degrades to passthrough (never crashes).
+Threads four cache tensors + a 2·L front-context between 208-sample
+chunks. Fixed shapes (batch 1, f32):
+
+| dir | names | shape |
+|---|---|---|
+| in | `audio` | `[1, 1, 240]` (32 front-ctx + 208 chunk) |
+| in | `enc_buf` | `[1, 512, 510]` |
+| in | `dec_buf` | `[1, 2, 13, 256]` |
+| in | `out_buf` | `[1, 512, 4]` |
+| in | `convnet_pre_ctx` | `[1, 1, 24]` |
+| out | `output` | `[1, 1, 208]` |
+| out | `enc_buf_out` / `dec_buf_out` / `out_buf_out` / `convnet_pre_ctx_out` | same as the matching input |
+
+All caches are zero-initialized (verified equivalent to the model's
+`None`-init). The engine streams 208-sample chunks (`dec_chunk_size 13 ·
+L 16`) ≈ 13 ms, threading the four `*_out` caches back in next call.
+
+### Non-streaming (fallback) — ~256 ms latency
+
+| dir | name | shape |
+|---|---|---|
+| in | `audio` | `[1, 1, T]` f32 |
+| out | (first output) | `[1, 1, T]` f32 |
+
+The engine sends `T = 4096`, converted statelessly per chunk. Any model
+matching either contract works; a mismatch degrades to passthrough
+(never crashes).
 
 ## Producing the LLVC model
 
@@ -58,6 +79,20 @@ self-pads to a multiple of L=16, so 4096-sample chunks need no boundary
 padding) with `dynamo=False` for a predictable graph, then checks ORT
 output vs PyTorch (expect `max|diff| < 1e-3`).
 
+### Streaming export (v1.3.0)
+
+[`export_streaming_onnx.py`](export_streaming_onnx.py) traces the
+**streaming** `Net.forward(x, enc_buf, dec_buf, out_buf, convnet_pre_ctx,
+pad=False)` — the five-in / five-out cache form — with the speechbrain
+`PositionalEncoding` vendored into `model.py` (its lazy import breaks the
+tracer) and `dynamo=False`. It then validates an 8-chunk streaming run of
+ONNX vs PyTorch (expect `max|diff| ≈ 2e-7`) and prints the cache shapes
+the Rust side threads. Run it from the LLVC repo root:
+
+```bash
+.venv/Scripts/python export_streaming_onnx.py llvc-narrator.onnx
+```
+
 ## Installing
 
 ### From a release installer (v0.12.4+)
@@ -79,8 +114,10 @@ listed), select the voice, and pick the *Deep Narrator* preset.
 
 ## Bundling pipeline (maintainers)
 
-The binaries are **not** in git. They live on the `voice-assets-v1`
-GitHub release and are fetched at release-build time:
+The binaries are **not** in git. They live on the `voice-assets-v2`
+GitHub release (v1 kept the older non-streaming narrator so pre-v1.3.0
+tags still build against their own asset) and are fetched at
+release-build time:
 
 - `scripts/fetch-voice-assets.ps1` downloads them into
   `src-tauri/resources/` (gitignored).
@@ -96,13 +133,14 @@ GitHub release and are fetched at release-build time:
   `list_voices` merges the bundled `voices/` dir with the user dir.
 
 To refresh the hosted assets (new model / runtime version), re-run the
-export, then `gh release upload voice-assets-v1 <files> --clobber`.
+export, then `gh release upload voice-assets-v2 <files> --clobber`.
 
 ## Notes
 
-- The non-streaming forward converts each 4096-sample chunk
-  independently. LLVC's small internal lookahead keeps seam artifacts
-  negligible at this chunk size; a future streaming export could thread
-  the model's cache tensors between chunks for even lower latency.
+- v1.3.0 ships the **streaming** export (208-sample chunks, ~13 ms),
+  threading the model's four cache tensors between chunks. The
+  non-streaming path (4096-sample independent chunks, ~256 ms) remains as
+  the fallback for models that only expose the single `audio` → `output`
+  contract.
 - Bundling the DLL + a model into the installer (so it works without
   this manual step) is tracked as future packaging work.

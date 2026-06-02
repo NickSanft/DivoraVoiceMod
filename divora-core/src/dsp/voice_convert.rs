@@ -13,9 +13,15 @@
 //!   5. Mixes the converted (wet) signal with a delay-matched dry copy
 //!      so a user can dial in any wet/dry blend.
 //!
-//! The chunk size is 4096 samples at 16 kHz (≈ 256 ms). This matches
-//! what the LLVC streaming variant expects and gives reasonable
-//! end-to-end latency without overwhelming a typical CPU.
+//! ### Streaming vs. non-streaming models (v1.3.0)
+//!
+//! A loaded model is detected as **streaming** when it exposes the LLVC
+//! cache-tensor contract (an `enc_buf` input). Streaming models run tiny
+//! 208-sample chunks (≈ 13 ms) and thread four cache tensors + a
+//! front-context between calls, so end-to-end latency is conversational.
+//! Models that only expose the single `audio` → `output` contract fall
+//! back to the original non-streaming path: one 4096-sample chunk
+//! (≈ 256 ms) converted statelessly per call.
 //!
 //! ### Graceful degradation
 //!
@@ -65,10 +71,53 @@ use super::{AudioEffect, EffectKind};
 pub const MODEL_RATE: u32 = 16_000;
 /// Native rate the rest of the engine runs at.
 pub const NATIVE_RATE: u32 = 48_000;
-/// Inference chunk size in 16 kHz samples (≈ 256 ms). Matches LLVC's
-/// streaming variant; large enough to give the model context, small
-/// enough to keep round-trip latency under a third of a second.
+/// Inference chunk size in 16 kHz samples (≈ 256 ms) for a NON-streaming
+/// model: the whole chunk is converted in one stateless call. Used as a
+/// fallback for models that only expose the single-tensor `audio` →
+/// `output` contract.
 pub const CHUNK_16K: usize = 4096;
+
+// ---- v1.3.0: streaming LLVC contract -------------------------------------
+//
+// The streaming export threads four cache tensors between successive
+// chunks and consumes a `2·L` front-context prepended to each chunk. The
+// shapes below are fixed by `export_streaming_onnx.py` (validated ONNX vs
+// PyTorch max|diff| ≈ 2e-7) and documented in `docs/STABLE-SURFACE.md`.
+// A model is treated as streaming when its inputs include `enc_buf`.
+
+/// Streaming inference chunk (`dec_chunk_size 13 · L 16`) ≈ 13 ms @ 16 kHz.
+pub const STREAM_CHUNK_16K: usize = 208;
+/// Front-context (`2·L`) prepended to each chunk for continuity.
+const STREAM_FRONT: usize = 32;
+/// Total model input length per chunk (front + chunk).
+const STREAM_IN: usize = STREAM_FRONT + STREAM_CHUNK_16K; // 240
+const ENC_BUF_SHAPE: [usize; 3] = [1, 512, 510];
+const DEC_BUF_SHAPE: [usize; 4] = [1, 2, 13, 256];
+const OUT_BUF_SHAPE: [usize; 3] = [1, 512, 4];
+const CPC_SHAPE: [usize; 3] = [1, 1, 24];
+
+/// Streaming cache state threaded between chunks. All tensors start at
+/// zero (verified equivalent to the model's `None`-init path); `front`
+/// holds the previous chunk's tail for the lookahead context.
+struct StreamCaches {
+    enc_buf: Vec<f32>,
+    dec_buf: Vec<f32>,
+    out_buf: Vec<f32>,
+    cpc: Vec<f32>,
+    front: Vec<f32>,
+}
+
+impl StreamCaches {
+    fn zeros() -> Self {
+        Self {
+            enc_buf: vec![0.0; ENC_BUF_SHAPE.iter().product()],
+            dec_buf: vec![0.0; DEC_BUF_SHAPE.iter().product()],
+            out_buf: vec![0.0; OUT_BUF_SHAPE.iter().product()],
+            cpc: vec![0.0; CPC_SHAPE.iter().product()],
+            front: vec![0.0; STREAM_FRONT],
+        }
+    }
+}
 
 /// In-place voice converter. Holds optional ONNX session, optional
 /// resamplers, and the streaming buffers that bridge native-rate audio
@@ -107,6 +156,12 @@ pub struct VoiceConverter {
     /// Last sample rate observed; used to detect device changes that
     /// require a resampler rebuild.
     last_rate: u32,
+    /// v1.3.0: true when the loaded model exposes the streaming
+    /// cache-tensor contract (detected at load by an `enc_buf` input).
+    streaming: bool,
+    /// v1.3.0: streaming cache state, threaded between chunks. Reset to
+    /// zero on (re)load and whenever the pipeline clears.
+    caches: StreamCaches,
 }
 
 impl VoiceConverter {
@@ -127,6 +182,8 @@ impl VoiceConverter {
             native_out: VecDeque::with_capacity(NATIVE_RATE as usize),
             dry_delay: VecDeque::with_capacity(NATIVE_RATE as usize),
             last_rate: 0,
+            streaming: false,
+            caches: StreamCaches::zeros(),
         }
     }
 
@@ -170,8 +227,11 @@ impl VoiceConverter {
         if let Some(rx) = self.loader.as_ref() {
             match rx.try_recv() {
                 Ok(session) => {
+                    self.streaming = session.as_ref().is_some_and(session_is_streaming);
                     self.session = session;
                     self.loader = None;
+                    // Fresh model → fresh streaming state.
+                    self.caches = StreamCaches::zeros();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     // Still loading; stay in passthrough this callback.
@@ -202,6 +262,8 @@ impl VoiceConverter {
         self.chunk_out.clear();
         self.native_out.clear();
         self.dry_delay.clear();
+        // Reset streaming cache + lookahead so re-engagement starts clean.
+        self.caches = StreamCaches::zeros();
         if let Some(d) = self.down.as_mut() {
             d.reset();
         }
@@ -225,15 +287,28 @@ impl VoiceConverter {
         self.up = MonoSinc::new(MODEL_RATE, rate, 256).ok();
     }
 
-    /// Drain `chunk_in` whenever a full 16k chunk has accumulated;
-    /// run inference; push the converted samples onto `chunk_out`.
+    /// Drain `chunk_in` whenever a full inference chunk has accumulated;
+    /// run inference; push the converted samples onto `chunk_out`. The
+    /// chunk size + inference path depend on whether the loaded model is
+    /// streaming (small, stateful chunks) or non-streaming (one big
+    /// stateless chunk).
     fn drain_chunks(&mut self) {
-        while self.chunk_in.len() >= CHUNK_16K {
-            let mut chunk = vec![0f32; CHUNK_16K];
-            for slot in chunk.iter_mut().take(CHUNK_16K) {
+        let chunk_len = if self.streaming {
+            STREAM_CHUNK_16K
+        } else {
+            CHUNK_16K
+        };
+        while self.chunk_in.len() >= chunk_len {
+            let mut chunk = vec![0f32; chunk_len];
+            for slot in &mut chunk {
                 *slot = self.chunk_in.pop_front().unwrap_or(0.0);
             }
-            let converted = run_inference(self.session.as_mut(), &chunk);
+            let converted = if self.streaming {
+                // Disjoint borrows of `session` + `caches`.
+                run_inference_streaming(self.session.as_mut(), &mut self.caches, &chunk)
+            } else {
+                run_inference(self.session.as_mut(), &chunk)
+            };
             for s in converted {
                 self.chunk_out.push_back(s);
             }
@@ -384,11 +459,17 @@ impl AudioEffect for VoiceConverter {
     }
 
     fn latency_samples(&self, sample_rate: u32) -> usize {
-        // The dominant latency in the app: a full 16 kHz inference chunk
-        // (≈ 256 ms), expressed at the engine's rate. Only incurred when
-        // a model is actually loaded — passthrough adds nothing.
+        // One inference chunk, expressed at the engine's rate. Streaming
+        // models use the small 208-sample chunk (≈ 13 ms); non-streaming
+        // models the full 4096 (≈ 256 ms). Only incurred when a model is
+        // actually loaded — passthrough adds nothing.
         if self.session.is_some() {
-            (u64::from(sample_rate) * CHUNK_16K as u64 / u64::from(MODEL_RATE)) as usize
+            let chunk = if self.streaming {
+                STREAM_CHUNK_16K
+            } else {
+                CHUNK_16K
+            };
+            (u64::from(sample_rate) * chunk as u64 / u64::from(MODEL_RATE)) as usize
         } else {
             0
         }
@@ -587,6 +668,116 @@ fn run_inference(session: Option<&mut Session>, chunk: &[f32]) -> Vec<f32> {
     t.iter().copied().collect()
 }
 
+/// Whether a loaded session uses the v1.3.0 streaming contract — detected
+/// by an input named `enc_buf` (the first of the four threaded caches).
+fn session_is_streaming(session: &Session) -> bool {
+    session.inputs().iter().any(|i| i.name() == "enc_buf")
+}
+
+/// Pull a named f32 output out of a session run as an owned `Vec`.
+fn extract_named(outputs: &ort::session::SessionOutputs, name: &str) -> Option<Vec<f32>> {
+    let (_, value) = outputs.iter().find(|(n, _)| *n == name)?;
+    let arr = value.try_extract_array::<f32>().ok()?;
+    Some(arr.iter().copied().collect())
+}
+
+/// Run one streaming chunk: prepend the front-context, feed the audio +
+/// four cache tensors, collect the converted samples, and thread the
+/// updated caches forward. On any failure the chunk passes through dry
+/// and the caches are left untouched (so the stream stays consistent).
+///
+/// ### Streaming model I/O contract (LLVC, v1.3.0)
+///   inputs : `audio` `[1,1,240]`, `enc_buf` `[1,512,510]`,
+///            `dec_buf` `[1,2,13,256]`, `out_buf` `[1,512,4]`,
+///            `convnet_pre_ctx` `[1,1,24]`
+///   outputs: `output` `[1,1,208]` + the four `*_out` caches (same shapes)
+fn run_inference_streaming(
+    session: Option<&mut Session>,
+    caches: &mut StreamCaches,
+    chunk: &[f32],
+) -> Vec<f32> {
+    let Some(session) = session else {
+        return chunk.to_vec();
+    };
+    if chunk.len() != STREAM_CHUNK_16K {
+        return chunk.to_vec();
+    }
+
+    // audio = front-context ++ chunk → [1, 1, 240]
+    let mut audio = Vec::with_capacity(STREAM_IN);
+    audio.extend_from_slice(&caches.front);
+    audio.extend_from_slice(chunk);
+
+    let built = (|| {
+        let audio_t = ndarray::Array3::from_shape_vec((1, 1, STREAM_IN), audio).ok()?;
+        let enc_t = ndarray::Array3::from_shape_vec(
+            (ENC_BUF_SHAPE[0], ENC_BUF_SHAPE[1], ENC_BUF_SHAPE[2]),
+            caches.enc_buf.clone(),
+        )
+        .ok()?;
+        let dec_t = ndarray::Array4::from_shape_vec(
+            (
+                DEC_BUF_SHAPE[0],
+                DEC_BUF_SHAPE[1],
+                DEC_BUF_SHAPE[2],
+                DEC_BUF_SHAPE[3],
+            ),
+            caches.dec_buf.clone(),
+        )
+        .ok()?;
+        let out_t = ndarray::Array3::from_shape_vec(
+            (OUT_BUF_SHAPE[0], OUT_BUF_SHAPE[1], OUT_BUF_SHAPE[2]),
+            caches.out_buf.clone(),
+        )
+        .ok()?;
+        let cpc_t = ndarray::Array3::from_shape_vec(
+            (CPC_SHAPE[0], CPC_SHAPE[1], CPC_SHAPE[2]),
+            caches.cpc.clone(),
+        )
+        .ok()?;
+        Some((
+            ort::value::Tensor::from_array(audio_t).ok()?,
+            ort::value::Tensor::from_array(enc_t).ok()?,
+            ort::value::Tensor::from_array(dec_t).ok()?,
+            ort::value::Tensor::from_array(out_t).ok()?,
+            ort::value::Tensor::from_array(cpc_t).ok()?,
+        ))
+    })();
+    let Some((audio_v, enc_v, dec_v, out_v, cpc_v)) = built else {
+        return chunk.to_vec();
+    };
+
+    let inputs = ort::inputs![
+        "audio" => audio_v,
+        "enc_buf" => enc_v,
+        "dec_buf" => dec_v,
+        "out_buf" => out_v,
+        "convnet_pre_ctx" => cpc_v,
+    ];
+    let Ok(outputs) = session.run(inputs) else {
+        return chunk.to_vec();
+    };
+
+    // Extract everything first; only commit the new caches if the full
+    // set is present, so a partial failure can't corrupt the stream.
+    let (Some(out), Some(enc), Some(dec), Some(ob), Some(cpc)) = (
+        extract_named(&outputs, "output"),
+        extract_named(&outputs, "enc_buf_out"),
+        extract_named(&outputs, "dec_buf_out"),
+        extract_named(&outputs, "out_buf_out"),
+        extract_named(&outputs, "convnet_pre_ctx_out"),
+    ) else {
+        return chunk.to_vec();
+    };
+
+    caches.enc_buf = enc;
+    caches.dec_buf = dec;
+    caches.out_buf = ob;
+    caches.cpc = cpc;
+    caches.front = chunk[chunk.len() - STREAM_FRONT..].to_vec();
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // bypass paths are bit-exact passthroughs
 mod tests {
@@ -742,24 +933,26 @@ mod tests {
         assert!(!vc.is_model_loaded());
     }
 
-    // Real end-to-end conversion check against the exported LLVC model.
+    // Real end-to-end check against the exported STREAMING LLVC model.
     // `#[ignore]` so it never runs on CI or a plain `cargo test` (which
     // have no model + no onnxruntime.dll). Run on a dev box that did the
     // export with:
     //
     //   cargo test -p divora-core --all-features -- --ignored \
-    //       llvc_model_converts_a_chunk
+    //       llvc_streaming_model_converts_chunks
     //
-    // It points `ORT_DYLIB_PATH` at the workspace `target/debug` DLL and
-    // loads the model from the app's voices dir, then asserts a 4096-
-    // sample chunk comes back finite, full-length, and *changed*.
+    // Points `ORT_DYLIB_PATH` at the workspace `target/debug` DLL, loads
+    // the model from the app's voices dir, confirms it's detected as
+    // streaming, then threads the caches through several 208-sample
+    // chunks and asserts each comes back one-chunk-long, finite, and the
+    // stream overall *changed*.
     #[test]
-    #[ignore = "needs the exported LLVC model + onnxruntime.dll installed locally"]
+    #[ignore = "needs the exported streaming LLVC model + onnxruntime.dll installed locally"]
     // `std::env::set_var` is unsafe in edition 2024; this is a single-
     // threaded, ignored, dev-only integration test setting the dylib path
     // before any ort init — no data race possible.
     #[allow(unsafe_code)]
-    fn llvc_model_converts_a_chunk() {
+    fn llvc_streaming_model_converts_chunks() {
         use std::path::PathBuf;
 
         let home = std::env::var("USERPROFILE")
@@ -775,7 +968,6 @@ mod tests {
             eprintln!("skip: {} not present", model.display());
             return;
         }
-        // Point ort at the DLL we copied next to the dev binary.
         let dll = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("target")
@@ -789,28 +981,40 @@ mod tests {
         }
 
         let mut session = super::load_session(&model);
-        assert!(session.is_some(), "LLVC model should load via ort");
-
-        // A 4096-sample 16 kHz sine — stand-in for one engine chunk.
-        let chunk: Vec<f32> = (0..super::CHUNK_16K)
-            .map(|i| (i as f32 * 0.05).sin() * 0.3)
-            .collect();
-        let out = super::run_inference(session.as_mut(), &chunk);
-
-        assert_eq!(out.len(), chunk.len(), "output length preserved");
-        assert!(out.iter().all(|s| s.is_finite()), "all output finite");
-        let max_abs = out.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
-        assert!(max_abs <= 1.01, "no clipping (max {max_abs})");
-        let diff: f32 = out
-            .iter()
-            .zip(&chunk)
-            .map(|(a, b)| (a - b).abs())
-            .sum::<f32>()
-            / chunk.len() as f32;
         assert!(
-            diff > 1e-4,
-            "output must differ from input (mean|d|={diff})"
+            session.is_some(),
+            "streaming LLVC model should load via ort"
         );
-        eprintln!("LLVC conversion OK: mean|delta|={diff:.4}, peak={max_abs:.4}");
+        assert!(
+            super::session_is_streaming(session.as_ref().unwrap()),
+            "the bundled model must be detected as streaming"
+        );
+
+        // Thread the caches through 8 successive 208-sample chunks of a
+        // continuous tone, exactly as the engine would stream them.
+        let mut caches = super::StreamCaches::zeros();
+        let mut total_diff = 0.0_f32;
+        let mut total = 0usize;
+        for k in 0..8usize {
+            let base = k * super::STREAM_CHUNK_16K;
+            let chunk: Vec<f32> = (0..super::STREAM_CHUNK_16K)
+                .map(|i| ((base + i) as f32 * 0.05).sin() * 0.3)
+                .collect();
+            let out = super::run_inference_streaming(session.as_mut(), &mut caches, &chunk);
+            assert_eq!(out.len(), super::STREAM_CHUNK_16K, "one chunk out");
+            assert!(out.iter().all(|s| s.is_finite()), "all output finite");
+            let max_abs = out.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+            assert!(max_abs <= 1.5, "no gross clipping (max {max_abs})");
+            for (a, b) in out.iter().zip(&chunk) {
+                total_diff += (a - b).abs();
+            }
+            total += out.len();
+        }
+        let mean = total_diff / total as f32;
+        assert!(
+            mean > 1e-4,
+            "streaming output must differ from input (mean|d|={mean})"
+        );
+        eprintln!("streaming LLVC OK: mean|delta|={mean:.4}");
     }
 }

@@ -315,6 +315,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Add `voice_convert` to a chain and select a model → after a brief background load, your voice converts to the target voice; there is **no** UI hang while the model loads.
 - [ ] Select a model file that doesn't exist / is invalid → the effect degrades to passthrough and never hangs (no 60 s freeze).
 - [ ] Disable Voice Convert → voice returns to the pre-conversion signal immediately.
+- [ ] **Streaming (v1.3.0):** with the bundled narrator, the converted voice has *conversational* latency — talking over a call feels responsive, not the old ~quarter-second lag. The Mixer latency readout shows ~13 ms (vs ~256 ms for a non-streaming model). No clicks/seams between chunks during continuous speech.
 - [ ] Confirm the converted audio reaches a Discord call when output = CABLE Input.
 
 ## Monitor output routing (Phase 13)
@@ -330,7 +331,7 @@ Run this checklist before tagging any release that touches audio capture, output
 ## Latency readout (Phase 14)
 
 - [ ] With the engine running and an empty/sample-by-sample chain, the Mixer header shows no latency suffix (or `+0 ms`).
-- [ ] Enable **Voice Convert** (model loaded) → header shows roughly `+256 ms` within a second.
+- [ ] Enable **Voice Convert** with the bundled **streaming** narrator (v1.3.0) → header shows roughly `+13 ms` (not the old ~256 ms), and the converted voice is usable in live conversation. A non-streaming BYO model still shows ~256 ms.
 - [ ] Enable the **denoiser** at 48 kHz → adds ~10 ms; enable **pitch** or **formant** → ~21 ms each. The number updates the instant you toggle an effect.
 - [ ] Disable all latency-adding effects → the readout returns to ~0.
 - [ ] Hover the readout → tooltip explains the contributors.

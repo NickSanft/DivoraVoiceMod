@@ -10,8 +10,10 @@
 
 $ErrorActionPreference = "Stop"
 
+# voice-assets-v2 hosts the STREAMING LLVC narrator (v1.3.0). v1 kept the
+# non-streaming model so older tags still build against their own asset.
 $repo = "NickSanft/DivoraVoiceMod"
-$tag = "voice-assets-v1"
+$tag = "voice-assets-v2"
 
 $root = Split-Path -Parent $PSScriptRoot
 $res = Join-Path $root "src-tauri\resources"

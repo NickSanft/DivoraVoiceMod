@@ -4,6 +4,34 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-01 — Streaming AI voice conversion (low latency)
+
+The AI voices are now usable in live conversation.
+
+### Added
+
+- **Streaming LLVC.** Re-exported LLVC in its streaming mode — the cache-tensor forward `(audio, enc_buf, dec_buf, out_buf, convnet_pre_ctx) → (output, …caches)` — and rewrote the Voice Convert effect to thread the four cache tensors + a 2·L front-context between tiny **208-sample (~13 ms)** chunks. Voice Convert latency drops from **~256 ms to ~13 ms**; the Mixer's "+N ms" readout reflects it.
+- The effect **auto-detects the model contract**: a model exposing the cache inputs (`enc_buf` …) uses the low-latency streaming path; an older single-`audio`→`output` model falls back to the 256 ms stateless path. Both still degrade to passthrough when the ONNX runtime or model is absent — and the caches are zero-initialized (verified equivalent to the model's `None`-init).
+- The bundled narrator is now the streaming export, hosted on the new **`voice-assets-v2`** release (v1 kept the non-streaming model so pre-1.3 tags still build). The reproducible exporter is committed at [`docs/voice-models/export_streaming_onnx.py`](docs/voice-models/export_streaming_onnx.py) — it validated the streaming ONNX against PyTorch to **max|diff| ≈ 2e-7** over an 8-chunk run.
+
+### Tests
+
+- **Rust**: the ignored LLVC integration test now threads the four caches through 8 streaming chunks against the real model (run locally with the runtime DLL — verified `mean|delta| ≈ 0.19`, full-length finite chunks, streaming detected). Unit + bypass tests unchanged; total unchanged.
+- **Frontend**: unchanged (254) — no UI/IPC change.
+
+### Notes
+
+- No frozen-surface change: Voice Convert's UI (Mix) + the Deep Narrator preset/cast are identical — it's the same effect, just fast enough for live calls. Final latency + audio sign-off is a desktop check (see `docs/MANUAL_TESTS.md`).
+
+### Pre-push checklist (local, 2026-06-01)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (+ streaming integration test verified locally with the DLL)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (254)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.2.1] — 2026-06-01 — Choir as a chord + "In use" fix
 
 Two fixes from feedback.
