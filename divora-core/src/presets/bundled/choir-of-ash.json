@@ -9,7 +9,7 @@
   "chain": [
     { "id": "pitch", "enabled": true, "vals": { "shift": 2 } },
     { "id": "formant", "enabled": true, "vals": { "shift": 3 } },
-    { "id": "chorus", "enabled": true, "vals": { "mix": 80, "depth": 65 } },
+    { "id": "harmonizer", "enabled": true, "vals": { "mix": 85, "v1": 3, "v2": 6, "v3": 9 } },
     { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 0, "high": 4 } },
     { "id": "reverb", "enabled": true, "vals": { "size": 64, "mix": 50 } }
   ]

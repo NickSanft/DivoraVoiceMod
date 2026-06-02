@@ -124,19 +124,22 @@ mod tests {
         );
     }
 
-    // v1.2.0 (The Coven): Choir of Ash gets its "many voices from one"
-    // ensemble from the chorus/doubler effect — lock it in so a future
-    // edit can't quietly drop it back to a single (high) voice.
+    // v1.2.1 (The Coven): Choir of Ash gets its chord from the
+    // harmonizer (a diminished stack), not a single (high) voice. Lock
+    // it in so a future edit can't quietly drop it back to one voice.
     #[test]
-    fn choir_of_ash_layers_a_chorus() {
+    fn choir_of_ash_layers_a_harmonizer() {
         let presets = bundled_presets();
         let choir = presets
             .iter()
             .find(|p| p.id == "choir-of-ash")
             .expect("choir-of-ash must be bundled");
         assert!(
-            choir.chain.iter().any(|e| e.id == "chorus" && e.enabled),
-            "Choir of Ash should layer an enabled chorus for the ensemble"
+            choir
+                .chain
+                .iter()
+                .any(|e| e.id == "harmonizer" && e.enabled),
+            "Choir of Ash should layer an enabled harmonizer for the chord"
         );
     }
 

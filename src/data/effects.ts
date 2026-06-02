@@ -120,6 +120,20 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.mix ?? 0}% · ${v.depth ?? 0}%`,
   },
+  harmonizer: {
+    id: "harmonizer",
+    name: "Harmonizer",
+    sigil: "ab",
+    desc: "Stacks pitched copies into a chord (diminished by default). Mix + three interval voices in semitones.",
+    params: [
+      { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 70 },
+      { key: "v1", label: "Voice 1", min: -24, max: 24, step: 1, unit: "st", default: 3 },
+      { key: "v2", label: "Voice 2", min: -24, max: 24, step: 1, unit: "st", default: 6 },
+      { key: "v3", label: "Voice 3", min: -24, max: 24, step: 1, unit: "st", default: 9 },
+    ],
+    readout: (v) =>
+      `${signed(v.v1 ?? 0)}/${signed(v.v2 ?? 0)}/${signed(v.v3 ?? 0)} st`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -145,6 +159,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "echo",
   "reverb",
   "chorus",
+  "harmonizer",
 ];
 
 /** Build a chain entry with sensible defaults, optionally overriding values. */

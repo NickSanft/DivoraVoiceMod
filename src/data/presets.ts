@@ -67,7 +67,7 @@ export const FALLBACK_PRESETS: Preset[] = [
     chain: [
       fx("pitch", true, { shift: 2 }),
       fx("formant", true, { shift: 3 }),
-      fx("chorus", true, { mix: 80, depth: 65 }),
+      fx("harmonizer", true, { mix: 85, v1: 3, v2: 6, v3: 9 }),
       fx("eq", true, { low: -2, mid: 0, high: 4 }),
       fx("reverb", true, { size: 64, mix: 50 }),
     ],

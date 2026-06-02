@@ -4,6 +4,33 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-06-01 — Choir as a chord + "In use" fix
+
+Two fixes from feedback.
+
+### Fixed
+
+- **Choir of Ash now sings a chord.** v1.2.0's chorus still read as a single (high) voice — a chorus only detunes, it can't make harmony. Replaced it with a new **Harmonizer** that stacks pitched copies into an actual **diminished chord** (the dry root plus +3 / +6 / +9 semitones).
+- **Presets "In use" badge no longer shows on every preset.** It compared the active preset to itself (always true), so every voice in the editor claimed "In use." It now appears only when the engine is actually running the active preset (nothing shows it while stopped).
+
+### Added
+
+- **Harmonizer effect** — sums the dry "root" with up to three independent phase-vocoder pitch voices. Defaults to a diminished stack (3 / 6 / 9 st), but each interval is adjustable (**Voice 1 / 2 / 3**), so it doubles as a general 3-voice harmonizer (e.g. 4 / 7 for a major triad). **Mix** sets the chord level; the dry path adds no latency. Additive `EffectKind::Harmonizer`.
+
+### Tests
+
+- **Rust**: 137 → 141 (+4 harmonizer: passthrough at mix 0, adds chord energy once warm, DC stays finite, zero added latency; the Choir-of-Ash lock now asserts the harmonizer).
+- **Frontend**: 254 (catalog + Choir tests updated chorus → harmonizer).
+
+### Pre-push checklist (local, 2026-06-01)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (148 across crates, +1 ignored LLVC)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (254)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.2.0] — 2026-06-01 — Coven ensemble: the chorus effect
 
 Choir of Ash finally sounds like a choir.

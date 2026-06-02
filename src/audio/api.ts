@@ -116,6 +116,7 @@ export type EffectKindWire =
   | "echo"
   | "reverb"
   | "chorus"
+  | "harmonizer"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

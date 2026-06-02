@@ -39,15 +39,18 @@ describe("The Coven cast", () => {
     expect(castMemberFor("not-a-member")).toBeUndefined();
   });
 
-  // v1.2.0: the chorus effect powers Choir of Ash's ensemble.
-  it("the chorus effect is in the catalog", () => {
+  // v1.2.0 / v1.2.1: the chorus + harmonizer effects power the Coven.
+  it("the chorus + harmonizer effects are in the catalog", () => {
     expect(EFFECTS.chorus).toBeDefined();
-    expect(EFFECTS.chorus.params.some((p) => p.key === "mix")).toBe(true);
+    expect(EFFECTS.harmonizer).toBeDefined();
+    expect(EFFECTS.harmonizer.params.some((p) => p.key === "v1")).toBe(true);
   });
 
-  it("Choir of Ash layers a chorus for its ensemble", () => {
+  it("Choir of Ash layers a harmonizer for its chord", () => {
     const choir = FALLBACK_PRESETS.find((p) => p.id === "choir-of-ash");
     expect(choir).toBeDefined();
-    expect(choir!.chain.some((e) => e.id === "chorus" && e.enabled)).toBe(true);
+    expect(choir!.chain.some((e) => e.id === "harmonizer" && e.enabled)).toBe(
+      true,
+    );
   });
 });

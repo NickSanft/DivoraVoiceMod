@@ -27,6 +27,7 @@ mod echo;
 mod eq;
 mod formant;
 mod gate;
+mod harmonizer;
 mod pitch;
 mod reverb;
 mod robot;
@@ -40,6 +41,7 @@ pub use echo::Echo;
 pub use eq::Eq;
 pub use formant::FormantShift;
 pub use gate::NoiseGate;
+pub use harmonizer::Harmonizer;
 pub use pitch::PitchShift;
 pub use reverb::Reverb;
 pub use robot::Robot;
@@ -66,8 +68,12 @@ pub enum EffectKind {
     Reverb,
     /// v1.2.0 (The Coven): chorus / doubler — modulated multi-tap delay
     /// summed with the dry signal for an ensemble ("many voices from
-    /// one"). Powers the richer "Choir of Ash" voice.
+    /// one").
     Chorus,
+    /// v1.2.1 (The Coven): harmonizer — pitched copies at musical
+    /// intervals summed with the dry root, making an actual chord
+    /// (diminished by default). Powers the "Choir of Ash" voice.
+    Harmonizer,
     /// Phase 12: ONNX-backed voice conversion (LLVC-style). Loads a
     /// `.onnx` model from the voices directory and streams 48 kHz mono
     /// through a 16 kHz inference chunk. Falls back to passthrough
@@ -259,6 +265,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::Echo => Box::new(Echo::new()),
         EffectKind::Reverb => Box::new(Reverb::new()),
         EffectKind::Chorus => Box::new(Chorus::new()),
+        EffectKind::Harmonizer => Box::new(Harmonizer::new()),
         EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
     };
     effect.set_enabled(spec.enabled);

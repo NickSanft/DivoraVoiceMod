@@ -36,8 +36,6 @@ export function PresetsScreen(): JSX.Element {
   const [exportJson, setExportJson] = createSignal("");
   const [actionError, setActionError] = createSignal<string | null>(null);
 
-  const isActive = (id: string) => app.presetId() === id;
-
   const openExport = async (): Promise<void> => {
     const snapshot = app.presetWithCurrentChain(app.presetId());
     if (!snapshot) return;
@@ -113,7 +111,6 @@ export function PresetsScreen(): JSX.Element {
           onReorder={(from, to) => app.reorderChainEntries(from, to)}
           actionError={actionError()}
           dismissError={() => setActionError(null)}
-          isActive={isActive(app.presetId())}
         />
       </div>
       <ExportPresetModal
@@ -314,7 +311,6 @@ function PresetGroup(props: PresetGroupProps): JSX.Element {
 interface PresetEditorProps {
   preset: Preset;
   chain: ChainEntry[];
-  isActive: boolean;
   isActiveRunning: boolean;
   onUse: () => void;
   onSave: () => void;
@@ -370,7 +366,7 @@ function PresetEditor(props: PresetEditorProps): JSX.Element {
               {props.preset.name}
             </h2>
             <Badge tone={isBundled() ? "accent" : "info"}>{props.preset.tag}</Badge>
-            <Show when={props.isActive}>
+            <Show when={props.isActiveRunning}>
               <Badge tone="success" icon="check">
                 In use
               </Badge>

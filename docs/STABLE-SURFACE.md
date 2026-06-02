@@ -137,10 +137,10 @@ GlobalShortcutEvent { id, accelerator, state: "pressed" | "released" }
 `EffectKindWire` (frozen set; new kinds may be **added** after v1.0):
 
 ```
-gate · denoiser · pitch · formant · eq · robot · distortion · echo · reverb · chorus · voice_convert
+gate · denoiser · pitch · formant · eq · robot · distortion · echo · reverb · chorus · harmonizer · voice_convert
 ```
 
-(`chorus` added in v1.2.0 — kinds are additive after v1.0.)
+(`chorus` added in v1.2.0, `harmonizer` in v1.2.1 — kinds are additive after v1.0.)
 
 ---
 
