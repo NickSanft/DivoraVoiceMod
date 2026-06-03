@@ -332,6 +332,41 @@ describe("app store — Phase 2 audio actions", () => {
     );
   });
 
+  it("restarts on the FIRST device change of the session while running (defer prev-undefined regression)", async () => {
+    // Regression (v1.4.1): with on(..., { defer: true }), Solid passes
+    // prev=undefined on the first post-mount change. The old guard
+    // `if (prev === undefined) return` swallowed the very first device
+    // switch — so picking a monitor took effect only on the *second* try.
+    // No device is changed before startEngine here, so the monitor change
+    // below IS the session's first — it must restart the engine.
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_audio_engine") {
+        const a = args as { monitorName: string | null };
+        return {
+          inputName: "in",
+          outputName: "out",
+          monitorName: a.monitorName,
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    await result.startEngine();
+    expect(result.engineRunning()).toBe(true);
+    invokeMock.mockClear();
+    result.setSelectedMonitor("Headphones"); // first device change since mount
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.objectContaining({ monitorName: "Headphones" }),
+    );
+  });
+
   it("startEngine passes the selected monitor device (Phase 13)", async () => {
     invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "start_audio_engine") {

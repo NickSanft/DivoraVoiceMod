@@ -632,9 +632,19 @@ export function createAppState(): AppState {
     on(
       [selectedInput, selectedOutput, selectedMonitor],
       ([newIn, newOut, newMon], prev) => {
-        if (prev === undefined) return; // initial run guard (belt + suspenders with defer)
-        const [prevIn, prevOut, prevMon] = prev;
-        if (newIn === prevIn && newOut === prevOut && newMon === prevMon) return;
+        // `defer: true` already skips the on-mount run, so any call here is
+        // a real change. Solid leaves `prev` undefined on the FIRST
+        // post-mount change (it doesn't record a prevInput during the
+        // deferred run) — treat that as a change too, otherwise the first
+        // device switch of the session is silently swallowed and only the
+        // second takes effect. Only dedupe a genuine no-op (prev present
+        // and all three equal).
+        if (prev) {
+          const [prevIn, prevOut, prevMon] = prev;
+          if (newIn === prevIn && newOut === prevOut && newMon === prevMon) {
+            return;
+          }
+        }
         if (!engineRunning()) return;
         void (async () => {
           await stopEngine();

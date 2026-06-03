@@ -4,6 +4,25 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-06-02 — Fix: first device switch was ignored
+
+### Fixed
+
+- **Changing an audio device now takes effect on the first try.** The live device-switch effect used `on(…, { defer: true })` guarded by `if (prev === undefined) return` — but Solid passes `prev === undefined` on the *first* post-mount change, so that guard silently swallowed the session's first device switch; only the second took effect. Most visible on the **monitor output** picker (the first selection seemed to do nothing). Now the first change restarts the engine as intended; genuine no-op re-selections are still deduped.
+
+### Tests
+
+- **Frontend**: 254 → 255 (+1 regression: the session's *first* device change, made while the engine is running, restarts it).
+
+### Pre-push checklist (local, 2026-06-02)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (255)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.4.0] — 2026-06-02 — The choir family (Coven expansion)
 
 Four new character voices, all built on the adjustable Harmonizer — the Coven cast is now 10.
