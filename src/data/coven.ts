@@ -58,6 +58,26 @@ export const COVEN: CastMember[] = [
     lore: "Calm, resonant, certain — the voice that already knows how this ends.",
   },
   {
+    presetId: "seraph",
+    kind: "dsp",
+    lore: "Radiant and many-winged — a major-chord choir that lifts where the Ash dreads.",
+  },
+  {
+    presetId: "dirge",
+    kind: "dsp",
+    lore: "A funeral hymn for one: minor thirds over a low toll, draped in cold stone.",
+  },
+  {
+    presetId: "the-swarm",
+    kind: "dsp",
+    lore: "Not one voice but a thousand, beating against each other. We are legion.",
+  },
+  {
+    presetId: "the-possessed",
+    kind: "dsp",
+    lore: "Your voice, and the thing wearing it — an octave lower and a fifth beneath.",
+  },
+  {
     presetId: "deep-narrator-ai",
     kind: "model",
     modelId: "llvc-narrator",

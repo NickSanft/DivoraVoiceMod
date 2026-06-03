@@ -4,6 +4,37 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-06-02 — The choir family (Coven expansion)
+
+Four new character voices, all built on the adjustable Harmonizer — the Coven cast is now 10.
+
+### Added
+
+- **Seraph** — the bright counterpart to Choir of Ash: a **major** chord (root + maj-3rd + 5th + octave) with airy formant + plate reverb. Lifts where the Ash dreads.
+- **Dirge** — a **minor** chord (min-3rd + 5th) over a low octave toll, slightly lowered and draped in cavernous reverb. A funeral hymn for one.
+- **The Swarm** — a tight dissonant **cluster** (+1 / +2 / −1 st) through a ring-mod buzz + grit. "We are legion."
+- **The Possessed** — your natural voice plus a demonic layer an **octave (and a fifth) below**, with a low ring-mod growl. The thing wearing your voice.
+
+All four are bundled presets + Coven cast members reusing the existing Harmonizer (no new effects, no model) — so they install everywhere and add zero latency.
+
+### Tests
+
+- **Rust**: +1 (`choir_family_intervals_are_distinct_chords`) locks each member's harmonizer chord (Seraph +4, Dirge +3/−12, Possessed −12, Swarm +1) so a future edit can't flatten them. `every_bundled_preset_parses` now covers 11 bundled presets.
+- **Frontend**: 254 (the cast-data tests now cover the four new members via the fallback presets).
+
+### Notes
+
+- No new effect/IPC/model surface — these are presets over the v1.2.1 Harmonizer. Roadmap shifts: zero-shot + personal voice → v1.5.0, loudness → v1.6.0.
+
+### Pre-push checklist (local, 2026-06-02)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (254)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.3.0] — 2026-06-01 — Streaming AI voice conversion (low latency)
 
 The AI voices are now usable in live conversation.

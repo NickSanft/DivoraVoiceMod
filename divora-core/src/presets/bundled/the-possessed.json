@@ -1,0 +1,16 @@
+{
+  "id": "the-possessed",
+  "version": 1,
+  "name": "The Possessed",
+  "color": "#9B2D5E",
+  "glyph": "panic",
+  "tag": "Bundled",
+  "desc": "Your voice, and the thing wearing it — an octave lower and a fifth beneath.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -50 } },
+    { "id": "harmonizer", "enabled": true, "vals": { "mix": 80, "v1": -12, "v2": -7, "v3": -12 } },
+    { "id": "robot", "enabled": true, "vals": { "freq": 70, "mix": 22 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 28 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 40, "mix": 22 } }
+  ]
+}

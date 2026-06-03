@@ -1,0 +1,16 @@
+{
+  "id": "the-swarm",
+  "version": 1,
+  "name": "The Swarm",
+  "color": "#8FB339",
+  "glyph": "ab",
+  "tag": "Bundled",
+  "desc": "Not one voice but a thousand, beating against each other. We are legion.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -48 } },
+    { "id": "harmonizer", "enabled": true, "vals": { "mix": 75, "v1": 1, "v2": 2, "v3": -1 } },
+    { "id": "robot", "enabled": true, "vals": { "freq": 110, "mix": 25 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 30 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 3, "high": 3 } }
+  ]
+}

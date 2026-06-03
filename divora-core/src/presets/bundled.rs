@@ -30,6 +30,23 @@ const BUNDLED: &[BundledSource] = &[
         id: "the-oracle",
         json: include_str!("bundled/the-oracle.json"),
     },
+    // v1.4.0: the choir family — adjustable-Harmonizer chord voices.
+    BundledSource {
+        id: "seraph",
+        json: include_str!("bundled/seraph.json"),
+    },
+    BundledSource {
+        id: "dirge",
+        json: include_str!("bundled/dirge.json"),
+    },
+    BundledSource {
+        id: "the-swarm",
+        json: include_str!("bundled/the-swarm.json"),
+    },
+    BundledSource {
+        id: "the-possessed",
+        json: include_str!("bundled/the-possessed.json"),
+    },
     BundledSource {
         id: "clean",
         json: include_str!("bundled/clean.json"),
@@ -63,7 +80,7 @@ pub fn bundled_preset_ids() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{bundled_preset_ids, bundled_presets};
-    use crate::presets::PresetTag;
+    use crate::presets::{Preset, PresetTag};
 
     #[test]
     fn every_bundled_preset_parses() {
@@ -141,6 +158,35 @@ mod tests {
                 .any(|e| e.id == "harmonizer" && e.enabled),
             "Choir of Ash should layer an enabled harmonizer for the chord"
         );
+    }
+
+    // v1.4.0: the choir family is built on the adjustable Harmonizer —
+    // each member layers a harmonizer with its own chord intervals. Lock
+    // the identities so a future edit can't flatten them.
+    #[test]
+    fn choir_family_intervals_are_distinct_chords() {
+        let presets = bundled_presets();
+        let find = |id: &str| presets.iter().find(|p| p.id == id).unwrap().clone();
+        let harm = |p: &Preset| {
+            p.chain
+                .iter()
+                .find(|e| e.id == "harmonizer" && e.enabled)
+                .unwrap_or_else(|| panic!("{} must layer a harmonizer", p.id))
+                .clone()
+        };
+        // Seraph = major triad (v1 = +4, major third).
+        assert_eq!(harm(&find("seraph")).vals.get("v1").copied(), Some(4.0));
+        // Dirge = minor third + a low octave toll (v1 = +3, v3 = -12).
+        let d = harm(&find("dirge"));
+        assert_eq!(d.vals.get("v1").copied(), Some(3.0));
+        assert_eq!(d.vals.get("v3").copied(), Some(-12.0));
+        // The Possessed = octave-down doubling (v1 = -12).
+        assert_eq!(
+            harm(&find("the-possessed")).vals.get("v1").copied(),
+            Some(-12.0)
+        );
+        // The Swarm = a tight dissonant cluster (v1 = +1).
+        assert_eq!(harm(&find("the-swarm")).vals.get("v1").copied(), Some(1.0));
     }
 
     // v0.12.2: the Deep Narrator preset must actually *sound* deep via

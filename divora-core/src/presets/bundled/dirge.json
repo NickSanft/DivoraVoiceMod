@@ -1,0 +1,16 @@
+{
+  "id": "dirge",
+  "version": 1,
+  "name": "Dirge",
+  "color": "#5B6B9E",
+  "glyph": "echo",
+  "tag": "Bundled",
+  "desc": "A funeral hymn for one — minor thirds over a low toll, draped in stone.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -52 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -2 } },
+    { "id": "harmonizer", "enabled": true, "vals": { "mix": 80, "v1": 3, "v2": 7, "v3": -12 } },
+    { "id": "eq", "enabled": true, "vals": { "low": 2, "mid": -1, "high": -2 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 70, "mix": 44 } }
+  ]
+}

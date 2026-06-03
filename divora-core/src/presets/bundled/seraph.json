@@ -1,0 +1,16 @@
+{
+  "id": "seraph",
+  "version": 1,
+  "name": "Seraph",
+  "color": "#F4D35E",
+  "glyph": "bolt",
+  "tag": "Bundled",
+  "desc": "Radiant and many-winged — a major-chord choir that lifts instead of dreads.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -52 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 2 } },
+    { "id": "harmonizer", "enabled": true, "vals": { "mix": 80, "v1": 4, "v2": 7, "v3": 12 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 0, "high": 4 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 58, "mix": 36 } }
+  ]
+}
