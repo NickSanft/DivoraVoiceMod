@@ -1,0 +1,17 @@
+{
+  "id": "leviathan",
+  "version": 1,
+  "name": "Leviathan",
+  "color": "#2E5E8C",
+  "glyph": "modulated",
+  "tag": "Bundled",
+  "desc": "From the trench where light dies — the weight of the whole ocean in a voice.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -50 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -10 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": -7 } },
+    { "id": "eq", "enabled": true, "vals": { "low": 6, "mid": -2, "high": -3 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 18 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 82, "mix": 42 } }
+  ]
+}

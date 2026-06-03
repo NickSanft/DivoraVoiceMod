@@ -4,6 +4,38 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-06-02 — Voice pack: range + utility (Coven → 15)
+
+Five more character voices, all DSP presets over the existing effects (no new effects, no model).
+
+### Added
+
+- **Leviathan** — the deepest voice in the cast: pitch −10 + formant −7 + a sub-bass shelf + cavern reverb and a touch of growl. Below Hollow King.
+- **The Imp** — the comedic high end: pitch +7 + formant up + a thin bright EQ + a playful short echo. The inverse of all the deep ones.
+- **Dispatch** — a clean **radio/comms** voice: gated, bandlimited (lows + highs cut, mids forward), lightly clipped. Intelligible and dry — practical for calls/streams. (Static Wraith is the *broken* radio; this is the working one.)
+- **Corrupted** — full digital decay: heavy bit-crush + ring-mod + tight stutter echo + a harsh EQ. A transmission eaten by the noise.
+- **Whisper Wraith** — airy and intimate: a high gate, a breath-forward EQ, a hair of formant lift, and a close room. Quiet and not quite alive.
+
+All five are bundled presets + Coven cast members, bringing the browser to **15 voices**.
+
+### Tests
+
+- **Rust**: +1 (`voice_pack_v15_keeps_its_character`) locks Leviathan as the deepest, The Imp as a pitch-up, and Dispatch as a dry (no-reverb) comms voice. `every_bundled_preset_parses` now covers 16 bundled presets.
+- **Frontend**: 255 (the cast-data tests cover the five new members via the fallback presets).
+
+### Notes
+
+- No new effect/IPC/model surface — presets over existing effects. Roadmap shifts: zero-shot + personal voice → v1.6.0, loudness → v1.7.0.
+
+### Pre-push checklist (local, 2026-06-02)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (255)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.4.1] — 2026-06-02 — Fix: first device switch was ignored
 
 ### Fixed

@@ -1,0 +1,15 @@
+{
+  "id": "whisper-wraith",
+  "version": 1,
+  "name": "Whisper Wraith",
+  "color": "#9AA7C7",
+  "glyph": "muted",
+  "tag": "Bundled",
+  "desc": "Close enough to feel the breath — airy, intimate, and not quite alive.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -55 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 1 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -4, "mid": -1, "high": 6 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 48, "mix": 30 } }
+  ]
+}

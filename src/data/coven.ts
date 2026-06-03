@@ -78,6 +78,31 @@ export const COVEN: CastMember[] = [
     lore: "Your voice, and the thing wearing it — an octave lower and a fifth beneath.",
   },
   {
+    presetId: "leviathan",
+    kind: "dsp",
+    lore: "From the trench where light dies — the weight of the whole ocean in a voice.",
+  },
+  {
+    presetId: "the-imp",
+    kind: "dsp",
+    lore: "Small, quick, and delighted by your misfortune — pitched up and never still.",
+  },
+  {
+    presetId: "dispatch",
+    kind: "dsp",
+    lore: "Clipped, bandlimited, all business — the voice on the other end of the radio.",
+  },
+  {
+    presetId: "corrupted",
+    kind: "dsp",
+    lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",
+  },
+  {
+    presetId: "whisper-wraith",
+    kind: "dsp",
+    lore: "Close enough to feel the breath — airy, intimate, and not quite alive.",
+  },
+  {
     presetId: "deep-narrator-ai",
     kind: "model",
     modelId: "llvc-narrator",

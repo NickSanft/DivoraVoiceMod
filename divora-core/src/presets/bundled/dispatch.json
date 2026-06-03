@@ -1,0 +1,14 @@
+{
+  "id": "dispatch",
+  "version": 1,
+  "name": "Dispatch",
+  "color": "#5FA8A0",
+  "glyph": "mic",
+  "tag": "Bundled",
+  "desc": "Clipped, bandlimited, all business — the voice on the other end of the radio.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -44 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -7, "mid": 5, "high": -5 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 25 } }
+  ]
+}

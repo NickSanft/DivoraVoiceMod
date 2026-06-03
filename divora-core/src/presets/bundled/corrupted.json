@@ -1,0 +1,16 @@
+{
+  "id": "corrupted",
+  "version": 1,
+  "name": "Corrupted",
+  "color": "#C13584",
+  "glyph": "warning",
+  "tag": "Bundled",
+  "desc": "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -46 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 65 } },
+    { "id": "robot", "enabled": true, "vals": { "freq": 180, "mix": 45 } },
+    { "id": "echo", "enabled": true, "vals": { "time": 60, "fb": 55 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 4, "high": 5 } }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "id": "the-imp",
+  "version": 1,
+  "name": "The Imp",
+  "color": "#F2A65A",
+  "glyph": "play",
+  "tag": "Bundled",
+  "desc": "Small, quick, and delighted by your misfortune. Pitched up and won't sit still.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -48 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": 7 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 6 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -3, "mid": 2, "high": 4 } },
+    { "id": "echo", "enabled": true, "vals": { "time": 90, "fb": 25 } }
+  ]
+}

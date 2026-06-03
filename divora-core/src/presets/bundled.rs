@@ -47,6 +47,27 @@ const BUNDLED: &[BundledSource] = &[
         id: "the-possessed",
         json: include_str!("bundled/the-possessed.json"),
     },
+    // v1.5.0: range fillers + utility voices.
+    BundledSource {
+        id: "leviathan",
+        json: include_str!("bundled/leviathan.json"),
+    },
+    BundledSource {
+        id: "the-imp",
+        json: include_str!("bundled/the-imp.json"),
+    },
+    BundledSource {
+        id: "dispatch",
+        json: include_str!("bundled/dispatch.json"),
+    },
+    BundledSource {
+        id: "corrupted",
+        json: include_str!("bundled/corrupted.json"),
+    },
+    BundledSource {
+        id: "whisper-wraith",
+        json: include_str!("bundled/whisper-wraith.json"),
+    },
     BundledSource {
         id: "clean",
         json: include_str!("bundled/clean.json"),
@@ -187,6 +208,41 @@ mod tests {
         );
         // The Swarm = a tight dissonant cluster (v1 = +1).
         assert_eq!(harm(&find("the-swarm")).vals.get("v1").copied(), Some(1.0));
+    }
+
+    // v1.5.0: range fillers + utility voices keep their defining
+    // character (Leviathan deepest, Imp pitched up, Dispatch a dry
+    // bandlimited comms voice). Lock it so edits can't blur them.
+    #[test]
+    fn voice_pack_v15_keeps_its_character() {
+        let presets = bundled_presets();
+        let p = |id: &str| presets.iter().find(|x| x.id == id).cloned();
+        let pitch = |id: &str| {
+            p(id)
+                .and_then(|x| {
+                    x.chain
+                        .iter()
+                        .find(|e| e.id == "pitch")
+                        .and_then(|e| e.vals.get("shift").copied())
+                })
+                .unwrap_or(0.0)
+        };
+        // Leviathan is the deepest in the cast — below Hollow King.
+        assert!(
+            pitch("leviathan") < pitch("hollow-king"),
+            "Leviathan must be deeper than Hollow King"
+        );
+        // The Imp pitches UP.
+        assert!(pitch("the-imp") > 0.0, "The Imp pitches up");
+        // Dispatch is a dry comms voice — no reverb, with a mid-forward EQ.
+        let dispatch = p("dispatch").expect("dispatch bundled");
+        assert!(
+            dispatch.chain.iter().all(|e| e.id != "reverb"),
+            "Dispatch stays dry (no reverb)"
+        );
+        // The atmospheric utility voices are present.
+        assert!(p("corrupted").is_some());
+        assert!(p("whisper-wraith").is_some());
     }
 
     // v0.12.2: the Deep Narrator preset must actually *sound* deep via
