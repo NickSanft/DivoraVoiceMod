@@ -84,6 +84,11 @@ export async function setAudioMonitor(enabled: boolean): Promise<void> {
   await invoke("set_audio_monitor", { enabled });
 }
 
+/** v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 = unity). */
+export async function setMonitorGain(gain: number): Promise<void> {
+  await invoke("set_monitor_gain", { gain });
+}
+
 export async function getEngineStatus(): Promise<EngineStatus> {
   return invoke<EngineStatus>("audio_engine_status");
 }

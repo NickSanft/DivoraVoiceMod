@@ -222,6 +222,25 @@ describe("app store — Phase 2 audio actions", () => {
     expect(result.engineMonitoring()).toBe(true);
   });
 
+  // ---- v1.6.0: monitor volume ------------------------------------------
+
+  it("setMonitorGain clamps, persists, and forwards to the backend", () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    expect(result.monitorGain()).toBe(1.0);
+
+    result.setMonitorGain(1.5);
+    expect(result.monitorGain()).toBe(1.5);
+    expect(invokeMock).toHaveBeenCalledWith("set_monitor_gain", { gain: 1.5 });
+    expect(window.localStorage.getItem("divora.monitorGain")).toBe("1.5");
+
+    // Above the 4.0 ceiling clamps down; below 0 clamps up.
+    result.setMonitorGain(99);
+    expect(result.monitorGain()).toBe(4);
+    result.setMonitorGain(-1);
+    expect(result.monitorGain()).toBe(0);
+  });
+
   // ---- Phase 16: recording ---------------------------------------------
 
   it("toggleRecording refuses to start while the engine is stopped", async () => {
@@ -542,6 +561,58 @@ describe("app store — Phase 4 preset actions", () => {
     result.usePreset(other!.id);
     expect(result.presetId()).toBe(other!.id);
     expect(result.ui.ab).toBe("A");
+  });
+
+  // ---- Presets: select vs. use (v1.6.0) --------------------------------
+
+  it("viewPreset previews without changing the active preset; Use applies", () => {
+    const { result } = setupApp();
+    const active = result.presetId();
+    const other = result.presets().find((p) => p.id !== active)!;
+    result.viewPreset(other.id);
+    expect(result.viewedId()).toBe(other.id); // editor shows the previewed one
+    expect(result.presetId()).toBe(active); // live voice unchanged
+    result.usePreset(other.id); // the "Use" button
+    expect(result.presetId()).toBe(other.id);
+    expect(result.viewedId()).toBe(other.id);
+  });
+
+  it("editing a previewed (non-active) preset does not touch the engine", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_audio_engine") {
+        return {
+          inputName: "i",
+          outputName: "o",
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    await result.startEngine();
+    const active = result.presetId();
+    const other = result.presets().find((p) => p.id !== active)!;
+    result.viewPreset(other.id);
+    invokeMock.mockClear();
+    result.setChainParam(0, "thresh", -33);
+    // The previewed preset's chain updated locally...
+    expect(result.viewedChain()[0]!.vals.thresh).toBe(-33);
+    // ...but the live engine was not told (it isn't the active preset).
+    expect(invokeMock).not.toHaveBeenCalledWith("set_effect_param", expect.anything());
+  });
+
+  it("leaving the Presets screen resyncs the viewed preset to the active one", async () => {
+    const { result } = setupApp();
+    const active = result.presetId();
+    const other = result.presets().find((p) => p.id !== active)!;
+    result.setNav("presets");
+    result.viewPreset(other.id);
+    expect(result.viewedId()).toBe(other.id);
+    result.setNav("mixer"); // leaving Presets
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(result.viewedId()).toBe(active); // back in sync with the live voice
   });
 
   // ---- The Coven (v1.1.0) ----------------------------------------------

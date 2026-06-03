@@ -28,6 +28,11 @@ pub struct EngineState {
     /// Phase 14: latency ADDED by the active DSP chain, in milliseconds
     /// (f32 bit pattern). Written by the output callback each buffer.
     pub dsp_latency_ms_bits: AtomicU32,
+    /// v1.6.0: gain applied to the monitor ("hear yourself") stream
+    /// (f32 bit pattern). 1.0 = unity. Set from the UI; read by the
+    /// monitor callback. `Default` leaves this 0.0, so `AudioEngine::new`
+    /// initializes it to 1.0.
+    pub monitor_gain_bits: AtomicU32,
 }
 
 impl EngineState {
@@ -67,6 +72,16 @@ impl EngineState {
     #[must_use]
     pub fn load_dsp_latency_ms(&self) -> f32 {
         f32::from_bits(self.dsp_latency_ms_bits.load(Ordering::Acquire))
+    }
+
+    pub fn store_monitor_gain(&self, gain: f32) {
+        self.monitor_gain_bits
+            .store(gain.to_bits(), Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn load_monitor_gain(&self) -> f32 {
+        f32::from_bits(self.monitor_gain_bits.load(Ordering::Acquire))
     }
 }
 

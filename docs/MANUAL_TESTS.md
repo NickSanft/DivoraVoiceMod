@@ -32,6 +32,14 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Click Stop → engine reports "Stopped"; IN and OUT meters drop to zero.
 - [ ] Round-trip latency feels under 30 ms (no perceptible echo of own voice when monitor is on).
 - [ ] Open Mixer → both vertical IN and OUT meters move while engine is running; peak-hold caps decay over ~1 s.
+
+## Monitor volume (v1.6.0)
+
+- [ ] Pick a **separate monitor device** (Settings → Audio, "Hear yourself" / monitor picker — e.g. your headphones, distinct from the stream output) and start the engine with Monitor on.
+- [ ] On the Mixer, the Monitor card shows a **Volume** slider with a `%` readout (defaults to 100 %).
+- [ ] Drag the slider up → you hear yourself **louder** in the monitor device; drag down toward 0 % → your sidetone fades to silence. The stream/main output level is unaffected.
+- [ ] The slider is disabled (greyed) when Monitor is toggled off.
+- [ ] Set a non-default volume (e.g. 150 %), restart the app → the slider restores to 150 % and the level matches on the next engine start.
 - [ ] When engine is stopped, Mixer shows "Engine offline" card with a clickable Settings link.
 - [ ] Sample-rate mismatch test: pick devices with different default sample rates (e.g., 44.1 kHz mic + 48 kHz output) → start fails with a clear "sample-rate mismatch" error message.
 
@@ -56,9 +64,12 @@ Run this checklist before tagging any release that touches audio capture, output
 ## Presets (Phase 4)
 
 - [ ] Default preset list loads on first run — the bundled presets visible in the left list under "Bundled · N", "User · 0" (N = the bundled count, currently 16 incl. the cast + Clean Passthrough + Deep Narrator).
-- [ ] Clicking a different preset in the list immediately switches the active preset (left dot moves; Mixer header updates).
-- [ ] Switching between presets is glitch-free (no clicks, no momentary silence — DSP graph swap on next buffer).
-- [ ] Right editor shows the active preset's header (glyph chip, name, Bundled/User badge, "In use" badge, description) and chain cards.
+- [ ] (v1.6.0) Clicking a different preset in the list **previews** it — the row highlights and the right editor shows it — but does **not** change the active voice: the green dot and the Mixer header stay on the active preset.
+- [ ] (v1.6.0) Click **Use** on the previewed preset → it becomes active (green dot moves; Mixer header updates). The Use button is disabled and labelled "In use" once that preset is active.
+- [ ] (v1.6.0) Preview a non-active preset and move one of its sliders while the engine runs → your live voice does **not** change (you're editing the preview, not the active chain). Then click Use → the edit takes effect live.
+- [ ] (v1.6.0) Preview a non-active preset on the Presets screen, then switch to the Mixer → the Mixer edits the **active** voice (not the preview); returning to Presets, the preview has resynced to the active preset.
+- [ ] Switching the active preset (via Use) is glitch-free (no clicks, no momentary silence — DSP graph swap on next buffer).
+- [ ] Right editor shows the **previewed** preset's header (glyph chip, name, Bundled/User badge, description) and chain cards. The "In use" badge appears only when the previewed preset is the active one **and** the engine is running.
 - [ ] Each ChainCard shows the effect's sigil, name, current readout, and an enable toggle.
 - [ ] Enabling a chain card expands it to show parameter sliders; disabling collapses them.
 - [ ] Drag a chain card's handle onto another card → drop target highlights indigo → release reorders the chain and the audio engine updates within one buffer.

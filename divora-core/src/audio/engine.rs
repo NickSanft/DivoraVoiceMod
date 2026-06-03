@@ -93,6 +93,8 @@ impl AudioEngine {
         // Monitor defaults to on so first-time users hear themselves
         // immediately when they start the engine.
         state.monitor.store(true, Ordering::Release);
+        // Monitor gain defaults to unity (Default would leave it 0.0).
+        state.store_monitor_gain(1.0);
         let state_clone = state.clone();
         let handle = std::thread::Builder::new()
             .name("divora-audio".into())
@@ -137,6 +139,14 @@ impl AudioEngine {
         let _ = self.tx.send(Command::SetMonitor(enabled));
     }
 
+    /// v1.6.0: set the gain applied to the separate monitor ("hear
+    /// yourself") stream. 1.0 = unity. Clamped to a safe range. Stored in
+    /// shared state and picked up by the monitor callback next buffer; no
+    /// engine restart needed.
+    pub fn set_monitor_gain(&self, gain: f32) {
+        self.state.store_monitor_gain(gain.clamp(0.0, 4.0));
+    }
+
     /// Send a DSP command (chain build, parameter sweep, etc.). The
     /// audio thread drains these at the top of each output buffer.
     pub fn send_dsp(&self, cmd: DspCommand) {
@@ -173,6 +183,12 @@ impl AudioEngine {
     #[must_use]
     pub fn is_monitoring(&self) -> bool {
         self.state.monitor.load(Ordering::Acquire)
+    }
+
+    /// v1.6.0: current monitor ("hear yourself") gain. 1.0 = unity.
+    #[must_use]
+    pub fn monitor_gain(&self) -> f32 {
+        self.state.load_monitor_gain()
     }
 
     #[must_use]
@@ -841,6 +857,8 @@ fn build_monitor_stream(
                     return;
                 }
                 let monitoring = state.monitor.load(Ordering::Acquire);
+                // v1.6.0: user-set monitor volume ("hear yourself" level).
+                let monitor_gain = state.load_monitor_gain();
                 let out_frames = (data.len() / channels).min(MAX_FRAMES_PER_CALLBACK);
 
                 // Match the main output's native-frame sizing so the
@@ -875,7 +893,7 @@ fn build_monitor_stream(
 
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
                     let sample = if i < written_out && monitoring {
-                        output_mono[i]
+                        output_mono[i] * monitor_gain
                     } else {
                         0.0
                     };
@@ -1125,6 +1143,21 @@ mod tests {
         assert_eq!(samples, vec![0, 16383, -16383, 32767, -32767]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.6.0: monitor gain defaults to unity and `set_monitor_gain`
+    /// clamps to a safe range.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn monitor_gain_defaults_to_unity_and_clamps() {
+        let engine = AudioEngine::new();
+        assert_eq!(engine.monitor_gain(), 1.0);
+        engine.set_monitor_gain(1.8);
+        assert!((engine.monitor_gain() - 1.8).abs() < 1e-6);
+        engine.set_monitor_gain(99.0);
+        assert_eq!(engine.monitor_gain(), 4.0); // clamped high
+        engine.set_monitor_gain(-3.0);
+        assert_eq!(engine.monitor_gain(), 0.0); // clamped low
     }
 
     #[test]

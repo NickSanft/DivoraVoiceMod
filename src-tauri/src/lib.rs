@@ -148,6 +148,13 @@ fn set_audio_monitor(state: State<'_, AppState>, enabled: bool) {
     state.engine.set_monitor(enabled);
 }
 
+/// v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 =
+/// unity). Takes effect next buffer; no restart needed.
+#[tauri::command]
+fn set_monitor_gain(state: State<'_, AppState>, gain: f32) {
+    state.engine.set_monitor_gain(gain);
+}
+
 #[tauri::command]
 fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
     EngineStatus {
@@ -660,6 +667,7 @@ pub fn run() {
             start_audio_engine,
             stop_audio_engine,
             set_audio_monitor,
+            set_monitor_gain,
             audio_engine_status,
             set_effect_chain,
             set_effect_param,

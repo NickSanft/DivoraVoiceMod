@@ -4,6 +4,38 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-06-03 — Presets preview-then-Use + monitor volume
+
+Two usability fixes from feedback: browsing presets no longer hijacks your live voice, and you can now set how loud you hear yourself.
+
+### Added
+
+- **Monitor volume** on the Mixer. A slider on the Monitor card scales the "hear yourself" (sidetone) level from **0–200 %** (engine clamps to 400 %), so you can boost or duck your own voice in your headphones without touching the stream that goes out. Persists across restarts and re-applies when the engine starts. Applies to the separate monitor device; with no separate monitor device active it has no effect.
+  - New backend surface: `set_monitor_gain` command → `AudioEngine::set_monitor_gain`, stored as an atomic f32 bit-pattern in `EngineState` and applied per-sample in the monitor stream callback.
+
+### Changed
+
+- **Presets no longer switch your live voice on click.** Selecting a preset in the Presets screen now only *previews* it (you can inspect and edit its chain); your active voice changes only when you press **Use**. Previously, clicking any row swapped the live voice immediately. The Mixer always edits the active voice — leaving the Presets screen resyncs the previewed selection back to the active one, so this split never leaks out.
+  - Internally: a new `viewedId` (editor selection) is split from `presetId` (active/live). Chain edits on the Presets screen target the viewed preset and only reach the engine when the viewed preset *is* the active one.
+
+### Tests
+
+- **Rust**: +1 (`monitor_gain_defaults_to_unity_and_clamps`) — unity default, high/low clamp.
+- **Frontend**: 255 → 259 (+4): preview-without-applying, editing a previewed non-active preset doesn't touch the engine, leaving the screen resyncs viewed→active, and `setMonitorGain` clamps/persists/forwards.
+
+### Notes
+
+- Roadmap unchanged from v1.5.0's shift: zero-shot + personal voice → v1.7.0, loudness → v1.8.0.
+
+### Pre-push checklist (local, 2026-06-03)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (259)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.5.0] — 2026-06-02 — Voice pack: range + utility (Coven → 15)
 
 Five more character voices, all DSP presets over the existing effects (no new effects, no model).

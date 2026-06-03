@@ -27,8 +27,9 @@ import type { ChainEntry, EffectId, Preset } from "../types";
 export function PresetsScreen(): JSX.Element {
   const app = useApp();
 
-  // Editor target = active preset. Clicking a row in the list calls
-  // usePreset(id), which sets the active id and resets A/B for it.
+  // Editor target = the VIEWED preset. Clicking a row in the list only
+  // previews it (viewPreset); the "Use" button applies it (usePreset),
+  // so browsing the library never changes the live voice on its own.
   const bundled = createMemo(() => app.presets().filter((p) => p.tag === "Bundled"));
   const user = createMemo(() => app.presets().filter((p) => p.tag === "User"));
 
@@ -37,7 +38,7 @@ export function PresetsScreen(): JSX.Element {
   const [actionError, setActionError] = createSignal<string | null>(null);
 
   const openExport = async (): Promise<void> => {
-    const snapshot = app.presetWithCurrentChain(app.presetId());
+    const snapshot = app.presetWithCurrentChain(app.viewedId());
     if (!snapshot) return;
     try {
       const json = await app.exportPreset(snapshot);
@@ -51,10 +52,11 @@ export function PresetsScreen(): JSX.Element {
   const onDuplicate = async (): Promise<void> => {
     setActionError(null);
     try {
-      const copy = await app.duplicatePreset(app.presetId());
+      const copy = await app.duplicatePreset(app.viewedId());
       if (copy) {
-        // Switch to the new copy so the user can edit it immediately.
-        app.usePreset(copy.id);
+        // Show the new copy in the editor so the user can edit it
+        // immediately — without making it the live voice (that's "Use").
+        app.viewPreset(copy.id);
       }
     } catch (err) {
       setActionError(String(err));
@@ -63,7 +65,7 @@ export function PresetsScreen(): JSX.Element {
 
   const onSave = async (): Promise<void> => {
     setActionError(null);
-    const snapshot = app.presetWithCurrentChain(app.presetId());
+    const snapshot = app.presetWithCurrentChain(app.viewedId());
     if (!snapshot) return;
     if (snapshot.tag !== "User") {
       // Bundled presets can't be saved over — use Duplicate instead.
@@ -82,7 +84,7 @@ export function PresetsScreen(): JSX.Element {
   const onDelete = async (): Promise<void> => {
     setActionError(null);
     try {
-      await app.deletePreset(app.presetId());
+      await app.deletePreset(app.viewedId());
     } catch (err) {
       setActionError(String(err));
     }
@@ -94,14 +96,16 @@ export function PresetsScreen(): JSX.Element {
         bundled={bundled()}
         user={user()}
         activeId={app.presetId()}
-        onPick={(id) => app.usePreset(id)}
+        selectedId={app.viewedId()}
+        onPick={(id) => app.viewPreset(id)}
       />
       <div style={{ flex: 1, "min-width": 0, display: "flex", "flex-direction": "column" }}>
         <PresetEditor
-          preset={app.preset()}
-          chain={app.chain()}
+          preset={app.viewedPreset()}
+          chain={app.viewedChain()}
+          isActive={app.viewedId() === app.presetId()}
           isActiveRunning={app.engineRunning()}
-          onUse={() => app.setNav("mixer")}
+          onUse={() => app.usePreset(app.viewedId())}
           onSave={() => void onSave()}
           onDuplicate={() => void onDuplicate()}
           onExport={() => void openExport()}
@@ -115,7 +119,7 @@ export function PresetsScreen(): JSX.Element {
       </div>
       <ExportPresetModal
         open={exportOpen()}
-        presetName={app.preset().name}
+        presetName={app.viewedPreset().name}
         json={exportJson()}
         onClose={() => setExportOpen(false)}
       />
@@ -126,7 +130,10 @@ export function PresetsScreen(): JSX.Element {
 interface PresetListProps {
   bundled: Preset[];
   user: Preset[];
+  /** The live (active) preset — gets the green "in use" dot. */
   activeId: string;
+  /** The previewed preset shown in the editor — gets the row highlight. */
+  selectedId: string;
   onPick: (id: string) => void;
 }
 
@@ -174,12 +181,14 @@ function PresetList(props: PresetListProps): JSX.Element {
           label="Bundled"
           presets={props.bundled}
           activeId={props.activeId}
+          selectedId={props.selectedId}
           onPick={props.onPick}
         />
         <PresetGroup
           label="User"
           presets={props.user}
           activeId={props.activeId}
+          selectedId={props.selectedId}
           onPick={props.onPick}
         />
       </div>
@@ -191,6 +200,7 @@ interface PresetGroupProps {
   label: string;
   presets: Preset[];
   activeId: string;
+  selectedId: string;
   onPick: (id: string) => void;
 }
 
@@ -231,7 +241,7 @@ function PresetGroup(props: PresetGroupProps): JSX.Element {
                 <button
                   type="button"
                   onClick={() => props.onPick(p.id)}
-                  aria-pressed={props.activeId === p.id}
+                  aria-pressed={props.selectedId === p.id}
                   style={{
                     width: "100%",
                     display: "flex",
@@ -240,9 +250,9 @@ function PresetGroup(props: PresetGroupProps): JSX.Element {
                     padding: "8px 10px",
                     "border-radius": "var(--r-md)",
                     background:
-                      props.activeId === p.id ? "var(--accent-bg)" : "transparent",
+                      props.selectedId === p.id ? "var(--accent-bg)" : "transparent",
                     border:
-                      props.activeId === p.id
+                      props.selectedId === p.id
                         ? "1px solid var(--line-glow)"
                         : "1px solid transparent",
                     color: "var(--text-hi)",
@@ -311,6 +321,8 @@ function PresetGroup(props: PresetGroupProps): JSX.Element {
 interface PresetEditorProps {
   preset: Preset;
   chain: ChainEntry[];
+  /** True when the viewed preset is also the active (live) one. */
+  isActive: boolean;
   isActiveRunning: boolean;
   onUse: () => void;
   onSave: () => void;
@@ -366,7 +378,7 @@ function PresetEditor(props: PresetEditorProps): JSX.Element {
               {props.preset.name}
             </h2>
             <Badge tone={isBundled() ? "accent" : "info"}>{props.preset.tag}</Badge>
-            <Show when={props.isActiveRunning}>
+            <Show when={props.isActive && props.isActiveRunning}>
               <Badge tone="success" icon="check">
                 In use
               </Badge>
@@ -383,8 +395,14 @@ function PresetEditor(props: PresetEditorProps): JSX.Element {
             {props.preset.desc}
           </div>
         </div>
-        <Button variant="primary" icon="play" onClick={props.onUse}>
-          Use
+        <Button
+          variant="primary"
+          icon="play"
+          onClick={props.onUse}
+          disabled={props.isActive}
+          title={props.isActive ? "Already the active voice" : "Make this the active voice"}
+        >
+          {props.isActive ? "In use" : "Use"}
         </Button>
       </div>
 

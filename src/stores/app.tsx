@@ -39,6 +39,7 @@ import {
   saveUserPreset as saveUserPresetCmd,
   scanSoundboardFolder as scanSoundboardFolderCmd,
   setAudioMonitor as setAudioMonitorCmd,
+  setMonitorGain as setMonitorGainCmd,
   setEffectChain as setEffectChainCmd,
   setEffectEnabled as setEffectEnabledCmd,
   setEffectParam as setEffectParamCmd,
@@ -138,6 +139,7 @@ const STORAGE_KEYS = {
   inputDevice: "divora.inputDevice",
   outputDevice: "divora.outputDevice",
   monitorDevice: "divora.monitorDevice",
+  monitorGain: "divora.monitorGain",
   soundboardFolder: "divora.soundboardFolder",
   tileGains: "divora.tileGains",
   soundboardMasterGain: "divora.soundboardMasterGain",
@@ -213,13 +215,18 @@ export interface AppState {
   /** True once at least one successful backend list has populated `presets`. */
   presetsLoaded: () => boolean;
 
-  // Active preset + chain
+  // Active preset + chain (the live voice — Mixer + engine)
   presetId: () => string;
   setPresetId: Setter<string>;
   preset: () => Preset;
   chains: Record<string, ChainEntry[]>;
   setChains: SetStoreFunction<Record<string, ChainEntry[]>>;
   chain: () => ChainEntry[];
+  // Viewed preset + chain (the Presets editor's selection — may differ
+  // from the active one while browsing; applied via `usePreset`).
+  viewedId: () => string;
+  viewedPreset: () => Preset;
+  viewedChain: () => ChainEntry[];
 
   // A/B compare snapshots
   abSlots: Record<string, AbSnapshots>;
@@ -282,6 +289,9 @@ export interface AppState {
   stopEngine: () => Promise<void>;
   toggleMonitor: () => Promise<void>;
   setMonitor: (enabled: boolean) => Promise<void>;
+  /** v1.6.0: monitor ("hear yourself") volume — linear gain, 1.0 = unity. */
+  monitorGain: () => number;
+  setMonitorGain: (gain: number) => void;
   /** Phase 16: toggle recording the modulated output to a WAV file. */
   toggleRecording: () => Promise<void>;
   /** Phase 16: absolute path of the recordings directory. */
@@ -303,6 +313,8 @@ export interface AppState {
 
   // Preset actions
   usePreset: (id: string) => void;
+  /** Preview a preset in the Presets editor without making it live. */
+  viewPreset: (id: string) => void;
   /** The Coven: apply a cast member's preset + (un)set its conversion model. */
   summon: (presetId: string, modelId?: string | null) => void;
   savePreset: (preset: Preset) => Promise<void>;
@@ -398,7 +410,14 @@ export function createAppState(): AppState {
   if (!firstPreset) {
     throw new Error("FALLBACK_PRESETS must contain at least one preset");
   }
+  // `presetId` is the ACTIVE / live preset — what the engine runs and the
+  // Mixer shows. `viewedId` is what the Presets editor shows + edits;
+  // clicking a row in the Presets list only changes `viewedId` (a
+  // preview), and the "Use" button applies it (active = viewed). The two
+  // are kept in sync everywhere except the Presets screen (see the nav
+  // resync effect below), so the Mixer always edits the active preset.
   const [presetId, setPresetId] = createSignal<string>(firstPreset.id);
+  const [viewedId, setViewedId] = createSignal<string>(firstPreset.id);
   const [chains, setChains] = createStore<Record<string, ChainEntry[]>>(
     initialChainsFor(FALLBACK_PRESETS),
   );
@@ -458,6 +477,18 @@ export function createAppState(): AppState {
     setSelectedMonitorRaw(name);
     saveJson(STORAGE_KEYS.monitorDevice, name);
   };
+  // v1.6.0: monitor ("hear yourself") volume, linear gain (1.0 = unity).
+  // Persisted + re-applied on engine start (a fresh session resets the
+  // engine's gain to unity). Sent live so the slider moves it instantly.
+  const [monitorGain, setMonitorGainRaw] = createSignal<number>(
+    loadJson<number>(STORAGE_KEYS.monitorGain, 1.0),
+  );
+  const setMonitorGain = (gain: number): void => {
+    const g = Math.min(Math.max(gain, 0), 4);
+    setMonitorGainRaw(g);
+    saveJson(STORAGE_KEYS.monitorGain, g);
+    void setMonitorGainCmd(g);
+  };
   const [engineRunning, setEngineRunning] = createSignal(false);
   const [engineMonitoring, setEngineMonitoring] = createSignal(true);
   const [engineError, setEngineError] = createSignal<string | null>(null);
@@ -477,6 +508,13 @@ export function createAppState(): AppState {
     () => presets().find((p) => p.id === presetId()) ?? presets()[0] ?? firstPreset,
   );
   const chain = createMemo<ChainEntry[]>(() => chains[presetId()] ?? []);
+
+  // The preset the Presets editor shows + edits (the "viewed" one, which
+  // may differ from the active one while browsing the list).
+  const viewedPreset = createMemo<Preset>(
+    () => presets().find((p) => p.id === viewedId()) ?? preset(),
+  );
+  const viewedChain = createMemo<ChainEntry[]>(() => chains[viewedId()] ?? []);
 
   const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
   const effectiveModulated = createMemo(() =>
@@ -557,6 +595,11 @@ export function createAppState(): AppState {
       // (master gain = unity), so re-apply the persisted master gain.
       if (soundboardMasterGain() !== 1.0) {
         void setSoundboardMasterGainCmd(soundboardMasterGain());
+      }
+      // v1.6.0: push the persisted monitor volume to the engine (a fresh
+      // app launch starts at unity until told otherwise).
+      if (monitorGain() !== 1.0) {
+        void setMonitorGainCmd(monitorGain());
       }
     } catch (err) {
       setEngineRunning(false);
@@ -757,30 +800,36 @@ export function createAppState(): AppState {
     applyActiveVoice();
   };
 
+  // Editing targets the VIEWED preset (on the Mixer that's always the
+  // active one; on Presets it may be a non-active preset being tweaked).
+  // Changes only reach the live engine when the viewed preset IS the
+  // active one — otherwise they're stored and applied when it's Used.
+  const editIsLive = (): boolean => engineRunning() && viewedId() === presetId();
+
   const setChainParam = (effectIndex: number, key: string, value: number): void => {
-    setChains(presetId(), effectIndex, "vals", key, value);
-    if (engineRunning()) {
+    setChains(viewedId(), effectIndex, "vals", key, value);
+    if (editIsLive()) {
       void setEffectParamCmd(effectIndex, key, value);
     }
   };
 
   const setChainEnabled = (effectIndex: number, enabled: boolean): void => {
-    setChains(presetId(), effectIndex, "enabled", enabled);
-    if (engineRunning()) {
+    setChains(viewedId(), effectIndex, "enabled", enabled);
+    if (editIsLive()) {
       void setEffectEnabledCmd(effectIndex, enabled);
     }
   };
 
   const toggleEffectById = (id: EffectId): void => {
-    const idx = chain().findIndex((c) => c.id === id);
+    const idx = viewedChain().findIndex((c) => c.id === id);
     if (idx < 0) return;
-    const entry = chain()[idx];
+    const entry = viewedChain()[idx];
     if (!entry) return;
     setChainEnabled(idx, !entry.enabled);
   };
 
   const reorderChainEntries = (from: number, to: number): void => {
-    const current = chain();
+    const current = viewedChain();
     if (
       from === to ||
       from < 0 ||
@@ -793,8 +842,8 @@ export function createAppState(): AppState {
     const next = current.slice();
     const [moved] = next.splice(from, 1);
     if (moved !== undefined) next.splice(to, 0, moved);
-    setChains(presetId(), next);
-    if (engineRunning()) {
+    setChains(viewedId(), next);
+    if (editIsLive()) {
       void setEffectChainCmd(chainToSpecs(next));
     }
   };
@@ -833,9 +882,18 @@ export function createAppState(): AppState {
     return { ...p, chain: cloneChain(c) };
   };
 
+  // Preview a preset in the Presets editor without making it live. The
+  // "Use" button (usePreset) is what actually applies it.
+  const viewPreset = (id: string): void => {
+    if (!presets().some((p) => p.id === id)) return;
+    setViewedId(id);
+  };
+
   const usePreset = (id: string): void => {
     if (!presets().some((p) => p.id === id)) return;
     setPresetId(id);
+    setViewedId(id); // applying makes the viewed preset the active one
+
     // Reset A/B for the new preset (both slots = current chain).
     const c = chains[id] ?? [];
     setAbSlots(id, { A: cloneChain(c), B: cloneChain(c) });
@@ -853,6 +911,20 @@ export function createAppState(): AppState {
     usePreset(presetId);
     setActiveVoice(modelId);
   };
+
+  // Keep the viewed preset synced to the active one everywhere except the
+  // Presets screen, so the Mixer (and every other screen) always edits
+  // the live preset, while the Presets list is free to preview a
+  // non-active preset without applying it.
+  createEffect(
+    on(
+      nav,
+      (n) => {
+        if (n !== "presets") setViewedId(presetId());
+      },
+      { defer: true },
+    ),
+  );
 
   const presetToWire = (p: Preset): WirePreset => ({
     id: p.id,
@@ -1315,6 +1387,9 @@ export function createAppState(): AppState {
     chains,
     setChains,
     chain,
+    viewedId,
+    viewedPreset,
+    viewedChain,
     abSlots,
     setAbSlots,
     setAbSlot,
@@ -1361,6 +1436,8 @@ export function createAppState(): AppState {
     stopEngine,
     toggleMonitor,
     setMonitor,
+    monitorGain,
+    setMonitorGain,
     toggleRecording,
     getRecordingsDir,
 
@@ -1377,6 +1454,7 @@ export function createAppState(): AppState {
     refreshVoiceLibrary,
 
     usePreset,
+    viewPreset,
     summon,
     savePreset,
     duplicatePreset,

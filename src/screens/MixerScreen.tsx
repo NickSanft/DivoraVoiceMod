@@ -405,14 +405,14 @@ function PushToModulateCard(): JSX.Element {
 
 function MonitorCard(): JSX.Element {
   const app = useApp();
+  const pct = () => Math.round(app.monitorGain() * 100);
   return (
     <div
       class="card"
       style={{
         padding: "var(--s4)",
         display: "flex",
-        "align-items": "center",
-        "justify-content": "space-between",
+        "flex-direction": "column",
         gap: "var(--s3)",
       }}
     >
@@ -420,25 +420,67 @@ function MonitorCard(): JSX.Element {
         style={{
           display: "flex",
           "align-items": "center",
+          "justify-content": "space-between",
           gap: "var(--s3)",
-          color: "var(--text-mid)",
         }}
       >
-        <Sigil name="monitor" size={20} style={{ color: "var(--indigo)" }} />
-        <div>
-          <div style={{ "font-size": "var(--t-sm)", "font-weight": 600 }}>
-            Monitor
-          </div>
-          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
-            Hear yourself in headphones
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+            color: "var(--text-mid)",
+          }}
+        >
+          <Sigil name="monitor" size={20} style={{ color: "var(--indigo)" }} />
+          <div>
+            <div style={{ "font-size": "var(--t-sm)", "font-weight": 600 }}>
+              Monitor
+            </div>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+              Hear yourself in headphones
+            </div>
           </div>
         </div>
+        <Toggle
+          on={app.engineMonitoring()}
+          onChange={(next) => void app.setMonitor(next)}
+          ariaLabel="Sidetone monitor"
+        />
       </div>
-      <Toggle
-        on={app.engineMonitoring()}
-        onChange={(next) => void app.setMonitor(next)}
-        ariaLabel="Sidetone monitor"
-      />
+
+      {/* v1.6.0: monitor volume — boost/cut how loud you hear yourself
+          (applies to the separate monitor device). */}
+      <div style={{ display: "flex", "align-items": "center", gap: "var(--s3)" }}>
+        <span
+          class="eyebrow"
+          style={{ color: "var(--text-lo)", "flex-shrink": 0 }}
+        >
+          Volume
+        </span>
+        <input
+          type="range"
+          min="0"
+          max="2"
+          step="0.05"
+          value={app.monitorGain()}
+          disabled={!app.engineMonitoring()}
+          onInput={(e) => app.setMonitorGain(parseFloat(e.currentTarget.value))}
+          aria-label="Monitor volume"
+          style={{ flex: 1, opacity: app.engineMonitoring() ? 1 : 0.5 }}
+        />
+        <span
+          class="tnum"
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+            width: "40px",
+            "text-align": "right",
+          }}
+        >
+          {pct()}%
+        </span>
+      </div>
     </div>
   );
 }
