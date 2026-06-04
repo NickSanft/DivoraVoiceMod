@@ -42,6 +42,9 @@ resolved `T` or a thrown string on the JS side.
 | `start_audio_engine` | `inputName?`, `outputName?`, `monitorName?` | `StreamInfo` / error |
 | `stop_audio_engine` | — | — |
 | `set_audio_monitor` | `enabled: bool` | — |
+| `set_monitor_gain` | `gain: number` (linear, 1.0 = unity) | — |
+| `set_loudness_enabled` | `enabled: bool` | — |
+| `set_loudness_target` | `dbfs: number` | — |
 | `audio_engine_status` | — | `EngineStatus` |
 
 ### DSP chain
@@ -122,9 +125,9 @@ Levels            { rms, peak }                       // both 0..1
 StreamInfo        { inputName, outputName, monitorName (nullable),
                     sampleRate, inputChannels, outputChannels }
 EngineStatus      { running, monitoring, input: Levels, output: Levels,
-                    dspLatencyMs, recording }
+                    dspLatencyMs, recording, loudnessGainDb }
 LevelUpdate       { input: Levels, output: Levels, running, monitoring,
-                    dspLatencyMs, recording }
+                    dspLatencyMs, recording, loudnessGainDb }
 EffectSpec        { kind: EffectKindWire, enabled, params: {string: number} }
 VoiceInfo         { id, name, path, sizeBytes }
 OnnxRuntimeStatus { runtimeAvailable, voicesDir }

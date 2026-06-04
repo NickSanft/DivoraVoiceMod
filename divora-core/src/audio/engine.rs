@@ -23,6 +23,7 @@ use ringbuf::HeapRb;
 use serde::{Deserialize, Serialize};
 
 use super::level::LevelMeter;
+use super::loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS};
 use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
@@ -95,6 +96,9 @@ impl AudioEngine {
         state.monitor.store(true, Ordering::Release);
         // Monitor gain defaults to unity (Default would leave it 0.0).
         state.store_monitor_gain(1.0);
+        // v1.7.0: loudness normalization is opt-in (enabled defaults false);
+        // seed the target so the readout/stage have a sane value if enabled.
+        state.store_loudness_target(DEFAULT_TARGET_DBFS);
         let state_clone = state.clone();
         let handle = std::thread::Builder::new()
             .name("divora-audio".into())
@@ -189,6 +193,38 @@ impl AudioEngine {
     #[must_use]
     pub fn monitor_gain(&self) -> f32 {
         self.state.load_monitor_gain()
+    }
+
+    /// v1.7.0: enable/disable output loudness normalization (auto-gain +
+    /// limiter). Stored in shared state and picked up by the output
+    /// callback next buffer; no engine restart needed.
+    pub fn set_loudness_enabled(&self, enabled: bool) {
+        self.state.store_loudness_enabled(enabled);
+    }
+
+    /// v1.7.0: set the loudness target level, dBFS. The normalizer clamps
+    /// it to its supported window.
+    pub fn set_loudness_target(&self, dbfs: f32) {
+        self.state.store_loudness_target(dbfs);
+    }
+
+    /// v1.7.0: whether loudness normalization is currently enabled.
+    #[must_use]
+    pub fn loudness_enabled(&self) -> bool {
+        self.state.load_loudness_enabled()
+    }
+
+    /// v1.7.0: current loudness target, dBFS.
+    #[must_use]
+    pub fn loudness_target(&self) -> f32 {
+        self.state.load_loudness_target()
+    }
+
+    /// v1.7.0: makeup gain the normalizer is currently applying, in dB
+    /// (0 dB while disabled or stopped). For the live UI readout.
+    #[must_use]
+    pub fn loudness_gain_db(&self) -> f32 {
+        self.state.load_loudness_gain_db()
     }
 
     #[must_use]
@@ -652,6 +688,8 @@ fn build_output_stream(
     let mut meter = LevelMeter::new();
     let mut chain = EffectChain::new();
     let mut soundboard = SoundboardMixer::new();
+    // v1.7.0: post-chain output loudness normalizer (auto-gain + limiter).
+    let mut loudness = LoudnessNormalizer::new();
     let channels = channels as usize;
     let state_for_callback = state.clone();
 
@@ -722,21 +760,31 @@ fn build_output_stream(
                     *slot = 0.0;
                 }
 
+                // v1.7.0: refresh the loudness stage's params from shared
+                // state (cheap atomic loads) so the Mixer toggle/slider
+                // take effect next buffer without an engine restart.
+                loudness.set_enabled(state_for_callback.load_loudness_enabled());
+                loudness.set_target_dbfs(state_for_callback.load_loudness_target());
+
                 // Run the DSP chain over the mic mono buffer first, so
-                // effects apply only to the user's voice…
-                // …then mix soundboard voices in alongside the
-                // already-effected voice. Clips play "as-is" (no DSP).
-                // Both write into the same `mono` buffer that the
-                // resampler / fan-out consume below, so the soundboard
-                // mix lands on whatever output device is selected —
-                // including CABLE Input, which is what makes the clips
-                // audible to call participants.
+                // effects apply only to the user's voice; normalize the
+                // voice's loudness post-chain (steady level across presets,
+                // never clipping); then mix soundboard voices in alongside
+                // the already-effected voice. Clips play "as-is" (no DSP,
+                // no normalization). All write into the same `mono` buffer
+                // that the resampler / fan-out consume below, so the mix
+                // lands on whatever output device is selected — including
+                // CABLE Input, which is what makes the clips audible to
+                // call participants.
                 mix_voice_and_soundboard(
                     &mut mono[..native_frames],
                     &mut chain,
+                    &mut loudness,
                     &mut soundboard,
                     input_rate,
                 );
+                // Publish the makeup gain for the UI "it's working" readout.
+                state_for_callback.store_loudness_gain_db(loudness.gain_db());
 
                 // Phase 13: tap the processed, input-rate mono into the
                 // monitor ring (if a monitor device is active) BEFORE
@@ -923,20 +971,22 @@ fn main_output_plays(has_monitor: bool, monitoring: bool) -> bool {
     has_monitor || monitoring
 }
 
-/// Run the DSP chain on the mic mono buffer, then mix soundboard
-/// voices in over the top of the already-effected signal. Extracted
-/// from the output callback so the order — "DSP first, then
-/// soundboard on top" — is unit-testable in isolation. (The order
-/// matters: it means effects apply only to the user's voice, and
-/// clips play as-is on whatever output device is selected, including
-/// the virtual mic.)
+/// Run the DSP chain on the mic mono buffer, normalize the voice's
+/// loudness (v1.7.0), then mix soundboard voices in over the top of the
+/// already-effected, level-matched signal. Extracted from the output
+/// callback so the order — "DSP → normalize voice → soundboard on top" —
+/// is unit-testable in isolation. (The order matters: effects + loudness
+/// normalization apply only to the user's voice, while clips play as-is
+/// on whatever output device is selected, including the virtual mic.)
 fn mix_voice_and_soundboard(
     mono: &mut [f32],
     chain: &mut EffectChain,
+    loudness: &mut LoudnessNormalizer,
     soundboard: &mut SoundboardMixer,
     sample_rate: u32,
 ) {
     chain.process(mono, sample_rate);
+    loudness.process(mono, sample_rate);
     soundboard.mix_into(mono, sample_rate);
 }
 
@@ -1035,8 +1085,8 @@ fn recording_writer(mut consumer: RingConsumer, rx: Receiver<RecordingCommand>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine, StreamInfo,
-        MAX_FRAMES_PER_CALLBACK, RING_BUFFER_FRAMES,
+        drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine,
+        LoudnessNormalizer, StreamInfo, MAX_FRAMES_PER_CALLBACK, RING_BUFFER_FRAMES,
     };
     use crate::dsp::EffectChain;
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
@@ -1160,6 +1210,21 @@ mod tests {
         assert_eq!(engine.monitor_gain(), 0.0); // clamped low
     }
 
+    /// v1.7.0: loudness normalization is off by default with a sane target,
+    /// and the setters round-trip through shared state.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn loudness_defaults_off_with_sane_target_and_setters_roundtrip() {
+        let engine = AudioEngine::new();
+        assert!(!engine.loudness_enabled(), "opt-in: defaults off");
+        assert_eq!(engine.loudness_target(), super::DEFAULT_TARGET_DBFS);
+        assert_eq!(engine.loudness_gain_db(), 0.0, "0 dB readout while idle");
+        engine.set_loudness_enabled(true);
+        assert!(engine.loudness_enabled());
+        engine.set_loudness_target(-22.0);
+        assert!((engine.loudness_target() - (-22.0)).abs() < 1e-6);
+    }
+
     #[test]
     #[allow(clippy::float_cmp)] // bit-exact zero on a fresh engine
     fn engine_levels_default_to_zero() {
@@ -1193,7 +1258,10 @@ mod tests {
         });
         // Pretend the mic delivered a 480-sample buffer of constant 0.10.
         let mut mono = vec![0.10_f32; 480];
-        mix_voice_and_soundboard(&mut mono, &mut chain, &mut sb, 48_000);
+        // Loudness normalizer defaults to disabled → bit-exact passthrough,
+        // so the mic + clip sum below is unaffected.
+        let mut loudness = LoudnessNormalizer::new();
+        mix_voice_and_soundboard(&mut mono, &mut chain, &mut loudness, &mut sb, 48_000);
         // Each output sample should now hold the sum: 0.10 (mic, passed
         // through the empty chain) + 0.25 (clip mixed in) = 0.35.
         // Linear-interpolation between same-value neighbours is exact.
@@ -1212,7 +1280,8 @@ mod tests {
         let mut chain = EffectChain::new();
         let mut sb = SoundboardMixer::new();
         let mut mono = vec![0.10_f32; 480];
-        mix_voice_and_soundboard(&mut mono, &mut chain, &mut sb, 48_000);
+        let mut loudness = LoudnessNormalizer::new();
+        mix_voice_and_soundboard(&mut mono, &mut chain, &mut loudness, &mut sb, 48_000);
         for &s in &mono {
             assert!(
                 (s - 0.10).abs() < 1e-6,

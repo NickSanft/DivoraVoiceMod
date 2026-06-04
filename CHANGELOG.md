@@ -4,6 +4,36 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-06-04 — Loudness normalization (auto-gain + limiter)
+
+An optional output stage that keeps your *perceived* level steady no matter which voice you're using, and guarantees the output never clips.
+
+### Added
+
+- **Loudness normalization** on the Mixer — a new "Loudness" card with an enable toggle and a **target slider** (−30…−6 dBFS, default −18). When on, the modulated voice is auto-leveled toward the target so switching between a whisper-quiet preset (Whisper Wraith) and a wall of sound (Leviathan) — or toggling Voice Convert — no longer sends your level lurching. A live **"Auto gain"** readout shows the makeup gain it's applying (e.g. `+4.2 dB`) so you can see it working.
+  - **Why it's a global stage, not a chain effect:** the whole point is to stay level *across* presets, so it can't live inside a preset (which would reset on every switch). It runs **after** the effect chain and is controlled by persisted app settings, exactly like the monitor / soundboard master gains.
+  - **How it works:** a fast-attack / slow-release auto-gain (EMA-tracked RMS → target, with the gain *held* below a noise floor so silence and hiss aren't cranked up) followed by a feed-forward brick-wall limiter at −1 dBFS and a final hard clamp. **Zero added latency** (no look-ahead). Applies to the voice only — soundboard clips, already user-leveled, pass through untouched.
+  - New backend surface: `set_loudness_enabled` / `set_loudness_target` commands → `AudioEngine`; a `loudnessGainDb` field added to the `audio-levels` event + `audio_engine_status` for the readout.
+
+### Notes
+
+- Off by default (opt-in); your choice + target persist across restarts and re-apply when the engine starts.
+- **Zero-shot voice conversion stays deferred.** A survey of the current zero-shot VC landscape confirmed there's no real-time, on-CPU, *permissively-licensed* model today: the fast CPU one (RT-VC) ships no license, and the licensed ones (kNN-VC, FreeVC) depend on a ~1.3 GB GPU-oriented encoder (WavLM-Large). Revisit when a shippable real-time option matures (see `docs/PLAN.md`).
+
+### Tests
+
+- **Rust**: +9 (8 `LoudnessNormalizer` DSP tests — boost/attenuate toward target, limiter under full scale, silence held, finite on NaN/extreme, sample-rate change, target clamp; +1 engine setter/default test). The `mix_voice_and_soundboard` order test now threads a (disabled, bit-exact) normalizer.
+- **Frontend**: 259 → 261 (+2): `setLoudnessEnabled` and `setLoudnessTarget` clamp / persist / forward.
+
+### Pre-push checklist (local, 2026-06-04)
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (261)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.6.0] — 2026-06-03 — Presets preview-then-Use + monitor volume
 
 Two usability fixes from feedback: browsing presets no longer hijacks your live voice, and you can now set how loud you hear yourself.

@@ -42,6 +42,9 @@ export interface EngineStatus {
   dspLatencyMs: number;
   /** Phase 16: true while the modulated output is being recorded. */
   recording: boolean;
+  /** v1.7.0: makeup gain the loudness normalizer is applying, in dB
+   *  (0 while disabled). */
+  loudnessGainDb: number;
 }
 
 /** Periodic update emitted by the backend at ~30 Hz. */
@@ -54,6 +57,8 @@ export interface LevelUpdate {
   dspLatencyMs: number;
   /** Phase 16: true while the modulated output is being recorded. */
   recording: boolean;
+  /** v1.7.0: makeup gain the loudness normalizer is applying, in dB. */
+  loudnessGainDb: number;
 }
 
 export async function listInputDevices(): Promise<DeviceInfo[]> {
@@ -87,6 +92,16 @@ export async function setAudioMonitor(enabled: boolean): Promise<void> {
 /** v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 = unity). */
 export async function setMonitorGain(gain: number): Promise<void> {
   await invoke("set_monitor_gain", { gain });
+}
+
+/** v1.7.0: enable/disable output loudness normalization (auto-gain + limiter). */
+export async function setLoudnessEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_loudness_enabled", { enabled });
+}
+
+/** v1.7.0: set the loudness target level in dBFS (engine clamps to its window). */
+export async function setLoudnessTarget(dbfs: number): Promise<void> {
+  await invoke("set_loudness_target", { dbfs });
 }
 
 export async function getEngineStatus(): Promise<EngineStatus> {

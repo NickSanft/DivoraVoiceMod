@@ -241,6 +241,40 @@ describe("app store — Phase 2 audio actions", () => {
     expect(result.monitorGain()).toBe(0);
   });
 
+  // ---- v1.7.0: loudness normalization ----------------------------------
+
+  it("setLoudnessEnabled persists and forwards to the backend", () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    expect(result.loudnessEnabled()).toBe(false); // opt-in default
+
+    result.setLoudnessEnabled(true);
+    expect(result.loudnessEnabled()).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("set_loudness_enabled", {
+      enabled: true,
+    });
+    expect(window.localStorage.getItem("divora.loudnessEnabled")).toBe("true");
+  });
+
+  it("setLoudnessTarget clamps to [-30, -6], persists, and forwards", () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    expect(result.loudnessTarget()).toBe(-18); // default target
+
+    result.setLoudnessTarget(-22);
+    expect(result.loudnessTarget()).toBe(-22);
+    expect(invokeMock).toHaveBeenCalledWith("set_loudness_target", {
+      dbfs: -22,
+    });
+    expect(window.localStorage.getItem("divora.loudnessTarget")).toBe("-22");
+
+    // Below the −30 floor clamps up; above the −6 ceiling clamps down.
+    result.setLoudnessTarget(-100);
+    expect(result.loudnessTarget()).toBe(-30);
+    result.setLoudnessTarget(0);
+    expect(result.loudnessTarget()).toBe(-6);
+  });
+
   // ---- Phase 16: recording ---------------------------------------------
 
   it("toggleRecording refuses to start while the engine is stopped", async () => {

@@ -181,6 +181,7 @@ function Shell(): JSX.Element {
           app.setEngineMonitoring(update.monitoring);
           app.setDspLatencyMs(update.dspLatencyMs);
           app.setIsRecording(update.recording);
+          app.setLoudnessGainDb(update.loudnessGainDb);
         });
       } catch (err) {
         app.setEngineError(`level subscription failed: ${String(err)}`);

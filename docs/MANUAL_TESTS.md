@@ -43,6 +43,17 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] When engine is stopped, Mixer shows "Engine offline" card with a clickable Settings link.
 - [ ] Sample-rate mismatch test: pick devices with different default sample rates (e.g., 44.1 kHz mic + 48 kHz output) → start fails with a clear "sample-rate mismatch" error message.
 
+## Loudness normalization (v1.7.0)
+
+- [ ] On the Mixer, the **Loudness** card shows an enable toggle (off by default) and a **Target** slider (−30…−6 dB, default −18 dB).
+- [ ] Start the engine, enable Loudness, and speak: a live **"Auto gain"** readout appears showing the makeup gain (e.g. `+4.2 dB`); it's hidden while the card is off or the engine is stopped.
+- [ ] Pick a **quiet** preset (e.g. Whisper Wraith) → the auto gain reads positive (boosting). Switch to a **loud/deep** preset (e.g. Leviathan) → the auto gain drops (or goes negative), and the *perceived* output level stays roughly the same across the switch. With Loudness **off**, the same switch produces an obvious level jump.
+- [ ] Drag the Target slider toward −6 dB → output gets louder; toward −30 dB → quieter. Slider is disabled (greyed) while the card is off.
+- [ ] Speak loudly / shout with Loudness on → output never audibly clips (the limiter + ceiling hold it under full scale); the OUT meter peak stays at/below the top.
+- [ ] Silence test: stop talking with Loudness on → background hiss is **not** cranked up (the gain holds rather than chasing silence).
+- [ ] Enable Loudness + set a target (e.g. −12 dB), restart the app → the toggle and target restore, and re-apply on the next engine start.
+- [ ] Soundboard interaction: play a clip while talking with Loudness on → the clip plays at its own (master-gain) level; it isn't auto-leveled with the voice.
+
 ## Effects + Spell Circle (Phase 3)
 
 - [ ] Open Mixer; spell circle is drawn with all effects orbiting the voice core.

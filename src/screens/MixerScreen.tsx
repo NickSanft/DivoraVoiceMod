@@ -253,6 +253,7 @@ function RightRail(): JSX.Element {
       <VoiceStatusCard />
       <PushToModulateCard />
       <MonitorCard />
+      <LoudnessCard />
       <RecordCard />
       <Inspector />
       <Show when={app.engineError()}>
@@ -481,6 +482,114 @@ function MonitorCard(): JSX.Element {
           {pct()}%
         </span>
       </div>
+    </div>
+  );
+}
+
+// v1.7.0: output loudness normalization (auto-gain + safety limiter).
+// A global, post-chain stage (NOT a per-preset effect) so the perceived
+// level stays steady when you switch between a whisper and a roar, and
+// never clips. The live "auto gain" readout shows it working.
+function LoudnessCard(): JSX.Element {
+  const app = useApp();
+  const on = () => app.loudnessEnabled();
+  const target = () => app.loudnessTarget();
+  // Show the live makeup gain only while it's actually doing something.
+  const gainDb = () => app.loudnessGainDb();
+  const gainLabel = () => {
+    const g = gainDb();
+    const sign = g >= 0 ? "+" : "−"; // unicode minus
+    return `${sign}${Math.abs(g).toFixed(1)} dB`;
+  };
+  return (
+    <div
+      class="card"
+      style={{
+        padding: "var(--s4)",
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+            color: "var(--text-mid)",
+          }}
+        >
+          <Sigil name="wave" size={20} style={{ color: "var(--indigo)" }} />
+          <div>
+            <div style={{ "font-size": "var(--t-sm)", "font-weight": 600 }}>
+              Loudness
+            </div>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+              Even out levels across voices
+            </div>
+          </div>
+        </div>
+        <Toggle
+          on={on()}
+          onChange={(next) => app.setLoudnessEnabled(next)}
+          ariaLabel="Loudness normalization"
+        />
+      </div>
+
+      {/* Target level: left = quieter (−30 dB), right = louder (−6 dB). */}
+      <div style={{ display: "flex", "align-items": "center", gap: "var(--s3)" }}>
+        <span class="eyebrow" style={{ color: "var(--text-lo)", "flex-shrink": 0 }}>
+          Target
+        </span>
+        <input
+          type="range"
+          min="-30"
+          max="-6"
+          step="1"
+          value={target()}
+          disabled={!on()}
+          onInput={(e) => app.setLoudnessTarget(parseFloat(e.currentTarget.value))}
+          aria-label="Loudness target level"
+          style={{ flex: 1, opacity: on() ? 1 : 0.5 }}
+        />
+        <span
+          class="tnum"
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+            width: "52px",
+            "text-align": "right",
+          }}
+        >
+          {target()} dB
+        </span>
+      </div>
+
+      {/* Live "it's working" readout: the makeup gain currently applied. */}
+      <Show when={on() && app.engineRunning()}>
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+          }}
+        >
+          <span class="eyebrow">Auto gain</span>
+          <span class="tnum" style={{ color: "var(--indigo)" }}>
+            {gainLabel()}
+          </span>
+        </div>
+      </Show>
     </div>
   );
 }

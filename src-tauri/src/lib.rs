@@ -41,6 +41,9 @@ struct LevelUpdate {
     dsp_latency_ms: f32,
     /// Phase 16: true while the modulated output is being recorded.
     recording: bool,
+    /// v1.7.0: makeup gain the loudness normalizer is applying, in dB
+    /// (0 while disabled). Drives the Mixer "it's working" readout.
+    loudness_gain_db: f32,
 }
 
 /// One-shot status snapshot used by the frontend at startup and after
@@ -55,6 +58,8 @@ struct EngineStatus {
     dsp_latency_ms: f32,
     /// Phase 16: true while the modulated output is being recorded.
     recording: bool,
+    /// v1.7.0: makeup gain the loudness normalizer is applying, in dB.
+    loudness_gain_db: f32,
 }
 
 /// Tauri-managed shared state. Holds the live audio engine, the user
@@ -155,6 +160,20 @@ fn set_monitor_gain(state: State<'_, AppState>, gain: f32) {
     state.engine.set_monitor_gain(gain);
 }
 
+/// v1.7.0: enable/disable output loudness normalization (auto-gain +
+/// limiter). Takes effect next buffer; no restart needed.
+#[tauri::command]
+fn set_loudness_enabled(state: State<'_, AppState>, enabled: bool) {
+    state.engine.set_loudness_enabled(enabled);
+}
+
+/// v1.7.0: set the loudness target level in dBFS. The engine clamps to
+/// its supported window.
+#[tauri::command]
+fn set_loudness_target(state: State<'_, AppState>, dbfs: f32) {
+    state.engine.set_loudness_target(dbfs);
+}
+
 #[tauri::command]
 fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
     EngineStatus {
@@ -164,6 +183,7 @@ fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
         output: state.engine.output_levels(),
         dsp_latency_ms: state.engine.dsp_latency_ms(),
         recording: state.engine.is_recording(),
+        loudness_gain_db: state.engine.loudness_gain_db(),
     }
 }
 
@@ -497,6 +517,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
                 monitoring: engine.is_monitoring(),
                 dsp_latency_ms: engine.dsp_latency_ms(),
                 recording: engine.is_recording(),
+                loudness_gain_db: engine.loudness_gain_db(),
             };
             if app.emit("audio-levels", &payload).is_err() {
                 // App is shutting down (no receivers / window gone).
@@ -668,6 +689,8 @@ pub fn run() {
             stop_audio_engine,
             set_audio_monitor,
             set_monitor_gain,
+            set_loudness_enabled,
+            set_loudness_target,
             audio_engine_status,
             set_effect_chain,
             set_effect_param,
@@ -733,12 +756,14 @@ mod tests {
             },
             dsp_latency_ms: 0.0,
             recording: false,
+            loudness_gain_db: 0.0,
         };
         assert_eq!(
             sorted_keys(&serde_json::to_value(&s).unwrap()),
             [
                 "dspLatencyMs",
                 "input",
+                "loudnessGainDb",
                 "monitoring",
                 "output",
                 "recording",
@@ -762,12 +787,14 @@ mod tests {
             monitoring: true,
             dsp_latency_ms: 0.0,
             recording: false,
+            loudness_gain_db: 0.0,
         };
         assert_eq!(
             sorted_keys(&serde_json::to_value(&u).unwrap()),
             [
                 "dspLatencyMs",
                 "input",
+                "loudnessGainDb",
                 "monitoring",
                 "output",
                 "recording",

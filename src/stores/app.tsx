@@ -40,6 +40,8 @@ import {
   scanSoundboardFolder as scanSoundboardFolderCmd,
   setAudioMonitor as setAudioMonitorCmd,
   setMonitorGain as setMonitorGainCmd,
+  setLoudnessEnabled as setLoudnessEnabledCmd,
+  setLoudnessTarget as setLoudnessTargetCmd,
   setEffectChain as setEffectChainCmd,
   setEffectEnabled as setEffectEnabledCmd,
   setEffectParam as setEffectParamCmd,
@@ -140,6 +142,8 @@ const STORAGE_KEYS = {
   outputDevice: "divora.outputDevice",
   monitorDevice: "divora.monitorDevice",
   monitorGain: "divora.monitorGain",
+  loudnessEnabled: "divora.loudnessEnabled",
+  loudnessTarget: "divora.loudnessTarget",
   soundboardFolder: "divora.soundboardFolder",
   tileGains: "divora.tileGains",
   soundboardMasterGain: "divora.soundboardMasterGain",
@@ -292,6 +296,15 @@ export interface AppState {
   /** v1.6.0: monitor ("hear yourself") volume — linear gain, 1.0 = unity. */
   monitorGain: () => number;
   setMonitorGain: (gain: number) => void;
+  /** v1.7.0: output loudness normalization (auto-gain + limiter). */
+  loudnessEnabled: () => boolean;
+  setLoudnessEnabled: (enabled: boolean) => void;
+  /** v1.7.0: loudness target level, dBFS (clamped to [-30, -6]). */
+  loudnessTarget: () => number;
+  setLoudnessTarget: (dbfs: number) => void;
+  /** v1.7.0: live makeup gain the normalizer is applying, in dB. */
+  loudnessGainDb: () => number;
+  setLoudnessGainDb: (db: number) => void;
   /** Phase 16: toggle recording the modulated output to a WAV file. */
   toggleRecording: () => Promise<void>;
   /** Phase 16: absolute path of the recordings directory. */
@@ -489,6 +502,32 @@ export function createAppState(): AppState {
     saveJson(STORAGE_KEYS.monitorGain, g);
     void setMonitorGainCmd(g);
   };
+  // v1.7.0: output loudness normalization (auto-gain + limiter). Opt-in;
+  // persisted + re-applied on engine start (a fresh session resets the
+  // engine to disabled/default-target). Sent live so the controls move it
+  // instantly. The target is dBFS, clamped to the engine's [-30, -6] window.
+  const LOUDNESS_TARGET_MIN = -30;
+  const LOUDNESS_TARGET_MAX = -6;
+  const LOUDNESS_TARGET_DEFAULT = -18;
+  const [loudnessEnabled, setLoudnessEnabledRaw] = createSignal<boolean>(
+    loadJson<boolean>(STORAGE_KEYS.loudnessEnabled, false),
+  );
+  const setLoudnessEnabled = (enabled: boolean): void => {
+    setLoudnessEnabledRaw(enabled);
+    saveJson(STORAGE_KEYS.loudnessEnabled, enabled);
+    void setLoudnessEnabledCmd(enabled);
+  };
+  const [loudnessTarget, setLoudnessTargetRaw] = createSignal<number>(
+    loadJson<number>(STORAGE_KEYS.loudnessTarget, LOUDNESS_TARGET_DEFAULT),
+  );
+  const setLoudnessTarget = (dbfs: number): void => {
+    const t = Math.min(Math.max(dbfs, LOUDNESS_TARGET_MIN), LOUDNESS_TARGET_MAX);
+    setLoudnessTargetRaw(t);
+    saveJson(STORAGE_KEYS.loudnessTarget, t);
+    void setLoudnessTargetCmd(t);
+  };
+  // Live makeup-gain readout (dB), driven by the ~30 Hz level event.
+  const [loudnessGainDb, setLoudnessGainDb] = createSignal(0);
   const [engineRunning, setEngineRunning] = createSignal(false);
   const [engineMonitoring, setEngineMonitoring] = createSignal(true);
   const [engineError, setEngineError] = createSignal<string | null>(null);
@@ -600,6 +639,13 @@ export function createAppState(): AppState {
       // app launch starts at unity until told otherwise).
       if (monitorGain() !== 1.0) {
         void setMonitorGainCmd(monitorGain());
+      }
+      // v1.7.0: a fresh engine starts with loudness normalization off at the
+      // default target, so re-apply the persisted settings. Always push the
+      // target (cheap) and only enable when the user had it on.
+      void setLoudnessTargetCmd(loudnessTarget());
+      if (loudnessEnabled()) {
+        void setLoudnessEnabledCmd(true);
       }
     } catch (err) {
       setEngineRunning(false);
@@ -1438,6 +1484,12 @@ export function createAppState(): AppState {
     setMonitor,
     monitorGain,
     setMonitorGain,
+    loudnessEnabled,
+    setLoudnessEnabled,
+    loudnessTarget,
+    setLoudnessTarget,
+    loudnessGainDb,
+    setLoudnessGainDb,
     toggleRecording,
     getRecordingsDir,
 

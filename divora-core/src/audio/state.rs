@@ -33,6 +33,17 @@ pub struct EngineState {
     /// monitor callback. `Default` leaves this 0.0, so `AudioEngine::new`
     /// initializes it to 1.0.
     pub monitor_gain_bits: AtomicU32,
+    /// v1.7.0: loudness normalization (auto-gain) on/off. `Default` false
+    /// (the stage is opt-in). Read by the output callback each buffer.
+    pub loudness_enabled: AtomicBool,
+    /// v1.7.0: loudness target level in dBFS (f32 bit pattern). `Default`
+    /// leaves 0.0, so `AudioEngine::new` initializes it to the real
+    /// default target (−18 dBFS).
+    pub loudness_target_bits: AtomicU32,
+    /// v1.7.0: makeup gain the normalizer is currently applying, in dB
+    /// (f32 bit pattern). Written by the output callback for the UI
+    /// "it's working" readout; 0 dB while disabled.
+    pub loudness_gain_db_bits: AtomicU32,
 }
 
 impl EngineState {
@@ -82,6 +93,35 @@ impl EngineState {
     #[must_use]
     pub fn load_monitor_gain(&self) -> f32 {
         f32::from_bits(self.monitor_gain_bits.load(Ordering::Acquire))
+    }
+
+    pub fn store_loudness_enabled(&self, enabled: bool) {
+        self.loudness_enabled.store(enabled, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn load_loudness_enabled(&self) -> bool {
+        self.loudness_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn store_loudness_target(&self, dbfs: f32) {
+        self.loudness_target_bits
+            .store(dbfs.to_bits(), Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn load_loudness_target(&self) -> f32 {
+        f32::from_bits(self.loudness_target_bits.load(Ordering::Acquire))
+    }
+
+    pub fn store_loudness_gain_db(&self, db: f32) {
+        self.loudness_gain_db_bits
+            .store(db.to_bits(), Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn load_loudness_gain_db(&self) -> f32 {
+        f32::from_bits(self.loudness_gain_db_bits.load(Ordering::Acquire))
     }
 }
 
