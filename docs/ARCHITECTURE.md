@@ -1012,6 +1012,135 @@ mic ring → mono buffer ───┐
 
 The two helper tests directly assert this: `mix_voice_and_soundboard` over a constant-0.10 mic buffer and a constant-0.25 playing clip yields constant-0.35 output; without the clip it yields constant-0.10. The chip on the Soundboard header surfaces this to the user.
 
-## Phase 12+ — (placeholders)
+## Phase 12 — AI voice conversion (ONNX / LLVC)
 
-To be filled in as each phase lands.
+The `VoiceConvert` effect (`divora-core/src/dsp/voice_convert.rs`) runs an
+ONNX voice-conversion model over the mic stream via the `ort` crate
+(ONNX Runtime). The reference model is **LLVC** (KoeAI, MIT). It is an
+ordinary chain effect (`EffectKind::VoiceConvert`) with one extra seam:
+`AudioEffect::set_resource` carries the active `.onnx` model **path**
+(numbers go through `set_param`; this carries the things that aren't
+numbers). `DspCommand::SetResource` is the matching wire command.
+
+**Graceful degradation is the invariant.** When the ONNX runtime DLL or
+the model file is missing, or a model's tensor shapes don't match either
+supported contract, the effect falls back to **passthrough** — it never
+crashes and never hangs. `onnx_runtime_available()` backs the
+Settings → Voice library status banner.
+
+Model I/O, the streaming vs non-streaming contracts, how to produce a
+model, and the installer-bundling pipeline are documented in detail in
+[`voice-models/README.md`](voice-models/README.md). The streaming export
+(threaded cache tensors, ~13 ms chunks) lands in v1.3.0; see the
+[CHANGELOG](../CHANGELOG.md).
+
+## Phase 13 — monitor output routing
+
+A **second, independent cpal output stream** so the main send can go to
+VB-Cable (→ Discord / games) while you still hear yourself on
+headphones. The main output callback runs the DSP + soundboard mix once
+and **taps the processed audio into a monitor ring**; the monitor stream
+resamples that to its own device rate and plays it (so the soundboard is
+audible on the monitor for free — it's mixed in before the tap).
+
+Gating (`main_output_plays`): with a separate monitor device active, the
+**main output always plays** (Discord must keep hearing you) and the
+Monitor toggle mutes only the headphone stream. With no separate monitor
+device, the toggle gates the main output as in Phase 2 — fully
+backward-compatible. The monitor device persists to
+`localStorage["divora.monitorDevice"]` and is wired into the live
+device-switch effect. `StreamInfo` gains `monitorName`;
+`start_audio_engine` + `AudioEngine::start` take a monitor argument.
+
+## Phase 14 — live latency readout
+
+`AudioEffect::latency_samples(sample_rate)` (default 0) reports the
+algorithmic delay each effect ADDS while actively processing;
+`EffectChain::latency_samples` sums the **enabled** effects (they're
+serial). Implemented for the effects that buffer:
+
+| Effect | Added latency |
+|---|---|
+| Voice Convert | the inference chunk — and only when a model is loaded (passthrough adds 0) |
+| Denoiser | one 480-sample RNNoise frame (10 ms) — and only at 48 kHz |
+| Pitch / Formant | the phase-vocoder STFT window (1024 samples ≈ 21 ms each) |
+| Gate / EQ / Robot / Distortion | 0 (sample-by-sample) |
+| Echo / Reverb | 0 to dry-path latency (wet tails) |
+
+The engine publishes the chain's added latency (ms) on the ~30 Hz
+`audio-levels` event; the Mixer header shows "· +N ms latency" and moves
+live as effects toggle. (The originally-sketched buffer-size selector was
+dropped — WASAPI shared mode largely ignores requested buffer sizes.)
+
+## Phase 15 — soundboard volume + folder persistence + system tray
+
+- **Soundboard volume** — per-tile and master gain. `SoundboardCommand::Play`
+  carries a per-voice `gain`; a new `SetMasterGain` command scales the bus.
+  `mix_into` multiplies each voice by `voice_gain × master_gain` (both
+  clamped 0–4). Persisted to `divora.tileGains` / `divora.soundboardMasterGain`
+  (master re-applied after an engine restart).
+- **Folder persistence** — the soundboard folder is saved to
+  `divora.soundboardFolder` and re-scanned at startup, so tiles + per-tile
+  hotkeys come back automatically.
+- **Minimize to system tray** — `WindowEvent::CloseRequested` → `prevent_close`
+  + `hide` keeps audio (and the VB-Cable route) running in the background;
+  "Quit" exits for real (`tray-icon` Tauri feature).
+
+## Phase 16 — recording
+
+One-click capture of the post-chain output (voice + soundboard) to a
+timestamped 16-bit PCM mono WAV. Recording **reuses the existing
+processed-mono tap** (the same signal sent to the main output / VB-Cable),
+so a take matches the call audio sample-for-sample. A dedicated **writer
+thread** drains a lock-free ring to disk — **no file I/O ever runs on the
+real-time callback**. Hot samples clamp to the i16 range (no wrap). Files
+land in `%APPDATA%/DivoraVoice/recordings/`. Commands:
+`start_recording` / `stop_recording` / `recordings_dir`; a `recording`
+flag rides the `audio-levels` event.
+
+## v1.0 — surface freeze
+
+No new features — the **contract cut**. The Tauri command + event +
+wire-type + preset-JSON surface documented in
+[`STABLE-SURFACE.md`](STABLE-SURFACE.md) is frozen and **additive-only**
+across the 1.x line, guarded by serialization freeze tests in CI (preset
+schema + tag casing + legacy-load; `StreamInfo` / `EngineStatus` /
+`LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus` key casing; every
+command-name string). The two vestigial Phase-0 commands (`ping`,
+`project_name`) were removed before the freeze.
+
+## v1.x — The Coven era
+
+Post-1.0 work stays inside the frozen surface (additive-only). Highlights;
+see the [CHANGELOG](../CHANGELOG.md) for the blow-by-blow:
+
+- **The Coven** (v1.1.0) — a frontend cast layer (`src/data/coven.ts`) over
+  the bundled presets: a gallery screen where each character has a sigil,
+  a **DSP** / **AI Voice** badge, and lore, summoned with one click.
+  `summon(presetId, modelId?)` applies the chain and sets/clears the
+  conversion model in one step. No new backend command.
+- **Chorus** (`dsp/chorus.rs`, v1.2.0) — LFO-modulated multi-tap delay
+  summed with the dry signal (`EffectKind::Chorus`). A wet tail → 0 added
+  latency.
+- **Harmonizer** (`dsp/harmonizer.rs`, v1.2.1) — sums the dry root with up
+  to three independent phase-vocoder pitch voices (`EffectKind::Harmonizer`),
+  making an actual chord (diminished by default; each interval adjustable).
+  Powers Choir of Ash and the **choir family** (Seraph / Dirge / The Swarm /
+  The Possessed — distinct chord intervals locked by test).
+- **Streaming LLVC** (v1.3.0) — re-exported in cache-tensor streaming mode;
+  Voice Convert latency drops ~256 ms → ~13 ms. Auto-detects the model
+  contract (streaming vs stateless), both still degrading to passthrough.
+- **Voice pack** (v1.5.0) — five DSP presets (Leviathan, The Imp, Dispatch,
+  Corrupted, Whisper Wraith) over existing effects → 16 bundled presets.
+- **Preview-then-Use presets** (v1.6.0) — the Presets screen splits a
+  `viewedId` (editor selection) from `presetId` (active/live): browsing
+  only *previews*; the live voice changes on **Use**. **Monitor volume** —
+  a `set_monitor_gain` command scaling the sidetone 0–400 %.
+- **Loudness normalization** (`dsp/loudness.rs`, v1.7.0) — a **global
+  output stage** (not a chain effect, so it persists across preset
+  switches): fast-attack / slow-release auto-gain toward a target
+  (−30…−6 dBFS, gain held below a noise floor) → feed-forward brick-wall
+  limiter at −1 dBFS → hard clamp. Zero added latency; applies to the
+  voice only (soundboard clips, already user-leveled, pass through).
+  Commands `set_loudness_enabled` / `set_loudness_target`; a
+  `loudnessGainDb` field on the `audio-levels` event drives the readout.

@@ -4,31 +4,34 @@ A free, open-source, real-time voice modulator for Windows. Local-first, no acco
 
 The visual identity is **"spellcraft for your voice"** — a calm utility tool wearing a dusk-lit arcane skin. See [`docs/mockups/`](docs/mockups/) for the design.
 
-> **Status: v0.10** — feature complete for v1. Pitch, formant, EQ, robot, distortion, echo, reverb, noise gate, **RNNoise denoiser**, soundboard, A/B compare, glyph casting, first-run wizard, global hotkeys, VB-Cable bridge, sample-rate matching, full Settings, all shipped.
+> **Status: v1.7.0** — stable. The v1.0 command + preset contract is frozen and additive-only across the 1.x line (see [`docs/STABLE-SURFACE.md`](docs/STABLE-SURFACE.md)). Since 1.0: **The Coven** voice cast (16 bundled presets), AI voice conversion, monitor-output routing, recording, system tray, a live latency readout, and loudness normalization. Full history in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
 Each tagged release publishes both an **MSI** and an **NSIS** installer. Grab the latest from the [Releases page](https://github.com/NickSanft/DivoraVoiceMod/releases).
 
-Until we have an EV code-signing certificate (planned for the v1.0 cycle), Windows SmartScreen will warn before running an unsigned installer. Click **More info → Run anyway**. Every release's `.msi` and `-setup.exe` have SHA-256 checksums in the Release notes if you want to verify the download.
+The installers are not yet code-signed, so Windows SmartScreen will warn before running one. Click **More info → Run anyway**. Every release's `.msi` and `-setup.exe` have SHA-256 checksums in the Release notes if you want to verify the download.
 
 ## What it does
 
-- **Real-time microphone effects** — pitch (phase vocoder), formant (spectrum warp), EQ, robot, distortion, echo, reverb, noise gate, **RNNoise denoiser** (new in v0.10).
-- **5 bundled persona presets** — Hollow King, Static Wraith, Velvet Demon, Choir of Ash, Clean Passthrough — with full JSON editor and export.
-- **A/B preset compare** on the Mixer header.
-- **Folder-backed soundboard** with drag-reorder, per-tile colors, recent folders, and **global per-tile hotkeys** that fire even when the app isn't focused.
-- **Self-monitoring** (sidetone) so you can hear yourself while tuning.
+- **Real-time microphone effects** — a live, reorderable chain of 12 effects: noise gate, **RNNoise denoiser**, pitch (phase vocoder), formant (spectrum warp), EQ, robot, distortion, echo, reverb, **chorus**, **harmonizer**, and **AI voice convert**. Each has per-effect parameters and a live **"+N ms latency"** readout that updates as you toggle effects.
+- **The Coven — 16 bundled persona presets.** A browsable cast of character voices: Hollow King, Velvet Demon, Static Wraith, The Oracle, Choir of Ash, Seraph, Dirge, The Swarm, The Possessed, Leviathan, The Imp, Dispatch, Corrupted, Whisper Wraith, Deep Narrator (AI), and Clean Passthrough. Plus unlimited user presets with a full JSON editor, export/import, and **A/B compare** on the Mixer.
+- **AI voice conversion** — an ONNX-Runtime `VoiceConvert` effect with a bundled streaming LLVC narrator (~13 ms) and **bring-your-own `.onnx` model** support. Degrades to passthrough (never hangs) when no model or runtime is present. See [`docs/voice-models/`](docs/voice-models/).
+- **Loudness normalization** — an optional output stage (auto-gain + brick-wall limiter, zero added latency) that keeps your *perceived* level steady across presets and never clips.
+- **Monitor output routing** — an independent second output, so the main send can go to VB-Cable (→ Discord / games) while you still hear yourself on headphones, with a separate monitor volume.
 - **VB-Cable bridge** — DivoraVoice pours the modulated voice into `CABLE Input`; Discord / Zoom / OBS pick it up from `CABLE Output`. The first-run wizard walks you through it.
+- **Folder-backed soundboard** with drag-reorder, per-tile colors, per-tile + master volume, recent folders, and **global per-tile hotkeys** that fire even when the app isn't focused.
+- **Recording** — one-click capture of the modulated output (voice + soundboard) to a timestamped WAV.
 - **Push-to-modulate global hotkey** (hold key → effects on, release → bypass). Configurable in Settings → Hotkeys.
 - **Glyph casting** — draw a triangle / inverted triangle / square / circle on the Mixer to instantly switch to the bound preset.
+- **System tray** — minimize to tray so audio keeps running in the background during calls/games.
 - **First-run wizard** with VB-Cable detection + device picker + Discord routing instructions.
 - **Sub-30 ms end-to-end latency** on consumer hardware (sub-26 ms even with the phase-vocoder pitch shifter active).
 - **Automatic sample-rate matching** via rubato — mismatched mic/output rates no longer hard-fail.
 
 ## What it doesn't do (and won't)
 
-- Named celebrity voice clones. Persona archetypes only. You can bring your own ONNX model later.
+- Named celebrity voice clones. Persona archetypes only. (The AI voice convert is bring-your-own-model.)
 - Cloud, accounts, telemetry, upsells.
 - Cross-platform (yet). Windows only for v1.
 
@@ -53,9 +56,21 @@ CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-featu
 
 - **Frontend**: SolidJS + TypeScript + Tailwind (Vite-built).
 - **Shell**: Tauri 2 (frameless window, custom titlebar).
-- **Backend**: Rust — `cpal` for WASAPI I/O, `realfft` + a hand-rolled phase vocoder for pitch / formant, `rubato` for sample-rate matching, `nnnoiseless` for RNNoise suppression, `biquad` for EQ, `symphonia` (+ `symphonia-adapter-libopus`) for soundboard decode.
+- **Backend**: Rust — `cpal` for WASAPI I/O, `realfft` + a hand-rolled phase vocoder for pitch / formant / harmonizer, `rubato` for sample-rate matching, `nnnoiseless` for RNNoise suppression, `biquad` for EQ, `symphonia` (+ `symphonia-adapter-libopus`) for soundboard decode, and `ort` (ONNX Runtime) for the AI voice-convert effect. The audio engine, DSP, presets, and soundboard live in the standalone `divora-core` crate (unit-testable without a UI); the Tauri shell (`src-tauri`) owns the IPC surface and window.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the per-phase deep dive.
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | Every release, newest first. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Per-phase deep dive into the engine, DSP, and frontend. |
+| [`docs/STABLE-SURFACE.md`](docs/STABLE-SURFACE.md) | The v1.0 back-compat contract (commands, events, wire shapes, preset schema). |
+| [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | Dev setup, house style, and the per-release workflow. |
+| [`docs/voice-models/`](docs/voice-models/) | How to produce and install an ONNX voice-conversion model. |
+| [`docs/MANUAL_TESTS.md`](docs/MANUAL_TESTS.md) | Pre-release manual test checklist. |
+| [`docs/PLAN.md`](docs/PLAN.md) | The original phase-by-phase implementation plan. |
 
 ## Contributing
 
@@ -67,4 +82,4 @@ Bug reports and PRs welcome. Pre-release manual test pass: [`docs/MANUAL_TESTS.m
 
 MIT — see [LICENSE](LICENSE).
 
-Third-party licenses worth calling out: `nnnoiseless` is BSD-3-Clause (Xiph RNNoise port); `symphonia-adapter-libopus` bundles libopus (BSD); `rubato`, `realfft`, and `rustfft` are MIT.
+Third-party licenses worth calling out: `nnnoiseless` is BSD-3-Clause (Xiph RNNoise port); `symphonia-adapter-libopus` bundles libopus (BSD); `rubato`, `realfft`, and `rustfft` are MIT; ONNX Runtime (`ort`) is MIT; the bundled LLVC narrator voice is derived from KoeAI's MIT-licensed LLVC.

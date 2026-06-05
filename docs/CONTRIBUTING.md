@@ -7,8 +7,9 @@ Thanks for considering a contribution. This document covers the development work
 ### Prerequisites
 
 - **Rust** stable (install via [rustup](https://rustup.rs/))
-- **Node.js** 20 or newer
-- **pnpm** 9 or newer (`npm install -g pnpm`)
+- **Node.js** 22 or newer
+- **pnpm** 10 or newer (`npm install -g pnpm`)
+- **cmake** — `symphonia-adapter-libopus` (→ `opusic-sys`) and `nnnoiseless` vendor C sources built via cmake
 - **Windows 10/11** (we're Windows-only for now)
 - **VB-Cable** installed (for end-to-end manual testing of the virtual mic flow)
 
@@ -30,27 +31,26 @@ See `docs/ARCHITECTURE.md` for a full breakdown. The short version:
 - `presets/` — JSON preset definitions bundled into the binary.
 - `docs/` — design docs and operational notes.
 
-## Per-phase ship workflow
+## Per-release ship workflow
 
-DivoraVoice ships in phases. Each phase follows the **same loop**, in order:
+DivoraVoice ships one tagged release at a time. Each follows the **same loop**, in order:
 
-1. **Implement** the phase's scope.
-2. **Tests** — unit (DSP blocks, pure helpers) + Playwright e2e (UI smoke).
-3. **Pre-push checklist** (all must pass):
-   - `cargo fmt --check`
-   - `cargo clippy --all-targets --all-features -- -D warnings`
-   - `cargo test --workspace`
+1. **Implement** the scope.
+2. **Tests** — Rust unit tests (DSP blocks, pure helpers) + Vitest unit/component tests for the frontend.
+3. **Pre-push checklist** (all must pass — this mirrors [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)):
+   - `cargo fmt --all -- --check`
+   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   - `cargo test --workspace --all-features`
    - `pnpm typecheck`
    - `pnpm test`
-   - `pnpm test:e2e` (when wired up)
-   - `cargo tauri build --debug`
-4. **Commit** with a detailed multi-line message.
-5. **Push** to `main`.
-6. **Watch CI** until green.
-7. **Tag** `vX.Y.Z` only after CI is green.
-8. **Roll into the next phase.**
+   - `pnpm tauri build --debug --no-bundle`
+4. **Update [`CHANGELOG.md`](../CHANGELOG.md)** — a dated entry with Added / Changed / Fixed, the test deltas, and the local pre-push results.
+5. **Commit** with a detailed multi-line message.
+6. **Push** to `main`.
+7. **Watch CI** until green.
+8. **Tag** `vX.Y.Z` only after CI is green.
 
-**Pre-1.0 versioning rule:** minor = phase number; patch = bug fixes within a phase. Phase 1 → `v0.1.x`, Phase 2 → `v0.2.x`, etc. After `v1.0.0`, full semver applies.
+**Versioning.** Pre-1.0, minor = phase number (Phase 1 → `v0.1.x`, etc.). **From `v1.0.0` on, full semver applies**, and the contracts in [`docs/STABLE-SURFACE.md`](STABLE-SURFACE.md) change in an **additive-only** way across the 1.x line (guarded by serialization tests in CI).
 
 ## Code style
 
@@ -69,30 +69,28 @@ DivoraVoice ships in phases. Each phase follows the **same loop**, in order:
 
 ### Commit messages
 
-- Subject line under 70 characters.
+- Subject line under 70 characters. Conventional-commit style, e.g. `feat(v1.7.0): loudness normalization (auto-gain + limiter)`.
 - Blank line, then a paragraph explaining the *why*.
 - Bullet list for notable details (file moves, behavior changes, dependency additions).
-- Always end with `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` when Claude collaborated.
+- When Claude collaborated, end with a `Co-Authored-By: Claude <model> <noreply@anthropic.com>` trailer naming the model used.
 
 ## Tests
 
-### DSP unit tests
+### Rust / DSP unit tests
 
-Every DSP effect must have a golden-WAV test:
+Each DSP effect carries its own `#[cfg(test)]` module asserting **algebraic / property** invariants rather than golden WAVs — e.g. passthrough at mix 0, energy added once warm, output stays finite on NaN / extreme input, the wet tail adds no dry-path latency, behavior across sample-rate changes. Co-locate new tests with the effect they cover (e.g. `divora-core/src/dsp/reverb.rs`). Run the whole workspace with `cargo test --workspace --all-features`.
 
-1. Load `tests/fixtures/<effect>_input.wav`.
-2. Run the effect with a documented parameter set.
-3. Compare to `tests/fixtures/<effect>_expected.wav` within an `f32` epsilon (~1e-4).
-4. To intentionally update the golden, run with `--bless` (a CLI flag we wire into the test binary).
+The engine and audio-device tests skip live cpal/WASAPI enumeration when `CI=true` (the headless runner can fault under parallel enumeration); real hardware runs them.
+
+There is also one `#[ignore]`d LLVC integration test that threads the real ONNX model — run it locally with the runtime DLL present.
 
 ### Frontend tests
 
-- Vitest for unit and component tests.
-- Playwright (via Tauri webdriver) for end-to-end smoke flows.
+- **Vitest** for unit and component tests (`pnpm test`). Store derivations, command wrappers, and design-system components each have specs co-located as `*.test.ts(x)`.
 
 ### Manual checklist
 
-`docs/MANUAL_TESTS.md` is the pre-release manual test list. Run through it before tagging a release that touches audio routing or virtual mic flow.
+[`docs/MANUAL_TESTS.md`](MANUAL_TESTS.md) is the pre-release manual test list — the device-level paths (audio routing, virtual mic, tray, recording) that can't run headless. Walk through it before tagging a release that touches those flows.
 
 ## Filing issues
 

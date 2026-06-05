@@ -1,6 +1,6 @@
-//! DSP effect chain — the 8 effects `DivoraVoice` ships, plus the
-//! `AudioEffect` trait, `EffectChain`, and the `DspCommand` enum the
-//! audio thread receives from the UI.
+//! DSP effect chain — the effects `DivoraVoice` ships (see `EffectKind`
+//! below for the full set), plus the `AudioEffect` trait, `EffectChain`,
+//! and the `DspCommand` enum the audio thread receives from the UI.
 //!
 //! ### Audio-thread ownership model
 //!
