@@ -224,10 +224,72 @@ After v1.0, features follow standard semver:
 | post-1.0 ✓ | v1.5.0 | **Voice pack — range + utility**: five more DSP voices over the existing effects — **Leviathan** (deepest), **The Imp** (comedic high), **Dispatch** (clean bandlimited comms), **Corrupted** (bit-crush + ring-mod glitch), **Whisper Wraith** (airy/intimate). Bundled presets + cast entries; no new effects/model. | The Coven browser shows 15 voices, each a distinct character |
 | post-1.0 ✓ | v1.6.0 | **Presets preview-then-Use + monitor volume** (from feedback): selecting a preset only previews/edits it — your live voice changes only on **Use** (the viewed/active split); and the Mixer gains a **monitor volume** slider (0–200 %) to set how loud you hear yourself, persisted + applied to the monitor stream. | Browsing presets doesn't change your live voice until Use; the monitor slider boosts/cuts sidetone |
 | post-1.0 ✓ | v1.7.0 | **Loudness normalization / auto-gain**: an optional RMS-target auto-gain stage + brick-wall limiter, applied as a **global post-chain output stage** (not a per-preset effect, so it stays level *across* presets), with a live makeup-gain readout. Zero added latency. | Switching presets or toggling Voice Convert keeps output loudness roughly constant without clipping |
+| planned | v1.8.0 | **Dynamics — compressor + de-esser**: two new chain effects. A **Compressor** (feed-forward, soft-knee, zero look-ahead) evens out a voice's level; a **De-esser** (high-band split-detect → dynamic attenuation) tames the sibilance that pitch/formant shifting exaggerates. Both are additive `EffectKind`s with zero added latency, fitting the existing chain/preset model. | Compressor + de-esser are selectable in the chain editor, usable in presets, and add 0 ms latency; the readout confirms it |
+| planned | v1.9.0 | **Control surfaces — MIDI + Stream Deck**: a MIDI-input mapping layer (`midir`) with **MIDI-learn**, mapping notes/CCs to existing actions — preset switch / soundboard tile / PTM / monitor / effect-param sweeps — plus a documented Stream Deck bridge (trigger the existing global hotkeys) and an optional companion plugin. Mappings persist locally. | A MIDI pad/knob (or Stream Deck) summons presets, fires soundboard tiles, holds PTM, and sweeps a param live; bindings survive a restart |
+| planned | v1.10.0 | **Guided mic calibration**: a wizard + Settings step that measures the room's noise floor over a short "stay quiet" window and auto-sets the **gate threshold** (and a sensible **denoiser mix**), so a new user gets a clean signal without hand-tuning. Advanced users can still override. | "Stay quiet for 2 s" sets a gate/denoiser that cleanly cuts the measured noise floor; the value is shown and editable |
 
 **Deferred — zero-shot conversion + personal voice** (*hybrid step 2*): an any-to-reference VC model (convert toward a reference clip, no per-voice training) would unlock realistic Coven members from bundled public-domain / synthetic clips **and** a consented "your voice" target recorded in-app, plus the AI-onboarding/voice-catalog idea. **Blocked on the model landscape:** as of 2026-06 there is no real-time, on-CPU, *permissively-licensed* zero-shot VC model — the fast CPU option (RT-VC, ~61 ms) ships no license, and the permissive ones (kNN-VC, FreeVC; both MIT) depend on WavLM-Large (~1.3 GB, GPU-oriented), which is the real-time killer on CPU. OpenVoice v2 (MIT) is viable only as offline *record-and-convert*, which cuts against the live-changer identity. Revisit when a real-time, ONNX-friendly, permissively-licensed option matures (RT-VC is the one to watch).
 
-Further out (standard semver): VST3 host, Stream Deck integration, OBS WebSocket, etc.
+**Next up (planned, detailed below):** v1.8 dynamics (compressor + de-esser), v1.9 control surfaces (MIDI + Stream Deck), v1.10 guided mic calibration.
+
+Further out (standard semver): VST3 host, OBS WebSocket, community preset registry, light theme, etc.
+
+## Roadmap detail — v1.8–v1.10 (planned)
+
+All three stay inside the **v1.0 frozen surface** ([`STABLE-SURFACE.md`](STABLE-SURFACE.md)): new effect kinds, new commands/events, and new `localStorage` keys are *additive* and allowed; nothing existing is renamed, retyped, or repurposed. Each ships through the standard per-release loop (implement → tests → green pre-push checklist → CHANGELOG entry → push → CI → tag).
+
+### v1.8.0 — Dynamics: compressor + de-esser
+
+**Why.** The chain has a gate, a denoiser, and a limiter (buried in the loudness stage) but no *compressor* — the single best tool for an even, broadcast-sounding voice — and no *de-esser*, which matters because pitch/formant shifting exaggerates sibilance. Both are textbook additive effects.
+
+**Surface (additive).** Two new `EffectKind` variants: `Compressor`, `DeEsser`.
+
+**Files to touch** (mirrors how `chorus` / `harmonizer` were added):
+
+- Rust: `divora-core/src/dsp/mod.rs` — `mod compressor; mod deesser;`, `pub use …`, two `EffectKind` variants, two `build_effect` arms. New `divora-core/src/dsp/compressor.rs` + `deesser.rs`, each `impl AudioEffect` with `latency_samples → 0`.
+- Frontend: `src/types.ts` (`EffectId` += `"compressor" | "deesser"`), `src/audio/api.ts` (`EffectKindWire`), `src/data/effects.ts` (two `EFFECTS` entries + `EFFECT_ORDER` slots), `src/data/effects.test.ts` (+catalog tests).
+- Sigils: author two custom Sigil glyphs (per the no-third-party-icons rule) — e.g. a compressor "clamp" and a de-esser "sss" mark.
+
+**Algorithm sketch.**
+
+- **Compressor** — feed-forward, **no look-ahead** (→ 0 latency): peak/RMS detector → soft-knee gain computer (threshold/ratio/knee) → attack/release-smoothed gain → makeup. Params: `thresh` (−60…0 dB), `ratio` (1…20), `attack` (1…100 ms), `release` (10…500 ms), `makeup` (0…24 dB, or an "auto" default).
+- **De-esser** — split a high band (~5–9 kHz, biquad), detect *that band's* level, attenuate it when it exceeds the threshold, recombine. Params: `freq` (3…10 kHz), `thresh` (−60…0 dB), `range` (0…24 dB of reduction). Also 0 latency.
+
+**Tests.** Per effect (same shape as the existing DSP tests): passthrough below threshold; measurable gain reduction above it; finite on NaN/extreme input; `latency_samples == 0`; stable across a sample-rate change. De-esser additionally: a low-freq tone passes; a high-freq sibilant burst is attenuated.
+
+**Out of scope.** Multiband compression, look-ahead limiting (the loudness stage already brick-walls the output), sidechain-from-another-source.
+
+### v1.9.0 — Control surfaces: MIDI + Stream Deck
+
+**Why.** The audience (streamers, gamers, performers) lives on hardware control surfaces. The actions already exist as store/IPC calls — this is an *input layer* feeding them.
+
+**Surface (additive).** New commands `list_midi_inputs` / `open_midi_input(name)` / `close_midi_input`; new event `midi-message { channel, kind, data1, data2 }` (drives MIDI-learn); new `localStorage["divora.midiMappings"]`. No existing surface changes.
+
+**Files to touch.**
+
+- Rust: add `midir` to `src-tauri`; a `midi` module that opens an input port on a thread and forwards messages as the `midi-message` event; three command handlers in `src-tauri/src/lib.rs`; capability entries if needed.
+- Frontend: `src/audio/api.ts` (wrappers + `MidiMessage` type), a `midiMappings` store (`Record<bindingKey, action>`) + a router that maps an incoming note/CC to an action and calls the **existing** store actions — `usePreset` / `summon`, `playTileById`, PTM `setUi("pressed", …)`, `toggleMonitor`, `setChainParam` (CC → param sweep). A **Settings → Control surfaces** section: MIDI input picker + a mapping table with per-row **Learn** (capture the next `midi-message`) + Clear.
+
+**Stream Deck.** Ship the zero-cost bridge first: a Stream Deck "Hotkey" button fires a keystroke the **existing** global-shortcut layer already handles (PTM / panic / monitor + per-tile hotkeys) — document it in the new Settings section with a help card. A dedicated companion plugin (talking to a localhost endpoint) is a later, separate effort — note it as such (a local server is a new trust surface, so it's opt-in and out of this release).
+
+**Tests.** Frontend: the MIDI router maps a learned note → the right action; a CC sweeps the bound param within range; mappings persist + restore; an unmapped message is a no-op. Rust: message-parse unit tests (the live port open is desktop-verified, like the tray/recording paths).
+
+**Out of scope.** MIDI *output*/feedback (lighting pads), MIDI clock, the full Stream Deck plugin.
+
+### v1.10.0 — Guided mic calibration
+
+**Why.** The gate threshold is hand-tuned today; a new user doesn't know where to put it. Measure it for them.
+
+**Surface.** Can ship with **no new backend command** — sample the existing ~30 Hz `audio-levels` event over a short window on the frontend. (Optionally add an additive `measure_noise_floor(durationMs)` helper later if a tighter measurement is wanted.)
+
+**Files to touch.**
+
+- Frontend: a calibration routine that, over a ~2 s "stay quiet" window, collects input levels and takes a high percentile as the noise floor; suggests `gate.thresh ≈ noiseFloorDb + 8 dB` (clamped to the −80…−20 range) and a denoiser mix when the floor is high. Applies via the existing `setChainParam`; shows the chosen value and leaves it editable.
+- UI: a **new wizard step** ("Calibrate your mic", after the device step) in `src/components/Wizard.tsx`, and an **"Auto-calibrate gate"** button in Settings → Audio devices. Persist that the user has calibrated so the wizard doesn't nag.
+
+**Tests.** Frontend: the threshold suggestion is computed correctly from a sampled level series; values clamp to the gate's range; calibration writes through to the active chain's gate; "already calibrated" suppresses the wizard step.
+
+**Out of scope.** Auto-tuning the whole chain, per-preset calibration, automatic gain (that's the v1.7 loudness stage).
 
 ## DSP Effect Set (Phase 3)
 
@@ -403,10 +465,11 @@ Jobs:
 
 ## Standout Features (Deferred to post-v1)
 
+- Compressor + de-esser dynamics effects — **scheduled v1.8.0** (see roadmap detail)
+- MIDI controller bindings + Stream Deck integration — **scheduled v1.9.0** (see roadmap detail)
+- Guided mic calibration — **scheduled v1.10.0** (see roadmap detail)
 - VST3 plugin host inside the effect chain
-- Stream Deck integration
 - OBS WebSocket integration
-- MIDI controller bindings for soundboard
 - Community preset registry (GitHub-hosted JSON)
 - 30-second rolling clip recorder
 - Light theme ("soon" in design)
