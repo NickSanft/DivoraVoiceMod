@@ -134,6 +134,32 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     readout: (v) =>
       `${signed(v.v1 ?? 0)}/${signed(v.v2 ?? 0)}/${signed(v.v3 ?? 0)} st`,
   },
+  compressor: {
+    id: "compressor",
+    name: "Compressor",
+    sigil: "compressor",
+    desc: "Evens out level — tames peaks for a steadier, broadcast-sounding voice. Zero added latency.",
+    params: [
+      { key: "thresh", label: "Threshold", min: -60, max: 0, step: 1, unit: "dB", default: -24 },
+      { key: "ratio", label: "Ratio", min: 1, max: 20, step: 0.5, unit: ":1", default: 3 },
+      { key: "attack", label: "Attack", min: 1, max: 100, step: 1, unit: "ms", default: 10 },
+      { key: "release", label: "Release", min: 10, max: 500, step: 5, unit: "ms", default: 120 },
+      { key: "makeup", label: "Makeup", min: 0, max: 24, step: 1, unit: "dB", default: 0 },
+    ],
+    readout: (v) => `${v.thresh ?? 0} dB · ${v.ratio ?? 1}:1`,
+  },
+  deesser: {
+    id: "deesser",
+    name: "De-esser",
+    sigil: "deesser",
+    desc: "Tames sibilance — ducks the harsh 'sss' band that pitch/formant shifting exaggerates. Zero added latency.",
+    params: [
+      { key: "freq", label: "Frequency", min: 3000, max: 10000, step: 100, unit: "Hz", default: 6000 },
+      { key: "thresh", label: "Threshold", min: -60, max: 0, step: 1, unit: "dB", default: -30 },
+      { key: "range", label: "Range", min: 0, max: 24, step: 1, unit: "dB", default: 12 },
+    ],
+    readout: (v) => `${((v.freq ?? 0) / 1000).toFixed(1)}k · ${v.thresh ?? 0} dB`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -154,6 +180,8 @@ export const EFFECT_ORDER: EffectId[] = [
   "pitch",
   "formant",
   "eq",
+  "compressor",
+  "deesser",
   "robot",
   "distortion",
   "echo",

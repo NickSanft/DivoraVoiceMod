@@ -70,6 +70,36 @@ describe("EFFECTS catalog", () => {
     expect(m!.unit).toBe("%");
   });
 
+  it("compressor exposes the standard dynamics params (v1.8.0)", () => {
+    expect(EFFECTS.compressor).toBeDefined();
+    const keys = EFFECTS.compressor.params.map((p) => p.key);
+    expect(keys).toEqual(["thresh", "ratio", "attack", "release", "makeup"]);
+    const ratio = EFFECTS.compressor.params.find((p) => p.key === "ratio");
+    expect(ratio!.min).toBe(1);
+    expect(ratio!.max).toBe(20);
+  });
+
+  it("de-esser exposes freq/thresh/range params (v1.8.0)", () => {
+    expect(EFFECTS.deesser).toBeDefined();
+    const keys = EFFECTS.deesser.params.map((p) => p.key);
+    expect(keys).toEqual(["freq", "thresh", "range"]);
+    const freq = EFFECTS.deesser.params.find((p) => p.key === "freq");
+    expect(freq!.unit).toBe("Hz");
+    expect(freq!.default).toBe(6000);
+  });
+
+  it("compressor and de-esser sit in the corrective group after EQ", () => {
+    // Dynamics belong with the corrective effects (after tone-shaping
+    // EQ), before the creative tail (robot/distortion/echo/reverb).
+    const eqIdx = EFFECT_ORDER.indexOf("eq");
+    const compIdx = EFFECT_ORDER.indexOf("compressor");
+    const deessIdx = EFFECT_ORDER.indexOf("deesser");
+    const robotIdx = EFFECT_ORDER.indexOf("robot");
+    expect(compIdx).toBeGreaterThan(eqIdx);
+    expect(deessIdx).toBeGreaterThan(compIdx);
+    expect(robotIdx).toBeGreaterThan(deessIdx);
+  });
+
   it("voice_convert runs after the cleanup effects but before pitch", () => {
     // Voice conversion wants a clean, gated, denoised signal as input;
     // it sits after gate + denoiser. Downstream tone-shaping (pitch,

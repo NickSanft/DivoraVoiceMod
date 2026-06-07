@@ -21,6 +21,8 @@
 //! LPC-based formant warp also lands later.
 
 mod chorus;
+mod compressor;
+mod deesser;
 mod denoiser;
 mod distortion;
 mod echo;
@@ -35,6 +37,8 @@ mod stft;
 mod voice_convert;
 
 pub use chorus::Chorus;
+pub use compressor::Compressor;
+pub use deesser::DeEsser;
 pub use denoiser::RnnDenoiser;
 pub use distortion::Distortion;
 pub use echo::Echo;
@@ -74,6 +78,13 @@ pub enum EffectKind {
     /// intervals summed with the dry root, making an actual chord
     /// (diminished by default). Powers the "Choir of Ash" voice.
     Harmonizer,
+    /// v1.8.0: dynamics compressor — feed-forward, soft-knee, zero
+    /// look-ahead. Evens out level for a steadier send. Adds no latency.
+    Compressor,
+    /// v1.8.0: de-esser — split-band dynamic attenuation of the
+    /// sibilance band ("sss"), which pitch/formant shifting exaggerates.
+    /// Adds no latency.
+    Deesser,
     /// Phase 12: ONNX-backed voice conversion (LLVC-style). Loads a
     /// `.onnx` model from the voices directory and streams 48 kHz mono
     /// through a 16 kHz inference chunk. Falls back to passthrough
@@ -266,6 +277,8 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::Reverb => Box::new(Reverb::new()),
         EffectKind::Chorus => Box::new(Chorus::new()),
         EffectKind::Harmonizer => Box::new(Harmonizer::new()),
+        EffectKind::Compressor => Box::new(Compressor::new()),
+        EffectKind::Deesser => Box::new(DeEsser::new()),
         EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
     };
     effect.set_enabled(spec.enabled);

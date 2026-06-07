@@ -137,6 +137,8 @@ export type EffectKindWire =
   | "reverb"
   | "chorus"
   | "harmonizer"
+  | "compressor"
+  | "deesser"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

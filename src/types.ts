@@ -11,6 +11,10 @@ export type EffectId =
   | "echo"
   | "chorus"
   | "harmonizer"
+  /** v1.8.0: dynamics compressor (feed-forward, zero look-ahead). */
+  | "compressor"
+  /** v1.8.0: split-band de-esser for sibilance. */
+  | "deesser"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

@@ -17,6 +17,7 @@ import { Show } from "solid-js";
 
 export type SigilName =
   | "pitch" | "formant" | "reverb" | "eq" | "robot" | "distortion" | "echo" | "gate"
+  | "compressor" | "deesser"
   | "mixer" | "soundboard" | "presets" | "settings"
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
   | "lock" | "panic" | "play" | "stop"
@@ -85,6 +86,23 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
       <path d="M6 20 V7 a6 6 0 0 1 12 0 V20" />
       <path d="M12 4.5 V20" stroke-dasharray="2 2.4" opacity="0.7" />
       <path d="M4.5 20 h15" />
+    </g>
+  ),
+  compressor: () => (
+    // Two plates squeezing a signal toward the center — dynamic range
+    // being compressed.
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 5 H20" />
+      <path d="M4 19 H20" />
+      <path d="M12 7.5 V11 M10 9 L12 11 L14 9" />
+      <path d="M12 16.5 V13 M10 15 L12 13 L14 15" />
+    </g>
+  ),
+  deesser: () => (
+    // A tight high-frequency wave whose amplitude decays left to right —
+    // the harsh sibilance being damped.
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12 L6 6.5 L8 17.5 L10 8 L12 16 L14 9.5 L16 14.5 L18 11 L20 12.5" />
     </g>
   ),
   // ---------- NAV ----------

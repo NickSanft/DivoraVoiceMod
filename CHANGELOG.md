@@ -4,6 +4,30 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-06-07 — Dynamics: compressor + de-esser
+
+Two new chain effects that fill the biggest remaining gap in the corrective toolkit — an even, broadcast-sounding voice and tamed sibilance — both additive over the frozen v1.0 effect set and both **zero-latency**.
+
+### Added
+
+- **Compressor** (`EffectKind::Compressor`) — a feed-forward, soft-knee, **zero look-ahead** dynamics compressor. Evens out level so peaks don't jump (great for calls/streaming and for taming a loud preset). Params: **Threshold** (−60…0 dB), **Ratio** (1…20:1), **Attack** (1…100 ms), **Release** (10…500 ms), **Makeup** (0…24 dB). The detector envelope lives in the gain-reduction (dB) domain with separate attack/release time constants, which is click-free; output is hard-sanitized so non-finite input can never poison the chain.
+- **De-esser** (`EffectKind::Deesser`) — a split-band dynamic processor that ducks the harsh "sss"/"shh" band that pitch- and formant-shifting exaggerate. A high-pass biquad isolates the sibilance band, its level is tracked, and when it exceeds the threshold a proportion of that band is subtracted back out — so only the highs are ducked, the body of the voice is untouched. Params: **Frequency** (3…10 kHz), **Threshold** (−60…0 dB), **Range** (max attenuation, 0…24 dB).
+- Both appear in the chain editor / spell-circle picker (new custom **Sigil** glyphs), are usable in user and bundled presets, and add **0 ms** to the latency readout (no look-ahead, so `latency_samples → 0`). They sit in the corrective group right after EQ in the default effect order.
+
+### Architecture
+
+- New `divora-core/src/dsp/compressor.rs` + `deesser.rs`, each `impl AudioEffect`; wired through `dsp/mod.rs` (modules, re-exports, two `EffectKind` variants, two `build_effect` arms). Additive only — no existing variant, command, event, or preset field changed (per [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)).
+- Frontend: `EffectId` (`src/types.ts`) and `EffectKindWire` (`src/audio/api.ts`) gain `compressor` / `deesser`; `src/data/effects.ts` adds the two catalog entries + `EFFECT_ORDER` slots; `src/components/Sigil.tsx` adds the two glyphs. The generic Inspector, spell circle, and Presets chain cards render them with no per-effect UI code.
+
+### Tests
+
+- **Rust**: +12 (6 per effect) — compressor: near-passthrough below threshold, compresses above it, unity ratio is a no-op, stays finite on NaN/∞/extreme input, zero added latency, sample-rate change; de-esser: low-frequency tone passes, sibilant high-frequency band is attenuated, finite on extreme input, zero latency, sample-rate change.
+- **Frontend**: +3 catalog tests — compressor param set, de-esser param set, and the corrective-group ordering (after EQ, before the creative tail).
+
+### Pre-push checklist
+
+- To be run in CI (the authoring environment had no Rust/Node toolchain): `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `pnpm typecheck`, `pnpm test`, `pnpm tauri build --debug --no-bundle`. Tag `v1.8.0` only after CI is green.
+
 ## [1.7.0] — 2026-06-04 — Loudness normalization (auto-gain + limiter)
 
 An optional output stage that keeps your *perceived* level steady no matter which voice you're using, and guarantees the output never clips.
