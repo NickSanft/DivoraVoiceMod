@@ -4,6 +4,36 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-06-08 — Control surfaces: MIDI + Stream Deck
+
+Bind a hardware controller to DivoraVoice. A new MIDI-input layer with **MIDI-learn** maps a controller's pads and knobs to actions that already exist — summon a preset, fire a soundboard tile, hold push-to-modulate, toggle the monitor, or sweep an effect param live — plus a zero-cost **Stream Deck** path that reuses the existing global hotkeys. Purely additive over the frozen v1.0 surface.
+
+### Added
+
+- **MIDI input + MIDI-learn** — a **Settings → Control surfaces** section with a MIDI input picker and a mapping table. Each row picks an action and (where relevant) a target, then **Learn** captures the next note/CC you send. Five action kinds:
+  - **Summon preset** — note → switches the active voice (`usePreset`).
+  - **Play soundboard tile** — note → fires a clip (`playTileById`).
+  - **Hold push-to-modulate** — momentary; held while the note is down (or the CC is in its upper half), released on note-off.
+  - **Toggle monitor** — note/CC → flips sidetone.
+  - **Sweep effect param** — a CC (0..127) maps onto the chosen effect param's range and drives it live (`setChainParam`).
+- **Mappings + device persist** locally (`divora.midiMappings`, `divora.midiInput`) and are restored on the next launch — the saved port re-opens automatically.
+- **Stream Deck** — no plugin needed: a help card explains binding a Stream Deck **Hotkey** button to the same keys set under Settings → Hotkeys (PTM / panic / monitor) or to a per-tile soundboard hotkey, so the button fires DivoraVoice's existing global shortcut even while a game or Discord is focused. (A dedicated companion plugin — a new localhost trust surface — is intentionally deferred.)
+
+### Architecture
+
+- **Surface (additive only).** Three new commands — `list_midi_inputs`, `open_midi_input(name)`, `close_midi_input` — and one new event, `midi-message { channel, kind, data1, data2 }`. Two new `localStorage` keys. Nothing existing renamed/retyped (per [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)).
+- **Backend** (`src-tauri`): `midir` (WinMM on Windows — no extra system deps) opens an input port; a new `src-tauri/src/midi.rs` parses each message and forwards it as a `midi-message` event. The live connection is held in `AppState` (dropping it closes the port), mirroring the recording/tray pattern. The live port open is desktop-verified, like tray/recording.
+- **Frontend**: a **pure router** (`src/midi/router.ts`) maps a message → action with zero Tauri/Solid coupling; `App.tsx` binds its handler interface to the live store actions and feeds `midi-message` events in (learn if armed, else route). A CC's `data2` scales onto the bound param's catalog range — channel-agnostic matching keyed on note-vs-CC + number.
+
+### Tests
+
+- **Rust**: +10 in `midi.rs` — note-on/off, note-on velocity-0 → note-off, CC, channel nibble, program-change (1 data byte), system/sysex ignored, empty/data-only ignored, frozen JSON keys, and `list_inputs` doesn't panic on a headless runner.
+- **Frontend**: +8 router tests (CC scaling + clamp, note-vs-CC matching, preset summon ignores note-off, momentary PTM hold/release, full-range param sweep, tile fire, monitor activates only on CC ≥ 64, unmapped/triggerless no-op) and +5 store tests (mapping persist + restore across re-init, MIDI-learn captures + disarms, routing a learned preset mapping, removal persists) and +4 api command-name tests.
+
+### Pre-push checklist
+
+- All green, run locally on this machine: `cargo fmt --check` clean, `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean, `cargo test --workspace --all-features`, `pnpm typecheck`, `pnpm test`, `pnpm tauri build --debug --no-bundle`.
+
 ## [1.8.0] — 2026-06-07 — Dynamics: compressor + de-esser
 
 Two new chain effects that fill the biggest remaining gap in the corrective toolkit — an even, broadcast-sounding voice and tamed sibilance — both additive over the frozen v1.0 effect set and both **zero-latency**.

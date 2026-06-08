@@ -12,13 +12,16 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   clearEffectChain,
+  closeMidiInput,
   deleteUserPreset,
   detectVirtualMic,
   exportPresetJson,
   getEngineStatus,
   listInputDevices,
+  listMidiInputs,
   listOutputDevices,
   listPresets,
+  openMidiInput,
   playSoundboardClip,
   presetStorePath,
   recordingsDir,
@@ -37,6 +40,7 @@ import {
   stopSoundboardClip,
   subscribeGlobalShortcut,
   subscribeLevels,
+  subscribeMidi,
   unregisterAllGlobalShortcuts,
   unregisterGlobalShortcut,
 } from "./api";
@@ -408,5 +412,46 @@ describe("audio api", () => {
     expect(listenMock).toHaveBeenCalled();
     expect(listenMock.mock.calls[0]?.[0]).toBe("audio-levels");
     expect(captured).toMatchObject({ running: true });
+  });
+
+  it("listMidiInputs invokes list_midi_inputs", async () => {
+    invokeMock.mockResolvedValueOnce([{ id: "Launchpad", name: "Launchpad" }]);
+    const inputs = await listMidiInputs();
+    expect(invokeMock).toHaveBeenCalledWith("list_midi_inputs");
+    expect(inputs[0]!.name).toBe("Launchpad");
+  });
+
+  it("openMidiInput forwards the port name", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await openMidiInput("Launchpad");
+    expect(invokeMock).toHaveBeenCalledWith("open_midi_input", { name: "Launchpad" });
+  });
+
+  it("closeMidiInput invokes close_midi_input", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await closeMidiInput();
+    expect(invokeMock).toHaveBeenCalledWith("close_midi_input");
+  });
+
+  it("subscribeMidi listens on midi-message and forwards payloads", async () => {
+    let captured: unknown = null;
+    listenMock.mockImplementationOnce(
+      async (
+        _event: string,
+        handler: (e: { payload: unknown }) => void,
+      ) => {
+        handler({
+          payload: { channel: 0, kind: "note-on", data1: 60, data2: 100 },
+        });
+        return () => {
+          /* unlisten */
+        };
+      },
+    );
+    await subscribeMidi((msg) => {
+      captured = msg;
+    });
+    expect(listenMock.mock.calls[0]?.[0]).toBe("midi-message");
+    expect(captured).toMatchObject({ kind: "note-on", data1: 60 });
   });
 });

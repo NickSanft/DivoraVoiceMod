@@ -381,3 +381,46 @@ export async function subscribeGlobalShortcut(
 ): Promise<UnlistenFn> {
   return listen<GlobalShortcutEvent>("global-shortcut", (e) => handler(e.payload));
 }
+
+// ---- MIDI control surfaces (v1.9.0) ----
+
+/** One available MIDI input port. `id` is the stable handle (the port's
+ *  display name) the backend re-resolves on open — midir port indices
+ *  aren't stable across hot-plug. */
+export interface MidiInputInfo {
+  id: string;
+  name: string;
+}
+
+/** Payload of the backend `midi-message` event. `kind` is a stable
+ *  string ("note-on" | "note-off" | "control-change" | …); `data1` /
+ *  `data2` are the two MIDI data bytes (note + velocity, or controller
+ *  + value). */
+export interface MidiMessage {
+  channel: number;
+  kind: string;
+  data1: number;
+  data2: number;
+}
+
+export async function listMidiInputs(): Promise<MidiInputInfo[]> {
+  return invoke<MidiInputInfo[]>("list_midi_inputs");
+}
+
+/** Open the named MIDI input port; the backend then emits `midi-message`
+ *  events for each note / CC. Opening replaces any existing connection. */
+export async function openMidiInput(name: string): Promise<void> {
+  await invoke("open_midi_input", { name });
+}
+
+/** Close the live MIDI input port (if any). */
+export async function closeMidiInput(): Promise<void> {
+  await invoke("close_midi_input");
+}
+
+/** Subscribe to `midi-message` events. Returns the Tauri unlisten function. */
+export async function subscribeMidi(
+  handler: (msg: MidiMessage) => void,
+): Promise<UnlistenFn> {
+  return listen<MidiMessage>("midi-message", (e) => handler(e.payload));
+}

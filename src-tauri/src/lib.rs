@@ -28,6 +28,12 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
+mod midi;
+use midi::{
+    list_inputs as list_midi_inputs_core, open_input as open_midi_input_core, MidiInputInfo,
+};
+use midir::MidiInputConnection;
+
 /// Payload of the periodic `audio-levels` event. Frontend listens with
 /// `tauri.event.listen("audio-levels", …)`.
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +90,10 @@ struct AppState {
     /// (`%APPDATA%/DivoraVoice/recordings/`). Created at startup;
     /// surfaced to the UI so it can open it + show where files land.
     recordings_dir: PathBuf,
+    /// v1.9.0: the live MIDI input connection, if a control surface is
+    /// connected. Held here so it stays alive — dropping it closes the
+    /// port. Replaced on `open_midi_input`, cleared on `close_midi_input`.
+    midi_connection: Mutex<Option<MidiInputConnection<()>>>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -455,6 +465,40 @@ fn unregister_all_global_shortcuts(
     }
 }
 
+/// v1.9.0: list the available MIDI input ports for the Control surfaces
+/// picker. Resilient — returns empty when no MIDI subsystem / ports.
+#[tauri::command]
+fn list_midi_inputs() -> Vec<MidiInputInfo> {
+    list_midi_inputs_core()
+}
+
+/// v1.9.0: open the named MIDI input port. Each parsed message is
+/// forwarded to the frontend as a `midi-message` event (drives
+/// MIDI-learn + the mapping router). Opening replaces any existing
+/// connection.
+#[tauri::command]
+fn open_midi_input(app: AppHandle, state: State<'_, AppState>, name: String) -> Result<(), String> {
+    // Close any existing connection first — WinMM won't reopen a port
+    // we already hold open.
+    {
+        let mut slot = state.midi_connection.lock().map_err(|e| e.to_string())?;
+        *slot = None;
+    }
+    let conn = open_midi_input_core(&app, &name)?;
+    let mut slot = state.midi_connection.lock().map_err(|e| e.to_string())?;
+    *slot = Some(conn);
+    Ok(())
+}
+
+/// v1.9.0: close the live MIDI input port (if any). Dropping the stored
+/// connection releases it.
+#[tauri::command]
+fn close_midi_input(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state.midi_connection.lock().map_err(|e| e.to_string())?;
+    *slot = None;
+    Ok(())
+}
+
 /// Decode a clip on first play; subsequent plays reuse the cached
 /// `Arc<Vec<f32>>` so a hot soundboard doesn't decode anything twice.
 fn decode_or_cache(
@@ -679,6 +723,7 @@ pub fn run() {
                 voices_dir,
                 bundled_voices_dir,
                 recordings_dir,
+                midi_connection: Mutex::new(None),
             });
             Ok(())
         })
@@ -717,6 +762,9 @@ pub fn run() {
             register_global_shortcut,
             unregister_global_shortcut,
             unregister_all_global_shortcuts,
+            list_midi_inputs,
+            open_midi_input,
+            close_midi_input,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");

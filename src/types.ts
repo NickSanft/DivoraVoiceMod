@@ -126,3 +126,43 @@ export interface UiState {
   ptmKey: string;
   pressed: boolean;
 }
+
+// ---- MIDI control surfaces (v1.9.0) ----
+
+/** The wire message type lives with the IPC layer; re-exported here so
+ *  non-API call sites (the router, the store) import it tidily. */
+export type { MidiMessage } from "./audio/api";
+
+/** Which existing action a MIDI mapping drives. */
+export type MidiActionKind = "preset" | "tile" | "ptm" | "monitor" | "param";
+
+/** The MIDI signal a mapping listens for, captured via MIDI-learn.
+ *  Matching is channel-agnostic (hardware varies); `channel` is kept
+ *  for display. */
+export interface MidiTrigger {
+  /** "note" matches note-on / note-off; "cc" matches control-change. */
+  kind: "note" | "cc";
+  /** Note number or controller number (0..127). */
+  data1: number;
+  channel: number;
+}
+
+/** One control-surface mapping: a learned trigger → an action. */
+export interface MidiMapping {
+  /** Stable local id (also the list key). */
+  id: string;
+  action: MidiActionKind;
+  /** Null until the user runs MIDI-learn. */
+  trigger: MidiTrigger | null;
+  /** action === "preset": the preset to summon. */
+  presetId?: string;
+  /** action === "tile": the soundboard tile to fire. */
+  tileId?: string;
+  /** action === "param": index into the active (viewed) chain. */
+  effectIndex?: number;
+  /** action === "param": the effect param key to sweep. */
+  paramKey?: string;
+  /** action === "param": a CC value of 0..127 maps onto [min, max]. */
+  min?: number;
+  max?: number;
+}

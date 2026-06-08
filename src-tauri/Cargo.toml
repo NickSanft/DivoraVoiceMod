@@ -23,6 +23,10 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-shell = "2"
+# v1.9.0: MIDI control surfaces. Windows backend is WinMM (built in, no
+# extra system deps); the live port open is desktop-verified like the
+# tray/recording paths.
+midir = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

@@ -14,7 +14,7 @@ import {
   type JSX,
 } from "solid-js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { subscribeGlobalShortcut, subscribeLevels } from "./audio/api";
+import { subscribeGlobalShortcut, subscribeLevels, subscribeMidi } from "./audio/api";
 import { Wizard } from "./components/Wizard";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
@@ -148,6 +148,36 @@ function Shell(): JSX.Element {
       // a restart. Defaults: PTM = Space, others empty (so this is a
       // no-op on first boot).
       await app.syncHotkeyBindings();
+    })();
+    onCleanup(() => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    });
+  });
+
+  // v1.9.0: MIDI control surfaces. Subscribe to `midi-message` events and
+  // feed them to the store router (which learns a trigger if armed, else
+  // dispatches to the bound action). Then enumerate the ports and re-open
+  // the persisted device so bindings work right after a restart — mirrors
+  // how the audio devices auto-start below.
+  onMount(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        unlisten = await subscribeMidi((msg) => app.handleMidiMessage(msg));
+      } catch (err) {
+        // Browser preview without the Tauri bridge — MIDI is desktop-only.
+        console.warn("[midi] subscribe failed", err);
+      }
+      if (cancelled) {
+        if (unlisten) unlisten();
+        unlisten = null;
+        return;
+      }
+      await app.refreshMidiInputs();
+      const saved = app.selectedMidiInput();
+      if (saved) await app.selectMidiInput(saved);
     })();
     onCleanup(() => {
       cancelled = true;

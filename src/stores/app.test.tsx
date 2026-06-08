@@ -1518,3 +1518,80 @@ describe("app store — Phase 11.1 tweak persistence + mystical values", () => {
     expect(result.tweaks.mystical).toBeCloseTo(0.7, 5);
   });
 });
+
+describe("app store — MIDI control surfaces (v1.9.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  const cc = (controller: number, value: number) => ({
+    channel: 0,
+    kind: "control-change",
+    data1: controller,
+    data2: value,
+  });
+
+  it("addMidiMapping persists to localStorage", () => {
+    const { result } = setupApp();
+    result.addMidiMapping({ action: "monitor", trigger: null });
+    expect(result.midiMappings()).toHaveLength(1);
+    const raw = window.localStorage.getItem("divora.midiMappings");
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!)[0].action).toBe("monitor");
+  });
+
+  it("mappings survive a re-init of the store (persist + restore)", () => {
+    const a = setupApp();
+    a.result.addMidiMapping({
+      action: "preset",
+      presetId: "clean",
+      trigger: { kind: "note", data1: 60, channel: 0 },
+    });
+    const b = setupApp();
+    expect(b.result.midiMappings()).toHaveLength(1);
+    expect(b.result.midiMappings()[0]?.presetId).toBe("clean");
+    expect(b.result.midiMappings()[0]?.trigger?.data1).toBe(60);
+  });
+
+  it("handleMidiMessage in learn mode captures the trigger and disarms", () => {
+    const { result } = setupApp();
+    result.addMidiMapping({ action: "ptm", trigger: null });
+    const id = result.midiMappings()[0]!.id;
+    result.setMidiLearnId(id);
+    result.handleMidiMessage(cc(7, 64));
+    expect(result.midiMappings()[0]?.trigger).toEqual({
+      kind: "cc",
+      data1: 7,
+      channel: 0,
+    });
+    expect(result.midiLearnId()).toBeNull();
+  });
+
+  it("handleMidiMessage routes a learned preset mapping to the active voice", () => {
+    const { result } = setupApp();
+    const target = result.presets().find((p) => p.id !== result.presetId());
+    expect(target).toBeTruthy();
+    result.addMidiMapping({
+      action: "preset",
+      presetId: target!.id,
+      trigger: { kind: "note", data1: 36, channel: 0 },
+    });
+    result.handleMidiMessage({ channel: 0, kind: "note-on", data1: 36, data2: 100 });
+    expect(result.presetId()).toBe(target!.id);
+  });
+
+  it("removeMidiMapping drops it and persists the removal", () => {
+    const { result } = setupApp();
+    result.addMidiMapping({ action: "monitor", trigger: null });
+    const id = result.midiMappings()[0]!.id;
+    result.removeMidiMapping(id);
+    expect(result.midiMappings()).toHaveLength(0);
+    expect(JSON.parse(window.localStorage.getItem("divora.midiMappings")!)).toEqual([]);
+  });
+});

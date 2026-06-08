@@ -225,12 +225,12 @@ After v1.0, features follow standard semver:
 | post-1.0 ✓ | v1.6.0 | **Presets preview-then-Use + monitor volume** (from feedback): selecting a preset only previews/edits it — your live voice changes only on **Use** (the viewed/active split); and the Mixer gains a **monitor volume** slider (0–200 %) to set how loud you hear yourself, persisted + applied to the monitor stream. | Browsing presets doesn't change your live voice until Use; the monitor slider boosts/cuts sidetone |
 | post-1.0 ✓ | v1.7.0 | **Loudness normalization / auto-gain**: an optional RMS-target auto-gain stage + brick-wall limiter, applied as a **global post-chain output stage** (not a per-preset effect, so it stays level *across* presets), with a live makeup-gain readout. Zero added latency. | Switching presets or toggling Voice Convert keeps output loudness roughly constant without clipping |
 | post-1.0 ✓ | v1.8.0 | **Dynamics — compressor + de-esser**: two new chain effects. A **Compressor** (feed-forward, soft-knee, zero look-ahead) evens out a voice's level; a **De-esser** (high-band split-detect → dynamic attenuation) tames the sibilance that pitch/formant shifting exaggerates. Both are additive `EffectKind`s with zero added latency, fitting the existing chain/preset model. | Compressor + de-esser are selectable in the chain editor, usable in presets, and add 0 ms latency; the readout confirms it |
-| planned | v1.9.0 | **Control surfaces — MIDI + Stream Deck**: a MIDI-input mapping layer (`midir`) with **MIDI-learn**, mapping notes/CCs to existing actions — preset switch / soundboard tile / PTM / monitor / effect-param sweeps — plus a documented Stream Deck bridge (trigger the existing global hotkeys) and an optional companion plugin. Mappings persist locally. | A MIDI pad/knob (or Stream Deck) summons presets, fires soundboard tiles, holds PTM, and sweeps a param live; bindings survive a restart |
+| post-1.0 ✓ | v1.9.0 | **Control surfaces — MIDI + Stream Deck**: a MIDI-input mapping layer (`midir`) with **MIDI-learn**, mapping notes/CCs to existing actions — preset switch / soundboard tile / PTM / monitor / effect-param sweeps — plus a documented Stream Deck bridge (trigger the existing global hotkeys) and an optional companion plugin. Mappings persist locally. | A MIDI pad/knob (or Stream Deck) summons presets, fires soundboard tiles, holds PTM, and sweeps a param live; bindings survive a restart |
 | planned | v1.10.0 | **Guided mic calibration**: a wizard + Settings step that measures the room's noise floor over a short "stay quiet" window and auto-sets the **gate threshold** (and a sensible **denoiser mix**), so a new user gets a clean signal without hand-tuning. Advanced users can still override. | "Stay quiet for 2 s" sets a gate/denoiser that cleanly cuts the measured noise floor; the value is shown and editable |
 
 **Deferred — zero-shot conversion + personal voice** (*hybrid step 2*): an any-to-reference VC model (convert toward a reference clip, no per-voice training) would unlock realistic Coven members from bundled public-domain / synthetic clips **and** a consented "your voice" target recorded in-app, plus the AI-onboarding/voice-catalog idea. **Blocked on the model landscape:** as of 2026-06 there is no real-time, on-CPU, *permissively-licensed* zero-shot VC model — the fast CPU option (RT-VC, ~61 ms) ships no license, and the permissive ones (kNN-VC, FreeVC; both MIT) depend on WavLM-Large (~1.3 GB, GPU-oriented), which is the real-time killer on CPU. OpenVoice v2 (MIT) is viable only as offline *record-and-convert*, which cuts against the live-changer identity. Revisit when a real-time, ONNX-friendly, permissively-licensed option matures (RT-VC is the one to watch).
 
-**Next up (planned, detailed below):** v1.9 control surfaces (MIDI + Stream Deck), v1.10 guided mic calibration. (v1.8 dynamics shipped.)
+**Next up (planned, detailed below):** v1.10 guided mic calibration. (v1.8 dynamics + v1.9 control surfaces shipped.)
 
 Further out (standard semver): VST3 host, OBS WebSocket, community preset registry, light theme, etc.
 
@@ -466,7 +466,7 @@ Jobs:
 ## Standout Features (Deferred to post-v1)
 
 - Compressor + de-esser dynamics effects — **shipped v1.8.0** (see roadmap detail)
-- MIDI controller bindings + Stream Deck integration — **scheduled v1.9.0** (see roadmap detail)
+- MIDI controller bindings + Stream Deck integration — **shipped v1.9.0** (see roadmap detail)
 - Guided mic calibration — **scheduled v1.10.0** (see roadmap detail)
 - VST3 plugin host inside the effect chain
 - OBS WebSocket integration

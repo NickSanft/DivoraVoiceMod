@@ -12,16 +12,19 @@
 //     Replay setup button that re-opens the first-run wizard)
 
 import { createMemo, createSignal, For, onMount, Show, type JSX } from "solid-js";
+import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { HotkeyCapture } from "../components/HotkeyCapture";
 import { DMark } from "../components/DMark";
+import { Kbd } from "../components/Kbd";
 import { HMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
 import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { clearWizardSeenFlag } from "../components/Wizard";
+import { EFFECTS } from "../data/effects";
 import {
   MYSTICAL_BALANCED,
   MYSTICAL_RICH,
@@ -29,7 +32,7 @@ import {
   useApp,
   type HotkeyAction,
 } from "../stores/app";
-import type { GlyphId, TweaksState } from "../types";
+import type { ChainEntry, GlyphId, MidiActionKind, MidiMapping, TweaksState } from "../types";
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
 
@@ -148,6 +151,8 @@ export function SettingsScreen(): JSX.Element {
       <VirtualMicSection />
 
       <HotkeysSection />
+
+      <ControlSurfacesSection />
 
       <GlyphCastingSection />
 
@@ -1014,6 +1019,302 @@ function HotkeysSection(): JSX.Element {
         >
           Hotkeys are global — they fire even while another app is focused.
         </div>
+      </div>
+    </section>
+  );
+}
+
+// ---------- Control surfaces (MIDI + Stream Deck) ----------
+
+const MIDI_ACTIONS: { value: MidiActionKind; label: string }[] = [
+  { value: "preset", label: "Summon preset" },
+  { value: "tile", label: "Play soundboard tile" },
+  { value: "ptm", label: "Hold push-to-modulate" },
+  { value: "monitor", label: "Toggle monitor" },
+  { value: "param", label: "Sweep effect param" },
+];
+
+interface ParamOption {
+  value: string; // `${effectIndex}:${key}`
+  label: string;
+  effectIndex: number;
+  key: string;
+  min: number;
+  max: number;
+}
+
+/** Flatten the active (viewed) chain into "Effect · Param" options a CC
+ *  can sweep. Each carries the param's range so the router can scale. */
+function paramOptionsFor(chain: ChainEntry[]): ParamOption[] {
+  const out: ParamOption[] = [];
+  chain.forEach((entry, idx) => {
+    const def = EFFECTS[entry.id];
+    for (const p of def.params) {
+      out.push({
+        value: `${idx}:${p.key}`,
+        label: `${def.name} · ${p.label}`,
+        effectIndex: idx,
+        key: p.key,
+        min: p.min,
+        max: p.max,
+      });
+    }
+  });
+  return out;
+}
+
+function triggerLabel(m: MidiMapping): string {
+  if (!m.trigger) return "—";
+  return `${m.trigger.kind === "note" ? "Note" : "CC"} ${m.trigger.data1}`;
+}
+
+function ControlSurfacesSection(): JSX.Element {
+  const app = useApp();
+
+  onMount(() => {
+    void app.refreshMidiInputs();
+  });
+
+  const deviceOptions = createMemo<SelectOption[]>(() => [
+    { value: "", label: "None — disconnected", sub: "no control surface" },
+    ...app.midiInputs().map((d) => ({ value: d.id, label: d.name, sub: "MIDI input" })),
+  ]);
+  const paramOpts = createMemo<ParamOption[]>(() => paramOptionsFor(app.viewedChain()));
+  const learning = (id: string): boolean => app.midiLearnId() === id;
+
+  // Switching a mapping's action resets the target fields to a sensible
+  // default for the new action (the store persists the result).
+  const setAction = (m: MidiMapping, action: MidiActionKind): void => {
+    const patch: Partial<MidiMapping> = {
+      action,
+      presetId: undefined,
+      tileId: undefined,
+      effectIndex: undefined,
+      paramKey: undefined,
+      min: undefined,
+      max: undefined,
+    };
+    if (action === "preset") {
+      patch.presetId = app.presets()[0]?.id;
+    } else if (action === "tile") {
+      patch.tileId = app.soundboardTiles()[0]?.id;
+    } else if (action === "param") {
+      const opt = paramOpts()[0];
+      if (opt) {
+        patch.effectIndex = opt.effectIndex;
+        patch.paramKey = opt.key;
+        patch.min = opt.min;
+        patch.max = opt.max;
+      }
+    }
+    app.updateMidiMapping(m.id, patch);
+  };
+
+  return (
+    <section>
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+          "margin-bottom": "var(--s3)",
+        }}
+      >
+        <div class="eyebrow">Control surfaces</div>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon="refresh"
+          onClick={() => void app.refreshMidiInputs()}
+          title="Re-scan MIDI input ports"
+        >
+          Rescan
+        </Button>
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s4)",
+        }}
+      >
+        <p style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", margin: 0 }}>
+          Bind a MIDI controller's pads and knobs to DivoraVoice. Pick your
+          device, add a mapping, then click <strong>Learn</strong> and move a
+          pad or knob to capture it. Mappings are saved locally and restored on
+          the next launch.
+        </p>
+
+        <FieldRow label="MIDI input">
+          <Select
+            icon="keyboard"
+            value={app.selectedMidiInput() ?? ""}
+            options={deviceOptions()}
+            onChange={(v) => void app.selectMidiInput(v || null)}
+          />
+        </FieldRow>
+
+        <div class="field-label" style={{ "margin-top": "var(--s2)" }}>
+          Mappings
+        </div>
+        <Show
+          when={app.midiMappings().length > 0}
+          fallback={
+            <div style={{ "font-size": "var(--t-sm)", color: "var(--text-lo)" }}>
+              No mappings yet — add one below.
+            </div>
+          }
+        >
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s3)" }}>
+            <For each={app.midiMappings()}>
+              {(m) => (
+                <div
+                  style={{
+                    display: "flex",
+                    "align-items": "center",
+                    gap: "var(--s2)",
+                    "flex-wrap": "wrap",
+                  }}
+                >
+                  <div style={{ "min-width": "168px", flex: "1 1 168px" }}>
+                    <Select
+                      icon="bolt"
+                      value={m.action}
+                      options={MIDI_ACTIONS.map((a) => ({ value: a.value, label: a.label }))}
+                      onChange={(v) => setAction(m, v as MidiActionKind)}
+                    />
+                  </div>
+
+                  <Show when={m.action === "preset"}>
+                    <div style={{ "min-width": "168px", flex: "1 1 168px" }}>
+                      <Select
+                        icon="presets"
+                        value={m.presetId ?? ""}
+                        options={app.presets().map((p) => ({ value: p.id, label: p.name }))}
+                        onChange={(v) => app.updateMidiMapping(m.id, { presetId: v })}
+                      />
+                    </div>
+                  </Show>
+                  <Show when={m.action === "tile"}>
+                    <div style={{ "min-width": "168px", flex: "1 1 168px" }}>
+                      <Select
+                        icon="soundboard"
+                        value={m.tileId ?? ""}
+                        options={
+                          app.soundboardTiles().length > 0
+                            ? app.soundboardTiles().map((t) => ({ value: t.id, label: t.label }))
+                            : [{ value: "", label: "No tiles — pick a folder first" }]
+                        }
+                        onChange={(v) => app.updateMidiMapping(m.id, { tileId: v })}
+                      />
+                    </div>
+                  </Show>
+                  <Show when={m.action === "param"}>
+                    <div style={{ "min-width": "188px", flex: "1 1 188px" }}>
+                      <Select
+                        icon="mixer"
+                        value={
+                          m.effectIndex !== undefined && m.paramKey
+                            ? `${m.effectIndex}:${m.paramKey}`
+                            : ""
+                        }
+                        options={
+                          paramOpts().length > 0
+                            ? paramOpts().map((o) => ({ value: o.value, label: o.label }))
+                            : [{ value: "", label: "Active preset has no effects" }]
+                        }
+                        onChange={(v) => {
+                          const opt = paramOpts().find((o) => o.value === v);
+                          if (opt) {
+                            app.updateMidiMapping(m.id, {
+                              effectIndex: opt.effectIndex,
+                              paramKey: opt.key,
+                              min: opt.min,
+                              max: opt.max,
+                            });
+                          }
+                        }}
+                      />
+                    </div>
+                  </Show>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      "align-items": "center",
+                      gap: "var(--s2)",
+                      "margin-left": "auto",
+                    }}
+                  >
+                    <Show when={learning(m.id)} fallback={<Kbd>{triggerLabel(m)}</Kbd>}>
+                      <Badge tone="accent">Listening…</Badge>
+                    </Show>
+                    <Button
+                      variant={learning(m.id) ? "primary" : "secondary"}
+                      size="sm"
+                      onClick={() => app.setMidiLearnId(learning(m.id) ? null : m.id)}
+                    >
+                      {learning(m.id) ? "Cancel" : "Learn"}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon="trash"
+                      onClick={() => app.removeMidiMapping(m.id)}
+                      title="Remove mapping"
+                    />
+                  </div>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+
+        <div>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="plus"
+            onClick={() =>
+              app.addMidiMapping({
+                action: "preset",
+                presetId: app.presets()[0]?.id,
+                trigger: null,
+              })
+            }
+          >
+            Add mapping
+          </Button>
+        </div>
+
+        <Card>
+          <div
+            style={{
+              padding: "var(--s4)",
+              display: "flex",
+              "flex-direction": "column",
+              gap: "var(--s2)",
+            }}
+          >
+            <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}>
+              <Sigil name="bolt" size={15} />
+              <div style={{ "font-weight": 600, "font-size": "var(--t-sm)" }}>
+                Using a Stream Deck
+              </div>
+            </div>
+            <p style={{ "font-size": "var(--t-xs)", color: "var(--text-mid)", margin: 0 }}>
+              No plugin needed. In the Stream Deck app, add a <strong>Hotkey</strong>{" "}
+              action to a button and set it to the same key you bound under{" "}
+              <strong>Settings → Hotkeys</strong> (push-to-modulate, panic, or
+              toggle monitor) or to a per-tile soundboard hotkey. The button then
+              fires DivoraVoice's existing global shortcut — even while a game or
+              Discord is focused.
+            </p>
+          </div>
+        </Card>
       </div>
     </section>
   );

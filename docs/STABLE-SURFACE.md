@@ -19,6 +19,7 @@ accidental break fails CI before it ships:
 - Preset JSON schema + tag casing + legacy-load — `divora-core/src/presets/mod.rs` (`schema_freeze_tests`).
 - `StreamInfo` keys — `divora-core/src/audio/engine.rs`.
 - `EngineStatus` / `LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus` keys — `src-tauri/src/lib.rs`.
+- `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - Every command wrapper's command-name string — `src/audio/api.test.ts`.
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
@@ -102,6 +103,14 @@ resolved `T` or a thrown string on the JS side.
 | `unregister_global_shortcut` | `id` | — / error |
 | `unregister_all_global_shortcuts` | — | — / error |
 
+### MIDI control surfaces (v1.9.0)
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_midi_inputs` | — | `MidiInputInfo[]` |
+| `open_midi_input` | `name: string` | — / error |
+| `close_midi_input` | — | — / error |
+
 ---
 
 ## 2. Events
@@ -112,6 +121,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 |---|---|---|
 | `audio-levels` | `LevelUpdate` | ~30 Hz while the app runs |
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
+| `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
 
 ---
 
@@ -135,6 +145,9 @@ SoundboardTile    { id, path, label, extension, sizeBytes, modifiedSecs? }
 VirtualMicStatus  { detected, cableInputDevice: DeviceInfo|null,
                     cableOutputDevice: DeviceInfo|null, downloadUrl }
 GlobalShortcutEvent { id, accelerator, state: "pressed" | "released" }
+MidiInputInfo     { id, name }                       // v1.9.0
+MidiMessage       { channel, kind, data1, data2 }    // v1.9.0; kind e.g.
+                  // "note-on" | "note-off" | "control-change"
 ```
 
 `EffectKindWire` (frozen set; new kinds may be **added** after v1.0):
@@ -200,6 +213,8 @@ to defaults (never throw).
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
+| `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |
+| `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 
 ---

@@ -28,9 +28,12 @@ import {
   detectVirtualMic as detectVirtualMicCmd,
   exportPresetJson as exportPresetJsonCmd,
   listInputDevices,
+  listMidiInputs as listMidiInputsCmd,
   listOutputDevices,
   listPresets,
   listVoices as listVoicesCmd,
+  openMidiInput as openMidiInputCmd,
+  closeMidiInput as closeMidiInputCmd,
   onnxRuntimeStatus as onnxRuntimeStatusCmd,
   pickSoundboardFolder as pickSoundboardFolderCmd,
   playSoundboardClip as playSoundboardClipCmd,
@@ -57,6 +60,8 @@ import {
   type DeviceInfo,
   type EffectSpec,
   type Levels,
+  type MidiInputInfo,
+  type MidiMessage,
   type OnnxRuntimeStatus,
   type SoundboardTile,
   type StreamInfo,
@@ -65,11 +70,13 @@ import {
   type WirePreset,
 } from "../audio/api";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
+import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
   AbSlot,
   ChainEntry,
   EffectId,
   GlyphId,
+  MidiMapping,
   NavId,
   PlayingClip,
   Preset,
@@ -147,6 +154,8 @@ const STORAGE_KEYS = {
   soundboardFolder: "divora.soundboardFolder",
   tileGains: "divora.tileGains",
   soundboardMasterGain: "divora.soundboardMasterGain",
+  midiInput: "divora.midiInput",
+  midiMappings: "divora.midiMappings",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -400,6 +409,25 @@ export interface AppState {
   clearHotkeyBinding: (action: HotkeyAction) => Promise<void>;
   /** Push all currently-set bindings into the backend. Idempotent. */
   syncHotkeyBindings: () => Promise<void>;
+
+  // MIDI control surfaces (v1.9.0)
+  /** Available MIDI input ports (display names). */
+  midiInputs: () => MidiInputInfo[];
+  refreshMidiInputs: () => Promise<void>;
+  /** The currently-open MIDI input name, or null when disconnected. */
+  selectedMidiInput: () => string | null;
+  /** Open (name) or close (null) a MIDI input port; persists the choice. */
+  selectMidiInput: (name: string | null) => Promise<void>;
+  /** User's note/CC → action mappings (persisted). */
+  midiMappings: () => MidiMapping[];
+  addMidiMapping: (mapping: Omit<MidiMapping, "id">) => void;
+  updateMidiMapping: (id: string, patch: Partial<MidiMapping>) => void;
+  removeMidiMapping: (id: string) => void;
+  /** The mapping id currently capturing its trigger via MIDI-learn, or null. */
+  midiLearnId: () => string | null;
+  setMidiLearnId: (id: string | null) => void;
+  /** Feed a `midi-message` in: learns a trigger if armed, else routes it. */
+  handleMidiMessage: (msg: MidiMessage) => void;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -1420,6 +1448,93 @@ export function createAppState(): AppState {
     }
   };
 
+  // MIDI control surfaces (v1.9.0). The backend forwards each note / CC
+  // as a `midi-message` event; App.tsx feeds them to `handleMidiMessage`,
+  // which either captures a trigger (MIDI-learn) or routes the message
+  // through the user's mappings to the existing store actions.
+
+  const [midiInputs, setMidiInputs] = createSignal<MidiInputInfo[]>([]);
+  const [selectedMidiInput, setSelectedMidiInput] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.midiInput, null),
+  );
+  const [midiMappings, setMidiMappings] = createSignal<MidiMapping[]>(
+    loadJson<MidiMapping[]>(STORAGE_KEYS.midiMappings, []),
+  );
+  const [midiLearnId, setMidiLearnIdRaw] = createSignal<string | null>(null);
+
+  const persistMidiMappings = (next: MidiMapping[]): void => {
+    setMidiMappings(next);
+    saveJson(STORAGE_KEYS.midiMappings, next);
+  };
+
+  const refreshMidiInputs = async (): Promise<void> => {
+    try {
+      setMidiInputs(await listMidiInputsCmd());
+    } catch (err) {
+      console.warn("[midi] list inputs failed", err);
+    }
+  };
+
+  const selectMidiInput = async (name: string | null): Promise<void> => {
+    setSelectedMidiInput(name);
+    saveJson(STORAGE_KEYS.midiInput, name);
+    try {
+      if (name) await openMidiInputCmd(name);
+      else await closeMidiInputCmd();
+    } catch (err) {
+      console.warn("[midi] open/close failed", err);
+      // Leave the selection set so the UI shows the attempted device;
+      // the user can re-pick once the port is available.
+    }
+  };
+
+  const newMidiId = (): string =>
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `midi-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}`;
+
+  const addMidiMapping = (mapping: Omit<MidiMapping, "id">): void => {
+    persistMidiMappings([...midiMappings(), { ...mapping, id: newMidiId() }]);
+  };
+
+  const updateMidiMapping = (id: string, patch: Partial<MidiMapping>): void => {
+    persistMidiMappings(
+      midiMappings().map((m) => (m.id === id ? { ...m, ...patch } : m)),
+    );
+  };
+
+  const removeMidiMapping = (id: string): void => {
+    if (midiLearnId() === id) setMidiLearnIdRaw(null);
+    persistMidiMappings(midiMappings().filter((m) => m.id !== id));
+  };
+
+  const setMidiLearnId = (id: string | null): void => {
+    setMidiLearnIdRaw(id);
+  };
+
+  // Bind the pure router's handler interface to the live store actions.
+  const midiHandlers: MidiHandlers = {
+    usePreset: (id) => usePreset(id),
+    playTile: (id) => void playTileById(id),
+    setPtm: (pressed) => setUi("pressed", pressed),
+    toggleMonitor: () => void toggleMonitor(),
+    setParam: (idx, key, value) => setChainParam(idx, key, value),
+  };
+
+  const handleMidiMessage = (msg: MidiMessage): void => {
+    const learnId = midiLearnId();
+    if (learnId !== null) {
+      const trig = triggerFor(msg);
+      if (trig) {
+        updateMidiMapping(learnId, { trigger: trig });
+        setMidiLearnIdRaw(null);
+      }
+      // Swallow the message used for learning — don't also route it.
+      return;
+    }
+    routeMidi(msg, midiMappings(), midiHandlers);
+  };
+
   return {
     nav,
     setNav,
@@ -1565,6 +1680,18 @@ export function createAppState(): AppState {
     setHotkeyBinding,
     clearHotkeyBinding,
     syncHotkeyBindings,
+
+    midiInputs,
+    refreshMidiInputs,
+    selectedMidiInput,
+    selectMidiInput,
+    midiMappings,
+    addMidiMapping,
+    updateMidiMapping,
+    removeMidiMapping,
+    midiLearnId,
+    setMidiLearnId,
+    handleMidiMessage,
 
     selectedEffect,
     setSelectedEffect,
