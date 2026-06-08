@@ -43,7 +43,8 @@ impl DeEsser {
     }
 
     fn rebuild(&mut self) {
-        self.hp.update_coefficients(hp_coeffs(self.sample_rate, self.freq_hz));
+        self.hp
+            .update_coefficients(hp_coeffs(self.sample_rate, self.freq_hz));
     }
 }
 

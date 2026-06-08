@@ -196,7 +196,10 @@ mod tests {
         let mut buf = vec![0.4_f32; 1024];
         c.process(&mut buf, 48_000);
         for s in &buf {
-            assert!((s - 0.4).abs() < 1e-3, "unity ratio should not change level");
+            assert!(
+                (s - 0.4).abs() < 1e-3,
+                "unity ratio should not change level"
+            );
         }
     }
 
