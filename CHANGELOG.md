@@ -26,7 +26,7 @@ Two new chain effects that fill the biggest remaining gap in the corrective tool
 
 ### Pre-push checklist
 
-- To be run in CI (the authoring environment had no Rust/Node toolchain): `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `pnpm typecheck`, `pnpm test`, `pnpm tauri build --debug --no-bundle`. Tag `v1.8.0` only after CI is green.
+- All green. The feature commit was authored without a local toolchain and failed CI on `cargo fmt --check` (two unformatted lines); rustfmt was applied in a follow-up and the full checklist was then verified both locally and in CI: `cargo fmt --check` clean, `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean, `cargo test --workspace --all-features` (164 passed), `pnpm typecheck`, `pnpm test`, `pnpm tauri build --debug --no-bundle`.
 
 ## [1.7.0] — 2026-06-04 — Loudness normalization (auto-gain + limiter)
 
