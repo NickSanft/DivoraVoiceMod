@@ -4,6 +4,29 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-06-08 — Guided mic calibration
+
+A new user doesn't know where to put the noise gate. Now DivoraVoice measures it: a short "stay quiet" capture reads the room's noise floor and auto-sets the gate threshold (and a denoiser mix when the room is loud), so the signal is clean without hand-tuning. Frontend-only — it samples the existing ~30 Hz `audio-levels` stream, so there's no new backend command.
+
+### Added
+
+- **Auto-calibrate** — over a ~2 s window, DivoraVoice collects input levels, takes the 90th percentile as the noise floor, and suggests `gate.thresh ≈ floor + 8 dB` (clamped to the gate's −80…−20 dB range). When the floor is high it also suggests a denoiser mix (0 % in a quiet room, scaling to 90 % in a noisy one). The suggestion is applied to the active preset's gate (and denoiser, if present) and shown so you can fine-tune it.
+- **New wizard step** — "Calibrate your mic" lands after the device step in the first-run wizard, with a live input meter and a one-click calibrate button. Once you've calibrated, the step is dropped from the wizard so replaying setup doesn't nag (persisted via `divora.calibrated`).
+- **Settings → Audio devices** gains an **Auto-calibrate gate** button + a readout of the measured floor and chosen values.
+
+### Architecture
+
+- **No new backend surface.** Calibration is pure frontend: `src/audio/calibration.ts` holds the math (amplitude→dBFS, percentile, gate/denoiser suggestion) with zero store/Tauri coupling; the store's `runCalibration(durationMs)` samples `inputLevels()` over the window and writes the result through the existing `setChainParam`. One additive `localStorage` key, `divora.calibrated` (per [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)).
+- The Wizard's step list became data-driven (keyed steps + a pure `wizardSteps(calibrated)` selector) so the calibration step can be conditionally included.
+
+### Tests
+
+- **Frontend**: +6 calibration-math tests (dBFS conversion + silence floor, nearest-rank percentile, gate ≈ floor + 8 dB, clamping to the gate range, denoiser-only-when-noisy, spike rejection), +3 store tests (gate write-through, denoiser write-through on a noisy floor, calibrated-flag persist/restore), and +2 wizard tests (`wizardSteps` drops the step once calibrated; the flow skips it end-to-end). Existing wizard walk-through updated for the new step.
+
+### Pre-push checklist
+
+- All green, run locally: `cargo fmt --check` clean, `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean, `cargo test --workspace --all-features`, `pnpm typecheck`, `pnpm test` (292), `pnpm tauri build --debug --no-bundle`.
+
 ## [1.9.0] — 2026-06-08 — Control surfaces: MIDI + Stream Deck
 
 Bind a hardware controller to DivoraVoice. A new MIDI-input layer with **MIDI-learn** maps a controller's pads and knobs to actions that already exist — summon a preset, fire a soundboard tile, hold push-to-modulate, toggle the monitor, or sweep an effect param live — plus a zero-cost **Stream Deck** path that reuses the existing global hotkeys. Purely additive over the frozen v1.0 surface.

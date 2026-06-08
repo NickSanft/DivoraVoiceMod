@@ -273,6 +273,47 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
           </div>
         </div>
 
+        <div>
+          <div class="field-label">Noise gate calibration</div>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s3)",
+              "flex-wrap": "wrap",
+            }}
+          >
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="gate"
+              onClick={() => void app.runCalibration()}
+              disabled={app.calibrating()}
+            >
+              {app.calibrating() ? "Listening… stay quiet" : "Auto-calibrate gate"}
+            </Button>
+            <Show
+              when={app.calibrationResult()}
+              fallback={
+                <span style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+                  Stay quiet for ~2 s; sets the active preset’s gate to your
+                  room’s measured noise floor.
+                </span>
+              }
+            >
+              {(r) => (
+                <span
+                  class="tnum"
+                  style={{ "font-size": "var(--t-xs)", color: "var(--text-mid)" }}
+                >
+                  Floor {r().noiseFloorDb.toFixed(0)} dB → gate {r().gateThreshDb} dB
+                  {r().denoiserMix > 0 ? ` · denoiser ${r().denoiserMix}%` : ""}
+                </span>
+              )}
+            </Show>
+          </div>
+        </div>
+
         <FieldRow label="Output device">
           <Show
             when={outputCount() > 0}

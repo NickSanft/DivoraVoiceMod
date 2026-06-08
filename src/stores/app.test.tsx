@@ -1595,3 +1595,51 @@ describe("app store — MIDI control surfaces (v1.9.0)", () => {
     expect(JSON.parse(window.localStorage.getItem("divora.midiMappings")!)).toEqual([]);
   });
 });
+
+describe("app store — guided mic calibration (v1.10.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("runCalibration writes the gate threshold into the active chain", async () => {
+    const { result } = setupApp();
+    const id = result.viewedId();
+    result.setChains(id, [
+      { id: "gate", enabled: true, vals: { thresh: -52 } },
+      { id: "denoiser", enabled: true, vals: { mix: 0 } },
+    ]);
+    // A −40 dB room (amp 0.01) → gate −32. durationMs 0 = one sample.
+    result.setInputLevels({ rms: 0.01, peak: 0.01 });
+    await result.runCalibration(0);
+    expect(result.chains[id]![0]!.vals.thresh).toBe(-32);
+    expect(result.calibrated()).toBe(true);
+    expect(result.calibrationResult()?.gateThreshDb).toBe(-32);
+  });
+
+  it("writes a denoiser mix through when the floor is noisy", async () => {
+    const { result } = setupApp();
+    const id = result.viewedId();
+    result.setChains(id, [
+      { id: "gate", enabled: true, vals: { thresh: -52 } },
+      { id: "denoiser", enabled: true, vals: { mix: 0 } },
+    ]);
+    // A loud room (amp 0.02 ≈ −34 dB) → denoiser maxed.
+    result.setInputLevels({ rms: 0.02, peak: 0.02 });
+    await result.runCalibration(0);
+    expect(result.chains[id]![1]!.vals.mix).toBeGreaterThan(0);
+  });
+
+  it("persists the calibrated flag and restores it across a re-init", () => {
+    const a = setupApp();
+    a.result.setCalibrated(true);
+    expect(window.localStorage.getItem("divora.calibrated")).toBe("true");
+    const b = setupApp();
+    expect(b.result.calibrated()).toBe(true);
+  });
+});

@@ -69,6 +69,10 @@ import {
   type VoiceInfo,
   type WirePreset,
 } from "../audio/api";
+import {
+  computeCalibration,
+  type CalibrationResult,
+} from "../audio/calibration";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
@@ -156,6 +160,7 @@ const STORAGE_KEYS = {
   soundboardMasterGain: "divora.soundboardMasterGain",
   midiInput: "divora.midiInput",
   midiMappings: "divora.midiMappings",
+  calibrated: "divora.calibrated",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -428,6 +433,21 @@ export interface AppState {
   setMidiLearnId: (id: string | null) => void;
   /** Feed a `midi-message` in: learns a trigger if armed, else routes it. */
   handleMidiMessage: (msg: MidiMessage) => void;
+
+  // Guided mic calibration (v1.10.0)
+  /** True once the user has run mic calibration (persisted; suppresses the
+   *  wizard's calibration step). */
+  calibrated: () => boolean;
+  setCalibrated: (value: boolean) => void;
+  /** True while a "stay quiet" measurement is in progress. */
+  calibrating: () => boolean;
+  /** The last calibration result, or null if never run this session. */
+  calibrationResult: () => CalibrationResult | null;
+  /** Measure the noise floor over `durationMs` of input levels, then set
+   *  the active chain's gate (and denoiser when the floor is high). */
+  runCalibration: (durationMs?: number) => Promise<CalibrationResult>;
+  /** Apply a calibration result to the active chain's gate / denoiser. */
+  applyCalibration: (result: CalibrationResult) => void;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -1535,6 +1555,54 @@ export function createAppState(): AppState {
     routeMidi(msg, midiMappings(), midiHandlers);
   };
 
+  // Guided mic calibration (v1.10.0). Sample the existing input-level
+  // stream over a short "stay quiet" window, derive a noise-gate (and
+  // denoiser) suggestion, and write it into the active chain.
+
+  const [calibrated, setCalibratedRaw] = createSignal<boolean>(
+    loadJson<boolean>(STORAGE_KEYS.calibrated, false),
+  );
+  const setCalibrated = (value: boolean): void => {
+    setCalibratedRaw(value);
+    saveJson(STORAGE_KEYS.calibrated, value);
+  };
+  const [calibrating, setCalibrating] = createSignal(false);
+  const [calibrationResult, setCalibrationResult] =
+    createSignal<CalibrationResult | null>(null);
+
+  const applyCalibration = (result: CalibrationResult): void => {
+    const chain = viewedChain();
+    const gateIdx = chain.findIndex((e) => e.id === "gate");
+    if (gateIdx >= 0) setChainParam(gateIdx, "thresh", result.gateThreshDb);
+    if (result.denoiserMix > 0) {
+      const denIdx = chain.findIndex((e) => e.id === "denoiser");
+      if (denIdx >= 0) setChainParam(denIdx, "mix", result.denoiserMix);
+    }
+  };
+
+  const runCalibration = async (durationMs = 2000): Promise<CalibrationResult> => {
+    setCalibrating(true);
+    const samples: number[] = [];
+    const startedAt = performance.now();
+    await new Promise<void>((resolve) => {
+      const tick = (): void => {
+        samples.push(inputLevels().rms);
+        if (performance.now() - startedAt >= durationMs) {
+          resolve();
+        } else {
+          setTimeout(tick, 50);
+        }
+      };
+      tick();
+    });
+    const result = computeCalibration(samples);
+    setCalibrationResult(result);
+    applyCalibration(result);
+    setCalibrated(true);
+    setCalibrating(false);
+    return result;
+  };
+
   return {
     nav,
     setNav,
@@ -1692,6 +1760,13 @@ export function createAppState(): AppState {
     midiLearnId,
     setMidiLearnId,
     handleMidiMessage,
+
+    calibrated,
+    setCalibrated,
+    calibrating,
+    calibrationResult,
+    runCalibration,
+    applyCalibration,
 
     selectedEffect,
     setSelectedEffect,

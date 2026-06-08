@@ -32,16 +32,25 @@ const STORAGE_KEY = "divora.wizardSeen";
 const VB_CABLE_URL = "https://vb-audio.com/Cable/";
 
 interface StepDef {
+  key: string;
   title: string;
   icon: SigilName;
 }
 
-const STEPS: StepDef[] = [
-  { title: "Welcome", icon: "clean" },
-  { title: "Virtual cable", icon: "output" },
-  { title: "Devices", icon: "mic" },
-  { title: "Ready", icon: "modulated" },
+const BASE_STEPS: StepDef[] = [
+  { key: "welcome", title: "Welcome", icon: "clean" },
+  { key: "cable", title: "Virtual cable", icon: "output" },
+  { key: "devices", title: "Devices", icon: "mic" },
+  { key: "calibrate", title: "Calibrate", icon: "gate" },
+  { key: "ready", title: "Ready", icon: "modulated" },
 ];
+
+/** The wizard steps for the current state. Once the user has calibrated
+ *  their mic the calibration step is dropped, so replaying setup doesn't
+ *  nag. Pure + exported for unit testing. */
+export function wizardSteps(calibrated: boolean): StepDef[] {
+  return calibrated ? BASE_STEPS.filter((s) => s.key !== "calibrate") : BASE_STEPS;
+}
 
 interface PillarDef {
   icon: SigilName;
@@ -136,6 +145,8 @@ interface OverlayProps {
 function WizardOverlay(props: OverlayProps): JSX.Element {
   const app = useApp();
   const [step, setStep] = createSignal(0);
+  const steps = createMemo<StepDef[]>(() => wizardSteps(app.calibrated()));
+  const current = createMemo<StepDef | undefined>(() => steps()[step()]);
 
   const inputOptions = createMemo<SelectOption[]>(() =>
     app.audioInputs().map((d) => ({
@@ -159,7 +170,7 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
   const cableDetected = () => app.virtualMicStatus()?.detected ?? false;
 
   const next = (): void => {
-    if (step() < STEPS.length - 1) {
+    if (step() < steps().length - 1) {
       setStep(step() + 1);
     } else {
       props.onFinish();
@@ -257,7 +268,7 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
                 "box-shadow": "0 0 40px rgba(124,92,246,0.5)",
               }}
             >
-              <Sigil name={STEPS[step()]?.icon ?? "clean"} size={42} />
+              <Sigil name={current()?.icon ?? "clean"} size={42} />
             </div>
           </div>
         </div>
@@ -270,7 +281,7 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
             gap: "7px",
           }}
         >
-          <For each={STEPS}>
+          <For each={steps()}>
             {(s, i) => (
               <StepRow
                 index={i()}
@@ -303,10 +314,10 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
           }}
         >
           <Switch>
-            <Match when={step() === 0}>
+            <Match when={current()?.key === "welcome"}>
               <WelcomeStep />
             </Match>
-            <Match when={step() === 1}>
+            <Match when={current()?.key === "cable"}>
               <CableStep
                 detected={cableDetected()}
                 cableInName={app.virtualMicStatus()?.cableInputDevice?.name ?? null}
@@ -315,13 +326,16 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
                 onRescan={() => void app.refreshVirtualMicStatus()}
               />
             </Match>
-            <Match when={step() === 2}>
+            <Match when={current()?.key === "devices"}>
               <DevicesStep
                 inputOptions={inputOptions()}
                 outputOptions={outputOptions()}
               />
             </Match>
-            <Match when={step() === 3}>
+            <Match when={current()?.key === "calibrate"}>
+              <CalibrateStep />
+            </Match>
+            <Match when={current()?.key === "ready"}>
               <ReadyStep />
             </Match>
           </Switch>
@@ -361,10 +375,10 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
           </Show>
           <Button
             variant="primary"
-            iconR={step() < STEPS.length - 1 ? "chevronR" : "bolt"}
+            iconR={step() < steps().length - 1 ? "chevronR" : "bolt"}
             onClick={next}
           >
-            {step() < STEPS.length - 1 ? "Continue" : "Enter Divora"}
+            {step() < steps().length - 1 ? "Continue" : "Enter Divora"}
           </Button>
         </div>
       </div>
@@ -719,6 +733,108 @@ function EmptyDevices(props: { kind: "input" | "output" }): JSX.Element {
     >
       No {props.kind} devices detected yet. They’ll appear once the engine
       enumerates them.
+    </div>
+  );
+}
+
+// ---------- Step: Calibrate your mic ----------
+
+function CalibrateStep(): JSX.Element {
+  const app = useApp();
+  const result = () => app.calibrationResult();
+  return (
+    <div style={{ "max-width": "480px" }}>
+      <div class="eyebrow" style={{ "margin-bottom": "12px" }}>
+        Step 4 · a clean signal
+      </div>
+      <h1 class="display" style={{ "font-size": "28px", "margin-bottom": "12px" }}>
+        Calibrate your mic
+      </h1>
+      <p
+        style={{
+          "font-size": "13.5px",
+          color: "var(--text-mid)",
+          "line-height": 1.6,
+          "margin-bottom": "20px",
+        }}
+      >
+        Stay quiet for a couple of seconds and DivoraVoice measures your
+        room’s noise floor, then sets the noise gate so it opens for your
+        voice but not the hum of the room.
+      </p>
+      <div
+        style={{
+          margin: "0 0 14px",
+          display: "flex",
+          "align-items": "center",
+          gap: "10px",
+        }}
+      >
+        <span class="eyebrow" style={{ flex: "none" }}>
+          Input
+        </span>
+        <div style={{ flex: 1 }}>
+          <HMeter level={app.inputLevels().rms} peak={app.inputLevels().peak} />
+        </div>
+      </div>
+      <Button
+        variant="primary"
+        icon="gate"
+        onClick={() => void app.runCalibration()}
+        disabled={app.calibrating()}
+      >
+        {app.calibrating() ? "Listening… stay quiet" : "Calibrate (2s)"}
+      </Button>
+      <Show when={result()}>
+        {(r) => (
+          <div
+            class="card"
+            style={{
+              "margin-top": "14px",
+              padding: "14px",
+              display: "flex",
+              "align-items": "center",
+              gap: "12px",
+              "border-color": "rgba(52,217,160,0.3)",
+              background: "var(--success-bg)",
+            }}
+          >
+            <span style={{ color: "var(--success)", "flex-shrink": 0 }}>
+              <Sigil name="check" size={22} />
+            </span>
+            <div
+              style={{
+                "font-size": "12.5px",
+                color: "var(--text-mid)",
+                "line-height": 1.5,
+              }}
+            >
+              Noise floor{" "}
+              <strong style={{ color: "var(--text-hi)" }}>
+                {r().noiseFloorDb.toFixed(0)} dB
+              </strong>{" "}
+              → gate set to{" "}
+              <strong style={{ color: "var(--text-hi)" }}>
+                {r().gateThreshDb} dB
+              </strong>
+              <Show when={r().denoiserMix > 0}>
+                {`, denoiser ${r().denoiserMix}%`}
+              </Show>
+              . You can fine-tune it in Settings.
+            </div>
+          </div>
+        )}
+      </Show>
+      <p
+        style={{
+          "margin-top": "14px",
+          "font-size": "11.5px",
+          color: "var(--text-lo)",
+        }}
+      >
+        Optional — skip this and adjust the gate later in Settings → Audio
+        devices.
+      </p>
     </div>
   );
 }

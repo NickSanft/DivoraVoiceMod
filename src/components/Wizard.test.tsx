@@ -15,7 +15,7 @@ vi.mock("@tauri-apps/plugin-shell", () => ({
 }));
 
 import { AppProvider, useApp } from "../stores/app";
-import { Wizard, clearWizardSeenFlag } from "./Wizard";
+import { Wizard, clearWizardSeenFlag, wizardSteps } from "./Wizard";
 import type { JSX } from "solid-js";
 
 function Harness(props: { children?: JSX.Element }): JSX.Element {
@@ -90,26 +90,47 @@ describe("Wizard", () => {
     expect(window.localStorage.getItem("divora.wizardSeen")).toBeNull();
   });
 
-  it("Continue advances through the four steps and Finish closes + sets seen", async () => {
+  it("Continue advances through every step and Finish closes + sets seen", async () => {
     const { getByText, queryByText, app } = setup();
     expect(queryByText(/transmuted in real time/i)).not.toBeNull();
 
-    // Step 0 → 1
+    // Welcome → Virtual cable
     getByText("Continue").click();
     expect(queryByText(/A virtual cable carries your voice/i)).not.toBeNull();
 
-    // Step 1 → 2
+    // Virtual cable → Devices
     getByText("Continue").click();
     expect(queryByText(/Pick your devices/i)).not.toBeNull();
 
-    // Step 2 → 3
+    // Devices → Calibrate (new in v1.10.0; shown until the user calibrates)
+    getByText("Continue").click();
+    expect(queryByText(/Calibrate your mic/i)).not.toBeNull();
+
+    // Calibrate → Ready
     getByText("Continue").click();
     expect(queryByText(/You.{0,3}re ready/i)).not.toBeNull();
 
-    // Step 3 → finish
+    // Ready → finish
     getByText("Enter Divora").click();
     expect(app().wizardOpen()).toBe(false);
     expect(window.localStorage.getItem("divora.wizardSeen")).toBe("true");
+  });
+
+  it("wizardSteps drops the calibration step once already calibrated", () => {
+    expect(wizardSteps(false).map((s) => s.key)).toContain("calibrate");
+    expect(wizardSteps(true).map((s) => s.key)).not.toContain("calibrate");
+    expect(wizardSteps(true).length).toBe(wizardSteps(false).length - 1);
+  });
+
+  it("skips the calibration step in the flow once already calibrated", () => {
+    window.localStorage.setItem("divora.calibrated", "true");
+    const { getByText, queryByText } = setup();
+    getByText("Continue").click(); // Welcome → Virtual cable
+    getByText("Continue").click(); // Virtual cable → Devices
+    expect(queryByText(/Pick your devices/i)).not.toBeNull();
+    getByText("Continue").click(); // Devices → Ready (calibrate suppressed)
+    expect(queryByText(/You.{0,3}re ready/i)).not.toBeNull();
+    expect(queryByText(/Calibrate your mic/i)).toBeNull();
   });
 
   it("Back walks the user back to the previous step", () => {

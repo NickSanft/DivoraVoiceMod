@@ -215,6 +215,7 @@ to defaults (never throw).
 | `divora.soundboardMasterGain` | master soundboard gain |
 | `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |
 | `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0 |
+| `divora.calibrated` | mic calibration completed flag (suppresses the wizard step) — v1.10.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 
 ---
