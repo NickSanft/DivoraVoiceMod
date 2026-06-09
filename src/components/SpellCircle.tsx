@@ -320,7 +320,7 @@ export function SpellCircle(props: SpellCircleProps): JSX.Element {
           cx={C}
           cy={C}
           r={CORE_R}
-          fill="rgba(13,10,22,0.7)"
+          fill="var(--core-ink)"
           stroke={coreColor()}
           stroke-width="1.5"
           style={{

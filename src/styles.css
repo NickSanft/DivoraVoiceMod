@@ -78,6 +78,13 @@
   --shadow-3: 0 18px 50px rgba(0, 0, 0, 0.55);
   --glow-accent: 0 0 0 1px rgba(124, 92, 246, 0.35), 0 0 30px rgba(124, 92, 246, 0.35);
 
+  /* "Deep" tokens — surfaces that stay dark in BOTH themes because a
+     glowing white glyph sits on them (the voice core, the wizard's
+     ceremonial sigil disc) or because they're a modal scrim. The light
+     theme keeps these deep so the white content stays readable. */
+  --core-ink: rgba(13, 10, 22, 0.7);
+  --scrim: rgba(7, 6, 13, 0.7);
+
   /* Type */
   --font-display: "Bricolage Grotesque Variable", system-ui, sans-serif;
   --font-ui: "Space Grotesk Variable", system-ui, sans-serif;
@@ -140,6 +147,84 @@
   --pink: #F25757;
   --pink-deep: #C13838;
   --grad: linear-gradient(120deg, #D97B2B 0%, #F2A857 50%, #F25757 100%);
+}
+
+/* ============================================================
+   LIGHT THEME (Tweaks · orthogonal to mood)
+   `data-theme="light"` flips the surface/text polarity; the mood
+   blocks below it (higher specificity) re-tint the hue so light
+   composes with warm/cool. Placed AFTER the dark mood blocks so the
+   shared surface/line/text props win on source order when only the
+   theme (not a mood-specific light block) matches. Brand gradient +
+   accent identity are unchanged — they read fine on light.
+   ============================================================ */
+:root[data-theme="light"] {
+  /* Soft lilac-tinted light ramp — surface gets *darker* with elevation
+     (the opposite of dark) so hover/pressed still read as "raised". */
+  --bg: #e6e2f1;
+  --surface-0: #f8f6fc;
+  --surface-1: #f1eef8;
+  --surface-2: #eae5f3;
+  --surface-3: #e0d9ed;
+  --surface-4: #d3cbe5;
+
+  --line: rgba(70, 50, 130, 0.12);
+  --line-strong: rgba(70, 50, 130, 0.20);
+  --line-glow: rgba(124, 92, 246, 0.45);
+
+  --text-hi: #1c1730;
+  --text-mid: #494060;
+  --text-lo: #6f6690;
+  --text-dim: #8b83a6;
+
+  /* Softer, violet-tinted shadows instead of harsh black on light. */
+  --shadow-1: 0 1px 2px rgba(60, 45, 110, 0.12);
+  --shadow-2: 0 6px 22px rgba(60, 45, 110, 0.14);
+  --shadow-3: 0 18px 50px rgba(40, 30, 80, 0.20);
+  --glow-accent: 0 0 0 1px rgba(124, 92, 246, 0.30), 0 0 26px rgba(124, 92, 246, 0.22);
+
+  /* Tints need a touch more alpha to register on a light surface. */
+  --success-bg: rgba(52, 217, 160, 0.18);
+  --warning-bg: rgba(233, 177, 76, 0.20);
+  --danger-bg: rgba(242, 86, 122, 0.15);
+  --info-bg: rgba(88, 198, 242, 0.18);
+  --accent-bg: rgba(124, 92, 246, 0.15);
+  --grad-soft: linear-gradient(120deg, rgba(79, 70, 229, 0.14), rgba(219, 39, 119, 0.14));
+
+  /* Keep the scrim a soft violet wash rather than near-black. The voice
+     core / sigil disc stay deep so their white glyphs read. */
+  --scrim: rgba(28, 20, 48, 0.40);
+  --core-ink: #241a3a;
+}
+
+/* Light + warm (parchment & candle) */
+:root[data-theme="light"][data-mood="ink"] {
+  --bg: #efe9df;
+  --surface-0: #faf6ee;
+  --surface-1: #f4efe4;
+  --surface-2: #ece5d7;
+  --surface-3: #e3dac9;
+  --surface-4: #d6cab4;
+  --line: rgba(120, 90, 40, 0.13);
+  --line-strong: rgba(120, 90, 40, 0.22);
+  --text-hi: #2a2114;
+  --text-mid: #5a4f3c;
+  --text-lo: #837560;
+}
+
+/* Light + cool (overcast slate) */
+:root[data-theme="light"][data-mood="midnight"] {
+  --bg: #e1e4ee;
+  --surface-0: #f5f7fb;
+  --surface-1: #eef1f7;
+  --surface-2: #e6eaf2;
+  --surface-3: #dadfeb;
+  --surface-4: #ccd3e3;
+  --line: rgba(40, 60, 110, 0.12);
+  --line-strong: rgba(40, 60, 110, 0.20);
+  --text-hi: #161b29;
+  --text-mid: #3e4660;
+  --text-lo: #6b7290;
 }
 
 /* Reduced motion: collapse motion factor to 0 by default; Tweaks can lift it */

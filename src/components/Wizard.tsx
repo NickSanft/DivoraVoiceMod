@@ -260,7 +260,7 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
                 width: "92px",
                 height: "92px",
                 "border-radius": "50%",
-                background: "var(--surface-0)",
+                background: "var(--core-ink)",
                 border: "1.5px solid var(--line-glow)",
                 display: "grid",
                 "place-items": "center",

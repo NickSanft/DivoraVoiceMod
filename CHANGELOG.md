@@ -4,6 +4,21 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added — Light theme (Tweaks light/dark axis)
+
+A full **light theme**, added as an *orthogonal* light/dark axis (not a 4th mood) so it composes with every existing Color mood. Settings → Appearance gains a **Theme** toggle (Dark / Light); the choice persists with the rest of the Tweaks.
+
+- **Composition.** `data-theme="light"` flips the surface/text polarity; the warm (Ink + Candle) and cool (Midnight) moods re-tint on top via selector specificity, giving three distinct light palettes — lilac (Dusk Violet), parchment (Ink + Candle), and slate (Midnight). Accent identity (the brand gradient, Abyssal, Ember) is unchanged — it reads fine on light.
+- **Inverted ramp + softened depth.** Surfaces go light and get *darker* with elevation (so hover/pressed still read as raised); text inverts to deep violet-greys; shadows become soft violet washes instead of hard black; semantic tints get slightly more alpha to register on a light surface.
+- **"Deep" elements stay deep.** The Mixer's voice core and the wizard's ceremonial sigil disc keep a dark backdrop in both themes (new `--core-ink` token) so their glowing white glyphs stay readable; the modal scrim uses a new `--scrim` token; the glyph-cast "SPELL CAST" eyebrow now reads its colour from the live theme so it's legible on light too.
+- Contrast verified across titlebar, sidebar, cards, buttons, selects, segmented controls, field labels, and the dim "local-first" affirmation (nudged darker for light).
+
+**Surface (additive).** New `TweaksState.theme: "dark" | "light"` (persisted inside the existing `divora.tweaks` key) and a new `data-theme="light"` root attribute. Nothing existing renamed or retyped.
+
+**Tests.** +2 store tests (theme defaults to dark + toggles; persists across a re-init) and an extended partial-merge test (old saved Tweaks without `theme` fall back to dark). Visually verified in a dev-server preview: token cascade, per-component contrast, and mood composition (violet/ink/midnight light palettes).
+
+**Remaining polish (follow-ups).** Vignette and parchment-grain overlays are still tuned for dark (both default off); the meter peak-cap glow and a couple of decorative swatch borders still derive from dark-leaning tokens. None affect legibility.
+
 ## [1.10.0] — 2026-06-08 — Guided mic calibration
 
 A new user doesn't know where to put the noise gate. Now DivoraVoice measures it: a short "stay quiet" capture reads the room's noise floor and auto-sets the gate threshold (and a denoiser mix when the room is loud), so the signal is clean without hand-tuning. Frontend-only — it samples the existing ~30 Hz `audio-levels` stream, so there's no new backend command.

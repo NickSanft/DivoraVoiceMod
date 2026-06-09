@@ -35,6 +35,16 @@ function Shell(): JSX.Element {
   const app = useApp();
 
   // Reflect Tweaks state on the root so CSS variable cascades fire.
+  // Theme polarity is orthogonal to mood: `data-theme="light"` flips the
+  // surface/text ramp, and the mood blocks compose on top via specificity
+  // (`[data-theme="light"][data-mood="ink"]`). Dark is the default, so we
+  // omit the attribute for it (mirrors the `violet` mood default).
+  createEffect(() => {
+    applyRootAttr(
+      "data-theme",
+      app.tweaks.theme === "light" ? "light" : null,
+    );
+  });
   createEffect(() => {
     applyRootAttr(
       "data-mood",

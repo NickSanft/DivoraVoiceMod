@@ -201,7 +201,7 @@ to defaults (never throw).
 
 | Key | Holds |
 |---|---|
-| `divora.tweaks` | appearance (mystical / motion / mood / accent / grain / vignette) |
+| `divora.tweaks` | appearance (theme / mystical / motion / mood / accent / grain / vignette) — `theme: "dark"\|"light"` added v1.11.0 |
 | `divora.activeVoice` | selected voice-model id (or null) |
 | `divora.inputDevice` | selected input device name (or null) |
 | `divora.outputDevice` | selected output device name (or null) |

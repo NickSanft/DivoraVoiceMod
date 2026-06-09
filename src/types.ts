@@ -111,6 +111,8 @@ export interface TweaksState {
   mystical: number;
   /** 0 = functional, 0.6 = ambient, 1 = rich */
   motion: number;
+  /** Light/dark polarity. Orthogonal to `mood` — composes with each hue. */
+  theme: "dark" | "light";
   mood: "violet" | "ink" | "midnight";
   accent: "brand" | "abyssal" | "ember";
   grain: boolean;

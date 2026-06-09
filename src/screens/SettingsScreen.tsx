@@ -1553,6 +1553,16 @@ function AppearanceSection(props: AppearanceProps): JSX.Element {
           gap: "var(--s5)",
         }}
       >
+        <Row label="Theme">
+          <Segmented<TweaksState["theme"]>
+            options={[
+              { value: "dark", label: "Dark" },
+              { value: "light", label: "Light" },
+            ]}
+            value={app.tweaks.theme}
+            onChange={(v) => app.setTweaks("theme", v)}
+          />
+        </Row>
         <Row label="Color mood">
           <Segmented<TweaksState["mood"]>
             options={[

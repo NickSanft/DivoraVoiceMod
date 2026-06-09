@@ -69,7 +69,7 @@ export function ExportPresetModal(props: ExportPresetModalProps): JSX.Element {
         style={{
           position: "fixed",
           inset: 0,
-          background: "rgba(7, 6, 13, 0.7)",
+          background: "var(--scrim)",
           "backdrop-filter": "blur(4px)",
           display: "grid",
           "place-items": "center",

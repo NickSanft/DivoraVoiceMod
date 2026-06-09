@@ -45,8 +45,26 @@ interface Omen {
   color: string;
   /** Preset display name (drawn under the shape). */
   name: string;
+  /** Theme-aware "SPELL CAST" eyebrow color, read off :root at cast time
+   *  so it stays legible on both the dark and light themes. */
+  eyebrow: string;
   /** performance.now() at omen start. */
   start: number;
+}
+
+/** Read a CSS custom property off :root, with a fallback for tests/SSR.
+ *  Canvas can't reference CSS vars, so theme-dependent canvas colors are
+ *  snapshotted from the live tokens here. */
+function readToken(name: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const v = getComputedStyle(document.documentElement)
+      .getPropertyValue(name)
+      .trim();
+    return v || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 interface SparkState {
@@ -261,7 +279,8 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
       ctx.font = '700 19px "Bricolage Grotesque", system-ui, sans-serif';
       ctx.fillText(o.name, o.shape.cx, o.shape.cy + half + 28);
       ctx.shadowBlur = 0;
-      ctx.fillStyle = "rgba(233,231,248,0.65)";
+      ctx.fillStyle = o.eyebrow;
+      ctx.globalAlpha = a * 0.65;
       ctx.font = '700 10px "Space Mono", monospace';
       ctx.fillText("◆  S P E L L   C A S T  ◆", o.shape.cx, o.shape.cy + half + 47);
       ctx.restore();
@@ -355,6 +374,7 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
         shape,
         color: preset.color,
         name: preset.name,
+        eyebrow: readToken("--text-hi", "rgba(233,231,248,0.85)"),
         start: performance.now(),
       };
       ensure();

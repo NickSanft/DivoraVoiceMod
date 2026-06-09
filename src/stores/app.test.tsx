@@ -1457,6 +1457,13 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
     expect(result.tweaks.vignette).toBe(true);
   });
 
+  it("theme defaults to dark and toggles to light (v1.11.0)", () => {
+    const { result } = setupApp();
+    expect(result.tweaks.theme).toBe("dark");
+    result.setTweaks("theme", "light");
+    expect(result.tweaks.theme).toBe("light");
+  });
+
   it("glyphs default to bundled preset ids and update via setGlyphs", () => {
     const { result } = setupApp();
     expect(result.glyphs.triangle).toBe("velvet-demon");
@@ -1503,6 +1510,16 @@ describe("app store — Phase 11.1 tweak persistence + mystical values", () => {
     expect(b.result.tweaks.accent).toBe("ember");
   });
 
+  it("the light/dark theme tweak persists across a re-init (v1.11.0)", () => {
+    const a = setupApp();
+    a.result.setTweaks("theme", "light");
+    expect(JSON.parse(window.localStorage.getItem("divora.tweaks")!).theme).toBe(
+      "light",
+    );
+    const b = setupApp();
+    expect(b.result.tweaks.theme).toBe("light");
+  });
+
   it("persisted payload is partial-merged onto defaults — new tweak fields don't blow up old data", () => {
     // Pretend an older app version saved only `mood` and never knew
     // about `vignette`. The current store should fill in defaults for
@@ -1513,9 +1530,10 @@ describe("app store — Phase 11.1 tweak persistence + mystical values", () => {
     );
     const { result } = setupApp();
     expect(result.tweaks.mood).toBe("ink");
-    // The default for vignette is false; for mystical 0.7.
+    // The default for vignette is false; for mystical 0.7; theme dark.
     expect(result.tweaks.vignette).toBe(false);
     expect(result.tweaks.mystical).toBeCloseTo(0.7, 5);
+    expect(result.tweaks.theme).toBe("dark");
   });
 });
 

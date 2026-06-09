@@ -110,6 +110,7 @@ export const MYSTICAL_RICH = 1.0;
 const defaultTweaks = (): TweaksState => ({
   mystical: MYSTICAL_BALANCED,
   motion: prefersReducedMotion() ? 0 : 1,
+  theme: "dark",
   mood: "violet",
   accent: "brand",
   grain: false,
