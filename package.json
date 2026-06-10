@@ -13,6 +13,8 @@
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "lint": "echo \"lint placeholder — ESLint wired in Phase 1\""
   },
   "dependencies": {
@@ -25,6 +27,7 @@
     "solid-js": "^1.9.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@solidjs/testing-library": "^0.8.10",
     "@tauri-apps/cli": "^2.1.0",
     "@testing-library/jest-dom": "^6.6.0",

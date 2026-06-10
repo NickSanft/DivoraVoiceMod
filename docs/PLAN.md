@@ -86,7 +86,7 @@ State sharing between threads uses `triple_buffer` or atomic pointer swaps for w
 | Frontend | SolidJS + TypeScript + Tailwind | Fine-grained reactivity (good fit for live meters), tiny runtime |
 | Fonts | Bricolage Grotesque / Space Grotesk / Space Mono | Self-hosted in production |
 | Frontend tests | Vitest | Standard for Vite-based frontends |
-| E2E tests | Playwright (via Tauri webdriver) | Industry standard |
+| E2E tests | Playwright (frontend in Chromium, Tauri `invoke` mocked) | Fast + reliable in CI; covers UI flows without real hardware |
 
 ## Design System
 
@@ -174,7 +174,7 @@ Every phase follows the **same per-phase ship loop**:
    - `cargo test --workspace --all-features`
    - `pnpm typecheck`
    - `pnpm test` (Vitest)
-   - `pnpm test:e2e` (Playwright, once wired)
+   - `pnpm test:e2e` (Playwright smoke — wired in CI as the `E2E (Playwright)` job)
    - `pnpm tauri build --debug --no-bundle`
 4. **Commit** — detailed multi-line message via HEREDOC, ending with `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
 5. **Push to main**.
@@ -410,9 +410,11 @@ User-facing visual variations, persisted to settings:
 - Component tests for each design-system component.
 - Spell-circle math: positioning of effect nodes around the orbit.
 
-### E2E tests (Playwright via Tauri webdriver)
+### E2E tests (Playwright — frontend in Chromium, Tauri mocked)
 
-- Smoke: launch app, switch nav, change preset, click soundboard tile (mocked audio engine), draw a square and see the SPELL CAST reveal.
+- Implemented: Playwright drives the built SolidJS frontend with the Tauri `invoke`/event layer mocked (`e2e/tauri-mock.ts` injects `__TAURI_INTERNALS__`), so the whole app wires up end-to-end without the desktop shell or audio hardware. Runs in CI as the `E2E (Playwright)` job.
+- Smoke specs (`e2e/smoke.spec.ts`): boots with no console errors; nav reaches all five screens; light theme toggles + persists + composes with a mood; preset preview-vs-Use; a drawn triangle casts its bound preset; the first-run wizard completes. The mock records `invoke` calls + can fire backend events, so specs can assert the command-surface contract from the UI side.
+- The Rust / IPC / audio paths still require real hardware and stay in [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
 
 ### Manual checklist (`docs/MANUAL_TESTS.md`)
 

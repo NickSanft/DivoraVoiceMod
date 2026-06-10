@@ -33,6 +33,39 @@ jobs:
       - name: unit tests
         run: pnpm test
 
+  e2e:
+    name: E2E (Playwright)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # Smoke tests drive the SolidJS frontend in Chromium with the Tauri
+      # invoke/event layer mocked (e2e/tauri-mock.ts). Playwright boots the
+      # Vite dev server itself (see playwright.config.ts webServer).
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+
+      - name: Playwright smoke tests
+        run: pnpm test:e2e
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: windows-2022

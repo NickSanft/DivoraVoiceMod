@@ -4,6 +4,17 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added — E2E smoke tests (Playwright)
+
+End-to-end smoke coverage of the whole SolidJS app — the layer the ~400-line [manual checklist](docs/MANUAL_TESTS.md) otherwise carried alone. Playwright drives the real frontend in Chromium with the Tauri `invoke`/event layer mocked (`e2e/tauri-mock.ts` injects a `__TAURI_INTERNALS__` stub), so the app wires up end to end — router, stores, screens — on every push, with no desktop shell or audio hardware.
+
+- **Six smoke specs** (`e2e/smoke.spec.ts`): app boots with no console errors; the nav rail reaches all five screens; the **light theme** toggles + persists across reload + composes with a Color mood; **preset preview-vs-Use** (previewing doesn't change the live voice, Use does); a drawn **triangle casts** its bound preset on the Mixer; the **first-run wizard** appears and completes.
+- **CI**: a new `E2E (Playwright)` job runs them on every push/PR (Chromium; Playwright boots the Vite dev server itself); the HTML report uploads as an artifact on failure.
+- `pnpm test:e2e` locally. The mock records every `invoke` (`window.__E2E_INVOKES__`) and can fire backend events (`window.__E2E_EMIT__`) for future specs — so specs can assert the command-surface contract from the UI side.
+- Vitest scoped to `src/` (`vitest.config.ts` `include`) so it no longer picks up the e2e `*.spec.ts`.
+
+The Rust / IPC / audio paths still need real hardware and stay in the manual checklist.
+
 ## [1.11.1] — 2026-06-08 — Light-theme polish
 
 Cosmetic follow-ups to v1.11.0 — the overlay/meter details that still derived from dark-leaning literals now flip with the theme. **Dark mode is unchanged**: each new token carries the original dark value verbatim, so only light mode is affected.
