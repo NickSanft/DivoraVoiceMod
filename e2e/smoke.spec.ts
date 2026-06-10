@@ -158,6 +158,24 @@ test.describe("in-app update check (v1.12)", () => {
   });
 });
 
+test.describe("setup diagnostic (v1.13)", () => {
+  test("'Test my setup' runs and renders a results checklist", async ({
+    page,
+  }) => {
+    await nav(page, "Settings").click();
+    await expect(
+      page.getByText(/Check your mic, output, engine/i),
+    ).toBeVisible();
+    await page.getByRole("button", { name: /Test my setup/i }).click();
+    // The engine briefly starts; results then render. VB-Cable + engine
+    // rows are always present.
+    await expect(page.getByText("VB-Cable installed")).toBeVisible({
+      timeout: 12_000,
+    });
+    await expect(page.getByText(/Audio engine/)).toBeVisible();
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 

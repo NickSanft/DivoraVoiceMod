@@ -1700,3 +1700,55 @@ describe("app store — in-app update check (v1.12.0)", () => {
     expect(result.updateAvailable()).toBeNull();
   });
 });
+
+describe("app store — setup diagnostic (v1.13.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_audio_input_devices")
+        return [{ name: "Mic", isDefault: true, defaultSampleRate: 48000, channels: 1 }];
+      if (cmd === "list_audio_output_devices")
+        return [{ name: "Speakers", isDefault: true, defaultSampleRate: 48000, channels: 2 }];
+      if (cmd === "detect_virtual_mic")
+        return { detected: false, cableInputDevice: null, cableOutputDevice: null, downloadUrl: "x" };
+      if (cmd === "start_audio_engine")
+        return { inputName: "Mic", outputName: "Speakers", monitorName: null, sampleRate: 48000, inputChannels: 1, outputChannels: 2 };
+      return undefined;
+    });
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("runs the checklist, starts the engine for the test, then restores stopped state", async () => {
+    const { result } = setupApp();
+    result.setSelectedInput("Mic");
+    result.setSelectedOutput("Speakers");
+    result.setOutputLevels({ rms: 0.5, peak: 0.6 }); // skip the 700ms signal poll
+    const checks = await result.runDiagnostics();
+    expect(checks.length).toBeGreaterThanOrEqual(4);
+    expect(result.diagnostics()).not.toBeNull();
+    // The engine was started for the test, then restored to stopped.
+    expect(result.engineRunning()).toBe(false);
+    expect(result.diagnosing()).toBe(false);
+    expect(checks.map((c) => c.id)).toEqual(
+      expect.arrayContaining(["input", "output", "engine", "cable"]),
+    );
+  });
+
+  it("reports a failure (and never starts the engine) when no devices exist", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_audio_input_devices") return [];
+      if (cmd === "list_audio_output_devices") return [];
+      if (cmd === "detect_virtual_mic")
+        return { detected: false, cableInputDevice: null, cableOutputDevice: null, downloadUrl: "x" };
+      return undefined;
+    });
+    const { result } = setupApp();
+    const checks = await result.runDiagnostics();
+    expect(checks.find((c) => c.id === "input")?.status).toBe("fail");
+    expect(result.engineRunning()).toBe(false);
+  });
+});

@@ -4,6 +4,27 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-06-10 — Setup diagnostic ("Test my setup")
+
+Routing — mic → effect → VB-Cable → app — is the most common point of confusion. A one-click **Test my setup** (Settings → Diagnostics) walks the chain and reports a green/amber/red checklist, so users don't have to guess what's wrong.
+
+### Added
+
+- **Test my setup** in Settings → Diagnostics runs an objective checklist: microphone detected + selected; output detected + selected; the **audio engine starts cleanly** (surfacing the exact error — e.g. a sample-rate mismatch — on failure); **signal reaches the output** (the OUT meter moved during the test); **VB-Cable installed**; and the **main output is routed to the cable** so other apps actually receive your voice (a warn with the fix when it isn't). Each row shows pass / warn / fail with a one-line detail.
+- Reuses existing commands/state (devices, VB-Cable detection, engine) — **no new backend surface**. Careful with side effects: it starts the engine only if stopped (to test startup + signal flow) and **restores the engine to its prior run-state** afterward.
+
+### Architecture
+
+- Pure evaluator in `src/audio/diagnostics.ts` (`evaluateDiagnostics(snapshot) → DiagCheck[]`, `overallStatus`) — zero store/Tauri coupling, like `calibration.ts`. The store's `runDiagnostics()` gathers the snapshot (refresh devices + VB-Cable, brief engine start, ~0.7 s OUT-meter sample) and feeds it in; a new `DiagnosticsSection` renders the rows. No new command, event, or `localStorage` key.
+
+### Tests
+
+- +11: `diagnostics.test.ts` ×8 (each check's pass/warn/fail from crafted snapshots; routing omitted without a cable; signal row omitted when the engine didn't start), store ×2 (full run starts + restores the engine; no-devices reports a failure without starting), +1 E2E (the checklist renders after clicking Test my setup).
+
+### Pre-push checklist
+
+- All green: `cargo fmt --check` (no Rust changes), `pnpm typecheck`, `pnpm test` (312), `pnpm test:e2e` (8), `pnpm tauri build --debug --no-bundle`.
+
 ## [1.12.0] — 2026-06-08 — Update check + E2E smoke tests
 
 Two additive improvements: a **lightweight in-app update check** so users learn when a new release lands, and the **E2E smoke harness** (merged earlier) that regression-guards the core UI on every push.

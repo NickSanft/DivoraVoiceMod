@@ -74,6 +74,7 @@ import {
   type CalibrationResult,
 } from "../audio/calibration";
 import { checkForUpdate, type UpdateInfo } from "../data/updates";
+import { evaluateDiagnostics, type DiagCheck } from "../audio/diagnostics";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
@@ -466,6 +467,16 @@ export interface AppState {
   /** Run the update check. No-op when disabled, in a dev build, or off
    *  Tauri (browser / E2E never hit the network). */
   checkUpdates: () => Promise<void>;
+
+  // Setup diagnostic (v1.13.0)
+  /** Last "Test my setup" result, or null if never run. */
+  diagnostics: () => DiagCheck[] | null;
+  /** True while a diagnostic is running. */
+  diagnosing: () => boolean;
+  /** Run the routing-chain diagnostic. Refreshes devices + VB-Cable,
+   *  briefly starts the engine if stopped (and restores that state),
+   *  then evaluates a green/amber/red checklist. */
+  runDiagnostics: () => Promise<DiagCheck[]>;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -1655,6 +1666,63 @@ export function createAppState(): AppState {
     }
   };
 
+  // Setup diagnostic (v1.13.0). Frontend-orchestrated over existing
+  // commands; careful with the engine — restores its prior run-state.
+  const [diagnostics, setDiagnostics] = createSignal<DiagCheck[] | null>(null);
+  const [diagnosing, setDiagnosing] = createSignal(false);
+
+  const runDiagnostics = async (): Promise<DiagCheck[]> => {
+    if (diagnosing()) return diagnostics() ?? [];
+    setDiagnosing(true);
+    const wasRunning = engineRunning();
+    try {
+      await refreshDevices();
+      await refreshVirtualMicStatus();
+
+      // Start the engine if stopped — to exercise startup + signal flow —
+      // but only when there's an input and output to talk to.
+      let engineStarted = engineRunning();
+      if (!engineStarted && selectedInput() && selectedOutput()) {
+        await startEngine();
+        engineStarted = engineRunning();
+      }
+
+      // Sample the OUT meter briefly to see whether signal is flowing.
+      let signalFlowing = false;
+      if (engineStarted && !engineError()) {
+        const startedAt = performance.now();
+        while (performance.now() - startedAt < 700) {
+          if (outputLevels().rms > 0.0005 || outputLevels().peak > 0.001) {
+            signalFlowing = true;
+            break;
+          }
+          await new Promise<void>((r) => setTimeout(r, 50));
+        }
+      }
+
+      const cable = virtualMicStatus();
+      const result = evaluateDiagnostics({
+        inputCount: audioInputs().length,
+        outputCount: audioOutputs().length,
+        selectedInput: selectedInput(),
+        selectedOutput: selectedOutput(),
+        engineStarted,
+        engineError: engineError(),
+        signalFlowing,
+        cableDetected: cable?.detected ?? false,
+        cableInputName: cable?.cableInputDevice?.name ?? null,
+      });
+      setDiagnostics(result);
+      return result;
+    } finally {
+      // Leave the engine exactly as we found it.
+      if (!wasRunning && engineRunning()) {
+        await stopEngine();
+      }
+      setDiagnosing(false);
+    }
+  };
+
   return {
     nav,
     setNav,
@@ -1826,6 +1894,10 @@ export function createAppState(): AppState {
     dismissUpdate,
     updateChecking,
     checkUpdates,
+
+    diagnostics,
+    diagnosing,
+    runDiagnostics,
 
     selectedEffect,
     setSelectedEffect,

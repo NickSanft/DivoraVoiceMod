@@ -24,6 +24,7 @@ import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { clearWizardSeenFlag } from "../components/Wizard";
+import { type DiagStatus } from "../audio/diagnostics";
 import { EFFECTS } from "../data/effects";
 import {
   MYSTICAL_BALANCED,
@@ -143,6 +144,8 @@ export function SettingsScreen(): JSX.Element {
         monitorOptions={monitorOptions()}
         startStop={startStop}
       />
+
+      <DiagnosticsSection />
 
       <VoiceLibrarySection />
 
@@ -1672,6 +1675,121 @@ const PILLARS: PillarDef[] = [
     body: "MIT-licensed and open source. Read or fork the code.",
   },
 ];
+
+// ---------- Diagnostics (v1.13.0) ----------
+
+function DiagnosticsSection(): JSX.Element {
+  const app = useApp();
+  const iconFor = (s: DiagStatus): SigilName =>
+    s === "pass" ? "check" : s === "warn" ? "warning" : "x";
+  const colorFor = (s: DiagStatus): string =>
+    s === "pass"
+      ? "var(--success)"
+      : s === "warn"
+        ? "var(--warning)"
+        : "var(--danger)";
+  return (
+    <section>
+      <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
+        Diagnostics
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s4)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s4)",
+          }}
+        >
+          <div
+            style={{
+              "font-size": "var(--t-sm)",
+              color: "var(--text-mid)",
+              "line-height": 1.5,
+            }}
+          >
+            Check your mic, output, engine, and VB-Cable routing in one go.
+          </div>
+          <Button
+            variant="secondary"
+            icon="bolt"
+            onClick={() => void app.runDiagnostics()}
+            disabled={app.diagnosing()}
+          >
+            {app.diagnosing() ? "Testing…" : "Test my setup"}
+          </Button>
+        </div>
+        <Show when={app.diagnostics()}>
+          {(checks) => (
+            <div
+              style={{
+                display: "flex",
+                "flex-direction": "column",
+                gap: "var(--s2)",
+              }}
+            >
+              <For each={checks()}>
+                {(c) => (
+                  <div
+                    class="card"
+                    style={{
+                      padding: "var(--s3)",
+                      display: "flex",
+                      gap: "var(--s3)",
+                      "align-items": "flex-start",
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: colorFor(c.status),
+                        "flex-shrink": 0,
+                        "margin-top": "1px",
+                      }}
+                    >
+                      <Sigil name={iconFor(c.status)} size={16} />
+                    </span>
+                    <div style={{ "min-width": 0 }}>
+                      <div
+                        style={{
+                          "font-size": "var(--t-sm)",
+                          "font-weight": 600,
+                          color: "var(--text-hi)",
+                        }}
+                      >
+                        {c.label}
+                      </div>
+                      <div
+                        style={{
+                          "font-size": "var(--t-xs)",
+                          color: "var(--text-lo)",
+                          "margin-top": "1px",
+                          "line-height": 1.4,
+                        }}
+                      >
+                        {c.detail}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+          )}
+        </Show>
+      </div>
+    </section>
+  );
+}
+
+// ---------- About ----------
 
 function AboutSection(): JSX.Element {
   const app = useApp();
