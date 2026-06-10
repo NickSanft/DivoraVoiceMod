@@ -1661,3 +1661,42 @@ describe("app store — guided mic calibration (v1.10.0)", () => {
     expect(b.result.calibrated()).toBe(true);
   });
 });
+
+describe("app store — in-app update check (v1.12.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("is opt-in by default and persists when toggled off", () => {
+    const a = setupApp();
+    expect(a.result.updateCheckEnabled()).toBe(true);
+    a.result.setUpdateCheckEnabled(false);
+    expect(window.localStorage.getItem("divora.updateCheckEnabled")).toBe(
+      "false",
+    );
+    const b = setupApp();
+    expect(b.result.updateCheckEnabled()).toBe(false);
+  });
+
+  it("checkUpdates is a no-op when disabled and never throws", async () => {
+    const { result } = setupApp();
+    result.setUpdateCheckEnabled(false);
+    await result.checkUpdates();
+    expect(result.updateAvailable()).toBeNull();
+    expect(result.updateChecking()).toBe(false);
+  });
+
+  it("checkUpdates stays null without a real version (jsdom) and dismiss is safe", async () => {
+    const { result } = setupApp();
+    await result.checkUpdates(); // enabled, but getVersion is unavailable here
+    expect(result.updateAvailable()).toBeNull();
+    result.dismissUpdate();
+    expect(result.updateAvailable()).toBeNull();
+  });
+});

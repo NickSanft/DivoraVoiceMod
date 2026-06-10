@@ -1783,6 +1783,119 @@ function AboutSection(): JSX.Element {
           </For>
         </div>
 
+        {/* Updates (v1.12.0) — lightweight, opt-out, no telemetry. */}
+        <div
+          style={{
+            "padding-top": "var(--s4)",
+            "border-top": "1px dashed var(--line)",
+            display: "flex",
+            "flex-direction": "column",
+            gap: "var(--s3)",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              "justify-content": "space-between",
+              gap: "var(--s4)",
+            }}
+          >
+            <div style={{ "min-width": 0 }}>
+              <div
+                style={{
+                  "font-size": "var(--t-sm)",
+                  "font-weight": 600,
+                  color: "var(--text-hi)",
+                }}
+              >
+                Updates
+              </div>
+              <div
+                style={{
+                  "font-size": "var(--t-xs)",
+                  color: "var(--text-lo)",
+                  "margin-top": "2px",
+                  "line-height": 1.5,
+                }}
+              >
+                Check GitHub for a newer release on launch. One-way version
+                check — no account, no telemetry.
+              </div>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                "align-items": "center",
+                gap: "var(--s3)",
+                "flex-shrink": 0,
+              }}
+            >
+              <Toggle
+                on={app.updateCheckEnabled()}
+                onChange={(v) => app.setUpdateCheckEnabled(v)}
+                ariaLabel="Check for updates on launch"
+              />
+              <Button
+                variant="secondary"
+                size="sm"
+                icon="refresh"
+                onClick={() => void app.checkUpdates()}
+                disabled={app.updateChecking()}
+              >
+                {app.updateChecking() ? "Checking…" : "Check now"}
+              </Button>
+            </div>
+          </div>
+          <Show when={app.updateAvailable()}>
+            {(info) => (
+              <div
+                class="card"
+                style={{
+                  padding: "var(--s4)",
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "var(--s3)",
+                  "border-color": "var(--line-glow)",
+                  background: "var(--accent-bg)",
+                }}
+              >
+                <span style={{ color: "var(--indigo)", "flex-shrink": 0 }}>
+                  <Sigil name="bolt" size={20} />
+                </span>
+                <div
+                  style={{
+                    flex: 1,
+                    "min-width": 0,
+                    "font-size": "var(--t-sm)",
+                    color: "var(--text-mid)",
+                  }}
+                >
+                  <strong style={{ color: "var(--text-hi)" }}>
+                    v{info().latest}
+                  </strong>{" "}
+                  is available{version() ? ` — you're on ${version()}` : ""}.
+                </div>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  iconR="external"
+                  onClick={() => void openExternal(info().url)}
+                >
+                  Download
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => app.dismissUpdate()}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            )}
+          </Show>
+        </div>
+
         <div
           style={{
             display: "flex",

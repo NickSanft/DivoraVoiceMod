@@ -73,6 +73,7 @@ import {
   computeCalibration,
   type CalibrationResult,
 } from "../audio/calibration";
+import { checkForUpdate, type UpdateInfo } from "../data/updates";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
@@ -162,6 +163,7 @@ const STORAGE_KEYS = {
   midiInput: "divora.midiInput",
   midiMappings: "divora.midiMappings",
   calibrated: "divora.calibrated",
+  updateCheckEnabled: "divora.updateCheckEnabled",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -449,6 +451,21 @@ export interface AppState {
   runCalibration: (durationMs?: number) => Promise<CalibrationResult>;
   /** Apply a calibration result to the active chain's gate / denoiser. */
   applyCalibration: (result: CalibrationResult) => void;
+
+  // In-app update check (v1.12.0)
+  /** Opt-out for the lightweight GitHub-release update check (persisted,
+   *  default on). No telemetry — a one-way version read only. */
+  updateCheckEnabled: () => boolean;
+  setUpdateCheckEnabled: (value: boolean) => void;
+  /** The newer release found by the last check, or null. */
+  updateAvailable: () => UpdateInfo | null;
+  /** Clear the "update available" notice (user dismissed it). */
+  dismissUpdate: () => void;
+  /** True while a check is in flight. */
+  updateChecking: () => boolean;
+  /** Run the update check. No-op when disabled, in a dev build, or off
+   *  Tauri (browser / E2E never hit the network). */
+  checkUpdates: () => Promise<void>;
 
   // Currently selected rune (effect) for the inspector.
   selectedEffect: () => EffectId | null;
@@ -1604,6 +1621,40 @@ export function createAppState(): AppState {
     return result;
   };
 
+  // In-app update check (v1.12.0). Lightweight, opt-out, no telemetry —
+  // a one-way read of the latest GitHub release. Gated so the browser /
+  // E2E / dev builds never hit the network.
+  const [updateCheckEnabled, setUpdateCheckEnabledRaw] = createSignal<boolean>(
+    loadJson<boolean>(STORAGE_KEYS.updateCheckEnabled, true),
+  );
+  const setUpdateCheckEnabled = (value: boolean): void => {
+    setUpdateCheckEnabledRaw(value);
+    saveJson(STORAGE_KEYS.updateCheckEnabled, value);
+  };
+  const [updateAvailable, setUpdateAvailable] = createSignal<UpdateInfo | null>(
+    null,
+  );
+  const [updateChecking, setUpdateChecking] = createSignal(false);
+  const dismissUpdate = (): void => {
+    setUpdateAvailable(null);
+  };
+
+  const checkUpdates = async (): Promise<void> => {
+    if (!updateCheckEnabled() || updateChecking()) return;
+    setUpdateChecking(true);
+    try {
+      const { getVersion } = await import("@tauri-apps/api/app");
+      const version = await getVersion().catch(() => null);
+      // Skip in the browser / E2E (no version) and dev builds ("0.0.0").
+      if (!version || version === "0.0.0") return;
+      setUpdateAvailable(await checkForUpdate(version));
+    } catch {
+      /* best-effort — never disrupt the app */
+    } finally {
+      setUpdateChecking(false);
+    }
+  };
+
   return {
     nav,
     setNav,
@@ -1768,6 +1819,13 @@ export function createAppState(): AppState {
     calibrationResult,
     runCalibration,
     applyCalibration,
+
+    updateCheckEnabled,
+    setUpdateCheckEnabled,
+    updateAvailable,
+    dismissUpdate,
+    updateChecking,
+    checkUpdates,
 
     selectedEffect,
     setSelectedEffect,

@@ -231,6 +231,10 @@ function Shell(): JSX.Element {
       // Failures keep the fallback bundled list seeded in the store.
       await app.refreshPresets();
 
+      // v1.12.0: fire-and-forget a lightweight update check (opt-out,
+      // no telemetry; no-ops off Tauri / in dev). Never blocks startup.
+      void app.checkUpdates();
+
       // Phase 15: re-scan the persisted soundboard folder (restored from
       // localStorage) so its tiles + per-tile hotkeys are live without
       // the user re-picking the folder each launch.

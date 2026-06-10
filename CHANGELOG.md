@@ -4,16 +4,34 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-06-08 — Update check + E2E smoke tests
+
+Two additive improvements: a **lightweight in-app update check** so users learn when a new release lands, and the **E2E smoke harness** (merged earlier) that regression-guards the core UI on every push.
+
+### Added — In-app update check
+
+A privacy-respecting check for new releases — **no telemetry**: a one-way read of the public GitHub Releases API on launch, nothing sent. Opt-out, and it never blocks or disrupts the app.
+
+- On startup (and via a **Check now** button in Settings → About) the app reads the latest GitHub release tag and, when it's newer than the running build, shows a non-intrusive **"vX.Y.Z is available → Download"** card that opens the release page. Dismissable.
+- An **opt-out toggle** ("Check GitHub for a newer release on launch") persisted to `divora.updateCheckEnabled` (default on).
+- Pure, tested semver compare in `src/data/version.ts` (`isNewer`); the fetch in `src/data/updates.ts` resolves to `null` on any network/parse failure (offline = no nag, no crash). The check is gated to a real build under Tauri — the browser, E2E, and dev builds (`0.0.0`) never hit the network. No new dependency or capability (CSP is already `null`; the GitHub API is CORS-enabled).
+
 ### Added — E2E smoke tests (Playwright)
 
 End-to-end smoke coverage of the whole SolidJS app — the layer the ~400-line [manual checklist](docs/MANUAL_TESTS.md) otherwise carried alone. Playwright drives the real frontend in Chromium with the Tauri `invoke`/event layer mocked (`e2e/tauri-mock.ts` injects a `__TAURI_INTERNALS__` stub), so the app wires up end to end — router, stores, screens — on every push, with no desktop shell or audio hardware.
 
-- **Six smoke specs** (`e2e/smoke.spec.ts`): app boots with no console errors; the nav rail reaches all five screens; the **light theme** toggles + persists across reload + composes with a Color mood; **preset preview-vs-Use** (previewing doesn't change the live voice, Use does); a drawn **triangle casts** its bound preset on the Mixer; the **first-run wizard** appears and completes.
+- **Seven smoke specs** (`e2e/smoke.spec.ts`): app boots with no console errors; the nav rail reaches all five screens; the **light theme** toggles + persists across reload + composes with a Color mood; **preset preview-vs-Use**; a drawn **triangle casts** its bound preset on the Mixer; the **first-run wizard** completes; Settings → About shows the **update-check control** (no network in-browser).
 - **CI**: a new `E2E (Playwright)` job runs them on every push/PR (Chromium; Playwright boots the Vite dev server itself); the HTML report uploads as an artifact on failure.
-- `pnpm test:e2e` locally. The mock records every `invoke` (`window.__E2E_INVOKES__`) and can fire backend events (`window.__E2E_EMIT__`) for future specs — so specs can assert the command-surface contract from the UI side.
+- `pnpm test:e2e` locally. The mock records every `invoke` (`window.__E2E_INVOKES__`) and can fire backend events (`window.__E2E_EMIT__`) for future specs.
 - Vitest scoped to `src/` (`vitest.config.ts` `include`) so it no longer picks up the e2e `*.spec.ts`.
 
-The Rust / IPC / audio paths still need real hardware and stay in the manual checklist.
+### Tests
+
+- +8 Vitest (`version.test.ts` ×5; store: opt-out default + persistence, disabled no-op, dismiss). +1 E2E spec. The Rust / IPC / audio paths still need real hardware and stay in the manual checklist.
+
+### Pre-push checklist
+
+- All green: `cargo fmt --check` (no Rust changes), `pnpm typecheck`, `pnpm test` (302), `pnpm test:e2e` (7), `pnpm tauri build --debug --no-bundle`.
 
 ## [1.11.1] — 2026-06-08 — Light-theme polish
 

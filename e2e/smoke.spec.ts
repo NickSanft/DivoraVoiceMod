@@ -143,6 +143,21 @@ test.describe("glyph casting", () => {
   });
 });
 
+test.describe("in-app update check (v1.12)", () => {
+  test("Settings → About shows the Updates control; no network in-browser", async ({
+    page,
+  }) => {
+    await nav(page, "Settings").click();
+    await expect(page.getByText("Updates", { exact: true })).toBeVisible();
+    await expect(page.getByText(/no account, no telemetry/i)).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /Check now/i }),
+    ).toBeVisible();
+    // Off Tauri there's no version → no fetch → no "update available" card.
+    await expect(page.getByText(/is available/i)).toHaveCount(0);
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 
