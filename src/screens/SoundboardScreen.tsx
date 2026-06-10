@@ -859,7 +859,7 @@ function ColorContextMenu(props: ColorContextMenuProps): JSX.Element {
                 background: swatch.color,
                 border:
                   current() === swatch.color
-                    ? "2px solid #fff"
+                    ? "2px solid var(--text-hi)"
                     : "1px solid var(--line)",
                 cursor: "pointer",
                 "box-shadow":

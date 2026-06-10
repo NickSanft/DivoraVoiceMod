@@ -4,6 +4,25 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.11.1] — 2026-06-08 — Light-theme polish
+
+Cosmetic follow-ups to v1.11.0 — the overlay/meter details that still derived from dark-leaning literals now flip with the theme. **Dark mode is unchanged**: each new token carries the original dark value verbatim, so only light mode is affected.
+
+### Fixed
+
+- **Meter peak-hold bloom** — the IN/OUT (and calibration) meter peak caps glowed with a near-white halo hard-coded from `--text-hi`, which became a dark smudge on light. The bloom is now a `--meter-peak-glow` token: the original bright halo on dark, a soft violet glow on light. (The cap itself stays `--text-hi` so it contrasts the track either way.)
+- **Vignette** (Settings → Appearance, opt-in) — the inset edge darkening was solid black (`rgba(0,0,0,0.55)`), reading as soot on a light surface. Now `--vignette-shadow`: black on dark, a soft violet wash on light.
+- **Parchment grain** (opt-in) — used `mix-blend-mode: overlay`, which barely registers on a light background. Now `--grain-blend` / `--grain-opacity` tokens: `overlay @0.5` on dark, `multiply @0.28` on light so the speckle actually shows.
+- **Soundboard tile colour picker** — the *selected* swatch ring was hard-white (`#fff`), invisible against the light popover. Now `var(--text-hi)` so the selection ring contrasts in both themes.
+
+### Tests
+
+- No new unit tests (CSS-token + one inline-style change). Verified in a dev-server preview that all four tokens resolve to the original values on dark (no regression) and the softened values on light.
+
+### Pre-push checklist
+
+- All green: `cargo fmt --check` (no Rust changes), `pnpm typecheck`, `pnpm test` (294), `pnpm tauri build --debug --no-bundle`.
+
 ## [1.11.0] — 2026-06-08 — Light theme
 
 A full **light theme**, added as an *orthogonal* light/dark axis (not a 4th mood) so it composes with every existing Color mood. Settings → Appearance gains a **Theme** toggle (Dark / Light); the choice persists with the rest of the Tweaks.
@@ -30,7 +49,7 @@ A full **light theme**, added as an *orthogonal* light/dark axis (not a 4th mood
 
 ### Remaining polish (follow-ups)
 
-- Vignette and parchment-grain overlays are still tuned for dark (both default off); the meter peak-cap glow and a couple of decorative swatch borders still derive from dark-leaning tokens. None affect legibility.
+- Vignette and parchment-grain overlays are still tuned for dark (both default off); the meter peak-cap glow and a couple of decorative swatch borders still derive from dark-leaning tokens. None affect legibility. *(Addressed in v1.11.1.)*
 
 ## [1.10.0] — 2026-06-08 — Guided mic calibration
 

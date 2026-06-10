@@ -85,6 +85,16 @@
   --core-ink: rgba(13, 10, 22, 0.7);
   --scrim: rgba(7, 6, 13, 0.7);
 
+  /* Meter peak-hold bloom + the optional grain/vignette overlays. The cap
+     itself stays `--text-hi` (so it contrasts the track in both themes);
+     only the bloom + overlays need theme-aware values — a bright halo and
+     a black vignette read as a smudge on light, so the light block softens
+     them to a violet wash. */
+  --meter-peak-glow: 0 0 6px rgba(236, 231, 248, 0.9);
+  --grain-blend: overlay;
+  --grain-opacity: 0.5;
+  --vignette-shadow: inset 0 0 160px 30px rgba(0, 0, 0, 0.55);
+
   /* Type */
   --font-display: "Bricolage Grotesque Variable", system-ui, sans-serif;
   --font-ui: "Space Grotesk Variable", system-ui, sans-serif;
@@ -195,6 +205,14 @@
      core / sigil disc stay deep so their white glyphs read. */
   --scrim: rgba(28, 20, 48, 0.40);
   --core-ink: #241a3a;
+
+  /* A black bloom/vignette reads as soot on light — use a soft violet
+     instead; switch grain to multiply so the parchment speckle darkens
+     (and so shows) on a light surface. */
+  --meter-peak-glow: 0 0 5px rgba(80, 60, 140, 0.30);
+  --grain-blend: multiply;
+  --grain-opacity: 0.28;
+  --vignette-shadow: inset 0 0 160px 30px rgba(60, 45, 110, 0.18);
 }
 
 /* Light + warm (parchment & candle) */
@@ -810,7 +828,7 @@
     right: 0;
     height: 2px;
     background: var(--text-hi);
-    box-shadow: 0 0 6px var(--text-hi);
+    box-shadow: var(--meter-peak-glow);
   }
 
   .vmeter-ticks {
@@ -851,7 +869,7 @@
     bottom: 0;
     width: 2px;
     background: var(--text-hi);
-    box-shadow: 0 0 6px var(--text-hi);
+    box-shadow: var(--meter-peak-glow);
   }
 
   /* ---------- Select / device picker ---------- */
@@ -1217,9 +1235,9 @@
     inset: 0;
     pointer-events: none;
     z-index: 60;
-    opacity: 0.5;
+    opacity: var(--grain-opacity);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
-    mix-blend-mode: overlay;
+    mix-blend-mode: var(--grain-blend);
   }
 
   .vignette::before {
@@ -1228,6 +1246,6 @@
     inset: 0;
     pointer-events: none;
     z-index: 59;
-    box-shadow: inset 0 0 160px 30px rgba(0, 0, 0, 0.55);
+    box-shadow: var(--vignette-shadow);
   }
 }
