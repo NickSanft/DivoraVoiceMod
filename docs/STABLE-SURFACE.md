@@ -66,6 +66,7 @@ resolved `T` or a thrown string on the JS side.
 | `save_user_preset` | `preset: Preset` | — / error |
 | `delete_user_preset` | `id: string` | — / error |
 | `export_preset_json` | `preset: Preset` | pretty JSON `string` / error |
+| `import_preset` | `path: string` | saved User `Preset` / error — v1.14.0 |
 | `preset_store_path` | — | `string` |
 
 ### Voice library
@@ -81,6 +82,7 @@ resolved `T` or a thrown string on the JS side.
 | Command | Args | Returns |
 |---|---|---|
 | `recordings_dir` | — | `string` |
+| `logs_dir` | — | `string` (logs directory, for "Open logs folder") — v1.14.0 |
 | `start_recording` | `filename: string` | full destination path `string` / error |
 | `stop_recording` | — | — |
 

@@ -18,7 +18,7 @@ use divora_core::audio::{
     VirtualMicStatus,
 };
 use divora_core::dsp::{onnx_runtime_available, DspCommand, EffectSpec};
-use divora_core::presets::{bundled_presets, Preset, PresetStore};
+use divora_core::presets::{bundled_presets, Preset, PresetStore, PresetTag};
 use divora_core::soundboard::{
     decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
 };
@@ -90,6 +90,10 @@ struct AppState {
     /// (`%APPDATA%/DivoraVoice/recordings/`). Created at startup;
     /// surfaced to the UI so it can open it + show where files land.
     recordings_dir: PathBuf,
+    /// v1.14.0: directory the rolling log file is written to
+    /// (`%APPDATA%/DivoraVoice/logs/`). Created at startup; surfaced to
+    /// the UI's "Open logs folder" support affordance.
+    logs_dir: PathBuf,
     /// v1.9.0: the live MIDI input connection, if a control surface is
     /// connected. Held here so it stays alive — dropping it closes the
     /// port. Replaced on `open_midi_input`, cleared on `close_midi_input`.
@@ -246,6 +250,78 @@ fn export_preset_json(preset: Preset) -> Result<String, String> {
     serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())
 }
 
+/// v1.14.0: import a preset from an arbitrary `.json` file (the counterpart
+/// to Export). Read + parse it, force it to a **User** preset, give it a
+/// unique filesystem-safe id (so it never clobbers a bundled or existing
+/// user preset), persist it, and return it so the UI can select it.
+#[tauri::command]
+fn import_preset(state: State<'_, AppState>, path: String) -> Result<Preset, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("couldn't read the file: {e}"))?;
+    let mut preset: Preset = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("that doesn't look like a preset file: {e}"))?;
+    // An imported preset is always a user preset (a bundled-tagged file
+    // becomes a user copy), and gets a fresh id unique across the full set.
+    preset.tag = PresetTag::User;
+    let taken: std::collections::HashSet<String> = {
+        let mut ids: std::collections::HashSet<String> =
+            bundled_presets().into_iter().map(|p| p.id).collect();
+        if let Ok(user) = state.preset_store.list_user() {
+            ids.extend(user.into_iter().map(|p| p.id));
+        }
+        ids
+    };
+    preset.id = unique_preset_id(&preset.id, &preset.name, &taken);
+    state
+        .preset_store
+        .save(&preset)
+        .map_err(|e| e.to_string())?;
+    Ok(preset)
+}
+
+/// Slugify into a filesystem-safe preset id: lowercase ASCII alphanumerics,
+/// runs of other characters collapse to a single `-`, keeping existing
+/// `-`/`_`. Matches the `is_safe_id` rule in divora-core's preset store.
+fn slugify_preset_id(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if (ch == '-' || ch == '_') && !out.is_empty() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Pick a unique id from the imported preset's id (or its name as a
+/// fallback), appending `-2`, `-3`, … until it's free in `taken`.
+fn unique_preset_id(raw_id: &str, name: &str, taken: &std::collections::HashSet<String>) -> String {
+    let mut base = slugify_preset_id(raw_id);
+    if base.is_empty() {
+        base = slugify_preset_id(name);
+    }
+    if base.is_empty() {
+        base = "imported-preset".to_string();
+    }
+    if !taken.contains(&base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 #[tauri::command]
 fn preset_store_path(state: State<'_, AppState>) -> String {
     state.preset_store.base_dir().to_string_lossy().into_owned()
@@ -333,6 +409,13 @@ fn set_voice_model(state: State<'_, AppState>, index: usize, path: Option<String
 #[tauri::command]
 fn recordings_dir(state: State<'_, AppState>) -> String {
     state.recordings_dir.to_string_lossy().into_owned()
+}
+
+/// v1.14.0: absolute path of the logs directory (for the "Open logs
+/// folder" support affordance). Created at startup.
+#[tauri::command]
+fn logs_dir(state: State<'_, AppState>) -> String {
+    state.logs_dir.to_string_lossy().into_owned()
 }
 
 /// Begin recording the modulated output to a WAV file. `filename` is the
@@ -635,6 +718,21 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // v1.14.0: install file logging first so both startup and
+            // runtime tracing events land in a rolling daily log under
+            // %APPDATA%/DivoraVoice/logs/ — nothing collected them before
+            // (there was no subscriber), so logs were silently dropped.
+            let logs_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join("logs"),
+                Err(_) => std::env::temp_dir().join("DivoraVoice").join("logs"),
+            };
+            let _ = std::fs::create_dir_all(&logs_dir);
+            let _ = tracing_subscriber::fmt()
+                .with_writer(tracing_appender::rolling::daily(&logs_dir, "divora.log"))
+                .with_ansi(false)
+                .try_init();
+            tracing::info!(path = %logs_dir.display(), "file logging ready");
+
             if let Err(e) = setup_tray(app) {
                 tracing::warn!(?e, "failed to set up system tray");
             }
@@ -723,6 +821,7 @@ pub fn run() {
                 voices_dir,
                 bundled_voices_dir,
                 recordings_dir,
+                logs_dir,
                 midi_connection: Mutex::new(None),
             });
             Ok(())
@@ -745,12 +844,14 @@ pub fn run() {
             save_user_preset,
             delete_user_preset,
             export_preset_json,
+            import_preset,
             preset_store_path,
             voices_dir,
             list_voices,
             onnx_runtime_status,
             set_voice_model,
             recordings_dir,
+            logs_dir,
             start_recording,
             stop_recording,
             scan_soundboard_folder,
@@ -772,7 +873,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_voice_dir, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, VoiceInfo};
+    use super::{
+        scan_voice_dir, slugify_preset_id, unique_preset_id, EngineStatus, LevelUpdate, Levels,
+        OnnxRuntimeStatus, VoiceInfo,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -780,6 +884,38 @@ mod tests {
         let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
         k.sort();
         k
+    }
+
+    // ---- v1.14.0: preset-import id helpers -----------------------------
+
+    #[test]
+    fn slugify_preset_id_makes_safe_ids() {
+        assert_eq!(slugify_preset_id("Hollow King"), "hollow-king");
+        assert_eq!(slugify_preset_id("My Custom #1!"), "my-custom-1");
+        assert_eq!(slugify_preset_id("already-safe_id"), "already-safe_id");
+        assert_eq!(slugify_preset_id("  spaced  out  "), "spaced-out");
+        assert_eq!(slugify_preset_id("!!!"), "");
+    }
+
+    #[test]
+    fn unique_preset_id_dedupes_against_taken() {
+        let mut taken = std::collections::HashSet::new();
+        taken.insert("velvet-demon".to_string());
+        taken.insert("velvet-demon-2".to_string());
+        // A fresh id passes through unchanged.
+        assert_eq!(
+            unique_preset_id("static-wraith", "Static Wraith", &taken),
+            "static-wraith"
+        );
+        // Collisions append the next free numeric suffix.
+        assert_eq!(
+            unique_preset_id("velvet-demon", "Velvet Demon", &taken),
+            "velvet-demon-3"
+        );
+        // An empty / unsafe id falls back to the slugified name.
+        assert_eq!(unique_preset_id("", "Brand New", &taken), "brand-new");
+        // Empty id + empty name → the constant fallback.
+        assert_eq!(unique_preset_id("", "", &taken), "imported-preset");
     }
 
     // ---- v1.0 freeze: IPC payload shapes -------------------------------

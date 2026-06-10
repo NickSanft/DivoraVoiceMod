@@ -35,6 +35,21 @@ The installers are not yet code-signed, so Windows SmartScreen will warn before 
 - Cloud, accounts, telemetry, upsells.
 - Cross-platform (yet). Windows only for v1.
 
+## Roadmap & known limitations
+
+DivoraVoice is feature-complete for v1 and shipping steady post-1.0 improvements (light theme, control surfaces, an in-app update check, a "Test my setup" diagnostic, preset import, …). The detailed per-release plan lives in [docs/PLAN.md](docs/PLAN.md).
+
+**Known limitations (today):**
+
+- **Windows only.** macOS / Linux aren't in scope for v1 (the audio path is cpal/WASAPI; a cross-platform pass is "further out").
+- **VB-Cable required** to send your voice to other apps — the app detects and prompts, but doesn't bundle it (licensing).
+- **AI voice conversion** falls back to passthrough when no ONNX runtime/model is present — it never blocks the app, but the effect is simply unavailable until a model is installed.
+- **Recording** is WAV only.
+- **Soundboard** plays one folder at a time and doesn't recurse into subfolders.
+- **Installers are unsigned** — Windows SmartScreen shows a warning (see [Install](#install) for the one-time "More info → Run anyway"). The in-app update check is a one-way version read (no telemetry); auto-install is intentionally not included.
+
+**Further out (standard semver):** dynamics polish, VST3 host, OBS WebSocket, a community preset registry, and eventually cross-platform. See [docs/PLAN.md](docs/PLAN.md) for specifics.
+
 ## Requirements
 
 - Windows 10 / 11

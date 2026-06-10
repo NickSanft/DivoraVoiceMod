@@ -208,6 +208,16 @@ export async function exportPresetJson(preset: WirePreset): Promise<string> {
   return invoke<string>("export_preset_json", { preset });
 }
 
+/**
+ * v1.14.0: import a preset from a `.json` file on disk (the counterpart to
+ * export). The backend reads + validates it, forces it to a **User**
+ * preset with a unique, filesystem-safe id, saves it, and returns the
+ * saved preset so the UI can select it.
+ */
+export async function importPreset(path: string): Promise<WirePreset> {
+  return invoke<WirePreset>("import_preset", { path });
+}
+
 export async function presetStorePath(): Promise<string> {
   return invoke<string>("preset_store_path");
 }
@@ -259,6 +269,11 @@ export async function setVoiceModel(
 /** Absolute path of the recordings directory. */
 export async function recordingsDir(): Promise<string> {
   return invoke<string>("recordings_dir");
+}
+
+/** v1.14.0: absolute path of the logs directory (for "Open logs folder"). */
+export async function logsDir(): Promise<string> {
+  return invoke<string>("logs_dir");
 }
 
 /**

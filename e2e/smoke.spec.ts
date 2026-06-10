@@ -176,6 +176,22 @@ test.describe("setup diagnostic (v1.13)", () => {
   });
 });
 
+test.describe("quick wins (v1.14)", () => {
+  test("Presets has an Import button; About has a Report-a-problem button", async ({
+    page,
+  }) => {
+    await nav(page, "Presets").click();
+    await expect(
+      page.getByRole("button", { name: /Import preset from JSON/i }),
+    ).toBeVisible();
+
+    await nav(page, "Settings").click();
+    await expect(
+      page.getByRole("button", { name: /Report a problem/i }),
+    ).toBeVisible();
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 

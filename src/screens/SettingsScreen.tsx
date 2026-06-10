@@ -36,6 +36,7 @@ import {
 import type { ChainEntry, GlyphId, MidiActionKind, MidiMapping, TweaksState } from "../types";
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
+const ISSUES_URL = "https://github.com/NickSanft/DivoraVoiceMod/issues/new";
 
 // Open a URL in the user's default browser. Lazy-loads the Tauri shell
 // plugin so the screen still renders in a browser preview that doesn't
@@ -1798,6 +1799,7 @@ function AboutSection(): JSX.Element {
   // Lazy-import + catch so the browser preview (no Tauri bridge) and the
   // jsdom test env degrade to a blank version instead of throwing.
   const [version, setVersion] = createSignal("");
+  const [logsPath, setLogsPath] = createSignal("");
   onMount(() => {
     void (async () => {
       try {
@@ -1807,6 +1809,10 @@ function AboutSection(): JSX.Element {
         console.warn("[settings] app version unavailable", err);
       }
     })();
+    // v1.14.0: the logs dir (for the "Open logs folder" support button).
+    void app.getLogsDir().then(setLogsPath).catch(() => {
+      /* not on Tauri (browser preview / E2E) — hide the button */
+    });
   });
   return (
     <section>
@@ -2012,6 +2018,61 @@ function AboutSection(): JSX.Element {
               </div>
             )}
           </Show>
+        </div>
+
+        {/* Support — logs + report a problem (v1.14.0). */}
+        <div
+          style={{
+            "padding-top": "var(--s4)",
+            "border-top": "1px dashed var(--line)",
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s4)",
+          }}
+        >
+          <div style={{ "min-width": 0 }}>
+            <div
+              style={{
+                "font-size": "var(--t-sm)",
+                "font-weight": 600,
+                color: "var(--text-hi)",
+              }}
+            >
+              Support
+            </div>
+            <div
+              style={{
+                "font-size": "var(--t-xs)",
+                color: "var(--text-lo)",
+                "margin-top": "2px",
+                "line-height": 1.5,
+              }}
+            >
+              Logs stay on your machine — open the folder to attach them to a
+              bug report.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: "var(--s2)", "flex-shrink": 0 }}>
+            <Show when={logsPath()}>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon="folder"
+                onClick={() => void openExternal(logsPath())}
+              >
+                Open logs folder
+              </Button>
+            </Show>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="external"
+              onClick={() => void openExternal(ISSUES_URL)}
+            >
+              Report a problem
+            </Button>
+          </div>
         </div>
 
         <div

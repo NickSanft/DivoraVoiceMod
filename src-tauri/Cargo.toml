@@ -30,6 +30,10 @@ midir = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# v1.14.0: collect tracing events into a rolling daily log file under
+# %APPDATA%/DivoraVoice/logs/ (surfaced via "Open logs folder").
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

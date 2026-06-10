@@ -27,6 +27,7 @@ import {
   deleteUserPreset as deleteUserPresetCmd,
   detectVirtualMic as detectVirtualMicCmd,
   exportPresetJson as exportPresetJsonCmd,
+  importPreset as importPresetCmd,
   listInputDevices,
   listMidiInputs as listMidiInputsCmd,
   listOutputDevices,
@@ -38,6 +39,7 @@ import {
   pickSoundboardFolder as pickSoundboardFolderCmd,
   playSoundboardClip as playSoundboardClipCmd,
   recordingsDir as recordingsDirCmd,
+  logsDir as logsDirCmd,
   registerGlobalShortcut as registerGlobalShortcutCmd,
   saveUserPreset as saveUserPresetCmd,
   scanSoundboardFolder as scanSoundboardFolderCmd,
@@ -327,6 +329,8 @@ export interface AppState {
   toggleRecording: () => Promise<void>;
   /** Phase 16: absolute path of the recordings directory. */
   getRecordingsDir: () => Promise<string>;
+  /** v1.14.0: absolute path of the logs directory (for "Open logs folder"). */
+  getLogsDir: () => Promise<string>;
 
   // DSP / chain editing — local store mutation + backend sync.
   setChainParam: (effectIndex: number, key: string, value: number) => void;
@@ -352,6 +356,9 @@ export interface AppState {
   duplicatePreset: (sourceId: string) => Promise<Preset | null>;
   deletePreset: (id: string) => Promise<void>;
   exportPreset: (preset: Preset) => Promise<string>;
+  /** v1.14.0: import a preset `.json` from disk (path), refresh the list,
+   *  and return the saved (User) preset. Throws on a bad file. */
+  importPreset: (path: string) => Promise<Preset>;
   /** Snapshot the current `chain()` into the active preset's record. Used by Save. */
   presetWithCurrentChain: (id: string) => Preset | null;
 
@@ -784,6 +791,7 @@ export function createAppState(): AppState {
   };
 
   const getRecordingsDir = (): Promise<string> => recordingsDirCmd();
+  const getLogsDir = (): Promise<string> => logsDirCmd();
 
   // Phase 11: live device switching. When the user picks a different
   // input or output device in Settings while the engine is running,
@@ -1142,6 +1150,15 @@ export function createAppState(): AppState {
       // Fall back to JSON.stringify when the backend isn't reachable.
       return `${JSON.stringify(presetToWire(preset), null, 2)}\n`;
     }
+  };
+
+  // v1.14.0: import a preset file. The backend validates + saves it as a
+  // unique User preset; we refresh the list so it appears, and hand back
+  // the saved preset so the caller can preview it.
+  const importPreset = async (path: string): Promise<Preset> => {
+    const wire = await importPresetCmd(path);
+    await refreshPresets();
+    return presetFromWire(wire);
   };
 
   // Soundboard state.
@@ -1795,6 +1812,7 @@ export function createAppState(): AppState {
     setLoudnessGainDb,
     toggleRecording,
     getRecordingsDir,
+    getLogsDir,
 
     setChainParam,
     setChainEnabled,
@@ -1815,6 +1833,7 @@ export function createAppState(): AppState {
     duplicatePreset,
     deletePreset,
     exportPreset,
+    importPreset,
     presetWithCurrentChain,
 
     soundboardFolder,

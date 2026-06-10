@@ -4,6 +4,29 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-06-10 — Quick wins: preset import, logs, README roadmap
+
+Three small, independent improvements bundled together.
+
+### Added
+
+- **Preset import** (the counterpart to Export JSON) — an **Import** button on the Presets list opens a file picker; the chosen `.json` is parsed + validated by the backend, forced to a **User** preset with a unique, filesystem-safe id (so it never clobbers a bundled or existing preset), saved, and previewed. New `import_preset` command reusing `PresetStore::save`'s validation.
+- **On-disk logging + support affordances** — DivoraVoice now writes a **rolling daily log** to `%APPDATA%/DivoraVoice/logs/` (there was no log subscriber before, so events were silently dropped). Settings → About gains **Open logs folder** and **Report a problem** (opens the GitHub issue composer), so users can attach logs to a bug report. New `logs_dir` command.
+- **README** gains a **Roadmap & known limitations** section (Windows-only v1, VB-Cable required, AI passthrough fallback, WAV-only recording, single soundboard folder, unsigned installers) pointing at [docs/PLAN.md](docs/PLAN.md).
+
+### Architecture / surface (additive)
+
+- Rust: new `import_preset(path) -> Preset` and `logs_dir() -> String` commands (`src-tauri/src/lib.rs`); `tracing-subscriber` + `tracing-appender` wire a file writer at startup; `AppState` gains `logs_dir`. The import id-dedup helpers (`slugify_preset_id`, `unique_preset_id`) are pure + unit-tested.
+- Frontend: `importPreset` / `logsDir` api wrappers; store `importPreset()` (saves + refreshes the list) and `getLogsDir()`; an Import `IconButton` on the Presets list; a Support block in Settings → About. No existing command, event, or preset field changed (per [docs/STABLE-SURFACE.md](docs/STABLE-SURFACE.md)).
+
+### Tests
+
+- Rust +2 (`slugify_preset_id` makes safe ids; `unique_preset_id` dedupes vs the full bundled+user set, falling back to the name then a constant). E2E +1 (the Import + Report-a-problem buttons render).
+
+### Pre-push checklist
+
+- All green: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features` (19 app + 164 core), `pnpm typecheck`, `pnpm test` (312), `pnpm test:e2e` (9), `pnpm tauri build --debug --no-bundle`.
+
 ## [1.13.0] — 2026-06-10 — Setup diagnostic ("Test my setup")
 
 Routing — mic → effect → VB-Cable → app — is the most common point of confusion. A one-click **Test my setup** (Settings → Diagnostics) walks the chain and reports a green/amber/red checklist, so users don't have to guess what's wrong.

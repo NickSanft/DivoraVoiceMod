@@ -49,6 +49,24 @@ export function PresetsScreen(): JSX.Element {
     }
   };
 
+  const onImport = async (): Promise<void> => {
+    setActionError(null);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const sel = await open({
+        multiple: false,
+        filters: [{ name: "Preset JSON", extensions: ["json"] }],
+        title: "Import a preset",
+      });
+      const path = typeof sel === "string" ? sel : null;
+      if (!path) return;
+      const imported = await app.importPreset(path);
+      app.viewPreset(imported.id); // preview the freshly imported preset
+    } catch (err) {
+      setActionError(`Couldn't import: ${String(err)}`);
+    }
+  };
+
   const onDuplicate = async (): Promise<void> => {
     setActionError(null);
     try {
@@ -98,6 +116,7 @@ export function PresetsScreen(): JSX.Element {
         activeId={app.presetId()}
         selectedId={app.viewedId()}
         onPick={(id) => app.viewPreset(id)}
+        onImport={() => void onImport()}
       />
       <div style={{ flex: 1, "min-width": 0, display: "flex", "flex-direction": "column" }}>
         <PresetEditor
@@ -135,6 +154,8 @@ interface PresetListProps {
   /** The previewed preset shown in the editor — gets the row highlight. */
   selectedId: string;
   onPick: (id: string) => void;
+  /** v1.14.0: import a preset `.json` from disk. */
+  onImport: () => void;
 }
 
 function PresetList(props: PresetListProps): JSX.Element {
@@ -167,13 +188,15 @@ function PresetList(props: PresetListProps): JSX.Element {
         >
           Presets
         </h2>
-        <span
-          class="eyebrow"
-          style={{ color: "var(--text-lo)" }}
-          title="Add new preset (Phase 4.x)"
-        >
+        <span class="eyebrow" style={{ color: "var(--text-lo)" }}>
           {props.bundled.length + props.user.length}
         </span>
+        <IconButton
+          icon="download"
+          tip="Import JSON"
+          aria-label="Import preset from JSON"
+          onClick={props.onImport}
+        />
       </div>
 
       <div style={{ flex: 1, overflow: "auto", padding: "0 var(--s3) var(--s5)" }}>
