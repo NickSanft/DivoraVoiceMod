@@ -192,6 +192,21 @@ test.describe("quick wins (v1.14)", () => {
   });
 });
 
+test.describe("custom glyph casting (v1.15)", () => {
+  test("Settings glyph section has action pickers + a Record button", async ({
+    page,
+  }) => {
+    await nav(page, "Settings").click();
+    await expect(page.getByText("Custom glyphs")).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /Record a glyph/i }),
+    ).toBeVisible();
+    // Opening the recorder shows the draw pad.
+    await page.getByRole("button", { name: /Record a glyph/i }).click();
+    await expect(page.getByText(/Draw a single stroke/i)).toBeVisible();
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@solidjs/testing-library";
+import { makeTemplate } from "../data/unistroke";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -1464,12 +1465,13 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
     expect(result.tweaks.theme).toBe("light");
   });
 
-  it("glyphs default to bundled preset ids and update via setGlyphs", () => {
+  it("built-in glyphs default to their preset bindings and rebind via setGlyphBinding", () => {
     const { result } = setupApp();
-    expect(result.glyphs.triangle).toBe("velvet-demon");
-    expect(result.glyphs.circle).toBe("clean");
-    result.setGlyphs("triangle", "static-wraith");
-    expect(result.glyphs.triangle).toBe("static-wraith");
+    expect(result.glyphBindings.triangle).toEqual({ kind: "preset", presetId: "velvet-demon" });
+    expect(result.glyphBindings.circle).toEqual({ kind: "preset", presetId: "clean" });
+    // A glyph can now bind to any action, e.g. the monitor toggle.
+    result.setGlyphBinding("triangle", { kind: "monitor" });
+    expect(result.glyphBindings.triangle).toEqual({ kind: "monitor" });
   });
 });
 
@@ -1750,5 +1752,67 @@ describe("app store — setup diagnostic (v1.13.0)", () => {
     const checks = await result.runDiagnostics();
     expect(checks.find((c) => c.id === "input")?.status).toBe("fail");
     expect(result.engineRunning()).toBe(false);
+  });
+});
+
+describe("app store — custom glyph casting (v1.15.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  // A clean square stroke (raw pointer path) for the recognizer.
+  const squarePath = (): { x: number; y: number }[] => {
+    const verts = [
+      { x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }, { x: 0, y: 0 },
+    ];
+    const out: { x: number; y: number }[] = [];
+    for (let i = 0; i < verts.length - 1; i++) {
+      const a = verts[i]!;
+      const b = verts[i + 1]!;
+      for (let s = 0; s < 12; s++) {
+        out.push({ x: a.x + ((b.x - a.x) * s) / 12, y: a.y + ((b.y - a.y) * s) / 12 });
+      }
+    }
+    return out;
+  };
+
+  it("a built-in glyph resolves its preset binding to colour + name", () => {
+    const { result } = setupApp();
+    const o = result.glyphOutcome("triangle");
+    expect(o?.label).toBe("Velvet Demon");
+    expect(o?.action).toEqual({ kind: "preset", presetId: "velvet-demon" });
+  });
+
+  it("a built-in glyph can rebind to a non-preset action", () => {
+    const { result } = setupApp();
+    result.setGlyphBinding("circle", { kind: "panic" });
+    expect(result.glyphOutcome("circle")).toEqual({
+      color: expect.any(String),
+      label: "Panic",
+      action: { kind: "panic" },
+    });
+    // And it survives a re-init.
+    const b = setupApp();
+    expect(b.result.glyphBindings.circle).toEqual({ kind: "panic" });
+  });
+
+  it("custom glyphs add, resolve, recognise, persist, and remove", () => {
+    const a = setupApp();
+    const template = makeTemplate(squarePath());
+    a.result.addCustomGlyph({ id: "g1", name: "Box", template, action: { kind: "monitor" } });
+    expect(a.result.glyphOutcome("g1")?.label).toBe("Monitor");
+    // Drawing the same stroke recognises it.
+    expect(a.result.recognizeCustomGlyph(squarePath())?.id).toBe("g1");
+    // Persists across a re-init.
+    const b = setupApp();
+    expect(b.result.customGlyphs().map((g) => g.id)).toContain("g1");
+    b.result.removeCustomGlyph("g1");
+    expect(b.result.customGlyphs()).toHaveLength(0);
   });
 });

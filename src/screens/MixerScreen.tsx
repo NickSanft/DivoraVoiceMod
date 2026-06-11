@@ -41,17 +41,19 @@ export function MixerScreen(): JSX.Element {
     }, 2400);
   };
 
-  /** Look up the preset bound to a recognised glyph. Returns null when
-   *  the glyph has no binding — the SparkLayer then surfaces a flash. */
-  const resolvePreset = (glyph: GlyphId): Preset | null => {
-    const presetId = app.glyphs[glyph];
-    return app.presets().find((p) => p.id === presetId) ?? null;
-  };
-
-  /** Apply the cast — switch to the bound preset. The SparkLayer has
-   *  already started the omen animation by the time we land here. */
-  const onCast = (preset: Preset): void => {
-    app.usePreset(preset.id);
+  /** Resolve a recognised glyph id (built-in or custom) to its cast
+   *  outcome — colour + label + the bound action to run. Null when
+   *  unbound; the SparkLayer then surfaces a flash. */
+  const resolveGlyph = (
+    glyphId: string,
+  ): { color: string; label: string; run: () => void } | null => {
+    const outcome = app.glyphOutcome(glyphId);
+    if (!outcome) return null;
+    return {
+      color: outcome.color,
+      label: outcome.label,
+      run: () => app.dispatchGlyphAction(outcome.action),
+    };
   };
 
   onCleanup(() => {
@@ -73,8 +75,8 @@ export function MixerScreen(): JSX.Element {
     >
       <PresetHeader activeCount={activeCount()} totalCount={totalCount()} />
       <SparkLayer
-        resolvePreset={resolvePreset}
-        onCast={onCast}
+        recognizeCustom={(path) => app.recognizeCustomGlyph(path)}
+        resolveGlyph={resolveGlyph}
         onMessage={flashMessage}
       />
       <Show when={castMessage()} keyed>

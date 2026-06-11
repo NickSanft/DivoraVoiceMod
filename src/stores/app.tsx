@@ -21,7 +21,7 @@ import {
   type Setter,
   useContext,
 } from "solid-js";
-import { createStore, type SetStoreFunction } from "solid-js/store";
+import { createStore, reconcile, type SetStoreFunction } from "solid-js/store";
 import {
   ZERO_LEVELS,
   deleteUserPreset as deleteUserPresetCmd,
@@ -77,12 +77,20 @@ import {
 } from "../audio/calibration";
 import { checkForUpdate, type UpdateInfo } from "../data/updates";
 import { evaluateDiagnostics, type DiagCheck } from "../audio/diagnostics";
+import {
+  makeTemplate,
+  recognize as recognizeUnistroke,
+  type UnistrokeTemplate,
+} from "../data/unistroke";
+import type { Point } from "../data/glyphs";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
   AbSlot,
   ChainEntry,
+  CustomGlyph,
   EffectId,
+  GlyphAction,
   GlyphId,
   MidiMapping,
   NavId,
@@ -121,12 +129,22 @@ const defaultTweaks = (): TweaksState => ({
   vignette: false,
 });
 
-const defaultGlyphs: Record<GlyphId, string> = {
-  triangle: "velvet-demon",
-  invtriangle: "glass-oracle",
-  square: "hollow-king",
-  circle: "clean",
-};
+/** v1.15.0: built-in glyphs default to their classic preset bindings, now
+ *  expressed as `GlyphAction`s (any glyph can bind to any action). */
+const defaultGlyphBindings = (): Record<string, GlyphAction> => ({
+  triangle: { kind: "preset", presetId: "velvet-demon" },
+  invtriangle: { kind: "preset", presetId: "glass-oracle" },
+  square: { kind: "preset", presetId: "hollow-king" },
+  circle: { kind: "preset", presetId: "clean" },
+});
+
+/** The four built-in shapes, in display order (for the Settings list). */
+export const BUILTIN_GLYPHS: GlyphId[] = [
+  "triangle",
+  "invtriangle",
+  "square",
+  "circle",
+];
 
 const defaultUi = (): UiState => ({
   muted: false,
@@ -167,6 +185,8 @@ const STORAGE_KEYS = {
   midiMappings: "divora.midiMappings",
   calibrated: "divora.calibrated",
   updateCheckEnabled: "divora.updateCheckEnabled",
+  glyphBindings: "divora.glyphBindings",
+  customGlyphs: "divora.customGlyphs",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -271,8 +291,28 @@ export interface AppState {
   setTweaks: SetStoreFunction<TweaksState>;
 
   // Glyph bindings
-  glyphs: Record<GlyphId, string>;
-  setGlyphs: SetStoreFunction<Record<GlyphId, string>>;
+  // Glyph casting (v1.15.0 — any glyph → any action + custom glyphs)
+  /** Glyph id (built-in `GlyphId` or a custom id) → the action it casts. */
+  glyphBindings: Record<string, GlyphAction>;
+  /** Bind a glyph to an action (persisted to `divora.glyphBindings`). */
+  setGlyphBinding: (glyphId: string, action: GlyphAction) => void;
+  /** User-recorded custom glyphs (persisted to `divora.customGlyphs`). */
+  customGlyphs: () => CustomGlyph[];
+  addCustomGlyph: (glyph: CustomGlyph) => void;
+  removeCustomGlyph: (id: string) => void;
+  setCustomGlyphAction: (id: string, action: GlyphAction) => void;
+  /** Resolve a recognised glyph id → cast outcome (canvas colour + label +
+   *  the bound action), or null when unbound / its target is gone. */
+  glyphOutcome: (
+    glyphId: string,
+  ) => { color: string; label: string; action: GlyphAction } | null;
+  /** Run a glyph's action against the live store. */
+  dispatchGlyphAction: (action: GlyphAction) => void;
+  /** Match a drawn path against the custom-glyph templates (built-ins use
+   *  the geometric `detectShape`). */
+  recognizeCustomGlyph: (
+    path: Point[],
+  ) => { id: string; template: Point[] } | null;
 
   // Audio engine
   audioInputs: () => DeviceInfo[];
@@ -540,7 +580,103 @@ export function createAppState(): AppState {
     (setTweaksRaw as (...a: unknown[]) => void)(...args);
     saveJson(STORAGE_KEYS.tweaks, { ...tweaks });
   }) as SetStoreFunction<TweaksState>;
-  const [glyphs, setGlyphs] = createStore<Record<GlyphId, string>>({ ...defaultGlyphs });
+  // Glyph casting (v1.15.0). Bindings (built-in + custom) and the custom
+  // templates persist; SparkLayer/MixerScreen recognise + dispatch through
+  // `recognizeCustomGlyph` / `glyphOutcome` / `dispatchGlyphAction`.
+  const [glyphBindings, setGlyphBindingsRaw] = createStore<
+    Record<string, GlyphAction>
+  >({
+    ...defaultGlyphBindings(),
+    ...loadJson<Record<string, GlyphAction>>(STORAGE_KEYS.glyphBindings, {}),
+  });
+  const setGlyphBinding = (glyphId: string, action: GlyphAction): void => {
+    // `reconcile` REPLACES the value — a plain-object set (even via a
+    // function) *merges* into the previous action, leaving stale fields
+    // like `presetId` when switching a glyph to a non-preset action.
+    setGlyphBindingsRaw(glyphId, reconcile(action));
+    saveJson(STORAGE_KEYS.glyphBindings, { ...glyphBindings });
+  };
+  const [customGlyphs, setCustomGlyphs] = createSignal<CustomGlyph[]>(
+    loadJson<CustomGlyph[]>(STORAGE_KEYS.customGlyphs, []),
+  );
+  const persistCustomGlyphs = (next: CustomGlyph[]): void => {
+    setCustomGlyphs(next);
+    saveJson(STORAGE_KEYS.customGlyphs, next);
+  };
+  const addCustomGlyph = (glyph: CustomGlyph): void => {
+    persistCustomGlyphs([...customGlyphs(), glyph]);
+  };
+  const removeCustomGlyph = (id: string): void => {
+    persistCustomGlyphs(customGlyphs().filter((g) => g.id !== id));
+  };
+  const setCustomGlyphAction = (id: string, action: GlyphAction): void => {
+    persistCustomGlyphs(
+      customGlyphs().map((g) => (g.id === id ? { ...g, action } : g)),
+    );
+  };
+
+  const dispatchGlyphAction = (action: GlyphAction): void => {
+    switch (action.kind) {
+      case "preset":
+        usePreset(action.presetId);
+        break;
+      case "tile":
+        void playTileById(action.tileId);
+        break;
+      case "monitor":
+        void toggleMonitor();
+        break;
+      case "mute":
+        setUi("muted", !ui.muted);
+        break;
+      case "panic":
+        void panicSoundboard();
+        break;
+    }
+  };
+
+  // Canvas-drawn omen colour for non-preset actions (a hex, since the
+  // cast canvas can't resolve CSS vars).
+  const GLYPH_ACCENT = "#7C5CF6";
+  const glyphOutcome = (
+    glyphId: string,
+  ): { color: string; label: string; action: GlyphAction } | null => {
+    // Custom glyphs own their action; built-ins use `glyphBindings`.
+    const custom = customGlyphs().find((g) => g.id === glyphId);
+    const action = custom ? custom.action : glyphBindings[glyphId];
+    if (!action) return null;
+    switch (action.kind) {
+      case "preset": {
+        const p = presets().find((x) => x.id === action.presetId);
+        return p ? { color: p.color, label: p.name, action } : null;
+      }
+      case "tile": {
+        const t = soundboardTiles().find((x) => x.id === action.tileId);
+        return { color: GLYPH_ACCENT, label: t ? `▶ ${t.label}` : "▶ Clip", action };
+      }
+      case "monitor":
+        return { color: GLYPH_ACCENT, label: "Monitor", action };
+      case "mute":
+        return { color: GLYPH_ACCENT, label: "Mute", action };
+      case "panic":
+        return { color: GLYPH_ACCENT, label: "Panic", action };
+    }
+  };
+
+  const recognizeCustomGlyph = (
+    path: Point[],
+  ): { id: string; template: Point[] } | null => {
+    const glyphs = customGlyphs();
+    if (glyphs.length === 0) return null;
+    const templates: UnistrokeTemplate[] = glyphs.map((g) => ({
+      id: g.id,
+      points: g.template,
+    }));
+    const m = recognizeUnistroke(path, templates);
+    if (!m) return null;
+    const g = glyphs.find((x) => x.id === m.id);
+    return g ? { id: g.id, template: g.template } : null;
+  };
 
   // Audio engine signals.
   const [audioInputs, setAudioInputs] = createSignal<DeviceInfo[]>([]);
@@ -1766,8 +1902,15 @@ export function createAppState(): AppState {
     setWizardOpen,
     tweaks,
     setTweaks,
-    glyphs,
-    setGlyphs,
+    glyphBindings,
+    setGlyphBinding,
+    customGlyphs,
+    addCustomGlyph,
+    removeCustomGlyph,
+    setCustomGlyphAction,
+    glyphOutcome,
+    dispatchGlyphAction,
+    recognizeCustomGlyph,
 
     audioInputs,
     setAudioInputs,

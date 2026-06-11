@@ -33,6 +33,27 @@ export type AbSlot = "A" | "B";
 
 export type GlyphId = "triangle" | "invtriangle" | "square" | "circle";
 
+/** What a cast glyph does (v1.15.0). Discrete one-shot actions only — a
+ *  tagged union with its target baked in. Built-in glyphs and custom
+ *  glyphs both bind to one of these. */
+export type GlyphAction =
+  | { kind: "preset"; presetId: string }
+  | { kind: "tile"; tileId: string }
+  | { kind: "monitor" }
+  | { kind: "mute" }
+  | { kind: "panic" };
+
+/** A user-recorded custom glyph (v1.15.0): a normalized single-stroke
+ *  template (from `makeTemplate` in `data/unistroke`) + the action it
+ *  casts when drawn on the Mixer. */
+export interface CustomGlyph {
+  /** Stable local id — list key and binding key. */
+  id: string;
+  name: string;
+  template: { x: number; y: number }[];
+  action: GlyphAction;
+}
+
 export type Tone =
   | ""
   | "accent"

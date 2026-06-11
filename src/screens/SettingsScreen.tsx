@@ -16,6 +16,7 @@ import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { HotkeyCapture } from "../components/HotkeyCapture";
+import { IconButton } from "../components/IconButton";
 import { DMark } from "../components/DMark";
 import { Kbd } from "../components/Kbd";
 import { HMeter } from "../components/Meters";
@@ -24,7 +25,9 @@ import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { clearWizardSeenFlag } from "../components/Wizard";
+import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
+import type { Point } from "../data/glyphs";
 import { EFFECTS } from "../data/effects";
 import {
   MYSTICAL_BALANCED,
@@ -33,7 +36,14 @@ import {
   useApp,
   type HotkeyAction,
 } from "../stores/app";
-import type { ChainEntry, GlyphId, MidiActionKind, MidiMapping, TweaksState } from "../types";
+import type {
+  ChainEntry,
+  GlyphAction,
+  GlyphId,
+  MidiActionKind,
+  MidiMapping,
+  TweaksState,
+} from "../types";
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
 const ISSUES_URL = "https://github.com/NickSanft/DivoraVoiceMod/issues/new";
@@ -1440,15 +1450,124 @@ const GLYPH_ROWS: GlyphRow[] = [
   },
 ];
 
+const GLYPH_ACTION_KINDS: SelectOption[] = [
+  { value: "preset", label: "Preset" },
+  { value: "tile", label: "Clip" },
+  { value: "monitor", label: "Monitor" },
+  { value: "mute", label: "Mute" },
+  { value: "panic", label: "Panic" },
+];
+
+/** Pick what a glyph casts: an action kind + (for preset/tile) a target. */
+function GlyphActionPicker(props: {
+  action: GlyphAction;
+  onChange: (a: GlyphAction) => void;
+  presetOptions: SelectOption[];
+  tileOptions: SelectOption[];
+}): JSX.Element {
+  const setKind = (k: GlyphAction["kind"]): void => {
+    if (k === "preset") {
+      props.onChange({ kind: "preset", presetId: props.presetOptions[0]?.value ?? "" });
+    } else if (k === "tile") {
+      props.onChange({ kind: "tile", tileId: props.tileOptions[0]?.value ?? "" });
+    } else {
+      props.onChange({ kind: k } as GlyphAction);
+    }
+  };
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: "var(--s2)",
+        "align-items": "center",
+        flex: 1,
+        "min-width": 0,
+      }}
+    >
+      <div style={{ width: "120px", "flex-shrink": 0 }}>
+        <Select
+          icon="bolt"
+          value={props.action.kind}
+          options={GLYPH_ACTION_KINDS}
+          onChange={(v) => setKind(v as GlyphAction["kind"])}
+        />
+      </div>
+      <Show when={props.action.kind === "preset"}>
+        <div style={{ flex: 1, "min-width": 0 }}>
+          <Select
+            icon="presets"
+            value={props.action.kind === "preset" ? props.action.presetId : ""}
+            options={props.presetOptions}
+            onChange={(v) => props.onChange({ kind: "preset", presetId: v })}
+          />
+        </div>
+      </Show>
+      <Show when={props.action.kind === "tile"}>
+        <div style={{ flex: 1, "min-width": 0 }}>
+          <Select
+            icon="soundboard"
+            value={props.action.kind === "tile" ? props.action.tileId : ""}
+            options={props.tileOptions}
+            onChange={(v) => props.onChange({ kind: "tile", tileId: v })}
+          />
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function GlyphCastingSection(): JSX.Element {
   const app = useApp();
+  const [recorderOpen, setRecorderOpen] = createSignal(false);
   const presetOptions = createMemo<SelectOption[]>(() =>
-    app.presets().map((p) => ({
-      value: p.id,
-      label: p.name,
-      sub: p.tag,
-    })),
+    app.presets().map((p) => ({ value: p.id, label: p.name, sub: p.tag })),
   );
+  const tileOptions = createMemo<SelectOption[]>(() =>
+    app.soundboardTiles().map((t) => ({ value: t.id, label: t.label })),
+  );
+
+  const onRecorded = (name: string, template: Point[]): void => {
+    const id = `glyph-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+    app.addCustomGlyph({
+      id,
+      name,
+      template,
+      action: { kind: "preset", presetId: presetOptions()[0]?.value ?? "" },
+    });
+  };
+
+  const chip = (inner: JSX.Element): JSX.Element => (
+    <span
+      style={{
+        width: "34px",
+        height: "34px",
+        "border-radius": "var(--r-sm)",
+        display: "grid",
+        "place-items": "center",
+        background: "var(--surface-3)",
+        color: "var(--indigo)",
+        "flex-shrink": 0,
+      }}
+    >
+      {inner}
+    </span>
+  );
+  const labelStyle = {
+    "font-size": "var(--t-sm)",
+    "font-weight": 600,
+    color: "var(--text-hi)",
+    overflow: "hidden",
+    "text-overflow": "ellipsis",
+    "white-space": "nowrap",
+  } as const;
+  const idCol = {
+    display: "flex",
+    "align-items": "center",
+    gap: "var(--s3)",
+    width: "164px",
+    "flex-shrink": 0,
+    "min-width": 0,
+  } as const;
 
   return (
     <section>
@@ -1465,64 +1584,76 @@ function GlyphCastingSection(): JSX.Element {
         }}
       >
         <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
-          Draw the shape on the Mixer to instantly switch to the bound preset.
+          Draw a glyph on the Mixer to fire its action. Bind the built-in
+          shapes — or record your own.
         </div>
         <For each={GLYPH_ROWS}>
           {(row) => (
-            <div
-              style={{
-                display: "flex",
-                "align-items": "center",
-                gap: "var(--s4)",
-                "justify-content": "space-between",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  "align-items": "center",
-                  gap: "var(--s3)",
-                  "min-width": 0,
-                  "flex-shrink": 0,
-                  width: "180px",
-                }}
-              >
-                <span
-                  style={{
-                    width: "34px",
-                    height: "34px",
-                    "border-radius": "var(--r-sm)",
-                    display: "grid",
-                    "place-items": "center",
-                    background: "var(--surface-3)",
-                    color: "var(--indigo)",
-                    "flex-shrink": 0,
-                  }}
-                >
-                  {row.shape}
-                </span>
-                <span
-                  style={{
-                    "font-size": "var(--t-sm)",
-                    "font-weight": 600,
-                    color: "var(--text-hi)",
-                  }}
-                >
-                  {row.label}
-                </span>
+            <div style={{ display: "flex", "align-items": "center", gap: "var(--s3)" }}>
+              <div style={idCol}>
+                {chip(row.shape)}
+                <span style={labelStyle}>{row.label}</span>
               </div>
-              <div style={{ flex: 1, "min-width": 0 }}>
-                <Select
-                  icon="presets"
-                  value={app.glyphs[row.id] ?? ""}
-                  options={presetOptions()}
-                  onChange={(v) => app.setGlyphs(row.id, v)}
-                />
-              </div>
+              <GlyphActionPicker
+                action={app.glyphBindings[row.id] ?? { kind: "preset", presetId: "" }}
+                onChange={(a) => app.setGlyphBinding(row.id, a)}
+                presetOptions={presetOptions()}
+                tileOptions={tileOptions()}
+              />
             </div>
           )}
         </For>
+
+        <div class="eyebrow" style={{ "margin-top": "var(--s2)" }}>
+          Custom glyphs
+        </div>
+        <Show
+          when={app.customGlyphs().length > 0}
+          fallback={
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+              None yet — record one below.
+            </div>
+          }
+        >
+          <For each={app.customGlyphs()}>
+            {(g) => (
+              <div style={{ display: "flex", "align-items": "center", gap: "var(--s3)" }}>
+                <div style={idCol}>
+                  {chip(<GlyphPreview template={g.template} size={22} />)}
+                  <span style={labelStyle}>{g.name}</span>
+                </div>
+                <GlyphActionPicker
+                  action={g.action}
+                  onChange={(a) => app.setCustomGlyphAction(g.id, a)}
+                  presetOptions={presetOptions()}
+                  tileOptions={tileOptions()}
+                />
+                <IconButton
+                  icon="trash"
+                  tip="Delete"
+                  aria-label={`Delete ${g.name}`}
+                  onClick={() => app.removeCustomGlyph(g.id)}
+                />
+              </div>
+            )}
+          </For>
+        </Show>
+        <div>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="plus"
+            onClick={() => setRecorderOpen(true)}
+          >
+            Record a glyph
+          </Button>
+        </div>
       </div>
+      <GlyphRecorder
+        open={recorderOpen()}
+        onClose={() => setRecorderOpen(false)}
+        onSave={onRecorded}
+      />
     </section>
   );
 }

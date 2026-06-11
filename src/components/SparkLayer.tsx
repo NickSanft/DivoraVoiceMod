@@ -18,7 +18,7 @@
 
 import { onCleanup, onMount, type JSX } from "solid-js";
 import { detectShape, type DetectedShape, type Point } from "../data/glyphs";
-import type { GlyphId, Preset } from "../types";
+import type { GlyphId } from "../types";
 
 const SPARK_CAP = 1600;
 const OMEN_LIFE_MS = 2500;
@@ -39,11 +39,28 @@ interface Spark {
   color: string;
 }
 
+/** A recognised cast: a glyph id + where it was drawn + the outline to
+ *  render (built-in shape geometry OR a custom normalized template). */
+interface GlyphHit {
+  glyphId: string;
+  shape: DetectedShape | null;
+  outline: Point[] | null;
+  cx: number;
+  cy: number;
+  size: number;
+}
+
 interface Omen {
-  shape: DetectedShape;
-  /** Brand color from the cast preset. */
+  cx: number;
+  cy: number;
+  size: number;
+  /** Built-in shape geometry for the outline (null for custom glyphs). */
+  shape: DetectedShape | null;
+  /** Custom glyph normalized template polyline (null for built-ins). */
+  outline: Point[] | null;
+  /** Brand color (preset colour, or the accent for non-preset actions). */
   color: string;
-  /** Preset display name (drawn under the shape). */
+  /** Action label drawn under the shape (preset name, "Monitor", …). */
   name: string;
   /** Theme-aware "SPELL CAST" eyebrow color, read off :root at cast time
    *  so it stays legible on both the dark and light themes. */
@@ -78,11 +95,16 @@ interface SparkState {
 }
 
 export interface SparkLayerProps {
-  /** Look up the preset bound to a glyph; return null if unbound. */
-  resolvePreset: (glyph: GlyphId) => Preset | null;
-  /** Apply the cast — switch chain/preset. Called when a shape is
-   *  recognised AND it's bound to a preset. */
-  onCast: (preset: Preset) => void;
+  /** Match the drawn path against the user's custom glyphs (the built-in
+   *  four shapes are recognised internally via `detectShape`). Returns the
+   *  matched glyph id + its normalized template, or null. */
+  recognizeCustom: (path: Point[]) => { id: string; template: Point[] } | null;
+  /** Resolve a recognised glyph id (built-in `GlyphId` or a custom id) to a
+   *  cast outcome — canvas colour, label, and the action to run — or null
+   *  when the glyph has no binding. */
+  resolveGlyph: (
+    glyphId: string,
+  ) => { color: string; label: string; run: () => void } | null;
   /** Short messages for the host's flash banner (unrecognised, unbound). */
   onMessage: (text: string) => void;
 }
@@ -135,7 +157,11 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
   };
 
   /** Look-up done at draw time, so prop changes flow without re-mount. */
-  const propsRef = { resolvePreset: props.resolvePreset, onCast: props.onCast, onMessage: props.onMessage };
+  const propsRef = {
+    recognizeCustom: props.recognizeCustom,
+    resolveGlyph: props.resolveGlyph,
+    onMessage: props.onMessage,
+  };
 
   onMount(() => {
     if (!canvasRef) return;
@@ -245,8 +271,7 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
       a = Math.max(0, Math.min(1, a));
       const pop =
         age < OMEN_POP_MS ? 0.6 + 0.4 * (age / OMEN_POP_MS) : 1;
-      const half =
-        Math.min(150, Math.max(95, o.shape.size * 0.5)) * pop;
+      const half = Math.min(150, Math.max(95, o.size * 0.5)) * pop;
 
       ctx.save();
       ctx.strokeStyle = o.color;
@@ -258,31 +283,36 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
       // Expanding halo ring behind the shape (subtle, low alpha).
       ctx.globalAlpha = a * 0.32;
       ctx.beginPath();
-      ctx.arc(
-        o.shape.cx,
-        o.shape.cy,
-        half * (1.12 + (age / OMEN_LIFE_MS) * 0.55),
-        0,
-        Math.PI * 2,
-      );
+      ctx.arc(o.cx, o.cy, half * (1.12 + (age / OMEN_LIFE_MS) * 0.55), 0, Math.PI * 2);
       ctx.stroke();
 
-      // The shape outline itself.
+      // The outline itself — a built-in shape, or the custom template stroke.
       ctx.globalAlpha = a;
-      drawShapeOutline(o.shape, half);
+      if (o.shape) {
+        drawShapeOutline(o.shape, half);
+      } else if (o.outline && o.outline.length > 1) {
+        ctx.beginPath();
+        o.outline.forEach((pt, i) => {
+          const px = o.cx + pt.x * half;
+          const py = o.cy + pt.y * half;
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+      }
 
-      // Labels — preset name + SPELL CAST eyebrow.
+      // Labels — action name + SPELL CAST eyebrow.
       ctx.shadowBlur = 14;
       ctx.fillStyle = o.color;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.font = '700 19px "Bricolage Grotesque", system-ui, sans-serif';
-      ctx.fillText(o.name, o.shape.cx, o.shape.cy + half + 28);
+      ctx.fillText(o.name, o.cx, o.cy + half + 28);
       ctx.shadowBlur = 0;
       ctx.fillStyle = o.eyebrow;
       ctx.globalAlpha = a * 0.65;
       ctx.font = '700 10px "Space Mono", monospace';
-      ctx.fillText("◆  S P E L L   C A S T  ◆", o.shape.cx, o.shape.cy + half + 47);
+      ctx.fillText("◆  S P E L L   C A S T  ◆", o.cx, o.cy + half + 47);
       ctx.restore();
     };
 
@@ -330,17 +360,43 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
       }
     };
 
-    const conjure = (shape: DetectedShape): void => {
-      const preset = propsRef.resolvePreset(shape.type);
-      if (!preset) {
-        propsRef.onMessage(`No preset bound to ${glyphLabel(shape.type)}`);
+    const BUILTIN_IDS: GlyphId[] = ["triangle", "invtriangle", "square", "circle"];
+
+    /** Bounding-box centre + diagonal of a drawn path (positions a custom
+     *  glyph's omen where the user actually drew). */
+    const pathBox = (pts: Point[]): { cx: number; cy: number; size: number } => {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      return {
+        cx: (minX + maxX) / 2,
+        cy: (minY + maxY) / 2,
+        size: Math.hypot(maxX - minX, maxY - minY),
+      };
+    };
+
+    const castHit = (hit: GlyphHit): void => {
+      const outcome = propsRef.resolveGlyph(hit.glyphId);
+      if (!outcome) {
+        const label = (BUILTIN_IDS as string[]).includes(hit.glyphId)
+          ? glyphLabel(hit.glyphId as GlyphId)
+          : "that glyph";
+        propsRef.onMessage(`No action bound to ${label}`);
         return;
       }
-      const colors = [preset.color, "#FFFFFF", preset.color, "#C9B8FF"];
+      const colors = [outcome.color, "#FFFFFF", outcome.color, "#C9B8FF"];
+      const half = Math.min(150, Math.max(95, hit.size * 0.5));
       // Trace sparks along the recognised outline so the user sees the
-      // app "complete" their stroke into the canonical shape.
-      if (shape.corners) {
-        const c = shape.corners;
+      // app "complete" their stroke.
+      if (hit.shape?.corners) {
+        const c = hit.shape.corners;
         for (let e = 0; e < c.length; e++) {
           const a = c[e]!;
           const b = c[(e + 1) % c.length]!;
@@ -357,28 +413,36 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
             );
           }
         }
-      } else if (shape.r) {
+      } else if (hit.shape?.r) {
         for (let i = 0; i < 28; i++) {
           const ang = (i / 28) * Math.PI * 2;
           spawn(
-            shape.cx + shape.r * Math.cos(ang),
-            shape.cy + shape.r * Math.sin(ang),
+            hit.cx + hit.shape.r * Math.cos(ang),
+            hit.cy + hit.shape.r * Math.sin(ang),
             2,
             { colors, size: 2.2 },
           );
         }
+      } else if (hit.outline) {
+        for (const pt of hit.outline) {
+          spawn(hit.cx + pt.x * half, hit.cy + pt.y * half, 1, { colors, size: 2.2 });
+        }
       }
       // Central burst.
-      spawn(shape.cx, shape.cy, 110, { colors, burst: 6.5, size: 2.6 });
+      spawn(hit.cx, hit.cy, 110, { colors, burst: 6.5, size: 2.6 });
       state.omen = {
-        shape,
-        color: preset.color,
-        name: preset.name,
+        cx: hit.cx,
+        cy: hit.cy,
+        size: hit.size,
+        shape: hit.shape,
+        outline: hit.outline,
+        color: outcome.color,
+        name: outcome.label,
         eyebrow: readToken("--text-hi", "rgba(233,231,248,0.85)"),
         start: performance.now(),
       };
       ensure();
-      propsRef.onCast(preset);
+      outcome.run();
     };
 
     const onDown = (ev: PointerEvent): void => {
@@ -408,15 +472,38 @@ export function SparkLayer(props: SparkLayerProps): JSX.Element {
     const onUp = (): void => {
       if (!state.drawing) return;
       state.drawing = false;
-      const shape = detectShape(state.path);
-      if (shape) {
-        conjure(shape);
-      } else if (state.path.length > 4) {
-        // The user drew something but it didn't classify — surface a
-        // brief hint so they understand the gesture happened.
-        propsRef.onMessage("Glyph not recognised — try again");
-      }
+      const path = state.path;
       state.path = [];
+      if (path.length <= 4) return;
+      // Built-in four shapes first (their tuned geometric detector + omen).
+      const shape = detectShape(path);
+      if (shape) {
+        castHit({
+          glyphId: shape.type,
+          shape,
+          outline: null,
+          cx: shape.cx,
+          cy: shape.cy,
+          size: shape.size,
+        });
+        return;
+      }
+      // Then the user's custom glyphs (unistroke template match).
+      const custom = propsRef.recognizeCustom(path);
+      if (custom) {
+        const box = pathBox(path);
+        castHit({
+          glyphId: custom.id,
+          shape: null,
+          outline: custom.template,
+          cx: box.cx,
+          cy: box.cy,
+          size: box.size,
+        });
+        return;
+      }
+      // Drew something, but it didn't classify — a brief hint.
+      propsRef.onMessage("Glyph not recognised — try again");
     };
 
     // Capture-phase window listeners so we see the pointer BEFORE any

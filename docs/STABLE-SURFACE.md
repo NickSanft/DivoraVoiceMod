@@ -219,6 +219,8 @@ to defaults (never throw).
 | `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0 |
 | `divora.calibrated` | mic calibration completed flag (suppresses the wizard step) — v1.10.0 |
 | `divora.updateCheckEnabled` | opt-out for the in-app update check (default true) — v1.12.0 |
+| `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
+| `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 
 ---

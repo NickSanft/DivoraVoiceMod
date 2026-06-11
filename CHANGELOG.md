@@ -4,6 +4,29 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-06-10 — Custom glyph casting
+
+The glyph-cast easter egg grows from a fixed party trick into a personal power feature: **record your own glyph** and bind any glyph — built-in or custom — to **any action**, not just a preset.
+
+### Added
+
+- **Record-your-own glyphs.** Settings → Glyph casting gains a **Record a glyph** pad: draw a single stroke, name it, and it's saved as a template. Drawing it on the Mixer casts its bound action, with the spell-cast omen tracing your recorded stroke.
+- **Bind any glyph to any action.** The four built-in shapes (and every custom glyph) can bind to a **preset**, a **soundboard clip**, **monitor toggle**, **mute**, or **panic** — chosen per glyph in Settings. (Previously: built-in shapes → preset only.)
+- **Recognition.** Built-in shapes keep their tuned geometric detector; custom glyphs use a new **$1-style unistroke recognizer** (`src/data/unistroke.ts`) — resample → normalize → nearest-template by average point distance, **orientation-preserving** so ▲ and ▽ stay distinct.
+- **Persistence (fix).** Glyph bindings weren't saved before (they reset each launch); now both the bindings and the custom glyphs persist (`divora.glyphBindings`, `divora.customGlyphs`).
+
+### Architecture (additive)
+
+- New pure `src/data/unistroke.ts` (recognizer) + `src/components/GlyphRecorder.tsx` (record pad + preview). New `GlyphAction` / `CustomGlyph` types. The cast pipeline (`SparkLayer` + `MixerScreen`) generalises from preset-only to a glyph-id → outcome (colour / label / run) model, reusing the same store action methods the v1.9 MIDI router drives (`usePreset` / `playTileById` / `toggleMonitor` / mute / `panicSoundboard`). No new Tauri command or event.
+
+### Tests
+
+- +7 recognizer (`unistroke.test.ts`), +3 store (preset resolution; rebind to a non-preset action + persist; custom glyph add/resolve/recognise/persist/remove), +1 E2E (the recorder UI). The existing built-in triangle-cast E2E still passes against the refactored pipeline.
+
+### Pre-push checklist
+
+- All green: `cargo fmt --check` (no Rust changes), `pnpm typecheck`, `pnpm test` (322), `pnpm test:e2e` (10), `pnpm tauri build --debug --no-bundle`.
+
 ## [1.14.0] — 2026-06-10 — Quick wins: preset import, logs, README roadmap
 
 Three small, independent improvements bundled together.
