@@ -192,6 +192,17 @@ test.describe("quick wins (v1.14)", () => {
   });
 });
 
+test.describe("stream overlay (v1.16)", () => {
+  test("Settings has the Stream overlay section + OBS guidance", async ({
+    page,
+  }) => {
+    await nav(page, "Settings").click();
+    await expect(page.getByText("Stream overlay")).toBeVisible();
+    await expect(page.getByText(/Show overlay window/i)).toBeVisible();
+    await expect(page.getByText(/capture it in OBS/i)).toBeVisible();
+  });
+});
+
 test.describe("custom glyph casting (v1.15)", () => {
   test("Settings glyph section has action pickers + a Record button", async ({
     page,

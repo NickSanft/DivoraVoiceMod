@@ -15,6 +15,7 @@ import {
 } from "solid-js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { subscribeGlobalShortcut, subscribeLevels, subscribeMidi } from "./audio/api";
+import { OVERLAY_EVENT, overlayPayload } from "./overlay/state";
 import { Wizard } from "./components/Wizard";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
@@ -79,6 +80,32 @@ function Shell(): JSX.Element {
   createEffect(() => {
     document.body.classList.toggle("grain", app.tweaks.grain);
     document.body.classList.toggle("vignette", app.tweaks.vignette);
+  });
+
+  // v1.16.0: while the stream overlay is open, push the spell-circle state
+  // to it over the Tauri event bus on every change (status / chain / tweaks
+  // / bg mode). The overlay animates on its own from there — no per-frame
+  // traffic. No-op off Tauri.
+  createEffect(() => {
+    if (!app.overlayOpen()) return;
+    const payload = overlayPayload({
+      chain: app.chain(),
+      status: app.status(),
+      motion: app.tweaks.motion,
+      mystical: app.tweaks.mystical,
+      mood: app.tweaks.mood,
+      accent: app.tweaks.accent,
+      theme: app.tweaks.theme,
+      bg: app.overlayBg(),
+    });
+    void (async () => {
+      try {
+        const { emit } = await import("@tauri-apps/api/event");
+        await emit(OVERLAY_EVENT, payload);
+      } catch {
+        /* not under Tauri */
+      }
+    })();
   });
 
   // Push-to-modulate fallback (in-app keyboard). The system-level

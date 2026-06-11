@@ -124,6 +124,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `audio-levels` | `LevelUpdate` | ~30 Hz while the app runs |
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
+| `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0) |
 
 ---
 
@@ -221,6 +222,7 @@ to defaults (never throw).
 | `divora.updateCheckEnabled` | opt-out for the in-app update check (default true) — v1.12.0 |
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
+| `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 
 ---

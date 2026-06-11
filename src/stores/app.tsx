@@ -83,6 +83,7 @@ import {
   type UnistrokeTemplate,
 } from "../data/unistroke";
 import type { Point } from "../data/glyphs";
+import type { OverlayBg } from "../overlay/state";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
@@ -187,6 +188,7 @@ const STORAGE_KEYS = {
   updateCheckEnabled: "divora.updateCheckEnabled",
   glyphBindings: "divora.glyphBindings",
   customGlyphs: "divora.customGlyphs",
+  overlay: "divora.overlay",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -313,6 +315,16 @@ export interface AppState {
   recognizeCustomGlyph: (
     path: Point[],
   ) => { id: string; template: Point[] } | null;
+
+  // Stream overlay (v1.16.0)
+  /** Whether the transparent spell-circle overlay window is open. */
+  overlayOpen: () => boolean;
+  /** Overlay background mode (persisted): alpha, or a chroma colour. */
+  overlayBg: () => OverlayBg;
+  setOverlayBg: (bg: OverlayBg) => void;
+  /** Open / close the overlay window (a second transparent Tauri window). */
+  openOverlay: () => Promise<void>;
+  closeOverlay: () => Promise<void>;
 
   // Audio engine
   audioInputs: () => DeviceInfo[];
@@ -676,6 +688,52 @@ export function createAppState(): AppState {
     if (!m) return null;
     const g = glyphs.find((x) => x.id === m.id);
     return g ? { id: g.id, template: g.template } : null;
+  };
+
+  // Stream overlay (v1.16.0). A second transparent Tauri window renders
+  // the spell circle for OBS; the main window pushes state to it (App.tsx).
+  const [overlayOpen, setOverlayOpen] = createSignal(false);
+  const [overlayBg, setOverlayBgRaw] = createSignal<OverlayBg>(
+    loadJson<{ bg: OverlayBg }>(STORAGE_KEYS.overlay, { bg: "transparent" }).bg,
+  );
+  const setOverlayBg = (bg: OverlayBg): void => {
+    setOverlayBgRaw(bg);
+    saveJson(STORAGE_KEYS.overlay, { bg });
+  };
+  const openOverlay = async (): Promise<void> => {
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const existing = await WebviewWindow.getByLabel("overlay");
+      if (existing) {
+        setOverlayOpen(true);
+        return;
+      }
+      const w = new WebviewWindow("overlay", {
+        url: "overlay.html",
+        title: "DivoraVoice Overlay",
+        width: 480,
+        height: 480,
+        transparent: true,
+        decorations: false,
+        alwaysOnTop: true,
+        resizable: true,
+      });
+      void w.once("tauri://created", () => setOverlayOpen(true));
+      void w.once("tauri://error", () => setOverlayOpen(false));
+      void w.once("tauri://destroyed", () => setOverlayOpen(false));
+    } catch {
+      /* not under Tauri (browser / E2E) — overlay is desktop-only */
+    }
+  };
+  const closeOverlay = async (): Promise<void> => {
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const w = await WebviewWindow.getByLabel("overlay");
+      if (w) await w.close();
+    } catch {
+      /* ignore */
+    }
+    setOverlayOpen(false);
   };
 
   // Audio engine signals.
@@ -1911,6 +1969,12 @@ export function createAppState(): AppState {
     glyphOutcome,
     dispatchGlyphAction,
     recognizeCustomGlyph,
+
+    overlayOpen,
+    overlayBg,
+    setOverlayBg,
+    openOverlay,
+    closeOverlay,
 
     audioInputs,
     setAudioInputs,

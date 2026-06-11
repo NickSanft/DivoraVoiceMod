@@ -28,6 +28,7 @@ import { clearWizardSeenFlag } from "../components/Wizard";
 import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
 import type { Point } from "../data/glyphs";
+import type { OverlayBg } from "../overlay/state";
 import { EFFECTS } from "../data/effects";
 import {
   MYSTICAL_BALANCED,
@@ -171,6 +172,8 @@ export function SettingsScreen(): JSX.Element {
       <GlyphCastingSection />
 
       <AppearanceSection motionLabel={motionLabel} />
+
+      <StreamOverlaySection />
 
       <AboutSection />
     </div>
@@ -1916,6 +1919,62 @@ function DiagnosticsSection(): JSX.Element {
             </div>
           )}
         </Show>
+      </div>
+    </section>
+  );
+}
+
+// ---------- Stream overlay (v1.16.0) ----------
+
+function StreamOverlaySection(): JSX.Element {
+  const app = useApp();
+  return (
+    <section>
+      <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
+        Stream overlay
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s5)",
+        }}
+      >
+        <Row label="Show overlay window">
+          <Toggle
+            on={app.overlayOpen()}
+            onChange={(v) => void (v ? app.openOverlay() : app.closeOverlay())}
+            ariaLabel="Show stream overlay window"
+          />
+        </Row>
+        <Row label="Background">
+          <Segmented<OverlayBg>
+            options={[
+              { value: "transparent", label: "Transparent" },
+              { value: "green", label: "Green" },
+              { value: "magenta", label: "Magenta" },
+            ]}
+            value={app.overlayBg()}
+            onChange={(v) => app.setOverlayBg(v)}
+          />
+        </Row>
+        <div
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+            "line-height": 1.5,
+          }}
+        >
+          A frameless, always-on-top window shows your spell circle reacting
+          to your voice — capture it in OBS. Use{" "}
+          <strong style={{ color: "var(--text-mid)" }}>Transparent</strong> with
+          a Window Capture that supports alpha, or pick{" "}
+          <strong style={{ color: "var(--text-mid)" }}>Green</strong> /{" "}
+          <strong style={{ color: "var(--text-mid)" }}>Magenta</strong> and add
+          a Chroma Key filter.
+        </div>
       </div>
     </section>
   );

@@ -399,6 +399,15 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] The **Chorus** effect is also selectable (Mix + Depth); enabling it thickens/widens the voice; Mix = 0 is a clean passthrough.
 - [ ] **Presets — "In use" badge**: with the engine **stopped**, no preset shows the green "In use" badge in the editor (previously every voice showed it). With the engine **running**, the active preset shows "In use."
 
+## Stream overlay (v1.16.0)
+
+- [ ] Settings → Stream overlay → toggle **Show overlay window** on → a frameless, always-on-top window appears showing the spell circle.
+- [ ] On the Mixer, hold Space (modulate) / change the preset / move Mystical / switch the Color mood → the overlay's circle updates to match (status colour, node count, mystical detail, mood) within a frame.
+- [ ] Set background = **Transparent** → in OBS, add a **Window Capture** of "DivoraVoice Overlay" with a method that supports transparency → the circle composites over your scene with no box.
+- [ ] Set background = **Green** (or Magenta) → the overlay fills solid green → add a **Chroma Key** filter in OBS → the green is removed, leaving the circle.
+- [ ] Close the overlay window's toggle (or the window's own close) → the window disappears and the toggle reflects it.
+- [ ] Restart the app → the background-mode choice is restored.
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.

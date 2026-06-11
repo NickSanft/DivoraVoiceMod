@@ -4,6 +4,27 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-06-10 — Spell-circle stream overlay
+
+Turn the app's signature visualization into an on-stream brand element: a transparent, always-on-top **overlay window** renders the spell circle reacting live to your voice, ready to capture in OBS. Local-first — no server, no network.
+
+### Added
+
+- **Stream overlay** (Settings → Stream overlay): a frameless, always-on-top second window mirrors the Mixer's spell circle — voice status (clean / modulated / muted), the active chain, and your Mystical / Motion / mood / theme tweaks. Toggle it on/off; the background mode persists.
+- **OBS-ready capture.** Background mode is **Transparent** (for OBS Window Capture with alpha) or a **Green / Magenta** chroma fill to key out, with a one-line OBS hint in Settings.
+
+### Architecture (additive)
+
+- A second Vite entry (`overlay.html` → `src/overlay.tsx`) renders **only** the spell circle — it never bootstraps a second engine/store (the `SpellCircle` component is already prop-driven, so it drops in directly). The main window pushes state over a new `overlay:state` Tauri event (`src/overlay/state.ts`, pure `overlayPayload`) on every change — the circle animates itself from there, so there's no per-frame traffic — and the overlay re-applies the theme data-attributes on its own root. No new dependency, no server, no network. New `localStorage["divora.overlay"]`; the `overlay` window + `core:webview:allow-create-webview-window` added to capabilities.
+
+### Tests
+
+- +2 (`overlay/state.test.ts` — the payload projector + the stable event name / chroma colours), +1 E2E (the Settings overlay section). The overlay window itself is desktop-verified (`MANUAL_TESTS.md`), like the tray / recording paths.
+
+### Pre-push checklist
+
+- All green: `cargo fmt --check` (no Rust changes), `pnpm typecheck`, `pnpm test` (324), `pnpm test:e2e` (11), `pnpm tauri build --debug --no-bundle` (the overlay entry bundles alongside the main app).
+
 ## [1.15.0] — 2026-06-10 — Custom glyph casting
 
 The glyph-cast easter egg grows from a fixed party trick into a personal power feature: **record your own glyph** and bind any glyph — built-in or custom — to **any action**, not just a preset.
