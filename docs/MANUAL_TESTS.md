@@ -410,19 +410,21 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## Speak — text-to-speech (v1.17.0)
 
-**Scaffolding (assets not yet staged — current state):**
+Assets ship in the installer (bundled build). Running **from source** needs
+`pwsh scripts/fetch-voice-assets.ps1` first (puts the model + espeak-ng into the
+resource dir), same as the AI voice-conversion models.
 
-- [ ] Sidebar → **Speak** → the screen shows the text box, the preset voice picker, and a **Speak** / **Stop** button.
-- [ ] The voices each show a **"Soon"** badge and a banner reads "Preset voices aren't installed yet."
-- [ ] Type a sentence → press **Speak** → a graceful notice ("text-to-speech voices are not installed") appears; the app does **not** hang or crash.
-- [ ] Pick a different voice → restart the app → the selection is restored (`divora.ttsVoice`).
+**Built app (assets present):**
 
-**After the Kokoro + espeak-ng assets are staged (gated — verify before tagging):**
-
-- [ ] Type a sentence → pick each preset voice → **Speak** → you hear that voice on the output; the voices are audibly distinct.
+- [ ] Sidebar → **Speak** → text box + a 6-voice picker (US/UK) + **Speak** / **Stop**. No "Soon" badges, no "not installed" banner.
+- [ ] Type a sentence → pick each preset voice → **Speak** → you hear that voice on the output; the voices are audibly distinct (US vs UK, M vs F).
 - [ ] Set output = **CABLE Input** and join a Discord call → a listener hears the spoken text, mixed with your live mic.
 - [ ] A long multi-sentence passage synthesizes as one continuous clip (sentence chunking, no dropouts); the playback **progress ring** tracks it; **Stop** halts it immediately.
-- [ ] Remove/rename the model file → **Speak** degrades to the "not installed" notice (never hangs), exactly like the AI voice-convert missing-model path.
+- [ ] Pick a different voice → restart the app → the selection is restored (`divora.ttsVoice`).
+
+**Degradation (no assets — e.g. dev run before fetch):**
+
+- [ ] Voices show a **"Soon"** badge + a "Preset voices aren't installed yet" banner; pressing **Speak** shows a graceful "text-to-speech voices are not installed" notice — never a hang or crash (same as the AI voice-convert missing-model path).
 
 ## Stress
 

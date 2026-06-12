@@ -17,6 +17,7 @@
 //! desktop-verified once `voice-assets-v2` carries the ~80 MB model. Gated
 //! here so the rest of the feature — UI, command surface, tests — ships now.
 
+pub mod kokoro;
 pub mod phonemize;
 pub mod tokens;
 
@@ -29,7 +30,8 @@ pub const TTS_SAMPLE_RATE: u32 = 24_000;
 
 /// Filenames for the staged Kokoro assets under the TTS asset directory.
 const MODEL_FILE: &str = "kokoro-v1.0.int8.onnx";
-const VOICES_FILE: &str = "voices-v1.0.bin";
+/// Our compact `DVTS` voice pack (preset voices only) — see `kokoro::StylePack`.
+const VOICES_FILE: &str = "voices-divora.bin";
 const CONFIG_FILE: &str = "kokoro-config.json";
 
 /// The curated preset voices shipped in Phase 1: `(id, display name, lang)`.
@@ -152,29 +154,45 @@ pub fn synthesize(text: &str, voice_id: &str, asset_dir: &Path) -> Result<TtsAud
         return Err(TtsError::NotInstalled);
     }
 
-    // Assets are present → run the pipeline that doesn't need `ort`:
-    // load the runtime vocab and phonemize + tokenize every chunk.
+    // Assets are present → run the full pipeline. Load the runtime vocab
+    // (from the model's config.json) and the compact voice pack, open the
+    // Kokoro session, then phonemize → tokenize → infer per chunk.
     let config = std::fs::read_to_string(&paths.config)
         .map_err(|e| TtsError::Inference(format!("read kokoro config: {e}")))?;
     let vocab = tokens::parse_vocab(&config)
         .map_err(|e| TtsError::Inference(format!("parse kokoro vocab: {e}")))?;
     let phonemizer = phonemize::Phonemizer::from_dir(&paths.espeak_dir);
 
-    let mut token_runs: Vec<Vec<i64>> = Vec::with_capacity(chunks.len());
+    let pack_bytes = std::fs::read(&paths.voices)
+        .map_err(|e| TtsError::Inference(format!("read voice pack: {e}")))?;
+    let pack = kokoro::StylePack::parse(&pack_bytes)
+        .ok_or_else(|| TtsError::Inference("invalid voice pack".to_string()))?;
+    if !pack.has_voice(voice.0) {
+        return Err(TtsError::UnknownVoice(voice.0.to_string()));
+    }
+    let mut session = kokoro::load_session(&paths.model)
+        .ok_or_else(|| TtsError::Inference("Kokoro model/runtime unavailable".to_string()))?;
+
+    let mut samples: Vec<f32> = Vec::new();
     for chunk in chunks {
         let phonemes = phonemizer.phonemize(&chunk, voice.2)?;
-        token_runs.push(tokens::phonemes_to_ids(&phonemes, &vocab));
+        let ids = tokens::phonemes_to_ids(&phonemes, &vocab);
+        // Kokoro selects the style vector by the *unpadded* token length.
+        let inner_len = ids.len().saturating_sub(2);
+        let style = pack
+            .style(voice.0, inner_len)
+            .ok_or_else(|| TtsError::Inference("style lookup failed".to_string()))?;
+        let mut audio = kokoro::infer(&mut session, &ids, style, 1.0)
+            .ok_or_else(|| TtsError::Inference("Kokoro inference failed".to_string()))?;
+        samples.append(&mut audio);
     }
-
-    // Remaining step (desktop-verified when `voice-assets-v2` carries the
-    // model): load `kokoro-v1.0.int8.onnx` via the `dsp::voice_convert`
-    // session pattern, look up each voice's 256-dim style vector from
-    // `voices-v1.0.bin` keyed by token-run length, run inference per run, and
-    // concatenate the 24 kHz output into a `TtsAudio`.
-    let _ = (&paths.model, &paths.voices, voice.0, token_runs);
-    Err(TtsError::Inference(
-        "Kokoro model staged separately; synthesis pending asset install".to_string(),
-    ))
+    if samples.is_empty() {
+        return Err(TtsError::EmptyText);
+    }
+    Ok(TtsAudio {
+        samples,
+        sample_rate: TTS_SAMPLE_RATE,
+    })
 }
 
 #[cfg(test)]
@@ -220,6 +238,29 @@ mod tests {
     #[test]
     fn paths_not_installed_for_empty_dir() {
         assert!(!TtsPaths::new(&empty_assets()).installed());
+    }
+
+    /// Full real pipeline — espeak-ng subprocess → tokens → Kokoro → audio.
+    /// Requires the staged assets + `onnxruntime.dll`, so it's `#[ignore]`d
+    /// (local-only). Run with:
+    /// `cargo test -p divora-core full_pipeline -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "requires staged TTS assets + espeak-ng + onnxruntime.dll (local only)"]
+    fn full_pipeline_synthesizes_audio() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+        let assets = PathBuf::from(format!("{res}/tts"));
+        // Sanity: the gate sees everything installed.
+        assert!(TtsPaths::new(&assets).installed(), "assets not all present");
+        let audio = synthesize("Speak, and the coven echoes.", "af_heart", &assets)
+            .expect("synthesis should succeed with staged assets");
+        assert_eq!(audio.sample_rate, TTS_SAMPLE_RATE);
+        assert!(
+            audio.samples.len() > 10_000,
+            "expected real audio, got {} samples",
+            audio.samples.len()
+        );
+        assert!(audio.samples.iter().all(|s| s.is_finite()));
     }
 
     #[test]

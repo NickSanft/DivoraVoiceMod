@@ -20,8 +20,9 @@ use std::process::Command;
 pub struct Phonemizer {
     /// Path to the `espeak-ng` executable.
     bin: PathBuf,
-    /// Path to the `espeak-ng-data` directory, if bundled alongside (passed
-    /// via `--path`). espeak-ng can also find its data relative to the binary.
+    /// The directory *containing* `espeak-ng-data` (passed via `--path`).
+    /// On a bundled/portable layout espeak-ng won't find its data otherwise,
+    /// so this is required when present. `None` if no data dir is bundled.
     data: Option<PathBuf>,
 }
 
@@ -43,8 +44,12 @@ impl Phonemizer {
     #[must_use]
     pub fn from_dir(dir: &Path) -> Self {
         let bin = dir.join(espeak_bin_name());
-        let data_dir = dir.join("espeak-ng-data");
-        let data = data_dir.is_dir().then_some(data_dir);
+        // espeak-ng's `--path` wants the directory *containing* `espeak-ng-data`
+        // (this dir), not the data dir itself.
+        let data = dir
+            .join("espeak-ng-data")
+            .is_dir()
+            .then(|| dir.to_path_buf());
         Self { bin, data }
     }
 
@@ -66,10 +71,7 @@ impl Phonemizer {
             return Err(PhonemizeError::NotInstalled(self.bin.clone()));
         }
         let mut cmd = Command::new(&self.bin);
-        cmd.args(espeak_args(lang, text));
-        if let Some(data) = &self.data {
-            cmd.arg("--path").arg(data);
-        }
+        cmd.args(espeak_args(lang, self.data.as_deref(), text));
         let output = cmd.output()?;
         if !output.status.success() {
             return Err(PhonemizeError::Exited {
@@ -81,19 +83,27 @@ impl Phonemizer {
     }
 }
 
-/// The espeak-ng arguments for quiet IPA phonemization, with the input text
-/// passed positionally last. `-q` suppresses audio; `--ipa` emits IPA with
-/// stress marks (matching the `phonemizer` espeak backend Kokoro trained on).
-fn espeak_args(lang: &str, text: &str) -> Vec<String> {
-    vec![
+/// The espeak-ng arguments for quiet IPA phonemization. `-q` suppresses audio;
+/// `--ipa` emits IPA with stress marks (matching the `phonemizer` espeak
+/// backend Kokoro trained on); `--path` points at the bundled data dir.
+///
+/// Ordering matters: `--` ends option parsing, so the text (and only the
+/// text) follows it — `--path` MUST come *before* `--`, or espeak treats it
+/// as literal text, runs with no data, and crashes.
+fn espeak_args(lang: &str, data: Option<&Path>, text: &str) -> Vec<String> {
+    let mut args = vec![
         "-q".to_string(),
         "--ipa".to_string(),
         "-v".to_string(),
         lang.to_string(),
-        // Separator so espeak never parses the text as a flag; it ignores it.
-        "--".to_string(),
-        text.to_string(),
-    ]
+    ];
+    if let Some(dir) = data {
+        args.push("--path".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args.push("--".to_string());
+    args.push(text.to_string());
+    args
 }
 
 fn espeak_bin_name() -> &'static str {
@@ -144,8 +154,21 @@ mod tests {
 
     #[test]
     fn args_are_quiet_ipa_with_lang_and_text_last() {
-        let args = espeak_args("en-us", "hello");
+        let args = espeak_args("en-us", None, "hello");
         assert_eq!(args, vec!["-q", "--ipa", "-v", "en-us", "--", "hello"]);
+    }
+
+    #[test]
+    fn args_put_path_before_the_text_separator() {
+        let args = espeak_args("en-us", Some(Path::new("C:/e/tts")), "hi");
+        assert_eq!(
+            args,
+            vec!["-q", "--ipa", "-v", "en-us", "--path", "C:/e/tts", "--", "hi"],
+        );
+        // `--path` must precede `--`, else espeak speaks it as text.
+        let dd = args.iter().position(|a| a == "--").unwrap();
+        let pp = args.iter().position(|a| a == "--path").unwrap();
+        assert!(pp < dd);
     }
 
     #[test]
