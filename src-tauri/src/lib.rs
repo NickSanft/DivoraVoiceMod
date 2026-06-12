@@ -889,6 +889,38 @@ pub fn run() {
             };
             tracing::info!(path = %tts_assets_dir.display(), "tts assets dir resolved");
 
+            // Dev fallback: a `tauri dev` (debug) build ships no bundled
+            // resources, so the resource-dir path above is empty and Speak
+            // would report "not installed". Point at the source-staged assets
+            // next to the crate (`src-tauri/resources/tts/`, populated by
+            // `scripts/fetch-voice-assets.ps1`) so Speak works in dev too —
+            // and set `ORT_DYLIB_PATH` to the source-staged runtime so the
+            // Kokoro session can actually load. Release builds skip this
+            // entirely and use the real bundled resource dir.
+            #[cfg(debug_assertions)]
+            let tts_assets_dir = if tts_assets_dir.join("kokoro-v1.0.int8.onnx").exists() {
+                tts_assets_dir
+            } else {
+                let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("resources")
+                    .join("tts");
+                if dev.join("kokoro-v1.0.int8.onnx").exists() {
+                    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+                        let dll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("resources")
+                            .join("onnxruntime.dll");
+                        if dll.is_file() {
+                            std::env::set_var("ORT_DYLIB_PATH", &dll);
+                            tracing::info!(path = %dll.display(), "dev: ORT_DYLIB_PATH set to source-staged runtime");
+                        }
+                    }
+                    tracing::info!(path = %dev.display(), "dev: using source-staged TTS assets");
+                    dev
+                } else {
+                    tts_assets_dir
+                }
+            };
+
             app.manage(AppState {
                 engine,
                 preset_store,
