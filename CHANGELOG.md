@@ -2,9 +2,11 @@
 
 All notable changes to Divora are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is **phase = minor** until v1.0 (see [docs/PLAN.md](docs/PLAN.md)).
 
-## [Unreleased] — Text-to-speech ("Speak") — ready to tag pending audio sign-off
+## [Unreleased]
 
-A new **Speak** section: type text, pick a preset voice, and Divora synthesizes it **on-device** and plays it through the output — mixed with the live mic via the soundboard seam, so a Discord call or stream hears it too. No cloud, no telemetry. The full pipeline is wired and verified end-to-end against the real model; the only thing left before tagging v1.17.0 is a human listen to confirm the voices sound right (`src-tauri/resources/_samples/*.wav`).
+## [1.17.0] — 2026-06-12 — Text-to-speech ("Speak")
+
+A new **Speak** section: type text, pick a preset voice, and Divora synthesizes it **on-device** and plays it through the output — mixed with the live mic via the soundboard seam, so a Discord call or stream hears it too. No cloud, no telemetry. Six preset voices (US + UK), powered by Kokoro-82M with espeak-ng phonemization.
 
 ### Added
 
