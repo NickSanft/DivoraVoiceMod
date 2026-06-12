@@ -19,6 +19,7 @@ const NAV: NavItem[] = [
   { id: "mixer", label: "Mixer", sigil: "mixer" },
   { id: "coven", label: "Coven", sigil: "modulated" },
   { id: "soundboard", label: "Board", sigil: "soundboard" },
+  { id: "speak", label: "Speak", sigil: "wave" },
   { id: "presets", label: "Presets", sigil: "presets" },
   { id: "settings", label: "Settings", sigil: "settings" },
 ];

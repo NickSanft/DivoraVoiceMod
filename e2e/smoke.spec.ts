@@ -18,7 +18,7 @@ test.beforeEach(async ({ page }) => {
 test.describe("app shell", () => {
   test("boots cleanly with no console errors", async ({ page, consoleErrors }) => {
     await expect(page.locator(".titlebar-wordmark")).toHaveText(/DivoraVoice/i);
-    await expect(page.locator(".sidebar-nav")).toHaveCount(5);
+    await expect(page.locator(".sidebar-nav")).toHaveCount(6);
     expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
 
@@ -218,6 +218,40 @@ test.describe("custom glyph casting (v1.15)", () => {
   });
 });
 
+test.describe("speak / text-to-speech (v1.17)", () => {
+  test("Speak screen renders text box, voice picker, and the scaffolding notice", async ({
+    page,
+  }) => {
+    await nav(page, "Speak").click();
+    await expect(nav(page, "Speak")).toHaveAttribute("aria-current", "page");
+
+    await expect(page.getByRole("heading", { name: "Speak" })).toBeVisible();
+    await expect(page.getByPlaceholder(/echoes/i)).toBeVisible();
+
+    // Preset voices come from the list_tts_voices mock.
+    await expect(page.getByRole("radio", { name: /Aria/i })).toBeVisible();
+    await expect(page.getByRole("radio", { name: /George/i })).toBeVisible();
+
+    // Scaffolding notice: voices aren't installed yet.
+    await expect(page.getByText(/aren't installed yet/i)).toBeVisible();
+
+    // The Speak action button (scope to the primary btn to avoid the
+    // sidebar's "Speak" nav button).
+    await expect(
+      page.locator("button.btn-primary", { hasText: "Speak" }),
+    ).toBeVisible();
+  });
+
+  test("typing then Speak surfaces the graceful 'not installed' message", async ({
+    page,
+  }) => {
+    await nav(page, "Speak").click();
+    await page.getByPlaceholder(/echoes/i).fill("Hello from the coven");
+    await page.locator("button.btn-primary", { hasText: "Speak" }).click();
+    await expect(page.getByText(/voices are not installed/i)).toBeVisible();
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 
@@ -237,6 +271,6 @@ test.describe("first-run wizard (v0.7)", () => {
 
     // Wizard dismissed — the Mixer shell is interactive.
     await expect(page.getByText(/transmuted in real time/i)).toBeHidden();
-    await expect(page.locator(".sidebar-nav")).toHaveCount(5);
+    await expect(page.locator(".sidebar-nav")).toHaveCount(6);
   });
 });

@@ -129,6 +129,17 @@ export async function installTauriMock(
         }),
         list_voices: () => [],
         voices_dir: () => "C:/mock/voices",
+        // v1.17.0: TTS scaffolding — preset voices exist but aren't
+        // installed yet, and synthesis rejects with the graceful message
+        // (mirrors the gated backend until the model assets are staged).
+        list_tts_voices: () => [
+          { id: "af_heart", name: "Aria — warm (US)", lang: "en-us", installed: false },
+          { id: "bm_george", name: "George — crisp (UK)", lang: "en-gb", installed: false },
+        ],
+        speak: () => {
+          throw "text-to-speech voices are not installed";
+        },
+        stop_speak: () => null,
         recordings_dir: () => "C:/mock/recordings",
         preset_store_path: () => "C:/mock/presets",
         list_midi_inputs: () => [],

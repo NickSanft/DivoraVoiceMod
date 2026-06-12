@@ -264,6 +264,41 @@ export async function setVoiceModel(
   await invoke("set_voice_model", { index, path });
 }
 
+// ---- Text-to-speech ("Speak") — v1.17.0 ----
+
+/** One preset "Speak" voice. `installed` is false until the Kokoro model +
+ *  voice pack + espeak-ng are staged in the bundle, so the UI can show a
+ *  clear "voice not installed" state instead of failing on Speak. */
+export interface TtsVoiceInfo {
+  /** Kokoro voice id (e.g. "af_heart") — also the style-pack key. */
+  id: string;
+  name: string;
+  /** espeak language used to phonemize this voice (e.g. "en-us"). */
+  lang: string;
+  /** True once every asset needed to synthesize is present on disk. */
+  installed: boolean;
+}
+
+/** List the preset Speak voices, each flagged with whether it's installed. */
+export async function listTtsVoices(): Promise<TtsVoiceInfo[]> {
+  return invoke<TtsVoiceInfo[]>("list_tts_voices");
+}
+
+/**
+ * Synthesize `text` with the preset `voiceId` and play it through the output,
+ * mixed with the live mic via the soundboard seam (so a Discord/stream
+ * listener hears it too). Resolves to the clip's duration in seconds. Rejects
+ * with a message (e.g. "voices are not installed") the UI can surface.
+ */
+export async function speak(text: string, voiceId: string): Promise<number> {
+  return invoke<number>("speak", { text, voiceId });
+}
+
+/** Stop any in-flight synthesized speech playing through the mixer. */
+export async function stopSpeak(): Promise<void> {
+  await invoke("stop_speak");
+}
+
 // ---- Recording (Phase 16) ----
 
 /** Absolute path of the recordings directory. */

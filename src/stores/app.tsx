@@ -33,6 +33,7 @@ import {
   listOutputDevices,
   listPresets,
   listVoices as listVoicesCmd,
+  listTtsVoices as listTtsVoicesCmd,
   openMidiInput as openMidiInputCmd,
   closeMidiInput as closeMidiInputCmd,
   onnxRuntimeStatus as onnxRuntimeStatusCmd,
@@ -58,6 +59,8 @@ import {
   stopAudioEngine,
   stopRecording as stopRecordingCmd,
   stopSoundboardClip as stopSoundboardClipCmd,
+  speak as speakCmd,
+  stopSpeak as stopSpeakCmd,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
@@ -67,6 +70,7 @@ import {
   type OnnxRuntimeStatus,
   type SoundboardTile,
   type StreamInfo,
+  type TtsVoiceInfo,
   type VirtualMicStatus,
   type VoiceInfo,
   type WirePreset,
@@ -189,6 +193,7 @@ const STORAGE_KEYS = {
   glyphBindings: "divora.glyphBindings",
   customGlyphs: "divora.customGlyphs",
   overlay: "divora.overlay",
+  ttsVoice: "divora.ttsVoice",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -397,6 +402,26 @@ export interface AppState {
   activeVoiceId: () => string | null;
   setActiveVoice: (id: string | null) => void;
   refreshVoiceLibrary: () => Promise<void>;
+
+  // Text-to-speech ("Speak") — v1.17.0
+  /** Preset Speak voices (each flagged `installed`). */
+  ttsVoices: () => TtsVoiceInfo[];
+  /** Selected preset voice id (persisted `divora.ttsVoice`); null until first load. */
+  selectedTtsVoice: () => string | null;
+  setSelectedTtsVoice: (id: string) => void;
+  /** Draft text in the Speak box (ephemeral — not persisted). */
+  ttsText: () => string;
+  setTtsText: (text: string) => void;
+  /** True while a synthesize request is in flight. */
+  synthesizing: () => boolean;
+  /** Last synthesis error (e.g. "voices not installed"), or null. */
+  ttsError: () => string | null;
+  /** Pull the preset voice list from the backend + default the selection. */
+  refreshTtsVoices: () => Promise<void>;
+  /** Synthesize the current text with the selected voice and play it. */
+  speakText: () => Promise<void>;
+  /** Stop any in-flight synthesized speech. */
+  stopSpeaking: () => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -1934,6 +1959,75 @@ export function createAppState(): AppState {
     }
   };
 
+  // ---- v1.17.0: text-to-speech ("Speak") ----
+
+  const [ttsVoices, setTtsVoices] = createSignal<TtsVoiceInfo[]>([]);
+  const [selectedTtsVoice, setSelectedTtsVoiceRaw] = createSignal<string | null>(
+    loadJson<string | null>(STORAGE_KEYS.ttsVoice, null),
+  );
+  const [ttsText, setTtsText] = createSignal("");
+  const [synthesizing, setSynthesizing] = createSignal(false);
+  const [ttsError, setTtsError] = createSignal<string | null>(null);
+
+  const setSelectedTtsVoice = (id: string): void => {
+    setSelectedTtsVoiceRaw(id);
+    saveJson(STORAGE_KEYS.ttsVoice, id);
+  };
+
+  const refreshTtsVoices = async (): Promise<void> => {
+    try {
+      const list = await listTtsVoicesCmd();
+      const next = Array.isArray(list) ? list : [];
+      setTtsVoices(next);
+      // Default the selection to the first voice when none is chosen (or
+      // the persisted one no longer exists in the list).
+      const current = selectedTtsVoice();
+      const first = next[0];
+      if ((!current || !next.some((v) => v.id === current)) && first) {
+        setSelectedTtsVoice(first.id);
+      }
+    } catch (err) {
+      console.warn("[tts] voice refresh failed", err);
+    }
+  };
+
+  const speakText = async (): Promise<void> => {
+    const text = ttsText().trim();
+    const voiceId = selectedTtsVoice();
+    if (!text || !voiceId || synthesizing()) return;
+    setTtsError(null);
+    setSynthesizing(true);
+    try {
+      const durationSecs = await speakCmd(text, voiceId);
+      // Reuse the soundboard playback seam: register a "tts" clip so the
+      // shared ~30 Hz clock drives the progress ring and auto-expires it.
+      setPlayingClips("tts", {
+        clipId: "tts",
+        startedAt: performance.now(),
+        durationSecs,
+      });
+    } catch (err) {
+      setTtsError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setSynthesizing(false);
+    }
+  };
+
+  const stopSpeaking = async (): Promise<void> => {
+    setPlayingClips("tts", undefined as unknown as PlayingClip);
+    try {
+      await stopSpeakCmd();
+    } catch (err) {
+      console.warn("[tts] stop failed", err);
+    }
+  };
+
   return {
     nav,
     setNav,
@@ -2032,6 +2126,17 @@ export function createAppState(): AppState {
     activeVoiceId,
     setActiveVoice,
     refreshVoiceLibrary,
+
+    ttsVoices,
+    selectedTtsVoice,
+    setSelectedTtsVoice,
+    ttsText,
+    setTtsText,
+    synthesizing,
+    ttsError,
+    refreshTtsVoices,
+    speakText,
+    stopSpeaking,
 
     usePreset,
     viewPreset,

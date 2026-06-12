@@ -86,6 +86,14 @@ struct AppState {
     /// installer's resource bundle. `None` in dev builds / when no
     /// resources were bundled. Listed alongside `voices_dir`.
     bundled_voices_dir: Option<PathBuf>,
+    /// v1.17.0: directory holding the bundled TTS ("Speak") assets —
+    /// `kokoro-v1.0.int8.onnx`, `voices-v1.0.bin`, `kokoro-config.json`,
+    /// and the espeak-ng binary + `espeak-ng-data` (resource dir's `tts/`
+    /// subfolder). The expected path is always set; the files only exist
+    /// once `voice-assets-v2` is fetched into the bundle, so until then
+    /// `list_tts_voices` reports every voice as not-installed and `speak`
+    /// degrades to a clear error rather than synthesizing.
+    tts_assets_dir: PathBuf,
     /// Phase 16: directory recordings are written to
     /// (`%APPDATA%/DivoraVoice/recordings/`). Created at startup;
     /// surfaced to the UI so it can open it + show where files land.
@@ -489,6 +497,61 @@ fn set_soundboard_master_gain(state: State<'_, AppState>, gain: f32) {
         .send_soundboard(SoundboardCommand::SetMasterGain(gain));
 }
 
+// ---- v1.17.0: text-to-speech ("Speak") ----
+
+/// Stable clip id for synthesized speech in the soundboard mixer, so `speak`
+/// replaces any in-flight utterance and `stop_speak` can target it.
+const TTS_CLIP_ID: &str = "tts";
+
+/// List the preset "Speak" voices, each flagged with whether its model assets
+/// are installed (so the UI can show "voice not installed" instead of failing
+/// on Speak). Never touches the ONNX runtime — pure filesystem probing.
+#[tauri::command]
+fn list_tts_voices(state: State<'_, AppState>) -> Vec<divora_core::tts::TtsVoiceInfo> {
+    divora_core::tts::list_voices(&state.tts_assets_dir)
+}
+
+/// Synthesize `text` with preset `voice_id` and play it through the output by
+/// reusing the soundboard mixer seam (so a Discord/stream listener hears it
+/// too, mixed with the live mic). Returns the clip duration in seconds for the
+/// playback progress ring.
+///
+/// Synthesis is batch work; it runs here on the command's worker thread (as
+/// `play_soundboard_clip` decodes synchronously). Until the Kokoro model is
+/// staged, `synthesize` returns `NotInstalled` immediately, surfaced to the UI
+/// as a graceful error string rather than a hang.
+#[tauri::command]
+fn speak(state: State<'_, AppState>, text: String, voice_id: String) -> Result<f32, String> {
+    let audio =
+        divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir).map_err(|e| {
+            tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
+            e.to_string()
+        })?;
+    let sample_rate = audio.sample_rate;
+    let samples = Arc::new(audio.samples);
+    #[allow(clippy::cast_precision_loss)]
+    let duration_secs = if sample_rate == 0 {
+        0.0
+    } else {
+        samples.len() as f32 / sample_rate as f32
+    };
+    state.engine.send_soundboard(SoundboardCommand::Play {
+        clip_id: TTS_CLIP_ID.to_string(),
+        samples,
+        sample_rate,
+        gain: 1.0,
+    });
+    Ok(duration_secs)
+}
+
+/// Stop any in-flight synthesized speech playing through the mixer.
+#[tauri::command]
+fn stop_speak(state: State<'_, AppState>) {
+    state.engine.send_soundboard(SoundboardCommand::Stop {
+        clip_id: TTS_CLIP_ID.to_string(),
+    });
+}
+
 #[tauri::command]
 fn detect_virtual_mic() -> VirtualMicStatus {
     detect_virtual_mic_core()
@@ -813,6 +876,19 @@ pub fn run() {
                 }
             };
 
+            // v1.17.0: the bundled TTS asset dir (resource dir's `tts/`
+            // subfolder). Always resolved to an expected path even when the
+            // files aren't bundled yet — `list_tts_voices`/`speak` probe the
+            // individual files and degrade to "not installed" if absent.
+            let tts_assets_dir = match app.path().resource_dir() {
+                Ok(res) => res.join("tts"),
+                Err(e) => {
+                    tracing::warn!(?e, "no resource dir; bundled TTS assets unavailable");
+                    std::env::temp_dir().join("DivoraVoice").join("tts")
+                }
+            };
+            tracing::info!(path = %tts_assets_dir.display(), "tts assets dir resolved");
+
             app.manage(AppState {
                 engine,
                 preset_store,
@@ -820,6 +896,7 @@ pub fn run() {
                 shortcuts: Mutex::new(HashMap::new()),
                 voices_dir,
                 bundled_voices_dir,
+                tts_assets_dir,
                 recordings_dir,
                 logs_dir,
                 midi_connection: Mutex::new(None),
@@ -859,6 +936,9 @@ pub fn run() {
             stop_soundboard_clip,
             stop_all_soundboard_clips,
             set_soundboard_master_gain,
+            list_tts_voices,
+            speak,
+            stop_speak,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,

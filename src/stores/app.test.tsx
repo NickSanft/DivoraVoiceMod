@@ -1816,3 +1816,108 @@ describe("app store — custom glyph casting (v1.15.0)", () => {
     expect(b.result.customGlyphs()).toHaveLength(0);
   });
 });
+
+describe("app store — v1.17.0 text-to-speech (Speak)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom always has localStorage */
+    }
+  });
+
+  const TWO_VOICES = [
+    { id: "af_heart", name: "Aria", lang: "en-us", installed: false },
+    { id: "bm_george", name: "George", lang: "en-gb", installed: false },
+  ];
+
+  it("refreshTtsVoices populates the list and defaults the selection to the first", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_tts_voices") return TWO_VOICES;
+      return null;
+    });
+    const { result } = setupApp();
+    expect(result.selectedTtsVoice()).toBeNull();
+    await result.refreshTtsVoices();
+    expect(result.ttsVoices()).toHaveLength(2);
+    expect(result.selectedTtsVoice()).toBe("af_heart");
+  });
+
+  it("refreshTtsVoices keeps a valid persisted selection", async () => {
+    window.localStorage.setItem("divora.ttsVoice", JSON.stringify("bm_george"));
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_tts_voices") return TWO_VOICES;
+      return null;
+    });
+    const { result } = setupApp();
+    expect(result.selectedTtsVoice()).toBe("bm_george");
+    await result.refreshTtsVoices();
+    expect(result.selectedTtsVoice()).toBe("bm_george"); // unchanged
+  });
+
+  it("setSelectedTtsVoice persists to localStorage", () => {
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    expect(window.localStorage.getItem("divora.ttsVoice")).toContain("af_heart");
+  });
+
+  it("speakText is a no-op when the text is blank", async () => {
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("   ");
+    invokeMock.mockClear();
+    await result.speakText();
+    expect(invokeMock).not.toHaveBeenCalledWith("speak", expect.anything());
+  });
+
+  it("speakText forwards text + voice and registers a 'tts' playing clip on success", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "speak") return 2.0; // duration
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("Hello there.");
+    await result.speakText();
+    expect(invokeMock).toHaveBeenCalledWith("speak", {
+      text: "Hello there.",
+      voiceId: "af_heart",
+    });
+    expect(result.playingClips["tts"]).toBeDefined();
+    expect(result.playingClips["tts"]!.durationSecs).toBe(2.0);
+    expect(result.synthesizing()).toBe(false);
+    expect(result.ttsError()).toBeNull();
+  });
+
+  it("speakText records a 'not installed' error and leaves nothing playing", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "speak") throw "text-to-speech voices are not installed";
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("Hello");
+    await result.speakText();
+    expect(result.ttsError()).toBe("text-to-speech voices are not installed");
+    expect(result.playingClips["tts"]).toBeUndefined();
+    expect(result.synthesizing()).toBe(false);
+  });
+
+  it("stopSpeaking clears the 'tts' clip and invokes stop_speak", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "speak") return 5.0;
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("A long passage.");
+    await result.speakText();
+    expect(result.playingClips["tts"]).toBeDefined();
+    invokeMock.mockClear();
+    await result.stopSpeaking();
+    expect(result.playingClips["tts"]).toBeUndefined();
+    expect(invokeMock).toHaveBeenCalledWith("stop_speak");
+  });
+});

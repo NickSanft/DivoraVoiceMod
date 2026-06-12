@@ -32,12 +32,15 @@ import {
   setEffectChain,
   setEffectEnabled,
   setEffectParam,
+  speak,
   startAudioEngine,
   startRecording,
+  listTtsVoices,
   stopAllSoundboardClips,
   stopAudioEngine,
   stopRecording,
   stopSoundboardClip,
+  stopSpeak,
   subscribeGlobalShortcut,
   subscribeLevels,
   subscribeMidi,
@@ -431,6 +434,39 @@ describe("audio api", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await closeMidiInput();
     expect(invokeMock).toHaveBeenCalledWith("close_midi_input");
+  });
+
+  it("listTtsVoices invokes list_tts_voices", async () => {
+    invokeMock.mockResolvedValueOnce([
+      { id: "af_heart", name: "Aria", lang: "en-us", installed: false },
+    ]);
+    const voices = await listTtsVoices();
+    expect(invokeMock).toHaveBeenCalledWith("list_tts_voices");
+    expect(voices[0]!.id).toBe("af_heart");
+    expect(voices[0]!.installed).toBe(false);
+  });
+
+  it("speak forwards text + voiceId and returns the duration", async () => {
+    invokeMock.mockResolvedValueOnce(1.8);
+    const d = await speak("Hello there.", "af_heart");
+    expect(invokeMock).toHaveBeenCalledWith("speak", {
+      text: "Hello there.",
+      voiceId: "af_heart",
+    });
+    expect(d).toBe(1.8);
+  });
+
+  it("speak surfaces a backend 'not installed' error", async () => {
+    invokeMock.mockRejectedValueOnce("text-to-speech voices are not installed");
+    await expect(speak("hi", "af_heart")).rejects.toBe(
+      "text-to-speech voices are not installed",
+    );
+  });
+
+  it("stopSpeak invokes stop_speak", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await stopSpeak();
+    expect(invokeMock).toHaveBeenCalledWith("stop_speak");
   });
 
   it("subscribeMidi listens on midi-message and forwards payloads", async () => {

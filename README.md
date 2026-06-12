@@ -44,6 +44,7 @@ DivoraVoice is feature-complete for v1 and shipping steady post-1.0 improvements
 - **Windows only.** macOS / Linux aren't in scope for v1 (the audio path is cpal/WASAPI; a cross-platform pass is "further out").
 - **VB-Cable required** to send your voice to other apps — the app detects and prompts, but doesn't bundle it (licensing).
 - **AI voice conversion** falls back to passthrough when no ONNX runtime/model is present — it never blocks the app, but the effect is simply unavailable until a model is installed.
+- **Text-to-speech ("Speak") is in development.** The workspace is present, but synthesis is gated behind "voice not installed" until the on-device voice models ship in an update; pressing Speak today shows a graceful notice. (When it ships it will bundle the GPL-3.0 [espeak-ng](https://github.com/espeak-ng/espeak-ng) phonemizer as a separate, arm's-length component — see [License](#license).)
 - **Recording** is WAV only.
 - **Soundboard** plays one folder at a time and doesn't recurse into subfolders.
 - **Installers are unsigned** — Windows SmartScreen shows a warning (see [Install](#install) for the one-time "More info → Run anyway"). The in-app update check is a one-way version read (no telemetry); auto-install is intentionally not included.
@@ -98,3 +99,5 @@ Bug reports and PRs welcome. Pre-release manual test pass: [`docs/MANUAL_TESTS.m
 MIT — see [LICENSE](LICENSE).
 
 Third-party licenses worth calling out: `nnnoiseless` is BSD-3-Clause (Xiph RNNoise port); `symphonia-adapter-libopus` bundles libopus (BSD); `rubato`, `realfft`, and `rustfft` are MIT; ONNX Runtime (`ort`) is MIT; the bundled LLVC narrator voice is derived from KoeAI's MIT-licensed LLVC.
+
+**Upcoming (text-to-speech, in development):** the "Speak" feature uses [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0) for synthesis and [espeak-ng](https://github.com/espeak-ng/espeak-ng) (**GPL-3.0**) for text→phoneme conversion. espeak-ng is **not linked into DivoraVoice** — when the feature ships, its binary + data will be bundled as a separate, arm's-length component invoked via subprocess (FSF "mere aggregation"), so DivoraVoice's own code stays MIT. This section will carry espeak-ng's source URL and license at that point.

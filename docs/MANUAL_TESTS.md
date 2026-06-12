@@ -408,6 +408,22 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Close the overlay window's toggle (or the window's own close) → the window disappears and the toggle reflects it.
 - [ ] Restart the app → the background-mode choice is restored.
 
+## Speak — text-to-speech (v1.17.0)
+
+**Scaffolding (assets not yet staged — current state):**
+
+- [ ] Sidebar → **Speak** → the screen shows the text box, the preset voice picker, and a **Speak** / **Stop** button.
+- [ ] The voices each show a **"Soon"** badge and a banner reads "Preset voices aren't installed yet."
+- [ ] Type a sentence → press **Speak** → a graceful notice ("text-to-speech voices are not installed") appears; the app does **not** hang or crash.
+- [ ] Pick a different voice → restart the app → the selection is restored (`divora.ttsVoice`).
+
+**After the Kokoro + espeak-ng assets are staged (gated — verify before tagging):**
+
+- [ ] Type a sentence → pick each preset voice → **Speak** → you hear that voice on the output; the voices are audibly distinct.
+- [ ] Set output = **CABLE Input** and join a Discord call → a listener hears the spoken text, mixed with your live mic.
+- [ ] A long multi-sentence passage synthesizes as one continuous clip (sentence chunking, no dropouts); the playback **progress ring** tracks it; **Stop** halts it immediately.
+- [ ] Remove/rename the model file → **Speak** degrades to the "not installed" notice (never hangs), exactly like the AI voice-convert missing-model path.
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.

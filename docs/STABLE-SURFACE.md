@@ -77,6 +77,14 @@ resolved `T` or a thrown string on the JS side.
 | `list_voices` | — | `VoiceInfo[]` |
 | `onnx_runtime_status` | — | `OnnxRuntimeStatus` |
 
+### Text-to-speech / "Speak" (v1.17.0)
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_tts_voices` | — | `TtsVoiceInfo[]` |
+| `speak` | `text: string`, `voiceId: string` | duration seconds `f32` / error (e.g. "voices are not installed") |
+| `stop_speak` | — | — |
+
 ### Recording
 
 | Command | Args | Returns |
@@ -144,6 +152,7 @@ LevelUpdate       { input: Levels, output: Levels, running, monitoring,
 EffectSpec        { kind: EffectKindWire, enabled, params: {string: number} }
 VoiceInfo         { id, name, path, sizeBytes }
 OnnxRuntimeStatus { runtimeAvailable, voicesDir }
+TtsVoiceInfo      { id, name, lang, installed }      // v1.17.0
 SoundboardTile    { id, path, label, extension, sizeBytes, modifiedSecs? }
 VirtualMicStatus  { detected, cableInputDevice: DeviceInfo|null,
                     cableOutputDevice: DeviceInfo|null, downloadUrl }
@@ -223,6 +232,7 @@ to defaults (never throw).
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
 | `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0 |
+| `divora.ttsVoice` | selected "Speak" preset voice id (or null) — v1.17.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 
 ---

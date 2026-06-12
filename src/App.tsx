@@ -22,6 +22,7 @@ import { Titlebar } from "./shell/Titlebar";
 import { MixerScreen } from "./screens/MixerScreen";
 import { CovenScreen } from "./screens/CovenScreen";
 import { SoundboardScreen } from "./screens/SoundboardScreen";
+import { SpeakScreen } from "./screens/SpeakScreen";
 import { PresetsScreen } from "./screens/PresetsScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
 import { AppProvider, useApp } from "./stores/app";
@@ -365,6 +366,9 @@ function Shell(): JSX.Element {
             </Match>
             <Match when={app.nav() === "soundboard"}>
               <SoundboardScreen />
+            </Match>
+            <Match when={app.nav() === "speak"}>
+              <SpeakScreen />
             </Match>
             <Match when={app.nav() === "presets"}>
               <PresetsScreen />

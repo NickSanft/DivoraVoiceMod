@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added (scaffolding — not yet shippable)
+
+- **Text-to-speech "Speak" workspace (Phase 1 scaffolding).** A new **Speak** section (sidebar → Speak): type text, pick a preset voice, and synthesize speech that plays through the output — mixed with the live mic via the soundboard seam, so a call/stream hears it too. On-device, no cloud, no telemetry. This commit lands everything that *doesn't* need the model — the pure tokenizer + text chunker, the espeak-ng phonemizer wrapper, the voice list, the `list_tts_voices` / `speak` / `stop_speak` command surface, and the screen + store + nav — with **synthesis gated behind "voice not installed"** until the Kokoro model assets are staged. Pressing Speak today surfaces a graceful notice rather than a hang.
+
+### Architecture (additive)
+
+- New `divora-core/src/tts/` module: `tokens.rs` (Kokoro phoneme→id mapping with `[0, …, 0]` framing + sentence/word chunking under the 510-phoneme cap, vocab loaded from the model's `config.json` at runtime — all pure and unit-tested), `phonemize.rs` (the **espeak-ng** CLI run as an **arm's-length subprocess** — GPL-3.0, never linked, keeping DivoraVoice's own code MIT), and `mod.rs` (`synthesize()` degrading to `NotInstalled` without ever touching `ort` when assets are absent, mirroring `dsp::voice_convert`'s passthrough-on-missing-model). The backend plays synthesized 24 kHz audio through the existing `SoundboardCommand::Play` mixer seam (`clip_id: "tts"`). New `localStorage["divora.ttsVoice"]`; `TtsVoiceInfo` wire type; the `list_tts_voices` / `speak` / `stop_speak` commands + the `divora.ttsVoice` key are added to STABLE-SURFACE.
+
+### Tests
+
+- +17 Rust (`tts::tokens` mapping/chunking/vocab; `tts::phonemize` arg-build + IPA cleanup + missing-binary gate; `tts::mod` not-installed / unknown-voice / empty-text gates + `TtsVoiceInfo` key freeze), +6 frontend store (voice-list default + persistence, `speakText` success/clip-registration + not-installed error, `stopSpeaking`), +4 api command-name, +2 E2E (Speak screen renders; Speak surfaces the graceful notice). Desktop synth is verified once assets land (`MANUAL_TESTS.md`).
+
+### Remaining before this ships (tracked)
+
+- Stage `kokoro-v1.0.int8.onnx` + `voices-v1.0.bin` + `kokoro-config.json` + the espeak-ng binary/data into the `voice-assets-v2` release; fetch in `scripts/fetch-voice-assets.ps1`; map in the bundle config. Wire the final ONNX inference (load session, per-voice style vector, run, concatenate). **Disclose the bundled GPL-3.0 espeak-ng in the README License section** (with source URL). Desktop-verify synthesis + mix-into-call. Only then tag a release.
+
 ## [1.16.0] — 2026-06-10 — Spell-circle stream overlay
 
 Turn the app's signature visualization into an on-stream brand element: a transparent, always-on-top **overlay window** renders the spell circle reacting live to your voice, ready to capture in OBS. Local-first — no server, no network.
