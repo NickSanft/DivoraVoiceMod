@@ -1961,4 +1961,38 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
       previewOnly: true,
     });
   });
+
+  it("refreshClonedVoices populates the cloned-voice list", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_cloned_voices") return [{ id: "my-voice", name: "My Voice" }];
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshClonedVoices();
+    expect(result.clonedVoices()).toHaveLength(1);
+    expect(result.clonedVoices()[0]!.id).toBe("my-voice");
+  });
+
+  it("removeClonedVoice deletes, refreshes, and resets a deleted selection", async () => {
+    let cloned = [{ id: "my-voice", name: "My Voice" }];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_cloned_voices") return cloned;
+      if (cmd === "delete_cloned_voice") {
+        cloned = [];
+        return undefined;
+      }
+      if (cmd === "list_tts_voices") return TWO_VOICES;
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshTtsVoices(); // presets, for the fallback
+    await result.refreshClonedVoices();
+    result.setSelectedTtsVoice("my-voice");
+    await result.removeClonedVoice("my-voice");
+    expect(invokeMock).toHaveBeenCalledWith("delete_cloned_voice", {
+      id: "my-voice",
+    });
+    expect(result.clonedVoices()).toHaveLength(0);
+    expect(result.selectedTtsVoice()).toBe("af_heart"); // fell back to first preset
+  });
 });

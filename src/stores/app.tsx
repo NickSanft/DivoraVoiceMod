@@ -34,6 +34,10 @@ import {
   listPresets,
   listVoices as listVoicesCmd,
   listTtsVoices as listTtsVoicesCmd,
+  listClonedVoices as listClonedVoicesCmd,
+  cloneVoice as cloneVoiceCmd,
+  deleteClonedVoice as deleteClonedVoiceCmd,
+  pickAudioFile as pickAudioFileCmd,
   openMidiInput as openMidiInputCmd,
   closeMidiInput as closeMidiInputCmd,
   onnxRuntimeStatus as onnxRuntimeStatusCmd,
@@ -68,6 +72,7 @@ import {
   type MidiInputInfo,
   type MidiMessage,
   type OnnxRuntimeStatus,
+  type ClonedVoiceInfo,
   type SoundboardTile,
   type StreamInfo,
   type TtsVoiceInfo,
@@ -431,6 +436,20 @@ export interface AppState {
   speakText: () => Promise<void>;
   /** Stop any in-flight synthesized speech. */
   stopSpeaking: () => Promise<void>;
+
+  // Voice cloning ("Your voices") — v1.20.0
+  /** The user's cloned voices (selectable in the picker alongside presets). */
+  clonedVoices: () => ClonedVoiceInfo[];
+  /** True while a clone (reference → speaker embedding) is being created. */
+  cloning: () => boolean;
+  /** Last clone error (e.g. "not installed"), or null. */
+  cloneError: () => string | null;
+  /** Pull the cloned-voice list from the backend. */
+  refreshClonedVoices: () => Promise<void>;
+  /** Pick a reference clip and create a cloned voice named `name`, then select it. */
+  addClonedVoice: (name: string) => Promise<void>;
+  /** Delete a cloned voice; if it was selected, fall back to the first preset. */
+  removeClonedVoice: (id: string) => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -2005,11 +2024,15 @@ export function createAppState(): AppState {
       const list = await listTtsVoicesCmd();
       const next = Array.isArray(list) ? list : [];
       setTtsVoices(next);
-      // Default the selection to the first voice when none is chosen (or
-      // the persisted one no longer exists in the list).
+      // Default to the first preset when none is chosen, or the persisted one
+      // exists as neither a preset nor a cloned voice.
       const current = selectedTtsVoice();
       const first = next[0];
-      if ((!current || !next.some((v) => v.id === current)) && first) {
+      const known =
+        !!current &&
+        (next.some((v) => v.id === current) ||
+          clonedVoices().some((v) => v.id === current));
+      if (!known && first) {
         setSelectedTtsVoice(first.id);
       }
     } catch (err) {
@@ -2056,6 +2079,58 @@ export function createAppState(): AppState {
       await stopSpeakCmd();
     } catch (err) {
       console.warn("[tts] stop failed", err);
+    }
+  };
+
+  // ---- v1.20.0: voice cloning ("Your voices") ----
+
+  const [clonedVoices, setClonedVoices] = createSignal<ClonedVoiceInfo[]>([]);
+  const [cloning, setCloning] = createSignal(false);
+  const [cloneError, setCloneError] = createSignal<string | null>(null);
+
+  const refreshClonedVoices = async (): Promise<void> => {
+    try {
+      const list = await listClonedVoicesCmd();
+      setClonedVoices(Array.isArray(list) ? list : []);
+    } catch (err) {
+      console.warn("[clone] refresh failed", err);
+    }
+  };
+
+  const addClonedVoice = async (name: string): Promise<void> => {
+    const trimmed = name.trim();
+    if (!trimmed || cloning()) return;
+    const path = await pickAudioFileCmd();
+    if (!path) return; // user cancelled the file picker
+    setCloneError(null);
+    setCloning(true);
+    try {
+      const voice = await cloneVoiceCmd(trimmed, path);
+      await refreshClonedVoices();
+      setSelectedTtsVoice(voice.id); // auto-select the new voice
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setCloning(false);
+    }
+  };
+
+  const removeClonedVoice = async (id: string): Promise<void> => {
+    try {
+      await deleteClonedVoiceCmd(id);
+    } catch (err) {
+      console.warn("[clone] delete failed", err);
+    }
+    await refreshClonedVoices();
+    if (selectedTtsVoice() === id) {
+      const first = ttsVoices()[0];
+      if (first) setSelectedTtsVoice(first.id);
     }
   };
 
@@ -2172,6 +2247,13 @@ export function createAppState(): AppState {
     refreshTtsVoices,
     speakText,
     stopSpeaking,
+
+    clonedVoices,
+    cloning,
+    cloneError,
+    refreshClonedVoices,
+    addClonedVoice,
+    removeClonedVoice,
 
     usePreset,
     viewPreset,

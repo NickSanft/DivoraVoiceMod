@@ -308,6 +308,56 @@ export async function stopSpeak(): Promise<void> {
   await invoke("stop_speak");
 }
 
+// ---- Voice cloning ("Your voices") — v1.20.0 ----
+
+/** One user-cloned voice. Its `id` is selectable in Speak like a preset. */
+export interface ClonedVoiceInfo {
+  id: string;
+  name: string;
+}
+
+/** List the user's cloned voices. */
+export async function listClonedVoices(): Promise<ClonedVoiceInfo[]> {
+  return invoke<ClonedVoiceInfo[]>("list_cloned_voices");
+}
+
+/**
+ * Create a cloned voice from a reference audio file: the backend decodes the
+ * clip, extracts a speaker embedding (OpenVoice), and stores it. Resolves to
+ * the new voice. Rejects with a message (e.g. "not installed") on failure.
+ */
+export async function cloneVoice(
+  name: string,
+  referencePath: string,
+): Promise<ClonedVoiceInfo> {
+  return invoke<ClonedVoiceInfo>("clone_voice", { name, referencePath });
+}
+
+/** Delete a cloned voice by id. */
+export async function deleteClonedVoice(id: string): Promise<void> {
+  await invoke("delete_cloned_voice", { id });
+}
+
+/**
+ * Open the native file-picker for a voice reference clip and return the chosen
+ * absolute path (or `null` if cancelled). Lazy-imports the dialog plugin so
+ * tests mocking `@tauri-apps/api/core` don't need to mock it too.
+ */
+export async function pickAudioFile(): Promise<string | null> {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const result = await open({
+      multiple: false,
+      title: "Pick a voice reference clip (20–30s of clear speech)",
+      filters: [{ name: "Audio", extensions: ["wav", "mp3", "ogg", "flac", "m4a"] }],
+    });
+    return typeof result === "string" ? result : null;
+  } catch (err) {
+    console.warn("[clone] file picker unavailable", err);
+    return null;
+  }
+}
+
 // ---- Recording (Phase 16) ----
 
 /** Absolute path of the recordings directory. */

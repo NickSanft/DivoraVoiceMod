@@ -428,6 +428,14 @@ resource dir), same as the AI voice-conversion models.
 
 - [ ] Voices show a **"Soon"** badge + a "Preset voices aren't installed yet" banner; pressing **Speak** shows a graceful "text-to-speech voices are not installed" notice — never a hang or crash (same as the AI voice-convert missing-model path).
 
+**Your voices — cloning (v1.20.0):**
+
+- [ ] Speak → **Your voices** → type a name → **Add your voice** → pick a clean 20–30 s WAV of a voice → after a moment it appears in the list and is auto-selected.
+- [ ] Type text → **Speak** with the cloned voice → the output takes on that voice's timbre (accent/cadence come from the Kokoro base). It mixes into a call like any Speak output.
+- [ ] **Delete** a cloned voice (trash icon) → it disappears; if it was selected, the selection falls back to a preset.
+- [ ] Restart the app → cloned voices persist (stored under `%APPDATA%/DivoraVoice/voices/cloned/`); a selected cloned voice is restored.
+- [ ] Pick a junk/too-short file → a graceful error appears (no crash).
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.

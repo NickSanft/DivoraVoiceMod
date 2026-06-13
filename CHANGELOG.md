@@ -4,6 +4,28 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.20.0] — 2026-06-13 — Speak: clone your own voice
+
+Add **your own voice** to Speak: import a short reference clip and the preset voices take on your timbre — fully on-device, the clip never leaves your machine.
+
+### Added
+
+- **"Your voices" in Speak.** Name a voice + pick a 20–30 s reference clip → the app extracts a speaker embedding and adds it to the voice picker. Speaking with a cloned voice generates with a Kokoro base (`am_puck`) and recolors the timbre toward you. Delete a voice anytime.
+
+### Architecture (additive)
+
+- New `divora-core/src/tts/clone.rs`: the **OpenVoice v2** tone-color extractor + converter via `ort` (linear spectrogram → 256-d speaker embedding; source spec + src/dest SE + `tau` → converted audio @ 22.05 kHz), with the spectrogram built on the existing `realfft`. `tts::synthesize_cloned` runs Kokoro then the converter per chunk; `tts::extract_voice_se` derives an SE from a reference clip. Backend `clone_voice` / `list_cloned_voices` / `delete_cloned_voice` commands; `speak` routes a cloned id through the converter. Cloned voices store a 256-d SE + meta under `%APPDATA%/DivoraVoice/voices/cloned/<id>/`. Frontend "Your voices" section + store + api wrappers.
+- **Assets**: the two OpenVoice ONNX models (**MIT**) staged on `voice-assets-v2`, fetched + bundled to `<resource>/tts/`. The converter is ~157 MB, so the installer grows — a future improvement (on-demand download or quantization) can shrink it.
+- **Quality / limits**: this is **timbre transfer** — accent + prosody come from the Kokoro base, so a clone sounds most like you when your accent matches the US/UK base. Validated end-to-end: a reference's speaker-embedding cosine to the converted output rises from ~0.34 (raw Kokoro) to ~0.89 (converted). The "next phase" will improve cloning (auto base-by-gender/accent, size reduction).
+
+### License
+
+- **OpenVoice v2 is MIT** — no new GPL beyond the Phase-1 espeak-ng. Disclosed in the README.
+
+### Tests
+
+- +5 Rust (`clone` spectrogram/resample units + 2 `#[ignore]`d real-clone / cloned-synthesis tests proving the `ort` port matches the validated spike), +5 frontend (3 api command-name, 2 store). Full pre-push checklist green.
+
 ## [1.19.0] — 2026-06-13 — Speak: Aoede preset voice
 
 ### Added

@@ -532,11 +532,19 @@ fn speak(
     gain: Option<f32>,
     preview_only: Option<bool>,
 ) -> Result<f32, String> {
-    let audio =
-        divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir).map_err(|e| {
-            tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
-            e.to_string()
-        })?;
+    // A cloned-voice id resolves to a stored speaker embedding → route it
+    // through the `OpenVoice` converter on the `am_puck` base. Otherwise it's a
+    // preset id → plain Kokoro.
+    let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
+        Some((se, base)) => {
+            divora_core::tts::synthesize_cloned(&text, &base, &se, &state.tts_assets_dir, CLONE_TAU)
+        }
+        None => divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir),
+    }
+    .map_err(|e| {
+        tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
+        e.to_string()
+    })?;
     let sample_rate = audio.sample_rate;
     let samples = Arc::new(audio.samples);
     #[allow(clippy::cast_precision_loss)]
@@ -574,6 +582,162 @@ fn stop_speak(state: State<'_, AppState>) {
     state.engine.send_soundboard(SoundboardCommand::Stop {
         clip_id: TTS_CLIP_ID.to_string(),
     });
+}
+
+// ---- v1.20.0: voice cloning ("Your voices") ----
+
+/// Default Kokoro base voice a cloned voice generates with before tone-color
+/// conversion — `am_puck`, the closest stock voice in the Phase-2a validation.
+/// Stored per-voice in meta so a later phase can vary it (e.g. by accent/gender).
+const CLONE_BASE_VOICE: &str = "am_puck";
+/// `OpenVoice` conversion temperature (its default).
+const CLONE_TAU: f32 = 0.3;
+
+/// One user-cloned voice (wire type for the Speak picker).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClonedVoiceInfo {
+    /// Stable slug id (also the on-disk folder name).
+    id: String,
+    name: String,
+}
+
+/// On-disk metadata for a cloned voice (`<id>/meta.json`).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct ClonedMeta {
+    name: String,
+    /// Kokoro base voice used for generation before tone-color conversion.
+    #[serde(default = "default_clone_base")]
+    base: String,
+}
+
+fn default_clone_base() -> String {
+    CLONE_BASE_VOICE.to_string()
+}
+
+/// Directory holding user-cloned voices: `<voices>/cloned/`.
+fn cloned_voices_dir(voices_dir: &Path) -> PathBuf {
+    voices_dir.join("cloned")
+}
+
+/// Whether `id` is a single safe path component (no separators / traversal).
+fn is_safe_voice_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() < 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Load a cloned voice's 256-d speaker embedding (`<id>/se.bin`, f32 LE) and
+/// its base voice. `None` if `id` isn't a stored cloned voice.
+fn load_cloned_voice(voices_dir: &Path, id: &str) -> Option<(Vec<f32>, String)> {
+    if !is_safe_voice_id(id) {
+        return None;
+    }
+    let dir = cloned_voices_dir(voices_dir).join(id);
+    let bytes = std::fs::read(dir.join("se.bin")).ok()?;
+    if bytes.len() != 256 * 4 {
+        return None;
+    }
+    let se = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let base = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok())
+        .map_or_else(|| CLONE_BASE_VOICE.to_string(), |m| m.base);
+    Some((se, base))
+}
+
+/// Scan `<voices>/cloned/` for valid cloned voices (folders with an `se.bin`).
+fn list_cloned_voice_infos(dir: &Path) -> Vec<ClonedVoiceInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(id) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if !p.is_dir() || !is_safe_voice_id(&id) || !p.join("se.bin").is_file() {
+            continue;
+        }
+        let name = std::fs::read_to_string(p.join("meta.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok())
+            .map_or_else(|| id.clone(), |m| m.name);
+        out.push(ClonedVoiceInfo { id, name });
+    }
+    out.sort_by_key(|a| a.name.to_lowercase());
+    out
+}
+
+/// Create a cloned voice from a reference audio file: decode it, extract a
+/// speaker embedding via the `OpenVoice` extractor, and store it under
+/// `<voices>/cloned/<id>/`. Returns the new voice for the picker.
+#[tauri::command]
+fn clone_voice(
+    state: State<'_, AppState>,
+    name: String,
+    reference_path: String,
+) -> Result<ClonedVoiceInfo, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("voice name is required".to_string());
+    }
+    let clip = decode_clip(Path::new(&reference_path)).map_err(|e| e.to_string())?;
+    let se =
+        divora_core::tts::extract_voice_se(&clip.samples, clip.sample_rate, &state.tts_assets_dir)
+            .map_err(|e| e.to_string())?;
+
+    let dir = cloned_voices_dir(&state.voices_dir);
+    let taken: std::collections::HashSet<String> = list_cloned_voice_infos(&dir)
+        .into_iter()
+        .map(|v| v.id)
+        .collect();
+    let id = unique_preset_id(&name, &name, &taken);
+    let voice_dir = dir.join(&id);
+    std::fs::create_dir_all(&voice_dir).map_err(|e| e.to_string())?;
+
+    let mut bytes = Vec::with_capacity(se.len() * 4);
+    for v in &se {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(voice_dir.join("se.bin"), bytes).map_err(|e| e.to_string())?;
+    let meta = ClonedMeta {
+        name: name.clone(),
+        base: CLONE_BASE_VOICE.to_string(),
+    };
+    std::fs::write(
+        voice_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    tracing::info!(id = %id, name = %name, "cloned voice created");
+    Ok(ClonedVoiceInfo { id, name })
+}
+
+/// List the user's cloned voices for the Speak picker.
+#[tauri::command]
+fn list_cloned_voices(state: State<'_, AppState>) -> Vec<ClonedVoiceInfo> {
+    list_cloned_voice_infos(&cloned_voices_dir(&state.voices_dir))
+}
+
+/// Delete a cloned voice by id.
+#[tauri::command]
+fn delete_cloned_voice(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if !is_safe_voice_id(&id) {
+        return Err("invalid voice id".to_string());
+    }
+    let voice_dir = cloned_voices_dir(&state.voices_dir).join(&id);
+    if voice_dir.is_dir() {
+        std::fs::remove_dir_all(&voice_dir).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -995,6 +1159,9 @@ pub fn run() {
             list_tts_voices,
             speak,
             stop_speak,
+            clone_voice,
+            list_cloned_voices,
+            delete_cloned_voice,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,

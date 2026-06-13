@@ -17,6 +17,7 @@
 //! desktop-verified once `voice-assets-v2` carries the ~80 MB model. Gated
 //! here so the rest of the feature — UI, command surface, tests — ships now.
 
+pub mod clone;
 pub mod kokoro;
 pub mod phonemize;
 pub mod tokens;
@@ -33,6 +34,9 @@ const MODEL_FILE: &str = "kokoro-v1.0.int8.onnx";
 /// Our compact `DVTS` voice pack (preset voices only) — see `kokoro::StylePack`.
 const VOICES_FILE: &str = "voices-divora.bin";
 const CONFIG_FILE: &str = "kokoro-config.json";
+/// `OpenVoice` tone-color models for Phase 2 voice cloning — see [`clone`].
+const CLONE_EXTRACTOR_FILE: &str = "openvoice-extractor.onnx";
+const CLONE_CONVERTER_FILE: &str = "openvoice-converter.onnx";
 
 /// The curated preset voices shipped in Phase 1: `(id, display name, lang)`.
 /// Display names are ours; the ids match Kokoro's voice-pack keys so the
@@ -93,6 +97,9 @@ pub struct TtsPaths {
     pub config: PathBuf,
     /// Directory holding `espeak-ng(.exe)` + `espeak-ng-data`.
     pub espeak_dir: PathBuf,
+    /// `OpenVoice` tone-color extractor + converter (Phase 2 cloning).
+    pub clone_extractor: PathBuf,
+    pub clone_converter: PathBuf,
 }
 
 impl TtsPaths {
@@ -103,6 +110,8 @@ impl TtsPaths {
             voices: asset_dir.join(VOICES_FILE),
             config: asset_dir.join(CONFIG_FILE),
             espeak_dir: asset_dir.to_path_buf(),
+            clone_extractor: asset_dir.join(CLONE_EXTRACTOR_FILE),
+            clone_converter: asset_dir.join(CLONE_CONVERTER_FILE),
         }
     }
 
@@ -114,6 +123,13 @@ impl TtsPaths {
             && self.voices.exists()
             && self.config.exists()
             && phonemize::Phonemizer::from_dir(&self.espeak_dir).is_available()
+    }
+
+    /// Whether the `OpenVoice` cloning models are present (in addition to the
+    /// base Kokoro assets). Pure filesystem check.
+    #[must_use]
+    pub fn clone_installed(&self) -> bool {
+        self.clone_extractor.exists() && self.clone_converter.exists()
     }
 }
 
@@ -132,32 +148,17 @@ pub fn list_voices(asset_dir: &Path) -> Vec<TtsVoiceInfo> {
         .collect()
 }
 
-/// Synthesize `text` with preset `voice_id`, returning 24 kHz mono audio ready
-/// for the soundboard mixer.
-///
-/// Until the Kokoro model, voice pack, config, and espeak-ng are staged in
-/// `asset_dir`, this returns [`TtsError::NotInstalled`] without ever calling
-/// into `ort` (so it can't hang on the missing runtime). Once the assets land,
-/// the gated branch runs the real phonemize → tokenize → Kokoro pipeline.
-pub fn synthesize(text: &str, voice_id: &str, asset_dir: &Path) -> Result<TtsAudio, TtsError> {
-    let voice = PRESET_VOICES
-        .iter()
-        .find(|&&(id, _, _)| id == voice_id)
-        .ok_or_else(|| TtsError::UnknownVoice(voice_id.to_string()))?;
-
-    let chunks = tokens::split_text(text, tokens::MAX_PHONEME_LENGTH);
-    if chunks.is_empty() {
-        return Err(TtsError::EmptyText);
-    }
-
-    let paths = TtsPaths::new(asset_dir);
-    if !paths.installed() {
-        return Err(TtsError::NotInstalled);
-    }
-
-    // Assets are present → run the full pipeline. Load the runtime vocab
-    // (from the model's config.json) and the compact voice pack, open the
-    // Kokoro session, then phonemize → tokenize → infer per chunk.
+/// Load Kokoro (vocab + voice pack + session) and render each already-split
+/// text chunk to 24 kHz audio for `voice_id` (lang `lang`), handing every
+/// chunk's samples to `sink`. Shared by [`synthesize`] (raw) and
+/// [`synthesize_cloned`] (tone-color converted). Assumes `paths.installed()`.
+fn kokoro_render(
+    chunks: Vec<String>,
+    voice_id: &str,
+    lang: &str,
+    paths: &TtsPaths,
+    mut sink: impl FnMut(Vec<f32>) -> Result<(), TtsError>,
+) -> Result<(), TtsError> {
     let config = std::fs::read_to_string(&paths.config)
         .map_err(|e| TtsError::Inference(format!("read kokoro config: {e}")))?;
     let vocab = tokens::parse_vocab(&config)
@@ -168,25 +169,51 @@ pub fn synthesize(text: &str, voice_id: &str, asset_dir: &Path) -> Result<TtsAud
         .map_err(|e| TtsError::Inference(format!("read voice pack: {e}")))?;
     let pack = kokoro::StylePack::parse(&pack_bytes)
         .ok_or_else(|| TtsError::Inference("invalid voice pack".to_string()))?;
-    if !pack.has_voice(voice.0) {
-        return Err(TtsError::UnknownVoice(voice.0.to_string()));
+    if !pack.has_voice(voice_id) {
+        return Err(TtsError::UnknownVoice(voice_id.to_string()));
     }
     let mut session = kokoro::load_session(&paths.model)
         .ok_or_else(|| TtsError::Inference("Kokoro model/runtime unavailable".to_string()))?;
 
-    let mut samples: Vec<f32> = Vec::new();
     for chunk in chunks {
-        let phonemes = phonemizer.phonemize(&chunk, voice.2)?;
+        let phonemes = phonemizer.phonemize(&chunk, lang)?;
         let ids = tokens::phonemes_to_ids(&phonemes, &vocab);
         // Kokoro selects the style vector by the *unpadded* token length.
         let inner_len = ids.len().saturating_sub(2);
         let style = pack
-            .style(voice.0, inner_len)
+            .style(voice_id, inner_len)
             .ok_or_else(|| TtsError::Inference("style lookup failed".to_string()))?;
-        let mut audio = kokoro::infer(&mut session, &ids, style, 1.0)
+        let audio = kokoro::infer(&mut session, &ids, style, 1.0)
             .ok_or_else(|| TtsError::Inference("Kokoro inference failed".to_string()))?;
-        samples.append(&mut audio);
+        sink(audio)?;
     }
+    Ok(())
+}
+
+/// Synthesize `text` with preset `voice_id`, returning 24 kHz mono audio ready
+/// for the soundboard mixer.
+///
+/// Until the Kokoro model, voice pack, config, and espeak-ng are staged in
+/// `asset_dir`, this returns [`TtsError::NotInstalled`] without ever calling
+/// into `ort` (so it can't hang on the missing runtime).
+pub fn synthesize(text: &str, voice_id: &str, asset_dir: &Path) -> Result<TtsAudio, TtsError> {
+    let voice = PRESET_VOICES
+        .iter()
+        .find(|&&(id, _, _)| id == voice_id)
+        .ok_or_else(|| TtsError::UnknownVoice(voice_id.to_string()))?;
+    let chunks = tokens::split_text(text, tokens::MAX_PHONEME_LENGTH);
+    if chunks.is_empty() {
+        return Err(TtsError::EmptyText);
+    }
+    let paths = TtsPaths::new(asset_dir);
+    if !paths.installed() {
+        return Err(TtsError::NotInstalled);
+    }
+    let mut samples: Vec<f32> = Vec::new();
+    kokoro_render(chunks, voice.0, voice.2, &paths, |mut audio| {
+        samples.append(&mut audio);
+        Ok(())
+    })?;
     if samples.is_empty() {
         return Err(TtsError::EmptyText);
     }
@@ -194,6 +221,89 @@ pub fn synthesize(text: &str, voice_id: &str, asset_dir: &Path) -> Result<TtsAud
         samples,
         sample_rate: TTS_SAMPLE_RATE,
     })
+}
+
+/// Synthesize `text` in a **cloned voice**: Kokoro generates with the preset
+/// `base_voice_id`, then `OpenVoice` recolors each chunk toward `target_se` (a
+/// 256-d speaker embedding from the user's reference clip). Returns audio at
+/// [`clone::OV_SAMPLE_RATE`] when cloning is active; if the `OpenVoice` models
+/// aren't installed it degrades to the plain base voice (24 kHz).
+pub fn synthesize_cloned(
+    text: &str,
+    base_voice_id: &str,
+    target_se: &[f32],
+    asset_dir: &Path,
+    tau: f32,
+) -> Result<TtsAudio, TtsError> {
+    let voice = PRESET_VOICES
+        .iter()
+        .find(|&&(id, _, _)| id == base_voice_id)
+        .ok_or_else(|| TtsError::UnknownVoice(base_voice_id.to_string()))?;
+    if target_se.len() != clone::SE_DIM {
+        return Err(TtsError::Inference("invalid speaker embedding".to_string()));
+    }
+    let chunks = tokens::split_text(text, tokens::MAX_PHONEME_LENGTH);
+    if chunks.is_empty() {
+        return Err(TtsError::EmptyText);
+    }
+    let paths = TtsPaths::new(asset_dir);
+    if !paths.installed() {
+        return Err(TtsError::NotInstalled);
+    }
+    // Load the converter pair if present; otherwise fall back to the base voice.
+    let mut clone_sessions = if paths.clone_installed() {
+        match (
+            clone::load_session(&paths.clone_extractor),
+            clone::load_session(&paths.clone_converter),
+        ) {
+            (Some(ext), Some(conv)) => Some((ext, conv)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let cloning = clone_sessions.is_some();
+
+    let mut samples: Vec<f32> = Vec::new();
+    kokoro_render(chunks, voice.0, voice.2, &paths, |kaudio| {
+        if let Some((ext, conv)) = clone_sessions.as_mut() {
+            let converted = clone::convert(ext, conv, &kaudio, target_se, tau)
+                .ok_or_else(|| TtsError::Inference("tone-color conversion failed".to_string()))?;
+            samples.extend(converted);
+        } else {
+            samples.extend(kaudio);
+        }
+        Ok(())
+    })?;
+    if samples.is_empty() {
+        return Err(TtsError::EmptyText);
+    }
+    Ok(TtsAudio {
+        samples,
+        sample_rate: if cloning {
+            clone::OV_SAMPLE_RATE
+        } else {
+            TTS_SAMPLE_RATE
+        },
+    })
+}
+
+/// Extract a 256-d speaker embedding from a reference clip's mono `samples` at
+/// `sample_rate`, for storing a cloned voice. Requires the `OpenVoice` extractor.
+pub fn extract_voice_se(
+    samples: &[f32],
+    sample_rate: u32,
+    asset_dir: &Path,
+) -> Result<Vec<f32>, TtsError> {
+    let paths = TtsPaths::new(asset_dir);
+    if !paths.clone_installed() {
+        return Err(TtsError::NotInstalled);
+    }
+    let mut extractor = clone::load_session(&paths.clone_extractor)
+        .ok_or_else(|| TtsError::Inference("`OpenVoice` extractor unavailable".to_string()))?;
+    let resampled = clone::resample_to_ov(samples, sample_rate);
+    clone::extract_se(&mut extractor, &resampled)
+        .ok_or_else(|| TtsError::Inference("speaker-embedding extraction failed".to_string()))
 }
 
 #[cfg(test)]
@@ -262,6 +372,33 @@ mod tests {
             audio.samples.len()
         );
         assert!(audio.samples.iter().all(|s| s.is_finite()));
+    }
+
+    /// Full cloned-voice path — extract an SE from a reference clip, then
+    /// synthesize text in that cloned voice (Kokoro base → `OpenVoice`
+    /// convert). `#[ignore]`d (needs staged TTS + `OpenVoice` models + a
+    /// reference clip). Run:
+    /// `cargo test -p divora-core cloned_synthesis -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "requires staged TTS + OpenVoice models + me.wav (local only)"]
+    fn cloned_synthesis_produces_audio() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+        let assets = PathBuf::from(format!("{res}/tts"));
+        let clip =
+            crate::soundboard::decode_clip(Path::new(&format!("{res}/_spike/me.wav"))).unwrap();
+        let se = extract_voice_se(&clip.samples, clip.sample_rate, &assets).unwrap();
+        assert_eq!(se.len(), clone::SE_DIM);
+        let audio = synthesize_cloned(
+            "Hello, this is my cloned voice.",
+            "am_puck",
+            &se,
+            &assets,
+            0.3,
+        )
+        .unwrap();
+        assert_eq!(audio.sample_rate, clone::OV_SAMPLE_RATE);
+        assert!(audio.samples.len() > 10_000 && audio.samples.iter().all(|s| s.is_finite()));
     }
 
     #[test]

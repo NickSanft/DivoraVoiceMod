@@ -43,11 +43,13 @@ $tts = Join-Path $res "tts"
 New-Item -ItemType Directory -Force -Path $tts | Out-Null
 
 $ttsFiles = @(
-  "kokoro-v1.0.int8.onnx", # Kokoro int8 model (~88 MB)
-  "voices-divora.bin",     # compact DVTS style pack (preset voices)
-  "kokoro-config.json",    # model config (holds the phoneme vocab)
-  "espeak-ng.exe",         # espeak-ng CLI (GPL-3.0)
-  "libespeak-ng.dll"       # espeak-ng runtime lib
+  "kokoro-v1.0.int8.onnx",     # Kokoro int8 model (~88 MB)
+  "voices-divora.bin",         # compact DVTS style pack (preset voices)
+  "kokoro-config.json",        # model config (holds the phoneme vocab)
+  "espeak-ng.exe",             # espeak-ng CLI (GPL-3.0)
+  "libespeak-ng.dll",          # espeak-ng runtime lib
+  "openvoice-extractor.onnx",  # v1.20.0: OpenVoice tone-color extractor (MIT)
+  "openvoice-converter.onnx"   # v1.20.0: OpenVoice tone-color converter (~157 MB)
 )
 foreach ($f in $ttsFiles) {
   $dest = Join-Path $tts $f

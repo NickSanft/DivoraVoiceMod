@@ -7,7 +7,7 @@
 // until the Kokoro model + voice pack + espeak-ng are bundled. Pressing
 // Speak before then surfaces a graceful notice rather than failing silently.
 
-import { For, Show, createMemo, onMount, type JSX } from "solid-js";
+import { For, Show, createMemo, createSignal, onMount, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Sigil } from "../components/Sigil";
@@ -15,9 +15,14 @@ import { useApp } from "../stores/app";
 
 export function SpeakScreen(): JSX.Element {
   const app = useApp();
+  const [cloneName, setCloneName] = createSignal("");
 
   onMount(() => {
-    void app.refreshTtsVoices();
+    // Load cloned voices first so a persisted cloned selection isn't reset.
+    void (async () => {
+      await app.refreshClonedVoices();
+      await app.refreshTtsVoices();
+    })();
   });
 
   const anyInstalled = (): boolean => app.ttsVoices().some((v) => v.installed);
@@ -225,6 +230,165 @@ export function SpeakScreen(): JSX.Element {
             </For>
           </div>
         </div>
+
+        {/* Your voices (cloned) — v1.20.0 */}
+        <Show when={anyInstalled()}>
+          <div
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              gap: "var(--s2)",
+            }}
+          >
+            <span
+              style={{
+                "font-size": "var(--t-xs)",
+                "text-transform": "uppercase",
+                "letter-spacing": "0.08em",
+                color: "var(--text-low)",
+              }}
+            >
+              Your voices
+            </span>
+
+            <Show when={app.clonedVoices().length > 0}>
+              <div
+                role="radiogroup"
+                aria-label="Your voices"
+                style={{
+                  display: "grid",
+                  "grid-template-columns": "repeat(auto-fill, minmax(220px, 1fr))",
+                  gap: "var(--s3)",
+                }}
+              >
+                <For each={app.clonedVoices()}>
+                  {(voice) => {
+                    const selected = (): boolean =>
+                      app.selectedTtsVoice() === voice.id;
+                    return (
+                      <div
+                        style={{
+                          display: "flex",
+                          "align-items": "stretch",
+                          gap: "var(--s1)",
+                          "border-radius": "var(--r-md)",
+                          border: `1px solid ${selected() ? "var(--accent)" : "var(--line)"}`,
+                          background: selected()
+                            ? "var(--accent-soft, var(--surface-2))"
+                            : "var(--surface-1)",
+                          overflow: "hidden",
+                        }}
+                      >
+                        <button
+                          type="button"
+                          role="radio"
+                          aria-checked={selected()}
+                          onClick={() => app.setSelectedTtsVoice(voice.id)}
+                          style={{
+                            display: "flex",
+                            "align-items": "center",
+                            gap: "var(--s2)",
+                            flex: 1,
+                            padding: "var(--s3) var(--s4)",
+                            background: "transparent",
+                            border: "none",
+                            color: "var(--text-high)",
+                            cursor: "pointer",
+                            "text-align": "left",
+                          }}
+                        >
+                          <span
+                            style={{
+                              color: selected() ? "var(--accent)" : "var(--text-low)",
+                              display: "flex",
+                            }}
+                          >
+                            <Sigil name="mic" size={16} />
+                          </span>
+                          {voice.name}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Delete ${voice.name}`}
+                          title="Delete this voice"
+                          onClick={() => void app.removeClonedVoice(voice.id)}
+                          style={{
+                            display: "flex",
+                            "align-items": "center",
+                            padding: "0 var(--s3)",
+                            background: "transparent",
+                            border: "none",
+                            "border-left": "1px solid var(--line)",
+                            color: "var(--text-low)",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <Sigil name="trash" size={14} />
+                        </button>
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+
+            {/* Add your voice */}
+            <div
+              style={{
+                display: "flex",
+                "align-items": "center",
+                gap: "var(--s2)",
+                "flex-wrap": "wrap",
+              }}
+            >
+              <input
+                type="text"
+                value={cloneName()}
+                onInput={(e) => setCloneName(e.currentTarget.value)}
+                placeholder="Name your voice, then pick a 20–30s clip"
+                disabled={app.cloning()}
+                style={{
+                  flex: "1 1 240px",
+                  padding: "var(--s2) var(--s3)",
+                  "border-radius": "var(--r-md)",
+                  border: "1px solid var(--line)",
+                  background: "var(--surface-1)",
+                  color: "var(--text-high)",
+                  "font-family": "inherit",
+                  "font-size": "var(--t-sm)",
+                }}
+              />
+              <Button
+                variant="secondary"
+                icon="mic"
+                disabled={app.cloning() || cloneName().trim().length === 0}
+                onClick={() => {
+                  void app.addClonedVoice(cloneName()).then(() => setCloneName(""));
+                }}
+              >
+                {app.cloning() ? "Cloning…" : "Add your voice"}
+              </Button>
+            </div>
+
+            <Show when={app.cloneError()}>
+              <span
+                role="alert"
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "var(--s2)",
+                  "font-size": "var(--t-sm)",
+                  color: "var(--text-mid)",
+                }}
+              >
+                <span style={{ color: "var(--warning, var(--text-low))" }}>
+                  <Sigil name="warning" size={15} />
+                </span>
+                {app.cloneError()}
+              </span>
+            </Show>
+          </div>
+        </Show>
 
         {/* Volume + preview options */}
         <div

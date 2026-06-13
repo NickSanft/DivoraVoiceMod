@@ -36,6 +36,9 @@ import {
   startAudioEngine,
   startRecording,
   listTtsVoices,
+  listClonedVoices,
+  cloneVoice,
+  deleteClonedVoice,
   stopAllSoundboardClips,
   stopAudioEngine,
   stopRecording,
@@ -480,6 +483,31 @@ describe("audio api", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await stopSpeak();
     expect(invokeMock).toHaveBeenCalledWith("stop_speak");
+  });
+
+  it("listClonedVoices invokes list_cloned_voices", async () => {
+    invokeMock.mockResolvedValueOnce([{ id: "my-voice", name: "My Voice" }]);
+    const voices = await listClonedVoices();
+    expect(invokeMock).toHaveBeenCalledWith("list_cloned_voices");
+    expect(voices[0]!.id).toBe("my-voice");
+  });
+
+  it("cloneVoice forwards name + referencePath", async () => {
+    invokeMock.mockResolvedValueOnce({ id: "my-voice", name: "My Voice" });
+    const v = await cloneVoice("My Voice", "C:/clips/me.wav");
+    expect(invokeMock).toHaveBeenCalledWith("clone_voice", {
+      name: "My Voice",
+      referencePath: "C:/clips/me.wav",
+    });
+    expect(v.id).toBe("my-voice");
+  });
+
+  it("deleteClonedVoice forwards the id", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await deleteClonedVoice("my-voice");
+    expect(invokeMock).toHaveBeenCalledWith("delete_cloned_voice", {
+      id: "my-voice",
+    });
   });
 
   it("subscribeMidi listens on midi-message and forwards payloads", async () => {
