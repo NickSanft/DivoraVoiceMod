@@ -37,7 +37,7 @@ import sys
 import numpy as np
 
 # Must match PRESET_VOICES in divora-core/src/tts/mod.rs.
-PRESET_VOICES = ["af_heart", "af_bella", "am_michael", "am_puck", "bf_emma", "bm_george"]
+PRESET_VOICES = ["af_heart", "af_bella", "af_aoede", "am_michael", "am_puck", "bf_emma", "bm_george"]
 ROWS, DIM = 510, 256  # one (1,256) style vector per token length 0..509
 
 

@@ -40,6 +40,7 @@ const CONFIG_FILE: &str = "kokoro-config.json";
 const PRESET_VOICES: &[(&str, &str, &str)] = &[
     ("af_heart", "Aria — warm (US)", "en-us"),
     ("af_bella", "Bella — bright (US)", "en-us"),
+    ("af_aoede", "Aoede — clear (US)", "en-us"),
     ("am_michael", "Michael — deep (US)", "en-us"),
     ("am_puck", "Puck — lively (US)", "en-us"),
     ("bf_emma", "Emma — soft (UK)", "en-gb"),

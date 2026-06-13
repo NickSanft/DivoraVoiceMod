@@ -4,6 +4,12 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-06-13 — Speak: Aoede preset voice
+
+### Added
+
+- **New Speak voice: Aoede (US).** A seventh bundled preset (Kokoro `af_aoede`) — a clear US female voice — joins the picker. Additive: the `voices-divora.bin` pack regrows from 6 to 7 voices (via `scripts/prep-tts-voices.py`); no surface changes.
+
 ## [1.18.0] — 2026-06-12 — Speak: volume + preview-only
 
 ### Added
