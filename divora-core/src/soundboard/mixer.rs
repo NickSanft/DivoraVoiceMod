@@ -32,6 +32,17 @@ pub enum SoundboardCommand {
         /// per voice on top of the master gain.
         gain: f32,
     },
+    /// v1.18.0: like `Play`, but the voice is routed to the **monitor only**
+    /// (the local "hear yourself" path) and excluded from the main send — so
+    /// e.g. TTS can be previewed locally without the call hearing it. With no
+    /// separate monitor device it rides the single output (so it's still
+    /// audible). Same fields as `Play`.
+    PlayMonitorOnly {
+        clip_id: String,
+        samples: Arc<Vec<f32>>,
+        sample_rate: u32,
+        gain: f32,
+    },
     Stop {
         clip_id: String,
     },
@@ -56,6 +67,9 @@ struct Voice {
     sample_rate: u32,
     /// Per-tile linear gain captured at play time.
     gain: f32,
+    /// v1.18.0: when true this voice is mixed only into the monitor path
+    /// (`mix_monitor_into`), never the main send (`mix_into`).
+    monitor_only: bool,
     /// Float position into `samples` (so the mixer can interpolate
     /// across engine-rate vs. clip-rate mismatches).
     position: f64,
@@ -72,6 +86,7 @@ impl Voice {
             samples: Arc::new(Vec::new()),
             sample_rate: 48_000,
             gain: 1.0,
+            monitor_only: false,
             position: 0.0,
             active: false,
             started_at: 0,
@@ -105,7 +120,13 @@ impl SoundboardMixer {
                 samples,
                 sample_rate,
                 gain,
-            } => self.play(clip_id, samples, sample_rate, gain),
+            } => self.play(clip_id, samples, sample_rate, gain, false),
+            SoundboardCommand::PlayMonitorOnly {
+                clip_id,
+                samples,
+                sample_rate,
+                gain,
+            } => self.play(clip_id, samples, sample_rate, gain, true),
             SoundboardCommand::Stop { clip_id } => self.stop(&clip_id),
             SoundboardCommand::StopAll => self.stop_all(),
             SoundboardCommand::SetMasterGain(g) => {
@@ -114,7 +135,14 @@ impl SoundboardMixer {
         }
     }
 
-    fn play(&mut self, clip_id: String, samples: Arc<Vec<f32>>, sample_rate: u32, gain: f32) {
+    fn play(
+        &mut self,
+        clip_id: String,
+        samples: Arc<Vec<f32>>,
+        sample_rate: u32,
+        gain: f32,
+        monitor_only: bool,
+    ) {
         self.counter = self.counter.wrapping_add(1);
         let started_at = self.counter;
         let gain = gain.clamp(0.0, 4.0);
@@ -126,6 +154,7 @@ impl SoundboardMixer {
                     samples,
                     sample_rate,
                     gain,
+                    monitor_only,
                     position: 0.0,
                     active: true,
                     started_at,
@@ -140,6 +169,7 @@ impl SoundboardMixer {
                 samples,
                 sample_rate,
                 gain,
+                monitor_only,
                 position: 0.0,
                 active: true,
                 started_at,
@@ -167,9 +197,22 @@ impl SoundboardMixer {
         self.voices.iter().filter(|v| v.active).count()
     }
 
-    /// Mix every active voice into `output` (additive). Voices that run
-    /// off the end of their buffer self-deactivate.
+    /// Mix every active **main-send** voice into `output` (additive). Voices
+    /// that run off the end of their buffer self-deactivate. Monitor-only
+    /// voices are skipped (see [`SoundboardMixer::mix_monitor_into`]).
     pub fn mix_into(&mut self, output: &mut [f32], engine_rate: u32) {
+        self.mix_filtered(output, engine_rate, false);
+    }
+
+    /// v1.18.0: mix every active **monitor-only** voice into `output`
+    /// (additive). The engine calls this on the monitor signal (or, with no
+    /// separate monitor device, the single output) exactly once per callback,
+    /// so these voices advance. Main-send voices are skipped here.
+    pub fn mix_monitor_into(&mut self, output: &mut [f32], engine_rate: u32) {
+        self.mix_filtered(output, engine_rate, true);
+    }
+
+    fn mix_filtered(&mut self, output: &mut [f32], engine_rate: u32, monitor_only: bool) {
         if output.is_empty() {
             return;
         }
@@ -177,7 +220,7 @@ impl SoundboardMixer {
         let engine_rate_f = f64::from(engine_rate);
         let master = self.master_gain;
         for v in &mut self.voices {
-            if !v.active {
+            if !v.active || v.monitor_only != monitor_only {
                 continue;
             }
             let step = f64::from(v.sample_rate) / engine_rate_f;
@@ -461,5 +504,40 @@ mod tests {
         assert!((v.duration_secs - 0.2).abs() < 1e-3);
         assert!(v.position_secs > 0.009);
         assert!(v.position_secs < 0.012);
+    }
+
+    #[test]
+    fn monitor_only_routes_to_monitor_path_not_main_send() {
+        let mut m = SoundboardMixer::new();
+        m.apply(SoundboardCommand::Play {
+            clip_id: "main".into(),
+            samples: Arc::new(vec![0.5_f32; 1024]),
+            sample_rate: 48_000,
+            gain: 1.0,
+        });
+        m.apply(SoundboardCommand::PlayMonitorOnly {
+            clip_id: "preview".into(),
+            samples: Arc::new(vec![0.5_f32; 1024]),
+            sample_rate: 48_000,
+            gain: 1.0,
+        });
+        // Main send carries ONLY the normal clip (~0.5); if the monitor-only
+        // clip leaked in it'd sum to ~1.0.
+        let mut main = vec![0.0_f32; 64];
+        m.mix_into(&mut main, 48_000);
+        assert!(
+            (main[0] - 0.5).abs() < 1e-3,
+            "main[0] = {} (expected ~0.5)",
+            main[0]
+        );
+        // Monitor path carries ONLY the monitor-only clip (~0.5), not the
+        // main-send clip.
+        let mut mon = vec![0.0_f32; 64];
+        m.mix_monitor_into(&mut mon, 48_000);
+        assert!(
+            (mon[0] - 0.5).abs() < 1e-3,
+            "mon[0] = {} (expected ~0.5)",
+            mon[0]
+        );
     }
 }

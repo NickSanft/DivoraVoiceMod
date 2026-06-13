@@ -289,9 +289,18 @@ export async function listTtsVoices(): Promise<TtsVoiceInfo[]> {
  * mixed with the live mic via the soundboard seam (so a Discord/stream
  * listener hears it too). Resolves to the clip's duration in seconds. Rejects
  * with a message (e.g. "voices are not installed") the UI can surface.
+ *
+ * `gain` (v1.18.0) is the linear playback volume (1.0 = unchanged).
+ * `previewOnly` (v1.18.0) routes the speech to your local monitor only — you
+ * hear it, the call doesn't — for previewing before sending.
  */
-export async function speak(text: string, voiceId: string): Promise<number> {
-  return invoke<number>("speak", { text, voiceId });
+export async function speak(
+  text: string,
+  voiceId: string,
+  gain = 1.0,
+  previewOnly = false,
+): Promise<number> {
+  return invoke<number>("speak", { text, voiceId, gain, previewOnly });
 }
 
 /** Stop any in-flight synthesized speech playing through the mixer. */

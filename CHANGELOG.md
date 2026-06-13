@@ -4,6 +4,20 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-06-12 — Speak: volume + preview-only
+
+### Added
+
+- **Speak: volume slider + "Preview only".** The Speak screen gains a **volume slider** (0–200 %) and a **Preview only** toggle. Preview routes the synthesized speech to your **local monitor only** — you hear it, the call/stream doesn't — so you can audition a line before sending it. Both settings persist (`divora.ttsVolume`, `divora.ttsPreviewOnly`).
+
+### Architecture (additive)
+
+- New soundboard seam `SoundboardCommand::PlayMonitorOnly` + `SoundboardMixer::mix_monitor_into`: monitor-only voices mix into the monitor signal only (or the single output when no separate monitor device is active), never the main send — the engine mixes them in at the monitor tap. `speak` gains two optional args — `gain` (default 1.0) and `previewOnly` (default false) — additive over the v1.17.0 signature. New `divora.ttsVolume` + `divora.ttsPreviewOnly` keys.
+
+### Tests
+
+- +1 Rust (mixer monitor-only routing: the main send excludes a `PlayMonitorOnly` voice while the monitor path includes it), +2 api command-name (explicit gain / preview), +3 store (volume clamp + persist, preview persist, `speakText` forwards both).
+
 ## [1.17.0] — 2026-06-12 — Text-to-speech ("Speak")
 
 A new **Speak** section: type text, pick a preset voice, and Divora synthesizes it **on-device** and plays it through the output — mixed with the live mic via the soundboard seam, so a Discord call or stream hears it too. No cloud, no telemetry. Six preset voices (US + UK), powered by Kokoro-82M with espeak-ng phonemization.

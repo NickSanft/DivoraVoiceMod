@@ -1884,6 +1884,8 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(invokeMock).toHaveBeenCalledWith("speak", {
       text: "Hello there.",
       voiceId: "af_heart",
+      gain: 1.0,
+      previewOnly: false,
     });
     expect(result.playingClips["tts"]).toBeDefined();
     expect(result.playingClips["tts"]!.durationSecs).toBe(2.0);
@@ -1919,5 +1921,44 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     await result.stopSpeaking();
     expect(result.playingClips["tts"]).toBeUndefined();
     expect(invokeMock).toHaveBeenCalledWith("stop_speak");
+  });
+
+  it("ttsVolume defaults to 1.0, clamps to [0,2], and persists", () => {
+    const { result } = setupApp();
+    expect(result.ttsVolume()).toBe(1.0);
+    result.setTtsVolume(0.5);
+    expect(result.ttsVolume()).toBe(0.5);
+    expect(window.localStorage.getItem("divora.ttsVolume")).toBe("0.5");
+    result.setTtsVolume(99);
+    expect(result.ttsVolume()).toBe(2);
+    result.setTtsVolume(-1);
+    expect(result.ttsVolume()).toBe(0);
+  });
+
+  it("ttsPreviewOnly defaults to false and persists", () => {
+    const { result } = setupApp();
+    expect(result.ttsPreviewOnly()).toBe(false);
+    result.setTtsPreviewOnly(true);
+    expect(result.ttsPreviewOnly()).toBe(true);
+    expect(window.localStorage.getItem("divora.ttsPreviewOnly")).toBe("true");
+  });
+
+  it("speakText passes the current volume + preview-only to the backend", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "speak") return 1.0;
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("Hello");
+    result.setTtsVolume(0.4);
+    result.setTtsPreviewOnly(true);
+    await result.speakText();
+    expect(invokeMock).toHaveBeenCalledWith("speak", {
+      text: "Hello",
+      voiceId: "af_heart",
+      gain: 0.4,
+      previewOnly: true,
+    });
   });
 });

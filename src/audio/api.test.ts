@@ -446,14 +446,27 @@ describe("audio api", () => {
     expect(voices[0]!.installed).toBe(false);
   });
 
-  it("speak forwards text + voiceId and returns the duration", async () => {
+  it("speak forwards text + voiceId (default gain/preview) and returns the duration", async () => {
     invokeMock.mockResolvedValueOnce(1.8);
     const d = await speak("Hello there.", "af_heart");
     expect(invokeMock).toHaveBeenCalledWith("speak", {
       text: "Hello there.",
       voiceId: "af_heart",
+      gain: 1.0,
+      previewOnly: false,
     });
     expect(d).toBe(1.8);
+  });
+
+  it("speak forwards an explicit gain + previewOnly", async () => {
+    invokeMock.mockResolvedValueOnce(2.0);
+    await speak("Hi", "bm_george", 0.5, true);
+    expect(invokeMock).toHaveBeenCalledWith("speak", {
+      text: "Hi",
+      voiceId: "bm_george",
+      gain: 0.5,
+      previewOnly: true,
+    });
   });
 
   it("speak surfaces a backend 'not installed' error", async () => {

@@ -226,6 +226,82 @@ export function SpeakScreen(): JSX.Element {
           </div>
         </div>
 
+        {/* Volume + preview options */}
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s5)",
+            "flex-wrap": "wrap",
+          }}
+        >
+          <label
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s3)",
+              flex: "1 1 240px",
+            }}
+          >
+            <span
+              style={{
+                "font-size": "var(--t-xs)",
+                "text-transform": "uppercase",
+                "letter-spacing": "0.08em",
+                color: "var(--text-low)",
+                "white-space": "nowrap",
+              }}
+            >
+              Volume
+            </span>
+            <input
+              type="range"
+              min="0"
+              max="2"
+              step="0.05"
+              value={app.ttsVolume()}
+              onInput={(e) => app.setTtsVolume(Number(e.currentTarget.value))}
+              style={{ flex: 1, "accent-color": "var(--accent)" }}
+              aria-label="Speak volume"
+            />
+            <span
+              style={{
+                "font-size": "var(--t-xs)",
+                color: "var(--text-mid)",
+                "font-variant-numeric": "tabular-nums",
+                "min-width": "3ch",
+                "text-align": "right",
+              }}
+            >
+              {Math.round(app.ttsVolume() * 100)}%
+            </span>
+          </label>
+
+          <label
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s2)",
+              cursor: "pointer",
+              "user-select": "none",
+            }}
+            title="Play only through your monitor — you hear it, the call doesn't"
+          >
+            <input
+              type="checkbox"
+              checked={app.ttsPreviewOnly()}
+              onChange={(e) => app.setTtsPreviewOnly(e.currentTarget.checked)}
+              style={{ "accent-color": "var(--accent)" }}
+            />
+            <span style={{ "font-size": "var(--t-sm)", color: "var(--text-high)" }}>
+              Preview only
+            </span>
+            <span aria-hidden="true" style={{ color: "var(--text-low)", display: "flex" }}>
+              <Sigil name="monitor" size={15} />
+            </span>
+          </label>
+        </div>
+
         {/* Controls */}
         <div
           style={{

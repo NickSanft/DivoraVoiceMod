@@ -82,7 +82,7 @@ resolved `T` or a thrown string on the JS side.
 | Command | Args | Returns |
 |---|---|---|
 | `list_tts_voices` | — | `TtsVoiceInfo[]` |
-| `speak` | `text: string`, `voiceId: string` | duration seconds `f32` / error (e.g. "voices are not installed") |
+| `speak` | `text: string`, `voiceId: string`, `gain?: number` (v1.18.0, default 1.0), `previewOnly?: bool` (v1.18.0, default false → monitor-only) | duration seconds `f32` / error (e.g. "voices are not installed") |
 | `stop_speak` | — | — |
 
 ### Recording
@@ -233,6 +233,8 @@ to defaults (never throw).
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
 | `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0 |
 | `divora.ttsVoice` | selected "Speak" preset voice id (or null) — v1.17.0 |
+| `divora.ttsVolume` | "Speak" playback volume (linear 0..2) — v1.18.0 |
+| `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 
 ---

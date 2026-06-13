@@ -787,13 +787,25 @@ fn build_output_stream(
                 state_for_callback.store_loudness_gain_db(loudness.gain_db());
 
                 // Phase 13: tap the processed, input-rate mono into the
-                // monitor ring (if a monitor device is active) BEFORE
-                // this device's own resample. The monitor stream then
-                // resamples it to the headphone device's rate. Dropping
-                // samples on a full ring is fine — the monitor just
-                // underruns to silence momentarily.
+                // monitor ring (if a monitor device is active) BEFORE this
+                // device's own resample. The monitor stream then resamples it
+                // to the headphone device's rate. Dropping samples on a full
+                // ring is fine — the monitor just underruns to silence.
+                //
+                // v1.18.0: monitor-only voices (e.g. a TTS "preview") are
+                // mixed in HERE — into the monitor signal only — so the main
+                // send (e.g. CABLE → the call) never carries them. With no
+                // separate monitor device they ride the single output instead
+                // so they stay audible locally. Either branch calls
+                // `mix_monitor_into` exactly once per callback, so those
+                // voices advance.
                 if let Some(mp) = monitor_producer.as_mut() {
-                    let _ = mp.push_slice(&mono[..native_frames]);
+                    let mut mon = [0f32; MAX_FRAMES_PER_CALLBACK];
+                    mon[..native_frames].copy_from_slice(&mono[..native_frames]);
+                    soundboard.mix_monitor_into(&mut mon[..native_frames], input_rate);
+                    let _ = mp.push_slice(&mon[..native_frames]);
+                } else {
+                    soundboard.mix_monitor_into(&mut mono[..native_frames], input_rate);
                 }
 
                 // Phase 16: tap the same processed mono into the

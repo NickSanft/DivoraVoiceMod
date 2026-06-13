@@ -194,6 +194,8 @@ const STORAGE_KEYS = {
   customGlyphs: "divora.customGlyphs",
   overlay: "divora.overlay",
   ttsVoice: "divora.ttsVoice",
+  ttsVolume: "divora.ttsVolume",
+  ttsPreviewOnly: "divora.ttsPreviewOnly",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -409,6 +411,13 @@ export interface AppState {
   /** Selected preset voice id (persisted `divora.ttsVoice`); null until first load. */
   selectedTtsVoice: () => string | null;
   setSelectedTtsVoice: (id: string) => void;
+  /** Speak playback volume, linear 0..2 (persisted `divora.ttsVolume`). */
+  ttsVolume: () => number;
+  setTtsVolume: (gain: number) => void;
+  /** v1.18.0: when true, Speak plays to the local monitor only (you hear it,
+   *  the call doesn't). Persisted `divora.ttsPreviewOnly`. */
+  ttsPreviewOnly: () => boolean;
+  setTtsPreviewOnly: (on: boolean) => void;
   /** Draft text in the Speak box (ephemeral — not persisted). */
   ttsText: () => string;
   setTtsText: (text: string) => void;
@@ -1968,10 +1977,27 @@ export function createAppState(): AppState {
   const [ttsText, setTtsText] = createSignal("");
   const [synthesizing, setSynthesizing] = createSignal(false);
   const [ttsError, setTtsError] = createSignal<string | null>(null);
+  const [ttsVolume, setTtsVolumeRaw] = createSignal<number>(
+    loadJson<number>(STORAGE_KEYS.ttsVolume, 1.0),
+  );
+  const [ttsPreviewOnly, setTtsPreviewOnlyRaw] = createSignal<boolean>(
+    loadJson<boolean>(STORAGE_KEYS.ttsPreviewOnly, false),
+  );
 
   const setSelectedTtsVoice = (id: string): void => {
     setSelectedTtsVoiceRaw(id);
     saveJson(STORAGE_KEYS.ttsVoice, id);
+  };
+
+  const setTtsVolume = (gain: number): void => {
+    const clamped = Math.max(0, Math.min(2, gain));
+    setTtsVolumeRaw(clamped);
+    saveJson(STORAGE_KEYS.ttsVolume, clamped);
+  };
+
+  const setTtsPreviewOnly = (on: boolean): void => {
+    setTtsPreviewOnlyRaw(on);
+    saveJson(STORAGE_KEYS.ttsPreviewOnly, on);
   };
 
   const refreshTtsVoices = async (): Promise<void> => {
@@ -1998,7 +2024,12 @@ export function createAppState(): AppState {
     setTtsError(null);
     setSynthesizing(true);
     try {
-      const durationSecs = await speakCmd(text, voiceId);
+      const durationSecs = await speakCmd(
+        text,
+        voiceId,
+        ttsVolume(),
+        ttsPreviewOnly(),
+      );
       // Reuse the soundboard playback seam: register a "tts" clip so the
       // shared ~30 Hz clock drives the progress ring and auto-expires it.
       setPlayingClips("tts", {
@@ -2130,6 +2161,10 @@ export function createAppState(): AppState {
     ttsVoices,
     selectedTtsVoice,
     setSelectedTtsVoice,
+    ttsVolume,
+    setTtsVolume,
+    ttsPreviewOnly,
+    setTtsPreviewOnly,
     ttsText,
     setTtsText,
     synthesizing,

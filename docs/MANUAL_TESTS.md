@@ -420,6 +420,8 @@ resource dir), same as the AI voice-conversion models.
 - [ ] Type a sentence → pick each preset voice → **Speak** → you hear that voice on the output; the voices are audibly distinct (US vs UK, M vs F).
 - [ ] Set output = **CABLE Input** and join a Discord call → a listener hears the spoken text, mixed with your live mic.
 - [ ] A long multi-sentence passage synthesizes as one continuous clip (sentence chunking, no dropouts); the playback **progress ring** tracks it; **Stop** halts it immediately.
+- [ ] **Volume slider** (v1.18.0): lower it → Speak is quieter; raise it → louder. Persists across restart (`divora.ttsVolume`).
+- [ ] **Preview only** (v1.18.0): with output = CABLE Input + a separate monitor device (headphones) + monitoring on, enable **Preview only** → Speak → you hear it in your headphones but a Discord listener does **not**. Disable it → the listener hears it again. Persists across restart (`divora.ttsPreviewOnly`).
 - [ ] Pick a different voice → restart the app → the selection is restored (`divora.ttsVoice`).
 
 **Degradation (no assets — e.g. dev run before fetch):**

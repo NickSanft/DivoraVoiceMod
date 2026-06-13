@@ -516,12 +516,22 @@ fn list_tts_voices(state: State<'_, AppState>) -> Vec<divora_core::tts::TtsVoice
 /// too, mixed with the live mic). Returns the clip duration in seconds for the
 /// playback progress ring.
 ///
+/// `gain` (v1.18.0, optional, default 1.0) is the linear playback volume.
+/// `preview_only` (v1.18.0, optional, default false) routes the speech to the
+/// local monitor only — you hear it, the call doesn't — for previewing.
+///
 /// Synthesis is batch work; it runs here on the command's worker thread (as
 /// `play_soundboard_clip` decodes synchronously). Until the Kokoro model is
 /// staged, `synthesize` returns `NotInstalled` immediately, surfaced to the UI
 /// as a graceful error string rather than a hang.
 #[tauri::command]
-fn speak(state: State<'_, AppState>, text: String, voice_id: String) -> Result<f32, String> {
+fn speak(
+    state: State<'_, AppState>,
+    text: String,
+    voice_id: String,
+    gain: Option<f32>,
+    preview_only: Option<bool>,
+) -> Result<f32, String> {
     let audio =
         divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir).map_err(|e| {
             tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
@@ -535,12 +545,26 @@ fn speak(state: State<'_, AppState>, text: String, voice_id: String) -> Result<f
     } else {
         samples.len() as f32 / sample_rate as f32
     };
-    state.engine.send_soundboard(SoundboardCommand::Play {
-        clip_id: TTS_CLIP_ID.to_string(),
-        samples,
-        sample_rate,
-        gain: 1.0,
-    });
+    let gain = gain.unwrap_or(1.0);
+    let clip_id = TTS_CLIP_ID.to_string();
+    // Preview → monitor-only (you hear it, the call doesn't); otherwise the
+    // normal both-paths play used by the soundboard.
+    let cmd = if preview_only.unwrap_or(false) {
+        SoundboardCommand::PlayMonitorOnly {
+            clip_id,
+            samples,
+            sample_rate,
+            gain,
+        }
+    } else {
+        SoundboardCommand::Play {
+            clip_id,
+            samples,
+            sample_rate,
+            gain,
+        }
+    };
+    state.engine.send_soundboard(cmd);
     Ok(duration_secs)
 }
 
