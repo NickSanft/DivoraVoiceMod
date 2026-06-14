@@ -97,9 +97,6 @@ pub struct TtsPaths {
     pub config: PathBuf,
     /// Directory holding `espeak-ng(.exe)` + `espeak-ng-data`.
     pub espeak_dir: PathBuf,
-    /// `OpenVoice` tone-color extractor + converter (Phase 2 cloning).
-    pub clone_extractor: PathBuf,
-    pub clone_converter: PathBuf,
 }
 
 impl TtsPaths {
@@ -110,8 +107,6 @@ impl TtsPaths {
             voices: asset_dir.join(VOICES_FILE),
             config: asset_dir.join(CONFIG_FILE),
             espeak_dir: asset_dir.to_path_buf(),
-            clone_extractor: asset_dir.join(CLONE_EXTRACTOR_FILE),
-            clone_converter: asset_dir.join(CLONE_CONVERTER_FILE),
         }
     }
 
@@ -124,13 +119,14 @@ impl TtsPaths {
             && self.config.exists()
             && phonemize::Phonemizer::from_dir(&self.espeak_dir).is_available()
     }
+}
 
-    /// Whether the `OpenVoice` cloning models are present (in addition to the
-    /// base Kokoro assets). Pure filesystem check.
-    #[must_use]
-    pub fn clone_installed(&self) -> bool {
-        self.clone_extractor.exists() && self.clone_converter.exists()
-    }
+/// Whether both `OpenVoice` cloning models are present in `clone_dir`. They're
+/// no longer bundled (v1.21.0) — downloaded on demand into a user dir — so the
+/// clone path resolves them separately from the bundled Kokoro assets.
+#[must_use]
+pub fn clone_models_present(clone_dir: &Path) -> bool {
+    clone_dir.join(CLONE_EXTRACTOR_FILE).exists() && clone_dir.join(CLONE_CONVERTER_FILE).exists()
 }
 
 /// List the preset voices, each flagged with whether its assets are installed.
@@ -233,6 +229,7 @@ pub fn synthesize_cloned(
     base_voice_id: &str,
     target_se: &[f32],
     asset_dir: &Path,
+    clone_dir: &Path,
     tau: f32,
 ) -> Result<TtsAudio, TtsError> {
     let voice = PRESET_VOICES
@@ -250,11 +247,12 @@ pub fn synthesize_cloned(
     if !paths.installed() {
         return Err(TtsError::NotInstalled);
     }
-    // Load the converter pair if present; otherwise fall back to the base voice.
-    let mut clone_sessions = if paths.clone_installed() {
+    // Load the converter pair from the (downloaded) clone dir if present;
+    // otherwise fall back to the plain base voice.
+    let mut clone_sessions = if clone_models_present(clone_dir) {
         match (
-            clone::load_session(&paths.clone_extractor),
-            clone::load_session(&paths.clone_converter),
+            clone::load_session(&clone_dir.join(CLONE_EXTRACTOR_FILE)),
+            clone::load_session(&clone_dir.join(CLONE_CONVERTER_FILE)),
         ) {
             (Some(ext), Some(conv)) => Some((ext, conv)),
             _ => None,
@@ -293,14 +291,14 @@ pub fn synthesize_cloned(
 pub fn extract_voice_se(
     samples: &[f32],
     sample_rate: u32,
-    asset_dir: &Path,
+    clone_dir: &Path,
 ) -> Result<Vec<f32>, TtsError> {
-    let paths = TtsPaths::new(asset_dir);
-    if !paths.clone_installed() {
+    let extractor_path = clone_dir.join(CLONE_EXTRACTOR_FILE);
+    if !extractor_path.exists() {
         return Err(TtsError::NotInstalled);
     }
-    let mut extractor = clone::load_session(&paths.clone_extractor)
-        .ok_or_else(|| TtsError::Inference("`OpenVoice` extractor unavailable".to_string()))?;
+    let mut extractor = clone::load_session(&extractor_path)
+        .ok_or_else(|| TtsError::Inference("OpenVoice extractor unavailable".to_string()))?;
     let resampled = clone::resample_to_ov(samples, sample_rate);
     clone::extract_se(&mut extractor, &resampled)
         .ok_or_else(|| TtsError::Inference("speaker-embedding extraction failed".to_string()))
@@ -389,10 +387,13 @@ mod tests {
             crate::soundboard::decode_clip(Path::new(&format!("{res}/_spike/me.wav"))).unwrap();
         let se = extract_voice_se(&clip.samples, clip.sample_rate, &assets).unwrap();
         assert_eq!(se.len(), clone::SE_DIM);
+        // In dev the OpenVoice models live in resources/tts too, so the same
+        // dir doubles as the Kokoro asset dir and the clone-model dir.
         let audio = synthesize_cloned(
             "Hello, this is my cloned voice.",
             "am_puck",
             &se,
+            &assets,
             &assets,
             0.3,
         )

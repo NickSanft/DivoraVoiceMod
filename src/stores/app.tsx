@@ -38,6 +38,9 @@ import {
   cloneVoice as cloneVoiceCmd,
   deleteClonedVoice as deleteClonedVoiceCmd,
   pickAudioFile as pickAudioFileCmd,
+  cloneModelsStatus as cloneModelsStatusCmd,
+  downloadCloneModels as downloadCloneModelsCmd,
+  subscribeCloneDownload,
   openMidiInput as openMidiInputCmd,
   closeMidiInput as closeMidiInputCmd,
   onnxRuntimeStatus as onnxRuntimeStatusCmd,
@@ -450,6 +453,16 @@ export interface AppState {
   addClonedVoice: (name: string) => Promise<void>;
   /** Delete a cloned voice; if it was selected, fall back to the first preset. */
   removeClonedVoice: (id: string) => Promise<void>;
+  /** v1.21.0: whether the (on-demand) voice-cloning models are downloaded. */
+  cloneModelsReady: () => boolean;
+  /** True while the cloning models are downloading. */
+  cloneDownloading: () => boolean;
+  /** Download progress 0–100 for the cloning models. */
+  cloneDownloadPct: () => number;
+  /** Refresh whether the cloning models are present. */
+  refreshCloneModelsStatus: () => Promise<void>;
+  /** Download the cloning models (~157 MB, one-time). */
+  downloadCloneModels: () => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -2134,6 +2147,52 @@ export function createAppState(): AppState {
     }
   };
 
+  // v1.21.0: on-demand cloning-model download.
+  const [cloneModelsReady, setCloneModelsReady] = createSignal(false);
+  const [cloneDownloading, setCloneDownloading] = createSignal(false);
+  const [cloneDownloadPct, setCloneDownloadPct] = createSignal(0);
+
+  const refreshCloneModelsStatus = async (): Promise<void> => {
+    try {
+      const status = await cloneModelsStatusCmd();
+      setCloneModelsReady(!!status?.ready);
+    } catch (err) {
+      console.warn("[clone] models status failed", err);
+    }
+  };
+
+  const downloadCloneModels = async (): Promise<void> => {
+    if (cloneDownloading()) return;
+    setCloneError(null);
+    setCloneDownloading(true);
+    setCloneDownloadPct(0);
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await subscribeCloneDownload((p) => {
+        if (p.total > 0) {
+          setCloneDownloadPct(Math.round((p.received / p.total) * 100));
+        }
+      });
+    } catch {
+      /* not under Tauri — no progress events */
+    }
+    try {
+      await downloadCloneModelsCmd();
+      await refreshCloneModelsStatus();
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setCloneDownloading(false);
+      if (unlisten) unlisten();
+    }
+  };
+
   return {
     nav,
     setNav,
@@ -2254,6 +2313,11 @@ export function createAppState(): AppState {
     refreshClonedVoices,
     addClonedVoice,
     removeClonedVoice,
+    cloneModelsReady,
+    cloneDownloading,
+    cloneDownloadPct,
+    refreshCloneModelsStatus,
+    downloadCloneModels,
 
     usePreset,
     viewPreset,

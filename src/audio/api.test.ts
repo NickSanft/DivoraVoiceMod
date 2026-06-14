@@ -39,6 +39,8 @@ import {
   listClonedVoices,
   cloneVoice,
   deleteClonedVoice,
+  cloneModelsStatus,
+  downloadCloneModels,
   stopAllSoundboardClips,
   stopAudioEngine,
   stopRecording,
@@ -508,6 +510,19 @@ describe("audio api", () => {
     expect(invokeMock).toHaveBeenCalledWith("delete_cloned_voice", {
       id: "my-voice",
     });
+  });
+
+  it("cloneModelsStatus invokes clone_models_status", async () => {
+    invokeMock.mockResolvedValueOnce({ ready: true });
+    const s = await cloneModelsStatus();
+    expect(invokeMock).toHaveBeenCalledWith("clone_models_status");
+    expect(s.ready).toBe(true);
+  });
+
+  it("downloadCloneModels invokes download_clone_models", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await downloadCloneModels();
+    expect(invokeMock).toHaveBeenCalledWith("download_clone_models");
   });
 
   it("subscribeMidi listens on midi-message and forwards payloads", async () => {

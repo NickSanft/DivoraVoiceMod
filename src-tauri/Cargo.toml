@@ -27,6 +27,10 @@ tauri-plugin-shell = "2"
 # extra system deps); the live port open is desktop-verified like the
 # tray/recording paths.
 midir = "0.10"
+# v1.21.0: on-demand download of the OpenVoice voice-cloning models (kept out
+# of the installer to keep it small). Lightweight blocking HTTP client with
+# rustls TLS; the download streams to disk in Rust (no 157 MB through IPC).
+ureq = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

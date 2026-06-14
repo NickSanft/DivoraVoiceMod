@@ -47,10 +47,12 @@ $ttsFiles = @(
   "voices-divora.bin",         # compact DVTS style pack (preset voices)
   "kokoro-config.json",        # model config (holds the phoneme vocab)
   "espeak-ng.exe",             # espeak-ng CLI (GPL-3.0)
-  "libespeak-ng.dll",          # espeak-ng runtime lib
-  "openvoice-extractor.onnx",  # v1.20.0: OpenVoice tone-color extractor (MIT)
-  "openvoice-converter.onnx"   # v1.20.0: OpenVoice tone-color converter (~157 MB)
+  "libespeak-ng.dll"           # espeak-ng runtime lib
 )
+# NOTE: the OpenVoice cloning models (openvoice-extractor.onnx +
+# openvoice-converter.onnx, ~157 MB) are intentionally NOT bundled (v1.21.0) —
+# they're downloaded on demand from the voice-assets-v2 release into
+# %APPDATA%/DivoraVoice/tts/ the first time a user clones a voice.
 foreach ($f in $ttsFiles) {
   $dest = Join-Path $tts $f
   gh release download $tag --repo $repo --pattern $f --output $dest --clobber

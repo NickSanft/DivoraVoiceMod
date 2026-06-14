@@ -8,6 +8,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -94,6 +95,11 @@ struct AppState {
     /// `list_tts_voices` reports every voice as not-installed and `speak`
     /// degrades to a clear error rather than synthesizing.
     tts_assets_dir: PathBuf,
+    /// v1.21.0: user-writable dir the voice-cloning models are
+    /// **downloaded** into on demand (`%APPDATA%/DivoraVoice/tts/`). They're
+    /// no longer bundled (kept the installer small); cloning prompts a
+    /// one-time download into here.
+    clone_models_dir: PathBuf,
     /// Phase 16: directory recordings are written to
     /// (`%APPDATA%/DivoraVoice/recordings/`). Created at startup;
     /// surfaced to the UI so it can open it + show where files land.
@@ -536,9 +542,14 @@ fn speak(
     // through the `OpenVoice` converter on the `am_puck` base. Otherwise it's a
     // preset id → plain Kokoro.
     let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
-        Some((se, base)) => {
-            divora_core::tts::synthesize_cloned(&text, &base, &se, &state.tts_assets_dir, CLONE_TAU)
-        }
+        Some((se, base)) => divora_core::tts::synthesize_cloned(
+            &text,
+            &base,
+            &se,
+            &state.tts_assets_dir,
+            &clone_dir(&state),
+            CLONE_TAU,
+        ),
         None => divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir),
     }
     .map_err(|e| {
@@ -690,7 +701,7 @@ fn clone_voice(
     }
     let clip = decode_clip(Path::new(&reference_path)).map_err(|e| e.to_string())?;
     let se =
-        divora_core::tts::extract_voice_se(&clip.samples, clip.sample_rate, &state.tts_assets_dir)
+        divora_core::tts::extract_voice_se(&clip.samples, clip.sample_rate, &clone_dir(&state))
             .map_err(|e| e.to_string())?;
 
     let dir = cloned_voices_dir(&state.voices_dir);
@@ -737,6 +748,134 @@ fn delete_cloned_voice(state: State<'_, AppState>, id: String) -> Result<(), Str
     if voice_dir.is_dir() {
         std::fs::remove_dir_all(&voice_dir).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+// ---- v1.21.0: on-demand OpenVoice model download ----
+
+/// GitHub release hosting the bundled voice assets (the cloning models are
+/// downloaded from here on demand rather than shipped in the installer).
+const CLONE_MODELS_BASE_URL: &str =
+    "https://github.com/NickSanft/DivoraVoiceMod/releases/download/voice-assets-v2";
+/// The cloning model files to fetch (extractor is tiny; converter is ~157 MB).
+const CLONE_MODEL_FILES: &[&str] = &["openvoice-extractor.onnx", "openvoice-converter.onnx"];
+
+/// Where to read the cloning models from: the downloaded user dir if it
+/// has them, else the bundled/dev asset dir (covers dev, where they're staged
+/// in `resources/tts/`), else the user dir (the download target).
+fn clone_dir(state: &AppState) -> PathBuf {
+    if divora_core::tts::clone_models_present(&state.clone_models_dir) {
+        state.clone_models_dir.clone()
+    } else if divora_core::tts::clone_models_present(&state.tts_assets_dir) {
+        state.tts_assets_dir.clone()
+    } else {
+        state.clone_models_dir.clone()
+    }
+}
+
+/// Whether the cloning models are available (so the UI can prompt a
+/// one-time download before the user records a voice).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloneModelsStatus {
+    ready: bool,
+}
+
+/// Progress event payload for the cloning-model download (`clone-model-download`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloneDownloadProgress {
+    /// Current file (1-based) and how many total.
+    file: usize,
+    file_count: usize,
+    /// Bytes received / total for the current file (total 0 if unknown).
+    received: u64,
+    total: u64,
+}
+
+/// Whether the cloning models are installed.
+#[tauri::command]
+fn clone_models_status(state: State<'_, AppState>) -> CloneModelsStatus {
+    CloneModelsStatus {
+        ready: divora_core::tts::clone_models_present(&clone_dir(&state)),
+    }
+}
+
+/// Download the cloning models into the user dir, emitting
+/// `clone-model-download` progress events. Blocks until done (the worker
+/// thread); the UI awaits it and tracks progress via the events. Skips files
+/// already present, and writes via a `.part` temp so a failed/partial download
+/// never looks complete.
+#[tauri::command]
+fn download_clone_models(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.clone_models_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let count = CLONE_MODEL_FILES.len();
+    for (i, name) in CLONE_MODEL_FILES.iter().enumerate() {
+        let dest = dir.join(name);
+        if dest.is_file() {
+            continue;
+        }
+        let url = format!("{CLONE_MODELS_BASE_URL}/{name}");
+        download_to_file(&app, &url, &dest, i + 1, count)
+            .map_err(|e| format!("downloading {name}: {e}"))?;
+    }
+    tracing::info!(path = %dir.display(), "clone models downloaded");
+    Ok(())
+}
+
+/// Stream `url` to `dest` (via a `.part` temp), emitting progress events.
+fn download_to_file(
+    app: &AppHandle,
+    url: &str,
+    dest: &Path,
+    file: usize,
+    file_count: usize,
+) -> Result<(), String> {
+    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let total: u64 = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let tmp = dest.with_extension("part");
+    let mut file_w = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut received: u64 = 0;
+    let mut last_emit: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file_w.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        received += n as u64;
+        // Throttle events to ~every 1 MB.
+        if received - last_emit >= 1 << 20 {
+            last_emit = received;
+            let _ = app.emit(
+                "clone-model-download",
+                CloneDownloadProgress {
+                    file,
+                    file_count,
+                    received,
+                    total,
+                },
+            );
+        }
+    }
+    file_w.flush().map_err(|e| e.to_string())?;
+    drop(file_w);
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+    let _ = app.emit(
+        "clone-model-download",
+        CloneDownloadProgress {
+            file,
+            file_count,
+            received,
+            total,
+        },
+    );
     Ok(())
 }
 
@@ -1109,6 +1248,20 @@ pub fn run() {
                 }
             };
 
+            // v1.21.0: user dir the OpenVoice cloning models download into
+            // (`%APPDATA%/DivoraVoice/tts/`). Best-effort create.
+            let clone_models_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join("tts"),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; clone models fall back to temp");
+                    std::env::temp_dir().join("DivoraVoice").join("tts")
+                }
+            };
+            if let Err(e) = std::fs::create_dir_all(&clone_models_dir) {
+                tracing::warn!(?e, path = %clone_models_dir.display(), "could not create clone models dir");
+            }
+            tracing::info!(path = %clone_models_dir.display(), "clone models dir ready");
+
             app.manage(AppState {
                 engine,
                 preset_store,
@@ -1117,6 +1270,7 @@ pub fn run() {
                 voices_dir,
                 bundled_voices_dir,
                 tts_assets_dir,
+                clone_models_dir,
                 recordings_dir,
                 logs_dir,
                 midi_connection: Mutex::new(None),
@@ -1162,6 +1316,8 @@ pub fn run() {
             clone_voice,
             list_cloned_voices,
             delete_cloned_voice,
+            clone_models_status,
+            download_clone_models,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,
@@ -1187,6 +1343,22 @@ mod tests {
         let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
         k.sort();
         k
+    }
+
+    /// v1.21.0: prove `ureq` can fetch a release asset (follows GitHub's
+    /// redirect, streams the body, Content-Length matches) — the core of the
+    /// on-demand cloning-model download. `#[ignore]`d (network).
+    #[test]
+    #[ignore = "network: downloads a release asset"]
+    fn ureq_fetches_release_asset() {
+        use std::io::Read;
+        let url = format!("{}/openvoice-extractor.onnx", super::CLONE_MODELS_BASE_URL);
+        let resp = ureq::get(&url).call().unwrap();
+        let len: usize = resp.header("Content-Length").unwrap().parse().unwrap();
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), len);
+        assert_eq!(buf.len(), 3_364_792);
     }
 
     // ---- v1.14.0: preset-import id helpers -----------------------------

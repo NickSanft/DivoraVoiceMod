@@ -338,6 +338,40 @@ export async function deleteClonedVoice(id: string): Promise<void> {
   await invoke("delete_cloned_voice", { id });
 }
 
+/** Whether the voice-cloning models are downloaded (v1.21.0). */
+export interface CloneModelsStatus {
+  ready: boolean;
+}
+
+/** Progress for the on-demand cloning-model download. */
+export interface CloneDownloadProgress {
+  file: number;
+  fileCount: number;
+  received: number;
+  total: number;
+}
+
+export async function cloneModelsStatus(): Promise<CloneModelsStatus> {
+  return invoke<CloneModelsStatus>("clone_models_status");
+}
+
+/**
+ * Download the voice-cloning models (~157 MB, one-time) into the user dir.
+ * Resolves when complete; progress arrives via {@link subscribeCloneDownload}.
+ */
+export async function downloadCloneModels(): Promise<void> {
+  await invoke("download_clone_models");
+}
+
+/** Subscribe to cloning-model download progress. Returns the unlisten fn. */
+export async function subscribeCloneDownload(
+  handler: (p: CloneDownloadProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<CloneDownloadProgress>("clone-model-download", (e) =>
+    handler(e.payload),
+  );
+}
+
 /**
  * Open the native file-picker for a voice reference clip and return the chosen
  * absolute path (or `null` if cancelled). Lazy-imports the dialog plugin so

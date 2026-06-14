@@ -9,9 +9,7 @@
       "resources/tts/kokoro-config.json": "tts/kokoro-config.json",
       "resources/tts/espeak-ng.exe": "tts/espeak-ng.exe",
       "resources/tts/libespeak-ng.dll": "tts/libespeak-ng.dll",
-      "resources/tts/espeak-ng-data": "tts/espeak-ng-data",
-      "resources/tts/openvoice-extractor.onnx": "tts/openvoice-extractor.onnx",
-      "resources/tts/openvoice-converter.onnx": "tts/openvoice-converter.onnx"
+      "resources/tts/espeak-ng-data": "tts/espeak-ng-data"
     }
   }
 }

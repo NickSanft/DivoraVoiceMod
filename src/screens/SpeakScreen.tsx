@@ -22,6 +22,7 @@ export function SpeakScreen(): JSX.Element {
     void (async () => {
       await app.refreshClonedVoices();
       await app.refreshTtsVoices();
+      await app.refreshCloneModelsStatus();
     })();
   });
 
@@ -332,43 +333,73 @@ export function SpeakScreen(): JSX.Element {
               </div>
             </Show>
 
-            {/* Add your voice */}
-            <div
-              style={{
-                display: "flex",
-                "align-items": "center",
-                gap: "var(--s2)",
-                "flex-wrap": "wrap",
-              }}
+            {/* Add your voice — gated on the cloning models being downloaded */}
+            <Show
+              when={app.cloneModelsReady()}
+              fallback={
+                <div
+                  style={{
+                    display: "flex",
+                    "align-items": "center",
+                    gap: "var(--s3)",
+                    "flex-wrap": "wrap",
+                  }}
+                >
+                  <Button
+                    variant="secondary"
+                    icon="download"
+                    disabled={app.cloneDownloading()}
+                    onClick={() => void app.downloadCloneModels()}
+                  >
+                    {app.cloneDownloading()
+                      ? `Downloading… ${app.cloneDownloadPct()}%`
+                      : "Download voice-cloning models (~157 MB)"}
+                  </Button>
+                  <span
+                    style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}
+                  >
+                    One-time, on-device — needed to add your own voice.
+                  </span>
+                </div>
+              }
             >
-              <input
-                type="text"
-                value={cloneName()}
-                onInput={(e) => setCloneName(e.currentTarget.value)}
-                placeholder="Name your voice, then pick a 20–30s clip"
-                disabled={app.cloning()}
+              <div
                 style={{
-                  flex: "1 1 240px",
-                  padding: "var(--s2) var(--s3)",
-                  "border-radius": "var(--r-md)",
-                  border: "1px solid var(--line)",
-                  background: "var(--surface-1)",
-                  color: "var(--text-high)",
-                  "font-family": "inherit",
-                  "font-size": "var(--t-sm)",
-                }}
-              />
-              <Button
-                variant="secondary"
-                icon="mic"
-                disabled={app.cloning() || cloneName().trim().length === 0}
-                onClick={() => {
-                  void app.addClonedVoice(cloneName()).then(() => setCloneName(""));
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "var(--s2)",
+                  "flex-wrap": "wrap",
                 }}
               >
-                {app.cloning() ? "Cloning…" : "Add your voice"}
-              </Button>
-            </div>
+                <input
+                  type="text"
+                  value={cloneName()}
+                  onInput={(e) => setCloneName(e.currentTarget.value)}
+                  placeholder="Name your voice, then pick a 20–30s clip"
+                  disabled={app.cloning()}
+                  style={{
+                    flex: "1 1 240px",
+                    padding: "var(--s2) var(--s3)",
+                    "border-radius": "var(--r-md)",
+                    border: "1px solid var(--line)",
+                    background: "var(--surface-1)",
+                    color: "var(--text-high)",
+                    "font-family": "inherit",
+                    "font-size": "var(--t-sm)",
+                  }}
+                />
+                <Button
+                  variant="secondary"
+                  icon="mic"
+                  disabled={app.cloning() || cloneName().trim().length === 0}
+                  onClick={() => {
+                    void app.addClonedVoice(cloneName()).then(() => setCloneName(""));
+                  }}
+                >
+                  {app.cloning() ? "Cloning…" : "Add your voice"}
+                </Button>
+              </div>
+            </Show>
 
             <Show when={app.cloneError()}>
               <span

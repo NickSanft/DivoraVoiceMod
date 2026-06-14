@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.21.0] — 2026-06-14 — Speak: smaller install (cloning models download on demand)
+
+The voice-cloning models are no longer bundled, so the installer drops from ~237 MB back to **~91 MB**. The first time you add your own voice, Speak downloads the ~157 MB OpenVoice models once into `%APPDATA%`, with a progress bar.
+
+### Changed
+
+- **On-demand cloning models.** The OpenVoice extractor + converter are fetched from the `voice-assets-v2` release into `%APPDATA%/DivoraVoice/tts/` on first cloning use — not shipped in the installer. "Your voices" shows a one-time **Download voice-cloning models (~157 MB)** button with progress; preset Speak voices are unaffected.
+
+### Architecture (additive)
+
+- New `clone_models_status` / `download_clone_models` commands + a `clone-model-download` progress event; a lightweight `ureq` client streams the models straight to disk (no 157 MB through IPC). `synthesize_cloned` / `extract_voice_se` now take the clone-model dir explicitly; the backend resolves it (downloaded user dir → bundled/dev dir → download target), so dev builds keep working with the staged models. The two OpenVoice models are dropped from `tauri.bundle.conf.json` + `fetch-voice-assets.ps1` (they stay on the release). New `%APPDATA%/DivoraVoice/tts/` user dir.
+
+### Tests
+
+- +3 (2 api command-name, 1 store status) + an `#[ignore]`d `ureq` download test that fetches a real release asset and validates the redirect + streaming + Content-Length. Full pre-push checklist green.
+
 ## [1.20.0] — 2026-06-13 — Speak: clone your own voice
 
 Add **your own voice** to Speak: import a short reference clip and the preset voices take on your timbre — fully on-device, the clip never leaves your machine.

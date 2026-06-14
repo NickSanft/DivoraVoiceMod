@@ -145,6 +145,8 @@ export async function installTauriMock(
           throw "text-to-speech voices are not installed";
         },
         delete_cloned_voice: () => null,
+        clone_models_status: () => ({ ready: false }),
+        download_clone_models: () => null,
         recordings_dir: () => "C:/mock/recordings",
         preset_store_path: () => "C:/mock/presets",
         list_midi_inputs: () => [],

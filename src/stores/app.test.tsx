@@ -1995,4 +1995,15 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(result.clonedVoices()).toHaveLength(0);
     expect(result.selectedTtsVoice()).toBe("af_heart"); // fell back to first preset
   });
+
+  it("refreshCloneModelsStatus reflects backend readiness", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "clone_models_status") return { ready: true };
+      return undefined;
+    });
+    const { result } = setupApp();
+    expect(result.cloneModelsReady()).toBe(false);
+    await result.refreshCloneModelsStatus();
+    expect(result.cloneModelsReady()).toBe(true);
+  });
 });

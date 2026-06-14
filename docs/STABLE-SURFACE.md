@@ -87,6 +87,8 @@ resolved `T` or a thrown string on the JS side.
 | `clone_voice` | `name: string`, `referencePath: string` | `ClonedVoiceInfo` / error — v1.20.0 |
 | `list_cloned_voices` | — | `ClonedVoiceInfo[]` — v1.20.0 |
 | `delete_cloned_voice` | `id: string` | — / error — v1.20.0 |
+| `clone_models_status` | — | `{ ready: bool }` — v1.21.0 |
+| `download_clone_models` | — | — / error (downloads ~157 MB on-demand) — v1.21.0 |
 
 ### Recording
 
@@ -136,6 +138,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
 | `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0) |
+| `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
 
 ---
 
@@ -157,6 +160,7 @@ VoiceInfo         { id, name, path, sizeBytes }
 OnnxRuntimeStatus { runtimeAvailable, voicesDir }
 TtsVoiceInfo      { id, name, lang, installed }      // v1.17.0
 ClonedVoiceInfo   { id, name }                       // v1.20.0
+CloneDownloadProgress { file, fileCount, received, total }  // v1.21.0
 SoundboardTile    { id, path, label, extension, sizeBytes, modifiedSecs? }
 VirtualMicStatus  { detected, cableInputDevice: DeviceInfo|null,
                     cableOutputDevice: DeviceInfo|null, downloadUrl }
@@ -251,6 +255,7 @@ Under `%APPDATA%\DivoraVoice\` (created at startup, best-effort):
 presets/<id>.json        user presets (see §4)
 voices/<id>.onnx         user-installed voice-conversion models
 voices/cloned/<id>/      user-cloned TTS voices (se.bin + meta.json) — v1.20.0
+tts/                     on-demand-downloaded OpenVoice cloning models — v1.21.0
 recordings/divora-<date>_<time>.wav   recorded modulated output (16-bit PCM mono)
 ```
 
