@@ -37,6 +37,11 @@ const CONFIG_FILE: &str = "kokoro-config.json";
 /// `OpenVoice` tone-color models for Phase 2 voice cloning — see [`clone`].
 const CLONE_EXTRACTOR_FILE: &str = "openvoice-extractor.onnx";
 const CLONE_CONVERTER_FILE: &str = "openvoice-converter.onnx";
+/// v1.22.0: precomputed per-preset speaker embeddings (bundled JSON,
+/// `{ voiceId: [256 f32] }`) used to auto-pick the closest base for a clone.
+const BASE_SES_FILE: &str = "base-ses.json";
+/// Fallback base voice when auto-selection can't run.
+const DEFAULT_BASE_VOICE: &str = "am_puck";
 
 /// The curated preset voices shipped in Phase 1: `(id, display name, lang)`.
 /// Display names are ours; the ids match Kokoro's voice-pack keys so the
@@ -142,6 +147,17 @@ pub fn list_voices(asset_dir: &Path) -> Vec<TtsVoiceInfo> {
             installed,
         })
         .collect()
+}
+
+/// The short, human label for a preset voice id — the part before the `" — "`
+/// in its display name (e.g. `am_puck` → `"Puck"`). `None` if `id` isn't a
+/// preset. Used to show which base a cloned voice was matched to.
+#[must_use]
+pub fn preset_short_name(id: &str) -> Option<&'static str> {
+    PRESET_VOICES
+        .iter()
+        .find(|&&(p, _, _)| p == id)
+        .map(|&(_, name, _)| name.split(" — ").next().unwrap_or(name))
 }
 
 /// Load Kokoro (vocab + voice pack + session) and render each already-split
@@ -304,6 +320,55 @@ pub fn extract_voice_se(
         .ok_or_else(|| TtsError::Inference("speaker-embedding extraction failed".to_string()))
 }
 
+/// Cosine similarity of two equal-length vectors (0.0 if either is degenerate).
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Pick the preset base voice whose natural timbre is closest to `target_se`
+/// (highest speaker-embedding cosine), reading the bundled [`BASE_SES_FILE`]
+/// under `asset_dir`.
+///
+/// This makes a cloned voice inherit the accent/gender of the nearest preset
+/// instead of always starting from one fixed base, so e.g. a UK-sounding
+/// reference clones from a UK base. Only ids that are real presets are
+/// considered. Falls back to [`DEFAULT_BASE_VOICE`] when the file is missing,
+/// unparseable, or yields no usable match (so cloning still works before the
+/// asset is staged).
+#[must_use]
+pub fn pick_base_voice(target_se: &[f32], asset_dir: &Path) -> String {
+    if target_se.len() != clone::SE_DIM {
+        return DEFAULT_BASE_VOICE.to_string();
+    }
+    let Ok(text) = std::fs::read_to_string(asset_dir.join(BASE_SES_FILE)) else {
+        return DEFAULT_BASE_VOICE.to_string();
+    };
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, Vec<f32>>>(&text)
+    else {
+        return DEFAULT_BASE_VOICE.to_string();
+    };
+    let mut best_id = DEFAULT_BASE_VOICE.to_string();
+    let mut best_cos = f32::MIN;
+    for (id, se) in map {
+        if se.len() != target_se.len() || !PRESET_VOICES.iter().any(|&(p, _, _)| p == id) {
+            continue;
+        }
+        let c = cosine(&se, target_se);
+        if c > best_cos {
+            best_cos = c;
+            best_id = id;
+        }
+    }
+    best_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +412,52 @@ mod tests {
     #[test]
     fn paths_not_installed_for_empty_dir() {
         assert!(!TtsPaths::new(&empty_assets()).installed());
+    }
+
+    #[test]
+    fn pick_base_voice_defaults_without_file() {
+        // No base-ses.json staged → documented fallback to the default base.
+        let got = pick_base_voice(&vec![0.1_f32; clone::SE_DIM], &empty_assets());
+        assert_eq!(got, DEFAULT_BASE_VOICE);
+    }
+
+    #[test]
+    fn pick_base_voice_wrong_dim_defaults() {
+        // A target SE of the wrong dimension can't be matched → fallback.
+        let got = pick_base_voice(&[0.1, 0.2, 0.3], &empty_assets());
+        assert_eq!(got, DEFAULT_BASE_VOICE);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn pick_base_voice_chooses_highest_cosine_among_presets() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("divora-pick-base-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let target: Vec<f32> = (0..clone::SE_DIM).map(|i| i as f32 + 1.0).collect();
+        // am_michael: target with one sign flip → cosine just under 1.0.
+        let mut michael = target.clone();
+        michael[0] = -michael[0];
+        // af_heart: reversed → markedly lower cosine.
+        let mut heart = target.clone();
+        heart.reverse();
+
+        let mut map = std::collections::BTreeMap::<String, Vec<f32>>::new();
+        map.insert("am_michael".to_string(), michael);
+        map.insert("af_heart".to_string(), heart);
+        // A non-preset id collinear with the target (cosine 1.0): it would win
+        // outright if the preset filter were broken, so it guards that filter.
+        map.insert("zzz_not_a_preset".to_string(), target.clone());
+
+        let json = serde_json::to_string(&map).unwrap();
+        std::fs::File::create(dir.join(BASE_SES_FILE))
+            .unwrap()
+            .write_all(json.as_bytes())
+            .unwrap();
+
+        assert_eq!(pick_base_voice(&target, &dir), "am_michael");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Full real pipeline — espeak-ng subprocess → tokens → Kokoro → audio.

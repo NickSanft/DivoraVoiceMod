@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-06-14 — Speak: clones auto-match the closest base voice
+
+Cloning a voice used to always start from one fixed base (`am_puck`); now the app **auto-picks the preset that already sounds closest to you** and clones from that. A UK-sounding reference starts from a UK base, a female reference from a female base — so the accent and register land closer with no extra steps. The "Your voices" list shows which base each clone was matched to (e.g. *based on Puck*).
+
+### Changed
+
+- **Auto-pick clone base.** At clone time the app compares your reference's speaker embedding against every preset's and generates from the best match instead of a hard-coded base. Existing cloned voices keep their stored base; re-clone to adopt the new pick. Falls back to `am_puck` if the comparison data is unavailable.
+
+### Architecture (additive)
+
+- New `tts::pick_base_voice(target_se, asset_dir)` (argmax speaker-embedding cosine over the bundled `base-ses.json`, restricted to real presets, default-on-missing) + `tts::preset_short_name`. `clone_voice` stores the picked id in `meta.base`; `ClonedVoiceInfo` gains a `baseName` field surfaced under each cloned voice. `base-ses.json` (7 preset SEs, ~37 KB — extracted once with the OpenVoice extractor) is **bundled** (added to `tauri.bundle.conf.json` + `fetch-voice-assets.ps1`), not download-on-demand. No change to the big on-demand models.
+
+### Tests
+
+- +3 Rust (`pick_base_voice`: default-without-file, wrong-dim, and highest-cosine-among-presets incl. a non-preset-filter guard). Full pre-push checklist green.
+
 ## [1.21.0] — 2026-06-14 — Speak: smaller install (cloning models download on demand)
 
 The voice-cloning models are no longer bundled, so the installer drops from ~237 MB back to **~91 MB**. The first time you add your own voice, Speak downloads the ~157 MB OpenVoice models once into `%APPDATA%`, with a progress bar.

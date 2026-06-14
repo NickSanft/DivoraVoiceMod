@@ -46,6 +46,7 @@ $ttsFiles = @(
   "kokoro-v1.0.int8.onnx",     # Kokoro int8 model (~88 MB)
   "voices-divora.bin",         # compact DVTS style pack (preset voices)
   "kokoro-config.json",        # model config (holds the phoneme vocab)
+  "base-ses.json",             # v1.22.0: per-preset speaker embeddings (clone base auto-pick)
   "espeak-ng.exe",             # espeak-ng CLI (GPL-3.0)
   "libespeak-ng.dll"           # espeak-ng runtime lib
 )

@@ -306,7 +306,25 @@ export function SpeakScreen(): JSX.Element {
                           >
                             <Sigil name="mic" size={16} />
                           </span>
-                          {voice.name}
+                          <span
+                            style={{
+                              display: "flex",
+                              "flex-direction": "column",
+                              "min-width": 0,
+                            }}
+                          >
+                            <span>{voice.name}</span>
+                            <Show when={voice.baseName}>
+                              <span
+                                style={{
+                                  "font-size": "0.72rem",
+                                  color: "var(--text-low)",
+                                }}
+                              >
+                                based on {voice.baseName}
+                              </span>
+                            </Show>
+                          </span>
                         </button>
                         <button
                           type="button"

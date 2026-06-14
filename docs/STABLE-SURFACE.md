@@ -159,7 +159,7 @@ EffectSpec        { kind: EffectKindWire, enabled, params: {string: number} }
 VoiceInfo         { id, name, path, sizeBytes }
 OnnxRuntimeStatus { runtimeAvailable, voicesDir }
 TtsVoiceInfo      { id, name, lang, installed }      // v1.17.0
-ClonedVoiceInfo   { id, name }                       // v1.20.0
+ClonedVoiceInfo   { id, name, baseName }             // v1.20.0; baseName v1.22.0
 CloneDownloadProgress { file, fileCount, received, total }  // v1.21.0
 SoundboardTile    { id, path, label, extension, sizeBytes, modifiedSecs? }
 VirtualMicStatus  { detected, cableInputDevice: DeviceInfo|null,

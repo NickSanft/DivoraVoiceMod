@@ -314,6 +314,11 @@ export async function stopSpeak(): Promise<void> {
 export interface ClonedVoiceInfo {
   id: string;
   name: string;
+  /**
+   * Short label of the preset this clone was auto-matched to (v1.22.0), e.g.
+   * `"Puck"`. Empty string when the stored base isn't a known preset.
+   */
+  baseName: string;
 }
 
 /** List the user's cloned voices. */

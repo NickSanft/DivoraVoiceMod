@@ -1964,7 +1964,8 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
 
   it("refreshClonedVoices populates the cloned-voice list", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "list_cloned_voices") return [{ id: "my-voice", name: "My Voice" }];
+      if (cmd === "list_cloned_voices")
+        return [{ id: "my-voice", name: "My Voice", baseName: "Puck" }];
       return undefined;
     });
     const { result } = setupApp();
@@ -1974,7 +1975,7 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
   });
 
   it("removeClonedVoice deletes, refreshes, and resets a deleted selection", async () => {
-    let cloned = [{ id: "my-voice", name: "My Voice" }];
+    let cloned = [{ id: "my-voice", name: "My Voice", baseName: "Puck" }];
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "list_cloned_voices") return cloned;
       if (cmd === "delete_cloned_voice") {

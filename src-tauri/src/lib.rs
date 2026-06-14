@@ -611,6 +611,9 @@ struct ClonedVoiceInfo {
     /// Stable slug id (also the on-disk folder name).
     id: String,
     name: String,
+    /// Short label of the preset this clone was matched to (v1.22.0), e.g.
+    /// `"Puck"`. Empty if the stored base isn't a known preset.
+    base_name: String,
 }
 
 /// On-disk metadata for a cloned voice (`<id>/meta.json`).
@@ -676,11 +679,20 @@ fn list_cloned_voice_infos(dir: &Path) -> Vec<ClonedVoiceInfo> {
         if !p.is_dir() || !is_safe_voice_id(&id) || !p.join("se.bin").is_file() {
             continue;
         }
-        let name = std::fs::read_to_string(p.join("meta.json"))
+        let meta = std::fs::read_to_string(p.join("meta.json"))
             .ok()
-            .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok())
-            .map_or_else(|| id.clone(), |m| m.name);
-        out.push(ClonedVoiceInfo { id, name });
+            .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok());
+        let name = meta.as_ref().map_or_else(|| id.clone(), |m| m.name.clone());
+        let base_name = meta
+            .as_ref()
+            .and_then(|m| divora_core::tts::preset_short_name(&m.base))
+            .unwrap_or_default()
+            .to_string();
+        out.push(ClonedVoiceInfo {
+            id,
+            name,
+            base_name,
+        });
     }
     out.sort_by_key(|a| a.name.to_lowercase());
     out
@@ -718,9 +730,13 @@ fn clone_voice(
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     std::fs::write(voice_dir.join("se.bin"), bytes).map_err(|e| e.to_string())?;
+    // Auto-pick the closest-sounding preset as the synthesis base (v1.22.0),
+    // so the clone inherits the nearest accent/gender instead of one fixed
+    // base. Falls back to `CLONE_BASE_VOICE` if `base-ses.json` is absent.
+    let base = divora_core::tts::pick_base_voice(&se, &state.tts_assets_dir);
     let meta = ClonedMeta {
         name: name.clone(),
-        base: CLONE_BASE_VOICE.to_string(),
+        base,
     };
     std::fs::write(
         voice_dir.join("meta.json"),
@@ -728,8 +744,15 @@ fn clone_voice(
     )
     .map_err(|e| e.to_string())?;
 
-    tracing::info!(id = %id, name = %name, "cloned voice created");
-    Ok(ClonedVoiceInfo { id, name })
+    tracing::info!(id = %id, name = %name, base = %meta.base, "cloned voice created");
+    let base_name = divora_core::tts::preset_short_name(&meta.base)
+        .unwrap_or_default()
+        .to_string();
+    Ok(ClonedVoiceInfo {
+        id,
+        name,
+        base_name,
+    })
 }
 
 /// List the user's cloned voices for the Speak picker.

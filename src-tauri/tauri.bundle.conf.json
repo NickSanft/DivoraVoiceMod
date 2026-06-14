@@ -7,6 +7,7 @@
       "resources/tts/kokoro-v1.0.int8.onnx": "tts/kokoro-v1.0.int8.onnx",
       "resources/tts/voices-divora.bin": "tts/voices-divora.bin",
       "resources/tts/kokoro-config.json": "tts/kokoro-config.json",
+      "resources/tts/base-ses.json": "tts/base-ses.json",
       "resources/tts/espeak-ng.exe": "tts/espeak-ng.exe",
       "resources/tts/libespeak-ng.dll": "tts/libespeak-ng.dll",
       "resources/tts/espeak-ng-data": "tts/espeak-ng-data"
