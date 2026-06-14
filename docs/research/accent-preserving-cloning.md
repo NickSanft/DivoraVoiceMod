@@ -124,6 +124,44 @@ on CPU?" has moved from **"no, blocked"** to **"plausibly yes — spike VoxCPM a
 Chatterbox to confirm quality + CPU latency before committing."** Keep OpenVoice as
 the fallback regardless.
 
+## Spike results (2026-06-14) — VoxCPM-0.5B vs Chatterbox on `me.wav`
+
+Ran both engines' reference Python impls on **CPU** (torch 2.x+cpu, no GPU),
+cloning the user's voice (`me.wav`, a male US-English reading) on two sentences.
+Audition clips live in `src-tauri/resources/_spike/accent/out/` (gitignored).
+
+| Metric | VoxCPM-0.5B | Chatterbox |
+|---|---|---|
+| License (code / weights) | **Apache / Apache** | **MIT / MIT** |
+| Model download | **1.5 GB** | **3.0 GB** |
+| Load (one-time) | ~18 s | ~22 s |
+| **CPU RTF (cloning)** | **~3.0** (4.6 s line → 13.6 s) | ~4–6 (4.1 s line → 25.9 s) |
+| Timbre cosine vs me.wav (OpenVoice SE) | 0.82–0.85 | 0.83–0.87 |
+| Reference transcript needed? | **Yes** (0.5B continuation mode; transcript-free `reference_wav_path` is VoxCPM2/2B-only, ~16 GB) | No (audio prompt only) |
+| Watermark | none | non-removable Perth watermark |
+
+Findings:
+- **Both clone timbre well** (SE cosine ~0.85, comparable to the Phase-2a
+  OpenVoice result ~0.89) and run on CPU with no GPU.
+- **VoxCPM is the better candidate**: half the download, ~2× faster on CPU,
+  Apache. Caveat: the 0.5B needs the reference *transcript* → an extra ASR step
+  in-product (or the user types what they recorded). A wrong/placeholder
+  transcript made it ramble (9 s for a 4 s line, RTF ~9); the correct transcript
+  fixed both quality and speed (RTF ~3).
+- **Chatterbox is simpler** (transcript-free) but 3.0 GB, slower, watermarked.
+- **Both are heavy for the product**: 1.5–3 GB download (vs the current 157 MB
+  OpenVoice), 13–26 s per sentence on CPU (vs near-instant Kokoro+OpenVoice), and
+  would *replace* Kokoro for cloned voices. A real `ort` integration is a
+  multi-week port (community ONNX exports exist, but the 0.5B decode loops must be
+  wired by hand).
+
+**Accent verdict (the deciding question): pending an ear test** of the audition
+clips vs `me.wav`. Objective metrics confirm cloning works and is permissive +
+CPU-feasible; whether the *accent* is meaningfully better than today's
+timbre-only path is subjective and must be judged by listening. Engineering
+take: technically a **GO** (feasible, permissive, on-CPU), but the size/latency/
+port cost is real — productize only if the accent gain is clearly worth it.
+
 ## Sources
 
 Zero-shot TTS: VoxCPM ([repo](https://github.com/OpenBMB/VoxCPM),
