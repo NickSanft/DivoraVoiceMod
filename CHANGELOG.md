@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.23.0] — 2026-06-14 — Speak: record your voice in-app to clone it
+
+You can now **add your voice by recording it right in the app** — no external WAV needed. In Speak → **Your voices**, name a voice, click **Record**, speak for 20–30 seconds, then **Stop & save** and it's cloned. Importing a clip ("Pick a clip") still works exactly as before.
+
+### Added
+
+- **In-app voice recording for cloning.** A dry-microphone recorder captures a clean reference (pre-effects, so your effect chain doesn't color it) straight into the clone pipeline — extract embedding → auto-pick base (v1.22.0) → save. The clip is transient (deleted after cloning). Requires the engine to be running (it taps the live mic); a clear message tells you to start it otherwise.
+
+### Architecture (additive)
+
+- Engine: a parallel **dry-input reference ring** fed from the input callback (the same lock-free `push_slice` the output recorder uses), drained by a second `recording_writer`. `AudioEngine::start_reference_recording` / `stop_reference_recording` (the stop **blocks until the WAV is finalized**, via a reply channel, so the clip is readable immediately) / `is_reference_recording`; new `EngineState.reference_recording` flag. Backend `start_voice_recording` / `stop_voice_recording(name)` commands reuse a shared `clone_from_path` helper (also used by `clone_voice`). Frontend: a **Record / Stop & save** control next to **Pick a clip** in "Your voices", store `recordingVoice` + `startRecordingVoice` / `stopRecordingVoice`, api wrappers.
+
+### Tests
+
+- +1 Rust (engine reference-recording is idle without a session and the synchronous stop never hangs), +4 frontend (2 api command-name, 2 store: record→clone→select, and the engine-off error path). Full pre-push checklist green.
+
 ## [1.22.0] — 2026-06-14 — Speak: clones auto-match the closest base voice
 
 Cloning a voice used to always start from one fixed base (`am_puck`); now the app **auto-picks the preset that already sounds closest to you** and clones from that. A UK-sounding reference starts from a UK base, a female reference from a female base — so the accent and register land closer with no extra steps. The "Your voices" list shows which base each clone was matched to (e.g. *based on Puck*).

@@ -338,6 +338,27 @@ export async function cloneVoice(
   return invoke<ClonedVoiceInfo>("clone_voice", { name, referencePath });
 }
 
+/**
+ * v1.23.0: start capturing the dry microphone for an in-app clone reference,
+ * so a user can add their voice without an external WAV. The audio engine
+ * must be running; rejects with a message (e.g. "start the engine first")
+ * otherwise.
+ */
+export async function startVoiceRecording(): Promise<void> {
+  return invoke("start_voice_recording");
+}
+
+/**
+ * v1.23.0: stop the in-app capture and clone it into a voice named `name`
+ * (the transient clip is deleted afterward). Resolves to the new voice;
+ * rejects with a message on failure.
+ */
+export async function stopVoiceRecording(
+  name: string,
+): Promise<ClonedVoiceInfo> {
+  return invoke<ClonedVoiceInfo>("stop_voice_recording", { name });
+}
+
 /** Delete a cloned voice by id. */
 export async function deleteClonedVoice(id: string): Promise<void> {
   await invoke("delete_cloned_voice", { id });

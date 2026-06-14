@@ -21,6 +21,10 @@ pub struct EngineState {
     /// Phase 16: true while the modulated output is being recorded to a
     /// WAV file. Gates the output callback's push into the recording ring.
     pub recording: AtomicBool,
+    /// v1.23.0: true while the DRY input (raw mic, pre-effects) is being
+    /// captured to a WAV for voice cloning. Gates the input callback's push
+    /// into the separate reference ring. Independent of `recording`.
+    pub reference_recording: AtomicBool,
     pub input_rms_bits: AtomicU32,
     pub input_peak_bits: AtomicU32,
     pub output_rms_bits: AtomicU32,

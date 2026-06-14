@@ -68,13 +68,29 @@ enum Command {
         path: PathBuf,
     },
     StopRecording,
+    /// v1.23.0: begin capturing the dry input to `path` for voice cloning.
+    StartReferenceRecording {
+        path: PathBuf,
+    },
+    /// v1.23.0: stop the dry capture; `reply` fires once the WAV is finalized.
+    StopReferenceRecording {
+        reply: Sender<()>,
+    },
     Shutdown,
 }
 
 /// Commands to the recording writer thread (drains the recording ring).
 enum RecordingCommand {
-    Start { path: PathBuf },
-    Stop,
+    Start {
+        path: PathBuf,
+    },
+    /// Finalize the open WAV. `reply` (v1.23.0) lets a caller block until the
+    /// file is fully flushed to disk — used by the reference recorder so the
+    /// clip can be decoded immediately after stopping. `None` for the
+    /// fire-and-forget output recorder.
+    Stop {
+        reply: Option<Sender<()>>,
+    },
 }
 
 /// Public handle to the audio engine. Construct once at app startup;
@@ -179,6 +195,34 @@ impl AudioEngine {
         self.state.recording.load(Ordering::Acquire)
     }
 
+    /// v1.23.0: begin recording the **dry input** (raw mic, before effects)
+    /// to a WAV at `path` — the reference clip for voice cloning. Independent
+    /// of [`start_recording`](Self::start_recording) (which captures the
+    /// modulated output). No-op (until next start) if the engine isn't running.
+    pub fn start_reference_recording(&self, path: PathBuf) {
+        let _ = self.tx.send(Command::StartReferenceRecording { path });
+    }
+
+    /// v1.23.0: stop the dry-input reference recording and **block until the
+    /// WAV is finalized** on disk, so the caller can decode it immediately.
+    /// Returns `false` only if the audio thread is gone.
+    pub fn stop_reference_recording(&self) -> bool {
+        let (reply_tx, reply_rx) = channel();
+        if self
+            .tx
+            .send(Command::StopReferenceRecording { reply: reply_tx })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.recv().is_ok()
+    }
+
+    #[must_use]
+    pub fn is_reference_recording(&self) -> bool {
+        self.state.reference_recording.load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Acquire)
@@ -277,27 +321,39 @@ struct StartedStreams {
     sb_tx: Sender<SoundboardCommand>,
     recording_tx: Sender<RecordingCommand>,
     writer: JoinHandle<()>,
+    /// v1.23.0: the dry-input reference recorder's channel + writer thread.
+    reference_tx: Sender<RecordingCommand>,
+    reference_writer: JoinHandle<()>,
 }
 
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
+#[allow(clippy::too_many_lines)] // one command dispatch loop; clearer inline
 fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<Sender<DspCommand>> = None;
     let mut sb_tx: Option<Sender<SoundboardCommand>> = None;
     let mut recording_tx: Option<Sender<RecordingCommand>> = None;
     let mut writer: Option<JoinHandle<()>> = None;
+    // v1.23.0: the parallel dry-input reference recorder (its own ring + writer).
+    let mut reference_tx: Option<Sender<RecordingCommand>> = None;
+    let mut reference_writer: Option<JoinHandle<()>> = None;
 
-    // Tear down the current session's streams + recording writer.
-    // Dropping `recording_tx` disconnects the writer's channel, which
-    // makes it finalize any open WAV and exit; we then join it.
+    // Tear down the current session's streams + recording writers.
+    // Dropping a writer's `tx` disconnects its channel, which makes it
+    // finalize any open WAV and exit; we then join it.
     macro_rules! teardown {
         () => {{
             drop(current.take());
             drop(dsp_tx.take());
             drop(sb_tx.take());
             state.recording.store(false, Ordering::Release);
+            state.reference_recording.store(false, Ordering::Release);
             drop(recording_tx.take());
+            drop(reference_tx.take());
             if let Some(h) = writer.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = reference_writer.take() {
                 let _ = h.join();
             }
             state.running.store(false, Ordering::Release);
@@ -326,6 +382,8 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                         sb_tx = Some(started.sb_tx);
                         recording_tx = Some(started.recording_tx);
                         writer = Some(started.writer);
+                        reference_tx = Some(started.reference_tx);
+                        reference_writer = Some(started.reference_writer);
                         let _ = reply.send(Ok(started.info));
                         Some(started.streams)
                     }
@@ -364,7 +422,24 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             Command::StopRecording => {
                 state.recording.store(false, Ordering::Release);
                 if let Some(tx) = &recording_tx {
-                    let _ = tx.send(RecordingCommand::Stop);
+                    let _ = tx.send(RecordingCommand::Stop { reply: None });
+                }
+            }
+            Command::StartReferenceRecording { path } => {
+                // Only if a session is live (the reference writer exists).
+                if let Some(tx) = &reference_tx {
+                    state.reference_recording.store(true, Ordering::Release);
+                    let _ = tx.send(RecordingCommand::Start { path });
+                }
+            }
+            Command::StopReferenceRecording { reply } => {
+                state.reference_recording.store(false, Ordering::Release);
+                if let Some(tx) = &reference_tx {
+                    // The writer fires `reply` once the WAV is finalized.
+                    let _ = tx.send(RecordingCommand::Stop { reply: Some(reply) });
+                } else {
+                    // No live session/writer — nothing to finalize; unblock now.
+                    let _ = reply.send(());
                 }
             }
             Command::Shutdown => {
@@ -417,6 +492,7 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
 
 #[allow(clippy::needless_pass_by_value)] // state is cloned into the stream closures
 #[allow(clippy::too_many_lines)] // linear device/stream setup; splitting hurts readability
+#[allow(clippy::similar_names)] // parallel recording/reference ring locals read clearer paired
 fn start_streams(
     input_name: Option<&str>,
     output_name: Option<&str>,
@@ -489,6 +565,14 @@ fn start_streams(
     let (recording_producer, recording_consumer) = rec_rb.split();
     let (recording_tx, recording_rx) = channel::<RecordingCommand>();
 
+    // v1.23.0: parallel dry-input reference ring. The input callback pushes
+    // the raw (pre-effects) mono into it only while `state.reference_recording`
+    // is set; its own writer thread drains it to a WAV used as a clone
+    // reference. Separate from the modulated-output recorder above.
+    let reference_rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
+    let (reference_producer, reference_consumer) = reference_rb.split();
+    let (reference_tx, reference_rx) = channel::<RecordingCommand>();
+
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
     let (sb_tx, sb_rx) = channel::<SoundboardCommand>();
 
@@ -499,6 +583,7 @@ fn start_streams(
         input_channels,
         producer,
         state.clone(),
+        reference_producer,
     )?;
     let output_stream = build_output_stream(
         &output_device,
@@ -568,6 +653,13 @@ fn start_streams(
         .spawn(move || recording_writer(recording_consumer, recording_rx, input_rate))
         .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
 
+    // v1.23.0: the reference (dry-input) writer — same drain-to-WAV body,
+    // its own ring + channel, captures at the native input rate.
+    let reference_writer = std::thread::Builder::new()
+        .name("divora-reference".into())
+        .spawn(move || recording_writer(reference_consumer, reference_rx, input_rate))
+        .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
+
     Ok(StartedStreams {
         streams: RunningStreams {
             _input: input_stream,
@@ -579,6 +671,8 @@ fn start_streams(
         sb_tx,
         recording_tx,
         writer,
+        reference_tx,
+        reference_writer,
     })
 }
 
@@ -592,6 +686,11 @@ fn build_input_stream(
     channels: u16,
     mut producer: RingProducer,
     state: Arc<EngineState>,
+    // v1.23.0: the dry (pre-effects) mono is tapped into this ring while
+    // `state.reference_recording` is set; a writer thread drains it to a WAV
+    // used as a voice-clone reference. Always wired — capture can begin
+    // mid-session.
+    mut reference_producer: RingProducer,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -635,6 +734,10 @@ fn build_input_stream(
                 }
                 let slice = &mono[..written];
                 let _ = producer.push_slice(slice);
+                // v1.23.0: tap the dry mono for a clone reference when armed.
+                if state.reference_recording.load(Ordering::Acquire) {
+                    let _ = reference_producer.push_slice(slice);
+                }
                 meter.process(slice);
                 state.store_input(Levels {
                     rms: meter.rms(),
@@ -1064,10 +1167,14 @@ fn recording_writer(mut consumer: RingConsumer, rx: Receiver<RecordingCommand>, 
                         }
                     }
                 }
-                Ok(RecordingCommand::Stop) => {
+                Ok(RecordingCommand::Stop { reply }) => {
                     if let Some(mut w) = writer.take() {
                         drain_recording(&mut consumer, &mut buf, &mut w);
                         let _ = w.finalize();
+                    }
+                    // v1.23.0: signal the caller the file is fully on disk.
+                    if let Some(r) = reply {
+                        let _ = r.send(());
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1205,6 +1312,22 @@ mod tests {
         assert_eq!(samples, vec![0, 16383, -16383, 32767, -32767]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.23.0: the dry-input reference recorder is idle on a fresh engine,
+    /// arming it without a live session is a no-op (stays idle), and stopping
+    /// returns promptly (the engine thread replies even with no writer, so the
+    /// synchronous stop never deadlocks).
+    #[test]
+    fn reference_recording_idle_without_session_and_stop_never_hangs() {
+        let engine = AudioEngine::new();
+        assert!(!engine.is_reference_recording());
+        // No live streams → the writer doesn't exist; arming can't take effect.
+        engine.start_reference_recording(std::env::temp_dir().join("divora-ref-noop.wav"));
+        assert!(!engine.is_reference_recording());
+        // Synchronous stop must still return (engine thread is alive).
+        assert!(engine.stop_reference_recording());
+        assert!(!engine.is_reference_recording());
     }
 
     /// v1.6.0: monitor gain defaults to unity and `set_monitor_gain`

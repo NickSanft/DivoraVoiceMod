@@ -36,6 +36,8 @@ import {
   listTtsVoices as listTtsVoicesCmd,
   listClonedVoices as listClonedVoicesCmd,
   cloneVoice as cloneVoiceCmd,
+  startVoiceRecording as startVoiceRecordingCmd,
+  stopVoiceRecording as stopVoiceRecordingCmd,
   deleteClonedVoice as deleteClonedVoiceCmd,
   pickAudioFile as pickAudioFileCmd,
   cloneModelsStatus as cloneModelsStatusCmd,
@@ -453,6 +455,12 @@ export interface AppState {
   addClonedVoice: (name: string) => Promise<void>;
   /** Delete a cloned voice; if it was selected, fall back to the first preset. */
   removeClonedVoice: (id: string) => Promise<void>;
+  /** v1.23.0: true while the dry mic is being captured for an in-app clone. */
+  recordingVoice: () => boolean;
+  /** v1.23.0: start capturing the dry mic (engine must be running). */
+  startRecordingVoice: () => Promise<void>;
+  /** v1.23.0: stop the capture and clone it into a voice named `name`, then select it. */
+  stopRecordingVoice: (name: string) => Promise<void>;
   /** v1.21.0: whether the (on-demand) voice-cloning models are downloaded. */
   cloneModelsReady: () => boolean;
   /** True while the cloning models are downloading. */
@@ -2147,6 +2155,48 @@ export function createAppState(): AppState {
     }
   };
 
+  // v1.23.0: in-app dry-mic recording of a clone reference.
+  const [recordingVoice, setRecordingVoice] = createSignal(false);
+
+  const startRecordingVoice = async (): Promise<void> => {
+    if (recordingVoice() || cloning()) return;
+    setCloneError(null);
+    try {
+      await startVoiceRecordingCmd();
+      setRecordingVoice(true);
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    }
+  };
+
+  const stopRecordingVoice = async (name: string): Promise<void> => {
+    if (!recordingVoice()) return;
+    setRecordingVoice(false);
+    setCloneError(null);
+    setCloning(true);
+    try {
+      const voice = await stopVoiceRecordingCmd(name.trim());
+      await refreshClonedVoices();
+      setSelectedTtsVoice(voice.id); // auto-select the new voice
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setCloning(false);
+    }
+  };
+
   // v1.21.0: on-demand cloning-model download.
   const [cloneModelsReady, setCloneModelsReady] = createSignal(false);
   const [cloneDownloading, setCloneDownloading] = createSignal(false);
@@ -2313,6 +2363,9 @@ export function createAppState(): AppState {
     refreshClonedVoices,
     addClonedVoice,
     removeClonedVoice,
+    recordingVoice,
+    startRecordingVoice,
+    stopRecordingVoice,
     cloneModelsReady,
     cloneDownloading,
     cloneDownloadPct,

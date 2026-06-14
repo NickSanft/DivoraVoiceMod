@@ -432,7 +432,9 @@ resource dir), same as the AI voice-conversion models.
 
 - [ ] **First run (models not downloaded):** Speak → **Your voices** shows a **Download voice-cloning models (~157 MB)** button. Click it → a progress % appears → on completion the **Add your voice** controls replace it. (Models land in `%APPDATA%/DivoraVoice/tts/`; not in the installer.)
 - [ ] Restart → the models are still present (no re-download); **Add your voice** is shown directly.
-- [ ] Type a name → **Add your voice** → pick a clean 20–30 s WAV of a voice → after a moment it appears in the list and is auto-selected.
+- [ ] Type a name → **Pick a clip** → choose a clean 20–30 s WAV of a voice → after a moment it appears in the list and is auto-selected.
+- [ ] **Record in-app (v1.23.0):** with the engine running, type a name → **Record** (button shows **Stop & save**, a "Recording…" hint appears) → speak 20–30 s → **Stop & save** → the voice is cloned, appears, and is auto-selected (same quality as an imported clip). The transient clip is not left behind in `%TEMP%\DivoraVoice`.
+- [ ] **Record with the engine stopped (v1.23.0):** stop the engine, then **Record** → a graceful "start the engine first" message appears (no crash); the recorder stays idle.
 - [ ] **Auto base-match (v1.22.0):** the new voice shows a small **"based on …"** caption naming a preset (e.g. *based on Puck*). Clone a clearly female and a clearly UK-accented reference → the captioned base shifts toward a female / UK preset accordingly (not always Puck).
 - [ ] Type text → **Speak** with the cloned voice → the output takes on that voice's timbre (accent/cadence come from the Kokoro base). It mixes into a call like any Speak output.
 - [ ] **Delete** a cloned voice (trash icon) → it disappears; if it was selected, the selection falls back to a preset.

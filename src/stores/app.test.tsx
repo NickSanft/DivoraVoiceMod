@@ -2007,4 +2007,43 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     await result.refreshCloneModelsStatus();
     expect(result.cloneModelsReady()).toBe(true);
   });
+
+  it("startRecordingVoice then stopRecordingVoice clones, selects, and clears recording (v1.23.0)", async () => {
+    let started = false;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_voice_recording") {
+        started = true;
+        return undefined;
+      }
+      if (cmd === "stop_voice_recording")
+        return { id: "me", name: "Me", baseName: "Puck" };
+      if (cmd === "list_cloned_voices")
+        return started ? [{ id: "me", name: "Me", baseName: "Puck" }] : [];
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.startRecordingVoice();
+    expect(result.recordingVoice()).toBe(true);
+
+    await result.stopRecordingVoice("Me");
+    expect(result.recordingVoice()).toBe(false);
+    expect(invokeMock).toHaveBeenCalledWith("stop_voice_recording", {
+      name: "Me",
+    });
+    expect(result.selectedTtsVoice()).toBe("me"); // auto-selected the new voice
+  });
+
+  it("startRecordingVoice surfaces an error and stays idle when the engine is off (v1.23.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_voice_recording")
+        throw "start the engine first, then record your voice";
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.startRecordingVoice();
+    expect(result.recordingVoice()).toBe(false);
+    expect(result.cloneError()).toBe(
+      "start the engine first, then record your voice",
+    );
+  });
 });

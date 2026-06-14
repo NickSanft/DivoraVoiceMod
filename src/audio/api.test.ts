@@ -38,6 +38,8 @@ import {
   listTtsVoices,
   listClonedVoices,
   cloneVoice,
+  startVoiceRecording,
+  stopVoiceRecording,
   deleteClonedVoice,
   cloneModelsStatus,
   downloadCloneModels,
@@ -500,6 +502,25 @@ describe("audio api", () => {
     expect(invokeMock).toHaveBeenCalledWith("clone_voice", {
       name: "My Voice",
       referencePath: "C:/clips/me.wav",
+    });
+    expect(v.id).toBe("my-voice");
+  });
+
+  it("startVoiceRecording invokes start_voice_recording", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await startVoiceRecording();
+    expect(invokeMock).toHaveBeenCalledWith("start_voice_recording");
+  });
+
+  it("stopVoiceRecording forwards the name", async () => {
+    invokeMock.mockResolvedValueOnce({
+      id: "my-voice",
+      name: "My Voice",
+      baseName: "Puck",
+    });
+    const v = await stopVoiceRecording("My Voice");
+    expect(invokeMock).toHaveBeenCalledWith("stop_voice_recording", {
+      name: "My Voice",
     });
     expect(v.id).toBe("my-voice");
   });

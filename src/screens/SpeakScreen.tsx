@@ -393,8 +393,8 @@ export function SpeakScreen(): JSX.Element {
                   type="text"
                   value={cloneName()}
                   onInput={(e) => setCloneName(e.currentTarget.value)}
-                  placeholder="Name your voice, then pick a 20–30s clip"
-                  disabled={app.cloning()}
+                  placeholder="Name your voice, then record or pick a 20–30s clip"
+                  disabled={app.cloning() || app.recordingVoice()}
                   style={{
                     flex: "1 1 240px",
                     padding: "var(--s2) var(--s3)",
@@ -407,16 +407,54 @@ export function SpeakScreen(): JSX.Element {
                   }}
                 />
                 <Button
+                  variant={app.recordingVoice() ? "primary" : "secondary"}
+                  icon={app.recordingVoice() ? "stop" : "mic"}
+                  disabled={
+                    app.cloning() ||
+                    (!app.recordingVoice() && cloneName().trim().length === 0)
+                  }
+                  onClick={() => {
+                    if (app.recordingVoice()) {
+                      void app
+                        .stopRecordingVoice(cloneName())
+                        .then(() => setCloneName(""));
+                    } else {
+                      void app.startRecordingVoice();
+                    }
+                  }}
+                >
+                  {app.recordingVoice()
+                    ? "Stop & save"
+                    : app.cloning()
+                      ? "Saving…"
+                      : "Record"}
+                </Button>
+                <Button
                   variant="secondary"
-                  icon="mic"
-                  disabled={app.cloning() || cloneName().trim().length === 0}
+                  icon="folder"
+                  disabled={
+                    app.cloning() ||
+                    app.recordingVoice() ||
+                    cloneName().trim().length === 0
+                  }
                   onClick={() => {
                     void app.addClonedVoice(cloneName()).then(() => setCloneName(""));
                   }}
                 >
-                  {app.cloning() ? "Cloning…" : "Add your voice"}
+                  Pick a clip
                 </Button>
               </div>
+              <Show when={app.recordingVoice()}>
+                <span
+                  role="status"
+                  style={{
+                    "font-size": "var(--t-xs)",
+                    color: "var(--text-low)",
+                  }}
+                >
+                  Recording… speak naturally for 20–30 seconds, then Stop &amp; save.
+                </span>
+              </Show>
             </Show>
 
             <Show when={app.cloneError()}>

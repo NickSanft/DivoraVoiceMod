@@ -85,6 +85,8 @@ resolved `T` or a thrown string on the JS side.
 | `speak` | `text: string`, `voiceId: string` (preset id **or** cloned id), `gain?: number` (v1.18.0, default 1.0), `previewOnly?: bool` (v1.18.0, default false → monitor-only) | duration seconds `f32` / error (e.g. "voices are not installed") |
 | `stop_speak` | — | — |
 | `clone_voice` | `name: string`, `referencePath: string` | `ClonedVoiceInfo` / error — v1.20.0 |
+| `start_voice_recording` | — | — / error ("start the engine first") — v1.23.0 |
+| `stop_voice_recording` | `name: string` | `ClonedVoiceInfo` / error — v1.23.0 |
 | `list_cloned_voices` | — | `ClonedVoiceInfo[]` — v1.20.0 |
 | `delete_cloned_voice` | `id: string` | — / error — v1.20.0 |
 | `clone_models_status` | — | `{ ready: bool }` — v1.21.0 |

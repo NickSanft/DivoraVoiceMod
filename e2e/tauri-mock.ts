@@ -144,6 +144,10 @@ export async function installTauriMock(
         clone_voice: () => {
           throw "text-to-speech voices are not installed";
         },
+        start_voice_recording: () => null,
+        stop_voice_recording: () => {
+          throw "text-to-speech voices are not installed";
+        },
         delete_cloned_voice: () => null,
         clone_models_status: () => ({ ready: false }),
         download_clone_models: () => null,

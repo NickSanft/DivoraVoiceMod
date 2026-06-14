@@ -112,6 +112,10 @@ struct AppState {
     /// connected. Held here so it stays alive — dropping it closes the
     /// port. Replaced on `open_midi_input`, cleared on `close_midi_input`.
     midi_connection: Mutex<Option<MidiInputConnection<()>>>,
+    /// v1.23.0: temp WAV path of an in-progress in-app voice recording (dry
+    /// mic), set by `start_voice_recording` and consumed by
+    /// `stop_voice_recording`. `None` when no capture is active.
+    voice_recording_path: Mutex<Option<PathBuf>>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -707,14 +711,25 @@ fn clone_voice(
     name: String,
     reference_path: String,
 ) -> Result<ClonedVoiceInfo, String> {
+    clone_from_path(&state, &name, Path::new(&reference_path))
+}
+
+/// Decode a reference clip, extract a speaker embedding, auto-pick the closest
+/// base (v1.22.0), and store the cloned voice under `<voices>/cloned/<id>/`.
+/// Shared by [`clone_voice`] (imported file) and [`stop_voice_recording`]
+/// (in-app dry-mic capture, v1.23.0).
+fn clone_from_path(
+    state: &AppState,
+    name: &str,
+    reference_path: &Path,
+) -> Result<ClonedVoiceInfo, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("voice name is required".to_string());
     }
-    let clip = decode_clip(Path::new(&reference_path)).map_err(|e| e.to_string())?;
-    let se =
-        divora_core::tts::extract_voice_se(&clip.samples, clip.sample_rate, &clone_dir(&state))
-            .map_err(|e| e.to_string())?;
+    let clip = decode_clip(reference_path).map_err(|e| e.to_string())?;
+    let se = divora_core::tts::extract_voice_se(&clip.samples, clip.sample_rate, &clone_dir(state))
+        .map_err(|e| e.to_string())?;
 
     let dir = cloned_voices_dir(&state.voices_dir);
     let taken: std::collections::HashSet<String> = list_cloned_voice_infos(&dir)
@@ -753,6 +768,45 @@ fn clone_voice(
         name,
         base_name,
     })
+}
+
+/// v1.23.0: begin capturing the dry mic to a temp WAV for an in-app clone
+/// reference. Requires the engine to be running (the dry tap lives in the
+/// live input callback). The path is held in `AppState` until
+/// [`stop_voice_recording`] consumes it.
+#[tauri::command]
+fn start_voice_recording(state: State<'_, AppState>) -> Result<(), String> {
+    if !state.engine.is_running() {
+        return Err("start the engine first, then record your voice".to_string());
+    }
+    let dir = std::env::temp_dir().join("DivoraVoice");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // A fixed name is fine — only one capture runs at a time and it's consumed
+    // (deleted) on stop.
+    let path = dir.join("voice-reference.wav");
+    *state.voice_recording_path.lock().unwrap() = Some(path.clone());
+    state.engine.start_reference_recording(path);
+    Ok(())
+}
+
+/// v1.23.0: stop the dry-mic capture (blocks until the WAV is finalized) and
+/// turn it into a cloned voice named `name`. The temp clip is deleted after.
+#[tauri::command]
+fn stop_voice_recording(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ClonedVoiceInfo, String> {
+    state.engine.stop_reference_recording();
+    let path = state
+        .voice_recording_path
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| "no voice recording in progress".to_string())?;
+    let result = clone_from_path(&state, &name, &path);
+    // Best-effort cleanup of the transient reference clip.
+    let _ = std::fs::remove_file(&path);
+    result
 }
 
 /// List the user's cloned voices for the Speak picker.
@@ -1297,6 +1351,7 @@ pub fn run() {
                 recordings_dir,
                 logs_dir,
                 midi_connection: Mutex::new(None),
+                voice_recording_path: Mutex::new(None),
             });
             Ok(())
         })
@@ -1337,6 +1392,8 @@ pub fn run() {
             speak,
             stop_speak,
             clone_voice,
+            start_voice_recording,
+            stop_voice_recording,
             list_cloned_voices,
             delete_cloned_voice,
             clone_models_status,
