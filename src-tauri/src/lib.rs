@@ -116,6 +116,10 @@ struct AppState {
     /// mic), set by `start_voice_recording` and consumed by
     /// `stop_voice_recording`. `None` when no capture is active.
     voice_recording_path: Mutex<Option<PathBuf>>,
+    /// `VoxCPM` accent-preserving cloning engine (4 ONNX sessions + tokenizer),
+    /// lazy-loaded on first `VoxCPM` cloned-voice speak and held (each is hundreds
+    /// of MB). `None` until first use / when the models aren't installed.
+    voxcpm_engine: Mutex<Option<divora_core::tts::voxcpm::VoxCpmEngine>>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -542,24 +546,28 @@ fn speak(
     gain: Option<f32>,
     preview_only: Option<bool>,
 ) -> Result<f32, String> {
-    // A cloned-voice id resolves to a stored speaker embedding → route it
-    // through the `OpenVoice` converter on the `am_puck` base. Otherwise it's a
-    // preset id → plain Kokoro.
+    // A cloned-voice id routes through its stored engine: `VoxCPM` (accent-
+    // preserving, from the reference clip) or OpenVoice (timbre-only, from the
+    // stored SE on the `am_puck` base). A preset id → plain Kokoro.
+    let to_err = |e: divora_core::tts::TtsError| {
+        tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
+        e.to_string()
+    };
     let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
-        Some((se, base)) => divora_core::tts::synthesize_cloned(
+        Some(ClonedVoice::VoxCpm { reference }) => speak_voxcpm(&state, &text, &reference)?,
+        Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
             &text,
             &base,
             &se,
             &state.tts_assets_dir,
             &clone_dir(&state),
             CLONE_TAU,
-        ),
-        None => divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir),
-    }
-    .map_err(|e| {
-        tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
-        e.to_string()
-    })?;
+        )
+        .map_err(to_err)?,
+        None => {
+            divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir).map_err(to_err)?
+        }
+    };
     let sample_rate = audio.sample_rate;
     let samples = Arc::new(audio.samples);
     #[allow(clippy::cast_precision_loss)]
@@ -607,6 +615,9 @@ fn stop_speak(state: State<'_, AppState>) {
 const CLONE_BASE_VOICE: &str = "am_puck";
 /// `OpenVoice` conversion temperature (its default).
 const CLONE_TAU: f32 = 0.3;
+/// Fixed diffusion seed for `VoxCPM` so a cloned voice sounds the same each time
+/// it speaks (reproducible) rather than drifting per utterance.
+const VOXCPM_SEED: u64 = 0x4469_766F_7261; // "Divora"
 
 /// One user-cloned voice (wire type for the Speak picker).
 #[derive(Debug, Clone, Serialize)]
@@ -624,13 +635,30 @@ struct ClonedVoiceInfo {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct ClonedMeta {
     name: String,
-    /// Kokoro base voice used for generation before tone-color conversion.
+    /// Kokoro base voice used for generation before tone-color conversion
+    /// (`OpenVoice` engine only).
     #[serde(default = "default_clone_base")]
     base: String,
+    /// Cloning engine: `"openvoice"` (timbre-only, stores `se.bin`) or
+    /// `"voxcpm"` (accent-preserving, stores `reference.wav`). Defaults to
+    /// `"openvoice"` for voices cloned before v2 (no field).
+    #[serde(default = "default_engine")]
+    engine: String,
 }
 
 fn default_clone_base() -> String {
     CLONE_BASE_VOICE.to_string()
+}
+
+fn default_engine() -> String {
+    "openvoice".to_string()
+}
+
+/// A resolved cloned voice ready for synthesis — the two engines need different
+/// inputs (`OpenVoice` an SE + Kokoro base; `VoxCPM` the raw reference clip).
+enum ClonedVoice {
+    OpenVoice { se: Vec<f32>, base: String },
+    VoxCpm { reference: PathBuf },
 }
 
 /// Directory holding user-cloned voices: `<voices>/cloned/`.
@@ -647,13 +675,26 @@ fn is_safe_voice_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Load a cloned voice's 256-d speaker embedding (`<id>/se.bin`, f32 LE) and
-/// its base voice. `None` if `id` isn't a stored cloned voice.
-fn load_cloned_voice(voices_dir: &Path, id: &str) -> Option<(Vec<f32>, String)> {
+/// Resolve a stored cloned voice for synthesis. `None` if `id` isn't a cloned
+/// voice. Branches on the stored `engine`: `VoxCPM` voices carry a
+/// `reference.wav`; `OpenVoice` voices (incl. pre-v2, no meta) carry `se.bin`.
+fn load_cloned_voice(voices_dir: &Path, id: &str) -> Option<ClonedVoice> {
     if !is_safe_voice_id(id) {
         return None;
     }
     let dir = cloned_voices_dir(voices_dir).join(id);
+    let meta = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok());
+
+    if meta.as_ref().is_some_and(|m| m.engine == "voxcpm") {
+        let reference = dir.join("reference.wav");
+        return reference
+            .is_file()
+            .then_some(ClonedVoice::VoxCpm { reference });
+    }
+
+    // OpenVoice (or legacy, no meta): 256-d SE + Kokoro base.
     let bytes = std::fs::read(dir.join("se.bin")).ok()?;
     if bytes.len() != 256 * 4 {
         return None;
@@ -662,11 +703,8 @@ fn load_cloned_voice(voices_dir: &Path, id: &str) -> Option<(Vec<f32>, String)> 
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let base = std::fs::read_to_string(dir.join("meta.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok())
-        .map_or_else(|| CLONE_BASE_VOICE.to_string(), |m| m.base);
-    Some((se, base))
+    let base = meta.map_or_else(|| CLONE_BASE_VOICE.to_string(), |m| m.base);
+    Some(ClonedVoice::OpenVoice { se, base })
 }
 
 /// Scan `<voices>/cloned/` for valid cloned voices (folders with an `se.bin`).
@@ -680,7 +718,9 @@ fn list_cloned_voice_infos(dir: &Path) -> Vec<ClonedVoiceInfo> {
         let Some(id) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
             continue;
         };
-        if !p.is_dir() || !is_safe_voice_id(&id) || !p.join("se.bin").is_file() {
+        // A valid clone has either an OpenVoice SE or a `VoxCPM` reference clip.
+        let has_voice = p.join("se.bin").is_file() || p.join("reference.wav").is_file();
+        if !p.is_dir() || !is_safe_voice_id(&id) || !has_voice {
             continue;
         }
         let meta = std::fs::read_to_string(p.join("meta.json"))
@@ -752,6 +792,7 @@ fn clone_from_path(
     let meta = ClonedMeta {
         name: name.clone(),
         base,
+        engine: "openvoice".to_string(),
     };
     std::fs::write(
         voice_dir.join("meta.json"),
@@ -803,10 +844,62 @@ fn stop_voice_recording(
         .unwrap()
         .take()
         .ok_or_else(|| "no voice recording in progress".to_string())?;
-    let result = clone_from_path(&state, &name, &path);
+    // The recorder has the user read READ_ALOUD_PROMPT, so the recording is a
+    // `VoxCPM` reference (accent-preserving) when those models are present; else
+    // fall back to OpenVoice timbre-transfer.
+    let result = if divora_core::tts::voxcpm::models_present(&voxcpm_dir(&state)) {
+        store_voxcpm_clone(&state, &name, &path)
+    } else {
+        clone_from_path(&state, &name, &path)
+    };
     // Best-effort cleanup of the transient reference clip.
     let _ = std::fs::remove_file(&path);
     result
+}
+
+/// Store a `VoxCPM` cloned voice: keep the recorded `reference` clip + a meta
+/// marking the `voxcpm` engine. Unlike the `OpenVoice` path, no SE is extracted —
+/// `VoxCPM` conditions on the raw clip at speak time.
+fn store_voxcpm_clone(
+    state: &AppState,
+    name: &str,
+    reference: &Path,
+) -> Result<ClonedVoiceInfo, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("voice name is required".to_string());
+    }
+    // Validate the recording decodes before committing it.
+    decode_clip(reference).map_err(|e| e.to_string())?;
+
+    let dir = cloned_voices_dir(&state.voices_dir);
+    let taken: std::collections::HashSet<String> = list_cloned_voice_infos(&dir)
+        .into_iter()
+        .map(|v| v.id)
+        .collect();
+    let id = unique_preset_id(&name, &name, &taken);
+    let voice_dir = dir.join(&id);
+    std::fs::create_dir_all(&voice_dir).map_err(|e| e.to_string())?;
+    std::fs::copy(reference, voice_dir.join("reference.wav")).map_err(|e| e.to_string())?;
+
+    let meta = ClonedMeta {
+        name: name.clone(),
+        base: CLONE_BASE_VOICE.to_string(),
+        engine: "voxcpm".to_string(),
+    };
+    std::fs::write(
+        voice_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    tracing::info!(id = %id, name = %name, "voxcpm cloned voice created");
+    // `VoxCPM` clones the user directly (no preset base), so no "based on" label.
+    Ok(ClonedVoiceInfo {
+        id,
+        name,
+        base_name: String::new(),
+    })
 }
 
 /// List the user's cloned voices for the Speak picker.
@@ -848,6 +941,50 @@ fn clone_dir(state: &AppState) -> PathBuf {
     } else {
         state.clone_models_dir.clone()
     }
+}
+
+/// Where to read the `VoxCPM` models from (the 4 graphs + tokenizer): the
+/// downloaded user dir if present, else the bundled/dev asset dir, else the
+/// download target. Mirrors [`clone_dir`].
+fn voxcpm_dir(state: &AppState) -> PathBuf {
+    use divora_core::tts::voxcpm::models_present;
+    if models_present(&state.clone_models_dir) {
+        state.clone_models_dir.clone()
+    } else if models_present(&state.tts_assets_dir) {
+        state.tts_assets_dir.clone()
+    } else {
+        state.clone_models_dir.clone()
+    }
+}
+
+/// Synthesize `text` in a `VoxCPM`-cloned voice from its stored `reference` clip
+/// (the user read [`READ_ALOUD_PROMPT`](divora_core::tts::voxcpm::READ_ALOUD_PROMPT)
+/// when recording, so the transcript is known). Lazy-loads + holds the engine.
+fn speak_voxcpm(
+    state: &AppState,
+    text: &str,
+    reference: &Path,
+) -> Result<divora_core::tts::TtsAudio, String> {
+    use divora_core::tts::voxcpm;
+    let clip = decode_clip(reference).map_err(|e| e.to_string())?;
+    let dir = voxcpm_dir(state);
+    let mut guard = state.voxcpm_engine.lock().unwrap();
+    if guard.is_none() {
+        *guard = voxcpm::VoxCpmEngine::load(&dir);
+    }
+    let engine = guard
+        .as_mut()
+        .ok_or_else(|| "voice-cloning models are not installed".to_string())?;
+    engine
+        .synthesize(
+            text,
+            &clip.samples,
+            clip.sample_rate,
+            voxcpm::READ_ALOUD_PROMPT,
+            voxcpm::DEFAULT_CFG,
+            VOXCPM_SEED,
+        )
+        .ok_or_else(|| "voice synthesis failed".to_string())
 }
 
 /// Whether the cloning models are available (so the UI can prompt a
@@ -1352,6 +1489,7 @@ pub fn run() {
                 logs_dir,
                 midi_connection: Mutex::new(None),
                 voice_recording_path: Mutex::new(None),
+                voxcpm_engine: Mutex::new(None),
             });
             Ok(())
         })
