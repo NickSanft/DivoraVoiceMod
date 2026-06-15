@@ -403,6 +403,14 @@ export async function downloadCloneModels(): Promise<void> {
   await invoke("download_clone_models");
 }
 
+/**
+ * v2: download the VoxCPM accent-cloning models (~1.6 GB, one-time). Resolves
+ * when complete; progress arrives via {@link subscribeCloneDownload}.
+ */
+export async function downloadVoxcpmModels(): Promise<void> {
+  await invoke("download_voxcpm_models");
+}
+
 /** Subscribe to cloning-model download progress. Returns the unlisten fn. */
 export async function subscribeCloneDownload(
   handler: (p: CloneDownloadProgress) => void,

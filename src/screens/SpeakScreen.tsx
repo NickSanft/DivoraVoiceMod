@@ -477,6 +477,35 @@ export function SpeakScreen(): JSX.Element {
                   </span>
                 </Show>
               </Show>
+              {/* Accent-preserving upgrade: offer the one-time VoxCPM download
+                  when cloning is available but the accent models aren't. */}
+              <Show when={!app.voxcpmAvailable()}>
+                <div
+                  style={{
+                    display: "flex",
+                    "align-items": "center",
+                    gap: "var(--s3)",
+                    "flex-wrap": "wrap",
+                  }}
+                >
+                  <Button
+                    variant="secondary"
+                    icon="download"
+                    disabled={app.cloneDownloading()}
+                    onClick={() => void app.downloadVoxcpmModels()}
+                  >
+                    {app.cloneDownloading()
+                      ? `Downloading… ${app.cloneDownloadPct()}%`
+                      : "Accent-preserving clones (~1.6 GB)"}
+                  </Button>
+                  <span
+                    style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}
+                  >
+                    One-time download — recorded voices then keep your accent
+                    (without it, clones are timbre-only).
+                  </span>
+                </div>
+              </Show>
             </Show>
 
             <Show when={app.cloneError()}>

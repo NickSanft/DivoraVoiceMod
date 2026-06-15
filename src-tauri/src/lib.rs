@@ -929,6 +929,15 @@ const CLONE_MODELS_BASE_URL: &str =
     "https://github.com/NickSanft/DivoraVoiceMod/releases/download/voice-assets-v2";
 /// The cloning model files to fetch (extractor is tiny; converter is ~157 MB).
 const CLONE_MODEL_FILES: &[&str] = &["openvoice-extractor.onnx", "openvoice-converter.onnx"];
+/// The `VoxCPM` accent-cloning model files to fetch (Q8 graphs + tokenizer,
+/// ~1.6 GB total). Hosted on the same `voice-assets-v2` release.
+const VOXCPM_MODEL_FILES: &[&str] = &[
+    "voxcpm-prefill.onnx",
+    "voxcpm-decode-step.onnx",
+    "voxcpm-vae-encoder.onnx",
+    "voxcpm-vae-decoder.onnx",
+    "voxcpm-tokenizer.json",
+];
 
 /// Where to read the cloning models from: the downloaded user dir if it
 /// has them, else the bundled/dev asset dir (covers dev, where they're staged
@@ -1064,6 +1073,27 @@ fn download_clone_models(app: AppHandle, state: State<'_, AppState>) -> Result<(
             .map_err(|e| format!("downloading {name}: {e}"))?;
     }
     tracing::info!(path = %dir.display(), "clone models downloaded");
+    Ok(())
+}
+
+/// Download the `VoxCPM` accent-cloning models (~1.6 GB) into the user dir,
+/// reusing the `clone-model-download` progress events. Mirrors
+/// [`download_clone_models`]; skips files already present.
+#[tauri::command]
+fn download_voxcpm_models(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.clone_models_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let count = VOXCPM_MODEL_FILES.len();
+    for (i, name) in VOXCPM_MODEL_FILES.iter().enumerate() {
+        let dest = dir.join(name);
+        if dest.is_file() {
+            continue;
+        }
+        let url = format!("{CLONE_MODELS_BASE_URL}/{name}");
+        download_to_file(&app, &url, &dest, i + 1, count)
+            .map_err(|e| format!("downloading {name}: {e}"))?;
+    }
+    tracing::info!(path = %dir.display(), "voxcpm models downloaded");
     Ok(())
 }
 
@@ -1566,6 +1596,7 @@ pub fn run() {
             clone_models_status,
             download_clone_models,
             voxcpm_status,
+            download_voxcpm_models,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,

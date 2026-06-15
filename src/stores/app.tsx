@@ -43,6 +43,7 @@ import {
   cloneModelsStatus as cloneModelsStatusCmd,
   voxcpmStatus as voxcpmStatusCmd,
   downloadCloneModels as downloadCloneModelsCmd,
+  downloadVoxcpmModels as downloadVoxcpmModelsCmd,
   subscribeCloneDownload,
   openMidiInput as openMidiInputCmd,
   closeMidiInput as closeMidiInputCmd,
@@ -478,6 +479,8 @@ export interface AppState {
   voxcpmReadPrompt: () => string;
   /** Refresh VoxCPM availability + read prompt. */
   refreshVoxcpmStatus: () => Promise<void>;
+  /** Download the VoxCPM accent-cloning models (~1.6 GB, one-time). */
+  downloadVoxcpmModels: () => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -2264,6 +2267,40 @@ export function createAppState(): AppState {
     }
   };
 
+  // v2: download the VoxCPM accent-cloning models (~1.6 GB). Reuses the same
+  // download progress signals + event; refreshes VoxCPM availability on done.
+  const downloadVoxcpmModels = async (): Promise<void> => {
+    if (cloneDownloading()) return;
+    setCloneError(null);
+    setCloneDownloading(true);
+    setCloneDownloadPct(0);
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await subscribeCloneDownload((p) => {
+        if (p.total > 0) {
+          setCloneDownloadPct(Math.round((p.received / p.total) * 100));
+        }
+      });
+    } catch {
+      /* not under Tauri — no progress events */
+    }
+    try {
+      await downloadVoxcpmModelsCmd();
+      await refreshVoxcpmStatus();
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setCloneDownloading(false);
+      if (unlisten) unlisten();
+    }
+  };
+
   return {
     nav,
     setNav,
@@ -2395,6 +2432,7 @@ export function createAppState(): AppState {
     voxcpmAvailable,
     voxcpmReadPrompt,
     refreshVoxcpmStatus,
+    downloadVoxcpmModels,
 
     usePreset,
     viewPreset,
