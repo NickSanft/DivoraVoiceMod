@@ -396,6 +396,123 @@ pub fn run_decode(
     Some(preds)
 }
 
+/// A tiny seeded Gaussian noise source (`xorshift64*` + Box–Muller) — `VoxCPM`'s
+/// per-step diffusion noise. Self-contained (no `rand` dep) and deterministic
+/// per seed, so a clone is reproducible (same reference + text + seed → same
+/// audio).
+#[derive(Debug, Clone)]
+pub struct NoiseGen {
+    state: u64,
+}
+
+impl NoiseGen {
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: seed.max(1), // 0 is a fixed point of xorshift
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn next_unit(&mut self) -> f32 {
+        // (0, 1] — 53-bit mantissa precision.
+        ((self.next_u64() >> 11) as f64 / (1u64 << 53) as f64) as f32
+    }
+
+    /// Fill `n` samples drawn from N(0, 1).
+    #[must_use]
+    pub fn normal(&mut self, n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let u1 = self.next_unit().max(1e-7);
+            let u2 = self.next_unit();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = std::f32::consts::TAU * u2;
+            out.push(r * theta.cos());
+            if out.len() < n {
+                out.push(r * theta.sin());
+            }
+        }
+        out
+    }
+}
+
+/// Assemble the decode loop's `pred_feat` patches into the VAE latent tensor
+/// `[1, 64, T*PATCH_SIZE]` (flattened) — per `bluryar`: stack `[1,T,2,64]` →
+/// transpose `(0,3,1,2)` → reshape `[1,64,T*2]`. Returns (latents, L).
+fn assemble_latents(preds: &[StateTensor]) -> Option<(Vec<f32>, usize)> {
+    if preds.is_empty() {
+        return None;
+    }
+    let l = preds.len() * PATCH_SIZE;
+    let mut latents = vec![0f32; VAE_LATENT_DIM * l];
+    for (ti, pred) in preds.iter().enumerate() {
+        if pred.data.len() != PATCH_SIZE * VAE_LATENT_DIM {
+            return None;
+        }
+        for p in 0..PATCH_SIZE {
+            for d in 0..VAE_LATENT_DIM {
+                latents[d * l + ti * PATCH_SIZE + p] = pred.data[p * VAE_LATENT_DIM + d];
+            }
+        }
+    }
+    Some((latents, l))
+}
+
+/// Decode VAE latents `[1, 64, L]` into a 16 kHz mono waveform (`640*L` samples).
+#[must_use]
+pub fn vae_decode(vae_decoder: &mut Session, latents: &[f32], l: usize) -> Option<Vec<f32>> {
+    if l == 0 {
+        return Some(Vec::new());
+    }
+    let z = ndarray::Array3::from_shape_vec((1, VAE_LATENT_DIM, l), latents.to_vec()).ok()?;
+    let inputs = ort::inputs![
+        "z" => ort::value::Tensor::from_array(z).ok()?,
+    ];
+    let outputs = vae_decoder.run(inputs).ok()?;
+    let (_, value) = outputs.iter().next()?;
+    let arr = value.try_extract_array::<f32>().ok()?; // [1, 1, 640*L]
+    Some(arr.iter().copied().collect())
+}
+
+/// Full `VoxCPM` cloned synthesis: reference clip (+ its `prompt_text`) + the
+/// `target_text` → a 16 kHz mono waveform in the reference speaker's voice
+/// (timbre **and** accent). `noise_fn` is the diffusion noise (a [`NoiseGen`] in
+/// production). `None` if any stage fails (caller falls back). The four sessions
+/// + tokenizer are loaded once by the backend and reused across utterances.
+#[allow(clippy::too_many_arguments)] // a pipeline orchestrator; each input is necessary
+#[must_use]
+pub fn synthesize_voxcpm(
+    vae_encoder: &mut Session,
+    prefill: &mut Session,
+    decode_step: &mut Session,
+    vae_decoder: &mut Session,
+    tokenizer: &Tokenizer,
+    prompt_text: &str,
+    target_text: &str,
+    reference: &[f32],
+    reference_rate: u32,
+    cfg: f32,
+    noise_fn: impl FnMut(&[usize]) -> Vec<f32>,
+) -> Option<Vec<f32>> {
+    let patches = encode_prompt(vae_encoder, reference, reference_rate)?;
+    let inp = build_prefill_inputs(tokenizer, prompt_text, target_text, &patches)?;
+    let target_tokens = tokenize(tokenizer, target_text)?.len();
+    let max_len = target_tokens * DECODE_LIMIT_FACTOR + 32; // stop_flag usually ends earlier
+    let state = run_prefill(prefill, &inp)?;
+    let preds = run_decode(decode_step, state, cfg, MIN_DECODE_LEN, max_len, noise_fn)?;
+    let (latents, l) = assemble_latents(&preds)?;
+    vae_decode(vae_decoder, &latents, l)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +710,114 @@ perform differently and have different strengths and weaknesses.";
             let s: f64 = p.data.iter().map(|&x| f64::from(x)).sum();
             assert!((s - e).abs() < 0.05, "step {i} sum {s} vs {e}");
         }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // deterministic seed → bit-identical streams
+    fn noise_gen_reproducible_and_unit_normal() {
+        let mut a = NoiseGen::new(42);
+        let mut b = NoiseGen::new(42);
+        let na = a.normal(2000);
+        assert_eq!(na, b.normal(2000)); // deterministic per seed
+        assert_eq!(na.len(), 2000);
+        let mean = na.iter().sum::<f32>() / 2000.0;
+        let var = na.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / 2000.0;
+        assert!(mean.abs() < 0.12, "mean {mean}");
+        assert!((var - 1.0).abs() < 0.2, "var {var}"); // ~N(0,1)
+        assert_ne!(NoiseGen::new(43).normal(8), NoiseGen::new(44).normal(8));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exactly-representable copied values
+    fn assemble_latents_stacks_and_transposes() {
+        // 2 patches [1,2,64] → latents [1,64,4]. latents[d*4 + ti*2 + p] ==
+        // preds[ti].data[p*64 + d].
+        let mk = |base: f32| StateTensor {
+            shape: vec![1, PATCH_SIZE, VAE_LATENT_DIM],
+            data: (0..PATCH_SIZE * VAE_LATENT_DIM)
+                .map(|i| base + i as f32)
+                .collect(),
+        };
+        let (lat, l) = assemble_latents(&[mk(0.0), mk(1000.0)]).unwrap();
+        assert_eq!(l, 4);
+        assert_eq!(lat.len(), VAE_LATENT_DIM * 4);
+        assert_eq!(lat[0], 0.0); // ti0 p0 d0 -> preds[0].data[0]
+        assert_eq!(lat[1], 64.0); // ti0 p1 d0 -> preds[0].data[64]
+        assert_eq!(lat[15], 1067.0); // ti1 p1 d3 -> preds[1].data[67] = 1000+67
+    }
+
+    /// Full pipeline: reference + text → a real 16 kHz clone waveform. Uses
+    /// random (seeded) noise, so it can't be exact-parity checked — instead it
+    /// asserts the audio is real (long enough, finite, non-silent) and writes it
+    /// to `_spike/accent/out/voxcpm_rust_welcome.wav` for audition. Per-graph
+    /// parity is covered by the other `#[ignore]` tests. Requires the staged
+    /// models + `onnxruntime.dll`. Run:
+    /// `cargo test -p divora-core synthesize_voxcpm_produces_audio -- --ignored`.
+    #[test]
+    #[ignore = "requires staged voxcpm models + onnxruntime.dll (local only)"]
+    fn synthesize_voxcpm_produces_audio() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+
+        let tok = load_tokenizer(Path::new(&format!("{res}/tts/voxcpm-tokenizer.json"))).unwrap();
+        let reader = hound::WavReader::open(format!("{res}/tts/voxcpm-ref-16k.wav")).unwrap();
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+        let mut ve =
+            load_session(Path::new(&format!("{res}/tts/voxcpm-vae-encoder.onnx"))).unwrap();
+        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm_prefill.onnx"))).unwrap();
+        let mut ds =
+            load_session(Path::new(&format!("{res}/tts/voxcpm_decode_step.onnx"))).unwrap();
+        let mut vd =
+            load_session(Path::new(&format!("{res}/tts/voxcpm-vae-decoder.onnx"))).unwrap();
+
+        let prompt_text = "Prosecutors have opened a massive investigation into \
+allegations of fixing games and illegal betting. Different telescope designs \
+perform differently and have different strengths and weaknesses.";
+        let target_text = "Welcome to Divora. This is my own voice, speaking the words I typed.";
+
+        let mut ng = NoiseGen::new(1);
+        let audio = synthesize_voxcpm(
+            &mut ve,
+            &mut pf,
+            &mut ds,
+            &mut vd,
+            &tok,
+            prompt_text,
+            target_text,
+            &samples,
+            VOXCPM_SAMPLE_RATE,
+            DEFAULT_CFG,
+            |shape| ng.normal(shape.iter().product()),
+        )
+        .unwrap();
+
+        let secs = audio.len() as f32 / VOXCPM_SAMPLE_RATE as f32;
+        assert!(
+            audio.len() > 16_000,
+            "got {} samples (~{secs:.1}s)",
+            audio.len()
+        );
+        assert!(audio.iter().all(|x| x.is_finite()));
+        let rms = (audio.iter().map(|&x| x * x).sum::<f32>() / audio.len() as f32).sqrt();
+        assert!(rms > 0.005, "audio too quiet, rms {rms}");
+
+        // Write for audition.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: VOXCPM_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let out = format!("{res}/_spike/accent/out/voxcpm_rust_welcome.wav");
+        if let Ok(mut w) = hound::WavWriter::create(&out, spec) {
+            for &s in &audio {
+                let _ = w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
+            let _ = w.finalize();
+        }
+        eprintln!(
+            "wrote {out}: {} samples (~{secs:.1}s), rms {rms:.4}",
+            audio.len()
+        );
     }
 }
