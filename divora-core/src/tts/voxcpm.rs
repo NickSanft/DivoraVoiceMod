@@ -309,6 +309,93 @@ pub fn run_prefill(prefill: &mut Session, inp: &PrefillInputs) -> Option<Vec<Sta
     Some(state)
 }
 
+/// Output names of the decode_step graph, in order: `pred_feat`, the 5 new
+/// states (dit_hidden + 4 KV), then `stop_flag` (bool).
+const DECODE_OUTPUTS: [&str; 7] = [
+    "pred_feat",
+    "new_dit_hidden",
+    "new_base_next_keys",
+    "new_base_next_values",
+    "new_residual_next_keys",
+    "new_residual_next_values",
+    "stop_flag",
+];
+
+/// Build an `ort` f32 tensor from a shape + row-major data (handles the
+/// varying-rank KV-cache tensors and the 0-d `cfg` scalar uniformly).
+fn array_tensor(shape: &[usize], data: Vec<f32>) -> Option<ort::value::Tensor<f32>> {
+    let arr = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(shape), data).ok()?;
+    ort::value::Tensor::from_array(arr).ok()
+}
+
+/// Run the autoregressive decode loop from the prefill `state` (the 6
+/// [`run_prefill`] outputs), returning the sequence of `pred_feat` latent
+/// patches (`[1, PATCH_SIZE, 64]` each). Each step feeds the 6 state tensors +
+/// `noise_fn(prefix_feat_cond.shape)` + `cfg`; the next `prefix_feat_cond` is the
+/// step's `pred_feat`, and `dit_hidden` + the 4 KV tensors are replaced by the
+/// step's outputs. Stops on the model's `stop_flag` once more than `min_len`
+/// patches exist, or at `max_len`. `noise_fn` is the diffusion noise source
+/// (random in production; deterministic zeros for parity tests).
+#[must_use]
+pub fn run_decode(
+    decode_step: &mut Session,
+    mut state: Vec<StateTensor>,
+    cfg: f32,
+    min_len: usize,
+    max_len: usize,
+    mut noise_fn: impl FnMut(&[usize]) -> Vec<f32>,
+) -> Option<Vec<StateTensor>> {
+    if state.len() != 6 {
+        return None;
+    }
+    let mut preds: Vec<StateTensor> = Vec::new();
+    for _ in 0..max_len {
+        let noise_shape = state[5].shape.clone();
+        let noise = noise_fn(&noise_shape);
+        let inputs = ort::inputs![
+            "dit_hidden" => array_tensor(&state[0].shape, state[0].data.clone())?,
+            "base_next_keys" => array_tensor(&state[1].shape, state[1].data.clone())?,
+            "base_next_values" => array_tensor(&state[2].shape, state[2].data.clone())?,
+            "residual_next_keys" => array_tensor(&state[3].shape, state[3].data.clone())?,
+            "residual_next_values" => array_tensor(&state[4].shape, state[4].data.clone())?,
+            "prefix_feat_cond" => array_tensor(&state[5].shape, state[5].data.clone())?,
+            "noise" => array_tensor(&noise_shape, noise)?,
+            "cfg_value" => array_tensor(&[], vec![cfg])?,
+        ];
+        let outputs = decode_step.run(inputs).ok()?;
+        let get = |name: &str| -> Option<StateTensor> {
+            let arr = outputs[name].try_extract_array::<f32>().ok()?;
+            Some(StateTensor {
+                shape: arr.shape().to_vec(),
+                data: arr.iter().copied().collect(),
+            })
+        };
+        let pred = get(DECODE_OUTPUTS[0])?;
+        let new_state: Vec<StateTensor> = DECODE_OUTPUTS[1..6]
+            .iter()
+            .map(|&n| get(n))
+            .collect::<Option<_>>()?;
+        let stop = preds.len() + 1 > min_len
+            && outputs[DECODE_OUTPUTS[6]]
+                .try_extract_array::<bool>()
+                .ok()
+                .and_then(|a| a.iter().next().copied())
+                .unwrap_or(false);
+
+        preds.push(pred.clone());
+        state[0] = new_state[0].clone();
+        state[1] = new_state[1].clone();
+        state[2] = new_state[2].clone();
+        state[3] = new_state[3].clone();
+        state[4] = new_state[4].clone();
+        state[5] = pred; // next prefix_feat_cond is this step's pred_feat
+        if stop {
+            break;
+        }
+    }
+    Some(preds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +548,50 @@ perform differently and have different strengths and weaknesses.";
             assert_eq!(state[i].shape, *shape, "shape mismatch out {i}");
             let got: f64 = state[i].data.iter().map(|&x| f64::from(x)).sum();
             assert!((got - sum).abs() < 1.0, "out {i} sum {got} vs {sum}");
+        }
+    }
+
+    /// The decode loop port must reproduce the Python ORT oracle step-for-step
+    /// under **fixed (zeros) noise** — proving the 6-tensor state threading +
+    /// the `prefix_feat_cond := pred_feat` update are correct (the real loop
+    /// uses random noise, validated later by audio quality). Requires the staged
+    /// models + `onnxruntime.dll`, so it's `#[ignore]`d. Run:
+    /// `cargo test -p divora-core decode_step_matches_oracle -- --ignored`.
+    #[test]
+    #[ignore = "requires staged voxcpm models + onnxruntime.dll (local only)"]
+    fn decode_step_matches_oracle() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+
+        let tok = load_tokenizer(Path::new(&format!("{res}/tts/voxcpm-tokenizer.json"))).unwrap();
+        let reader = hound::WavReader::open(format!("{res}/tts/voxcpm-ref-16k.wav")).unwrap();
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+        let mut ve =
+            load_session(Path::new(&format!("{res}/tts/voxcpm-vae-encoder.onnx"))).unwrap();
+        let patches = encode_prompt(&mut ve, &samples, VOXCPM_SAMPLE_RATE).unwrap();
+
+        let prompt_text = "Prosecutors have opened a massive investigation into \
+allegations of fixing games and illegal betting. Different telescope designs \
+perform differently and have different strengths and weaknesses.";
+        let target_text = "Welcome to Divora. This is my own voice, speaking the words I typed.";
+        let inp = build_prefill_inputs(&tok, prompt_text, target_text, &patches).unwrap();
+        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm_prefill.onnx"))).unwrap();
+        let state = run_prefill(&mut pf, &inp).unwrap();
+
+        let mut ds =
+            load_session(Path::new(&format!("{res}/tts/voxcpm_decode_step.onnx"))).unwrap();
+        // Zeros noise, 3 steps, min_len huge so the stop flag never fires.
+        let preds = run_decode(&mut ds, state, DEFAULT_CFG, 1000, 3, |shape| {
+            vec![0.0f32; shape.iter().product()]
+        })
+        .unwrap();
+
+        let expect = [12.30785f64, 0.51888, 5.78393];
+        assert_eq!(preds.len(), 3);
+        for (i, (p, &e)) in preds.iter().zip(expect.iter()).enumerate() {
+            assert_eq!(p.shape, vec![1, PATCH_SIZE, VAE_LATENT_DIM]);
+            let s: f64 = p.data.iter().map(|&x| f64::from(x)).sum();
+            assert!((s - e).abs() < 0.05, "step {i} sum {s} vs {e}");
         }
     }
 }
