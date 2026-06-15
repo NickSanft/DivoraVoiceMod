@@ -178,8 +178,9 @@ pub fn convert(
 }
 
 /// Linear-interpolation resample (matches the spike's `np.interp`; the engine
-/// resamples the 22.05 kHz result to 48 kHz on playback anyway).
-fn resample_linear(input: &[f32], src: u32, dst: u32) -> Vec<f32> {
+/// resamples the 22.05 kHz result to 48 kHz on playback anyway). Shared with
+/// [`crate::tts::voxcpm`] (its reference-clip resample to 16 kHz also linear).
+pub(crate) fn resample_linear(input: &[f32], src: u32, dst: u32) -> Vec<f32> {
     if src == dst || input.len() < 2 {
         return input.to_vec();
     }

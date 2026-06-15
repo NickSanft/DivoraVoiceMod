@@ -48,6 +48,17 @@ pub const DEFAULT_CFG: f32 = 2.0;
 pub const MIN_DECODE_LEN: usize = 2;
 /// Per-step decode budget factor relative to the text length.
 pub const DECODE_LIMIT_FACTOR: usize = 6;
+/// Token appended after the text ids to mark the start of audio.
+pub const AUDIO_START_TOKEN: i64 = 101;
+
+/// Audio VAE latent dimension.
+const VAE_LATENT_DIM: usize = 64;
+/// Audio samples per latent step.
+const CHUNK_SIZE: usize = 640;
+/// Latent steps grouped into one patch.
+const PATCH_SIZE: usize = 2;
+/// Audio samples per patch (the VAE input length must be a multiple of this).
+const PATCH_LEN: usize = PATCH_SIZE * CHUNK_SIZE;
 
 /// The fixed sentence the in-app recorder asks the user to read, so its
 /// transcript is known without any ASR model (Phase B decision). Phonetically
@@ -138,6 +149,54 @@ pub fn tokenize(tokenizer: &Tokenizer, text: &str) -> Option<Vec<i64>> {
     Some(encoding.get_ids().iter().map(|&id| i64::from(id)).collect())
 }
 
+/// Encode a reference clip into `VoxCPM` latent patches, flattened row-major as
+/// `[T-1, PATCH_SIZE, 64]` — the prompt conditioning the prefill graph consumes.
+/// `samples`/`sample_rate` is the reference clip at any rate (resampled to
+/// 16 kHz, linearly, matching the reference pipeline). `None` on any failure.
+///
+/// Mirrors `bluryar`'s `encode_audio_to_patches`: pad to a multiple of
+/// [`PATCH_LEN`], run `audio_data` `[1, 1, T]` → latent `[1, 64, L]`, regroup to
+/// `[T, PATCH_SIZE, 64]` and drop the trailing patch.
+#[must_use]
+pub fn encode_prompt(
+    vae_encoder: &mut Session,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Option<Vec<f32>> {
+    let mut audio = crate::tts::clone::resample_linear(samples, sample_rate, VOXCPM_SAMPLE_RATE);
+    if audio.len() < PATCH_LEN {
+        return None;
+    }
+    let rem = audio.len() % PATCH_LEN;
+    if rem != 0 {
+        audio.resize(audio.len() + (PATCH_LEN - rem), 0.0);
+    }
+    let t = audio.len();
+    let input = ndarray::Array3::from_shape_vec((1, 1, t), audio).ok()?;
+    let inputs = ort::inputs![
+        "audio_data" => ort::value::Tensor::from_array(input).ok()?,
+    ];
+    let outputs = vae_encoder.run(inputs).ok()?;
+    let (_, value) = outputs.iter().next()?;
+    let arr = value.try_extract_array::<f32>().ok()?;
+    let arr = arr.into_dimensionality::<ndarray::Ix3>().ok()?; // [1, 64, L]
+    let (_, dim, len) = arr.dim();
+    if dim != VAE_LATENT_DIM || len % PATCH_SIZE != 0 {
+        return None;
+    }
+    let keep = (len / PATCH_SIZE).saturating_sub(1); // drop the trailing patch
+    let mut patches = Vec::with_capacity(keep * PATCH_SIZE * VAE_LATENT_DIM);
+    for ti in 0..keep {
+        for p in 0..PATCH_SIZE {
+            let col = ti * PATCH_SIZE + p;
+            for d in 0..VAE_LATENT_DIM {
+                patches.push(arr[[0, d, col]]);
+            }
+        }
+    }
+    Some(patches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +249,44 @@ mod tests {
                 *expect,
                 "token id mismatch for {text:?}"
             );
+        }
+    }
+
+    /// The Rust VAE-encoder port must reproduce the Python ORT oracle's latent
+    /// patches for the same 16 kHz input (`bluryar`'s `encode_audio_to_patches`
+    /// on `me.wav`). Requires the staged encoder + ref wav + `onnxruntime.dll`,
+    /// so it's `#[ignore]`d. Run:
+    /// `cargo test -p divora-core encode_prompt_matches_oracle -- --ignored`.
+    #[test]
+    #[ignore = "requires staged voxcpm-vae-encoder.onnx + ref wav + onnxruntime.dll (local only)"]
+    fn encode_prompt_matches_oracle() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+
+        let reader = hound::WavReader::open(format!("{res}/tts/voxcpm-ref-16k.wav"))
+            .expect("staged 16 kHz ref wav");
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), 192_000);
+
+        let mut sess = load_session(Path::new(&format!("{res}/tts/voxcpm-vae-encoder.onnx")))
+            .expect("vae encoder session");
+        let patches = encode_prompt(&mut sess, &samples, VOXCPM_SAMPLE_RATE).expect("encode");
+
+        // Oracle: shape (149, 2, 64), sum 535.058, spot values.
+        assert_eq!(patches.len(), 149 * PATCH_SIZE * VAE_LATENT_DIM);
+        let sum: f32 = patches.iter().sum();
+        assert!((sum - 535.058_f32).abs() < 1.0, "sum was {sum}");
+
+        let approx = |a: f32, b: f32| assert!((a - b).abs() < 1e-2, "{a} vs {b}");
+        let first5: [f32; 5] = [0.44306, 0.73455, 0.94602, -0.04608, -0.17029];
+        for (i, &e) in first5.iter().enumerate() {
+            approx(patches[i], e);
+        }
+        // patches[-1, 1, -5:] → flat base for (ti=148, p=1, d=59..63).
+        let last5: [f32; 5] = [0.67470, 0.14353, -0.14778, -0.29811, -1.12688];
+        let base = (148 * PATCH_SIZE + 1) * VAE_LATENT_DIM + (VAE_LATENT_DIM - 5);
+        for (i, &e) in last5.iter().enumerate() {
+            approx(patches[base + i], e);
         }
     }
 }
