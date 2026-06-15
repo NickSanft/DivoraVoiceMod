@@ -75,8 +75,12 @@ VoxCPM-0.5B continuation mode needs the prompt's transcript. Options:
    "import an arbitrary clip" path. Adds a model + a decode loop. Defer unless (1)
    proves insufficient.
 
-Decision leaning: **fixed read-aloud sentence** for the in-app recorder (no ASR),
-optional whisper-ONNX later for imported clips.
+**DECIDED (2026-06-15): fixed read-aloud sentence — no ASR model.** The in-app
+recorder shows a set sentence; the transcript is therefore known and constant, so
+no whisper/ASR is bundled. The imported-clip path can later add an optional
+type-it field or whisper-ONNX, but the primary record→clone flow ships with zero
+transcription model. This removes Phase B's model dependency entirely (it folds
+into the Phase D recorder UX).
 
 ## Phases D–E
 

@@ -21,6 +21,7 @@ pub mod clone;
 pub mod kokoro;
 pub mod phonemize;
 pub mod tokens;
+pub mod voxcpm;
 
 use std::path::{Path, PathBuf};
 
