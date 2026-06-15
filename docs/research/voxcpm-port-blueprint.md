@@ -87,11 +87,12 @@ under fixed noise; the KV cache threaded as uniform `ArrayD`) · ✅ VAE decoder
 *better* than the Python ORT oracle (0.868) and the torch reference (0.854). Each
 graph is parity-tested (`#[ignore]`d, local) against the Python oracle.
 
-**Remaining → Phase D:** quantize the graphs to Q8 (~1.5 GB vs the 4.8 GB fp32
-used for validation) + host on the release for download-on-demand; back-end
-routing (cloned voices → `synthesize_voxcpm`, presets stay on Kokoro); the
-recorder UX (show [`READ_ALOUD_PROMPT`] so the transcript is known). Then ship
-(Phase E).
+**Shipped (v1.24.0).** Phases D + E done: **per-channel** Q8 of prefill + decode
+(per-tensor Q8 was too lossy — 0.71; per-channel restores 0.88) + fp32 VAE ≈
+**1.6 GB**, hosted on `voice-assets-v2`, downloaded on demand; `VoxCpmEngine`
+held in `AppState`, `speak` routes `engine: "voxcpm"` clones; recorder shows
+[`READ_ALOUD_PROMPT`] (no ASR); per-utterance random diffusion seed (a fixed
+seed can miss the model's stop and ramble). End-to-end **0.878** in Rust.
 
 | Component | Source of truth | Rust approach | Risk |
 |---|---|---|---|

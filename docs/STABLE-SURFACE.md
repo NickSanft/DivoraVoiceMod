@@ -91,6 +91,8 @@ resolved `T` or a thrown string on the JS side.
 | `delete_cloned_voice` | `id: string` | — / error — v1.20.0 |
 | `clone_models_status` | — | `{ ready: bool }` — v1.21.0 |
 | `download_clone_models` | — | — / error (downloads ~157 MB on-demand) — v1.21.0 |
+| `voxcpm_status` | — | `{ available: bool, readPrompt: string }` — v1.24.0 |
+| `download_voxcpm_models` | — | — / error (downloads ~1.6 GB on-demand) — v1.24.0 |
 
 ### Recording
 

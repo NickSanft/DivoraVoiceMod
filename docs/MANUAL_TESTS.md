@@ -441,6 +441,14 @@ resource dir), same as the AI voice-conversion models.
 - [ ] Restart the app → cloned voices persist (stored under `%APPDATA%/DivoraVoice/voices/cloned/`); a selected cloned voice is restored.
 - [ ] Pick a junk/too-short file → a graceful error appears (no crash).
 
+**Accent-preserving cloning — VoxCPM (v1.24.0):**
+
+- [ ] **Download (first run):** Speak → **Your voices** shows **Accent-preserving clones (~1.6 GB)**. Click → progress % → on completion it disappears (models in `%APPDATA%/DivoraVoice/tts/`; not bundled).
+- [ ] **Record an accent clone:** with the engine running + accent models present, type a name → **Record** → the hint shows a **fixed sentence to read aloud** (not "speak naturally") → read it → **Stop & save** → the voice appears (no "based on …" caption — it's not preset-based).
+- [ ] **Speak it:** type text → **Speak** the recorded voice → the output keeps **your accent and prosody** (not a US/UK preset accent), mixed into a call. Compare to an OpenVoice clone of the same voice (timbre-only) — the accent difference should be audible. (First utterance loads the engine — a few seconds; later ones are quicker.)
+- [ ] **Import stays timbre-only:** **Pick a clip** still produces an OpenVoice clone (timbre-only, with a "based on …" caption) even when the accent models are present.
+- [ ] Restart → accent clones persist + speak correctly (stored as `reference.wav` under `voices/cloned/<id>/`).
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.

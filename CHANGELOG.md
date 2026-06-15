@@ -4,6 +4,27 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.24.0] — 2026-06-15 — Speak: clone your accent (VoxCPM)
+
+Recorded voice clones now **keep your accent and prosody**, not just your timbre. Until now cloning recolored a US/UK preset toward your voice (so a non-US/UK speaker still sounded US/UK); the new engine generates speech conditioned on your actual recording, so the clone sounds like *you*. In Speak → **Your voices**, download the one-time accent models, then **Record** (read the on-screen sentence) → your clone speaks anything in your own voice + accent.
+
+### Added
+
+- **Accent-preserving voice cloning (VoxCPM v2, Apache-2.0).** A reference-conditioned zero-shot TTS engine ported to Rust/`ort` runs fully on-device (CPU). Recording a voice (reading a fixed phonetically-balanced sentence, so no speech-recognition model is needed) stores it as a VoxCPM clone; Speak then generates in your timbre **and** accent. Importing a clip still uses the OpenVoice timbre-only path — a clean split: **Record = accent-preserving, Pick a clip = timbre-only**. Validated end-to-end at a speaker-embedding cosine of **0.878** to the reference (matching the full-precision model).
+
+### Architecture (additive)
+
+- New `divora-core/src/tts/voxcpm.rs`: the full 4-graph VoxCPM pipeline via `ort` — Llama BPE tokenizer (`tokenizers` crate), VAE encode, prefill, the autoregressive `decode_step` + KV-cache loop (diffusion noise from a self-contained seeded `NoiseGen`), VAE decode — wrapped in a held-sessions `VoxCpmEngine`. Each graph was parity-validated against a Python ONNX-Runtime oracle. Backend: `ClonedMeta.engine` (`openvoice`/`voxcpm`) routes `speak` to the right engine, holding the lazy-loaded engine in `AppState`; VoxCPM clones store a `reference.wav` (no SE); `voxcpm_status` + `download_voxcpm_models` commands. Frontend: the recorder shows the read-aloud sentence + an "Accent-preserving clones (~1.6 GB)" one-time download.
+- **Models**: per-channel **Q8** quantized graphs (prefill 0.6 GB + decode 0.8 GB) + fp32 VAE + tokenizer ≈ **1.6 GB**, hosted on `voice-assets-v2` and downloaded on demand (not bundled — the installer stays small). Per-channel Q8 was essential: per-tensor Q8 dropped quality to 0.71; per-channel restores 0.88.
+
+### License
+
+- **VoxCPM-0.5B is Apache-2.0** (code + weights) — no new copyleft. Disclosed in the README.
+
+### Tests
+
+- +10 Rust (`voxcpm`: tokenizer/VAE/prefill/decode parity vs the ORT oracle, `NoiseGen`, latent assembly, end-to-end synthesis) + frontend wiring. Research + port blueprint in `docs/research/`. Full pre-push checklist green.
+
 ## [1.23.0] — 2026-06-14 — Speak: record your voice in-app to clone it
 
 You can now **add your voice by recording it right in the app** — no external WAV needed. In Speak → **Your voices**, name a voice, click **Record**, speak for 20–30 seconds, then **Stop & save** and it's cloned. Importing a clip ("Pick a clip") still works exactly as before.
