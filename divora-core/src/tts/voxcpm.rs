@@ -35,6 +35,7 @@
 use std::path::{Path, PathBuf};
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
+use tokenizers::Tokenizer;
 
 /// `VoxCPM` operates at 16 kHz (the `bluryar` export's prompt + output rate).
 pub const VOXCPM_SAMPLE_RATE: u32 = 16_000;
@@ -122,6 +123,21 @@ pub fn load_session(path: &Path) -> Option<Session> {
         .ok()
 }
 
+/// Load `VoxCPM`'s Llama BPE tokenizer from its `tokenizer.json`.
+#[must_use]
+pub fn load_tokenizer(path: &Path) -> Option<Tokenizer> {
+    Tokenizer::from_file(path).ok()
+}
+
+/// Tokenize `text` into `VoxCPM` token ids. No special tokens are added — this
+/// matches the reference pipeline (`LlamaTokenizerFast.tokenize` +
+/// `convert_tokens_to_ids`); the prefill graph adds the structural tokens.
+#[must_use]
+pub fn tokenize(tokenizer: &Tokenizer, text: &str) -> Option<Vec<i64>> {
+    let encoding = tokenizer.encode(text, false).ok()?;
+    Some(encoding.get_ids().iter().map(|&id| i64::from(id)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +163,33 @@ mod tests {
         // The fixed transcript must be stable + plain so tokenization matches.
         assert!(READ_ALOUD_PROMPT.len() > 40);
         assert!(READ_ALOUD_PROMPT.is_ascii());
+    }
+
+    /// The Rust tokenizer must produce the exact ids the Python reference
+    /// (`LlamaTokenizerFast`) does, or the prefill graph gets wrong inputs.
+    /// Captured from the `bluryar` ORT oracle. Requires the staged
+    /// `voxcpm-tokenizer.json`, so it's `#[ignore]`d (local only). Run:
+    /// `cargo test -p divora-core voxcpm_tokenizer -- --ignored`.
+    #[test]
+    #[ignore = "requires staged voxcpm-tokenizer.json (local only)"]
+    fn tokenizer_matches_reference_ids() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        let tok = load_tokenizer(Path::new(&format!("{res}/tts/voxcpm-tokenizer.json")))
+            .expect("voxcpm-tokenizer.json should load");
+        let cases: &[(&str, &[i64])] = &[
+            ("Welcome to Divora.", &[27841, 1385, 7340, 8390, 72]),
+            (
+                "The quick brown fox jumps over the lazy dog.",
+                &[1507, 4766, 13329, 49712, 43384, 1865, 1358, 29117, 6595, 72],
+            ),
+            ("Hello there, world!", &[21045, 1887, 59342, 2809, 73]),
+        ];
+        for (text, expect) in cases {
+            assert_eq!(
+                tokenize(&tok, text).unwrap(),
+                *expect,
+                "token id mismatch for {text:?}"
+            );
+        }
     }
 }

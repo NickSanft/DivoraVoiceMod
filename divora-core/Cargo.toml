@@ -55,6 +55,12 @@ symphonia = { version = "0.6", features = ["wav", "mp3", "vorbis", "ogg", "flac"
 # we don't depend on a system libopus install on Windows CI.
 symphonia-adapter-libopus = "0.3"
 thiserror = "1"
+# Phase C (accent cloning): load VoxCPM's Llama BPE tokenizer from its
+# `tokenizer.json`. Default features pull in onig (a C oniguruma build) plus a
+# training/HTTP stack we don't need; use the pure-Rust `fancy-regex` backend so
+# the build stays toolchain-free (this tokenizer is plain BPE + a Prepend/
+# Replace normalizer, no regex pre-tokenizer, so it's a lean load-only use).
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 tracing = "0.1"
 walkdir = "2"
 
