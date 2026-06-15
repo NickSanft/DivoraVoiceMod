@@ -44,10 +44,41 @@ loop (autoregressive, until stop token "1" or max_len):
 audio_vae_decoder(concat latents) ─► waveform @ output rate
 ```
 
+## The decode contract (confirmed from `bluryar/infer_loop.py`)
+
+Cleaner than DakeQQ's 8-graph version — the KV cache is **4 opaque state tensors
+threaded through** (no manual slicing; the graph manages them):
+
+- **prefill** (deterministic): `in (text_token, text_mask, audio_feat, audio_mask)`
+  → `out (dit_hidden, base_keys, base_values, residual_keys, residual_values,
+  prefix_feat_cond)`.
+- **decode_step** (per step): `in (dit_hidden, base_keys, base_values,
+  residual_keys, residual_values, prefix_feat_cond, noise, cfg)` →
+  `out (pred_feat, dit_hidden', base_keys', base_values', residual_keys',
+  residual_values', stop_flag)`.
+- **loop:** prefill once; then each step feeds back the 6 state tensors + fresh
+  `noise = randn(prefix_feat_cond.shape)`; append `pred_feat`; stop when
+  `len > min_len && stop_flag`. Assemble `pred_feat`s `[1,T,2,64]` → transpose →
+  `[1,64,T*2]` → `audio_vae_decoder` → waveform.
+- **Input construction:** `text_token = tokenize(prompt_text + target_text) +
+  [AUDIO_START_TOKEN(101)]`; `audio_feat = concat([zeros(text_len, 2, 64),
+  prompt_patches])`; `text_mask`/`audio_mask` = the 1/0 split over text vs audio
+  positions.
+
+**Validation note:** `noise` is random per step, so the decode loop is
+**stochastic** — exact numerical parity isn't possible. Validate it by (a)
+**fixed-noise (zeros) parity** vs the Python ORT oracle for the loop port, then
+(b) **audio quality** (timbre cosine ~0.87 vs the reference, intelligibility)
+with real random noise. Prefill + both VAE graphs are deterministic → exact
+parity (as done for the tokenizer + VAE encoder).
+
 ## Rust port plan (Phase C)
 
 `ort` is already a workspace dep. New `divora-core/src/tts/voxcpm.rs`, mirroring the
-existing `clone.rs`/`kokoro.rs` `ort` patterns.
+existing `clone.rs`/`kokoro.rs` `ort` patterns. **Progress:** ✅ scaffold +
+runtime gate · ✅ tokenizer (exact-id parity vs `LlamaTokenizerFast`) · ✅ VAE
+encoder (`encode_prompt`, patch parity vs oracle) · ⏭ prefill · ⏭ decode loop
+(the crux: thread owned `ort::Value`s across iterations) · ⏭ VAE decoder.
 
 | Component | Source of truth | Rust approach | Risk |
 |---|---|---|---|
