@@ -75,10 +75,23 @@ parity (as done for the tokenizer + VAE encoder).
 ## Rust port plan (Phase C)
 
 `ort` is already a workspace dep. New `divora-core/src/tts/voxcpm.rs`, mirroring the
-existing `clone.rs`/`kokoro.rs` `ort` patterns. **Progress:** ✅ scaffold +
-runtime gate · ✅ tokenizer (exact-id parity vs `LlamaTokenizerFast`) · ✅ VAE
-encoder (`encode_prompt`, patch parity vs oracle) · ⏭ prefill · ⏭ decode loop
-(the crux: thread owned `ort::Value`s across iterations) · ⏭ VAE decoder.
+existing `clone.rs`/`kokoro.rs` `ort` patterns. **Phase C core inference: DONE
+(2026-06-15).** ✅ scaffold + runtime gate · ✅ tokenizer (exact-id parity vs
+`LlamaTokenizerFast`) · ✅ VAE encoder (`encode_prompt`, patch parity) · ✅
+prefill (6-output parity) · ✅ decode loop (`run_decode`, step-for-step parity
+under fixed noise; the KV cache threaded as uniform `ArrayD`) · ✅ VAE decoder +
+`assemble_latents` + `NoiseGen` (seeded Box–Muller) + `synthesize_voxcpm`.
+
+**End-to-end validated:** `synthesize_voxcpm` generates a real ~5.6 s clone of
+`me.wav` on CPU; the Rust output scores **timbre cosine 0.877** vs `me.wav` —
+*better* than the Python ORT oracle (0.868) and the torch reference (0.854). Each
+graph is parity-tested (`#[ignore]`d, local) against the Python oracle.
+
+**Remaining → Phase D:** quantize the graphs to Q8 (~1.5 GB vs the 4.8 GB fp32
+used for validation) + host on the release for download-on-demand; back-end
+routing (cloned voices → `synthesize_voxcpm`, presets stay on Kokoro); the
+recorder UX (show [`READ_ALOUD_PROMPT`] so the transcript is known). Then ship
+(Phase E).
 
 | Component | Source of truth | Rust approach | Risk |
 |---|---|---|---|
