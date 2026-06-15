@@ -181,7 +181,7 @@ pub fn encode_prompt(
     let arr = value.try_extract_array::<f32>().ok()?;
     let arr = arr.into_dimensionality::<ndarray::Ix3>().ok()?; // [1, 64, L]
     let (_, dim, len) = arr.dim();
-    if dim != VAE_LATENT_DIM || len % PATCH_SIZE != 0 {
+    if dim != VAE_LATENT_DIM || !len.is_multiple_of(PATCH_SIZE) {
         return None;
     }
     let keep = (len / PATCH_SIZE).saturating_sub(1); // drop the trailing patch
@@ -195,6 +195,118 @@ pub fn encode_prompt(
         }
     }
     Some(patches)
+}
+
+/// Output names of the prefill graph, in order. The first/last are the model
+/// state we read; the four middle ones are the opaque KV cache.
+const PREFILL_OUTPUTS: [&str; 6] = [
+    "dit_hidden",
+    "base_next_keys",
+    "base_next_values",
+    "residual_next_keys",
+    "residual_next_values",
+    "prefix_feat_cond",
+];
+
+/// The four flattened prefill input tensors + sequence length `S`
+/// (= text positions + audio patches).
+#[derive(Debug, Clone)]
+pub struct PrefillInputs {
+    /// `[1, S]` i64: text ids + `AUDIO_START_TOKEN` + zero-pad over audio.
+    pub text_token: Vec<i64>,
+    /// `[1, S]` i32: 1 over text positions, 0 over audio.
+    pub text_mask: Vec<i32>,
+    /// `[1, S, PATCH_SIZE, 64]` f32: zeros over text positions, then patches.
+    pub feat: Vec<f32>,
+    /// `[1, S]` i32: 0 over text positions, 1 over audio (inverse of text mask).
+    pub feat_mask: Vec<i32>,
+    pub seq_len: usize,
+}
+
+/// One model output/state tensor (shape + row-major data) — the form the decode
+/// loop threads between steps.
+#[derive(Debug, Clone)]
+pub struct StateTensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<f32>,
+}
+
+/// Build the prefill inputs from `prompt_text + target_text` (tokenized
+/// together) and the encoded prompt `patches` (flattened `[P, PATCH_SIZE, 64]`).
+/// Pure — no model needed. Mirrors `bluryar`'s `build_inputs_with_patches`.
+#[must_use]
+pub fn build_prefill_inputs(
+    tokenizer: &Tokenizer,
+    prompt_text: &str,
+    target_text: &str,
+    patches: &[f32],
+) -> Option<PrefillInputs> {
+    let mut text_seed = tokenize(tokenizer, &format!("{prompt_text}{target_text}"))?;
+    text_seed.push(AUDIO_START_TOKEN);
+    assemble_prefill(text_seed, patches)
+}
+
+/// Pure assembly of the prefill tensors from the text token seed (text ids +
+/// `AUDIO_START_TOKEN`) and the prompt `patches`. Split out so the
+/// padding/masking is unit-testable without a tokenizer or model.
+fn assemble_prefill(text_seed: Vec<i64>, patches: &[f32]) -> Option<PrefillInputs> {
+    let text_length = text_seed.len();
+    let stride = PATCH_SIZE * VAE_LATENT_DIM;
+    if stride == 0 || !patches.len().is_multiple_of(stride) {
+        return None;
+    }
+    let audio_length = patches.len() / stride;
+    let seq_len = text_length + audio_length;
+
+    let mut text_token = text_seed;
+    text_token.resize(seq_len, 0); // zero-pad over the audio positions
+
+    let mut text_mask = vec![1i32; text_length];
+    text_mask.resize(seq_len, 0);
+    let mut feat_mask = vec![0i32; text_length];
+    feat_mask.resize(seq_len, 1);
+
+    let mut feat = vec![0f32; text_length * stride];
+    feat.extend_from_slice(patches);
+
+    Some(PrefillInputs {
+        text_token,
+        text_mask,
+        feat,
+        feat_mask,
+        seq_len,
+    })
+}
+
+/// Run the prefill graph, returning its 6 outputs (see [`PREFILL_OUTPUTS`]) as
+/// owned [`StateTensor`]s — `dit_hidden`, the four KV-cache tensors, and
+/// `prefix_feat_cond` — the seed the decode loop iterates from.
+#[must_use]
+pub fn run_prefill(prefill: &mut Session, inp: &PrefillInputs) -> Option<Vec<StateTensor>> {
+    let s = inp.seq_len;
+    let text = ndarray::Array2::from_shape_vec((1, s), inp.text_token.clone()).ok()?;
+    let text_mask = ndarray::Array2::from_shape_vec((1, s), inp.text_mask.clone()).ok()?;
+    let feat_mask = ndarray::Array2::from_shape_vec((1, s), inp.feat_mask.clone()).ok()?;
+    let feat =
+        ndarray::Array4::from_shape_vec((1, s, PATCH_SIZE, VAE_LATENT_DIM), inp.feat.clone())
+            .ok()?;
+
+    let inputs = ort::inputs![
+        "text" => ort::value::Tensor::from_array(text).ok()?,
+        "text_mask" => ort::value::Tensor::from_array(text_mask).ok()?,
+        "feat" => ort::value::Tensor::from_array(feat).ok()?,
+        "feat_mask" => ort::value::Tensor::from_array(feat_mask).ok()?,
+    ];
+    let outputs = prefill.run(inputs).ok()?;
+    let mut state = Vec::with_capacity(PREFILL_OUTPUTS.len());
+    for name in PREFILL_OUTPUTS {
+        let arr = outputs[name].try_extract_array::<f32>().ok()?;
+        state.push(StateTensor {
+            shape: arr.shape().to_vec(),
+            data: arr.iter().copied().collect(),
+        });
+    }
+    Some(state)
 }
 
 #[cfg(test)]
@@ -287,6 +399,68 @@ mod tests {
         let base = (148 * PATCH_SIZE + 1) * VAE_LATENT_DIM + (VAE_LATENT_DIM - 5);
         for (i, &e) in last5.iter().enumerate() {
             approx(patches[base + i], e);
+        }
+    }
+
+    #[test]
+    fn assemble_prefill_pads_and_masks() {
+        let stride = PATCH_SIZE * VAE_LATENT_DIM;
+        let patches = vec![0.5f32; 2 * stride]; // 2 audio patches
+        let inp = assemble_prefill(vec![10, 20, 30], &patches).unwrap();
+        assert_eq!(inp.seq_len, 5); // 3 text + 2 audio
+        assert_eq!(inp.text_token, vec![10, 20, 30, 0, 0]);
+        assert_eq!(inp.text_mask, vec![1, 1, 1, 0, 0]);
+        assert_eq!(inp.feat_mask, vec![0, 0, 0, 1, 1]); // inverse of text_mask
+        assert_eq!(inp.feat.len(), 5 * stride);
+        assert!(inp.feat[..3 * stride].iter().all(|&x| x == 0.0)); // text positions zeroed
+        assert!(inp.feat[3 * stride..]
+            .iter()
+            .all(|&x| (x - 0.5).abs() < 1e-9));
+    }
+
+    /// The prefill graph port must reproduce the Python ORT oracle's 6 outputs
+    /// (deterministic — no noise) for the same inputs: `dit_hidden`, the 4
+    /// KV-cache tensors, and `prefix_feat_cond`. Requires the staged tokenizer +
+    /// VAE encoder + prefill graph + `onnxruntime.dll`, so it's `#[ignore]`d.
+    /// Run: `cargo test -p divora-core prefill_matches_oracle -- --ignored`.
+    #[test]
+    #[ignore = "requires staged voxcpm models + onnxruntime.dll (local only)"]
+    fn prefill_matches_oracle() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+
+        let tok = load_tokenizer(Path::new(&format!("{res}/tts/voxcpm-tokenizer.json"))).unwrap();
+        let reader = hound::WavReader::open(format!("{res}/tts/voxcpm-ref-16k.wav")).unwrap();
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+        let mut ve =
+            load_session(Path::new(&format!("{res}/tts/voxcpm-vae-encoder.onnx"))).unwrap();
+        let patches = encode_prompt(&mut ve, &samples, VOXCPM_SAMPLE_RATE).unwrap();
+
+        // Exact strings used for the oracle capture.
+        let prompt_text = "Prosecutors have opened a massive investigation into \
+allegations of fixing games and illegal betting. Different telescope designs \
+perform differently and have different strengths and weaknesses.";
+        let target_text = "Welcome to Divora. This is my own voice, speaking the words I typed.";
+        let inp = build_prefill_inputs(&tok, prompt_text, target_text, &patches).unwrap();
+        assert_eq!(inp.seq_len, 196);
+
+        // Staged with bluryar's original name (external .onnx.data ref).
+        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm_prefill.onnx"))).unwrap();
+        let state = run_prefill(&mut pf, &inp).unwrap();
+
+        // (shape, sum) per output, from the Python ORT oracle.
+        let expect: [(&[usize], f64); 6] = [
+            (&[1, 1024], -37.88686),
+            (&[1, 24, 2, 196, 64], -1063.36394),
+            (&[1, 24, 2, 196, 64], 2595.34526),
+            (&[1, 6, 2, 196, 64], -1796.92019),
+            (&[1, 6, 2, 196, 64], 65.49082),
+            (&[1, 2, 64], 14.83514),
+        ];
+        for (i, (shape, sum)) in expect.iter().enumerate() {
+            assert_eq!(state[i].shape, *shape, "shape mismatch out {i}");
+            let got: f64 = state[i].data.iter().map(|&x| f64::from(x)).sum();
+            assert!((got - sum).abs() < 1.0, "out {i} sum {got} vs {sum}");
         }
     }
 }
