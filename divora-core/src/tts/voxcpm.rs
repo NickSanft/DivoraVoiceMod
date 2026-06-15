@@ -709,7 +709,10 @@ perform differently and have different strengths and weaknesses.";
         let inp = build_prefill_inputs(&tok, prompt_text, target_text, &patches).unwrap();
         assert_eq!(inp.seq_len, 196);
 
-        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm-prefill.onnx"))).unwrap();
+        let mut pf = load_session(Path::new(&format!(
+            "{res}/_spike/accent/bluryar/models/voxcpm_prefill.onnx"
+        )))
+        .unwrap();
         let state = run_prefill(&mut pf, &inp).unwrap();
 
         // (shape, sum) per output, from the Python ORT oracle.
@@ -752,11 +755,16 @@ allegations of fixing games and illegal betting. Different telescope designs \
 perform differently and have different strengths and weaknesses.";
         let target_text = "Welcome to Divora. This is my own voice, speaking the words I typed.";
         let inp = build_prefill_inputs(&tok, prompt_text, target_text, &patches).unwrap();
-        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm-prefill.onnx"))).unwrap();
+        let mut pf = load_session(Path::new(&format!(
+            "{res}/_spike/accent/bluryar/models/voxcpm_prefill.onnx"
+        )))
+        .unwrap();
         let state = run_prefill(&mut pf, &inp).unwrap();
 
-        let mut ds =
-            load_session(Path::new(&format!("{res}/tts/voxcpm-decode-step.onnx"))).unwrap();
+        let mut ds = load_session(Path::new(&format!(
+            "{res}/_spike/accent/bluryar/models/voxcpm_decode_step.onnx"
+        )))
+        .unwrap();
         // Zeros noise, 3 steps, min_len huge so the stop flag never fires.
         let preds = run_decode(&mut ds, state, DEFAULT_CFG, 1000, 3, |shape| {
             vec![0.0f32; shape.iter().product()]
@@ -836,7 +844,7 @@ perform differently and have different strengths and weaknesses.";
                 VOXCPM_SAMPLE_RATE,
                 prompt_text,
                 DEFAULT_CFG,
-                1,
+                42,
             )
             .expect("synthesize");
         assert_eq!(tts.sample_rate, VOXCPM_SAMPLE_RATE);

@@ -615,8 +615,8 @@ fn stop_speak(state: State<'_, AppState>) {
 const CLONE_BASE_VOICE: &str = "am_puck";
 /// `OpenVoice` conversion temperature (its default).
 const CLONE_TAU: f32 = 0.3;
-/// Fixed diffusion seed for `VoxCPM` so a cloned voice sounds the same each time
-/// it speaks (reproducible) rather than drifting per utterance.
+/// Fallback `VoxCPM` diffusion seed if the system clock is unavailable (normally
+/// each utterance seeds from the clock — see `speak_voxcpm`).
 const VOXCPM_SEED: u64 = 0x4469_766F_7261; // "Divora"
 
 /// One user-cloned voice (wire type for the Speak picker).
@@ -975,6 +975,14 @@ fn speak_voxcpm(
     let engine = guard
         .as_mut()
         .ok_or_else(|| "voice-cloning models are not installed".to_string())?;
+    // Fresh diffusion noise each utterance (a per-utterance seed). A fixed seed
+    // can occasionally fail to trigger the model's stop and ramble to the length
+    // cap; varying it keeps generation healthy (and natural per-utterance
+    // variation is fine for a voice changer).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let seed = u64::try_from(nanos).unwrap_or(VOXCPM_SEED);
     engine
         .synthesize(
             text,
@@ -982,7 +990,7 @@ fn speak_voxcpm(
             clip.sample_rate,
             voxcpm::READ_ALOUD_PROMPT,
             voxcpm::DEFAULT_CFG,
-            VOXCPM_SEED,
+            seed,
         )
         .ok_or_else(|| "voice synthesis failed".to_string())
 }
