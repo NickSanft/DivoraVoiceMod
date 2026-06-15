@@ -513,6 +513,67 @@ pub fn synthesize_voxcpm(
     vae_decode(vae_decoder, &latents, l)
 }
 
+/// The loaded `VoxCPM` engine: the four ONNX sessions + the tokenizer, held
+/// together so the backend loads them once (each is hundreds of MB) and reuses
+/// them across utterances. Constructed via [`VoxCpmEngine::load`] once the
+/// models are downloaded; [`synthesize`](Self::synthesize) clones a voice.
+pub struct VoxCpmEngine {
+    vae_encoder: Session,
+    prefill: Session,
+    decode_step: Session,
+    vae_decoder: Session,
+    tokenizer: Tokenizer,
+}
+
+impl VoxCpmEngine {
+    /// Load all four graphs + the tokenizer from `model_dir`. `None` if any are
+    /// missing or the ONNX runtime is unavailable (caller falls back to the
+    /// OpenVoice path).
+    #[must_use]
+    pub fn load(model_dir: &Path) -> Option<Self> {
+        let p = VoxCpmPaths::new(model_dir);
+        Some(Self {
+            vae_encoder: load_session(&p.vae_encoder)?,
+            prefill: load_session(&p.prefill)?,
+            decode_step: load_session(&p.decode_step)?,
+            vae_decoder: load_session(&p.vae_decoder)?,
+            tokenizer: load_tokenizer(&p.tokenizer)?,
+        })
+    }
+
+    /// Clone `reference` (spoken text `prompt_text`) saying `target_text`, as a
+    /// 16 kHz [`crate::tts::TtsAudio`]. `seed` makes a clone reproducible.
+    #[must_use]
+    pub fn synthesize(
+        &mut self,
+        target_text: &str,
+        reference: &[f32],
+        reference_rate: u32,
+        prompt_text: &str,
+        cfg: f32,
+        seed: u64,
+    ) -> Option<crate::tts::TtsAudio> {
+        let mut noise = NoiseGen::new(seed);
+        let samples = synthesize_voxcpm(
+            &mut self.vae_encoder,
+            &mut self.prefill,
+            &mut self.decode_step,
+            &mut self.vae_decoder,
+            &self.tokenizer,
+            prompt_text,
+            target_text,
+            reference,
+            reference_rate,
+            cfg,
+            |shape| noise.normal(shape.iter().product()),
+        )?;
+        Some(crate::tts::TtsAudio {
+            samples,
+            sample_rate: VOXCPM_SAMPLE_RATE,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,8 +709,7 @@ perform differently and have different strengths and weaknesses.";
         let inp = build_prefill_inputs(&tok, prompt_text, target_text, &patches).unwrap();
         assert_eq!(inp.seq_len, 196);
 
-        // Staged with bluryar's original name (external .onnx.data ref).
-        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm_prefill.onnx"))).unwrap();
+        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm-prefill.onnx"))).unwrap();
         let state = run_prefill(&mut pf, &inp).unwrap();
 
         // (shape, sum) per output, from the Python ORT oracle.
@@ -692,11 +752,11 @@ allegations of fixing games and illegal betting. Different telescope designs \
 perform differently and have different strengths and weaknesses.";
         let target_text = "Welcome to Divora. This is my own voice, speaking the words I typed.";
         let inp = build_prefill_inputs(&tok, prompt_text, target_text, &patches).unwrap();
-        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm_prefill.onnx"))).unwrap();
+        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm-prefill.onnx"))).unwrap();
         let state = run_prefill(&mut pf, &inp).unwrap();
 
         let mut ds =
-            load_session(Path::new(&format!("{res}/tts/voxcpm_decode_step.onnx"))).unwrap();
+            load_session(Path::new(&format!("{res}/tts/voxcpm-decode-step.onnx"))).unwrap();
         // Zeros noise, 3 steps, min_len huge so the stop flag never fires.
         let preds = run_decode(&mut ds, state, DEFAULT_CFG, 1000, 3, |shape| {
             vec![0.0f32; shape.iter().product()]
@@ -759,37 +819,28 @@ perform differently and have different strengths and weaknesses.";
         let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
         std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
 
-        let tok = load_tokenizer(Path::new(&format!("{res}/tts/voxcpm-tokenizer.json"))).unwrap();
+        // Load via the held-sessions engine (the backend's path).
+        let mut engine = VoxCpmEngine::load(Path::new(&format!("{res}/tts"))).expect("engine");
         let reader = hound::WavReader::open(format!("{res}/tts/voxcpm-ref-16k.wav")).unwrap();
         let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
-        let mut ve =
-            load_session(Path::new(&format!("{res}/tts/voxcpm-vae-encoder.onnx"))).unwrap();
-        let mut pf = load_session(Path::new(&format!("{res}/tts/voxcpm_prefill.onnx"))).unwrap();
-        let mut ds =
-            load_session(Path::new(&format!("{res}/tts/voxcpm_decode_step.onnx"))).unwrap();
-        let mut vd =
-            load_session(Path::new(&format!("{res}/tts/voxcpm-vae-decoder.onnx"))).unwrap();
 
         let prompt_text = "Prosecutors have opened a massive investigation into \
 allegations of fixing games and illegal betting. Different telescope designs \
 perform differently and have different strengths and weaknesses.";
         let target_text = "Welcome to Divora. This is my own voice, speaking the words I typed.";
 
-        let mut ng = NoiseGen::new(1);
-        let audio = synthesize_voxcpm(
-            &mut ve,
-            &mut pf,
-            &mut ds,
-            &mut vd,
-            &tok,
-            prompt_text,
-            target_text,
-            &samples,
-            VOXCPM_SAMPLE_RATE,
-            DEFAULT_CFG,
-            |shape| ng.normal(shape.iter().product()),
-        )
-        .unwrap();
+        let tts = engine
+            .synthesize(
+                target_text,
+                &samples,
+                VOXCPM_SAMPLE_RATE,
+                prompt_text,
+                DEFAULT_CFG,
+                1,
+            )
+            .expect("synthesize");
+        assert_eq!(tts.sample_rate, VOXCPM_SAMPLE_RATE);
+        let audio = tts.samples;
 
         let secs = audio.len() as f32 / VOXCPM_SAMPLE_RATE as f32;
         assert!(
