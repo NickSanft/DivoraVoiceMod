@@ -150,6 +150,7 @@ export async function installTauriMock(
         },
         delete_cloned_voice: () => null,
         clone_models_status: () => ({ ready: false }),
+        voxcpm_status: () => ({ available: false, readPrompt: "" }),
         download_clone_models: () => null,
         recordings_dir: () => "C:/mock/recordings",
         preset_store_path: () => "C:/mock/presets",

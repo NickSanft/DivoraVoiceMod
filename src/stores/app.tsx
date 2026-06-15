@@ -41,6 +41,7 @@ import {
   deleteClonedVoice as deleteClonedVoiceCmd,
   pickAudioFile as pickAudioFileCmd,
   cloneModelsStatus as cloneModelsStatusCmd,
+  voxcpmStatus as voxcpmStatusCmd,
   downloadCloneModels as downloadCloneModelsCmd,
   subscribeCloneDownload,
   openMidiInput as openMidiInputCmd,
@@ -471,6 +472,12 @@ export interface AppState {
   refreshCloneModelsStatus: () => Promise<void>;
   /** Download the cloning models (~157 MB, one-time). */
   downloadCloneModels: () => Promise<void>;
+  /** v2: whether VoxCPM accent-preserving cloning is available (models present). */
+  voxcpmAvailable: () => boolean;
+  /** v2: the fixed sentence the user reads when recording a VoxCPM clone. */
+  voxcpmReadPrompt: () => string;
+  /** Refresh VoxCPM availability + read prompt. */
+  refreshVoxcpmStatus: () => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -2211,6 +2218,20 @@ export function createAppState(): AppState {
     }
   };
 
+  // VoxCPM accent-preserving cloning (v2): whether available + the read prompt.
+  const [voxcpmAvailable, setVoxcpmAvailable] = createSignal(false);
+  const [voxcpmReadPrompt, setVoxcpmReadPrompt] = createSignal("");
+
+  const refreshVoxcpmStatus = async (): Promise<void> => {
+    try {
+      const status = await voxcpmStatusCmd();
+      setVoxcpmAvailable(!!status?.available);
+      setVoxcpmReadPrompt(status?.readPrompt ?? "");
+    } catch (err) {
+      console.warn("[voxcpm] status failed", err);
+    }
+  };
+
   const downloadCloneModels = async (): Promise<void> => {
     if (cloneDownloading()) return;
     setCloneError(null);
@@ -2371,6 +2392,9 @@ export function createAppState(): AppState {
     cloneDownloadPct,
     refreshCloneModelsStatus,
     downloadCloneModels,
+    voxcpmAvailable,
+    voxcpmReadPrompt,
+    refreshVoxcpmStatus,
 
     usePreset,
     viewPreset,

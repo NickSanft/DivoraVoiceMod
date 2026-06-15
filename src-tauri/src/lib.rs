@@ -987,6 +987,27 @@ fn speak_voxcpm(
         .ok_or_else(|| "voice synthesis failed".to_string())
 }
 
+/// `VoxCPM` accent-preserving cloning status for the recorder UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoxCpmStatus {
+    /// True when the `VoxCPM` models are installed, so the in-app recorder
+    /// produces an accent-preserving clone (and should show the read prompt).
+    available: bool,
+    /// The sentence to display for the user to read aloud, so the reference
+    /// transcript is known.
+    read_prompt: String,
+}
+
+/// Whether `VoxCPM` cloning is available + the fixed sentence to read.
+#[tauri::command]
+fn voxcpm_status(state: State<'_, AppState>) -> VoxCpmStatus {
+    VoxCpmStatus {
+        available: divora_core::tts::voxcpm::models_present(&voxcpm_dir(&state)),
+        read_prompt: divora_core::tts::voxcpm::READ_ALOUD_PROMPT.to_string(),
+    }
+}
+
 /// Whether the cloning models are available (so the UI can prompt a
 /// one-time download before the user records a voice).
 #[derive(Debug, Clone, Serialize)]
@@ -1536,6 +1557,7 @@ pub fn run() {
             delete_cloned_voice,
             clone_models_status,
             download_clone_models,
+            voxcpm_status,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,

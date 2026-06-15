@@ -23,6 +23,7 @@ export function SpeakScreen(): JSX.Element {
       await app.refreshClonedVoices();
       await app.refreshTtsVoices();
       await app.refreshCloneModelsStatus();
+      await app.refreshVoxcpmStatus();
     })();
   });
 
@@ -445,15 +446,36 @@ export function SpeakScreen(): JSX.Element {
                 </Button>
               </div>
               <Show when={app.recordingVoice()}>
-                <span
-                  role="status"
-                  style={{
-                    "font-size": "var(--t-xs)",
-                    color: "var(--text-low)",
-                  }}
+                <Show
+                  when={app.voxcpmAvailable() && app.voxcpmReadPrompt()}
+                  fallback={
+                    <span
+                      role="status"
+                      style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}
+                    >
+                      Recording… speak naturally for 20–30 seconds, then Stop &amp; save.
+                    </span>
+                  }
                 >
-                  Recording… speak naturally for 20–30 seconds, then Stop &amp; save.
-                </span>
+                  {/* VoxCPM (accent-preserving) needs a known transcript, so the
+                      user reads this fixed sentence. */}
+                  <span
+                    role="status"
+                    style={{ "font-size": "var(--t-xs)", color: "var(--text-mid)" }}
+                  >
+                    Recording… read this aloud, then Stop &amp; save:
+                    <span
+                      style={{
+                        display: "block",
+                        "margin-top": "var(--s1)",
+                        color: "var(--text-high)",
+                        "font-style": "italic",
+                      }}
+                    >
+                      “{app.voxcpmReadPrompt()}”
+                    </span>
+                  </span>
+                </Show>
               </Show>
             </Show>
 

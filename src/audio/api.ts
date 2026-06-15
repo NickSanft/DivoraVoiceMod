@@ -382,6 +382,20 @@ export async function cloneModelsStatus(): Promise<CloneModelsStatus> {
 }
 
 /**
+ * VoxCPM accent-preserving cloning status. When `available`, the in-app
+ * recorder produces an accent-preserving clone and should show `readPrompt`
+ * for the user to read aloud (so the reference transcript is known).
+ */
+export interface VoxCpmStatus {
+  available: boolean;
+  readPrompt: string;
+}
+
+export async function voxcpmStatus(): Promise<VoxCpmStatus> {
+  return invoke<VoxCpmStatus>("voxcpm_status");
+}
+
+/**
  * Download the voice-cloning models (~157 MB, one-time) into the user dir.
  * Resolves when complete; progress arrives via {@link subscribeCloneDownload}.
  */
