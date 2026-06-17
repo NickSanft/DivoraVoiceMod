@@ -327,7 +327,32 @@ export function SpeakScreen(): JSX.Element {
                               "min-width": 0,
                             }}
                           >
-                            <span>{voice.name}</span>
+                            <span
+                              style={{
+                                display: "flex",
+                                "align-items": "center",
+                                gap: "var(--s2)",
+                                "min-width": 0,
+                              }}
+                            >
+                              <span
+                                style={{
+                                  overflow: "hidden",
+                                  "text-overflow": "ellipsis",
+                                  "white-space": "nowrap",
+                                }}
+                              >
+                                {voice.name}
+                              </span>
+                              {/* v1.25.0: which engine cloned this voice —
+                                  accent (VoxCPM) supports the Clone quality
+                                  control; timbre (OpenVoice) does not. */}
+                              <Show when={voice.engine === "voxcpm"} fallback={
+                                <Badge tone="info">timbre</Badge>
+                              }>
+                                <Badge tone="accent">accent</Badge>
+                              </Show>
+                            </span>
                             <Show when={voice.baseName}>
                               <span
                                 style={{

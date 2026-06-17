@@ -12,6 +12,7 @@ Accent-preserving cloning now sounds **more like you, more reliably**. VoxCPM ge
 
 - **Best-of-N reranking for VoxCPM clones.** Each Speak generates N takes (different diffusion seeds) and a **WeSpeaker** speaker-verification model scores each against your reference; the closest wins, and any take that ran to the decode cap (a rambler) is dropped. The empirical spike showed why a *proper* verification model is needed: the OpenVoice tone-color cosine we ship for timbre cloning rated a 12.5 s runaway take **0.866** (near the top), while WeSpeaker rated it **0.598** (by far the worst) — same-speaker vs different-speaker separation is 0.966 vs 0.076, a real discriminative range.
 - **Clone quality control** (Speak, VoxCPM voices only): **Fast** (1 take), **Balanced** (3, default), **Best** (6). ~7 s/take on CPU, so it's an explicit latency-for-fidelity dial; persisted across sessions.
+- **Accent / timbre badge** on each "Your voices" entry, so it's clear at a glance which clones are accent-preserving (VoxCPM — they get the Clone quality control) versus timbre-only (OpenVoice).
 
 ### Architecture (additive)
 
