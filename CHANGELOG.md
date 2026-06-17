@@ -4,6 +4,28 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.25.0] — 2026-06-16 — Speak: closer clones (best-of-N reranker)
+
+Accent-preserving cloning now sounds **more like you, more reliably**. VoxCPM generation is stochastic — most takes clone you well, but a minority drift in timbre or *ramble* (repeat to the length cap). Speak now generates a few takes and a speaker-verification model keeps the one closest to your reference, discarding ramblers. A new **Clone quality** control (Fast / Balanced / Best) lets you trade speed for fidelity.
+
+### Added
+
+- **Best-of-N reranking for VoxCPM clones.** Each Speak generates N takes (different diffusion seeds) and a **WeSpeaker** speaker-verification model scores each against your reference; the closest wins, and any take that ran to the decode cap (a rambler) is dropped. The empirical spike showed why a *proper* verification model is needed: the OpenVoice tone-color cosine we ship for timbre cloning rated a 12.5 s runaway take **0.866** (near the top), while WeSpeaker rated it **0.598** (by far the worst) — same-speaker vs different-speaker separation is 0.966 vs 0.076, a real discriminative range.
+- **Clone quality control** (Speak, VoxCPM voices only): **Fast** (1 take), **Balanced** (3, default), **Best** (6). ~7 s/take on CPU, so it's an explicit latency-for-fidelity dial; persisted across sessions.
+
+### Architecture (additive)
+
+- New `divora-core/src/tts/speaker.rs`: a `SpeakerScorer` wrapping the WeSpeaker ResNet34-LM ONNX model with a from-scratch Kaldi-`fbank` front-end (25/10 ms frames, pre-emphasis, Hamming, 512-pt real FFT, 80 mel filters, CMN) reproduced to match `torchaudio.compliance.kaldi` — **parity-validated** against a Python oracle (Rust↔Python embedding cosine > 0.999). `VoxCpmEngine::synthesize` gains a `candidates` count: it prefills once (noise-independent) and fans out the decode+VAE per candidate, then reranks. `speak` takes an optional `candidates`; `ClonedVoiceInfo.engine` is surfaced so the UI shows the control for VoxCPM voices only.
+- **Model**: the reranker is a small (~25 MB) addition to the on-demand VoxCPM set on `voice-assets-v2` — existing installs fetch only the new file, not the 1.6 GB graphs.
+
+### License
+
+- **WeSpeaker VoxCeleb ResNet34-LM is CC-BY-4.0** (`onnx-community` ONNX export) — attribution-only, no copyleft. Disclosed in the README.
+
+### Tests
+
+- +6 Rust (`speaker`: cosine, Hamming window, mel-bank construction, `fbank` frame geometry, and the Python-oracle embedding-parity `#[ignore]` test; `voxcpm`: best-of-N end-to-end) + 2 frontend (clone-quality persistence + best-of-N forwarding). Full pre-push checklist green.
+
 ## [1.24.0] — 2026-06-15 — Speak: clone your accent (VoxCPM)
 
 Recorded voice clones now **keep your accent and prosody**, not just your timbre. Until now cloning recolored a US/UK preset toward your voice (so a non-US/UK speaker still sounded US/UK); the new engine generates speech conditioned on your actual recording, so the clone sounds like *you*. In Speak → **Your voices**, download the one-time accent models, then **Record** (read the on-screen sentence) → your clone speaks anything in your own voice + accent.

@@ -208,6 +208,7 @@ const STORAGE_KEYS = {
   ttsVoice: "divora.ttsVoice",
   ttsVolume: "divora.ttsVolume",
   ttsPreviewOnly: "divora.ttsPreviewOnly",
+  cloneQuality: "divora.cloneQuality",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -430,6 +431,11 @@ export interface AppState {
    *  the call doesn't). Persisted `divora.ttsPreviewOnly`. */
   ttsPreviewOnly: () => boolean;
   setTtsPreviewOnly: (on: boolean) => void;
+  /** v1.25.0: best-of-N count for VoxCPM cloned voices — the backend generates
+   *  N takes and keeps the one closest to your voice (Fast 1 / Balanced 3 /
+   *  Best 6; higher = more faithful but slower). Persisted `divora.cloneQuality`. */
+  cloneQuality: () => number;
+  setCloneQuality: (n: number) => void;
   /** Draft text in the Speak box (ephemeral — not persisted). */
   ttsText: () => string;
   setTtsText: (text: string) => void;
@@ -2033,6 +2039,11 @@ export function createAppState(): AppState {
   const [ttsPreviewOnly, setTtsPreviewOnlyRaw] = createSignal<boolean>(
     loadJson<boolean>(STORAGE_KEYS.ttsPreviewOnly, false),
   );
+  // Best-of-N count for VoxCPM cloned voices (Fast 1 / Balanced 3 / Best 6).
+  // Mirrors the backend's DEFAULT_CANDIDATES; higher = more faithful, slower.
+  const [cloneQuality, setCloneQualityRaw] = createSignal<number>(
+    loadJson<number>(STORAGE_KEYS.cloneQuality, 3),
+  );
 
   const setSelectedTtsVoice = (id: string): void => {
     setSelectedTtsVoiceRaw(id);
@@ -2048,6 +2059,12 @@ export function createAppState(): AppState {
   const setTtsPreviewOnly = (on: boolean): void => {
     setTtsPreviewOnlyRaw(on);
     saveJson(STORAGE_KEYS.ttsPreviewOnly, on);
+  };
+
+  const setCloneQuality = (n: number): void => {
+    const clamped = Math.max(1, Math.min(8, Math.round(n)));
+    setCloneQualityRaw(clamped);
+    saveJson(STORAGE_KEYS.cloneQuality, clamped);
   };
 
   const refreshTtsVoices = async (): Promise<void> => {
@@ -2083,6 +2100,7 @@ export function createAppState(): AppState {
         voiceId,
         ttsVolume(),
         ttsPreviewOnly(),
+        cloneQuality(),
       );
       // Reuse the soundboard playback seam: register a "tts" clip so the
       // shared ~30 Hz clock drives the progress ring and auto-expires it.
@@ -2407,6 +2425,8 @@ export function createAppState(): AppState {
     setTtsVolume,
     ttsPreviewOnly,
     setTtsPreviewOnly,
+    cloneQuality,
+    setCloneQuality,
     ttsText,
     setTtsText,
     synthesizing,

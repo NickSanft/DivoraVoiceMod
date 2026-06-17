@@ -545,6 +545,7 @@ fn speak(
     voice_id: String,
     gain: Option<f32>,
     preview_only: Option<bool>,
+    candidates: Option<usize>,
 ) -> Result<f32, String> {
     // A cloned-voice id routes through its stored engine: `VoxCPM` (accent-
     // preserving, from the reference clip) or OpenVoice (timbre-only, from the
@@ -553,8 +554,13 @@ fn speak(
         tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
         e.to_string()
     };
+    // Best-of-N for `VoxCPM` cloning; the UI's clone-quality control sets it,
+    // defaulting to the validated balanced count.
+    let candidates = candidates.unwrap_or(divora_core::tts::voxcpm::DEFAULT_CANDIDATES);
     let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
-        Some(ClonedVoice::VoxCpm { reference }) => speak_voxcpm(&state, &text, &reference)?,
+        Some(ClonedVoice::VoxCpm { reference }) => {
+            speak_voxcpm(&state, &text, &reference, candidates)?
+        }
         Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
             &text,
             &base,
@@ -629,6 +635,10 @@ struct ClonedVoiceInfo {
     /// Short label of the preset this clone was matched to (v1.22.0), e.g.
     /// `"Puck"`. Empty if the stored base isn't a known preset.
     base_name: String,
+    /// Cloning engine: `"voxcpm"` (accent-preserving) or `"openvoice"`
+    /// (timbre-only). Lets the UI show the best-of-N quality control for
+    /// `VoxCPM` voices only (v1.25.0).
+    engine: String,
 }
 
 /// On-disk metadata for a cloned voice (`<id>/meta.json`).
@@ -732,10 +742,22 @@ fn list_cloned_voice_infos(dir: &Path) -> Vec<ClonedVoiceInfo> {
             .and_then(|m| divora_core::tts::preset_short_name(&m.base))
             .unwrap_or_default()
             .to_string();
+        // Fall back to a `reference.wav`-based guess when meta is missing.
+        let engine = meta.as_ref().map_or_else(
+            || {
+                if p.join("reference.wav").is_file() {
+                    "voxcpm".to_string()
+                } else {
+                    "openvoice".to_string()
+                }
+            },
+            |m| m.engine.clone(),
+        );
         out.push(ClonedVoiceInfo {
             id,
             name,
             base_name,
+            engine,
         });
     }
     out.sort_by_key(|a| a.name.to_lowercase());
@@ -808,6 +830,7 @@ fn clone_from_path(
         id,
         name,
         base_name,
+        engine: meta.engine.clone(),
     })
 }
 
@@ -899,6 +922,7 @@ fn store_voxcpm_clone(
         id,
         name,
         base_name: String::new(),
+        engine: meta.engine.clone(),
     })
 }
 
@@ -937,6 +961,8 @@ const VOXCPM_MODEL_FILES: &[&str] = &[
     "voxcpm-vae-encoder.onnx",
     "voxcpm-vae-decoder.onnx",
     "voxcpm-tokenizer.json",
+    // WeSpeaker best-of-N reranker (~25 MB) — see `divora_core::tts::speaker`.
+    "voxcpm-speaker.onnx",
 ];
 
 /// Where to read the cloning models from: the downloaded user dir if it
@@ -973,6 +999,7 @@ fn speak_voxcpm(
     state: &AppState,
     text: &str,
     reference: &Path,
+    candidates: usize,
 ) -> Result<divora_core::tts::TtsAudio, String> {
     use divora_core::tts::voxcpm;
     let clip = decode_clip(reference).map_err(|e| e.to_string())?;
@@ -987,7 +1014,8 @@ fn speak_voxcpm(
     // Fresh diffusion noise each utterance (a per-utterance seed). A fixed seed
     // can occasionally fail to trigger the model's stop and ramble to the length
     // cap; varying it keeps generation healthy (and natural per-utterance
-    // variation is fine for a voice changer).
+    // variation is fine for a voice changer). Best-of-N then takes seeds
+    // `seed..seed+N` and the reranker keeps the take closest to the reference.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0u128, |d| d.as_nanos());
@@ -1000,6 +1028,7 @@ fn speak_voxcpm(
             voxcpm::READ_ALOUD_PROMPT,
             voxcpm::DEFAULT_CFG,
             seed,
+            candidates.clamp(1, voxcpm::MAX_CANDIDATES),
         )
         .ok_or_else(|| "voice synthesis failed".to_string())
 }

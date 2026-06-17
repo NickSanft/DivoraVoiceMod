@@ -1886,6 +1886,7 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
       voiceId: "af_heart",
       gain: 1.0,
       previewOnly: false,
+      candidates: 3,
     });
     expect(result.playingClips["tts"]).toBeDefined();
     expect(result.playingClips["tts"]!.durationSecs).toBe(2.0);
@@ -1959,7 +1960,36 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
       voiceId: "af_heart",
       gain: 0.4,
       previewOnly: true,
+      candidates: 3,
     });
+  });
+
+  it("cloneQuality defaults to 3 (balanced), clamps to [1,8], and persists", () => {
+    const { result } = setupApp();
+    expect(result.cloneQuality()).toBe(3);
+    result.setCloneQuality(6);
+    expect(result.cloneQuality()).toBe(6);
+    expect(window.localStorage.getItem("divora.cloneQuality")).toBe("6");
+    result.setCloneQuality(99);
+    expect(result.cloneQuality()).toBe(8);
+    result.setCloneQuality(0);
+    expect(result.cloneQuality()).toBe(1);
+  });
+
+  it("speakText forwards the selected clone quality as best-of-N candidates", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "speak") return 1.0;
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("Hello");
+    result.setCloneQuality(6);
+    await result.speakText();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "speak",
+      expect.objectContaining({ candidates: 6 }),
+    );
   });
 
   it("refreshClonedVoices populates the cloned-voice list", async () => {

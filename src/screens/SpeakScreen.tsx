@@ -30,6 +30,19 @@ export function SpeakScreen(): JSX.Element {
   const anyInstalled = (): boolean => app.ttsVoices().some((v) => v.installed);
   const hasText = (): boolean => app.ttsText().trim().length > 0;
 
+  // Best-of-N tiers for VoxCPM cloned voices (~7 s/take on CPU). The backend
+  // generates N takes and a speaker-verification reranker keeps the one closest
+  // to your reference; more takes = more faithful but slower (v1.25.0).
+  const QUALITY_TIERS = [
+    { label: "Fast", n: 1, hint: "1 take · quickest" },
+    { label: "Balanced", n: 3, hint: "3 takes · recommended" },
+    { label: "Best", n: 6, hint: "6 takes · most faithful" },
+  ] as const;
+  const selectedClone = createMemo(() =>
+    app.clonedVoices().find((v) => v.id === app.selectedTtsVoice()),
+  );
+  const isVoxcpmSelected = (): boolean => selectedClone()?.engine === "voxcpm";
+
   // The "tts" clip lives in the shared soundboard playback store; the global
   // ~30 Hz clock drives the progress ring and auto-expires the entry.
   const ttsClip = () => app.playingClips["tts"];
@@ -603,6 +616,68 @@ export function SpeakScreen(): JSX.Element {
             </span>
           </label>
         </div>
+
+        {/* Clone quality (best-of-N) — VoxCPM cloned voices only, v1.25.0 */}
+        <Show when={isVoxcpmSelected()}>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s3)",
+              "flex-wrap": "wrap",
+            }}
+          >
+            <span
+              style={{
+                "font-size": "var(--t-xs)",
+                "text-transform": "uppercase",
+                "letter-spacing": "0.08em",
+                color: "var(--text-low)",
+                "white-space": "nowrap",
+              }}
+            >
+              Clone quality
+            </span>
+            <div
+              role="radiogroup"
+              aria-label="Clone quality"
+              style={{
+                display: "inline-flex",
+                border: "1px solid var(--line)",
+                "border-radius": "var(--r-md)",
+                overflow: "hidden",
+              }}
+            >
+              <For each={QUALITY_TIERS}>
+                {(tier) => {
+                  const active = (): boolean => app.cloneQuality() === tier.n;
+                  return (
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={active()}
+                      title={tier.hint}
+                      onClick={() => app.setCloneQuality(tier.n)}
+                      style={{
+                        padding: "var(--s2) var(--s4)",
+                        "font-size": "var(--t-sm)",
+                        border: "none",
+                        cursor: "pointer",
+                        background: active() ? "var(--accent)" : "transparent",
+                        color: active() ? "var(--on-accent, #fff)" : "var(--text-mid)",
+                      }}
+                    >
+                      {tier.label}
+                    </button>
+                  );
+                }}
+              </For>
+            </div>
+            <span style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}>
+              more takes sound more like you, but take longer
+            </span>
+          </div>
+        </Show>
 
         {/* Controls */}
         <div

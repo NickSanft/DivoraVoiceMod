@@ -293,14 +293,18 @@ export async function listTtsVoices(): Promise<TtsVoiceInfo[]> {
  * `gain` (v1.18.0) is the linear playback volume (1.0 = unchanged).
  * `previewOnly` (v1.18.0) routes the speech to your local monitor only — you
  * hear it, the call doesn't — for previewing before sending.
+ * `candidates` (v1.25.0) is the best-of-N count for `VoxCPM`-cloned voices: the
+ * backend generates N takes and keeps the one closest to the reference speaker
+ * (higher = more faithful but slower; ignored by preset/OpenVoice voices).
  */
 export async function speak(
   text: string,
   voiceId: string,
   gain = 1.0,
   previewOnly = false,
+  candidates?: number,
 ): Promise<number> {
-  return invoke<number>("speak", { text, voiceId, gain, previewOnly });
+  return invoke<number>("speak", { text, voiceId, gain, previewOnly, candidates });
 }
 
 /** Stop any in-flight synthesized speech playing through the mixer. */
@@ -319,6 +323,12 @@ export interface ClonedVoiceInfo {
    * `"Puck"`. Empty string when the stored base isn't a known preset.
    */
   baseName: string;
+  /**
+   * Cloning engine: `"voxcpm"` (accent-preserving) or `"openvoice"`
+   * (timbre-only). The Speak screen shows the best-of-N quality control only
+   * for `voxcpm` voices (v1.25.0).
+   */
+  engine: string;
 }
 
 /** List the user's cloned voices. */

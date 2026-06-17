@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use tokenizers::Tokenizer;
 
+use crate::tts::speaker::{self, SpeakerScorer};
+
 /// `VoxCPM` operates at 16 kHz (the `bluryar` export's prompt + output rate).
 pub const VOXCPM_SAMPLE_RATE: u32 = 16_000;
 /// Autoregressive stop token id.
@@ -48,6 +50,14 @@ pub const DEFAULT_CFG: f32 = 2.0;
 pub const MIN_DECODE_LEN: usize = 2;
 /// Per-step decode budget factor relative to the text length.
 pub const DECODE_LIMIT_FACTOR: usize = 6;
+/// Default best-of-N candidate count for cloned synthesis. Generation is
+/// stochastic; the reranker keeps the candidate closest to the reference speaker
+/// and drops ramblers. ~7 s/candidate on CPU, so this trades latency for fidelity
+/// (validated default — see [`crate::tts::speaker`]). The UI exposes Fast (1) /
+/// Balanced (this) / Best (6).
+pub const DEFAULT_CANDIDATES: usize = 3;
+/// Clamp range for a caller-supplied candidate count (keeps latency bounded).
+pub const MAX_CANDIDATES: usize = 8;
 /// Token appended after the text ids to mark the start of audio.
 pub const AUDIO_START_TOKEN: i64 = 101;
 
@@ -85,6 +95,9 @@ pub struct VoxCpmPaths {
     pub vae_encoder: PathBuf,
     pub vae_decoder: PathBuf,
     pub tokenizer: PathBuf,
+    /// WeSpeaker reranker for best-of-N (small — ~25 MB). See
+    /// [`crate::tts::speaker`].
+    pub speaker: PathBuf,
 }
 
 impl VoxCpmPaths {
@@ -96,12 +109,13 @@ impl VoxCpmPaths {
             vae_encoder: model_dir.join(VAE_ENCODER_FILE),
             vae_decoder: model_dir.join(VAE_DECODER_FILE),
             tokenizer: model_dir.join(TOKENIZER_FILE),
+            speaker: model_dir.join(crate::tts::speaker::SPEAKER_MODEL_FILE),
         }
     }
 
-    /// Whether every graph + the tokenizer are present on disk. Pure filesystem
-    /// checks — never touches `ort` — so it's safe to call freely (mirrors
-    /// [`crate::tts::clone_models_present`]).
+    /// Whether every graph + the tokenizer + the reranker are present on disk.
+    /// Pure filesystem checks — never touches `ort` — so it's safe to call
+    /// freely (mirrors [`crate::tts::clone_models_present`]).
     #[must_use]
     pub fn present(&self) -> bool {
         self.prefill.exists()
@@ -109,6 +123,7 @@ impl VoxCpmPaths {
             && self.vae_encoder.exists()
             && self.vae_decoder.exists()
             && self.tokenizer.exists()
+            && self.speaker.exists()
     }
 }
 
@@ -523,12 +538,15 @@ pub struct VoxCpmEngine {
     decode_step: Session,
     vae_decoder: Session,
     tokenizer: Tokenizer,
+    /// Best-of-N reranker. `None` if the WeSpeaker model is absent — synthesis
+    /// then degrades to best-of-1 (single candidate, no reranking).
+    speaker: Option<SpeakerScorer>,
 }
 
 impl VoxCpmEngine {
-    /// Load all four graphs + the tokenizer from `model_dir`. `None` if any are
-    /// missing or the ONNX runtime is unavailable (caller falls back to the
-    /// OpenVoice path).
+    /// Load the four graphs + the tokenizer from `model_dir` (plus the optional
+    /// reranker). `None` if any *required* graph/tokenizer is missing or the ONNX
+    /// runtime is unavailable (caller falls back to the OpenVoice path).
     #[must_use]
     pub fn load(model_dir: &Path) -> Option<Self> {
         let p = VoxCpmPaths::new(model_dir);
@@ -538,11 +556,17 @@ impl VoxCpmEngine {
             decode_step: load_session(&p.decode_step)?,
             vae_decoder: load_session(&p.vae_decoder)?,
             tokenizer: load_tokenizer(&p.tokenizer)?,
+            speaker: SpeakerScorer::load(&p.speaker),
         })
     }
 
     /// Clone `reference` (spoken text `prompt_text`) saying `target_text`, as a
-    /// 16 kHz [`crate::tts::TtsAudio`]. `seed` makes a clone reproducible.
+    /// 16 kHz [`crate::tts::TtsAudio`]. Generates `candidates` best-of-N takes
+    /// (seeds `seed..seed+N`) and keeps the one closest to the reference speaker,
+    /// preferring candidates that stopped naturally over ramblers. With no
+    /// reranker loaded it falls back to a single take. `seed` makes the result
+    /// reproducible.
+    #[allow(clippy::too_many_arguments)] // a synthesis orchestrator; each input is necessary
     #[must_use]
     pub fn synthesize(
         &mut self,
@@ -552,23 +576,62 @@ impl VoxCpmEngine {
         prompt_text: &str,
         cfg: f32,
         seed: u64,
+        candidates: usize,
     ) -> Option<crate::tts::TtsAudio> {
-        let mut noise = NoiseGen::new(seed);
-        let samples = synthesize_voxcpm(
-            &mut self.vae_encoder,
-            &mut self.prefill,
-            &mut self.decode_step,
-            &mut self.vae_decoder,
-            &self.tokenizer,
-            prompt_text,
-            target_text,
-            reference,
-            reference_rate,
-            cfg,
-            |shape| noise.normal(shape.iter().product()),
-        )?;
+        // Noise-independent prefill, computed once and reused across candidates.
+        let patches = encode_prompt(&mut self.vae_encoder, reference, reference_rate)?;
+        let inp = build_prefill_inputs(&self.tokenizer, prompt_text, target_text, &patches)?;
+        let target_tokens = tokenize(&self.tokenizer, target_text)?.len();
+        let max_len = target_tokens * DECODE_LIMIT_FACTOR + 32; // ramble cap
+        let state = run_prefill(&mut self.prefill, &inp)?;
+
+        // Reference speaker embedding for reranking; `None` → best-of-1, no rerank.
+        let ref_emb = self
+            .speaker
+            .as_mut()
+            .and_then(|s| s.embed(reference, reference_rate));
+        let n = if ref_emb.is_some() {
+            candidates.max(1)
+        } else {
+            1
+        };
+
+        // (stopped_naturally, secs, samples) of the best candidate so far.
+        let mut best: Option<(bool, f32, Vec<f32>)> = None;
+        for i in 0..n {
+            let mut noise = NoiseGen::new(seed.wrapping_add(i as u64));
+            let preds = run_decode(
+                &mut self.decode_step,
+                state.clone(),
+                cfg,
+                MIN_DECODE_LEN,
+                max_len,
+                |shape| noise.normal(shape.iter().product()),
+            )?;
+            let stopped = preds.len() < max_len; // hit the cap ⇒ rambled
+            let (latents, l) = assemble_latents(&preds)?;
+            let samples = vae_decode(&mut self.vae_decoder, &latents, l)?;
+
+            let secs = match (&ref_emb, self.speaker.as_mut()) {
+                (Some(r), Some(s)) => s
+                    .embed(&samples, VOXCPM_SAMPLE_RATE)
+                    .map_or(f32::NEG_INFINITY, |e| speaker::cosine(&e, r)),
+                _ => 0.0,
+            };
+            // Prefer a natural stop; tie-break on higher speaker similarity.
+            let better = match &best {
+                None => true,
+                Some((bstop, bsecs, _)) => {
+                    (stopped && !*bstop) || (stopped == *bstop && secs > *bsecs)
+                }
+            };
+            if better {
+                best = Some((stopped, secs, samples));
+            }
+        }
+
         Some(crate::tts::TtsAudio {
-            samples,
+            samples: best.map(|(_, _, s)| s)?,
             sample_rate: VOXCPM_SAMPLE_RATE,
         })
     }
@@ -845,6 +908,7 @@ perform differently and have different strengths and weaknesses.";
                 prompt_text,
                 DEFAULT_CFG,
                 42,
+                2, // best-of-2 (exercises the reranker if the model is staged)
             )
             .expect("synthesize");
         assert_eq!(tts.sample_rate, VOXCPM_SAMPLE_RATE);

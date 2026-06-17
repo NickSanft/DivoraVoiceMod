@@ -162,6 +162,31 @@ timbre-only path is subjective and must be judged by listening. Engineering
 take: technically a **GO** (feasible, permissive, on-CPU), but the size/latency/
 port cost is real — productize only if the accent gain is clearly worth it.
 
+## Accuracy follow-up: best-of-N reranking (2026-06-16, shipped v1.25.0)
+
+After shipping VoxCPM (v1.24.0), the next accuracy lever was **variance**, not the
+model. Empirical sweeps on `me.wav` (per-channel Q8, the shipped graphs):
+
+- **cfg_value**: 2.0 is optimal and stable (mean speaker cosine **0.858** over 4
+  seeds; 1.5 → 0.801 unstable, 2.5 → 0.749 with a 0.48 crater). Confirmed
+  multi-seed — a single seed had falsely favored 1.5.
+- **Per-seed variance dominates.** Even at cfg 2.0 the cosine swings 0.83–0.87,
+  and a minority of seeds *ramble* (decode to the length cap). So **best-of-N**
+  (generate a few, keep the best) is the dominant lever — bigger than any knob.
+
+Reranking needs a **proper speaker-verification model**, not the OpenVoice
+tone-color cosine (it's compressed — all candidates 0.81–0.87 — and **gameable**):
+across 8 candidates it rated a 12.5 s rambler **0.866** (near the top), while
+**WeSpeaker** ResNet34-LM rated the same take **0.598** (by far the worst).
+WeSpeaker sanity: same-speaker **0.966**, different-speaker **0.076** — real range.
+
+Shipped design (`divora-core/src/tts/speaker.rs` + `VoxCpmEngine`): prefill once
+(noise-independent), fan out decode+VAE per candidate (~7 s each on CPU), drop any
+that hit the decode cap, rerank survivors by WeSpeaker SECS vs the reference, keep
+the best. The `fbank` front-end is a from-scratch Kaldi reimplementation
+parity-validated against `torchaudio` (Rust↔Python embedding cosine > 0.999).
+Exposed as a **Fast / Balanced / Best** (1 / 3 / 6) latency-vs-fidelity control.
+
 ## Sources
 
 Zero-shot TTS: VoxCPM ([repo](https://github.com/OpenBMB/VoxCPM),
