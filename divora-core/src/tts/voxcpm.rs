@@ -134,8 +134,19 @@ pub fn models_present(model_dir: &Path) -> bool {
     VoxCpmPaths::new(model_dir).present()
 }
 
+/// ONNX Runtime intra-op thread count for `VoxCPM` + reranker sessions, capped to
+/// leave headroom for the UI. By default ORT uses *every* core, so best-of-N
+/// (tens of seconds of inference) starves the UI thread and the app feels frozen
+/// — even though synthesis runs off the UI thread, so the cause is CPU
+/// contention, not blocking. Reserve 2 cores for the UI; never go below 1.
+#[must_use]
+pub fn intra_op_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1))
+}
+
 /// Load one `VoxCPM` ONNX graph, degrading to `None` if the file or the ONNX
-/// runtime is absent (same gate as [`crate::tts::clone::load_session`]).
+/// runtime is absent (same gate as [`crate::tts::clone::load_session`]). Caps
+/// intra-op threads ([`intra_op_threads`]) so synthesis stays off the UI's back.
 #[must_use]
 pub fn load_session(path: &Path) -> Option<Session> {
     if !path.exists() || !crate::dsp::onnx_runtime_available() {
@@ -144,6 +155,8 @@ pub fn load_session(path: &Path) -> Option<Session> {
     Session::builder()
         .ok()?
         .with_optimization_level(GraphOptimizationLevel::Level3)
+        .ok()?
+        .with_intra_threads(intra_op_threads())
         .ok()?
         .commit_from_file(path)
         .ok()
@@ -577,6 +590,7 @@ impl VoxCpmEngine {
         cfg: f32,
         seed: u64,
         candidates: usize,
+        mut on_progress: impl FnMut(usize, usize),
     ) -> Option<crate::tts::TtsAudio> {
         // Noise-independent prefill, computed once and reused across candidates.
         let patches = encode_prompt(&mut self.vae_encoder, reference, reference_rate)?;
@@ -599,6 +613,7 @@ impl VoxCpmEngine {
         // (stopped_naturally, secs, samples) of the best candidate so far.
         let mut best: Option<(bool, f32, Vec<f32>)> = None;
         for i in 0..n {
+            on_progress(i + 1, n); // "generating take i+1 of n" — drives the UI
             let mut noise = NoiseGen::new(seed.wrapping_add(i as u64));
             let preds = run_decode(
                 &mut self.decode_step,
@@ -662,6 +677,18 @@ mod tests {
         // The fixed transcript must be stable + plain so tokenization matches.
         assert!(READ_ALOUD_PROMPT.len() > 40);
         assert!(READ_ALOUD_PROMPT.is_ascii());
+    }
+
+    #[test]
+    fn intra_op_threads_leaves_ui_headroom() {
+        let n = intra_op_threads();
+        assert!(n >= 1, "always at least one inference thread");
+        if let Ok(p) = std::thread::available_parallelism() {
+            assert!(n <= p.get(), "never more than the machine has");
+            if p.get() > 2 {
+                assert!(n < p.get(), "reserves cores for the UI on multi-core");
+            }
+        }
     }
 
     /// The Rust tokenizer must produce the exact ids the Python reference
@@ -908,7 +935,8 @@ perform differently and have different strengths and weaknesses.";
                 prompt_text,
                 DEFAULT_CFG,
                 42,
-                2, // best-of-2 (exercises the reranker if the model is staged)
+                2,         // best-of-2 (exercises the reranker if the model is staged)
+                |_, _| {}, // progress callback unused in the test
             )
             .expect("synthesize");
         assert_eq!(tts.sample_rate, VOXCPM_SAMPLE_RATE);

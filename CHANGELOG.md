@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.27.0] — 2026-06-17 — Speak stays responsive (un-freeze + take progress)
+
+Generating an accent clone no longer locks up the app. Best-of-N ran ONNX inference across **every** CPU core for the full 20–40 s, starving the UI thread so the window looked frozen. Now inference leaves cores free for the UI, and the Speak button reports which take it's on.
+
+### Changed
+
+- **Capped ONNX Runtime intra-op threads** to `cores − 2` (minimum 1) for the VoxCPM graphs + the reranker. Synthesis already runs off the UI thread, so the freeze was pure CPU contention; leaving the UI a couple of cores keeps the app responsive during generation. A touch slower per take, but the window stays usable — and GPU offload (a later item) will remove the CPU pressure entirely.
+
+### Added
+
+- **Per-take progress.** The backend emits a `tts-progress` event for each best-of-N take; the Speak button shows **"Take 2 of 6…"** as it goes, so a multi-take generation reads as work-in-progress rather than a hang. Single-take (Fast) and preset/OpenVoice voices show the usual "Synthesizing…".
+
+### Tests
+
+- +1 Rust (`intra_op_threads` leaves UI headroom) + 1 frontend (`ttsProgress` lifecycle). Full pre-push checklist green.
+
 ## [1.26.0] — 2026-06-17 — Friendlier startup (boot splash)
 
 The app no longer opens to a blank white window while the UI loads — it shows a branded boot splash immediately, so launch feels intentional instead of frozen.

@@ -1976,6 +1976,20 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(result.cloneQuality()).toBe(1);
   });
 
+  it("ttsProgress starts null, is settable, and clears after speakText", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "speak" ? 1.0 : undefined,
+    );
+    const { result } = setupApp();
+    expect(result.ttsProgress()).toBeNull();
+    result.setTtsProgress({ done: 2, total: 6 });
+    expect(result.ttsProgress()).toEqual({ done: 2, total: 6 });
+    result.setSelectedTtsVoice("af_heart");
+    result.setTtsText("Hello");
+    await result.speakText();
+    expect(result.ttsProgress()).toBeNull(); // cleared in the finally block
+  });
+
   it("speakText forwards the selected clone quality as best-of-N candidates", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "speak") return 1.0;

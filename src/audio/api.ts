@@ -430,6 +430,20 @@ export async function subscribeCloneDownload(
   );
 }
 
+/** Best-of-N synthesis progress for a VoxCPM cloned voice (v1.27.0): the
+ *  backend is generating take `done` of `total`. */
+export interface TtsProgress {
+  done: number;
+  total: number;
+}
+
+/** Subscribe to per-take TTS synthesis progress. Returns the unlisten fn. */
+export async function subscribeTtsProgress(
+  handler: (p: TtsProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<TtsProgress>("tts-progress", (e) => handler(e.payload));
+}
+
 /**
  * Open the native file-picker for a voice reference clip and return the chosen
  * absolute path (or `null` if cancelled). Lazy-imports the dialog plugin so

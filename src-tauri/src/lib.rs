@@ -540,6 +540,7 @@ fn list_tts_voices(state: State<'_, AppState>) -> Vec<divora_core::tts::TtsVoice
 /// as a graceful error string rather than a hang.
 #[tauri::command]
 fn speak(
+    app: AppHandle,
     state: State<'_, AppState>,
     text: String,
     voice_id: String,
@@ -559,7 +560,7 @@ fn speak(
     let candidates = candidates.unwrap_or(divora_core::tts::voxcpm::DEFAULT_CANDIDATES);
     let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
         Some(ClonedVoice::VoxCpm { reference }) => {
-            speak_voxcpm(&state, &text, &reference, candidates)?
+            speak_voxcpm(&app, &state, &text, &reference, candidates)?
         }
         Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
             &text,
@@ -996,6 +997,7 @@ fn voxcpm_dir(state: &AppState) -> PathBuf {
 /// (the user read [`READ_ALOUD_PROMPT`](divora_core::tts::voxcpm::READ_ALOUD_PROMPT)
 /// when recording, so the transcript is known). Lazy-loads + holds the engine.
 fn speak_voxcpm(
+    app: &AppHandle,
     state: &AppState,
     text: &str,
     reference: &Path,
@@ -1029,8 +1031,21 @@ fn speak_voxcpm(
             voxcpm::DEFAULT_CFG,
             seed,
             candidates.clamp(1, voxcpm::MAX_CANDIDATES),
+            |done, total| {
+                // Per-take progress → the Speak panel ("Take 2 of 6"), so a
+                // multi-take generation shows motion instead of a frozen UI.
+                let _ = app.emit("tts-progress", TtsProgress { done, total });
+            },
         )
         .ok_or_else(|| "voice synthesis failed".to_string())
+}
+
+/// Best-of-N progress for the Speak UI: generating take `done` of `total`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TtsProgress {
+    done: usize,
+    total: usize,
 }
 
 /// `VoxCPM` accent-preserving cloning status for the recorder UI.

@@ -43,6 +43,14 @@ export function SpeakScreen(): JSX.Element {
   );
   const isVoxcpmSelected = (): boolean => selectedClone()?.engine === "voxcpm";
 
+  // Speak button label: shows best-of-N take progress while a multi-take VoxCPM
+  // clone generates ("Take 2 of 6…"), so the wait reads as work, not a freeze.
+  const speakLabel = (): string => {
+    if (!app.synthesizing()) return "Speak";
+    const p = app.ttsProgress();
+    return p && p.total > 1 ? `Take ${p.done} of ${p.total}…` : "Synthesizing…";
+  };
+
   // The "tts" clip lives in the shared soundboard playback store; the global
   // ~30 Hz clock drives the progress ring and auto-expires the entry.
   const ttsClip = () => app.playingClips["tts"];
@@ -718,7 +726,7 @@ export function SpeakScreen(): JSX.Element {
             disabled={!hasText() || app.synthesizing()}
             onClick={() => void app.speakText()}
           >
-            {app.synthesizing() ? "Synthesizing…" : "Speak"}
+            {speakLabel()}
           </Button>
           <Button
             variant="secondary"

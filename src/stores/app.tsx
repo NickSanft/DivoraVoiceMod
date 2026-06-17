@@ -441,6 +441,10 @@ export interface AppState {
   setTtsText: (text: string) => void;
   /** True while a synthesize request is in flight. */
   synthesizing: () => boolean;
+  /** Best-of-N take progress (v1.27.0): `{done,total}` while a VoxCPM clone
+   *  generates its takes, null when idle or for single-pass voices. */
+  ttsProgress: () => { done: number; total: number } | null;
+  setTtsProgress: (p: { done: number; total: number } | null) => void;
   /** Last synthesis error (e.g. "voices not installed"), or null. */
   ttsError: () => string | null;
   /** Pull the preset voice list from the backend + default the selection. */
@@ -2032,6 +2036,12 @@ export function createAppState(): AppState {
   );
   const [ttsText, setTtsText] = createSignal("");
   const [synthesizing, setSynthesizing] = createSignal(false);
+  // Best-of-N take progress for VoxCPM clones (v1.27.0), driven by the backend's
+  // "tts-progress" events; null when idle or for single-pass voices.
+  const [ttsProgress, setTtsProgress] = createSignal<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [ttsError, setTtsError] = createSignal<string | null>(null);
   const [ttsVolume, setTtsVolumeRaw] = createSignal<number>(
     loadJson<number>(STORAGE_KEYS.ttsVolume, 1.0),
@@ -2093,6 +2103,7 @@ export function createAppState(): AppState {
     const voiceId = selectedTtsVoice();
     if (!text || !voiceId || synthesizing()) return;
     setTtsError(null);
+    setTtsProgress(null);
     setSynthesizing(true);
     try {
       const durationSecs = await speakCmd(
@@ -2119,6 +2130,7 @@ export function createAppState(): AppState {
       );
     } finally {
       setSynthesizing(false);
+      setTtsProgress(null);
     }
   };
 
@@ -2430,6 +2442,8 @@ export function createAppState(): AppState {
     ttsText,
     setTtsText,
     synthesizing,
+    ttsProgress,
+    setTtsProgress,
     ttsError,
     refreshTtsVoices,
     speakText,

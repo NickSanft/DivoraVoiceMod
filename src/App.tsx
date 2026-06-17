@@ -14,7 +14,12 @@ import {
   type JSX,
 } from "solid-js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { subscribeGlobalShortcut, subscribeLevels, subscribeMidi } from "./audio/api";
+import {
+  subscribeGlobalShortcut,
+  subscribeLevels,
+  subscribeMidi,
+  subscribeTtsProgress,
+} from "./audio/api";
 import { OVERLAY_EVENT, overlayPayload } from "./overlay/state";
 import { Wizard } from "./components/Wizard";
 import { Sidebar } from "./shell/Sidebar";
@@ -281,6 +286,25 @@ function Shell(): JSX.Element {
       cancelled = true;
       if (unlisten) unlisten();
       void app.stopEngine();
+    });
+  });
+
+  // v1.27.0: per-take TTS synthesis progress → the Speak panel, so a multi-take
+  // (best-of-N) VoxCPM generation shows "Take 2 of 6" instead of a frozen UI.
+  onMount(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        unlisten = await subscribeTtsProgress((p) => app.setTtsProgress(p));
+      } catch (err) {
+        console.warn("[tts] progress subscribe failed", err);
+      }
+      if (cancelled && unlisten) unlisten();
+    })();
+    onCleanup(() => {
+      cancelled = true;
+      if (unlisten) unlisten();
     });
   });
 
