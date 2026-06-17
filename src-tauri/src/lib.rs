@@ -1579,6 +1579,22 @@ pub fn run() {
                 voice_recording_path: Mutex::new(None),
                 voxcpm_engine: Mutex::new(None),
             });
+
+            // The window is created hidden (`visible: false`) so the user never
+            // sees an empty black frame while WebView2 initializes. The frontend
+            // reveals it the instant the boot splash paints (see index.html) —
+            // that's the only moment we know WebView2 has rendered. This Rust
+            // timer is just a safety net: if that frontend reveal never runs
+            // (JS error, non-web target), show the window anyway so it can't get
+            // stuck hidden. `show()` is idempotent, so the earlier of the two
+            // wins.
+            if let Some(win) = app.webview_windows().values().next().cloned() {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

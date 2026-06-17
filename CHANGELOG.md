@@ -10,11 +10,11 @@ The app no longer opens to a blank white window while the UI loads — it shows 
 
 ### Added
 
-- **Instant boot splash.** A lightweight splash (app name + spinner) is inlined directly in `index.html`, so it paints **before** the JavaScript bundle, fonts, and stylesheet load — exactly the window that was previously a pure-white screen. It fades out the moment the app shell renders. Because the dismissal code lives in the JS entry point, the splash naturally covers the entire bundle-load gap and clears precisely when the UI is ready.
+- **Instant boot splash, no empty frame.** Launch previously showed a blank window (white, then black) for several seconds while WebView2 initialized and the UI bundle loaded. Now: the window is created **hidden** and the frontend reveals it the instant a lightweight splash (app name + spinner, inlined in `index.html`) has painted — so the window appears *already showing* the splash rather than as an empty rectangle. The splash then fades out once the app shell renders. The reveal is permission-gated (`core:window:allow-show`) and driven by the actual paint, not a guessed timer, with a Rust timeout as a safety net so the window can never get stuck hidden.
 
 ### Notes
 
-- The startup delay itself is the UI bundle warming up (most visible in `tauri dev`; release builds are much quicker). Heavy TTS models are **not** loaded at launch — they load lazily on first use — so progress feedback for *those* belongs to a Speak generation, not startup.
+- A brief blank moment can remain while WebView2 itself starts up (before any web content can paint) — eliminating that entirely would need a separate native splash window. The startup delay is the UI bundle warming up (most visible in `tauri dev`; release builds are quicker). Heavy TTS models are **not** loaded at launch — they load lazily on first use — so progress feedback for *those* belongs to a Speak generation, not startup.
 
 ## [1.25.0] — 2026-06-16 — Speak: closer clones (best-of-N reranker)
 

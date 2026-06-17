@@ -11,6 +11,11 @@
          the app shell has rendered. Colors are hardcoded to the dark default
          theme since the theme vars aren't loaded yet. -->
     <style>
+      html,
+      body {
+        margin: 0;
+        background: #07060d;
+      }
       #boot-splash {
         position: fixed;
         inset: 0;
@@ -74,6 +79,26 @@
       </div>
     </div>
     <div id="root"></div>
+    <script type="module">
+      // The native window is created hidden (visible:false in tauri.conf.json).
+      // Reveal it the instant the splash above has painted — that's only now,
+      // after WebView2 finished initializing and rendered this page, so the
+      // window appears already showing the splash instead of an empty black
+      // frame during WebView2 startup. Two rAFs ensure the splash is composited
+      // first. Loads in parallel with the (much larger) app bundle below, so it
+      // fires within a frame of page load. No-op outside Tauri; Rust reveals on
+      // a timeout as a fallback if this never runs.
+      import("@tauri-apps/api/window")
+        .then(({ getCurrentWindow }) => {
+          const win = getCurrentWindow();
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              win.show().catch(() => {});
+            }),
+          );
+        })
+        .catch(() => {});
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
