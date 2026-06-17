@@ -587,6 +587,15 @@ async fn speak(
         } else {
             samples.len() as f32 / sample_rate as f32
         };
+        // v1.28.0: persist the generated clip to the "Saved clips" folder so the
+        // user can replay/keep it. Best-effort — never fails the speak.
+        save_tts_clip(
+            &speak_clips_path(&state),
+            &samples,
+            sample_rate,
+            &text,
+            &voice_id,
+        );
         let gain = gain.unwrap_or(1.0);
         let clip_id = TTS_CLIP_ID.to_string();
         // Preview → monitor-only (you hear it, the call doesn't); otherwise the
@@ -619,6 +628,129 @@ fn stop_speak(state: State<'_, AppState>) {
     state.engine.send_soundboard(SoundboardCommand::Stop {
         clip_id: TTS_CLIP_ID.to_string(),
     });
+}
+
+// ---- v1.28.0: saved Speak clips ("Saved clips") ----
+
+/// One saved Speak (TTS) clip: metadata stored as `<id>.json` next to the
+/// `<id>.wav`. `path` (the WAV's absolute path) is filled in at list time so the
+/// UI can replay it via [`play_soundboard_clip`]; it isn't persisted.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeakClip {
+    id: String,
+    text: String,
+    voice: String,
+    /// Milliseconds since the Unix epoch.
+    created_at: u64,
+    duration_secs: f32,
+    #[serde(default)]
+    path: String,
+}
+
+/// Directory saved Speak clips are written to (`%APPDATA%/DivoraVoice/
+/// speak-clips/`), a sibling of the recordings dir. Created lazily on first save.
+fn speak_clips_path(state: &AppState) -> PathBuf {
+    state.recordings_dir.parent().map_or_else(
+        || state.recordings_dir.join("speak-clips"),
+        |p| p.join("speak-clips"),
+    )
+}
+
+/// Best-effort: persist a generated TTS clip (WAV + JSON sidecar) so it appears
+/// in the "Saved clips" list. Never fails the `speak` call — errors are logged.
+#[allow(clippy::cast_precision_loss)]
+fn save_tts_clip(dir: &Path, samples: &[f32], sample_rate: u32, text: &str, voice: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(?e, "could not create speak-clips dir");
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let id = now.as_nanos().to_string();
+    let created_at = u64::try_from(now.as_millis()).unwrap_or(0);
+    let duration_secs = if sample_rate == 0 {
+        0.0
+    } else {
+        samples.len() as f32 / sample_rate as f32
+    };
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    match hound::WavWriter::create(dir.join(format!("{id}.wav")), spec) {
+        Ok(mut w) => {
+            for &s in samples {
+                let _ = w.write_sample(s);
+            }
+            let _ = w.finalize();
+        }
+        Err(e) => {
+            tracing::warn!(?e, "could not write speak clip wav");
+            return;
+        }
+    }
+    let meta = SpeakClip {
+        id,
+        text: text.to_string(),
+        voice: voice.to_string(),
+        created_at,
+        duration_secs,
+        path: String::new(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+        let _ = std::fs::write(dir.join(format!("{}.json", meta.id)), json);
+    }
+}
+
+/// Absolute path of the saved-clips directory (for an "Open folder" button).
+#[tauri::command]
+fn speak_clips_dir(state: State<'_, AppState>) -> String {
+    speak_clips_path(&state).to_string_lossy().into_owned()
+}
+
+/// List saved Speak clips, newest first (each with its WAV `path` for replay).
+#[tauri::command]
+fn list_speak_clips(state: State<'_, AppState>) -> Vec<SpeakClip> {
+    let dir = speak_clips_path(&state);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SpeakClip> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let mut clip: SpeakClip = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())?;
+            let wav = dir.join(format!("{}.wav", clip.id));
+            if !wav.is_file() {
+                return None; // orphaned sidecar
+            }
+            clip.path = wav.to_string_lossy().into_owned();
+            Some(clip)
+        })
+        .collect();
+    out.sort_by_key(|c| std::cmp::Reverse(c.created_at));
+    out
+}
+
+/// Delete a saved Speak clip (its WAV + sidecar) by id.
+#[tauri::command]
+fn delete_speak_clip(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if !is_safe_voice_id(&id) {
+        return Err("invalid clip id".to_string());
+    }
+    let dir = speak_clips_path(&state);
+    let _ = std::fs::remove_file(dir.join(format!("{id}.wav")));
+    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+    Ok(())
 }
 
 // ---- v1.20.0: voice cloning ("Your voices") ----
@@ -1655,6 +1787,9 @@ pub fn run() {
             list_tts_voices,
             speak,
             stop_speak,
+            speak_clips_dir,
+            list_speak_clips,
+            delete_speak_clip,
             clone_voice,
             start_voice_recording,
             stop_voice_recording,
@@ -1679,11 +1814,48 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        scan_voice_dir, slugify_preset_id, unique_preset_id, EngineStatus, LevelUpdate, Levels,
-        OnnxRuntimeStatus, VoiceInfo,
+        save_tts_clip, scan_voice_dir, slugify_preset_id, unique_preset_id, EngineStatus,
+        LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn save_tts_clip_writes_wav_and_parseable_meta() {
+        let dir = std::env::temp_dir().join(format!("divora-clips-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        save_tts_clip(
+            &dir,
+            &[0.1, -0.1, 0.2, 0.0],
+            16_000,
+            "hello world",
+            "af_heart",
+        );
+
+        let paths: Vec<PathBuf> = fs::read_dir(&dir)
+            .expect("clips dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        let ext_count = |ext: &str| {
+            paths
+                .iter()
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
+                .count()
+        };
+        assert_eq!(ext_count("wav"), 1, "one wav written");
+        assert_eq!(ext_count("json"), 1, "one sidecar written");
+
+        let json = paths
+            .iter()
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .unwrap();
+        let meta: SpeakClip = serde_json::from_str(&fs::read_to_string(json).unwrap()).unwrap();
+        assert_eq!(meta.text, "hello world");
+        assert_eq!(meta.voice, "af_heart");
+        assert!(meta.duration_secs > 0.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn sorted_keys(v: &serde_json::Value) -> Vec<String> {
         let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();

@@ -33,6 +33,9 @@ midir = "0.10"
 ureq = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# v1.28.0: write saved Speak (TTS) clips to disk as WAV (same crate divora-core
+# uses for recordings).
+hound = "3"
 tracing = "0.1"
 # v1.14.0: collect tracing events into a rolling daily log file under
 # %APPDATA%/DivoraVoice/logs/ (surfaced via "Open logs folder").

@@ -72,6 +72,8 @@ import {
   stopSoundboardClip as stopSoundboardClipCmd,
   speak as speakCmd,
   stopSpeak as stopSpeakCmd,
+  listSpeakClips as listSpeakClipsCmd,
+  deleteSpeakClip as deleteSpeakClipCmd,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
@@ -80,6 +82,7 @@ import {
   type MidiMessage,
   type OnnxRuntimeStatus,
   type ClonedVoiceInfo,
+  type SpeakClip,
   type SoundboardTile,
   type StreamInfo,
   type TtsVoiceInfo,
@@ -453,6 +456,14 @@ export interface AppState {
   speakText: () => Promise<void>;
   /** Stop any in-flight synthesized speech. */
   stopSpeaking: () => Promise<void>;
+  /** v1.28.0: saved Speak clips (TTS outputs), newest first. */
+  speakClips: () => SpeakClip[];
+  /** Reload the saved-clips list from the backend. */
+  refreshSpeakClips: () => Promise<void>;
+  /** Replay a saved clip through the soundboard. */
+  playSpeakClip: (clip: SpeakClip) => Promise<void>;
+  /** Delete a saved clip (WAV + sidecar) by id. */
+  removeSpeakClip: (id: string) => Promise<void>;
 
   // Voice cloning ("Your voices") — v1.20.0
   /** The user's cloned voices (selectable in the picker alongside presets). */
@@ -2043,6 +2054,8 @@ export function createAppState(): AppState {
     total: number;
   } | null>(null);
   const [ttsError, setTtsError] = createSignal<string | null>(null);
+  // v1.28.0: saved Speak clips (TTS outputs persisted to the speak-clips folder).
+  const [speakClips, setSpeakClips] = createSignal<SpeakClip[]>([]);
   const [ttsVolume, setTtsVolumeRaw] = createSignal<number>(
     loadJson<number>(STORAGE_KEYS.ttsVolume, 1.0),
   );
@@ -2098,6 +2111,32 @@ export function createAppState(): AppState {
     }
   };
 
+  const refreshSpeakClips = async (): Promise<void> => {
+    try {
+      const clips = await listSpeakClipsCmd();
+      setSpeakClips(Array.isArray(clips) ? clips : []);
+    } catch (err) {
+      console.warn("[speak] list clips failed", err);
+    }
+  };
+
+  const playSpeakClip = async (clip: SpeakClip): Promise<void> => {
+    try {
+      await playSoundboardClipCmd(`speak-clip-${clip.id}`, clip.path, ttsVolume());
+    } catch (err) {
+      console.warn("[speak] play clip failed", err);
+    }
+  };
+
+  const removeSpeakClip = async (id: string): Promise<void> => {
+    try {
+      await deleteSpeakClipCmd(id);
+      setSpeakClips((cs) => cs.filter((c) => c.id !== id));
+    } catch (err) {
+      console.warn("[speak] delete clip failed", err);
+    }
+  };
+
   const speakText = async (): Promise<void> => {
     const text = ttsText().trim();
     const voiceId = selectedTtsVoice();
@@ -2120,6 +2159,8 @@ export function createAppState(): AppState {
         startedAt: performance.now(),
         durationSecs,
       });
+      // The backend just saved this clip; refresh the "Saved clips" list.
+      void refreshSpeakClips();
     } catch (err) {
       setTtsError(
         typeof err === "string"
@@ -2448,6 +2489,10 @@ export function createAppState(): AppState {
     refreshTtsVoices,
     speakText,
     stopSpeaking,
+    speakClips,
+    refreshSpeakClips,
+    playSpeakClip,
+    removeSpeakClip,
 
     clonedVoices,
     cloning,

@@ -11,7 +11,19 @@ import { For, Show, createMemo, createSignal, onMount, type JSX } from "solid-js
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Sigil } from "../components/Sigil";
+import { speakClipsDir } from "../audio/api";
 import { useApp } from "../stores/app";
+
+// Open a path with the OS default handler (a folder → the file manager). Falls
+// back gracefully outside the Tauri shell (browser preview / tests).
+async function openExternal(path: string): Promise<void> {
+  try {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(path);
+  } catch (err) {
+    console.warn("[speak] open folder failed", err);
+  }
+}
 
 export function SpeakScreen(): JSX.Element {
   const app = useApp();
@@ -24,8 +36,20 @@ export function SpeakScreen(): JSX.Element {
       await app.refreshTtsVoices();
       await app.refreshCloneModelsStatus();
       await app.refreshVoxcpmStatus();
+      await app.refreshSpeakClips();
     })();
   });
+
+  const openClipsFolder = (): void => {
+    void (async () => openExternal(await speakClipsDir()))();
+  };
+  const clipDate = (ms: number): string => {
+    try {
+      return new Date(ms).toLocaleString();
+    } catch {
+      return "";
+    }
+  };
 
   const anyInstalled = (): boolean => app.ttsVoices().some((v) => v.installed);
   const hasText = (): boolean => app.ttsText().trim().length > 0;
@@ -766,6 +790,144 @@ export function SpeakScreen(): JSX.Element {
             </span>
           </Show>
         </div>
+
+        {/* Saved clips (v1.28.0): every generated TTS clip, replayable. */}
+        <Show when={app.speakClips().length > 0}>
+          <div
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              gap: "var(--s2)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                "align-items": "center",
+                "justify-content": "space-between",
+                gap: "var(--s3)",
+              }}
+            >
+              <span
+                style={{
+                  "font-size": "var(--t-xs)",
+                  "text-transform": "uppercase",
+                  "letter-spacing": "0.08em",
+                  color: "var(--text-low)",
+                }}
+              >
+                Saved clips
+              </span>
+              <button
+                type="button"
+                onClick={openClipsFolder}
+                title="Open the saved-clips folder"
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "var(--s2)",
+                  background: "transparent",
+                  border: "1px solid var(--line)",
+                  "border-radius": "var(--r-md)",
+                  color: "var(--text-mid)",
+                  cursor: "pointer",
+                  padding: "var(--s1) var(--s3)",
+                  "font-size": "var(--t-sm)",
+                }}
+              >
+                <Sigil name="folder" size={14} />
+                Open folder
+              </button>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                "flex-direction": "column",
+                gap: "var(--s1)",
+                "max-height": "220px",
+                "overflow-y": "auto",
+              }}
+            >
+              <For each={app.speakClips()}>
+                {(clip) => (
+                  <div
+                    style={{
+                      display: "flex",
+                      "align-items": "center",
+                      gap: "var(--s2)",
+                      padding: "var(--s2) var(--s3)",
+                      "border-radius": "var(--r-md)",
+                      border: "1px solid var(--line)",
+                      background: "var(--surface-1)",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      aria-label="Play clip"
+                      title="Play"
+                      onClick={() => void app.playSpeakClip(clip)}
+                      style={{
+                        display: "flex",
+                        background: "transparent",
+                        border: "none",
+                        color: "var(--accent)",
+                        cursor: "pointer",
+                        padding: 0,
+                      }}
+                    >
+                      <Sigil name="play" size={16} />
+                    </button>
+                    <span
+                      style={{
+                        display: "flex",
+                        "flex-direction": "column",
+                        flex: 1,
+                        "min-width": 0,
+                      }}
+                    >
+                      <span
+                        style={{
+                          overflow: "hidden",
+                          "text-overflow": "ellipsis",
+                          "white-space": "nowrap",
+                          "font-size": "var(--t-sm)",
+                          color: "var(--text-high)",
+                        }}
+                      >
+                        {clip.text}
+                      </span>
+                      <span
+                        style={{
+                          "font-size": "0.72rem",
+                          color: "var(--text-low)",
+                          "font-variant-numeric": "tabular-nums",
+                        }}
+                      >
+                        {clipDate(clip.createdAt)} · {clip.durationSecs.toFixed(1)}s
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="Delete clip"
+                      title="Delete"
+                      onClick={() => void app.removeSpeakClip(clip.id)}
+                      style={{
+                        display: "flex",
+                        background: "transparent",
+                        border: "none",
+                        color: "var(--text-low)",
+                        cursor: "pointer",
+                        padding: 0,
+                      }}
+                    >
+                      <Sigil name="trash" size={14} />
+                    </button>
+                  </div>
+                )}
+              </For>
+            </div>
+          </div>
+        </Show>
       </div>
     </div>
   );

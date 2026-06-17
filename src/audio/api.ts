@@ -312,6 +312,33 @@ export async function stopSpeak(): Promise<void> {
   await invoke("stop_speak");
 }
 
+/** One saved Speak (TTS) clip, for the "Saved clips" list (v1.28.0). */
+export interface SpeakClip {
+  id: string;
+  text: string;
+  voice: string;
+  /** Milliseconds since the Unix epoch. */
+  createdAt: number;
+  durationSecs: number;
+  /** Absolute path to the WAV — replay via {@link playSoundboardClip}. */
+  path: string;
+}
+
+/** Absolute path of the saved-clips folder (for an "Open folder" button). */
+export async function speakClipsDir(): Promise<string> {
+  return invoke<string>("speak_clips_dir");
+}
+
+/** List saved Speak clips, newest first. */
+export async function listSpeakClips(): Promise<SpeakClip[]> {
+  return invoke<SpeakClip[]>("list_speak_clips");
+}
+
+/** Delete a saved Speak clip by id. */
+export async function deleteSpeakClip(id: string): Promise<void> {
+  await invoke("delete_speak_clip", { id });
+}
+
 // ---- Voice cloning ("Your voices") — v1.20.0 ----
 
 /** One user-cloned voice. Its `id` is selectable in Speak like a preset. */

@@ -910,6 +910,7 @@ name = "divora-app"
 version = "0.0.0"
 dependencies = [
  "divora-core",
+ "hound",
  "midir",
  "serde",
  "serde_json",

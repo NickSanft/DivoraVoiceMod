@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.28.0] — 2026-06-17 — Speak: saved clips
+
+Every clip you generate in Speak is now kept, so you can replay or reuse it without regenerating.
+
+### Added
+
+- **Saved clips.** Each TTS generation is written to a `speak-clips/` folder (WAV + a small JSON sidecar with the text, voice, and timestamp), and a **"Saved clips"** list appears in the Speak panel — newest first, each with **play**, **delete**, and an **Open folder** button. Replays route through the soundboard like any clip. Saving is best-effort, so it never interferes with synthesis.
+
+### Architecture (additive)
+
+- Backend: `speak` persists the clip via `save_tts_clip` (reusing `hound`), plus `list_speak_clips` / `delete_speak_clip` / `speak_clips_dir` commands; the wire type carries the WAV path so the UI replays via the existing `play_soundboard_clip`. Frontend: `speakClips` store state refreshed after each generation, and the list UI in `SpeakScreen`.
+
+### Tests
+
+- +1 Rust (`save_tts_clip` writes a WAV + parseable sidecar) + E2E mock wiring. Full pre-push checklist green.
+
 ## [1.27.0] — 2026-06-17 — Speak stays responsive (un-freeze + take progress)
 
 Generating an accent clone no longer locks up the app. Best-of-N ran ONNX inference across **every** CPU core for the full 20–40 s, starving the UI thread so the window looked frozen. Now inference leaves cores free for the UI, and the Speak button reports which take it's on.
