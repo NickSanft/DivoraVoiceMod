@@ -5,8 +5,74 @@
     <link rel="icon" type="image/png" href="/src-tauri/icons/icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DivoraVoice</title>
+    <!-- Boot splash: inline so it paints instantly, before the JS module graph
+         (and styles.css / fonts) load. Without it the window is pure white for
+         the seconds it takes the bundle to come up. main.tsx fades it out once
+         the app shell has rendered. Colors are hardcoded to the dark default
+         theme since the theme vars aren't loaded yet. -->
+    <style>
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #07060d;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        transition: opacity 0.4s ease;
+      }
+      #boot-splash.boot-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .boot-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 18px;
+      }
+      .boot-title {
+        color: #efeaf7;
+        font-size: 22px;
+        font-weight: 600;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+      .boot-spinner {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 3px solid rgba(168, 150, 220, 0.16);
+        border-top-color: #8b6ef0;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      #boot-msg {
+        color: #6f6885;
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        min-height: 1em;
+      }
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-spinner {
+          animation-duration: 2.4s;
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="boot-splash" role="status" aria-live="polite">
+      <div class="boot-inner">
+        <div class="boot-title">DivoraVoice</div>
+        <div class="boot-spinner" aria-hidden="true"></div>
+        <div id="boot-msg">Starting&hellip;</div>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

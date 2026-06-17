@@ -4,6 +4,18 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.26.0] — 2026-06-17 — Friendlier startup (boot splash)
+
+The app no longer opens to a blank white window while the UI loads — it shows a branded boot splash immediately, so launch feels intentional instead of frozen.
+
+### Added
+
+- **Instant boot splash.** A lightweight splash (app name + spinner) is inlined directly in `index.html`, so it paints **before** the JavaScript bundle, fonts, and stylesheet load — exactly the window that was previously a pure-white screen. It fades out the moment the app shell renders. Because the dismissal code lives in the JS entry point, the splash naturally covers the entire bundle-load gap and clears precisely when the UI is ready.
+
+### Notes
+
+- The startup delay itself is the UI bundle warming up (most visible in `tauri dev`; release builds are much quicker). Heavy TTS models are **not** loaded at launch — they load lazily on first use — so progress feedback for *those* belongs to a Speak generation, not startup.
+
 ## [1.25.0] — 2026-06-16 — Speak: closer clones (best-of-N reranker)
 
 Accent-preserving cloning now sounds **more like you, more reliably**. VoxCPM generation is stochastic — most takes clone you well, but a minority drift in timbre or *ramble* (repeat to the length cap). Speak now generates a few takes and a speaker-verification model keeps the one closest to your reference, discarding ramblers. A new **Clone quality** control (Fast / Balanced / Best) lets you trade speed for fidelity.

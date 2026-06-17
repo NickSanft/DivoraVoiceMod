@@ -14,3 +14,20 @@ if (!root) {
   throw new Error("Root element not found");
 }
 render(() => <App />, root);
+
+// Dismiss the boot splash (index.html) now that the app shell has rendered —
+// this is the moment the pre-render white screen would otherwise end. Two
+// rAFs let the first real frame composite so the fade is smooth; a timeout is
+// a belt-and-suspenders removal if `transitionend` never fires.
+const splash = document.getElementById("boot-splash");
+if (splash) {
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      splash.classList.add("boot-hidden");
+      splash.addEventListener("transitionend", () => splash.remove(), {
+        once: true,
+      });
+      setTimeout(() => splash.remove(), 800);
+    }),
+  );
+}
