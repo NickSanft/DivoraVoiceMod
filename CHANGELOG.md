@@ -10,7 +10,8 @@ Generating an accent clone no longer locks up the app. Best-of-N ran ONNX infere
 
 ### Changed
 
-- **Capped ONNX Runtime intra-op threads** to `cores − 2` (minimum 1) for the VoxCPM graphs + the reranker. Synthesis already runs off the UI thread, so the freeze was pure CPU contention; leaving the UI a couple of cores keeps the app responsive during generation. A touch slower per take, but the window stays usable — and GPU offload (a later item) will remove the CPU pressure entirely.
+- **Synthesis now runs off the UI thread.** `speak` was a *synchronous* command, so it executed on the main thread and blocked the window's event loop — freezing the entire UI (you couldn't even switch panels) for the 20–40 s of a best-of-N generation. It's now an **async command that offloads synthesis to a blocking thread**, so the event loop stays free, the window stays responsive, and the `tts-progress` events render live.
+- **Capped ONNX Runtime intra-op threads** to `cores − 2` (minimum 1) for the VoxCPM graphs + the reranker, so inference leaves CPU for the UI to render smoothly during generation. A touch slower per take; GPU offload (a later item) will remove the CPU pressure entirely.
 
 ### Added
 

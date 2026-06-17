@@ -539,71 +539,78 @@ fn list_tts_voices(state: State<'_, AppState>) -> Vec<divora_core::tts::TtsVoice
 /// staged, `synthesize` returns `NotInstalled` immediately, surfaced to the UI
 /// as a graceful error string rather than a hang.
 #[tauri::command]
-fn speak(
+async fn speak(
     app: AppHandle,
-    state: State<'_, AppState>,
     text: String,
     voice_id: String,
     gain: Option<f32>,
     preview_only: Option<bool>,
     candidates: Option<usize>,
 ) -> Result<f32, String> {
-    // A cloned-voice id routes through its stored engine: `VoxCPM` (accent-
-    // preserving, from the reference clip) or OpenVoice (timbre-only, from the
-    // stored SE on the `am_puck` base). A preset id → plain Kokoro.
-    let to_err = |e: divora_core::tts::TtsError| {
-        tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
-        e.to_string()
-    };
-    // Best-of-N for `VoxCPM` cloning; the UI's clone-quality control sets it,
-    // defaulting to the validated balanced count.
+    // Best-of-N is tens of seconds of CPU-bound synthesis. A *synchronous*
+    // command runs on the main thread and would block the window's event loop —
+    // freezing the whole UI (you couldn't even switch panels). So this command
+    // is async and the synthesis + playback hand-off run on a blocking thread;
+    // the event loop stays free to pump window messages and deliver the
+    // `tts-progress` events emitted from inside.
     let candidates = candidates.unwrap_or(divora_core::tts::voxcpm::DEFAULT_CANDIDATES);
-    let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
-        Some(ClonedVoice::VoxCpm { reference }) => {
-            speak_voxcpm(&app, &state, &text, &reference, candidates)?
-        }
-        Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
-            &text,
-            &base,
-            &se,
-            &state.tts_assets_dir,
-            &clone_dir(&state),
-            CLONE_TAU,
-        )
-        .map_err(to_err)?,
-        None => {
-            divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir).map_err(to_err)?
-        }
-    };
-    let sample_rate = audio.sample_rate;
-    let samples = Arc::new(audio.samples);
-    #[allow(clippy::cast_precision_loss)]
-    let duration_secs = if sample_rate == 0 {
-        0.0
-    } else {
-        samples.len() as f32 / sample_rate as f32
-    };
-    let gain = gain.unwrap_or(1.0);
-    let clip_id = TTS_CLIP_ID.to_string();
-    // Preview → monitor-only (you hear it, the call doesn't); otherwise the
-    // normal both-paths play used by the soundboard.
-    let cmd = if preview_only.unwrap_or(false) {
-        SoundboardCommand::PlayMonitorOnly {
-            clip_id,
-            samples,
-            sample_rate,
-            gain,
-        }
-    } else {
-        SoundboardCommand::Play {
-            clip_id,
-            samples,
-            sample_rate,
-            gain,
-        }
-    };
-    state.engine.send_soundboard(cmd);
-    Ok(duration_secs)
+    tauri::async_runtime::spawn_blocking(move || -> Result<f32, String> {
+        let state = app.state::<AppState>();
+        // A cloned-voice id routes through its stored engine: `VoxCPM` (accent-
+        // preserving, from the reference clip) or OpenVoice (timbre-only, from
+        // the stored SE on the `am_puck` base). A preset id → plain Kokoro.
+        let to_err = |e: divora_core::tts::TtsError| {
+            tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
+            e.to_string()
+        };
+        let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
+            Some(ClonedVoice::VoxCpm { reference }) => {
+                speak_voxcpm(&app, &state, &text, &reference, candidates)?
+            }
+            Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
+                &text,
+                &base,
+                &se,
+                &state.tts_assets_dir,
+                &clone_dir(&state),
+                CLONE_TAU,
+            )
+            .map_err(to_err)?,
+            None => divora_core::tts::synthesize(&text, &voice_id, &state.tts_assets_dir)
+                .map_err(to_err)?,
+        };
+        let sample_rate = audio.sample_rate;
+        let samples = Arc::new(audio.samples);
+        #[allow(clippy::cast_precision_loss)]
+        let duration_secs = if sample_rate == 0 {
+            0.0
+        } else {
+            samples.len() as f32 / sample_rate as f32
+        };
+        let gain = gain.unwrap_or(1.0);
+        let clip_id = TTS_CLIP_ID.to_string();
+        // Preview → monitor-only (you hear it, the call doesn't); otherwise the
+        // normal both-paths play used by the soundboard.
+        let cmd = if preview_only.unwrap_or(false) {
+            SoundboardCommand::PlayMonitorOnly {
+                clip_id,
+                samples,
+                sample_rate,
+                gain,
+            }
+        } else {
+            SoundboardCommand::Play {
+                clip_id,
+                samples,
+                sample_rate,
+                gain,
+            }
+        };
+        state.engine.send_soundboard(cmd);
+        Ok(duration_secs)
+    })
+    .await
+    .map_err(|e| format!("synthesis task failed: {e}"))?
 }
 
 /// Stop any in-flight synthesized speech playing through the mixer.
