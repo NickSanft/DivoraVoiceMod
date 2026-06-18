@@ -187,6 +187,30 @@ the best. The `fbank` front-end is a from-scratch Kaldi reimplementation
 parity-validated against `torchaudio` (Rust↔Python embedding cosine > 0.999).
 Exposed as a **Fast / Balanced / Best** (1 / 3 / 6) latency-vs-fidelity control.
 
+## GPU feasibility (2026-06-17) — DirectML is a NO-GO for this export
+
+After the async un-freeze (v1.27.0) the CPU path is responsive but still ~7 s /
+take. GPU offload was the obvious next lever, so we spiked **DirectML** (the only
+*portable* Windows GPU runtime — works on any DX12 GPU, built into Windows, no
+CUDA toolkit), measured on an **RTX 4090** via `onnxruntime-directml`.
+
+**Result: the `bluryar` VoxCPM graphs don't run on DirectML at all.** Both the
+shipped per-channel **Q8** and the **fp32** models crash identically:
+`RUNTIME_EXCEPTION … Reshape node 'node_view'` (DML's `MLOperatorAuthorImpl`).
+Because fp32 fails the same way, it's **architectural** (a reshape the export
+emits that DML's operator can't author), not a quantization issue. CPU baseline
+on the same machine was ~6 s; DML never completed a single take.
+
+**Verdict: defer GPU.** DirectML can't run it; CUDA could (NVIDIA-only) but isn't
+portable for a free app and needs the CUDA toolkit; and the cost is dominated by
+the **autoregressive `decode_step` loop** (hundreds of tiny sequential dispatches
++ CPU↔GPU syncs), which is exactly the GPU-overhead-sensitive pattern — so even a
+working GPU path would likely give a modest gain, not the 5–10× big-matmul wins.
+The real path, if GPU becomes a priority, is a **DirectML-compatible re-export**
+(drop/replace the `node_view` reshape — e.g. the `DakeQQ` export) or a CUDA
+fast-path for a future VoxCPM2-2B premium tier. The v1.27.0 thread-cap +
+async-off-thread changes remain the shipped mitigation.
+
 ## Sources
 
 Zero-shot TTS: VoxCPM ([repo](https://github.com/OpenBMB/VoxCPM),
