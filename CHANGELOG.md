@@ -10,7 +10,8 @@ Every clip you generate in Speak is now kept, so you can replay or reuse it with
 
 ### Added
 
-- **Saved clips.** Each TTS generation is written to a `speak-clips/` folder (WAV + a small JSON sidecar with the text, voice, and timestamp), and a **"Saved clips"** list appears in the Speak panel — newest first, each with **play**, **delete**, and an **Open folder** button. Replays route through the soundboard like any clip. Saving is best-effort, so it never interferes with synthesis.
+- **Saved clips.** Each TTS generation is written to a `speak-clips/` folder (WAV + a small JSON sidecar with the text, voice, and timestamp), and a **"Saved clips"** list appears in the Speak panel — newest first, each with **play** and **delete**. Replays route through the soundboard like any clip. Saving is best-effort, so it never interferes with synthesis.
+- **Open folder in Explorer.** An always-available **Open folder** button reveals the `speak-clips/` directory in Windows Explorer (a native `explorer` launch from the backend, so it reliably opens a *folder* rather than going through the URL-scoped shell plugin). The folder is created on demand, so it opens even before your first clip.
 
 ### Architecture (additive)
 

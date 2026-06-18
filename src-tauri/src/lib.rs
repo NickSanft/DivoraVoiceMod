@@ -712,6 +712,29 @@ fn speak_clips_dir(state: State<'_, AppState>) -> String {
     speak_clips_path(&state).to_string_lossy().into_owned()
 }
 
+/// Open the saved-clips folder in the OS file manager (Explorer on Windows).
+/// Creates it first so it opens even before the first clip is saved. Uses a
+/// native process rather than the frontend shell plugin so it reliably reveals
+/// a *directory* (the plugin's `open` is scoped/validated for URLs + files).
+#[tauri::command]
+fn open_speak_clips_folder(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = speak_clips_path(&state);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let program = "xdg-open";
+    // `explorer` returns a non-zero exit even on success, so just spawn (don't
+    // wait) — a successful launch is all we need.
+    std::process::Command::new(program)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// List saved Speak clips, newest first (each with its WAV `path` for replay).
 #[tauri::command]
 fn list_speak_clips(state: State<'_, AppState>) -> Vec<SpeakClip> {
@@ -1788,6 +1811,7 @@ pub fn run() {
             speak,
             stop_speak,
             speak_clips_dir,
+            open_speak_clips_folder,
             list_speak_clips,
             delete_speak_clip,
             clone_voice,

@@ -142,6 +142,7 @@ export async function installTauriMock(
         stop_speak: () => null,
         list_speak_clips: () => [],
         speak_clips_dir: () => "C:/mock/speak-clips",
+        open_speak_clips_folder: () => null,
         delete_speak_clip: () => null,
         list_cloned_voices: () => [],
         clone_voice: () => {

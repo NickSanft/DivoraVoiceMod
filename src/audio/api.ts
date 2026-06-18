@@ -329,6 +329,11 @@ export async function speakClipsDir(): Promise<string> {
   return invoke<string>("speak_clips_dir");
 }
 
+/** Open the saved-clips folder in the OS file manager (Explorer on Windows). */
+export async function openSpeakClipsFolder(): Promise<void> {
+  await invoke("open_speak_clips_folder");
+}
+
 /** List saved Speak clips, newest first. */
 export async function listSpeakClips(): Promise<SpeakClip[]> {
   return invoke<SpeakClip[]>("list_speak_clips");

@@ -11,19 +11,8 @@ import { For, Show, createMemo, createSignal, onMount, type JSX } from "solid-js
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Sigil } from "../components/Sigil";
-import { speakClipsDir } from "../audio/api";
+import { openSpeakClipsFolder } from "../audio/api";
 import { useApp } from "../stores/app";
-
-// Open a path with the OS default handler (a folder → the file manager). Falls
-// back gracefully outside the Tauri shell (browser preview / tests).
-async function openExternal(path: string): Promise<void> {
-  try {
-    const { open } = await import("@tauri-apps/plugin-shell");
-    await open(path);
-  } catch (err) {
-    console.warn("[speak] open folder failed", err);
-  }
-}
 
 export function SpeakScreen(): JSX.Element {
   const app = useApp();
@@ -41,7 +30,7 @@ export function SpeakScreen(): JSX.Element {
   });
 
   const openClipsFolder = (): void => {
-    void (async () => openExternal(await speakClipsDir()))();
+    void openSpeakClipsFolder();
   };
   const clipDate = (ms: number): string => {
     try {
@@ -791,8 +780,10 @@ export function SpeakScreen(): JSX.Element {
           </Show>
         </div>
 
-        {/* Saved clips (v1.28.0): every generated TTS clip, replayable. */}
-        <Show when={app.speakClips().length > 0}>
+        {/* Saved clips (v1.28.0): every generated TTS clip, replayable. Shown
+            whenever Speak is usable so "Open folder" is always available; the
+            list itself appears once there are clips. */}
+        <Show when={anyInstalled()}>
           <div
             style={{
               display: "flex",
@@ -839,6 +830,16 @@ export function SpeakScreen(): JSX.Element {
                 Open folder
               </button>
             </div>
+            <Show
+              when={app.speakClips().length > 0}
+              fallback={
+                <span
+                  style={{ "font-size": "var(--t-sm)", color: "var(--text-low)" }}
+                >
+                  No saved clips yet — generate one above and it appears here.
+                </span>
+              }
+            >
             <div
               style={{
                 display: "flex",
@@ -926,6 +927,7 @@ export function SpeakScreen(): JSX.Element {
                 )}
               </For>
             </div>
+            </Show>
           </div>
         </Show>
       </div>
