@@ -14,11 +14,11 @@ Disabling the Mixer's mic monitor no longer silences Speak previews. They were s
 
 ### Fixed
 
-- Speak previews were gated by the Mixer's mic-monitor toggle, so turning that off also muted Speak. The two are now separate.
+- Speak output (the **Speak button** and **saved-clip playback**, plus previews) was gated by the Mixer's mic-monitor toggle, so turning that off also muted Speak in your monitor. The two are now fully independent.
 
 ### Architecture (additive)
 
-- New `EngineState.monitor_soundboard` atomic + `AudioEngine::set_speak_monitor`/`is_speak_monitoring` + a `set_speak_monitor` command. With a separate monitor device, the output callback now gates the two monitor sources **independently while they're still separable** — mic+clips by `monitor`, the monitor-only preview voices by `monitor_soundboard` — and the monitor stream plays the pre-gated ring (the monitor-volume gain still applies over the whole headphone mix). The send to the call is untouched.
+- New `EngineState.monitor_soundboard` atomic + `AudioEngine::set_speak_monitor`/`is_speak_monitoring` + a `set_speak_monitor` command. The key change is in the output callback: the soundboard's regular `Play` voices (Speak + saved clips) now render into their **own buffer**, separate from the DSP-processed mic, so the monitor tap can gate the two **independently** — mic by `monitor`, soundboard/Speak (`Play` voices + monitor-only previews) by `monitor_soundboard` — before folding the soundboard back into the main `mono` for the call send. The monitor stream then plays the pre-gated ring (monitor-volume gain still applies over the whole headphone mix). The send to the call and the no-separate-monitor-device path are untouched.
 
 ## [1.28.0] — 2026-06-17 — Speak: saved clips
 

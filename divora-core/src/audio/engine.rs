@@ -898,8 +898,14 @@ fn build_output_stream(
                 // lands on whatever output device is selected — including
                 // CABLE Input, which is what makes the clips audible to
                 // call participants.
+                // v1.29.0: soundboard `Play` voices (incl. "Speak" + saved
+                // clips) render into their OWN buffer so the monitor can gate
+                // them by the Speak monitor, independent of the mic monitor.
+                // Folded back into `mono` for the main send below.
+                let mut sb = [0f32; MAX_FRAMES_PER_CALLBACK];
                 mix_voice_and_soundboard(
                     &mut mono[..native_frames],
+                    &mut sb[..native_frames],
                     &mut chain,
                     &mut loudness,
                     &mut soundboard,
@@ -921,33 +927,43 @@ fn build_output_stream(
                 // so they stay audible locally. Either branch calls
                 // `mix_monitor_into` exactly once per callback, so those
                 // voices advance.
+                let mic_mon = state_for_callback.monitor.load(Ordering::Acquire);
+                let speak_mon = state_for_callback
+                    .monitor_soundboard
+                    .load(Ordering::Acquire);
                 if let Some(mp) = monitor_producer.as_mut() {
-                    // v1.29.0: gate the two monitor sources INDEPENDENTLY here,
-                    // while mic and preview are still separable, then play the
-                    // ring ungated in the monitor stream. So disabling mic
-                    // monitoring no longer silences Speak previews.
+                    // v1.29.0: build the monitor mix from INDEPENDENTLY-gated
+                    // sources — mic by the Mixer monitor, soundboard/Speak (the
+                    // `sb` Play voices + monitor-only previews) by the Speak
+                    // monitor — so muting one never silences the other. The ring
+                    // is then played ungated in the monitor stream.
                     let mut mon = [0f32; MAX_FRAMES_PER_CALLBACK];
-                    // Mic (+ regular clips) into the monitor only when mic
-                    // monitoring is on. The monitor-volume gain is applied later
-                    // in the monitor stream, over the whole headphone mix.
-                    if state_for_callback.monitor.load(Ordering::Acquire) {
+                    if mic_mon {
                         mon[..native_frames].copy_from_slice(&mono[..native_frames]);
                     }
-                    // Monitor-only voices (TTS preview): always advance them so
-                    // the clip plays through, but fold into the monitor only when
-                    // Speak monitoring is on.
-                    if state_for_callback
-                        .monitor_soundboard
-                        .load(Ordering::Acquire)
-                    {
+                    if speak_mon {
+                        for (m, &s) in mon[..native_frames].iter_mut().zip(&sb[..native_frames]) {
+                            *m += s;
+                        }
                         soundboard.mix_monitor_into(&mut mon[..native_frames], input_rate);
                     } else {
+                        // Still advance the monitor-only voices so clips play through.
                         let mut scratch = [0f32; MAX_FRAMES_PER_CALLBACK];
                         soundboard.mix_monitor_into(&mut scratch[..native_frames], input_rate);
                     }
                     let _ = mp.push_slice(&mon[..native_frames]);
                 } else {
+                    // No separate monitor device: the single output carries the
+                    // monitor-only voices too (gated downstream by the monitor
+                    // toggle, exactly as before).
                     soundboard.mix_monitor_into(&mut mono[..native_frames], input_rate);
+                }
+
+                // Fold the soundboard `Play` voices back into `mono` for the main
+                // send (the call always hears Speak/soundboard output) and the
+                // recording tap below.
+                for (m, &s) in mono[..native_frames].iter_mut().zip(&sb[..native_frames]) {
+                    *m += s;
                 }
 
                 // Phase 16: tap the same processed mono into the
@@ -1128,15 +1144,16 @@ fn main_output_plays(has_monitor: bool, monitoring: bool) -> bool {
     has_monitor || monitoring
 }
 
-/// Run the DSP chain on the mic mono buffer, normalize the voice's
-/// loudness (v1.7.0), then mix soundboard voices in over the top of the
-/// already-effected, level-matched signal. Extracted from the output
-/// callback so the order — "DSP → normalize voice → soundboard on top" —
-/// is unit-testable in isolation. (The order matters: effects + loudness
-/// normalization apply only to the user's voice, while clips play as-is
-/// on whatever output device is selected, including the virtual mic.)
+/// Run the DSP chain on the mic mono buffer and normalize the voice's
+/// loudness (v1.7.0), then render the soundboard's regular (`Play`) voices into
+/// a **separate** `soundboard_out` buffer. Keeping them apart lets the monitor
+/// tap gate the mic and the soundboard/Speak output independently (v1.29.0);
+/// the caller folds `soundboard_out` back into `mono` afterwards for the main
+/// send. Effects + loudness apply only to the user's voice; clips play as-is.
+/// Extracted so the order is unit-testable in isolation.
 fn mix_voice_and_soundboard(
     mono: &mut [f32],
+    soundboard_out: &mut [f32],
     chain: &mut EffectChain,
     loudness: &mut LoudnessNormalizer,
     soundboard: &mut SoundboardMixer,
@@ -1144,7 +1161,7 @@ fn mix_voice_and_soundboard(
 ) {
     chain.process(mono, sample_rate);
     loudness.process(mono, sample_rate);
-    soundboard.mix_into(mono, sample_rate);
+    soundboard.mix_into(soundboard_out, sample_rate);
 }
 
 /// The WAV writer the recording thread holds while a file is open.
@@ -1426,14 +1443,13 @@ mod tests {
         assert_eq!(output.peak, 0.0);
     }
 
-    /// Phase 11 regression — confirm that the engine's output
-    /// callback mixes the soundboard ON TOP of the DSP-processed mic
-    /// buffer (rather than into a separate stream or only the monitor
-    /// path). The function is small but the assertion is the property
-    /// users care about: if the user routes the engine output into
-    /// CABLE Input, the clips reach the call.
+    /// Phase 11 regression (updated v1.29.0) — the mic stays in `mono` and the
+    /// soundboard clips render into the SEPARATE `soundboard_out` buffer (so the
+    /// monitor can gate them independently). The property users care about still
+    /// holds: their SUM is what reaches the output (the caller folds them
+    /// together), so routing into CABLE Input still carries clips to the call.
     #[test]
-    fn soundboard_clips_land_in_the_same_output_buffer_as_the_mic() {
+    fn soundboard_clips_render_into_their_own_buffer_then_sum_with_mic() {
         let mut chain = EffectChain::new(); // empty → mic samples pass through
         let mut sb = SoundboardMixer::new();
         // Inject a 4096-sample clip of constant 0.25 at 48 kHz so the
@@ -1447,17 +1463,30 @@ mod tests {
         });
         // Pretend the mic delivered a 480-sample buffer of constant 0.10.
         let mut mono = vec![0.10_f32; 480];
-        // Loudness normalizer defaults to disabled → bit-exact passthrough,
-        // so the mic + clip sum below is unaffected.
+        let mut sb_out = vec![0.0_f32; 480];
+        // Loudness normalizer defaults to disabled → bit-exact passthrough.
         let mut loudness = LoudnessNormalizer::new();
-        mix_voice_and_soundboard(&mut mono, &mut chain, &mut loudness, &mut sb, 48_000);
-        // Each output sample should now hold the sum: 0.10 (mic, passed
-        // through the empty chain) + 0.25 (clip mixed in) = 0.35.
-        // Linear-interpolation between same-value neighbours is exact.
-        for (i, &s) in mono.iter().enumerate() {
+        mix_voice_and_soundboard(
+            &mut mono,
+            &mut sb_out,
+            &mut chain,
+            &mut loudness,
+            &mut sb,
+            48_000,
+        );
+        for (i, (&m, &s)) in mono.iter().zip(&sb_out).enumerate() {
             assert!(
-                (s - 0.35).abs() < 1e-5,
-                "expected mic + clip to sum at i={i}, got {s}"
+                (m - 0.10).abs() < 1e-6,
+                "mic stays in mono at i={i}, got {m}"
+            );
+            assert!(
+                (s - 0.25).abs() < 1e-5,
+                "clip lands in sb_out at i={i}, got {s}"
+            );
+            assert!(
+                (m + s - 0.35).abs() < 1e-5,
+                "their sum is the output at i={i}, got {}",
+                m + s
             );
         }
     }
@@ -1469,13 +1498,22 @@ mod tests {
         let mut chain = EffectChain::new();
         let mut sb = SoundboardMixer::new();
         let mut mono = vec![0.10_f32; 480];
+        let mut sb_out = vec![0.0_f32; 480];
         let mut loudness = LoudnessNormalizer::new();
-        mix_voice_and_soundboard(&mut mono, &mut chain, &mut loudness, &mut sb, 48_000);
-        for &s in &mono {
+        mix_voice_and_soundboard(
+            &mut mono,
+            &mut sb_out,
+            &mut chain,
+            &mut loudness,
+            &mut sb,
+            48_000,
+        );
+        for (&m, &s) in mono.iter().zip(&sb_out) {
             assert!(
-                (s - 0.10).abs() < 1e-6,
-                "mic-only path mutated the sample, got {s}"
+                (m - 0.10).abs() < 1e-6,
+                "mic-only path mutated the mic, got {m}"
             );
+            assert!(s.abs() < 1e-9, "no clip → empty soundboard buffer, got {s}");
         }
     }
 }
