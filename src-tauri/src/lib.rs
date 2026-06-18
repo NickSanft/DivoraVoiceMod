@@ -189,6 +189,14 @@ fn set_audio_monitor(state: State<'_, AppState>, enabled: bool) {
     state.engine.set_monitor(enabled);
 }
 
+/// v1.29.0: toggle hearing Speak/soundboard previews in the monitor —
+/// independent of the Mixer's mic monitor ([`set_audio_monitor`]). Takes effect
+/// next buffer; no restart needed.
+#[tauri::command]
+fn set_speak_monitor(state: State<'_, AppState>, enabled: bool) {
+    state.engine.set_speak_monitor(enabled);
+}
+
 /// v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 =
 /// unity). Takes effect next buffer; no restart needed.
 #[tauri::command]
@@ -1780,6 +1788,7 @@ pub fn run() {
             start_audio_engine,
             stop_audio_engine,
             set_audio_monitor,
+            set_speak_monitor,
             set_monitor_gain,
             set_loudness_enabled,
             set_loudness_target,

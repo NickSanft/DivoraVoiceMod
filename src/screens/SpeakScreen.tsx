@@ -661,6 +661,29 @@ export function SpeakScreen(): JSX.Element {
               <Sigil name="monitor" size={15} />
             </span>
           </label>
+
+          {/* v1.29.0: hear Speak in the monitor, independent of the Mixer's
+              mic monitor — disabling that no longer silences Speak previews. */}
+          <label
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s2)",
+              cursor: "pointer",
+              "user-select": "none",
+            }}
+            title="Hear Speak in your monitor — independent of the Mixer's mic monitor"
+          >
+            <input
+              type="checkbox"
+              checked={app.speakMonitor()}
+              onChange={(e) => app.setSpeakMonitor(e.currentTarget.checked)}
+              style={{ "accent-color": "var(--accent)" }}
+            />
+            <span style={{ "font-size": "var(--t-sm)", color: "var(--text-high)" }}>
+              Monitor
+            </span>
+          </label>
         </div>
 
         {/* Clone quality (best-of-N) — VoxCPM cloned voices only, v1.25.0 */}

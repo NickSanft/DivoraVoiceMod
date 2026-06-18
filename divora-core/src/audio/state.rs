@@ -18,6 +18,12 @@ pub struct Levels {
 pub struct EngineState {
     pub running: AtomicBool,
     pub monitor: AtomicBool,
+    /// v1.29.0: independent gate for hearing **Speak / soundboard "monitor-only"
+    /// voices** (e.g. a TTS preview) in the monitor, separate from [`monitor`]
+    /// (which gates hearing your own mic). Lets you disable mic monitoring
+    /// without silencing Speak previews. `Default` false; `AudioEngine::new`
+    /// sets it true so previews are audible out of the box.
+    pub monitor_soundboard: AtomicBool,
     /// Phase 16: true while the modulated output is being recorded to a
     /// WAV file. Gates the output callback's push into the recording ring.
     pub recording: AtomicBool,

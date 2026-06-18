@@ -74,6 +74,7 @@ import {
   stopSpeak as stopSpeakCmd,
   listSpeakClips as listSpeakClipsCmd,
   deleteSpeakClip as deleteSpeakClipCmd,
+  setSpeakMonitor as setSpeakMonitorCmd,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
@@ -212,6 +213,7 @@ const STORAGE_KEYS = {
   ttsVolume: "divora.ttsVolume",
   ttsPreviewOnly: "divora.ttsPreviewOnly",
   cloneQuality: "divora.cloneQuality",
+  speakMonitor: "divora.speakMonitor",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -439,6 +441,10 @@ export interface AppState {
    *  Best 6; higher = more faithful but slower). Persisted `divora.cloneQuality`. */
   cloneQuality: () => number;
   setCloneQuality: (n: number) => void;
+  /** v1.29.0: hear Speak previews in the monitor, independent of the Mixer's
+   *  mic monitor. Default on; persisted `divora.speakMonitor`. */
+  speakMonitor: () => boolean;
+  setSpeakMonitor: (on: boolean) => void;
   /** Draft text in the Speak box (ephemeral — not persisted). */
   ttsText: () => string;
   setTtsText: (text: string) => void;
@@ -2067,6 +2073,15 @@ export function createAppState(): AppState {
   const [cloneQuality, setCloneQualityRaw] = createSignal<number>(
     loadJson<number>(STORAGE_KEYS.cloneQuality, 3),
   );
+  // v1.29.0: hear Speak previews in the monitor, independent of the Mixer's mic
+  // monitor. Default on; persisted + pushed to the engine (which also defaults
+  // it on) so it survives restarts.
+  const [speakMonitor, setSpeakMonitorRaw] = createSignal<boolean>(
+    loadJson<boolean>(STORAGE_KEYS.speakMonitor, true),
+  );
+  // Sync the persisted value to the engine at startup (covers a persisted
+  // "off"); the command just stores an atomic, so it's safe before streams run.
+  void setSpeakMonitorCmd(speakMonitor()).catch(() => {});
 
   const setSelectedTtsVoice = (id: string): void => {
     setSelectedTtsVoiceRaw(id);
@@ -2088,6 +2103,12 @@ export function createAppState(): AppState {
     const clamped = Math.max(1, Math.min(8, Math.round(n)));
     setCloneQualityRaw(clamped);
     saveJson(STORAGE_KEYS.cloneQuality, clamped);
+  };
+
+  const setSpeakMonitor = (on: boolean): void => {
+    setSpeakMonitorRaw(on);
+    saveJson(STORAGE_KEYS.speakMonitor, on);
+    void setSpeakMonitorCmd(on).catch(() => {});
   };
 
   const refreshTtsVoices = async (): Promise<void> => {
@@ -2480,6 +2501,8 @@ export function createAppState(): AppState {
     setTtsPreviewOnly,
     cloneQuality,
     setCloneQuality,
+    speakMonitor,
+    setSpeakMonitor,
     ttsText,
     setTtsText,
     synthesizing,

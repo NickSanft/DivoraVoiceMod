@@ -89,6 +89,12 @@ export async function setAudioMonitor(enabled: boolean): Promise<void> {
   await invoke("set_audio_monitor", { enabled });
 }
 
+/** v1.29.0: toggle hearing Speak/soundboard previews in the monitor, separate
+ *  from the Mixer's mic monitor ({@link setAudioMonitor}). */
+export async function setSpeakMonitor(enabled: boolean): Promise<void> {
+  await invoke("set_speak_monitor", { enabled });
+}
+
 /** v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 = unity). */
 export async function setMonitorGain(gain: number): Promise<void> {
   await invoke("set_monitor_gain", { gain });

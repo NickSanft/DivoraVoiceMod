@@ -110,6 +110,9 @@ impl AudioEngine {
         // Monitor defaults to on so first-time users hear themselves
         // immediately when they start the engine.
         state.monitor.store(true, Ordering::Release);
+        // Speak/soundboard monitor defaults to on so TTS previews are audible
+        // even if mic monitoring is later turned off (v1.29.0).
+        state.monitor_soundboard.store(true, Ordering::Release);
         // Monitor gain defaults to unity (Default would leave it 0.0).
         state.store_monitor_gain(1.0);
         // v1.7.0: loudness normalization is opt-in (enabled defaults false);
@@ -157,6 +160,22 @@ impl AudioEngine {
     /// silence even while the engine is running and metering input.
     pub fn set_monitor(&self, enabled: bool) {
         let _ = self.tx.send(Command::SetMonitor(enabled));
+    }
+
+    /// v1.29.0: toggle hearing Speak/soundboard "monitor-only" voices (TTS
+    /// previews) in the monitor — independent of [`set_monitor`](Self::set_monitor)
+    /// (which governs hearing your own mic). Stored directly; the output callback
+    /// picks it up next buffer.
+    pub fn set_speak_monitor(&self, enabled: bool) {
+        self.state
+            .monitor_soundboard
+            .store(enabled, Ordering::Release);
+    }
+
+    /// v1.29.0: whether Speak/soundboard previews are routed to the monitor.
+    #[must_use]
+    pub fn is_speak_monitoring(&self) -> bool {
+        self.state.monitor_soundboard.load(Ordering::Acquire)
     }
 
     /// v1.6.0: set the gain applied to the separate monitor ("hear
@@ -903,9 +922,29 @@ fn build_output_stream(
                 // `mix_monitor_into` exactly once per callback, so those
                 // voices advance.
                 if let Some(mp) = monitor_producer.as_mut() {
+                    // v1.29.0: gate the two monitor sources INDEPENDENTLY here,
+                    // while mic and preview are still separable, then play the
+                    // ring ungated in the monitor stream. So disabling mic
+                    // monitoring no longer silences Speak previews.
                     let mut mon = [0f32; MAX_FRAMES_PER_CALLBACK];
-                    mon[..native_frames].copy_from_slice(&mono[..native_frames]);
-                    soundboard.mix_monitor_into(&mut mon[..native_frames], input_rate);
+                    // Mic (+ regular clips) into the monitor only when mic
+                    // monitoring is on. The monitor-volume gain is applied later
+                    // in the monitor stream, over the whole headphone mix.
+                    if state_for_callback.monitor.load(Ordering::Acquire) {
+                        mon[..native_frames].copy_from_slice(&mono[..native_frames]);
+                    }
+                    // Monitor-only voices (TTS preview): always advance them so
+                    // the clip plays through, but fold into the monitor only when
+                    // Speak monitoring is on.
+                    if state_for_callback
+                        .monitor_soundboard
+                        .load(Ordering::Acquire)
+                    {
+                        soundboard.mix_monitor_into(&mut mon[..native_frames], input_rate);
+                    } else {
+                        let mut scratch = [0f32; MAX_FRAMES_PER_CALLBACK];
+                        soundboard.mix_monitor_into(&mut scratch[..native_frames], input_rate);
+                    }
                     let _ = mp.push_slice(&mon[..native_frames]);
                 } else {
                     soundboard.mix_monitor_into(&mut mono[..native_frames], input_rate);
@@ -1019,8 +1058,11 @@ fn build_monitor_stream(
                 if data.is_empty() || channels == 0 {
                     return;
                 }
-                let monitoring = state.monitor.load(Ordering::Acquire);
-                // v1.6.0: user-set monitor volume ("hear yourself" level).
+                // v1.29.0: the ring is already gated per-source by the main
+                // output callback (mic by `monitor`, preview by
+                // `monitor_soundboard`), so this stream no longer gates on
+                // `monitor` — it plays whatever it's fed.
+                // v1.6.0: user-set monitor volume, applied over the whole mix.
                 let monitor_gain = state.load_monitor_gain();
                 let out_frames = (data.len() / channels).min(MAX_FRAMES_PER_CALLBACK);
 
@@ -1055,7 +1097,7 @@ fn build_monitor_stream(
                 };
 
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
-                    let sample = if i < written_out && monitoring {
+                    let sample = if i < written_out {
                         output_mono[i] * monitor_gain
                     } else {
                         0.0
@@ -1328,6 +1370,18 @@ mod tests {
         // Synchronous stop must still return (engine thread is alive).
         assert!(engine.stop_reference_recording());
         assert!(!engine.is_reference_recording());
+    }
+
+    /// v1.29.0: the Speak/soundboard monitor defaults on (TTS previews audible)
+    /// and toggles independently — disabling the mic monitor can't silence it.
+    #[test]
+    fn speak_monitor_defaults_on_and_toggles() {
+        let engine = AudioEngine::new();
+        assert!(engine.is_speak_monitoring(), "previews audible by default");
+        engine.set_speak_monitor(false);
+        assert!(!engine.is_speak_monitoring());
+        engine.set_speak_monitor(true);
+        assert!(engine.is_speak_monitoring());
     }
 
     /// v1.6.0: monitor gain defaults to unity and `set_monitor_gain`

@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.29.0] — 2026-06-18 — Speak: independent monitor toggle
+
+Disabling the Mixer's mic monitor no longer silences Speak previews. They were sharing one monitor flag; now Speak has its own.
+
+### Added
+
+- **Speak "Monitor" toggle.** A toggle in the Speak panel controls whether you hear Speak/preview audio in your monitor — **independent of the Mixer's mic ("hear yourself") monitor**. So you can turn off mic monitoring and still hear what Speak generates. Defaults on, persisted across sessions.
+
+### Fixed
+
+- Speak previews were gated by the Mixer's mic-monitor toggle, so turning that off also muted Speak. The two are now separate.
+
+### Architecture (additive)
+
+- New `EngineState.monitor_soundboard` atomic + `AudioEngine::set_speak_monitor`/`is_speak_monitoring` + a `set_speak_monitor` command. With a separate monitor device, the output callback now gates the two monitor sources **independently while they're still separable** — mic+clips by `monitor`, the monitor-only preview voices by `monitor_soundboard` — and the monitor stream plays the pre-gated ring (the monitor-volume gain still applies over the whole headphone mix). The send to the call is untouched.
+
 ## [1.28.0] — 2026-06-17 — Speak: saved clips
 
 Every clip you generate in Speak is now kept, so you can replay or reuse it without regenerating.
