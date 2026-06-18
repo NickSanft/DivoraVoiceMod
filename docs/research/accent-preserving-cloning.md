@@ -211,6 +211,30 @@ The real path, if GPU becomes a priority, is a **DirectML-compatible re-export**
 fast-path for a future VoxCPM2-2B premium tier. The v1.27.0 thread-cap +
 async-off-thread changes remain the shipped mitigation.
 
+### Re-test (2026-06-18) — the first spike was misconfigured, but the verdict holds
+
+The original spike created DML sessions with **default options**. **DirectML
+requires `enable_mem_pattern = False` + `ExecutionMode::ORT_SEQUENTIAL`** (it has
+no memory-pattern planner; ORT returns an error otherwise) — which the spike
+never set, so it was testing a misconfigured session. Re-tested with the correct
+options on the RTX 4090:
+
+- ✅ **All four graphs now LOAD and place their nodes on `DmlExecutionProvider`** —
+  the original couldn't get that far.
+- ❌ **The runtime still hard-crashes on the same `Reshape 'node_view'`** — now
+  cleanly inside the VAE encoder's `run()` (`8007023E {Application Error}` from
+  DML's `MLOperatorAuthorImpl`). Disabling graph optimization doesn't help.
+
+So it's **not** the session config — it's a specific `Reshape` op DML's kernel
+can't author. `node_view` (a PyTorch `.view()` artifact) is **pervasive**: 35
+occurrences in the encoder, **310 in `decode_step`** (the hot path), 139 in
+prefill, 57 in the decoder — so there's no partial-offload escape hatch either.
+This `8007023E` Reshape failure is a **known DirectML limitation** (unsupported
+operator/opset as exported — the same code recurs across Concat/Unsqueeze/Gemm in
+many models, incl. Kokoro). **Net: DirectML genuinely can't run this export; the
+fix is a DML-friendly re-export, not a config tweak.** Verdict unchanged, now
+precisely diagnosed.
+
 ## Sources
 
 Zero-shot TTS: VoxCPM ([repo](https://github.com/OpenBMB/VoxCPM),
