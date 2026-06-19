@@ -1887,6 +1887,7 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
       gain: 1.0,
       previewOnly: false,
       candidates: 3,
+      useGpu: false,
     });
     expect(result.playingClips["tts"]).toBeDefined();
     expect(result.playingClips["tts"]!.durationSecs).toBe(2.0);
@@ -1961,6 +1962,7 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
       gain: 0.4,
       previewOnly: true,
       candidates: 3,
+      useGpu: false,
     });
   });
 

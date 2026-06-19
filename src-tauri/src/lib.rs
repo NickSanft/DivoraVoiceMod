@@ -118,8 +118,11 @@ struct AppState {
     voice_recording_path: Mutex<Option<PathBuf>>,
     /// `VoxCPM` accent-preserving cloning engine (4 ONNX sessions + tokenizer),
     /// lazy-loaded on first `VoxCPM` cloned-voice speak and held (each is hundreds
-    /// of MB). `None` until first use / when the models aren't installed.
-    voxcpm_engine: Mutex<Option<divora_core::tts::voxcpm::VoxCpmEngine>>,
+    /// of MB). `None` until first use / when the models aren't installed. The
+    /// `bool` is the GPU mode the cached engine was built with — when a speak
+    /// requests a different mode, the engine is rebuilt (the `decode_step` swaps
+    /// between the CPU and the `DirectML` fp16 build).
+    voxcpm_engine: Mutex<Option<(bool, divora_core::tts::voxcpm::VoxCpmEngine)>>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -554,6 +557,7 @@ async fn speak(
     gain: Option<f32>,
     preview_only: Option<bool>,
     candidates: Option<usize>,
+    use_gpu: Option<bool>,
 ) -> Result<f32, String> {
     // Best-of-N is tens of seconds of CPU-bound synthesis. A *synchronous*
     // command runs on the main thread and would block the window's event loop —
@@ -562,6 +566,7 @@ async fn speak(
     // the event loop stays free to pump window messages and deliver the
     // `tts-progress` events emitted from inside.
     let candidates = candidates.unwrap_or(divora_core::tts::voxcpm::DEFAULT_CANDIDATES);
+    let use_gpu = use_gpu.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || -> Result<f32, String> {
         let state = app.state::<AppState>();
         // A cloned-voice id routes through its stored engine: `VoxCPM` (accent-
@@ -573,7 +578,7 @@ async fn speak(
         };
         let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
             Some(ClonedVoice::VoxCpm { reference }) => {
-                speak_voxcpm(&app, &state, &text, &reference, candidates)?
+                speak_voxcpm(&app, &state, &text, &reference, candidates, use_gpu)?
             }
             Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
                 &text,
@@ -1172,16 +1177,20 @@ fn speak_voxcpm(
     text: &str,
     reference: &Path,
     candidates: usize,
+    use_gpu: bool,
 ) -> Result<divora_core::tts::TtsAudio, String> {
     use divora_core::tts::voxcpm;
     let clip = decode_clip(reference).map_err(|e| e.to_string())?;
     let dir = voxcpm_dir(state);
     let mut guard = state.voxcpm_engine.lock().unwrap();
-    if guard.is_none() {
-        *guard = voxcpm::VoxCpmEngine::load(&dir);
+    // (Re)load when nothing is cached or the GPU mode changed — the engine holds a
+    // CPU- or `DirectML`-built decode_step, so a toggle means a rebuild.
+    if guard.as_ref().is_none_or(|(gpu, _)| *gpu != use_gpu) {
+        *guard = voxcpm::VoxCpmEngine::load(&dir, use_gpu).map(|e| (use_gpu, e));
     }
     let engine = guard
         .as_mut()
+        .map(|(_, e)| e)
         .ok_or_else(|| "voice-cloning models are not installed".to_string())?;
     // Fresh diffusion noise each utterance (a per-utterance seed). A fixed seed
     // can occasionally fail to trigger the model's stop and ramble to the length
@@ -1308,6 +1317,45 @@ fn download_voxcpm_models(app: AppHandle, state: State<'_, AppState>) -> Result<
             .map_err(|e| format!("downloading {name}: {e}"))?;
     }
     tracing::info!(path = %dir.display(), "voxcpm models downloaded");
+    Ok(())
+}
+
+/// `DirectML` GPU-acceleration status for the Speak UI: whether the platform can run
+/// it and whether the opt-in fp16 GPU decode model is installed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoxCpmGpuStatus {
+    /// Platform supports the `DirectML` build (Windows + DX12). The app is
+    /// Windows-only, so effectively always true — kept explicit for the UI/future.
+    supported: bool,
+    /// The fp16 GPU decode model is present, so GPU mode can be turned on.
+    model_present: bool,
+}
+
+/// Whether GPU (`DirectML`) cloning can be offered, and whether its model is on disk.
+#[tauri::command]
+fn voxcpm_gpu_status(state: State<'_, AppState>) -> VoxCpmGpuStatus {
+    let paths = divora_core::tts::voxcpm::VoxCpmPaths::new(&voxcpm_dir(&state));
+    VoxCpmGpuStatus {
+        supported: cfg!(windows),
+        model_present: paths.gpu_decode_present(),
+    }
+}
+
+/// Download the optional fp16 `DirectML` decode model (~1.2 GB) that GPU cloning
+/// uses. Reuses the `clone-model-download` progress events; no-op if present.
+#[tauri::command]
+fn download_voxcpm_gpu_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.clone_models_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = "voxcpm-decode-step-gpu.onnx";
+    let dest = dir.join(name);
+    if dest.is_file() {
+        return Ok(());
+    }
+    let url = format!("{CLONE_MODELS_BASE_URL}/{name}");
+    download_to_file(&app, &url, &dest, 1, 1).map_err(|e| format!("downloading {name}: {e}"))?;
+    tracing::info!(path = %dest.display(), "voxcpm gpu model downloaded");
     Ok(())
 }
 
@@ -1832,6 +1880,8 @@ pub fn run() {
             download_clone_models,
             voxcpm_status,
             download_voxcpm_models,
+            voxcpm_gpu_status,
+            download_voxcpm_gpu_model,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,

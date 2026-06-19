@@ -23,16 +23,22 @@ $voices = Join-Path $res "voices"
 New-Item -ItemType Directory -Force -Path $voices | Out-Null
 
 $dll = Join-Path $res "onnxruntime.dll"
+$directml = Join-Path $res "DirectML.dll"
 $model = Join-Path $voices "llvc-narrator.onnx"
 
 Write-Host "Fetching voice assets from $repo@$tag ..."
+# v1.30.0: onnxruntime.dll on the release is the DirectML build (runs CPU too) so
+# the optional GPU cloning path can init the DML EP; DirectML.dll ships beside it.
 gh release download $tag --repo $repo --pattern "onnxruntime.dll" --output $dll --clobber
+gh release download $tag --repo $repo --pattern "DirectML.dll" --output $directml --clobber
 gh release download $tag --repo $repo --pattern "llvc-narrator.onnx" --output $model --clobber
 
 if (-not (Test-Path $dll)) { throw "missing $dll after fetch" }
+if (-not (Test-Path $directml)) { throw "missing $directml after fetch" }
 if (-not (Test-Path $model)) { throw "missing $model after fetch" }
 Write-Host "Voice assets ready:"
 Write-Host "  $dll ($([math]::Round((Get-Item $dll).Length/1MB,1)) MB)"
+Write-Host "  $directml ($([math]::Round((Get-Item $directml).Length/1MB,1)) MB)"
 Write-Host "  $model ($([math]::Round((Get-Item $model).Length/1MB,1)) MB)"
 
 # v1.17.0: text-to-speech ("Speak") assets — Kokoro-82M (Apache-2.0) for

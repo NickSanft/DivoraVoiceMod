@@ -25,6 +25,7 @@ export function SpeakScreen(): JSX.Element {
       await app.refreshTtsVoices();
       await app.refreshCloneModelsStatus();
       await app.refreshVoxcpmStatus();
+      await app.refreshVoxcpmGpuStatus();
       await app.refreshSpeakClips();
     })();
   });
@@ -745,6 +746,67 @@ export function SpeakScreen(): JSX.Element {
             <span style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}>
               more takes sound more like you, but take longer
             </span>
+          </div>
+        </Show>
+
+        {/* Experimental DirectML GPU — VoxCPM cloned voices only, v1.30.0. Opt-in:
+            needs the ~1.2 GB fp16 GPU model; falls back to CPU if DirectML fails. */}
+        <Show when={isVoxcpmSelected() && app.voxcpmGpuSupported()}>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s3)",
+              "flex-wrap": "wrap",
+            }}
+          >
+            <Show
+              when={app.voxcpmGpuModelPresent()}
+              fallback={
+                <button
+                  type="button"
+                  disabled={app.cloneDownloading()}
+                  onClick={() => void app.downloadVoxcpmGpuModel()}
+                  style={{
+                    padding: "var(--s2) var(--s4)",
+                    "font-size": "var(--t-sm)",
+                    border: "1px solid var(--line)",
+                    "border-radius": "var(--r-md)",
+                    background: "transparent",
+                    color: "var(--text-mid)",
+                    cursor: app.cloneDownloading() ? "default" : "pointer",
+                  }}
+                >
+                  {app.cloneDownloading()
+                    ? `Downloading… ${app.cloneDownloadPct()}%`
+                    : "Enable GPU (download ~1.2 GB)"}
+                </button>
+              }
+            >
+              <label
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "var(--s2)",
+                  cursor: "pointer",
+                  "user-select": "none",
+                }}
+                title="Run the decode step on your GPU via DirectML — falls back to CPU if unavailable"
+              >
+                <input
+                  type="checkbox"
+                  checked={app.cloneGpu()}
+                  onChange={(e) => app.setCloneGpu(e.currentTarget.checked)}
+                  style={{ "accent-color": "var(--accent)" }}
+                />
+                <span style={{ "font-size": "var(--t-sm)", color: "var(--text-high)" }}>
+                  Use GPU (experimental)
+                </span>
+              </label>
+              <span style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}>
+                ~1.3× faster decode on a DX12 GPU
+              </span>
+            </Show>
           </div>
         </Show>
 

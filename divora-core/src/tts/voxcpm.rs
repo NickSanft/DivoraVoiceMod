@@ -80,6 +80,11 @@ dish. The juice of lemons makes fine punch.";
 /// ONNX graph + tokenizer filenames under the `VoxCPM` model directory.
 const PREFILL_FILE: &str = "voxcpm-prefill.onnx";
 const DECODE_STEP_FILE: &str = "voxcpm-decode-step.onnx";
+/// Optional fp16 GPU build of the decode_step (DirectML), an opt-in extra download
+/// (~1.2 GB). Only the decode_step is GPU-accelerated — it's the autoregressive
+/// bottleneck; prefill/VAE stay on CPU. fp32 I/O (the casts run on-GPU) so it drops
+/// into the same decode loop. See `docs/research/accent-preserving-cloning.md`.
+const DECODE_STEP_GPU_FILE: &str = "voxcpm-decode-step-gpu.onnx";
 const VAE_ENCODER_FILE: &str = "voxcpm-vae-encoder.onnx";
 const VAE_DECODER_FILE: &str = "voxcpm-vae-decoder.onnx";
 const TOKENIZER_FILE: &str = "voxcpm-tokenizer.json";
@@ -92,6 +97,8 @@ const TOKENIZER_FILE: &str = "voxcpm-tokenizer.json";
 pub struct VoxCpmPaths {
     pub prefill: PathBuf,
     pub decode_step: PathBuf,
+    /// fp16 DirectML build of the decode_step (optional opt-in download).
+    pub decode_step_gpu: PathBuf,
     pub vae_encoder: PathBuf,
     pub vae_decoder: PathBuf,
     pub tokenizer: PathBuf,
@@ -106,11 +113,19 @@ impl VoxCpmPaths {
         Self {
             prefill: model_dir.join(PREFILL_FILE),
             decode_step: model_dir.join(DECODE_STEP_FILE),
+            decode_step_gpu: model_dir.join(DECODE_STEP_GPU_FILE),
             vae_encoder: model_dir.join(VAE_ENCODER_FILE),
             vae_decoder: model_dir.join(VAE_DECODER_FILE),
             tokenizer: model_dir.join(TOKENIZER_FILE),
             speaker: model_dir.join(crate::tts::speaker::SPEAKER_MODEL_FILE),
         }
+    }
+
+    /// Whether the optional fp16 GPU decode build is present (so GPU mode can be
+    /// offered/used). The other graphs are shared with the CPU path.
+    #[must_use]
+    pub fn gpu_decode_present(&self) -> bool {
+        self.decode_step_gpu.exists()
     }
 
     /// Whether every graph + the tokenizer + the reranker are present on disk.
@@ -157,6 +172,30 @@ pub fn load_session(path: &Path) -> Option<Session> {
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .ok()?
         .with_intra_threads(intra_op_threads())
+        .ok()?
+        .commit_from_file(path)
+        .ok()
+}
+
+/// Load a graph on the **DirectML** (portable GPU) execution provider — used for
+/// the fp16 `decode_step` GPU build. Returns `None` (so the caller falls back to
+/// the CPU graph) if DirectML can't initialize: the bundled `onnxruntime.dll` must
+/// be the DirectML build, and there must be a usable DX12 adapter. DirectML
+/// requires the memory-pattern planner **off** and **sequential** execution (it
+/// errors otherwise); the EP register path is enabled by the `load-dynamic`
+/// feature, so no extra Cargo feature is needed.
+#[must_use]
+pub fn load_session_gpu(path: &Path) -> Option<Session> {
+    if !path.exists() || !crate::dsp::onnx_runtime_available() {
+        return None;
+    }
+    Session::builder()
+        .ok()?
+        .with_execution_providers([ort::ep::DirectML::default().build()])
+        .ok()?
+        .with_memory_pattern(false)
+        .ok()?
+        .with_parallel_execution(false)
         .ok()?
         .commit_from_file(path)
         .ok()
@@ -560,13 +599,23 @@ impl VoxCpmEngine {
     /// Load the four graphs + the tokenizer from `model_dir` (plus the optional
     /// reranker). `None` if any *required* graph/tokenizer is missing or the ONNX
     /// runtime is unavailable (caller falls back to the OpenVoice path).
+    ///
+    /// `use_gpu` runs the `decode_step` (the autoregressive bottleneck) on
+    /// **DirectML** using the fp16 GPU build, when it's present and DirectML
+    /// initializes — otherwise that one graph silently falls back to the CPU build.
+    /// The other three graphs always stay on CPU (one-shot; not worth the GPU).
     #[must_use]
-    pub fn load(model_dir: &Path) -> Option<Self> {
+    pub fn load(model_dir: &Path, use_gpu: bool) -> Option<Self> {
         let p = VoxCpmPaths::new(model_dir);
+        let decode_step = if use_gpu && p.gpu_decode_present() {
+            load_session_gpu(&p.decode_step_gpu).or_else(|| load_session(&p.decode_step))?
+        } else {
+            load_session(&p.decode_step)?
+        };
         Some(Self {
             vae_encoder: load_session(&p.vae_encoder)?,
             prefill: load_session(&p.prefill)?,
-            decode_step: load_session(&p.decode_step)?,
+            decode_step,
             vae_decoder: load_session(&p.vae_decoder)?,
             tokenizer: load_tokenizer(&p.tokenizer)?,
             speaker: SpeakerScorer::load(&p.speaker),
@@ -757,6 +806,25 @@ mod tests {
         }
     }
 
+    /// The fp16 GPU decode build must load + run on **DirectML** — verifies the
+    /// `ep::DirectML` + mem-pattern-off + sequential session path against the real
+    /// staged model. Requires `voxcpm-decode-step-gpu.onnx`, a **DirectML-enabled**
+    /// `onnxruntime.dll` (+ `DirectML.dll` beside it), and a DX12 GPU, so it's
+    /// `#[ignore]`d. Run:
+    /// `cargo test -p divora-core gpu_decode_loads_on_directml -- --ignored`.
+    #[test]
+    #[ignore = "requires staged voxcpm-decode-step-gpu.onnx + DirectML onnxruntime.dll + DX12 GPU"]
+    fn gpu_decode_loads_on_directml() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
+        std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
+        let path = format!("{res}/tts/voxcpm-decode-step-gpu.onnx");
+        let sess = load_session_gpu(Path::new(&path));
+        assert!(
+            sess.is_some(),
+            "fp16 decode_step should load on DirectML (is onnxruntime.dll the DirectML build?)"
+        );
+    }
+
     #[test]
     fn assemble_prefill_pads_and_masks() {
         let stride = PATCH_SIZE * VAE_LATENT_DIM;
@@ -917,8 +985,9 @@ perform differently and have different strengths and weaknesses.";
         let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources");
         std::env::set_var("ORT_DYLIB_PATH", format!("{res}/onnxruntime.dll"));
 
-        // Load via the held-sessions engine (the backend's path).
-        let mut engine = VoxCpmEngine::load(Path::new(&format!("{res}/tts"))).expect("engine");
+        // Load via the held-sessions engine (the backend's path); CPU decode.
+        let mut engine =
+            VoxCpmEngine::load(Path::new(&format!("{res}/tts")), false).expect("engine");
         let reader = hound::WavReader::open(format!("{res}/tts/voxcpm-ref-16k.wav")).unwrap();
         let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
 

@@ -3,6 +3,7 @@
   "bundle": {
     "resources": {
       "resources/onnxruntime.dll": "onnxruntime.dll",
+      "resources/DirectML.dll": "DirectML.dll",
       "resources/voices/llvc-narrator.onnx": "voices/llvc-narrator.onnx",
       "resources/tts/kokoro-v1.0.int8.onnx": "tts/kokoro-v1.0.int8.onnx",
       "resources/tts/voices-divora.bin": "tts/voices-divora.bin",

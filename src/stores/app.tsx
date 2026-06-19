@@ -42,8 +42,10 @@ import {
   pickAudioFile as pickAudioFileCmd,
   cloneModelsStatus as cloneModelsStatusCmd,
   voxcpmStatus as voxcpmStatusCmd,
+  voxcpmGpuStatus as voxcpmGpuStatusCmd,
   downloadCloneModels as downloadCloneModelsCmd,
   downloadVoxcpmModels as downloadVoxcpmModelsCmd,
+  downloadVoxcpmGpuModel as downloadVoxcpmGpuModelCmd,
   subscribeCloneDownload,
   openMidiInput as openMidiInputCmd,
   closeMidiInput as closeMidiInputCmd,
@@ -214,6 +216,7 @@ const STORAGE_KEYS = {
   ttsPreviewOnly: "divora.ttsPreviewOnly",
   cloneQuality: "divora.cloneQuality",
   speakMonitor: "divora.speakMonitor",
+  cloneGpu: "divora.cloneGpu",
 } as const;
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
@@ -445,6 +448,10 @@ export interface AppState {
    *  mic monitor. Default on; persisted `divora.speakMonitor`. */
   speakMonitor: () => boolean;
   setSpeakMonitor: (on: boolean) => void;
+  /** v1.30.0: experimental DirectML GPU for VoxCPM cloning (~1.3× on the decode
+   *  step). Opt-in — needs the ~1.2 GB fp16 GPU model. Persisted `divora.cloneGpu`. */
+  cloneGpu: () => boolean;
+  setCloneGpu: (on: boolean) => void;
   /** Draft text in the Speak box (ephemeral — not persisted). */
   ttsText: () => string;
   setTtsText: (text: string) => void;
@@ -508,6 +515,14 @@ export interface AppState {
   refreshVoxcpmStatus: () => Promise<void>;
   /** Download the VoxCPM accent-cloning models (~1.6 GB, one-time). */
   downloadVoxcpmModels: () => Promise<void>;
+  /** v1.30.0: whether DirectML GPU cloning is supported on this platform. */
+  voxcpmGpuSupported: () => boolean;
+  /** v1.30.0: whether the opt-in fp16 GPU decode model is downloaded. */
+  voxcpmGpuModelPresent: () => boolean;
+  /** Refresh GPU-cloning support + model presence. */
+  refreshVoxcpmGpuStatus: () => Promise<void>;
+  /** Download the optional fp16 DirectML decode model (~1.2 GB, one-time). */
+  downloadVoxcpmGpuModel: () => Promise<void>;
 
   // Preset actions
   usePreset: (id: string) => void;
@@ -2079,6 +2094,11 @@ export function createAppState(): AppState {
   const [speakMonitor, setSpeakMonitorRaw] = createSignal<boolean>(
     loadJson<boolean>(STORAGE_KEYS.speakMonitor, true),
   );
+  // Experimental DirectML GPU for VoxCPM cloning. Default off (opt-in: needs the
+  // ~1.2 GB fp16 GPU model). Persisted; passed to `speak` per-utterance.
+  const [cloneGpu, setCloneGpuRaw] = createSignal<boolean>(
+    loadJson<boolean>(STORAGE_KEYS.cloneGpu, false),
+  );
   // Sync the persisted value to the engine at startup (covers a persisted
   // "off"); the command just stores an atomic, so it's safe before streams run.
   void setSpeakMonitorCmd(speakMonitor()).catch(() => {});
@@ -2109,6 +2129,10 @@ export function createAppState(): AppState {
     setSpeakMonitorRaw(on);
     saveJson(STORAGE_KEYS.speakMonitor, on);
     void setSpeakMonitorCmd(on).catch(() => {});
+  };
+  const setCloneGpu = (on: boolean): void => {
+    setCloneGpuRaw(on);
+    saveJson(STORAGE_KEYS.cloneGpu, on);
   };
 
   const refreshTtsVoices = async (): Promise<void> => {
@@ -2172,6 +2196,7 @@ export function createAppState(): AppState {
         ttsVolume(),
         ttsPreviewOnly(),
         cloneQuality(),
+        cloneGpu(),
       );
       // Reuse the soundboard playback seam: register a "tts" clip so the
       // shared ~30 Hz clock drives the progress ring and auto-expires it.
@@ -2327,6 +2352,21 @@ export function createAppState(): AppState {
     }
   };
 
+  // v1.30.0: experimental DirectML GPU cloning — whether the platform supports it
+  // and whether the opt-in fp16 GPU decode model is downloaded.
+  const [voxcpmGpuSupported, setVoxcpmGpuSupported] = createSignal(false);
+  const [voxcpmGpuModelPresent, setVoxcpmGpuModelPresent] = createSignal(false);
+
+  const refreshVoxcpmGpuStatus = async (): Promise<void> => {
+    try {
+      const status = await voxcpmGpuStatusCmd();
+      setVoxcpmGpuSupported(!!status?.supported);
+      setVoxcpmGpuModelPresent(!!status?.modelPresent);
+    } catch (err) {
+      console.warn("[voxcpm] gpu status failed", err);
+    }
+  };
+
   const downloadCloneModels = async (): Promise<void> => {
     if (cloneDownloading()) return;
     setCloneError(null);
@@ -2379,6 +2419,40 @@ export function createAppState(): AppState {
     try {
       await downloadVoxcpmModelsCmd();
       await refreshVoxcpmStatus();
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setCloneDownloading(false);
+      if (unlisten) unlisten();
+    }
+  };
+
+  // v1.30.0: download the optional fp16 DirectML decode model (~1.2 GB). Reuses
+  // the same download progress signals + event; refreshes GPU status on done.
+  const downloadVoxcpmGpuModel = async (): Promise<void> => {
+    if (cloneDownloading()) return;
+    setCloneError(null);
+    setCloneDownloading(true);
+    setCloneDownloadPct(0);
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await subscribeCloneDownload((p) => {
+        if (p.total > 0) {
+          setCloneDownloadPct(Math.round((p.received / p.total) * 100));
+        }
+      });
+    } catch {
+      /* not under Tauri — no progress events */
+    }
+    try {
+      await downloadVoxcpmGpuModelCmd();
+      await refreshVoxcpmGpuStatus();
     } catch (err) {
       setCloneError(
         typeof err === "string"
@@ -2503,6 +2577,8 @@ export function createAppState(): AppState {
     setCloneQuality,
     speakMonitor,
     setSpeakMonitor,
+    cloneGpu,
+    setCloneGpu,
     ttsText,
     setTtsText,
     synthesizing,
@@ -2535,6 +2611,10 @@ export function createAppState(): AppState {
     voxcpmReadPrompt,
     refreshVoxcpmStatus,
     downloadVoxcpmModels,
+    voxcpmGpuSupported,
+    voxcpmGpuModelPresent,
+    refreshVoxcpmGpuStatus,
+    downloadVoxcpmGpuModel,
 
     usePreset,
     viewPreset,

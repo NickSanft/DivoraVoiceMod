@@ -189,6 +189,10 @@ Exposed as a **Fast / Balanced / Best** (1 / 3 / 6) latency-vs-fidelity control.
 
 ## GPU feasibility (2026-06-17) — DirectML is a NO-GO for this export
 
+> **Superseded (2026-06-18): this "NO-GO" was wrong.** DirectML runs VoxCPM fine
+> after a one-attribute graph patch — see *"DirectML DOES run it"* below. The
+> sections below are kept as the investigation trail.
+
 After the async un-freeze (v1.27.0) the CPU path is responsive but still ~7 s /
 take. GPU offload was the obvious next lever, so we spiked **DirectML** (the only
 *portable* Windows GPU runtime — works on any DX12 GPU, built into Windows, no
@@ -229,11 +233,86 @@ So it's **not** the session config — it's a specific `Reshape` op DML's kernel
 can't author. `node_view` (a PyTorch `.view()` artifact) is **pervasive**: 35
 occurrences in the encoder, **310 in `decode_step`** (the hot path), 139 in
 prefill, 57 in the decoder — so there's no partial-offload escape hatch either.
-This `8007023E` Reshape failure is a **known DirectML limitation** (unsupported
-operator/opset as exported — the same code recurs across Concat/Unsqueeze/Gemm in
-many models, incl. Kokoro). **Net: DirectML genuinely can't run this export; the
-fix is a DML-friendly re-export, not a config tweak.** Verdict unchanged, now
-precisely diagnosed.
+This looked like a **known DirectML limitation** (unsupported operator/opset as
+exported). **That diagnosis was wrong** — see *"DirectML DOES run it"* below: the
+real cause is a single `allowzero=1` attribute, and the fix is a one-line graph
+patch, not a re-export.
+
+### CUDA upper-bound (2026-06-18) — GPU *does* work, ~2.3× via CUDA
+
+DirectML is the *portable* runtime, but to answer "does GPU help this workload at
+all," we measured **CUDA** on the RTX 4090 (CUDA's kernels handle `node_view`).
+Setup gotchas, all real: the default `pip install onnxruntime-gpu` pulls a
+**CUDA-13** build (wants `cudart64_13.dll`) while the machine has **CUDA 12.6** →
+silent CPU fallback; pinning `onnxruntime-gpu==1.22.0` (CUDA-12) + `pip install
+nvidia-cudnn-cu12` (cuDNN 9 was missing) + `ort.preload_dlls()` fixed it.
+
+Result (fp32 models — **CUDA rejects the int8 Q8 graphs entirely**, runs them
+all-CPU):
+
+```
+CPU  (warm):  4.6 s audio in 5.8 s
+CUDA (warm):  4.7 s audio in 2.6 s   →  ~2.3× faster
+```
+
+So **GPU is viable via CUDA at ~2.3×** — meaningful but not dramatic; the
+autoregressive `decode_step` loop's per-step CPU↔GPU round-trips cap it (as
+predicted). A cuDNN Conv (`node_conv1d`) also hit `CUDNN_BACKEND_API_FAILED` and
+fell back to CPU, so 2.3× is even *with* that on CPU.
+
+**Verdict (corrected): CUDA works as a niche NVIDIA fast-path.** It needs
+CUDA + cuDNN installed (NVIDIA-only), the **fp32 models (~4.8 GB vs 1.6 GB Q8)**,
+and a CUDA-matched `onnxruntime.dll` — for a free, portable app that's a power-user
+opt-in, not a default. (The *portable* DirectML path turned out NOT to need a
+re-export after all — see next.)
+
+### DirectML DOES run it (2026-06-18) — the blocker was one attribute, not a re-export
+
+Pushed past the re-export verdict by reading the real DML error under verbose
+logging: `Reshape 'node_view_20' … 80070057 The parameter is incorrect`
+(`E_INVALIDARG` in DML's `MLOperatorAuthorImpl`). It is **not** an unauthored op.
+The TorchDynamo exporter stamps **`allowzero=1`** on every `.view()` reshape (310
+in `decode_step`); DML's Reshape author rejects `allowzero=1` outright — even
+though **none of these shapes contain a 0**, so the attribute is a semantic no-op.
+The fix is a **one-line graph patch: set `allowzero=0` on all Reshapes** (35 enc /
+139 prefill / 310 decode / 57 dec). No PyTorch re-export, no weight change; applies
+to the **already-shipped Q8/fp32 ONNX**. (A red herring en route: pinning the
+symbolic `batch_size`→2 and constant-folding turned 469 reshapes static but just
+moved the same `allowzero` crash from runtime to load — confirming the attribute,
+not the dynamic shape, was the culprit.)
+
+With the flip, **`decode_step` runs end-to-end on DirectML** (any DX12 GPU):
+
+- **Parity vs CPU (fp32):** `pred_feat` **1.4e-06**, `new_dit_hidden` 1.2e-06 —
+  numerically faithful. (Q8 drifts ~0.11/step on the hidden state — that's int8,
+  not DML — acceptable under best-of-N reranking.)
+- **Speed (RTX 4090, isolated `decode_step` micro-bench):**
+
+  | run        | ms/step | vs CPU |
+  |------------|---------|--------|
+  | CPU  fp32  | 101     | 1.0×   |
+  | **DML fp32** | **78**  | **1.29×** |
+  | DML  Q8    | ~105    | 0.96×  |
+
+  Full synthesis (decode on GPU; one-shot prefill/VAE on CPU): DML fp32 ~1.1×, Q8 0.96×.
+
+**Why so modest:** the cost is the **autoregressive decode loop** — batch=2, hundreds
+of tiny sequential steps. It's **dispatch/kernel-bound, not compute-bound** (KV
+round-trips are ~1 % of step time, so IO-binding won't move it), and DML's per-call
+overhead is ~2× CUDA's on the identical graph+loop (CUDA fp32 = 2.3×). fp16 (tensor
+cores) is the only remaining lever, but the prebuilt fp16 export is malformed and a
+clean re-conversion fought onnx external-data tooling; since the bottleneck is
+dispatch not FLOPS, the reasoned ceiling is **~1.5–1.8×**, not a multiplier.
+
+**Final verdict.** The earlier *"DirectML can't run this / needs a re-export"* was
+**wrong** — DirectML runs VoxCPM after a trivial `allowzero=0` patch, so portable
+GPU support is **solved for any GPU**. But the portable speedup is **modest (~1.3×
+fp32 decode, ~1.1× full synthesis)**, and shipping it costs real work: `ort`
+DirectML EP + CPU fallback, GPU-only fp16/fp32 model variants that are **1.5–3× the
+1.6 GB Q8 download**, and GPU detection. For a free app where best-of-N already runs
+unblocked in the background (v1.27.0), portable GPU is a **power-user opt-in at
+best, not a default**. CPU + the v1.27.0 thread-cap/async changes remain the
+shipped baseline; CUDA (2.3×) is the separate NVIDIA-only fast-path.
 
 ## Sources
 

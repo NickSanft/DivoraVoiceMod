@@ -309,8 +309,9 @@ export async function speak(
   gain = 1.0,
   previewOnly = false,
   candidates?: number,
+  useGpu?: boolean,
 ): Promise<number> {
-  return invoke<number>("speak", { text, voiceId, gain, previewOnly, candidates });
+  return invoke<number>("speak", { text, voiceId, gain, previewOnly, candidates, useGpu });
 }
 
 /** Stop any in-flight synthesized speech playing through the mixer. */
@@ -457,6 +458,28 @@ export async function downloadCloneModels(): Promise<void> {
  */
 export async function downloadVoxcpmModels(): Promise<void> {
   await invoke("download_voxcpm_models");
+}
+
+/**
+ * Experimental GPU (DirectML) cloning status. `supported` is whether the platform
+ * can run the DirectML build; `modelPresent` is whether the opt-in fp16 GPU decode
+ * model (~1.2 GB) is downloaded. The toggle is offered only when both hold.
+ */
+export interface VoxCpmGpuStatus {
+  supported: boolean;
+  modelPresent: boolean;
+}
+
+export async function voxcpmGpuStatus(): Promise<VoxCpmGpuStatus> {
+  return invoke<VoxCpmGpuStatus>("voxcpm_gpu_status");
+}
+
+/**
+ * Download the optional fp16 DirectML decode model (~1.2 GB, one-time) for GPU
+ * cloning. Resolves when complete; progress arrives via {@link subscribeCloneDownload}.
+ */
+export async function downloadVoxcpmGpuModel(): Promise<void> {
+  await invoke("download_voxcpm_gpu_model");
 }
 
 /** Subscribe to cloning-model download progress. Returns the unlisten fn. */

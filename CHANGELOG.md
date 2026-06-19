@@ -4,6 +4,18 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.30.0] — 2026-06-19 — Speak: experimental GPU (DirectML) cloning
+
+Optional GPU acceleration for VoxCPM voice cloning on machines with a DirectX 12 GPU. Off by default — an opt-in extra download for a modest speedup.
+
+### Added
+
+- **Experimental "Use GPU" toggle** for cloned voices in the Speak panel (Windows + DX12). It runs the cloning **decode step on your GPU via DirectML** — portable across AMD/Intel/NVIDIA — about **1.3× faster** than CPU on the autoregressive decode. Opt-in: it needs a one-time **~1.2 GB fp16 GPU-model** download (shown as an "Enable GPU" button), persists across sessions, and **falls back to CPU automatically** if DirectML can't initialize. Best-of-N already runs unblocked in the background, so this is a power-user nice-to-have, not a fix for any blocking slowness.
+
+### Notes
+
+- The win is modest by design: the decode loop is many tiny sequential GPU dispatches, so it's dispatch-bound rather than compute-bound (fp16 runs at the same speed as fp32 here — it's chosen only for the smaller download). The bundled ONNX Runtime is now the **DirectML build**, which runs CPU identically; CPU-only users are unaffected apart from a slightly larger install (~+22 MB for `DirectML.dll` + the runtime). The earlier "DirectML can't run VoxCPM" finding was wrong — see [docs/research/accent-preserving-cloning.md](docs/research/accent-preserving-cloning.md); it only needed a one-attribute (`allowzero`) graph fix.
+
 ## [1.29.0] — 2026-06-18 — Speak: independent monitor toggle
 
 Disabling the Mixer's mic monitor no longer silences Speak previews. They were sharing one monitor flag; now Speak has its own.

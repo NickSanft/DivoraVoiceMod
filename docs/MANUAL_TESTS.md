@@ -449,6 +449,13 @@ resource dir), same as the AI voice-conversion models.
 - [ ] **Import stays timbre-only:** **Pick a clip** still produces an OpenVoice clone (timbre-only, with a "based on …" caption) even when the accent models are present.
 - [ ] Restart → accent clones persist + speak correctly (stored as `reference.wav` under `voices/cloned/<id>/`).
 
+**Experimental GPU (DirectML) cloning — v1.30.0:**
+
+- [ ] With accent clones working on CPU, selecting a VoxCPM clone shows a **GPU** control in the Speak panel (Windows + DX12). First run: **Enable GPU (download ~1.2 GB)** → click → a progress % appears → on completion a **Use GPU (experimental)** checkbox replaces it (persists `divora.cloneGpu`).
+- [ ] Enable the toggle → **Speak** the cloned voice → the output keeps your voice/accent (identical in character to CPU) and synthesis is modestly faster (~1.3× on the decode step). No crash, no garbled/robotic audio.
+- [ ] Force a GPU-unavailable case (machine without a usable DX12 GPU, or rename `DirectML.dll`): with the toggle on, **Speak** still produces correct audio — it **falls back to CPU** silently (never a hang or crash).
+- [ ] Restart with GPU on → the toggle persists and Speak still works.
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.
