@@ -194,6 +194,7 @@ const STORAGE_KEYS = {
   tileHotkeys: "divora.tileHotkeys",
   recentFolders: "divora.recentFolders",
   tweaks: "divora.tweaks",
+  activePreset: "divora.activePreset",
   activeVoice: "divora.activeVoice",
   inputDevice: "divora.inputDevice",
   outputDevice: "divora.outputDevice",
@@ -691,8 +692,12 @@ export function createAppState(): AppState {
   // preview), and the "Use" button applies it (active = viewed). The two
   // are kept in sync everywhere except the Presets screen (see the nav
   // resync effect below), so the Mixer always edits the active preset.
-  const [presetId, setPresetId] = createSignal<string>(firstPreset.id);
-  const [viewedId, setViewedId] = createSignal<string>(firstPreset.id);
+  // Restore the last active preset across restarts (persisted below). Falls
+  // back to the first preset; if the id no longer exists (a deleted user
+  // preset), `refreshPresets` resets it once the real list loads.
+  const persistedPresetId = loadJson<string>(STORAGE_KEYS.activePreset, firstPreset.id);
+  const [presetId, setPresetId] = createSignal<string>(persistedPresetId);
+  const [viewedId, setViewedId] = createSignal<string>(persistedPresetId);
   const [chains, setChains] = createStore<Record<string, ChainEntry[]>>(
     initialChainsFor(FALLBACK_PRESETS),
   );
@@ -991,9 +996,23 @@ export function createAppState(): AppState {
       if (next.length > 0) {
         setPresets(next);
         setPresetsLoaded(true);
+        // The restored active preset may have been a user preset that's
+        // since been deleted — if it's gone from the real list, fall back
+        // so the engine doesn't run an empty chain.
+        if (!next.some((p) => p.id === presetId())) {
+          const fallback = next.find((p) => p.id === firstPreset.id) ?? next[0];
+          if (fallback) {
+            setPresetId(fallback.id);
+            setViewedId(fallback.id);
+          }
+        }
       }
     } catch (err) {
-      // Browser preview / Tauri unreachable — keep the fallback.
+      // Browser preview / Tauri unreachable — keep the fallback bundled
+      // set. A restored active id we can't validate yet (e.g. a user
+      // preset, offline) stands until the next successful refresh; the
+      // engine isn't auto-started, so this resolves before the user can
+      // run an unvalidated chain.
       console.warn(
         "[presets] listPresets failed; keeping fallback bundled set",
         err,
@@ -1187,6 +1206,13 @@ export function createAppState(): AppState {
         applyActiveVoice();
       }
     }, { defer: true }),
+  );
+
+  // Persist the active preset so it's restored on the next launch. `defer`
+  // skips the redundant write of the just-loaded value on mount; every real
+  // switch (Use / summon / glyph / the validity fallback) is saved.
+  createEffect(
+    on(presetId, (id) => saveJson(STORAGE_KEYS.activePreset, id), { defer: true }),
   );
 
   // ---- Phase 12: voice library ----

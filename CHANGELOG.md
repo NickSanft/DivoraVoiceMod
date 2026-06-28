@@ -4,6 +4,12 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.31.0] — 2026-06-27 — Modulator preset remembered across restarts
+
+### Fixed
+
+- **The active modulator preset now persists between launches.** Previously the app always reopened on the first preset, silently discarding whichever voice you had selected; the active preset is now saved and restored on startup (the Mixer reopens on it too). If the remembered preset has since been deleted, it falls back to a valid one so the engine never starts on an empty chain.
+
 ## [1.30.0] — 2026-06-19 — Speak: experimental GPU (DirectML) cloning
 
 Optional GPU acceleration for VoxCPM voice cloning on machines with a DirectX 12 GPU. Off by default — an opt-in extra download for a modest speedup.

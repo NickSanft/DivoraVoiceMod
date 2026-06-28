@@ -544,6 +544,13 @@ describe("app store — Phase 4 preset actions", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(undefined);
+    // The active preset now persists to localStorage; clear it so a
+    // `usePreset` in one test doesn't restore into the next.
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom always has localStorage */
+    }
   });
 
   it("refreshPresets replaces the list with the backend response", async () => {
@@ -596,6 +603,67 @@ describe("app store — Phase 4 preset actions", () => {
     result.usePreset(other!.id);
     expect(result.presetId()).toBe(other!.id);
     expect(result.ui.ab).toBe("A");
+  });
+
+  // ---- Active preset persists across restarts (bug fix) ----------------
+
+  it("persists the active preset to localStorage", () => {
+    const { result } = setupApp();
+    const other = result.presets().find((p) => p.id !== result.presetId());
+    expect(other).toBeDefined();
+    result.usePreset(other!.id);
+    expect(window.localStorage.getItem("divora.activePreset")).toContain(
+      other!.id,
+    );
+  });
+
+  it("restores the persisted active preset on a fresh store", () => {
+    // Discover a real, non-default bundled preset id (defer means mounting
+    // the probe store doesn't itself write to localStorage).
+    const probe = setupApp();
+    const target = probe.result
+      .presets()
+      .find((p) => p.id !== probe.result.presetId());
+    expect(target).toBeDefined();
+    window.localStorage.setItem(
+      "divora.activePreset",
+      JSON.stringify(target!.id),
+    );
+    const { result } = setupApp();
+    expect(result.presetId()).toBe(target!.id);
+    expect(result.viewedId()).toBe(target!.id); // editor opens on the active one
+  });
+
+  it("falls back when the persisted active preset no longer exists", async () => {
+    window.localStorage.setItem(
+      "divora.activePreset",
+      JSON.stringify("ghost-deleted-user-preset"),
+    );
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_presets") {
+        return [
+          {
+            id: "my-voice",
+            version: 1,
+            name: "My Voice",
+            color: "#34D9A0",
+            glyph: "eq",
+            tag: "User",
+            desc: "Custom.",
+            chain: [{ id: "gate", enabled: true, vals: { thresh: -45 } }],
+          },
+        ];
+      }
+      return null;
+    });
+    const { result } = setupApp();
+    expect(result.presetId()).toBe("ghost-deleted-user-preset"); // optimistic restore
+    await result.refreshPresets();
+    // The id isn't in the real list → fall back to a valid preset so the
+    // engine never runs an empty chain.
+    expect(result.presets().some((p) => p.id === result.presetId())).toBe(true);
+    expect(result.presetId()).not.toBe("ghost-deleted-user-preset");
+    expect(result.viewedId()).toBe(result.presetId());
   });
 
   // ---- Presets: select vs. use (v1.6.0) --------------------------------
