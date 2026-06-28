@@ -4,6 +4,13 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.33.0] — 2026-06-28 — Fix: soundboard could freeze the whole app
+
+### Fixed
+
+- **The app no longer freezes after playing soundboard clips for a while.** The UI→audio command queue was unbounded, so if the output device ever stopped accepting audio mid-session (a headset unplugged, a Bluetooth drop, or the default output device changing), every subsequent clip press piled up in a queue nobody was draining — growing until the process ran out of memory and the entire app locked up. The queue is now bounded (extra plays are harmlessly dropped only when audio is already broken), so this can never exhaust memory.
+- **Audio now recovers automatically after a device change.** Previously an output-device error was only logged, leaving the engine silently dead until a manual restart. The engine now detects the failure and rebuilds the session on your selected devices, so sound comes back on its own (the modulation chain re-applies automatically). A capped retry budget prevents a genuinely failing device from looping.
+
 ## [1.32.0] — 2026-06-28 — Vintage radio: new DSP effects + two old-timey voices
 
 Three new modulator effects purpose-built for a convincing old-radio sound — and two voices that showcase them. Researched and adversarially design-reviewed against the real DSP source.

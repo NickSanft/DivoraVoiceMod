@@ -31,6 +31,11 @@ pub struct EngineState {
     /// captured to a WAV for voice cloning. Gates the input callback's push
     /// into the separate reference ring. Independent of `recording`.
     pub reference_recording: AtomicBool,
+    /// v1.33.0: set by an output stream's error callback, cleared by the
+    /// engine thread once it begins recovery. It COALESCES the burst of
+    /// repeated errors a dying stream emits into a single rebuild request,
+    /// so a device loss triggers exactly one teardown+rebuild, not a flood.
+    pub stream_error_pending: AtomicBool,
     pub input_rms_bits: AtomicU32,
     pub input_peak_bits: AtomicU32,
     pub output_rms_bits: AtomicU32,

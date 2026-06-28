@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -38,6 +38,19 @@ const RING_BUFFER_FRAMES: usize = 8192;
 /// stay well under this; the array sits on the stack so no allocation
 /// happens in the audio thread.
 const MAX_FRAMES_PER_CALLBACK: usize = 4096;
+
+/// Capacity of the bounded UI→audio soundboard command queue. The realtime
+/// output callback drains it every buffer, so in normal use it holds only a
+/// handful of messages. The cap exists purely as a safety valve: if the
+/// output callback ever stops draining — a dead/disconnected output device —
+/// the queue cannot grow without bound and OOM the whole process; excess
+/// plays are dropped (`try_send`) instead. (v1.33.0)
+const SB_CHANNEL_CAPACITY: usize = 256;
+
+/// Max automatic session rebuilds (after stream errors) between manual
+/// starts. Caps recovery so a permanently-flapping device can't loop
+/// forever; a manual `Start` resets the budget. (v1.33.0)
+const MAX_AUTO_RECOVERIES: u32 = 8;
 
 /// Information about the live engine session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +89,11 @@ enum Command {
     StopReferenceRecording {
         reply: Sender<()>,
     },
+    /// v1.33.0: an output stream's error callback fired (device unplugged,
+    /// disabled, or the default device changed). The engine thread tears the
+    /// session down and rebuilds on the same devices — device-loss recovery.
+    /// Coalesced via [`EngineState::stream_error_pending`].
+    StreamError,
     Shutdown,
 }
 
@@ -119,9 +137,12 @@ impl AudioEngine {
         // seed the target so the readout/stage have a sane value if enabled.
         state.store_loudness_target(DEFAULT_TARGET_DBFS);
         let state_clone = state.clone();
+        // The engine thread keeps a Command sender so a stream's error
+        // callback can ask it to rebuild the session after a device loss.
+        let cmd_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("divora-audio".into())
-            .spawn(move || engine_thread(rx, state_clone))
+            .spawn(move || engine_thread(rx, cmd_tx, state_clone))
             .expect("spawning the audio thread should not fail");
         Self {
             tx,
@@ -337,7 +358,7 @@ struct StartedStreams {
     streams: RunningStreams,
     info: StreamInfo,
     dsp_tx: Sender<DspCommand>,
-    sb_tx: Sender<SoundboardCommand>,
+    sb_tx: SyncSender<SoundboardCommand>,
     recording_tx: Sender<RecordingCommand>,
     writer: JoinHandle<()>,
     /// v1.23.0: the dry-input reference recorder's channel + writer thread.
@@ -347,15 +368,20 @@ struct StartedStreams {
 
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
 #[allow(clippy::too_many_lines)] // one command dispatch loop; clearer inline
-fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
+fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<EngineState>) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<Sender<DspCommand>> = None;
-    let mut sb_tx: Option<Sender<SoundboardCommand>> = None;
+    let mut sb_tx: Option<SyncSender<SoundboardCommand>> = None;
     let mut recording_tx: Option<Sender<RecordingCommand>> = None;
     let mut writer: Option<JoinHandle<()>> = None;
     // v1.23.0: the parallel dry-input reference recorder (its own ring + writer).
     let mut reference_tx: Option<Sender<RecordingCommand>> = None;
     let mut reference_writer: Option<JoinHandle<()>> = None;
+    // v1.33.0: the devices of the live session, kept so a stream error can
+    // rebuild on the same ones; and a counter that caps automatic recoveries
+    // between manual starts so a flapping device can't loop forever.
+    let mut last_start: Option<(Option<String>, Option<String>, Option<String>)> = None;
+    let mut stream_recoveries: u32 = 0;
 
     // Tear down the current session's streams + recording writers.
     // Dropping a writer's `tx` disconnects its channel, which makes it
@@ -379,6 +405,29 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
         }};
     }
 
+    // Bring a session up on the given devices, wiring the command senders +
+    // `running` flag into the engine thread's locals. Shared by the user
+    // `Start` path and the automatic post-error recovery; returns the
+    // `StreamInfo` on success, the build error on failure.
+    macro_rules! bring_up {
+        ($in:expr, $out:expr, $mon:expr) => {{
+            match start_streams($in, $out, $mon, state.clone(), cmd_tx.clone()) {
+                Ok(started) => {
+                    state.running.store(true, Ordering::Release);
+                    dsp_tx = Some(started.dsp_tx);
+                    sb_tx = Some(started.sb_tx);
+                    recording_tx = Some(started.recording_tx);
+                    writer = Some(started.writer);
+                    reference_tx = Some(started.reference_tx);
+                    reference_writer = Some(started.reference_writer);
+                    current = Some(started.streams);
+                    Ok(started.info)
+                }
+                Err(e) => Err(e),
+            }
+        }};
+    }
+
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Start {
@@ -388,35 +437,68 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
                 reply,
             } => {
                 teardown!();
-                let result = start_streams(
+                let result = bring_up!(
                     input_name.as_deref(),
                     output_name.as_deref(),
-                    monitor_name.as_deref(),
-                    state.clone(),
+                    monitor_name.as_deref()
                 );
-                current = match result {
-                    Ok(started) => {
-                        state.running.store(true, Ordering::Release);
-                        dsp_tx = Some(started.dsp_tx);
-                        sb_tx = Some(started.sb_tx);
-                        recording_tx = Some(started.recording_tx);
-                        writer = Some(started.writer);
-                        reference_tx = Some(started.reference_tx);
-                        reference_writer = Some(started.reference_writer);
-                        let _ = reply.send(Ok(started.info));
-                        Some(started.streams)
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                        None
-                    }
-                };
+                if result.is_ok() {
+                    // Remember the devices for post-error recovery and reset
+                    // the auto-recovery budget for this fresh session.
+                    last_start = Some((input_name, output_name, monitor_name));
+                    stream_recoveries = 0;
+                    state.stream_error_pending.store(false, Ordering::Release);
+                }
+                let _ = reply.send(result);
             }
             Command::Stop => {
                 teardown!();
                 state.store_input(Levels::default());
                 state.store_output(Levels::default());
                 state.store_dsp_latency_ms(0.0);
+                // A user Stop must win over any in-flight StreamError: a device
+                // error that fired just before Stop has already queued a
+                // `Command::StreamError` behind us. Clear the recovery intent
+                // so that queued error can't resurrect the session the user
+                // just stopped (with `last_start` None its rebuild is skipped).
+                last_start = None;
+                stream_recoveries = 0;
+                state.stream_error_pending.store(false, Ordering::Release);
+            }
+            Command::StreamError => {
+                // An output stream died — most likely the device was
+                // unplugged/disabled or the default device changed. Tear the
+                // session down (which drops `sb_tx`, so the UI→audio queue
+                // stops growing) and rebuild on the same devices so audio
+                // comes back without a manual restart. `stream_error_pending`
+                // is re-armed only AFTER teardown, so the now-dropped stream
+                // can't re-signal; a capped budget stops a genuinely failing
+                // device from looping forever (a manual Start resets it).
+                teardown!();
+                state.store_input(Levels::default());
+                state.store_output(Levels::default());
+                state.store_dsp_latency_ms(0.0);
+                state.stream_error_pending.store(false, Ordering::Release);
+                stream_recoveries += 1;
+                if stream_recoveries > MAX_AUTO_RECOVERIES {
+                    tracing::error!(
+                        attempts = stream_recoveries,
+                        "audio stream kept failing; auto-recovery gave up — \
+                         the engine is stopped, restart to try again"
+                    );
+                } else if let Some((i, o, m)) = last_start.clone() {
+                    match bring_up!(i.as_deref(), o.as_deref(), m.as_deref()) {
+                        Ok(info) => tracing::warn!(
+                            attempt = stream_recoveries,
+                            output = %info.output_name,
+                            "audio stream error — recovered by rebuilding the session"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = ?e,
+                            "audio stream error — rebuild failed; engine stopped"
+                        ),
+                    }
+                }
             }
             Command::SetMonitor(enabled) => {
                 state.monitor.store(enabled, Ordering::Release);
@@ -428,7 +510,13 @@ fn engine_thread(rx: Receiver<Command>, state: Arc<EngineState>) {
             }
             Command::Soundboard(sb_cmd) => {
                 if let Some(tx) = &sb_tx {
-                    let _ = tx.send(sb_cmd);
+                    // Bounded + non-blocking. The realtime output callback is
+                    // the only consumer, draining this every buffer. If it has
+                    // stalled (a dead output device), `try_send` DROPS the play
+                    // rather than let the queue grow without bound and OOM the
+                    // whole app. The engine thread must never block here, so
+                    // we never use the blocking `send`.
+                    let _ = tx.try_send(sb_cmd);
                 }
             }
             Command::StartRecording { path } => {
@@ -517,6 +605,9 @@ fn start_streams(
     output_name: Option<&str>,
     monitor_name: Option<&str>,
     state: Arc<EngineState>,
+    // v1.33.0: handed to the output stream's error callback so a device loss
+    // can signal the engine thread to rebuild the session.
+    cmd_tx: Sender<Command>,
 ) -> Result<StartedStreams, AudioEngineError> {
     let input_device = find_device(Direction::Input, input_name)?;
     let output_device = find_device(Direction::Output, output_name)?;
@@ -593,7 +684,7 @@ fn start_streams(
     let (reference_tx, reference_rx) = channel::<RecordingCommand>();
 
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
-    let (sb_tx, sb_rx) = channel::<SoundboardCommand>();
+    let (sb_tx, sb_rx) = sync_channel::<SoundboardCommand>(SB_CHANNEL_CAPACITY);
 
     let input_stream = build_input_stream(
         &input_device,
@@ -618,6 +709,7 @@ fn start_streams(
         monitor_producer,
         has_monitor,
         recording_producer,
+        cmd_tx,
     )?;
 
     // Build the monitor stream last so the tap producer is already wired
@@ -794,6 +886,9 @@ fn build_output_stream(
     // ring while `state.recording` is set; a writer thread drains it to
     // a WAV file. Always wired — recording can begin mid-session.
     mut recording_producer: RingProducer,
+    // v1.33.0: lets the stream's error callback ask the engine thread to
+    // rebuild the session after a device loss (see `Command::StreamError`).
+    cmd_tx: Sender<Command>,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -803,8 +898,17 @@ fn build_output_stream(
         });
     }
     let err_label = device_name;
+    let err_state = state.clone();
     let err_fn = move |err: cpal::StreamError| {
         tracing::error!(?err, device = %err_label, "output stream error");
+        // Coalesce the burst of repeated errors a dying stream emits into a
+        // single recovery request; the engine thread re-arms this after it
+        // tears the session down. Without recovery a dead output callback
+        // would stop draining the soundboard queue (see SB_CHANNEL_CAPACITY)
+        // and the app would go silently dead until a manual restart.
+        if !err_state.stream_error_pending.swap(true, Ordering::AcqRel) {
+            let _ = cmd_tx.send(Command::StreamError);
+        }
     };
 
     let mut meter = LevelMeter::new();
