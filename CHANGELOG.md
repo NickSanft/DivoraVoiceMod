@@ -4,6 +4,17 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.32.0] — 2026-06-28 — Vintage radio: new DSP effects + two old-timey voices
+
+Three new modulator effects purpose-built for a convincing old-radio sound — and two voices that showcase them. Researched and adversarially design-reviewed against the real DSP source.
+
+### Added
+
+- **Radio Band-pass** effect — a *real* band-limiter: cascaded 24 dB/oct high-pass + low-pass with a movable high-Q "cone/horn" resonance. The steep band edge and resonant midrange peak that the gentle 3-band EQ can't make — the core "through an old radio" cue (also good for megaphone / telephone / walkie voices).
+- **Vintage Noise** effect — an additive hiss + mains-hum + sparse-crackle bed that **swells in the silences and ducks under your voice**. The app's first additive (signal-independent) effect — it fills the digitally-silent gaps that give a filtered voice away. Run it last in the chain.
+- **Distortion → Warmth** — an optional asymmetric bias on the existing Distortion for even-harmonic "valve" warmth instead of the symmetric tanh's odd-harmonic "transistor edge" (Warmth 0 = bit-for-bit unchanged, so existing presets are unaffected).
+- **Two vintage-radio voices** built on the above — **Spirit Radio** (the warm valve set, the voice *inside* the radio) and **Parlor Augur** (the tinny tabletop set heard *across a room*). Both are voice-agnostic transmission effects, join the Coven cast next to the modern-comms **Dispatch**, and are fully editable in the Presets editor.
+
 ## [1.31.0] — 2026-06-27 — Modulator preset remembered across restarts
 
 ### Fixed

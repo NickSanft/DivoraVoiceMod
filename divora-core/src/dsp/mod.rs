@@ -31,9 +31,11 @@ mod formant;
 mod gate;
 mod harmonizer;
 mod pitch;
+mod radio_bandpass;
 mod reverb;
 mod robot;
 mod stft;
+mod vintage_noise;
 mod voice_convert;
 
 pub use chorus::Chorus;
@@ -47,8 +49,10 @@ pub use formant::FormantShift;
 pub use gate::NoiseGate;
 pub use harmonizer::Harmonizer;
 pub use pitch::PitchShift;
+pub use radio_bandpass::RadioBandpass;
 pub use reverb::Reverb;
 pub use robot::Robot;
+pub use vintage_noise::VintageNoise;
 pub use voice_convert::{onnx_runtime_available, VoiceConverter};
 
 use std::collections::HashMap;
@@ -85,11 +89,19 @@ pub enum EffectKind {
     /// sibilance band ("sss"), which pitch/formant shifting exaggerates.
     /// Adds no latency.
     Deesser,
+    /// v1.32.0: vintage-radio band-pass — cascaded 24 dB/oct HP+LP plus a
+    /// movable high-Q "cone/horn" resonance. A real band-limiter (a wall,
+    /// not the EQ shelves' slope) for the "through an old radio" sound.
+    RadioBandpass,
     /// Phase 12: ONNX-backed voice conversion (LLVC-style). Loads a
     /// `.onnx` model from the voices directory and streams 48 kHz mono
     /// through a 16 kHz inference chunk. Falls back to passthrough
     /// when the runtime DLL or the model file is missing.
     VoiceConvert,
+    /// v1.32.0: vintage-noise bed — additive hiss + mains hum + sparse crackle
+    /// that swells in the gaps and ducks under speech. The first additive,
+    /// signal-independent effect; run it LAST in the chain.
+    VintageNoise,
 }
 
 /// Trait every effect implements. The audio thread holds a `Box<dyn
@@ -279,7 +291,9 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::Harmonizer => Box::new(Harmonizer::new()),
         EffectKind::Compressor => Box::new(Compressor::new()),
         EffectKind::Deesser => Box::new(DeEsser::new()),
+        EffectKind::RadioBandpass => Box::new(RadioBandpass::new()),
         EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
+        EffectKind::VintageNoise => Box::new(VintageNoise::new()),
     };
     effect.set_enabled(spec.enabled);
     for (key, value) in &spec.params {

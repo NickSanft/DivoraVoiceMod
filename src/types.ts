@@ -15,6 +15,12 @@ export type EffectId =
   | "compressor"
   /** v1.8.0: split-band de-esser for sibilance. */
   | "deesser"
+  /** v1.32.0: vintage-radio band-pass — steep HP+LP + a movable high-Q
+   *  "cone" resonance. The real band-limiter behind the old-radio voices. */
+  | "radio_bandpass"
+  /** v1.32.0: vintage-noise bed — additive hiss + mains hum + crackle that
+   *  swells in the gaps and ducks under speech. The first additive effect. */
+  | "vintage_noise"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

@@ -245,6 +245,37 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("reverb", true, { size: 38, mix: 14 }),
     ],
   },
+  {
+    id: "spirit-radio",
+    name: "Spirit Radio",
+    color: "#C8862E",
+    glyph: "wave",
+    tag: "Bundled",
+    desc: "The warm valve-glow of a 1940s broadcast — band-limited through the old transmitter, leaned flat by the announcer's compressor, warmed with tube saturation, and riding a faint carrier hiss that swells when the voice falls silent. The set that never signs off.",
+    chain: [
+      fx("gate", true, { thresh: -50 }),
+      fx("compressor", true, { thresh: -30, ratio: 8, attack: 7, release: 160, makeup: 5 }),
+      fx("distortion", true, { drive: 18, warmth: 60 }),
+      fx("radio_bandpass", true, { hp: 180, lp: 3500, peak: 1500, gain: 7, q: 3 }),
+      fx("vintage_noise", true, { hiss: 22, hum: 10, humFreq: 60, crackle: 10, tone: 45, duck: 75 }),
+    ],
+  },
+  {
+    id: "parlor-augur",
+    name: "Parlor Augur",
+    color: "#B5996A",
+    glyph: "echo",
+    tag: "Bundled",
+    desc: "Heard across a darkened room through a tin-throated parlor set — a narrow, cone-honking band, squashed by a cheap valve AGC, with the hiss and crackle of the little box filling the quiet. It keeps only the middle of the word and throws the rest to the dust.",
+    chain: [
+      fx("gate", true, { thresh: -50 }),
+      fx("compressor", true, { thresh: -28, ratio: 10, attack: 6, release: 110, makeup: 5 }),
+      fx("distortion", true, { drive: 22, warmth: 50 }),
+      fx("radio_bandpass", true, { hp: 350, lp: 2600, peak: 2400, gain: 9, q: 4 }),
+      fx("reverb", true, { size: 8, mix: 6 }),
+      fx("vintage_noise", true, { hiss: 40, hum: 14, humFreq: 60, crackle: 20, tone: 35, duck: 65 }),
+    ],
+  },
 ];
 
 /**

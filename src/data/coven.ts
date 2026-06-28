@@ -93,6 +93,16 @@ export const COVEN: CastMember[] = [
     lore: "Clipped, bandlimited, all business — the voice on the other end of the radio.",
   },
   {
+    presetId: "spirit-radio",
+    kind: "dsp",
+    lore: "A warm wireless ghost from 1940 — band-limited and tube-saturated, still reading the late bulletin to a house that emptied years ago.",
+  },
+  {
+    presetId: "parlor-augur",
+    kind: "dsp",
+    lore: "A thin voice calling its omens across a darkened parlor — all cone and rattle, the little tabletop set keeping only the middle of each word.",
+  },
+  {
     presetId: "corrupted",
     kind: "dsp",
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",

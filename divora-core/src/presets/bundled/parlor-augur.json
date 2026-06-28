@@ -1,0 +1,17 @@
+{
+  "id": "parlor-augur",
+  "version": 1,
+  "name": "Parlor Augur",
+  "color": "#B5996A",
+  "glyph": "echo",
+  "tag": "Bundled",
+  "desc": "Heard across a darkened room through a tin-throated parlor set — a narrow, cone-honking band, squashed by a cheap valve AGC, with the hiss and crackle of the little box filling the quiet. It keeps only the middle of the word and throws the rest to the dust.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -50 } },
+    { "id": "compressor", "enabled": true, "vals": { "thresh": -28, "ratio": 10, "attack": 6, "release": 110, "makeup": 5 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 22, "warmth": 50 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 350, "lp": 2600, "peak": 2400, "gain": 9, "q": 4 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 8, "mix": 6 } },
+    { "id": "vintage_noise", "enabled": true, "vals": { "hiss": 40, "hum": 14, "humFreq": 60, "crackle": 20, "tone": 35, "duck": 65 } }
+  ]
+}

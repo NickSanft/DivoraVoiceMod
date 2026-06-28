@@ -72,9 +72,10 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     id: "distortion",
     name: "Distortion",
     sigil: "distortion",
-    desc: "Saturation and grit.",
+    desc: "Saturation and grit. Drive is the symmetric (odd-harmonic) edge; Warmth biases it asymmetric for even-harmonic 'valve' warmth.",
     params: [
       { key: "drive", label: "Drive", min: 0, max: 100, step: 1, unit: "%", default: 35 },
+      { key: "warmth", label: "Warmth", min: 0, max: 100, step: 1, unit: "%", default: 0 },
     ],
     readout: (v) => `${v.drive ?? 0}%`,
   },
@@ -160,6 +161,35 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${((v.freq ?? 0) / 1000).toFixed(1)}k · ${v.thresh ?? 0} dB`,
   },
+  radio_bandpass: {
+    id: "radio_bandpass",
+    name: "Radio Band-pass",
+    sigil: "wave",
+    desc: "A real band-limiter — steep high-pass + low-pass with a movable resonant 'cone' peak. The through-an-old-radio sound the EQ shelves can't make.",
+    params: [
+      { key: "hp", label: "Low cut", min: 100, max: 1000, step: 10, unit: "Hz", default: 300 },
+      { key: "lp", label: "High cut", min: 1500, max: 6000, step: 50, unit: "Hz", default: 3000 },
+      { key: "peak", label: "Resonance", min: 300, max: 4000, step: 50, unit: "Hz", default: 1500 },
+      { key: "gain", label: "Res gain", min: 0, max: 12, step: 1, unit: "dB", default: 6 },
+      { key: "q", label: "Res Q", min: 0.5, max: 8, step: 0.5, unit: "", default: 3 },
+    ],
+    readout: (v) => `${v.hp ?? 0}–${v.lp ?? 0} Hz`,
+  },
+  vintage_noise: {
+    id: "vintage_noise",
+    name: "Vintage Noise",
+    sigil: "distortion",
+    desc: "An old-radio noise bed — hiss, mains hum and sparse crackle that swells in the silences and ducks under your voice. Run it last in the chain.",
+    params: [
+      { key: "hiss", label: "Hiss", min: 0, max: 100, step: 1, unit: "%", default: 25 },
+      { key: "hum", label: "Hum", min: 0, max: 100, step: 1, unit: "%", default: 12 },
+      { key: "humFreq", label: "Mains", min: 50, max: 60, step: 10, unit: "Hz", default: 60 },
+      { key: "crackle", label: "Crackle", min: 0, max: 100, step: 1, unit: "%", default: 15 },
+      { key: "tone", label: "Tone", min: 0, max: 100, step: 1, unit: "%", default: 50 },
+      { key: "duck", label: "Duck", min: 0, max: 100, step: 1, unit: "%", default: 70 },
+    ],
+    readout: (v) => `hiss ${v.hiss ?? 0}% · duck ${v.duck ?? 0}%`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -180,6 +210,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "pitch",
   "formant",
   "eq",
+  "radio_bandpass",
   "compressor",
   "deesser",
   "robot",
@@ -188,6 +219,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "reverb",
   "chorus",
   "harmonizer",
+  "vintage_noise",
 ];
 
 /** Build a chain entry with sensible defaults, optionally overriding values. */

@@ -145,6 +145,8 @@ export type EffectKindWire =
   | "harmonizer"
   | "compressor"
   | "deesser"
+  | "radio_bandpass"
+  | "vintage_noise"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

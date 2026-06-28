@@ -76,6 +76,19 @@ const BUNDLED: &[BundledSource] = &[
         id: "deep-narrator-ai",
         json: include_str!("bundled/deep-narrator-ai.json"),
     },
+    // v1.32.0: old-timey radio pair (researched + adversarially design-reviewed),
+    // built on the new radio_bandpass + vintage_noise + asymmetric-warmth DSP.
+    // "spirit-radio" = warm vintage broadcast (the voice inside the valve set);
+    // "parlor-augur" = tinny across-the-room tabletop set. Both distinct from the
+    // modern tactical "dispatch".
+    BundledSource {
+        id: "spirit-radio",
+        json: include_str!("bundled/spirit-radio.json"),
+    },
+    BundledSource {
+        id: "parlor-augur",
+        json: include_str!("bundled/parlor-augur.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's
@@ -281,6 +294,94 @@ mod tests {
                 .iter()
                 .any(|e| e.id == "voice_convert" && e.enabled),
             "deep narrator keeps an enabled voice_convert slot for BYO models"
+        );
+    }
+
+    // v1.32.0: Spirit Radio is the warm vintage-broadcast voice, rebuilt on real
+    // DSP — a `radio_bandpass` (steep band-limit + cone honk, replacing the old
+    // EQ/de-esser fakes), a broadcast compressor, asymmetric "warm" tube
+    // saturation, and a `vintage_noise` floor that fills the gaps. Lock that
+    // identity so an edit can't blur it into the modern, tactical "dispatch".
+    #[test]
+    fn spirit_radio_is_a_vintage_broadcast_chain() {
+        let presets = bundled_presets();
+        let p = presets
+            .iter()
+            .find(|p| p.id == "spirit-radio")
+            .expect("spirit-radio must be bundled");
+        assert_eq!(p.name, "Spirit Radio");
+        // A close-mic'd announcer, not a hall — stays dry (like dispatch).
+        assert!(
+            p.chain.iter().all(|e| e.id != "reverb"),
+            "Spirit Radio stays dry (no reverb)"
+        );
+        // The real band-limiter (a wall, not the EQ shelves' slope).
+        assert!(
+            p.chain
+                .iter()
+                .any(|e| e.id == "radio_bandpass" && e.enabled),
+            "band-limited via radio_bandpass"
+        );
+        // Relentless broadcast level + warm (even-harmonic) tube grit.
+        assert!(
+            p.chain.iter().any(|e| e.id == "compressor" && e.enabled),
+            "broadcast compressor"
+        );
+        let dist = p
+            .chain
+            .iter()
+            .find(|e| e.id == "distortion")
+            .expect("tube saturation");
+        assert!(
+            dist.vals.get("warmth").copied().unwrap_or(0.0) > 0.0,
+            "warm (asymmetric) saturation"
+        );
+        // The noise floor that fills the silences.
+        assert!(
+            p.chain.iter().any(|e| e.id == "vintage_noise" && e.enabled),
+            "vintage noise floor"
+        );
+    }
+
+    // v1.32.0: Parlor Augur is the tinny, distant tabletop set. Its identity is a
+    // NARROWER radio_bandpass than Spirit (higher low cut + lower high cut), a
+    // whisper of reverb for the across-the-room distance, and a hotter noise bed.
+    #[test]
+    fn parlor_augur_is_the_distant_tinny_set() {
+        let presets = bundled_presets();
+        let bp = |id: &str| {
+            presets
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("{id} must be bundled"))
+                .chain
+                .iter()
+                .find(|e| e.id == "radio_bandpass")
+                .unwrap_or_else(|| panic!("{id} must band-limit with radio_bandpass"))
+                .clone()
+        };
+        let spirit = bp("spirit-radio");
+        let parlor = bp("parlor-augur");
+        // Narrower band than Spirit — thinner, tinnier.
+        assert!(
+            parlor.vals.get("hp").copied().unwrap_or(0.0)
+                > spirit.vals.get("hp").copied().unwrap_or(0.0),
+            "Parlor cuts more low end than Spirit"
+        );
+        assert!(
+            parlor.vals.get("lp").copied().unwrap_or(0.0)
+                < spirit.vals.get("lp").copied().unwrap_or(0.0),
+            "Parlor cuts more top than Spirit"
+        );
+        let p = presets.iter().find(|p| p.id == "parlor-augur").unwrap();
+        // Across the room (Spirit is dry), with the little box's noise floor.
+        assert!(
+            p.chain.iter().any(|e| e.id == "reverb" && e.enabled),
+            "a little room for the distance"
+        );
+        assert!(
+            p.chain.iter().any(|e| e.id == "vintage_noise" && e.enabled),
+            "the little box's noise floor"
         );
     }
 }
