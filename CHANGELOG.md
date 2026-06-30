@@ -4,6 +4,19 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.34.0] — 2026-06-29 — Villager voice + Tremolo effect
+
+A Minecraft-villager voice, researched and adversarially design-reviewed against how the game's sound and real voice-changers actually work — plus the new modulator effect it needed.
+
+### Added
+
+- **Tremolo** effect — a slow **amplitude** wobble (sub-audio LFO, rate + depth). Distinct from Robot's audio-rate ring modulation: this modulates *loudness*, not timbre. It's the pulsing "hrm-hrm" cadence that makes the villager read as a villager — and is broadly reusable (helicopter, sci-fi pulse, classic guitar tremolo).
+- **Villager** voice — pitched up small, with a true nasal *pole/notch* pair (a low murmur boost + a cut at the ~1 kHz "m" antiformant) instead of a generic midrange honk, band-limited dull, and riding the Tremolo wobble. Joins the Coven cast and is fully editable in the Presets editor.
+
+### Changed
+
+- **Radio Band-pass** resonance gain can now go **negative** (−18…+18 dB), so the movable peak can *cut* (a notch), not only boost — this is what lets the Villager carve its nasal antiformant. Existing presets (Spirit Radio, Parlor Augur) are unaffected.
+
 ## [1.33.0] — 2026-06-28 — Fix: soundboard could freeze the whole app
 
 ### Fixed

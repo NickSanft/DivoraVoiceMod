@@ -147,6 +147,7 @@ export type EffectKindWire =
   | "deesser"
   | "radio_bandpass"
   | "vintage_noise"
+  | "tremolo"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

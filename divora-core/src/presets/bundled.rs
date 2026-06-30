@@ -89,6 +89,14 @@ const BUNDLED: &[BundledSource] = &[
         id: "parlor-augur",
         json: include_str!("bundled/parlor-augur.json"),
     },
+    // v1.34.0: Minecraft-villager voice (researched + adversarially reviewed).
+    // Built on the new `tremolo` (the "hrm-hrm" wobble) + a two-`radio_bandpass`
+    // nasal pole/notch pair (a murmur boost low, a cut at the ~1 kHz "m"
+    // antiformant) enabled by the negative-gain band-pass.
+    BundledSource {
+        id: "villager",
+        json: include_str!("bundled/villager.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's
@@ -382,6 +390,61 @@ mod tests {
         assert!(
             p.chain.iter().any(|e| e.id == "vintage_noise" && e.enabled),
             "the little box's noise floor"
+        );
+    }
+
+    // v1.34.0: the Villager voice. Its identity is the nasal pole/notch pair
+    // (a low murmur BOOST + a CUT at the ~1 kHz "m" antiformant — the latter
+    // only possible now that radio_bandpass gain can go negative) plus the
+    // tremolo "hrm-hrm" wobble that flips it from "nasal voice" to "villager".
+    // Pitched UP (the game's own production) and dry. Lock all of that.
+    #[test]
+    fn villager_is_a_nasal_wobbling_npc() {
+        let presets = bundled_presets();
+        let p = presets
+            .iter()
+            .find(|p| p.id == "villager")
+            .expect("villager must be bundled");
+        assert_eq!(p.name, "Villager");
+        // Pitched UP (small comic NPC) — direction the game's sound confirms.
+        let pitch = p
+            .chain
+            .iter()
+            .find(|e| e.id == "pitch")
+            .expect("villager is pitched");
+        assert!(
+            pitch.vals.get("shift").copied().unwrap_or(0.0) > 0.0,
+            "villager is pitched UP"
+        );
+        // The amplitude wobble — the single most villager-specific cue.
+        assert!(
+            p.chain.iter().any(|e| e.id == "tremolo" && e.enabled),
+            "the 'hrm-hrm' wobble (tremolo)"
+        );
+        // Two radio_bandpass stages: a nasal POLE (boost) and a nasal NOTCH
+        // (negative gain) — true /m/ nasality, not a generic midrange honk.
+        let bands: Vec<_> = p
+            .chain
+            .iter()
+            .filter(|e| e.id == "radio_bandpass" && e.enabled)
+            .collect();
+        assert!(bands.len() >= 2, "a nasal pole + notch pair");
+        assert!(
+            bands
+                .iter()
+                .any(|e| e.vals.get("gain").copied().unwrap_or(0.0) > 0.0),
+            "a nasal-murmur BOOST (pole)"
+        );
+        assert!(
+            bands
+                .iter()
+                .any(|e| e.vals.get("gain").copied().unwrap_or(0.0) < 0.0),
+            "a nasal-antiformant CUT (notch) — needs negative band-pass gain"
+        );
+        // Close-mic NPC, not a hall — dry.
+        assert!(
+            p.chain.iter().all(|e| e.id != "reverb"),
+            "villager stays dry (no reverb)"
         );
     }
 }

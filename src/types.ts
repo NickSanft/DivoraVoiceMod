@@ -21,6 +21,9 @@ export type EffectId =
   /** v1.32.0: vintage-noise bed — additive hiss + mains hum + crackle that
    *  swells in the gaps and ducks under speech. The first additive effect. */
   | "vintage_noise"
+  /** v1.34.0: tremolo — a slow amplitude LFO (the "wobble" behind the Villager
+   *  voice's "hrm-hrm" cadence; also helicopter / sci-fi pulse / guitar tremolo). */
+  | "tremolo"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

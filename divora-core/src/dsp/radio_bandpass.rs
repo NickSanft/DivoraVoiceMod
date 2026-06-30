@@ -134,7 +134,10 @@ impl AudioEffect for RadioBandpass {
             "hp" => self.hp_hz = value.clamp(50.0, 2000.0),
             "lp" => self.lp_hz = value.clamp(800.0, 12_000.0),
             "peak" => self.peak_hz = value.clamp(100.0, 6000.0),
-            "gain" => self.peak_db = value.clamp(0.0, 18.0),
+            // v1.34.0: allow NEGATIVE gain so a second instance can CUT a
+            // resonance (a true notch) — e.g. the Villager voice's ~1.05 kHz
+            // nasal antiformant. PeakingEQ coefficients accept negative dB.
+            "gain" => self.peak_db = value.clamp(-18.0, 18.0),
             "q" => self.peak_q = value.clamp(0.2, 12.0),
             _ => return,
         }

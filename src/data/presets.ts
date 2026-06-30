@@ -276,6 +276,29 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("vintage_noise", true, { hiss: 40, hum: 14, humFreq: 60, crackle: 20, tone: 35, duck: 65 }),
     ],
   },
+  {
+    id: "villager",
+    name: "Villager",
+    color: "#8A9A5B",
+    glyph: "pitch",
+    tag: "Bundled",
+    desc: "The blocked-nose hum of the village idle — pitched up small, honking through a pinched nasal band with the murmur boosted and the 'm' notch carved out, mumbling its endless 'hrm-hrm' to nobody. Will trade emeralds for your dignity.",
+    chain: [
+      fx("gate", true, { thresh: -48 }),
+      fx("pitch", true, { shift: 4 }),
+      fx("formant", true, { shift: 2 }),
+      // Nasal POLE: boost the low ~300 Hz murmur + band-limit to the dull top.
+      fx("radio_bandpass", true, { hp: 200, lp: 3400, peak: 300, gain: 8, q: 2.5 }),
+      // Nasal NOTCH: cut the ~1.05 kHz "m" antiformant (edges parked wide so
+      // this stage is a pure notch, not a second band-limit).
+      fx("radio_bandpass", true, { hp: 100, lp: 6000, peak: 1050, gain: -8, q: 6 }),
+      fx("eq", true, { low: -2, mid: 3, high: -4 }),
+      fx("distortion", true, { drive: 13, warmth: 35 }),
+      fx("compressor", true, { thresh: -28, ratio: 6, attack: 5, release: 90, makeup: 4 }),
+      // The "hrm-hrm" wobble — after the compressor so leveling can't fight it.
+      fx("tremolo", true, { rate: 5, depth: 40 }),
+    ],
+  },
 ];
 
 /**

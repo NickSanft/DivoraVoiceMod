@@ -103,6 +103,11 @@ export const COVEN: CastMember[] = [
     lore: "A thin voice calling its omens across a darkened parlor — all cone and rattle, the little tabletop set keeping only the middle of each word.",
   },
   {
+    presetId: "villager",
+    kind: "dsp",
+    lore: "Hrm. A blocked-nose mumble pitched up small, honking and bobbing its endless 'hrm-hrm' — it has emeralds, dignity is extra.",
+  },
+  {
     presetId: "corrupted",
     kind: "dsp",
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",

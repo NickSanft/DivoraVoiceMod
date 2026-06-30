@@ -1,0 +1,20 @@
+{
+  "id": "villager",
+  "version": 1,
+  "name": "Villager",
+  "color": "#8A9A5B",
+  "glyph": "pitch",
+  "tag": "Bundled",
+  "desc": "The blocked-nose hum of the village idle — pitched up small, honking through a pinched nasal band with the murmur boosted and the 'm' notch carved out, mumbling its endless 'hrm-hrm' to nobody. Will trade emeralds for your dignity.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -48 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": 4 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 2 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 200, "lp": 3400, "peak": 300, "gain": 8, "q": 2.5 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 100, "lp": 6000, "peak": 1050, "gain": -8, "q": 6 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 3, "high": -4 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 13, "warmth": 35 } },
+    { "id": "compressor", "enabled": true, "vals": { "thresh": -28, "ratio": 6, "attack": 5, "release": 90, "makeup": 4 } },
+    { "id": "tremolo", "enabled": true, "vals": { "rate": 5, "depth": 40 } }
+  ]
+}

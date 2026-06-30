@@ -170,7 +170,10 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
       { key: "hp", label: "Low cut", min: 100, max: 1000, step: 10, unit: "Hz", default: 300 },
       { key: "lp", label: "High cut", min: 1500, max: 6000, step: 50, unit: "Hz", default: 3000 },
       { key: "peak", label: "Resonance", min: 300, max: 4000, step: 50, unit: "Hz", default: 1500 },
-      { key: "gain", label: "Res gain", min: 0, max: 12, step: 1, unit: "dB", default: 6 },
+      // v1.34.0: gain goes negative so the peak can CUT (a notch), e.g. the
+      // Villager voice's ~1 kHz nasal antiformant — not just boost. Not marked
+      // bipolar: it defaults to a +6 dB boost, not a centered 0.
+      { key: "gain", label: "Res gain", min: -18, max: 18, step: 1, unit: "dB", default: 6 },
       { key: "q", label: "Res Q", min: 0.5, max: 8, step: 0.5, unit: "", default: 3 },
     ],
     readout: (v) => `${v.hp ?? 0}–${v.lp ?? 0} Hz`,
@@ -189,6 +192,17 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
       { key: "duck", label: "Duck", min: 0, max: 100, step: 1, unit: "%", default: 70 },
     ],
     readout: (v) => `hiss ${v.hiss ?? 0}% · duck ${v.duck ?? 0}%`,
+  },
+  tremolo: {
+    id: "tremolo",
+    name: "Tremolo",
+    sigil: "wave",
+    desc: "A slow amplitude wobble (sub-audio LFO). The pulsing 'hrm-hrm' cadence behind the Villager voice — also helicopter, sci-fi pulse, and classic guitar tremolo.",
+    params: [
+      { key: "rate", label: "Rate", min: 0.5, max: 12, step: 0.5, unit: "Hz", default: 5 },
+      { key: "depth", label: "Depth", min: 0, max: 100, step: 1, unit: "%", default: 40 },
+    ],
+    readout: (v) => `${v.rate ?? 0} Hz · ${v.depth ?? 0}%`,
   },
   voice_convert: {
     id: "voice_convert",
@@ -219,6 +233,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "reverb",
   "chorus",
   "harmonizer",
+  "tremolo",
   "vintage_noise",
 ];
 

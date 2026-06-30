@@ -35,6 +35,7 @@ mod radio_bandpass;
 mod reverb;
 mod robot;
 mod stft;
+mod tremolo;
 mod vintage_noise;
 mod voice_convert;
 
@@ -52,6 +53,7 @@ pub use pitch::PitchShift;
 pub use radio_bandpass::RadioBandpass;
 pub use reverb::Reverb;
 pub use robot::Robot;
+pub use tremolo::Tremolo;
 pub use vintage_noise::VintageNoise;
 pub use voice_convert::{onnx_runtime_available, VoiceConverter};
 
@@ -102,6 +104,11 @@ pub enum EffectKind {
     /// that swells in the gaps and ducks under speech. The first additive,
     /// signal-independent effect; run it LAST in the chain.
     VintageNoise,
+    /// v1.34.0: tremolo — a slow **amplitude** LFO (sub-audio rate), distinct
+    /// from `Robot`'s audio-rate ring modulation. The pulsing "wobble" behind
+    /// the Villager voice's "hrm-hrm" cadence (also helicopter / sci-fi pulse /
+    /// guitar tremolo).
+    Tremolo,
 }
 
 /// Trait every effect implements. The audio thread holds a `Box<dyn
@@ -294,6 +301,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::RadioBandpass => Box::new(RadioBandpass::new()),
         EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
         EffectKind::VintageNoise => Box::new(VintageNoise::new()),
+        EffectKind::Tremolo => Box::new(Tremolo::new()),
     };
     effect.set_enabled(spec.enabled);
     for (key, value) in &spec.params {
