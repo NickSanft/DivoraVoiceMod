@@ -299,6 +299,28 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("tremolo", true, { rate: 5, depth: 40 }),
     ],
   },
+  {
+    id: "creeper",
+    name: "Creeper",
+    color: "#5CA83E",
+    glyph: "wave",
+    tag: "Bundled",
+    desc: "The thing that crept up behind you — every word dissolving into a rising, sibilant hiss, the fuse-breath that swells the longer you speak. You have about one and a half seconds. Sssss.",
+    chain: [
+      fx("gate", true, { thresh: -46 }),
+      fx("pitch", true, { shift: -4 }),
+      // Thin the chest + a static air/brightness lift (the shelf hinges ~1.25 kHz).
+      fx("eq", true, { low: -8, mid: -4, high: 12 }),
+      // Band-limit to the sizzle window + a resonant sss cone at the 4 kHz cap.
+      fx("radio_bandpass", true, { hp: 300, lp: 6000, peak: 4000, gain: 8, q: 2 }),
+      fx("distortion", true, { drive: 18, warmth: 0 }),
+      // The linchpin: hiss that SWELLS with each word — the building fuse.
+      fx("breath", true, { amount: 75, color: 65, swell: 80, sens: 60 }),
+      // A slow simmer layered under the swell (breath carries most of it).
+      fx("tremolo", true, { rate: 1, depth: 30 }),
+      fx("reverb", true, { size: 65, mix: 30 }),
+    ],
+  },
 ];
 
 /**

@@ -4,6 +4,15 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.35.0] — 2026-06-30 — Creeper voice + Breath (whisperizer) effect
+
+A Minecraft-creeper voice, researched and adversarially design-reviewed — plus the new effect it needed to nail the signature "building fuse" hiss.
+
+### Added
+
+- **Breath** effect — a whisperizer: additive band-passed hiss whose level **swells up with your voice** (a fast-attack / slow-release envelope follower gates the noise up). It's the deliberate inverse of Vintage Noise, which ducks its bed *under* speech. Params: Amount, Color (dark↔bright), Swell (follows-the-voice vs static bed), Sensitivity. Reusable for whisper / ASMR / wind voices. Additive, zero latency, RT-safe.
+- **Creeper** voice — a breathy, sibilant menace whose "sssSSS" hiss builds the longer you speak (the fuse), pitched down, with a boosted sibilance band and a slow simmer. Notably, no commercial changer ships a real-time creeper *mic morph* (they all use a soundboard sample) — so this is a genuine first. Joins the Coven cast; fully editable.
+
 ## [1.34.0] — 2026-06-29 — Villager voice + Tremolo effect
 
 A Minecraft-villager voice, researched and adversarially design-reviewed against how the game's sound and real voice-changers actually work — plus the new modulator effect it needed.

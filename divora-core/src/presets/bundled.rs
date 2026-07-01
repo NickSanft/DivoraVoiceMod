@@ -97,6 +97,14 @@ const BUNDLED: &[BundledSource] = &[
         id: "villager",
         json: include_str!("bundled/villager.json"),
     },
+    // v1.35.0: Minecraft-creeper voice (researched + adversarially reviewed).
+    // Built on the new `breath` whisperizer — additive noise that SWELLS with
+    // the voice envelope (the building fuse), the inverse of vintage_noise's
+    // duck — plus a sibilant band boost, light rasp, and a slow simmer.
+    BundledSource {
+        id: "creeper",
+        json: include_str!("bundled/creeper.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's
@@ -445,6 +453,44 @@ mod tests {
         assert!(
             p.chain.iter().all(|e| e.id != "reverb"),
             "villager stays dry (no reverb)"
+        );
+    }
+
+    // v1.35.0: the Creeper voice. Its identity is the `breath` whisperizer —
+    // additive noise that SWELLS with the voice (the building fuse) — plus a
+    // sibilant-band BOOST (not a de-ess) and NO tonal carrier. Pitched DOWN
+    // (the game hiss is the fuse pitched down), the opposite of the villager.
+    #[test]
+    fn creeper_is_a_swelling_hiss_voice() {
+        let presets = bundled_presets();
+        let p = presets
+            .iter()
+            .find(|p| p.id == "creeper")
+            .expect("creeper must be bundled");
+        assert_eq!(p.name, "Creeper");
+        // The linchpin: the envelope-following hiss that swells with the voice.
+        assert!(
+            p.chain.iter().any(|e| e.id == "breath" && e.enabled),
+            "the swelling fuse hiss (breath whisperizer)"
+        );
+        // Pitched DOWN (the fuse pitched down) — opposite of the villager (+).
+        let pitch = p.chain.iter().find(|e| e.id == "pitch");
+        assert!(
+            pitch
+                .and_then(|e| e.vals.get("shift").copied())
+                .unwrap_or(0.0)
+                < 0.0,
+            "creeper is pitched DOWN"
+        );
+        // Sibilance is BOOSTED, never de-essed (the de-esser can only cut).
+        assert!(
+            p.chain.iter().all(|e| e.id != "deesser"),
+            "no de-esser — the sss band is boosted, not cut"
+        );
+        // No metallic ring-mod carrier — a creeper is a hiss, not a robot.
+        assert!(
+            p.chain.iter().all(|e| e.id != "robot"),
+            "no robot ring-mod (antithetical to a hiss)"
         );
     }
 }

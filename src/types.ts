@@ -24,6 +24,9 @@ export type EffectId =
   /** v1.34.0: tremolo — a slow amplitude LFO (the "wobble" behind the Villager
    *  voice's "hrm-hrm" cadence; also helicopter / sci-fi pulse / guitar tremolo). */
   | "tremolo"
+  /** v1.35.0: breath / whisperizer — additive band-passed noise that swells UP
+   *  with the voice envelope (the Creeper's building fuse hiss; also whisper/wind). */
+  | "breath"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

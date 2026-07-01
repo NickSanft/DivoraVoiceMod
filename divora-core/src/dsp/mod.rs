@@ -20,6 +20,7 @@
 //! later phase. Formant ships a parallel band-pass colouring; the real
 //! LPC-based formant warp also lands later.
 
+mod breath;
 mod chorus;
 mod compressor;
 mod deesser;
@@ -39,6 +40,7 @@ mod tremolo;
 mod vintage_noise;
 mod voice_convert;
 
+pub use breath::Breath;
 pub use chorus::Chorus;
 pub use compressor::Compressor;
 pub use deesser::DeEsser;
@@ -109,6 +111,11 @@ pub enum EffectKind {
     /// the Villager voice's "hrm-hrm" cadence (also helicopter / sci-fi pulse /
     /// guitar tremolo).
     Tremolo,
+    /// v1.35.0: breath / whisperizer — additive band-passed noise whose level
+    /// RIDES UP with the voice envelope (the inverse of `VintageNoise`'s duck).
+    /// The swelling sibilant hiss behind the Creeper voice; also whisper / wind.
+    /// Additive, signal-following; run it late in the chain.
+    Breath,
 }
 
 /// Trait every effect implements. The audio thread holds a `Box<dyn
@@ -302,6 +309,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::VoiceConvert => Box::new(VoiceConverter::new()),
         EffectKind::VintageNoise => Box::new(VintageNoise::new()),
         EffectKind::Tremolo => Box::new(Tremolo::new()),
+        EffectKind::Breath => Box::new(Breath::new()),
     };
     effect.set_enabled(spec.enabled);
     for (key, value) in &spec.params {

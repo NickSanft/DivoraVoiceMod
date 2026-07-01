@@ -148,6 +148,7 @@ export type EffectKindWire =
   | "radio_bandpass"
   | "vintage_noise"
   | "tremolo"
+  | "breath"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

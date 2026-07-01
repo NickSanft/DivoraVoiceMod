@@ -204,6 +204,19 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.rate ?? 0} Hz · ${v.depth ?? 0}%`,
   },
+  breath: {
+    id: "breath",
+    name: "Breath",
+    sigil: "wave",
+    desc: "A whisperizer — additive band-passed hiss that SWELLS with your voice (the opposite of Vintage Noise's duck). The building 'sssSSS' fuse behind the Creeper voice; also whisper / ASMR / wind. Run it late in the chain.",
+    params: [
+      { key: "amount", label: "Amount", min: 0, max: 100, step: 1, unit: "%", default: 70 },
+      { key: "color", label: "Color", min: 0, max: 100, step: 1, unit: "%", default: 65 },
+      { key: "swell", label: "Swell", min: 0, max: 100, step: 1, unit: "%", default: 80 },
+      { key: "sens", label: "Sensitivity", min: 0, max: 100, step: 1, unit: "%", default: 60 },
+    ],
+    readout: (v) => `${v.amount ?? 0}% · swell ${v.swell ?? 0}%`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -234,6 +247,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "chorus",
   "harmonizer",
   "tremolo",
+  "breath",
   "vintage_noise",
 ];
 

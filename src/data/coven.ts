@@ -108,6 +108,11 @@ export const COVEN: CastMember[] = [
     lore: "Hrm. A blocked-nose mumble pitched up small, honking and bobbing its endless 'hrm-hrm' — it has emeralds, dignity is extra.",
   },
   {
+    presetId: "creeper",
+    kind: "dsp",
+    lore: "It doesn't speak so much as hiss — every word swelling into the sibilant fuse of something green and patient standing much too close. Sssss.",
+  },
+  {
     presetId: "corrupted",
     kind: "dsp",
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",
