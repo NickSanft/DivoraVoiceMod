@@ -45,7 +45,10 @@ impl Breath {
             enabled: false,
             amount: 0.7,
             color: 0.65,
-            swell: 0.8,
+            // Default to a full swell (no static floor) so the hiss only rides
+            // the voice and is silent when idle — the intuitive whisperizer
+            // behaviour. Lower it to blend in an always-on breath bed.
+            swell: 1.0,
             sens: 0.6,
             rng: 0x2545_f491,
             hp_lp: 0.0,

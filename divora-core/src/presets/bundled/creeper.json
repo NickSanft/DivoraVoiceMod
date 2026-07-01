@@ -12,7 +12,7 @@
     { "id": "eq", "enabled": true, "vals": { "low": -8, "mid": -4, "high": 12 } },
     { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 300, "lp": 6000, "peak": 4000, "gain": 8, "q": 2 } },
     { "id": "distortion", "enabled": true, "vals": { "drive": 18, "warmth": 0 } },
-    { "id": "breath", "enabled": true, "vals": { "amount": 75, "color": 65, "swell": 80, "sens": 60 } },
+    { "id": "breath", "enabled": true, "vals": { "amount": 75, "color": 65, "swell": 100, "sens": 60 } },
     { "id": "tremolo", "enabled": true, "vals": { "rate": 1, "depth": 30 } },
     { "id": "reverb", "enabled": true, "vals": { "size": 65, "mix": 30 } }
   ]

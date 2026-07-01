@@ -315,7 +315,8 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("radio_bandpass", true, { hp: 300, lp: 6000, peak: 4000, gain: 8, q: 2 }),
       fx("distortion", true, { drive: 18, warmth: 0 }),
       // The linchpin: hiss that SWELLS with each word — the building fuse.
-      fx("breath", true, { amount: 75, color: 65, swell: 80, sens: 60 }),
+      // swell 100 = no static floor, so it's silent when idle (only rides speech).
+      fx("breath", true, { amount: 75, color: 65, swell: 100, sens: 60 }),
       // A slow simmer layered under the swell (breath carries most of it).
       fx("tremolo", true, { rate: 1, depth: 30 }),
       fx("reverb", true, { size: 65, mix: 30 }),
