@@ -322,6 +322,32 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("reverb", true, { size: 65, mix: 30 }),
     ],
   },
+  {
+    id: "zombie",
+    name: "Zombie",
+    color: "#5E7250",
+    glyph: "distortion",
+    tag: "Bundled",
+    desc: "A slow, phlegmy moan dragged up from a caved-in chest — pitched down just enough to be a person who died a while ago, gargling the words through the flu it never got over. Unnnh.",
+    chain: [
+      fx("gate", true, { thresh: -46 }),
+      // Shallow drop — an undead HUMAN, not a demon octave. Keep it above Leviathan.
+      fx("pitch", true, { shift: -5 }),
+      fx("formant", true, { shift: -4 }),
+      // Octave-down sub (all three voices on one octave), ground into the
+      // distortion below so it fuses into one gravelly throat, not a chord.
+      fx("harmonizer", true, { mix: 35, v1: -12, v2: -12, v3: -12 }),
+      fx("distortion", true, { drive: 35, warmth: 45 }),
+      // Dark + congested, but keep the CHEST (low HP, unlike the radio voices).
+      fx("radio_bandpass", true, { hp: 120, lp: 3200, peak: 1000, gain: 4, q: 1.5 }),
+      fx("eq", true, { low: 3, mid: 0, high: -5 }),
+      // Watery detune = the wet-mouth gurgle (doesn't fight the slow tremolo).
+      fx("chorus", true, { mix: 40, depth: 80 }),
+      // Slow moan.
+      fx("tremolo", true, { rate: 1.5, depth: 40 }),
+      fx("reverb", true, { size: 65, mix: 30 }),
+    ],
+  },
 ];
 
 /**

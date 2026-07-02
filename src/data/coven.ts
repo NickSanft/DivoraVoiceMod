@@ -113,6 +113,11 @@ export const COVEN: CastMember[] = [
     lore: "It doesn't speak so much as hiss — every word swelling into the sibilant fuse of something green and patient standing much too close. Sssss.",
   },
   {
+    presetId: "zombie",
+    kind: "dsp",
+    lore: "A slow, phlegmy moan from a caved-in chest — pitched down just enough to be someone who died a while ago, still gargling the words. Unnnh.",
+  },
+  {
     presetId: "corrupted",
     kind: "dsp",
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",

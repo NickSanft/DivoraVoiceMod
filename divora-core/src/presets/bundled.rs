@@ -105,6 +105,15 @@ const BUNDLED: &[BundledSource] = &[
         id: "creeper",
         json: include_str!("bundled/creeper.json"),
     },
+    // v1.36.0: Minecraft-zombie voice (researched + adversarially reviewed).
+    // A SHALLOW pitch/formant drop (undead human, NOT a demon octave-drop),
+    // an octave-down harmonizer ground into asymmetric distortion for the
+    // gravel/sub, a slow tremolo moan + chorus wet-smear, kept dark but with
+    // the chest body preserved (low HP). No new DSP — pure recipe.
+    BundledSource {
+        id: "zombie",
+        json: include_str!("bundled/zombie.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's
@@ -492,5 +501,52 @@ mod tests {
             p.chain.iter().all(|e| e.id != "robot"),
             "no robot ring-mod (antithetical to a hiss)"
         );
+    }
+
+    // v1.36.0: the Zombie voice. Its identity is a SHALLOW pitch drop (an
+    // undead human, not a deep demon), grit + an octave-down sub, and a slow
+    // moan — deliberately distinct from the deep, clean Leviathan. Lock the
+    // shallow pitch (must be higher than Leviathan's), the moan, and the grit.
+    #[test]
+    fn zombie_is_a_shallow_gravelly_undead() {
+        let presets = bundled_presets();
+        let p = presets
+            .iter()
+            .find(|p| p.id == "zombie")
+            .expect("zombie must be bundled");
+        assert_eq!(p.name, "Zombie");
+        let pitch_of = |id: &str| {
+            presets
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.chain.iter().find(|e| e.id == "pitch"))
+                .and_then(|e| e.vals.get("shift").copied())
+        };
+        let zshift = pitch_of("zombie").expect("zombie is pitched");
+        assert!(zshift < 0.0, "zombie is pitched DOWN");
+        // ...but SHALLOWER than Leviathan — an undead human, not a leviathan.
+        if let Some(lev) = pitch_of("leviathan") {
+            assert!(
+                zshift > lev,
+                "zombie pitch ({zshift}) must be shallower than leviathan ({lev})"
+            );
+        }
+        // The slow moan.
+        assert!(
+            p.chain.iter().any(|e| e.id == "tremolo" && e.enabled),
+            "the slow moan (tremolo)"
+        );
+        // Grit + an octave-down body (the growl fake), not depth alone.
+        assert!(
+            p.chain.iter().any(|e| e.id == "distortion" && e.enabled),
+            "gravel (distortion)"
+        );
+        assert!(
+            p.chain.iter().any(|e| e.id == "harmonizer" && e.enabled),
+            "sub-octave body (harmonizer)"
+        );
+        // No tonal ring-mod (wrong for organic undead); no de-ess (keep body).
+        assert!(p.chain.iter().all(|e| e.id != "robot"), "no robot ring-mod");
+        assert!(p.chain.iter().all(|e| e.id != "deesser"), "no de-esser");
     }
 }

@@ -4,6 +4,14 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.36.0] — 2026-07-02 — Zombie voice
+
+The Minecraft-mob series continues (Phase 1 of 3), researched and adversarially design-reviewed.
+
+### Added
+
+- **Zombie** voice — a slow, phlegmy undead moan. Built as a pure recipe over existing effects: a *shallow* pitch/formant drop (a dead human, not a demon octave-drop), an octave-down harmonizer ground into asymmetric distortion for the gravelly sub-throat, a watery chorus smear + a slow tremolo moan, kept dark but with the chest body preserved. Deliberately distinct from the deep, clean Leviathan. Joins the Coven cast; fully editable. (No new DSP effect.)
+
 ## [1.35.0] — 2026-06-30 — Creeper voice + Breath (whisperizer) effect
 
 A Minecraft-creeper voice, researched and adversarially design-reviewed — plus the new effect it needed to nail the signature "building fuse" hiss.

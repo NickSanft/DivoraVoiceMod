@@ -1,0 +1,21 @@
+{
+  "id": "zombie",
+  "version": 1,
+  "name": "Zombie",
+  "color": "#5E7250",
+  "glyph": "distortion",
+  "tag": "Bundled",
+  "desc": "A slow, phlegmy moan dragged up from a caved-in chest — pitched down just enough to be a person who died a while ago, gargling the words through the flu it never got over. Unnnh.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -46 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -5 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": -4 } },
+    { "id": "harmonizer", "enabled": true, "vals": { "mix": 35, "v1": -12, "v2": -12, "v3": -12 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 35, "warmth": 45 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 120, "lp": 3200, "peak": 1000, "gain": 4, "q": 1.5 } },
+    { "id": "eq", "enabled": true, "vals": { "low": 3, "mid": 0, "high": -5 } },
+    { "id": "chorus", "enabled": true, "vals": { "mix": 40, "depth": 80 } },
+    { "id": "tremolo", "enabled": true, "vals": { "rate": 1.5, "depth": 40 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 65, "mix": 30 } }
+  ]
+}
