@@ -114,6 +114,15 @@ const BUNDLED: &[BundledSource] = &[
         id: "zombie",
         json: include_str!("bundled/zombie.json"),
     },
+    // v1.37.0: Minecraft-enderman voice (researched + adversarially reviewed).
+    // An honest close-approximation, NOT literal reversed speech (which needs
+    // buffering + latency): built on the new `warble` pitch-vibrato for the
+    // otherworldly wobble, plus a low ring-mod garble, heavy chorus, and a big
+    // void reverb. Pitched/formant down for the tall being.
+    BundledSource {
+        id: "enderman",
+        json: include_str!("bundled/enderman.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's
@@ -548,5 +557,37 @@ mod tests {
         // No tonal ring-mod (wrong for organic undead); no de-ess (keep body).
         assert!(p.chain.iter().all(|e| e.id != "robot"), "no robot ring-mod");
         assert!(p.chain.iter().all(|e| e.id != "deesser"), "no de-esser");
+    }
+
+    // v1.37.0: the Enderman voice — an honest OTHERWORLDLY approximation (not
+    // literal reversed speech). Its identity is the new `warble` pitch-vibrato
+    // (the wobble), pitched DOWN for the tall being, with a garbling ring-mod
+    // and a big void reverb. Lock the warble, the down-pitch, and the space.
+    #[test]
+    fn enderman_is_a_warbling_otherworldly_voice() {
+        let presets = bundled_presets();
+        let p = presets
+            .iter()
+            .find(|p| p.id == "enderman")
+            .expect("enderman must be bundled");
+        assert_eq!(p.name, "Enderman");
+        // The identity linchpin: the pitch-vibrato wobble (the new effect).
+        assert!(
+            p.chain.iter().any(|e| e.id == "warble" && e.enabled),
+            "the otherworldly wobble (warble)"
+        );
+        // Pitched DOWN — a tall being from the void.
+        let shift = p
+            .chain
+            .iter()
+            .find(|e| e.id == "pitch")
+            .and_then(|e| e.vals.get("shift").copied())
+            .unwrap_or(0.0);
+        assert!(shift < 0.0, "enderman is pitched down");
+        // The void — a big reverb.
+        assert!(
+            p.chain.iter().any(|e| e.id == "reverb" && e.enabled),
+            "the void (reverb)"
+        );
     }
 }

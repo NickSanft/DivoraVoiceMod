@@ -4,6 +4,15 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.37.0] — 2026-07-02 — Enderman voice + Warble (pitch-vibrato) effect
+
+The Minecraft-mob series continues (Phase 2 of 3), researched and adversarially design-reviewed — with the new effect the Enderman needed.
+
+### Added
+
+- **Warble** effect — a pitch **vibrato**: an LFO sweeps a short delay tap so the *fundamental* bends up and down (unlike Chorus, which only sums a diluted detuned copy). Params: Rate, Depth, Mix. Reusable for sci-fi / seasick / theremin voices. Adds a small (~base-delay) latency.
+- **Enderman** voice — an *otherworldly* wobble built on Warble, plus a low ring-mod garble, heavy chorus, a dark hollow band, and a big void reverb, pitched down for the tall being. An **honest close approximation** (~85–90%): a real-time chain can't literally reverse your speech (that needs buffering + latency and mangles words), so this chases the reversed *timbre* and wobble rather than literal backwards speech. Joins the Coven cast; fully editable.
+
 ## [1.36.0] — 2026-07-02 — Zombie voice
 
 The Minecraft-mob series continues (Phase 1 of 3), researched and adversarially design-reviewed.

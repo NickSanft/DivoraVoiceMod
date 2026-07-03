@@ -348,6 +348,31 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("reverb", true, { size: 65, mix: 30 }),
     ],
   },
+  {
+    id: "enderman",
+    name: "Enderman",
+    color: "#8B5CF6",
+    glyph: "echo",
+    tag: "Bundled",
+    desc: "A tall shadow that speaks a language like your own words played backward — warbling up out of the void, pitched down and elsewhere. Don't look at it. Don't look— oh.",
+    chain: [
+      fx("gate", true, { thresh: -44 }),
+      fx("pitch", true, { shift: -6 }),
+      fx("formant", true, { shift: -5 }),
+      // Low ring-mod carrier = the inhuman metallic garble.
+      fx("robot", true, { freq: 45, mix: 40 }),
+      fx("chorus", true, { mix: 70, depth: 90 }),
+      // The linchpin: a real pitch-vibrato that bends the fundamental (the
+      // otherworldly wobble the reversed enderman speech is famous for).
+      fx("warble", true, { rate: 6, depth: 55, mix: 100 }),
+      fx("distortion", true, { drive: 25, warmth: 40 }),
+      fx("radio_bandpass", true, { hp: 250, lp: 3500, peak: 1200, gain: 4, q: 1.5 }),
+      fx("eq", true, { low: 0, mid: 0, high: -6 }),
+      fx("echo", true, { time: 200, fb: 25 }),
+      // The void.
+      fx("reverb", true, { size: 80, mix: 45 }),
+    ],
+  },
 ];
 
 /**

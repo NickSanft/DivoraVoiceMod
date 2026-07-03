@@ -177,10 +177,10 @@ MidiMessage       { channel, kind, data1, data2 }    // v1.9.0; kind e.g.
 `EffectKindWire` (frozen set; new kinds may be **added** after v1.0):
 
 ```
-gate · denoiser · pitch · formant · eq · robot · distortion · echo · reverb · chorus · harmonizer · compressor · deesser · radio_bandpass · vintage_noise · tremolo · breath · voice_convert
+gate · denoiser · pitch · formant · eq · robot · distortion · echo · reverb · chorus · harmonizer · compressor · deesser · radio_bandpass · vintage_noise · tremolo · breath · warble · voice_convert
 ```
 
-(`chorus` added in v1.2.0, `harmonizer` in v1.2.1, `compressor` + `deesser` in v1.8.0, `radio_bandpass` + `vintage_noise` in v1.32.0, `tremolo` in v1.34.0, `breath` in v1.35.0 — kinds are additive after v1.0.)
+(`chorus` added in v1.2.0, `harmonizer` in v1.2.1, `compressor` + `deesser` in v1.8.0, `radio_bandpass` + `vintage_noise` in v1.32.0, `tremolo` in v1.34.0, `breath` in v1.35.0, `warble` in v1.37.0 — kinds are additive after v1.0.)
 
 ---
 

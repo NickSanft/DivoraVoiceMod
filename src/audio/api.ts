@@ -149,6 +149,7 @@ export type EffectKindWire =
   | "vintage_noise"
   | "tremolo"
   | "breath"
+  | "warble"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

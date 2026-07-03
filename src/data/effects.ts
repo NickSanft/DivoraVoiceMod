@@ -217,6 +217,18 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.amount ?? 0}% · swell ${v.swell ?? 0}%`,
   },
+  warble: {
+    id: "warble",
+    name: "Warble",
+    sigil: "wave",
+    desc: "A pitch vibrato — an LFO bends the fundamental up and down (unlike Chorus, which only sums a diluted copy). The otherworldly wobble behind the Enderman; also sci-fi / seasick / theremin. Adds a small latency.",
+    params: [
+      { key: "rate", label: "Rate", min: 0.5, max: 12, step: 0.5, unit: "Hz", default: 6 },
+      { key: "depth", label: "Depth", min: 0, max: 100, step: 1, unit: "%", default: 50 },
+      { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 100 },
+    ],
+    readout: (v) => `${v.rate ?? 0} Hz · ${v.depth ?? 0}%`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -248,6 +260,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "harmonizer",
   "tremolo",
   "breath",
+  "warble",
   "vintage_noise",
 ];
 

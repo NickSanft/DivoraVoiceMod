@@ -118,6 +118,11 @@ export const COVEN: CastMember[] = [
     lore: "A slow, phlegmy moan from a caved-in chest — pitched down just enough to be someone who died a while ago, still gargling the words. Unnnh.",
   },
   {
+    presetId: "enderman",
+    kind: "dsp",
+    lore: "A tall shadow warbling your own words back at you from the void — pitched down, garbled, and elsewhere. Whatever you do, don't look at it.",
+  },
+  {
     presetId: "corrupted",
     kind: "dsp",
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",

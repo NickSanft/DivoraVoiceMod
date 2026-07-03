@@ -27,6 +27,9 @@ export type EffectId =
   /** v1.35.0: breath / whisperizer — additive band-passed noise that swells UP
    *  with the voice envelope (the Creeper's building fuse hiss; also whisper/wind). */
   | "breath"
+  /** v1.37.0: warble — a pitch vibrato (an LFO-swept delay that bends the
+   *  fundamental). The Enderman's otherworldly wobble; also sci-fi / seasick. */
+  | "warble"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

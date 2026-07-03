@@ -39,6 +39,7 @@ mod stft;
 mod tremolo;
 mod vintage_noise;
 mod voice_convert;
+mod warble;
 
 pub use breath::Breath;
 pub use chorus::Chorus;
@@ -58,6 +59,7 @@ pub use robot::Robot;
 pub use tremolo::Tremolo;
 pub use vintage_noise::VintageNoise;
 pub use voice_convert::{onnx_runtime_available, VoiceConverter};
+pub use warble::Warble;
 
 use std::collections::HashMap;
 
@@ -116,6 +118,11 @@ pub enum EffectKind {
     /// The swelling sibilant hiss behind the Creeper voice; also whisper / wind.
     /// Additive, signal-following; run it late in the chain.
     Breath,
+    /// v1.37.0: warble — a pitch VIBRATO (an LFO-swept delay tap that bends the
+    /// fundamental, unlike `Chorus` which only sums a diluted copy). The
+    /// otherworldly wobble behind the Enderman voice; also sci-fi / seasick /
+    /// theremin. Adds a small (~base-delay) latency.
+    Warble,
 }
 
 /// Trait every effect implements. The audio thread holds a `Box<dyn
@@ -310,6 +317,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::VintageNoise => Box::new(VintageNoise::new()),
         EffectKind::Tremolo => Box::new(Tremolo::new()),
         EffectKind::Breath => Box::new(Breath::new()),
+        EffectKind::Warble => Box::new(Warble::new()),
     };
     effect.set_enabled(spec.enabled);
     for (key, value) in &spec.params {

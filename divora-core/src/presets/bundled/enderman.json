@@ -1,0 +1,22 @@
+{
+  "id": "enderman",
+  "version": 1,
+  "name": "Enderman",
+  "color": "#8B5CF6",
+  "glyph": "echo",
+  "tag": "Bundled",
+  "desc": "A tall shadow that speaks a language like your own words played backward — warbling up out of the void, pitched down and elsewhere. Don't look at it. Don't look— oh.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -44 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": -6 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": -5 } },
+    { "id": "robot", "enabled": true, "vals": { "freq": 45, "mix": 40 } },
+    { "id": "chorus", "enabled": true, "vals": { "mix": 70, "depth": 90 } },
+    { "id": "warble", "enabled": true, "vals": { "rate": 6, "depth": 55, "mix": 100 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 25, "warmth": 40 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 250, "lp": 3500, "peak": 1200, "gain": 4, "q": 1.5 } },
+    { "id": "eq", "enabled": true, "vals": { "low": 0, "mid": 0, "high": -6 } },
+    { "id": "echo", "enabled": true, "vals": { "time": 200, "fb": 25 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 80, "mix": 45 } }
+  ]
+}
