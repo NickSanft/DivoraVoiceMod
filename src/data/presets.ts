@@ -373,6 +373,35 @@ export const FALLBACK_PRESETS: Preset[] = [
       fx("reverb", true, { size: 80, mix: 45 }),
     ],
   },
+  {
+    id: "ghast",
+    name: "Ghast",
+    color: "#E8E4DA",
+    glyph: "reverb",
+    tag: "Bundled",
+    desc: "A great pale thing adrift in the dark, crying your words back high and breathy and mournful — a kitten's wail stretched across a cavern the size of the underworld. It is about to open its mouth.",
+    chain: [
+      fx("gate", true, { thresh: -44 }),
+      // Pitched UP — the high, piercing, plaintive cat-cry register (the
+      // family's odd one out; the game pitched its cat recording up too).
+      fx("pitch", true, { shift: 6 }),
+      fx("formant", true, { shift: 3 }),
+      fx("eq", true, { low: -8, mid: 2, high: 10 }),
+      // Concentrate the ~2 kHz "piercing" cry band; strip the chest.
+      fx("radio_bandpass", true, { hp: 800, lp: 5000, peak: 2200, gain: 6, q: 2 }),
+      // The showcase: the airy exhale that swells with the cry.
+      fx("breath", true, { amount: 68, color: 75, swell: 85, sens: 60 }),
+      // A slow, shallow, partial waver — a cry trembles, it doesn't lurch.
+      fx("warble", true, { rate: 3, depth: 40, mix: 60 }),
+      // A slow sob under the waver.
+      fx("tremolo", true, { rate: 1.5, depth: 25 }),
+      // Tame the sibilant pile-up from pitch-up + air + breath hiss.
+      fx("deesser", true, { freq: 6500, thresh: -32, range: 8 }),
+      // Diffuse distance + the big floating Nether cavern.
+      fx("echo", true, { time: 140, fb: 18 }),
+      fx("reverb", true, { size: 88, mix: 50 }),
+    ],
+  },
 ];
 
 /**

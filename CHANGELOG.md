@@ -4,6 +4,14 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.38.0] — 2026-07-03 — Ghast voice
+
+The Minecraft-mob series finale (Phase 3 of 3), researched and adversarially design-reviewed.
+
+### Added
+
+- **Ghast** voice — a high, mournful, breathy wail. The family's odd one out: pitched **up** (the game pitched its cat recording up too) for the plaintive cat-cry register, with the **Breath** whisperizer as the airy exhale, a slow shallow **Warble** for the mournful waver, a resonant cry-band peak, a de-esser to keep the air smooth, and a big floating Nether-cavern reverb. A pure recipe over existing effects (no new DSP). Joins the Coven cast; fully editable.
+
 ## [1.37.0] — 2026-07-02 — Enderman voice + Warble (pitch-vibrato) effect
 
 The Minecraft-mob series continues (Phase 2 of 3), researched and adversarially design-reviewed — with the new effect the Enderman needed.

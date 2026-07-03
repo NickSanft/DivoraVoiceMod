@@ -123,6 +123,15 @@ const BUNDLED: &[BundledSource] = &[
         id: "enderman",
         json: include_str!("bundled/enderman.json"),
     },
+    // v1.38.0: Minecraft-ghast voice (researched + adversarially reviewed).
+    // The family's odd one out — pitched UP (a high, plaintive cat-cry, the
+    // game pitched its cat recording up too). A pure recipe: the `breath`
+    // whisperizer for the airy exhale + a slow shallow `warble` for the
+    // mournful waver + a big cavernous reverb for the floating Nether hall.
+    BundledSource {
+        id: "ghast",
+        json: include_str!("bundled/ghast.json"),
+    },
 ];
 
 /// Parse every bundled preset. Panics if any JSON is malformed — that's
@@ -589,5 +598,42 @@ mod tests {
             p.chain.iter().any(|e| e.id == "reverb" && e.enabled),
             "the void (reverb)"
         );
+    }
+
+    // v1.38.0: the Ghast voice — the family's odd one out, pitched UP for the
+    // high plaintive cat-cry (creeper/enderman/zombie all go DOWN). Its
+    // identity is the airy `breath` exhale, a slow mournful `warble`, and a
+    // big floating reverb. Lock the up-pitch, the breath, the waver, the space.
+    #[test]
+    fn ghast_is_a_high_breathy_wailing_cry() {
+        let presets = bundled_presets();
+        let p = presets
+            .iter()
+            .find(|p| p.id == "ghast")
+            .expect("ghast must be bundled");
+        assert_eq!(p.name, "Ghast");
+        // Pitched UP — the invert of the other mobs (a high, piercing wail).
+        let shift = p
+            .chain
+            .iter()
+            .find(|e| e.id == "pitch")
+            .and_then(|e| e.vals.get("shift").copied())
+            .unwrap_or(0.0);
+        assert!(shift > 0.0, "ghast is pitched UP (unlike the other mobs)");
+        // The airy exhale + the mournful waver + the floating space.
+        assert!(
+            p.chain.iter().any(|e| e.id == "breath" && e.enabled),
+            "the airy exhale (breath)"
+        );
+        assert!(
+            p.chain.iter().any(|e| e.id == "warble" && e.enabled),
+            "the mournful waver (warble)"
+        );
+        assert!(
+            p.chain.iter().any(|e| e.id == "reverb" && e.enabled),
+            "the floating cavern (reverb)"
+        );
+        // Organic cat-cry, not a robot.
+        assert!(p.chain.iter().all(|e| e.id != "robot"), "no robot ring-mod");
     }
 }

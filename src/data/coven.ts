@@ -123,6 +123,11 @@ export const COVEN: CastMember[] = [
     lore: "A tall shadow warbling your own words back at you from the void — pitched down, garbled, and elsewhere. Whatever you do, don't look at it.",
   },
   {
+    presetId: "ghast",
+    kind: "dsp",
+    lore: "A great pale thing adrift in the dark — your words come out high, breathy and mournful, a kitten's wail stretched across the whole underworld. Then it opens its mouth.",
+  },
+  {
     presetId: "corrupted",
     kind: "dsp",
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",

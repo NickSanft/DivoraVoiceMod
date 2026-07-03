@@ -1,0 +1,22 @@
+{
+  "id": "ghast",
+  "version": 1,
+  "name": "Ghast",
+  "color": "#E8E4DA",
+  "glyph": "reverb",
+  "tag": "Bundled",
+  "desc": "A great pale thing adrift in the dark, crying your words back high and breathy and mournful — a kitten's wail stretched across a cavern the size of the underworld. It is about to open its mouth.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -44 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": 6 } },
+    { "id": "formant", "enabled": true, "vals": { "shift": 3 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -8, "mid": 2, "high": 10 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 800, "lp": 5000, "peak": 2200, "gain": 6, "q": 2 } },
+    { "id": "breath", "enabled": true, "vals": { "amount": 68, "color": 75, "swell": 85, "sens": 60 } },
+    { "id": "warble", "enabled": true, "vals": { "rate": 3, "depth": 40, "mix": 60 } },
+    { "id": "tremolo", "enabled": true, "vals": { "rate": 1.5, "depth": 25 } },
+    { "id": "deesser", "enabled": true, "vals": { "freq": 6500, "thresh": -32, "range": 8 } },
+    { "id": "echo", "enabled": true, "vals": { "time": 140, "fb": 18 } },
+    { "id": "reverb", "enabled": true, "vals": { "size": 88, "mix": 50 } }
+  ]
+}
