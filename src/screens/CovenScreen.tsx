@@ -64,7 +64,18 @@ export function CovenScreen(): JSX.Element {
             Summon a voice — each one transmutes you live.{" "}
             <Show
               when={app.engineRunning()}
-              fallback={<>Start the engine on the Mixer to hear them.</>}
+              fallback={
+                <>
+                  Not hearing anything?{" "}
+                  <button
+                    type="button"
+                    class="btn btn-primary btn-sm"
+                    onClick={() => void app.startEngine()}
+                  >
+                    Start engine
+                  </button>
+                </>
+              }
             >
               They take effect the moment you speak.
             </Show>

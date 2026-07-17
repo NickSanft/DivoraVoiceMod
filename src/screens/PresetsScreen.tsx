@@ -362,6 +362,9 @@ interface PresetEditorProps {
 function PresetEditor(props: PresetEditorProps): JSX.Element {
   const isBundled = () => props.preset.tag === "Bundled";
   const activeCount = () => props.chain.filter((c) => c.enabled).length;
+  // v1.40.0: two-click confirm so one misclick can't permanently delete a
+  // hand-tuned preset — the editor's only irreversible action.
+  const [confirmDelete, setConfirmDelete] = createSignal(false);
 
   return (
     <div
@@ -459,10 +462,23 @@ function PresetEditor(props: PresetEditorProps): JSX.Element {
           <Button
             variant="danger"
             icon="trash"
-            onClick={props.onDelete}
             disabled={isBundled()}
+            title={
+              confirmDelete()
+                ? "Click again to permanently delete"
+                : "Delete this preset"
+            }
+            onClick={() => {
+              if (confirmDelete()) {
+                setConfirmDelete(false);
+                props.onDelete();
+              } else {
+                setConfirmDelete(true);
+                setTimeout(() => setConfirmDelete(false), 3000);
+              }
+            }}
           >
-            Delete
+            {confirmDelete() ? "Confirm?" : "Delete"}
           </Button>
         </div>
       </div>

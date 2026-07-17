@@ -21,6 +21,7 @@ import {
 } from "solid-js";
 import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
+import { HotkeyCapture } from "../components/HotkeyCapture";
 import { IconButton } from "../components/IconButton";
 import { Kbd } from "../components/Kbd";
 import { Sigil } from "../components/Sigil";
@@ -401,22 +402,52 @@ function Header(props: HeaderProps): JSX.Element {
         </div>
       </div>
       <div style={{ flex: 1 }} />
-      <input
-        type="text"
-        placeholder="Search clips…"
-        value={app.soundboardSearch()}
-        onInput={(e) => app.setSoundboardSearch(e.currentTarget.value)}
-        style={{
-          width: "260px",
-          height: "36px",
-          padding: "0 12px",
-          "border-radius": "var(--r-md)",
-          background: "var(--surface-2)",
-          border: "1px solid var(--line-strong)",
-          color: "var(--text-hi)",
-          "font-size": "var(--t-sm)",
-        }}
-      />
+      <div style={{ position: "relative", width: "260px" }}>
+        <input
+          type="text"
+          placeholder="Search clips…"
+          aria-label="Search clips"
+          value={app.soundboardSearch()}
+          onInput={(e) => app.setSoundboardSearch(e.currentTarget.value)}
+          style={{
+            width: "100%",
+            height: "36px",
+            padding: "0 32px 0 12px",
+            "border-radius": "var(--r-md)",
+            background: "var(--surface-2)",
+            border: "1px solid var(--line-strong)",
+            color: "var(--text-hi)",
+            "font-size": "var(--t-sm)",
+          }}
+        />
+        <Show when={app.soundboardSearch()}>
+          <button
+            type="button"
+            aria-label="Clear search"
+            onClick={() => app.setSoundboardSearch("")}
+            style={{
+              position: "absolute",
+              right: "6px",
+              top: "50%",
+              transform: "translateY(-50%)",
+              width: "22px",
+              height: "22px",
+              display: "flex",
+              "align-items": "center",
+              "justify-content": "center",
+              "border-radius": "var(--r-sm)",
+              border: "none",
+              background: "transparent",
+              color: "var(--text-mid)",
+              cursor: "pointer",
+              "font-size": "16px",
+              "line-height": 1,
+            }}
+          >
+            ×
+          </button>
+        </Show>
+      </div>
       <div
         style={{ display: "flex", "align-items": "center", gap: "var(--s2)" }}
         title="Master soundboard volume"
@@ -883,6 +914,32 @@ function ColorContextMenu(props: ColorContextMenuProps): JSX.Element {
           }}
         >
           Reset to default
+        </button>
+      </Show>
+      {/* v1.40.0: assign a global hotkey so this clip fires even when Divora
+          isn't focused. The wiring already existed; this exposes it. */}
+      <div
+        class="eyebrow"
+        style={{
+          "margin-bottom": "var(--s2)",
+          "margin-top": "var(--s3)",
+          color: "var(--text-lo)",
+        }}
+      >
+        Hotkey
+      </div>
+      <HotkeyCapture
+        value={app.tileHotkeys[props.clipId] ?? null}
+        onChange={(keys) => void app.bindTileHotkey(props.clipId, keys)}
+      />
+      <Show when={(app.tileHotkeys[props.clipId] ?? []).length > 0}>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          style={{ width: "100%", "margin-top": "var(--s2)" }}
+          onClick={() => void app.clearTileHotkey(props.clipId)}
+        >
+          Clear hotkey
         </button>
       </Show>
     </div>

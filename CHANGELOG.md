@@ -4,6 +4,21 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.40.0] — 2026-07-03 — Quick UX wins
+
+A grab-bag of small usability fixes surfaced by an audit.
+
+### Added
+
+- **Assign a hotkey to a soundboard tile from its menu.** Per-tile global hotkeys were fully wired but had no UI — you could only set one by hand-editing storage. The tile's right-click menu now has a **Hotkey** capture field (and a Clear).
+- **"Load into editor" on saved Speak clips.** Reuse a saved clip's text + voice with one click instead of retyping — turning the saved-clips list into a phrase library.
+
+### Fixed
+
+- **The "start the engine" prompts now have a button that actually starts it.** The Coven and Speak offline hints pointed you to "the Mixer" (which has no Start button — Start lives in Settings); they now show a working **Start engine** button inline.
+- **Deleting a user preset now takes two clicks** ("Delete" → "Confirm?"), so one misclick can't permanently remove a hand-tuned preset.
+- **The soundboard search box** now has an accessible label and a **clear (×) button**.
+
 ## [1.39.0] — 2026-07-03 — Device-loss recovery hardening
 
 Follow-ups to the v1.33.0 soundboard-freeze fix, closing the silent-failure gaps around audio device loss (headset unplugged, Bluetooth drop, default-device change).

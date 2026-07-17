@@ -99,7 +99,18 @@ export function SpeakScreen(): JSX.Element {
             Type something, choose a voice, and Divora speaks it aloud —{" "}
             <Show
               when={app.engineRunning()}
-              fallback={<>start the engine on the Mixer to route it into a call.</>}
+              fallback={
+                <>
+                  <button
+                    type="button"
+                    class="btn btn-primary btn-sm"
+                    onClick={() => void app.startEngine()}
+                  >
+                    Start engine
+                  </button>{" "}
+                  to route it into a call or stream.
+                </>
+              }
             >
               mixed into your output so a call or stream hears it too.
             </Show>
@@ -992,6 +1003,25 @@ export function SpeakScreen(): JSX.Element {
                         {clipDate(clip.createdAt)} · {clip.durationSecs.toFixed(1)}s
                       </span>
                     </span>
+                    <button
+                      type="button"
+                      aria-label="Load into editor"
+                      title="Load this text + voice back into the editor"
+                      onClick={() => {
+                        app.setTtsText(clip.text);
+                        app.setSelectedTtsVoice(clip.voice);
+                      }}
+                      style={{
+                        display: "flex",
+                        background: "transparent",
+                        border: "none",
+                        color: "var(--text-mid)",
+                        cursor: "pointer",
+                        padding: 0,
+                      }}
+                    >
+                      <Sigil name="copy" size={16} />
+                    </button>
                     <button
                       type="button"
                       aria-label="Delete clip"
