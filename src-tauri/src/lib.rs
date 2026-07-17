@@ -39,6 +39,7 @@ use midir::MidiInputConnection;
 /// `tauri.event.listen("audio-levels", …)`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // flat status flags for one wire event
 struct LevelUpdate {
     input: Levels,
     output: Levels,
@@ -51,6 +52,9 @@ struct LevelUpdate {
     /// v1.7.0: makeup gain the loudness normalizer is applying, in dB
     /// (0 while disabled). Drives the Mixer "it's working" readout.
     loudness_gain_db: f32,
+    /// v1.39.0: true when device-loss auto-recovery gave up (engine stopped,
+    /// no audio) — drives the "device lost — restart" banner.
+    device_lost: bool,
 }
 
 /// One-shot status snapshot used by the frontend at startup and after
@@ -1509,6 +1513,10 @@ fn close_midi_input(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Decode a clip on first play; subsequent plays reuse the cached
 /// `Arc<Vec<f32>>` so a hot soundboard doesn't decode anything twice.
+/// v1.39.0: cap on the decoded-clip cache — bounds accumulated PCM for a very
+/// large sound library. A soundboard rarely has this many distinct clips.
+const MAX_CACHED_CLIPS: usize = 64;
+
 fn decode_or_cache(
     state: &State<'_, AppState>,
     clip_id: &str,
@@ -1522,6 +1530,15 @@ fn decode_or_cache(
     }
     let clip = decode_clip(path).map_err(|e| e.to_string())?;
     let mut cache = state.clip_cache.lock().map_err(|e| e.to_string())?;
+    // v1.39.0: bound the cache so a big library can't accumulate decoded PCM
+    // without limit (the same unbounded-growth class the v1.33.0 freeze fix
+    // addressed). Once full, evict one arbitrary entry to make room — a
+    // soundboard rarely has this many distinct clips, so it seldom bites.
+    if cache.len() >= MAX_CACHED_CLIPS && !cache.contains_key(clip_id) {
+        if let Some(k) = cache.keys().next().cloned() {
+            cache.remove(&k);
+        }
+    }
     cache.insert(clip_id.to_owned(), clip.clone());
     Ok(clip)
 }
@@ -1570,6 +1587,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
                 dsp_latency_ms: engine.dsp_latency_ms(),
                 recording: engine.is_recording(),
                 loudness_gain_db: engine.loudness_gain_db(),
+                device_lost: engine.device_recovery_failed(),
             };
             if app.emit("audio-levels", &payload).is_err() {
                 // App is shutting down (no receivers / window gone).
@@ -2048,10 +2066,12 @@ mod tests {
             dsp_latency_ms: 0.0,
             recording: false,
             loudness_gain_db: 0.0,
+            device_lost: false,
         };
         assert_eq!(
             sorted_keys(&serde_json::to_value(&u).unwrap()),
             [
+                "deviceLost",
                 "dspLatencyMs",
                 "input",
                 "loudnessGainDb",

@@ -10,6 +10,7 @@ import {
   Match,
   onCleanup,
   onMount,
+  Show,
   Switch,
   type JSX,
 } from "solid-js";
@@ -255,6 +256,7 @@ function Shell(): JSX.Element {
           app.setDspLatencyMs(update.dspLatencyMs);
           app.setIsRecording(update.recording);
           app.setLoudnessGainDb(update.loudnessGainDb);
+          app.setDeviceLost(update.deviceLost);
         });
       } catch (err) {
         app.setEngineError(`level subscription failed: ${String(err)}`);
@@ -370,6 +372,43 @@ function Shell(): JSX.Element {
       }}
     >
       <Titlebar />
+      {/* v1.39.0: device-loss recovery gave up — the engine is stopped with no
+          audio. Surface it (instead of a silent metering-but-dead state) with a
+          one-click restart. */}
+      <Show when={app.deviceLost()}>
+        <div
+          role="alert"
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "0.75rem",
+            padding: "0.5rem 1rem",
+            background: "var(--danger, #b4232a)",
+            color: "#fff",
+            "font-size": "0.85rem",
+          }}
+        >
+          <span style={{ flex: 1 }}>
+            Audio device lost — the engine stopped and couldn't recover on its
+            own (a headset unplugged, or the output device changed).
+          </span>
+          <button
+            type="button"
+            onClick={() => void app.startEngine()}
+            style={{
+              padding: "0.3rem 0.8rem",
+              "border-radius": "6px",
+              border: "1px solid rgba(255,255,255,0.6)",
+              background: "rgba(255,255,255,0.15)",
+              color: "#fff",
+              "font-weight": 600,
+              cursor: "pointer",
+            }}
+          >
+            Restart audio
+          </button>
+        </div>
+      </Show>
       <div style={{ display: "flex", flex: 1, "min-height": 0 }}>
         <Sidebar />
         <div

@@ -4,6 +4,17 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.39.0] — 2026-07-03 — Device-loss recovery hardening
+
+Follow-ups to the v1.33.0 soundboard-freeze fix, closing the silent-failure gaps around audio device loss (headset unplugged, Bluetooth drop, default-device change).
+
+### Fixed
+
+- **A lost audio device is no longer a silent dead end.** When auto-recovery exhausts its retries (or the rebuild fails), the app now shows a **"device lost — restart audio" banner** with a one-click restart, instead of a metering-but-dead "running" state with no explanation.
+- **Your soundboard volume survives a device-loss recovery.** An auto-rebuild used to construct a fresh mixer at 100%, silently resetting your chosen master gain; the engine now restores it.
+- **The decoded-clip cache is now bounded** (evicts once full) so a very large sound library can't accumulate decoded audio without limit — the same unbounded-growth class the freeze fix addressed.
+- **Echo, Reverb, and Robot are now NaN-guarded** like the rest of the effects; a stray non-finite sample can no longer latch into Echo's or Reverb's feedback loops and self-sustain.
+
 ## [1.38.0] — 2026-07-03 — Ghast voice
 
 The Minecraft-mob series finale (Phase 3 of 3), researched and adversarially design-reviewed.

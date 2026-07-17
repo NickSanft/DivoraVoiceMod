@@ -96,7 +96,9 @@ impl Default for Reverb {
 impl AudioEffect for Reverb {
     fn process(&mut self, buffer: &mut [f32], _sample_rate: u32) {
         for sample in buffer.iter_mut() {
-            let dry = *sample;
+            // Guard the input so a stray NaN/Inf can't enter (and latch into)
+            // the recursive comb feedback loops (feedback runs up to 0.98).
+            let dry = if sample.is_finite() { *sample } else { 0.0 };
             let mut wet = 0.0_f32;
             for c in &mut self.combs {
                 wet += c.process(dry);
@@ -105,7 +107,8 @@ impl AudioEffect for Reverb {
             for ap in &mut self.allpasses {
                 wet = ap.process(wet);
             }
-            *sample = dry * (1.0 - self.mix) + wet * self.mix;
+            let out = dry * (1.0 - self.mix) + wet * self.mix;
+            *sample = if out.is_finite() { out } else { dry };
         }
     }
 
@@ -161,5 +164,24 @@ mod tests {
         // Expect non-zero energy well after the impulse.
         let tail_energy: f32 = buf[2000..4000].iter().map(|s| s.abs()).sum();
         assert!(tail_energy > 0.1);
+    }
+
+    #[test]
+    fn survives_nan_without_latching_the_tail() {
+        let mut r = Reverb::new();
+        r.set_enabled(true);
+        r.set_param("size", 100.0); // comb feedback ~0.98
+        r.set_param("mix", 100.0);
+        let mut buf = [f32::NAN, f32::INFINITY, -f32::INFINITY, 0.5, 0.5, 0.5];
+        r.process(&mut buf, 48_000);
+        for s in buf {
+            assert!(s.is_finite(), "output must stay finite, got {s}");
+        }
+        // A poisoned sample must not have latched into the recursive combs.
+        let mut buf2 = vec![0.1_f32; 4000];
+        r.process(&mut buf2, 48_000);
+        for s in buf2 {
+            assert!(s.is_finite(), "no latched non-finite comb state, got {s}");
+        }
     }
 }

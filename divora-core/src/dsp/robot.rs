@@ -36,9 +36,11 @@ impl AudioEffect for Robot {
         let sr = sample_rate as f32;
         let phase_inc = TAU * self.carrier_hz / sr;
         for sample in buffer.iter_mut() {
+            let x = if sample.is_finite() { *sample } else { 0.0 };
             let carrier = self.phase.sin();
-            let robotic = *sample * carrier;
-            *sample = *sample * (1.0 - self.mix) + robotic * self.mix;
+            let robotic = x * carrier;
+            let out = x * (1.0 - self.mix) + robotic * self.mix;
+            *sample = if out.is_finite() { out } else { x };
             self.phase += phase_inc;
             if self.phase > TAU {
                 self.phase -= TAU;
@@ -95,5 +97,17 @@ mod tests {
         let max = buf.iter().copied().fold(f32::MIN, f32::max);
         let min = buf.iter().copied().fold(f32::MAX, f32::min);
         assert!(max - min > 0.4);
+    }
+
+    #[test]
+    fn survives_nan_input() {
+        let mut r = Robot::new();
+        r.set_enabled(true);
+        r.set_param("mix", 100.0);
+        let mut buf = [f32::NAN, f32::INFINITY, -f32::INFINITY, 0.5, -0.5];
+        r.process(&mut buf, 48000);
+        for s in buf {
+            assert!(s.is_finite(), "output must stay finite, got {s}");
+        }
     }
 }

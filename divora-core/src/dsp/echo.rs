@@ -44,12 +44,17 @@ impl AudioEffect for Echo {
         let delay = delay.clamp(1, self.buffer.len() - 1);
         let buf_len = self.buffer.len();
         for sample in buffer.iter_mut() {
+            // Guard the input so a stray NaN/Inf can't latch into the feedback
+            // buffer and recirculate forever (feedback runs up to 0.95).
+            let x = if sample.is_finite() { *sample } else { 0.0 };
             let read_pos = (self.write_pos + buf_len - delay) % buf_len;
             let delayed = self.buffer[read_pos];
             let wet = delayed * 0.5;
-            self.buffer[self.write_pos] = *sample + delayed * self.feedback;
+            let fed = x + delayed * self.feedback;
+            self.buffer[self.write_pos] = if fed.is_finite() { fed } else { 0.0 };
             self.write_pos = (self.write_pos + 1) % buf_len;
-            *sample += wet;
+            let out = x + wet;
+            *sample = if out.is_finite() { out } else { x };
         }
     }
 
@@ -105,5 +110,30 @@ mod tests {
         // Count peaks above 0.05.
         let peaks = buf.iter().filter(|s| s.abs() > 0.05).count();
         assert!(peaks > 3);
+    }
+
+    #[test]
+    fn survives_nan_without_latching_feedback() {
+        let mut e = Echo::new();
+        e.set_enabled(true);
+        e.set_param("fb", 90.0);
+        // A short delay (1 ms = 48 samples) so the read head circles back to
+        // the poisoned write positions within the second buffer below — this
+        // genuinely closes the feedback loop, not just the input path.
+        e.set_param("time", 1.0);
+        // Poison the input, then feed clean audio: the NaN/Inf must not latch
+        // into the feedback buffer and recirculate forever.
+        let mut buf = [f32::NAN, f32::INFINITY, -f32::INFINITY, 0.5, 0.5, 0.5];
+        e.process(&mut buf, 48_000);
+        for s in buf {
+            assert!(s.is_finite(), "output must stay finite, got {s}");
+        }
+        // A later buffer of clean audio must also stay finite (no latched NaN
+        // recirculating through the delay line).
+        let mut buf2 = vec![0.2_f32; 2400];
+        e.process(&mut buf2, 48_000);
+        for s in buf2 {
+            assert!(s.is_finite(), "no latched non-finite state, got {s}");
+        }
     }
 }

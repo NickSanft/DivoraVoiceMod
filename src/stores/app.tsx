@@ -385,6 +385,10 @@ export interface AppState {
   /** Phase 16: true while the modulated output is being recorded. */
   isRecording: () => boolean;
   setIsRecording: Setter<boolean>;
+  /** v1.39.0: true when device-loss auto-recovery gave up (engine stopped,
+   *  no audio) — drives the "device lost — restart" banner. */
+  deviceLost: () => boolean;
+  setDeviceLost: Setter<boolean>;
   /** Phase 16: full path of the most recent recording (for the hint). */
   recordingPath: () => string | null;
 
@@ -950,6 +954,9 @@ export function createAppState(): AppState {
   // level event (backend is source of truth), but we also set it
   // optimistically on toggle for instant button feedback.
   const [isRecording, setIsRecording] = createSignal(false);
+  // v1.39.0: true when the backend's device-loss auto-recovery gave up — the
+  // engine is stopped with no audio. Confirmed by the ~30 Hz level event.
+  const [deviceLost, setDeviceLost] = createSignal(false);
   const [recordingPath, setRecordingPath] = createSignal<string | null>(null);
 
   const preset = createMemo<Preset>(
@@ -2561,6 +2568,8 @@ export function createAppState(): AppState {
     setDspLatencyMs,
     isRecording,
     setIsRecording,
+    deviceLost,
+    setDeviceLost,
     recordingPath,
 
     refreshDevices,

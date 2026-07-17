@@ -59,6 +59,9 @@ export interface LevelUpdate {
   recording: boolean;
   /** v1.7.0: makeup gain the loudness normalizer is applying, in dB. */
   loudnessGainDb: number;
+  /** v1.39.0: true when device-loss auto-recovery gave up (engine stopped, no
+   *  audio) — drives the "device lost — restart" banner. */
+  deviceLost: boolean;
 }
 
 export async function listInputDevices(): Promise<DeviceInfo[]> {

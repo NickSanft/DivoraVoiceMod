@@ -36,6 +36,12 @@ pub struct EngineState {
     /// repeated errors a dying stream emits into a single rebuild request,
     /// so a device loss triggers exactly one teardown+rebuild, not a flood.
     pub stream_error_pending: AtomicBool,
+    /// v1.39.0: true when device-loss auto-recovery has GIVEN UP (exhausted its
+    /// retry budget, or the rebuild itself failed) and the engine is stopped
+    /// with no audio. Cleared on a successful recovery or a manual Start/Stop.
+    /// The UI polls this to show a "device lost — restart" banner instead of a
+    /// silent, metering-but-dead "running" state.
+    pub recovery_failed: AtomicBool,
     pub input_rms_bits: AtomicU32,
     pub input_peak_bits: AtomicU32,
     pub output_rms_bits: AtomicU32,

@@ -268,6 +268,13 @@ impl AudioEngine {
         self.state.running.load(Ordering::Acquire)
     }
 
+    /// v1.39.0: true when device-loss auto-recovery gave up and the engine is
+    /// stopped with no audio (drives the UI's "device lost — restart" banner).
+    #[must_use]
+    pub fn device_recovery_failed(&self) -> bool {
+        self.state.recovery_failed.load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn is_monitoring(&self) -> bool {
         self.state.monitor.load(Ordering::Acquire)
@@ -382,6 +389,10 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
     // between manual starts so a flapping device can't loop forever.
     let mut last_start: Option<(Option<String>, Option<String>, Option<String>)> = None;
     let mut stream_recoveries: u32 = 0;
+    // v1.39.0: remember the soundboard master gain so a device-loss rebuild can
+    // restore it — a rebuild constructs a fresh mixer at unity, which would
+    // otherwise silently jump the user's chosen volume back to 100%.
+    let mut last_master_gain: f32 = 1.0;
 
     // Tear down the current session's streams + recording writers.
     // Dropping a writer's `tx` disconnects its channel, which makes it
@@ -421,6 +432,11 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                     reference_tx = Some(started.reference_tx);
                     reference_writer = Some(started.reference_writer);
                     current = Some(started.streams);
+                    // Restore the soundboard master gain onto the fresh (unity)
+                    // mixer so a rebuild doesn't reset the user's volume.
+                    if let Some(tx) = &sb_tx {
+                        let _ = tx.try_send(SoundboardCommand::SetMasterGain(last_master_gain));
+                    }
                     Ok(started.info)
                 }
                 Err(e) => Err(e),
@@ -448,6 +464,8 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                     last_start = Some((input_name, output_name, monitor_name));
                     stream_recoveries = 0;
                     state.stream_error_pending.store(false, Ordering::Release);
+                    // A manual start clears any prior "recovery gave up" banner.
+                    state.recovery_failed.store(false, Ordering::Release);
                 }
                 let _ = reply.send(result);
             }
@@ -464,6 +482,8 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                 last_start = None;
                 stream_recoveries = 0;
                 state.stream_error_pending.store(false, Ordering::Release);
+                // A deliberate Stop also dismisses any "recovery gave up" state.
+                state.recovery_failed.store(false, Ordering::Release);
             }
             Command::StreamError => {
                 // An output stream died — most likely the device was
@@ -481,6 +501,9 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                 state.stream_error_pending.store(false, Ordering::Release);
                 stream_recoveries += 1;
                 if stream_recoveries > MAX_AUTO_RECOVERIES {
+                    // Give up — surface it so the UI can prompt a restart
+                    // instead of showing a silent, metering-but-dead session.
+                    state.recovery_failed.store(true, Ordering::Release);
                     tracing::error!(
                         attempts = stream_recoveries,
                         "audio stream kept failing; auto-recovery gave up — \
@@ -488,15 +511,21 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                     );
                 } else if let Some((i, o, m)) = last_start.clone() {
                     match bring_up!(i.as_deref(), o.as_deref(), m.as_deref()) {
-                        Ok(info) => tracing::warn!(
-                            attempt = stream_recoveries,
-                            output = %info.output_name,
-                            "audio stream error — recovered by rebuilding the session"
-                        ),
-                        Err(e) => tracing::error!(
-                            error = ?e,
-                            "audio stream error — rebuild failed; engine stopped"
-                        ),
+                        Ok(info) => {
+                            state.recovery_failed.store(false, Ordering::Release);
+                            tracing::warn!(
+                                attempt = stream_recoveries,
+                                output = %info.output_name,
+                                "audio stream error — recovered by rebuilding the session"
+                            );
+                        }
+                        Err(e) => {
+                            state.recovery_failed.store(true, Ordering::Release);
+                            tracing::error!(
+                                error = ?e,
+                                "audio stream error — rebuild failed; engine stopped"
+                            );
+                        }
                     }
                 }
             }
@@ -509,6 +538,11 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                 }
             }
             Command::Soundboard(sb_cmd) => {
+                // Snoop the master gain so a device-loss rebuild can restore it
+                // to the fresh (unity) mixer (v1.39.0).
+                if let SoundboardCommand::SetMasterGain(g) = &sb_cmd {
+                    last_master_gain = *g;
+                }
                 if let Some(tx) = &sb_tx {
                     // Bounded + non-blocking. The realtime output callback is
                     // the only consumer, draining this every buffer. If it has
@@ -1427,7 +1461,11 @@ mod tests {
         // hang or panic.
         let engine = AudioEngine::new();
         assert!(!engine.is_running());
+        // v1.39.0: a fresh engine has not "failed recovery" (the banner flag
+        // defaults off); a plain Stop leaves it off too.
+        assert!(!engine.device_recovery_failed());
         engine.stop();
+        assert!(!engine.device_recovery_failed());
         engine.set_monitor(false);
         drop(engine);
     }
