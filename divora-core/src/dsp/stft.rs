@@ -62,15 +62,22 @@ pub struct Stft {
     /// `realfft` planner is just a factory; the actual FFT objects below.
     fft_fwd: Arc<dyn RealToComplex<f32>>,
     fft_inv: Arc<dyn ComplexToReal<f32>>,
-    /// Input ring — holds the most recent `WINDOW` samples we've seen,
-    /// shifted left by `HOP` each time a new frame is analysed.
+    /// Input ring — a CIRCULAR buffer of the most recent `WINDOW` samples.
+    /// New samples overwrite the oldest at `in_pos` (O(1)); a frame reads
+    /// oldest→newest starting from `in_pos`. (v1.41.0: was an O(WINDOW)
+    /// per-sample memmove.)
     in_ring: Vec<f32>,
+    /// Write head into `in_ring`. After a write it also points at the OLDEST
+    /// sample, so a frame windows `in_ring[(in_pos + i) % WINDOW]`.
+    in_pos: usize,
     /// How many samples are queued in `in_ring` since the last frame.
     in_fill: usize,
-    /// Output overlap-add buffer. Each synthesised window is added at
-    /// the start; once `HOP` samples have accumulated at the front we
-    /// pop them and shift the rest left.
+    /// Output overlap-add buffer — a CIRCULAR buffer. Each synthesised window
+    /// is added starting at `out_pos`; each sample pops (and zeroes) `out_pos`
+    /// then advances it. (v1.41.0: was an O(WINDOW) per-sample memmove.)
     out_ring: Vec<f32>,
+    /// Read head into `out_ring`.
+    out_pos: usize,
     /// FFT scratch buffers (kept around to avoid allocating per call).
     time_buf: Vec<f32>,
     freq_buf: Vec<Complex32>,
@@ -102,8 +109,10 @@ impl Stft {
             fft_fwd,
             fft_inv,
             in_ring: vec![0.0; WINDOW],
+            in_pos: 0,
             in_fill: 0,
             out_ring: vec![0.0; WINDOW + HOP],
+            out_pos: 0,
             time_buf: vec![0.0; WINDOW],
             freq_buf: vec![Complex32::default(); BINS],
             mag_scratch: vec![0.0; BINS],
@@ -118,10 +127,12 @@ impl Stft {
         for s in &mut self.in_ring {
             *s = 0.0;
         }
+        self.in_pos = 0;
         self.in_fill = 0;
         for s in &mut self.out_ring {
             *s = 0.0;
         }
+        self.out_pos = 0;
     }
 
     /// Process a block of samples in-place. The caller's closure
@@ -138,12 +149,11 @@ impl Stft {
         F: FnMut(&mut Frame<'_>),
     {
         let bin_hz = sample_rate as f32 / WINDOW as f32;
+        let out_len = self.out_ring.len();
         for slot in buf.iter_mut() {
-            // 1. Shift the new sample into the input ring.
-            for i in 0..WINDOW - 1 {
-                self.in_ring[i] = self.in_ring[i + 1];
-            }
-            self.in_ring[WINDOW - 1] = *slot;
+            // 1. Write the new sample into the circular input ring (O(1)).
+            self.in_ring[self.in_pos] = *slot;
+            self.in_pos = (self.in_pos + 1) % WINDOW;
             self.in_fill += 1;
 
             // 2. Every HOP samples in, run a full STFT frame.
@@ -152,20 +162,21 @@ impl Stft {
                 self.run_frame(bin_hz, &mut modify);
             }
 
-            // 3. Pop the head of the output ring as this sample's output.
-            *slot = self.out_ring[0] * OLA_GAIN;
-            // Shift the output ring left by one.
-            for i in 0..self.out_ring.len() - 1 {
-                self.out_ring[i] = self.out_ring[i + 1];
-            }
-            *self.out_ring.last_mut().expect("non-empty out_ring") = 0.0;
+            // 3. Pop the head of the circular output ring (O(1)): read it,
+            //    zero it (so the next OLA at this slot starts clean), advance.
+            *slot = self.out_ring[self.out_pos] * OLA_GAIN;
+            self.out_ring[self.out_pos] = 0.0;
+            self.out_pos = (self.out_pos + 1) % out_len;
         }
     }
 
     fn run_frame<F: FnMut(&mut Frame<'_>)>(&mut self, bin_hz: f32, modify: &mut F) {
-        // Window the input.
-        for (i, slot) in self.time_buf.iter_mut().enumerate() {
-            *slot = self.in_ring[i] * self.window[i];
+        // Window the input, reading the circular ring oldest → newest.
+        // After the latest write, `in_pos` points at the oldest sample.
+        let in_pos = self.in_pos;
+        for i in 0..WINDOW {
+            let idx = (in_pos + i) % WINDOW;
+            self.time_buf[i] = self.in_ring[idx] * self.window[i];
         }
         // Forward FFT.
         let _ = self.fft_fwd.process(&mut self.time_buf, &mut self.freq_buf);
@@ -192,10 +203,15 @@ impl Stft {
             self.freq_buf[i] = Complex32::new(m * p.cos(), m * p.sin());
         }
         let _ = self.fft_inv.process(&mut self.freq_buf, &mut self.time_buf);
-        // Normalise (rustfft's inverse is unscaled), window again, OLA into out_ring.
+        // Normalise (rustfft's inverse is unscaled), window again, and OLA into
+        // the circular out_ring starting at the current read head `out_pos`.
+        let out_pos = self.out_pos;
+        let out_len = self.out_ring.len();
         let scale = 1.0 / WINDOW as f32;
-        for (i, slot) in self.out_ring[..WINDOW].iter_mut().enumerate() {
-            *slot += self.time_buf[i] * scale * self.window[i];
+        for i in 0..WINDOW {
+            let idx = (out_pos + i) % out_len;
+            let contribution = self.time_buf[i] * scale * self.window[i];
+            self.out_ring[idx] += contribution;
         }
     }
 }

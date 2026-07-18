@@ -4,6 +4,12 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.41.0] — 2026-07-18 — Faster pitch / formant (O(1) STFT)
+
+### Changed
+
+- **The phase-vocoder STFT no longer memmoves its ring buffers on every sample.** Pitch, Formant, and the 3-voice Harmonizer share a streaming STFT that was shifting its input and output rings one element at a time — on the order of hundreds of millions of float moves per second for a Harmonizer alone. It's now a constant-time circular buffer (bit-equivalent output — verified by the identity-reconstruction test), cutting the CPU those effects burn and lowering the xrun risk when several are stacked. No audible change; just cheaper.
+
 ## [1.40.0] — 2026-07-03 — Quick UX wins
 
 A grab-bag of small usability fixes surfaced by an audit.
