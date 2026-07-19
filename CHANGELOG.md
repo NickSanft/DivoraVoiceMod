@@ -4,6 +4,13 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.42.0] — 2026-07-19 — Reverb quality + gate expander
+
+### Changed
+
+- **Reverb now has damping and is sample-rate-consistent.** Each comb low-passes its own feedback loop so the tail darkens as it decays (a real hall, not a ringing spring) — exposed as a new **Damping** control, gentle by default. And the comb/allpass buffers now scale with the device sample rate, so the room sounds the same at 48 kHz and 96 kHz instead of shrinking.
+- **The Noise Gate is now a soft downward expander.** Instead of a hard on/off it reduces below-threshold signal in proportion to how far below (new **Ratio** + **Range**), with proper **Attack / Release / Hold** timing (all sample-rate-aware). A longer Hold stops it chattering on quiet or breathy input; max Ratio + Range still gives a hard gate. Existing presets (which only set the threshold) get a smooth gate by default.
+
 ## [1.41.0] — 2026-07-18 — Faster pitch / formant (O(1) STFT)
 
 ### Changed

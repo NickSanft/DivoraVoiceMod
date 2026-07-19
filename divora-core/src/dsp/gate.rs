@@ -1,15 +1,29 @@
-//! Noise gate. Hysteresis-gated linear gain driven by a peak-following
-//! envelope. Below the threshold the gain closes smoothly to silence;
-//! above it the gate opens.
+//! Noise gate / downward expander (v1.42.0). A soft downward expander driven
+//! by a peak-following envelope: below the threshold the gain is reduced in
+//! proportion to how far below (by `ratio`), down to a `range` floor, with
+//! `attack`/`release` timing and a `hold` that keeps it open briefly after the
+//! signal dips — so it doesn't chatter on quiet/breathy input the way the old
+//! hard hysteresis gate did. At a high ratio + range it still acts as a hard
+//! gate; at a low ratio + small range it's a gentle expander. All timing is
+//! sample-rate-aware.
 
 use super::{AudioEffect, EffectKind};
 
-/// Hysteresis-gated noise gate.
+/// Soft downward expander (a superset of the old hard gate).
 pub struct NoiseGate {
     enabled: bool,
     threshold_db: f32,
+    /// Downward-expansion ratio (1 = off, higher = steeper; large = gate-like).
+    ratio: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    /// Maximum attenuation below the threshold, in dB (the floor).
+    range_db: f32,
+    hold_ms: f32,
     envelope: f32,
     gain: f32,
+    /// Remaining "hold open" countdown in samples.
+    hold_left: u32,
 }
 
 impl NoiseGate {
@@ -18,8 +32,14 @@ impl NoiseGate {
         Self {
             enabled: false,
             threshold_db: -52.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 120.0,
+            range_db: 60.0,
+            hold_ms: 20.0,
             envelope: 0.0,
-            gain: 0.0,
+            gain: 1.0,
+            hold_left: 0,
         }
     }
 }
@@ -31,33 +51,68 @@ impl Default for NoiseGate {
 }
 
 impl AudioEffect for NoiseGate {
-    fn process(&mut self, buffer: &mut [f32], _sample_rate: u32) {
+    fn process(&mut self, buffer: &mut [f32], sample_rate: u32) {
+        #[allow(clippy::cast_precision_loss)]
+        let sr = sample_rate.max(1) as f32;
         let open_amp = 10_f32.powf(self.threshold_db / 20.0);
-        let close_amp = open_amp * 0.8; // hysteresis floor
+        // Sample-rate-aware one-pole coefficients (attack/release time constants).
+        let env_atk = (-1.0 / (0.001 * sr)).exp(); // 1 ms envelope attack
+        let env_rel = (-1.0 / (0.050 * sr)).exp(); // 50 ms envelope release
+        let gain_atk = (-1.0 / ((self.attack_ms / 1000.0).max(1e-5) * sr)).exp();
+        let gain_rel = (-1.0 / ((self.release_ms / 1000.0).max(1e-5) * sr)).exp();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let hold_samples = (self.hold_ms / 1000.0 * sr) as u32;
         for sample in buffer.iter_mut() {
-            // Peak envelope follower (fast attack, slow release).
-            let abs = sample.abs();
-            self.envelope = if abs > self.envelope {
-                self.envelope * 0.5 + abs * 0.5 // attack
+            let x = if sample.is_finite() { *sample } else { 0.0 };
+            let abs = x.abs();
+            // Peak envelope follower.
+            let ec = if abs > self.envelope {
+                env_atk
             } else {
-                self.envelope * 0.995 + abs * 0.005 // release
+                env_rel
             };
-            let target = if self.envelope > open_amp {
+            self.envelope = ec * self.envelope + (1.0 - ec) * abs;
+
+            // Hold: refresh while above threshold; count down once below, so a
+            // brief dip doesn't slam the gate shut (anti-chatter).
+            if self.envelope >= open_amp {
+                self.hold_left = hold_samples;
+            } else if self.hold_left > 0 {
+                self.hold_left -= 1;
+            }
+
+            // Target gain: fully open above threshold / during hold, else a
+            // downward-expansion reduction proportional to dB below threshold,
+            // clamped to the `range` floor.
+            let target = if self.envelope >= open_amp || self.hold_left > 0 {
                 1.0
-            } else if self.envelope < close_amp {
-                0.0
             } else {
-                self.gain
+                let env_db = 20.0 * self.envelope.max(1e-9).log10();
+                let below = (self.threshold_db - env_db).max(0.0);
+                let reduction = (below * (self.ratio - 1.0)).min(self.range_db);
+                10_f32.powf(-reduction / 20.0)
             };
-            // Smooth gain ramp to avoid clicks.
-            self.gain += (target - self.gain) * 0.04;
-            *sample *= self.gain;
+
+            // Smooth toward the target (fast when opening, slow when closing).
+            let gc = if target > self.gain {
+                gain_atk
+            } else {
+                gain_rel
+            };
+            self.gain = gc * self.gain + (1.0 - gc) * target;
+            *sample = x * self.gain;
         }
     }
 
     fn set_param(&mut self, key: &str, value: f32) {
-        if key == "thresh" {
-            self.threshold_db = value.clamp(-90.0, 0.0);
+        match key {
+            "thresh" => self.threshold_db = value.clamp(-90.0, 0.0),
+            "ratio" => self.ratio = value.clamp(1.0, 20.0),
+            "attack" => self.attack_ms = value.clamp(0.1, 100.0),
+            "release" => self.release_ms = value.clamp(5.0, 1000.0),
+            "range" => self.range_db = value.clamp(0.0, 90.0),
+            "hold" => self.hold_ms = value.clamp(0.0, 500.0),
+            _ => {}
         }
     }
 
@@ -123,5 +178,29 @@ mod tests {
         g.process(&mut buf, 48000);
         // gain was set to 1.0 on disable, so the buffer is unchanged.
         assert!((buf[0] - 0.3).abs() < 1e-3);
+    }
+
+    // v1.42.0: with a gentle ratio + small range, a below-threshold signal is
+    // REDUCED but not slammed to silence — the expander behaviour a hard gate
+    // can't do.
+    #[test]
+    fn gentle_expansion_reduces_but_does_not_close() {
+        let mut g = NoiseGate::new();
+        g.set_enabled(true);
+        g.set_param("thresh", -30.0);
+        g.set_param("ratio", 2.0);
+        g.set_param("range", 12.0); // cap attenuation at 12 dB
+        g.set_param("hold", 0.0);
+        // -40 dBFS, i.e. 10 dB below the -30 threshold.
+        let mut buf = [0.01_f32; 512];
+        for _ in 0..40 {
+            buf.copy_from_slice(&[0.01_f32; 512]);
+            g.process(&mut buf, 48_000);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let avg = buf.iter().map(|s| s.abs()).sum::<f32>() / buf.len() as f32;
+        // 10 dB below × (ratio-1)=1 → ~10 dB reduction (10^-0.5 ≈ 0.316×):
+        // clearly reduced from 0.01, but far from silent.
+        assert!(avg < 0.008 && avg > 0.002, "gentle expansion, got {avg}");
     }
 }

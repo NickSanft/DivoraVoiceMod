@@ -115,7 +115,7 @@ describe("EFFECTS catalog", () => {
 describe("fx helper", () => {
   it("seeds defaults for every param of the effect", () => {
     const e = fx("reverb", true);
-    expect(e.vals).toEqual({ size: 40, mix: 25 });
+    expect(e.vals).toEqual({ size: 40, mix: 25, damp: 20 });
   });
 
   it("respects overrides while preserving unspecified defaults", () => {

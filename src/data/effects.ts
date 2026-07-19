@@ -41,6 +41,9 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     params: [
       { key: "size", label: "Size", min: 0, max: 100, step: 1, unit: "%", default: 40 },
       { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 25 },
+      // v1.42.0: feedback-loop damping — how fast the tail loses its highs.
+      // 0 = bright/ringy, higher = a darker, more natural decay.
+      { key: "damp", label: "Damping", min: 0, max: 100, step: 1, unit: "%", default: 20 },
     ],
     readout: (v) => `${v.size ?? 0}% · ${v.mix ?? 0}%`,
   },
@@ -94,11 +97,16 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     id: "gate",
     name: "Noise Gate",
     sigil: "gate",
-    desc: "Silence the input below a threshold.",
+    desc: "Downward expander — reduces (or fully gates) the signal below a threshold. Ratio + Range set how hard it clamps down; Attack/Release/Hold set the timing (a longer Hold stops it chattering on quiet/breathy input).",
     params: [
       { key: "thresh", label: "Threshold", min: -80, max: -20, step: 1, unit: "dB", default: -52 },
+      { key: "ratio", label: "Ratio", min: 1, max: 20, step: 0.5, unit: ":1", default: 4 },
+      { key: "range", label: "Range", min: 0, max: 90, step: 1, unit: "dB", default: 60 },
+      { key: "attack", label: "Attack", min: 0.1, max: 100, step: 0.1, unit: "ms", default: 5 },
+      { key: "release", label: "Release", min: 5, max: 1000, step: 5, unit: "ms", default: 120 },
+      { key: "hold", label: "Hold", min: 0, max: 500, step: 5, unit: "ms", default: 20 },
     ],
-    readout: (v) => `${v.thresh ?? 0} dB`,
+    readout: (v) => `${v.thresh ?? 0} dB · ${v.ratio ?? 1}:1`,
   },
   denoiser: {
     id: "denoiser",
