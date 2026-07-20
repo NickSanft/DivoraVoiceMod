@@ -24,7 +24,8 @@ export type SigilName =
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
   | "download" | "external" | "trash" | "copy" | "info" | "warning"
-  | "github" | "shield" | "ab" | "bolt" | "wave" | "eye" | "keyboard" | "refresh";
+  | "github" | "shield" | "ab" | "bolt" | "wave" | "eye" | "keyboard" | "refresh"
+  | "pencil";
 
 const SIGILS: Record<SigilName, () => JSX.Element> = {
   // ---------- EFFECTS ----------
@@ -228,6 +229,13 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
       <path d="M14 5 H19 V10" />
       <path d="M19 5 L11 13" />
       <path d="M17 13.5 V18 a1.5 1.5 0 0 1 -1.5 1.5 H6.5 A1.5 1.5 0 0 1 5 18 V8.5 A1.5 1.5 0 0 1 6.5 7 H11" />
+    </g>
+  ),
+  // v1.43.0: rename (inline edit) — a nib angled over its stroke.
+  pencil: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 20 L4.8 16.2 L15.5 5.5 L18.5 8.5 L7.8 19.2 Z" />
+      <path d="M14 7 L17 10" />
     </g>
   ),
   trash: () => (

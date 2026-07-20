@@ -41,6 +41,7 @@ import {
   startVoiceRecording,
   stopVoiceRecording,
   deleteClonedVoice,
+  renameClonedVoice,
   cloneModelsStatus,
   downloadCloneModels,
   stopAllSoundboardClips,
@@ -530,6 +531,15 @@ describe("audio api", () => {
     await deleteClonedVoice("my-voice");
     expect(invokeMock).toHaveBeenCalledWith("delete_cloned_voice", {
       id: "my-voice",
+    });
+  });
+
+  it("renameClonedVoice forwards the id + new name (v1.43.0)", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await renameClonedVoice("my-voice", "Renamed Voice");
+    expect(invokeMock).toHaveBeenCalledWith("rename_cloned_voice", {
+      id: "my-voice",
+      name: "Renamed Voice",
     });
   });
 

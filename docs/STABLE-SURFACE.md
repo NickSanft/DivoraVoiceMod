@@ -88,6 +88,7 @@ resolved `T` or a thrown string on the JS side.
 | `start_voice_recording` | — | — / error ("start the engine first") — v1.23.0 |
 | `stop_voice_recording` | `name: string` | `ClonedVoiceInfo` / error — v1.23.0 |
 | `list_cloned_voices` | — | `ClonedVoiceInfo[]` — v1.20.0 |
+| `rename_cloned_voice` | `id: string`, `name: string` | — / error — v1.43.0 (display name only; the `id` is stable) |
 | `delete_cloned_voice` | `id: string` | — / error — v1.20.0 |
 | `clone_models_status` | — | `{ ready: bool }` — v1.21.0 |
 | `download_clone_models` | — | — / error (downloads ~157 MB on-demand) — v1.21.0 |

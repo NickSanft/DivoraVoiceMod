@@ -437,6 +437,7 @@ resource dir), same as the AI voice-conversion models.
 - [ ] **Record with the engine stopped (v1.23.0):** stop the engine, then **Record** → a graceful "start the engine first" message appears (no crash); the recorder stays idle.
 - [ ] **Auto base-match (v1.22.0):** the new voice shows a small **"based on …"** caption naming a preset (e.g. *based on Puck*). Clone a clearly female and a clearly UK-accented reference → the captioned base shifts toward a female / UK preset accordingly (not always Puck).
 - [ ] Type text → **Speak** with the cloned voice → the output takes on that voice's timbre (accent/cadence come from the Kokoro base). It mixes into a call like any Speak output.
+- [ ] **Rename (v1.43.0):** click the **pencil** on a cloned voice → the card becomes an inline editor, already focused with the name selected → type a new name → **Enter** (or ✓) → the card shows the new name, it stays selected if it was, and the **"based on …"** caption + engine badge are unchanged. **Escape** (or ✕) discards the edit and returns focus to the pencil. Restart → the new name persists. Rename it to blank → nothing is saved and the editor stays open.
 - [ ] **Delete** a cloned voice (trash icon) → it disappears; if it was selected, the selection falls back to a preset.
 - [ ] Restart the app → cloned voices persist (stored under `%APPDATA%/DivoraVoice/voices/cloned/`); a selected cloned voice is restored.
 - [ ] Pick a junk/too-short file → a graceful error appears (no crash).

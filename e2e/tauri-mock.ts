@@ -152,6 +152,7 @@ export async function installTauriMock(
         stop_voice_recording: () => {
           throw "text-to-speech voices are not installed";
         },
+        rename_cloned_voice: () => null,
         delete_cloned_voice: () => null,
         clone_models_status: () => ({ ready: false }),
         voxcpm_status: () => ({ available: false, readPrompt: "" }),

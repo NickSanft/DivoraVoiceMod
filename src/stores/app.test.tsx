@@ -2111,6 +2111,72 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(result.selectedTtsVoice()).toBe("af_heart"); // fell back to first preset
   });
 
+  // ---- v1.43.0: renaming a cloned voice ----
+
+  it("renameClonedVoice renames, refreshes, and keeps the selection (v1.43.0)", async () => {
+    let cloned = [{ id: "my-voice", name: "My Voice", baseName: "Puck" }];
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_cloned_voices") return cloned;
+      if (cmd === "rename_cloned_voice") {
+        const { id, name } = args as { id: string; name: string };
+        cloned = cloned.map((v) => (v.id === id ? { ...v, name } : v));
+        return undefined;
+      }
+      if (cmd === "list_tts_voices") return TWO_VOICES;
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshClonedVoices();
+    result.setSelectedTtsVoice("my-voice");
+
+    // Leading/trailing whitespace is trimmed before it reaches the backend.
+    const ok = await result.renameClonedVoice("my-voice", "  Renamed  ");
+    expect(ok).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("rename_cloned_voice", {
+      id: "my-voice",
+      name: "Renamed",
+    });
+    expect(result.clonedVoices()[0]!.name).toBe("Renamed");
+    // The id is stable, so the selection survives the rename.
+    expect(result.selectedTtsVoice()).toBe("my-voice");
+    expect(result.cloneError()).toBeNull();
+  });
+
+  it("renameClonedVoice surfaces a backend rejection and keeps the old name (v1.43.0)", async () => {
+    const cloned = [{ id: "my-voice", name: "My Voice", baseName: "Puck" }];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_cloned_voices") return cloned;
+      if (cmd === "rename_cloned_voice") throw "name cannot be empty";
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshClonedVoices();
+
+    const ok = await result.renameClonedVoice("my-voice", "Whatever");
+    expect(ok).toBe(false);
+    expect(result.cloneError()).toBe("name cannot be empty");
+    expect(result.clonedVoices()[0]!.name).toBe("My Voice");
+  });
+
+  it("renameClonedVoice skips empty names and no-op renames (v1.43.0)", async () => {
+    const cloned = [{ id: "my-voice", name: "My Voice", baseName: "Puck" }];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_cloned_voices") return cloned;
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshClonedVoices();
+
+    // Whitespace-only is refused without touching the backend.
+    expect(await result.renameClonedVoice("my-voice", "   ")).toBe(false);
+    // Renaming to the SAME name is a no-op success (no pointless write).
+    expect(await result.renameClonedVoice("my-voice", "My Voice")).toBe(true);
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "rename_cloned_voice",
+      expect.anything(),
+    );
+  });
+
   it("refreshCloneModelsStatus reflects backend readiness", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "clone_models_status") return { ready: true };

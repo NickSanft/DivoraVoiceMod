@@ -969,6 +969,15 @@ fn clone_from_path(
     if name.is_empty() {
         return Err("voice name is required".to_string());
     }
+    // Cap at creation as well as rename (v1.43.0): an over-long name would
+    // otherwise produce a voice that can't be renamed without first hand-
+    // trimming it, and a very long one slugifies to an id that fails
+    // `is_safe_voice_id`, leaving the voice on disk but invisible forever.
+    if name.chars().count() > MAX_CLONE_NAME_LEN {
+        return Err(format!(
+            "name must be {MAX_CLONE_NAME_LEN} characters or fewer"
+        ));
+    }
     let clip = decode_clip(reference_path).map_err(|e| e.to_string())?;
     let se = divora_core::tts::extract_voice_se(&clip.samples, clip.sample_rate, &clone_dir(state))
         .map_err(|e| e.to_string())?;
@@ -1072,6 +1081,12 @@ fn store_voxcpm_clone(
     if name.is_empty() {
         return Err("voice name is required".to_string());
     }
+    // Same cap as the OpenVoice path + rename — see `clone_from_path`.
+    if name.chars().count() > MAX_CLONE_NAME_LEN {
+        return Err(format!(
+            "name must be {MAX_CLONE_NAME_LEN} characters or fewer"
+        ));
+    }
     // Validate the recording decodes before committing it.
     decode_clip(reference).map_err(|e| e.to_string())?;
 
@@ -1110,6 +1125,83 @@ fn store_voxcpm_clone(
 #[tauri::command]
 fn list_cloned_voices(state: State<'_, AppState>) -> Vec<ClonedVoiceInfo> {
     list_cloned_voice_infos(&cloned_voices_dir(&state.voices_dir))
+}
+
+/// Longest display name accepted for a cloned voice (characters, not bytes).
+const MAX_CLONE_NAME_LEN: usize = 64;
+
+/// v1.43.0: rewrite a cloned voice's DISPLAY name in `<id>/meta.json`.
+///
+/// The folder (and thus the id) deliberately stays put: the id is the stable
+/// key that the persisted voice selection, saved clips, and any in-flight
+/// synthesis all reference, so renaming the directory would orphan them.
+/// Split out from the command so it is testable without a Tauri `State`.
+fn rename_cloned_voice_in(voices_dir: &Path, id: &str, name: &str) -> Result<(), String> {
+    if !is_safe_voice_id(id) {
+        return Err("invalid voice id".to_string());
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    if name.chars().count() > MAX_CLONE_NAME_LEN {
+        return Err(format!(
+            "name must be {MAX_CLONE_NAME_LEN} characters or fewer"
+        ));
+    }
+    let dir = cloned_voices_dir(voices_dir).join(id);
+    if !dir.is_dir() {
+        return Err("voice not found".to_string());
+    }
+
+    // Preserve base/engine — only the name changes. A pre-v2 clone may have no
+    // meta.json at all, so synthesize one using the same engine inference
+    // `list_cloned_voice_infos` displays, keeping the badge and what actually
+    // gets loaded for synthesis in agreement.
+    let mut meta = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<ClonedMeta>(&s).ok())
+        .unwrap_or_else(|| ClonedMeta {
+            name: id.to_string(),
+            base: default_clone_base(),
+            engine: if dir.join("reference.wav").is_file() {
+                "voxcpm".to_string()
+            } else {
+                default_engine()
+            },
+        });
+    meta.name = name.to_string();
+
+    // Write to a temp file and rename over the original, so an interrupted
+    // write can't leave a truncated meta.json (which would silently drop the
+    // voice's base/engine and fall back to the id as its name). The temp name
+    // is unique per call — a fixed one would let two concurrent renames of the
+    // same voice interleave their writes and publish corrupt JSON, which is
+    // exactly what this dance exists to prevent. It sits in the voice's own
+    // directory so the rename is same-volume (and therefore atomic), and one
+    // level below the dir `list_cloned_voice_infos` scans, so a stray temp file
+    // can never show up as a voice.
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!("meta.json.{}.{nanos}.tmp", std::process::id()));
+    std::fs::write(&tmp, json).map_err(|e| {
+        std::fs::remove_file(&tmp).ok(); // a partial write must not linger
+        e.to_string()
+    })?;
+    std::fs::rename(&tmp, dir.join("meta.json")).map_err(|e| {
+        std::fs::remove_file(&tmp).ok(); // don't leave the temp file behind
+        e.to_string()
+    })?;
+    tracing::info!(id = %id, name = %name, "cloned voice renamed");
+    Ok(())
+}
+
+/// Rename a cloned voice. Only the display name changes; the id is stable.
+#[tauri::command]
+fn rename_cloned_voice(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
+    rename_cloned_voice_in(&state.voices_dir, &id, &name)
 }
 
 /// Delete a cloned voice by id.
@@ -1893,6 +1985,7 @@ pub fn run() {
             start_voice_recording,
             stop_voice_recording,
             list_cloned_voices,
+            rename_cloned_voice,
             delete_cloned_voice,
             clone_models_status,
             download_clone_models,
@@ -1915,8 +2008,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        save_tts_clip, scan_voice_dir, slugify_preset_id, unique_preset_id, EngineStatus,
-        LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
+        cloned_voices_dir, default_clone_base, list_cloned_voice_infos, rename_cloned_voice_in,
+        save_tts_clip, scan_voice_dir, slugify_preset_id, unique_preset_id, ClonedMeta,
+        EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
+        MAX_CLONE_NAME_LEN,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2170,5 +2265,139 @@ mod tests {
         let mut out: Vec<VoiceInfo> = Vec::new();
         scan_voice_dir(&PathBuf::from("/no/such/voices/dir"), &mut out);
         assert!(out.is_empty());
+    }
+
+    // ---- v1.43.0: renaming a cloned voice ------------------------------
+
+    /// Build `<voices>/cloned/<id>/` with a voice payload + optional meta.
+    fn seed_clone(voices: &Path, id: &str, meta: Option<&str>, payload: &str) {
+        let dir = cloned_voices_dir(voices).join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(payload), b"x").unwrap();
+        if let Some(m) = meta {
+            fs::write(dir.join("meta.json"), m).unwrap();
+        }
+    }
+
+    fn read_meta(voices: &Path, id: &str) -> ClonedMeta {
+        let s = fs::read_to_string(cloned_voices_dir(voices).join(id).join("meta.json")).unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn rename_updates_the_name_and_preserves_base_and_engine() {
+        let voices = scratch("rename-ok");
+        seed_clone(
+            &voices,
+            "velvet-demon",
+            Some(r#"{"name":"Velvet Demon","base":"am_puck","engine":"voxcpm"}"#),
+            "reference.wav",
+        );
+
+        rename_cloned_voice_in(&voices, "velvet-demon", "  Static Wraith  ").unwrap();
+
+        let meta = read_meta(&voices, "velvet-demon");
+        assert_eq!(meta.name, "Static Wraith", "name is renamed and trimmed");
+        assert_eq!(meta.base, "am_puck", "base must survive a rename");
+        assert_eq!(meta.engine, "voxcpm", "engine must survive a rename");
+        // The id/folder is the stable key — it must NOT move.
+        assert!(cloned_voices_dir(&voices).join("velvet-demon").is_dir());
+        // And the rename is visible through the normal listing path.
+        let infos = list_cloned_voice_infos(&cloned_voices_dir(&voices));
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, "velvet-demon");
+        assert_eq!(infos[0].name, "Static Wraith");
+        // No temp file left behind.
+        assert!(!cloned_voices_dir(&voices)
+            .join("velvet-demon")
+            .join("meta.json.tmp")
+            .exists());
+        fs::remove_dir_all(&voices).ok();
+    }
+
+    #[test]
+    fn rename_a_legacy_clone_without_meta_writes_one() {
+        let voices = scratch("rename-legacy");
+        // Pre-v2 OpenVoice clone: an `se.bin` and no meta.json at all.
+        seed_clone(&voices, "old-voice", None, "se.bin");
+
+        rename_cloned_voice_in(&voices, "old-voice", "Renamed Legacy").unwrap();
+
+        let meta = read_meta(&voices, "old-voice");
+        assert_eq!(meta.name, "Renamed Legacy");
+        // Engine inference must match what the listing shows for this voice.
+        assert_eq!(meta.engine, "openvoice");
+        assert_eq!(meta.base, default_clone_base());
+        fs::remove_dir_all(&voices).ok();
+    }
+
+    #[test]
+    fn rename_rejects_bad_input_without_touching_disk() {
+        let voices = scratch("rename-bad");
+        seed_clone(
+            &voices,
+            "velvet-demon",
+            Some(r#"{"name":"Velvet Demon","base":"am_puck","engine":"voxcpm"}"#),
+            "reference.wav",
+        );
+
+        // Path traversal / unsafe ids are refused.
+        assert!(rename_cloned_voice_in(&voices, "../escape", "Nope").is_err());
+        assert!(rename_cloned_voice_in(&voices, "", "Nope").is_err());
+        // Empty / whitespace-only names are refused.
+        assert!(rename_cloned_voice_in(&voices, "velvet-demon", "   ").is_err());
+        // Absurdly long names are refused.
+        let long = "x".repeat(MAX_CLONE_NAME_LEN + 1);
+        assert!(rename_cloned_voice_in(&voices, "velvet-demon", &long).is_err());
+        // A voice that doesn't exist is refused.
+        assert!(rename_cloned_voice_in(&voices, "no-such-voice", "Nope").is_err());
+
+        // None of that disturbed the stored meta.
+        let meta = read_meta(&voices, "velvet-demon");
+        assert_eq!(meta.name, "Velvet Demon");
+        assert_eq!(meta.engine, "voxcpm");
+        fs::remove_dir_all(&voices).ok();
+    }
+
+    #[test]
+    fn rename_accepts_a_name_at_the_length_limit() {
+        let voices = scratch("rename-limit");
+        seed_clone(&voices, "edge", None, "se.bin");
+        let exact = "y".repeat(MAX_CLONE_NAME_LEN);
+        rename_cloned_voice_in(&voices, "edge", &exact).unwrap();
+        assert_eq!(read_meta(&voices, "edge").name, exact);
+        fs::remove_dir_all(&voices).ok();
+    }
+
+    /// The limit counts CHARACTERS, not bytes — a 64-char multibyte name is
+    /// 128 bytes and must still be accepted.
+    #[test]
+    fn rename_length_limit_counts_characters_not_bytes() {
+        let voices = scratch("rename-utf8");
+        seed_clone(&voices, "edge", None, "se.bin");
+        let multibyte = "é".repeat(MAX_CLONE_NAME_LEN);
+        assert!(multibyte.len() > MAX_CLONE_NAME_LEN, "sanity: >1 byte/char");
+        rename_cloned_voice_in(&voices, "edge", &multibyte).unwrap();
+        assert_eq!(read_meta(&voices, "edge").name, multibyte);
+        // One character over is still refused.
+        let over = "é".repeat(MAX_CLONE_NAME_LEN + 1);
+        assert!(rename_cloned_voice_in(&voices, "edge", &over).is_err());
+        fs::remove_dir_all(&voices).ok();
+    }
+
+    /// The other arm of the legacy engine inference: a meta-less dir holding a
+    /// `reference.wav` is a `VoxCPM` clone, matching what the listing displays.
+    #[test]
+    fn rename_a_legacy_voxcpm_clone_infers_the_voxcpm_engine() {
+        let voices = scratch("rename-legacy-vox");
+        seed_clone(&voices, "old-vox", None, "reference.wav");
+        rename_cloned_voice_in(&voices, "old-vox", "Renamed Vox").unwrap();
+        let meta = read_meta(&voices, "old-vox");
+        assert_eq!(meta.name, "Renamed Vox");
+        assert_eq!(meta.engine, "voxcpm");
+        // And the listing agrees with what we just persisted.
+        let infos = list_cloned_voice_infos(&cloned_voices_dir(&voices));
+        assert_eq!(infos[0].engine, "voxcpm");
+        fs::remove_dir_all(&voices).ok();
     }
 }

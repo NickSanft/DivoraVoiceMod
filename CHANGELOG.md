@@ -4,6 +4,12 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.43.0] — 2026-07-19 — Rename your cloned voices
+
+### Added
+
+- **Cloned voices can be renamed.** A pencil button on each voice in *Your voices* swaps the card into an inline editor — Enter or ✓ saves, Escape or ✕ cancels. Only the label changes: the voice keeps its identity, so your current selection, saved clips, and its cloning engine all carry over untouched. Voices cloned before the metadata format existed get renamed too (their details are filled in on the way).
+
 ## [1.42.0] — 2026-07-19 — Reverb quality + gate expander
 
 ### Changed

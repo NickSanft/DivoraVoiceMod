@@ -39,6 +39,7 @@ import {
   startVoiceRecording as startVoiceRecordingCmd,
   stopVoiceRecording as stopVoiceRecordingCmd,
   deleteClonedVoice as deleteClonedVoiceCmd,
+  renameClonedVoice as renameClonedVoiceCmd,
   pickAudioFile as pickAudioFileCmd,
   cloneModelsStatus as cloneModelsStatusCmd,
   voxcpmStatus as voxcpmStatusCmd,
@@ -496,6 +497,12 @@ export interface AppState {
   addClonedVoice: (name: string) => Promise<void>;
   /** Delete a cloned voice; if it was selected, fall back to the first preset. */
   removeClonedVoice: (id: string) => Promise<void>;
+  /**
+   * v1.43.0: rename a cloned voice's display name (the id stays stable, so the
+   * selection and saved clips are unaffected). Resolves true on success; on
+   * failure the reason lands in `cloneError`.
+   */
+  renameClonedVoice: (id: string, name: string) => Promise<boolean>;
   /** v1.23.0: true while the dry mic is being captured for an in-app clone. */
   recordingVoice: () => boolean;
   /** v1.23.0: start capturing the dry mic (engine must be running). */
@@ -2302,6 +2309,37 @@ export function createAppState(): AppState {
     }
   };
 
+  // v1.43.0: rename a cloned voice. Only the display name changes — the id is
+  // stable, so the current selection and saved clips keep working. Resolves to
+  // true on success; on failure the message lands in `cloneError`.
+  const renameClonedVoice = async (
+    id: string,
+    name: string,
+  ): Promise<boolean> => {
+    // Cleared up front: a stale failure from an earlier attempt must not sit
+    // on screen next to a rename that then succeeds (including the no-op).
+    setCloneError(null);
+    const trimmed = name.trim();
+    if (!trimmed) return false;
+    // No-op if the name didn't actually change.
+    const current = clonedVoices().find((v) => v.id === id);
+    if (current && current.name === trimmed) return true;
+    try {
+      await renameClonedVoiceCmd(id, trimmed);
+    } catch (err) {
+      setCloneError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+      return false;
+    }
+    await refreshClonedVoices();
+    return true;
+  };
+
   const removeClonedVoice = async (id: string): Promise<void> => {
     try {
       await deleteClonedVoiceCmd(id);
@@ -2634,6 +2672,7 @@ export function createAppState(): AppState {
     refreshClonedVoices,
     addClonedVoice,
     removeClonedVoice,
+    renameClonedVoice,
     recordingVoice,
     startRecordingVoice,
     stopRecordingVoice,

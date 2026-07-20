@@ -416,6 +416,18 @@ export async function stopVoiceRecording(
   return invoke<ClonedVoiceInfo>("stop_voice_recording", { name });
 }
 
+/**
+ * v1.43.0: rename a cloned voice. Only the display name changes — the id is
+ * the stable key the voice selection and saved clips reference, so it stays
+ * put. Rejects with a message on an empty/too-long name or unknown id.
+ */
+export async function renameClonedVoice(
+  id: string,
+  name: string,
+): Promise<void> {
+  await invoke("rename_cloned_voice", { id, name });
+}
+
 /** Delete a cloned voice by id. */
 export async function deleteClonedVoice(id: string): Promise<void> {
   await invoke("delete_cloned_voice", { id });

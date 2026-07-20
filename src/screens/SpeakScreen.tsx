@@ -18,6 +18,43 @@ export function SpeakScreen(): JSX.Element {
   const app = useApp();
   const [cloneName, setCloneName] = createSignal("");
 
+  // v1.43.0: inline rename of a cloned voice. One card edits at a time. Enter
+  // or ✓ commits, Escape or ✕ abandons — deliberately no save-on-blur, so
+  // clicking cancel can't race a blur handler and save what you just rejected.
+  const [renamingId, setRenamingId] = createSignal<string | null>(null);
+  const [renameDraft, setRenameDraft] = createSignal("");
+  const MAX_VOICE_NAME = 64; // matches MAX_CLONE_NAME_LEN in the backend
+
+  const beginRename = (id: string, current: string): void => {
+    setRenameDraft(current);
+    setRenamingId(id);
+  };
+  // Closing the editor unmounts the focused input, which would drop focus to
+  // <body> and strand a keyboard user at the top of the document — so hand it
+  // back to the pencil that opened it. Re-queried rather than held as a ref
+  // because the row is rebuilt whenever the voice list refreshes.
+  const focusRenameTrigger = (id: string): void => {
+    queueMicrotask(() => {
+      document
+        .querySelector<HTMLElement>(`[data-rename-for="${id}"]`)
+        ?.focus();
+    });
+  };
+  const cancelRename = (id?: string): void => {
+    setRenamingId(null);
+    setRenameDraft("");
+    if (id) focusRenameTrigger(id);
+  };
+  const commitRename = (id: string): void => {
+    const next = renameDraft().trim();
+    if (!next) return; // keep the editor open rather than saving an empty name
+    void (async () => {
+      // Only close the editor if the backend accepted it; on failure the
+      // reason renders inline in the editor and the editor stays open.
+      if (await app.renameClonedVoice(id, next)) cancelRename(id);
+    })();
+  };
+
   onMount(() => {
     // Load cloned voices first so a persisted cloned selection isn't reset.
     void (async () => {
@@ -327,6 +364,119 @@ export function SpeakScreen(): JSX.Element {
                           overflow: "hidden",
                         }}
                       >
+                        <Show
+                          when={renamingId() !== voice.id}
+                          fallback={
+                            <div
+                              style={{
+                                display: "flex",
+                                "flex-direction": "column",
+                                gap: "var(--s1)",
+                                flex: 1,
+                                "min-width": 0,
+                                padding: "var(--s2) var(--s3)",
+                              }}
+                            >
+                             <div
+                              style={{
+                                display: "flex",
+                                "align-items": "center",
+                                gap: "var(--s2)",
+                                "min-width": 0,
+                              }}
+                             >
+                              <input
+                                type="text"
+                                value={renameDraft()}
+                                onInput={(e) =>
+                                  setRenameDraft(e.currentTarget.value)
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    commitRename(voice.id);
+                                  } else if (e.key === "Escape") {
+                                    e.preventDefault();
+                                    cancelRename(voice.id);
+                                  }
+                                }}
+                                ref={(el) => {
+                                  // Focus + select so typing replaces the old
+                                  // name immediately.
+                                  queueMicrotask(() => {
+                                    el.focus();
+                                    el.select();
+                                  });
+                                }}
+                                maxlength={MAX_VOICE_NAME}
+                                aria-label={`Rename ${voice.name}`}
+                                style={{
+                                  flex: 1,
+                                  "min-width": 0,
+                                  padding: "var(--s1) var(--s2)",
+                                  "border-radius": "var(--r-sm)",
+                                  border: "1px solid var(--accent)",
+                                  background: "var(--surface-1)",
+                                  color: "var(--text-high)",
+                                  "font-family": "inherit",
+                                  "font-size": "var(--t-sm)",
+                                }}
+                              />
+                              <button
+                                type="button"
+                                aria-label="Save name"
+                                title="Save"
+                                disabled={renameDraft().trim().length === 0}
+                                onClick={() => commitRename(voice.id)}
+                                style={{
+                                  display: "flex",
+                                  background: "transparent",
+                                  border: "none",
+                                  color:
+                                    renameDraft().trim().length === 0
+                                      ? "var(--text-low)"
+                                      : "var(--accent)",
+                                  cursor:
+                                    renameDraft().trim().length === 0
+                                      ? "default"
+                                      : "pointer",
+                                }}
+                              >
+                                <Sigil name="check" size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label="Cancel rename"
+                                title="Cancel"
+                                onClick={() => cancelRename(voice.id)}
+                                style={{
+                                  display: "flex",
+                                  background: "transparent",
+                                  border: "none",
+                                  color: "var(--text-low)",
+                                  cursor: "pointer",
+                                }}
+                              >
+                                <Sigil name="x" size={15} />
+                              </button>
+                             </div>
+                              {/* Why a rejected rename failed, right where the
+                                  correction happens — the shared clone-error
+                                  line sits below the whole grid. */}
+                              <Show when={app.cloneError()}>
+                                <span
+                                  role="alert"
+                                  style={{
+                                    "font-size": "0.72rem",
+                                    color: "var(--text-mid)",
+                                  }}
+                                >
+                                  {app.cloneError()}
+                                </span>
+                              </Show>
+                            </div>
+                          }
+                        >
                         <button
                           type="button"
                           role="radio"
@@ -398,6 +548,28 @@ export function SpeakScreen(): JSX.Element {
                             </Show>
                           </span>
                         </button>
+                        {/* v1.43.0: rename — swaps this card into an inline
+                            editor. Only the label changes; the voice keeps its
+                            id, so the selection and saved clips are unaffected. */}
+                        <button
+                          type="button"
+                          aria-label={`Rename ${voice.name}`}
+                          title="Rename this voice"
+                          data-rename-for={voice.id}
+                          onClick={() => beginRename(voice.id, voice.name)}
+                          style={{
+                            display: "flex",
+                            "align-items": "center",
+                            padding: "0 var(--s3)",
+                            background: "transparent",
+                            border: "none",
+                            "border-left": "1px solid var(--line)",
+                            color: "var(--text-low)",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <Sigil name="pencil" size={14} />
+                        </button>
                         <button
                           type="button"
                           aria-label={`Delete ${voice.name}`}
@@ -416,6 +588,7 @@ export function SpeakScreen(): JSX.Element {
                         >
                           <Sigil name="trash" size={14} />
                         </button>
+                        </Show>
                       </div>
                     );
                   }}
@@ -466,6 +639,7 @@ export function SpeakScreen(): JSX.Element {
                   value={cloneName()}
                   onInput={(e) => setCloneName(e.currentTarget.value)}
                   placeholder="Name your voice, then record or pick a 20–30s clip"
+                  maxlength={MAX_VOICE_NAME}
                   disabled={app.cloning() || app.recordingVoice()}
                   style={{
                     flex: "1 1 240px",
