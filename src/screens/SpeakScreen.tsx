@@ -377,89 +377,89 @@ export function SpeakScreen(): JSX.Element {
                                 padding: "var(--s2) var(--s3)",
                               }}
                             >
-                             <div
-                              style={{
-                                display: "flex",
-                                "align-items": "center",
-                                gap: "var(--s2)",
-                                "min-width": 0,
-                              }}
-                             >
-                              <input
-                                type="text"
-                                value={renameDraft()}
-                                onInput={(e) =>
-                                  setRenameDraft(e.currentTarget.value)
-                                }
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") {
-                                    e.preventDefault();
-                                    commitRename(voice.id);
-                                  } else if (e.key === "Escape") {
-                                    e.preventDefault();
-                                    cancelRename(voice.id);
-                                  }
-                                }}
-                                ref={(el) => {
-                                  // Focus + select so typing replaces the old
-                                  // name immediately.
-                                  queueMicrotask(() => {
-                                    el.focus();
-                                    el.select();
-                                  });
-                                }}
-                                maxlength={MAX_VOICE_NAME}
-                                aria-label={`Rename ${voice.name}`}
+                              <div
                                 style={{
-                                  flex: 1,
+                                  display: "flex",
+                                  "align-items": "center",
+                                  gap: "var(--s2)",
                                   "min-width": 0,
-                                  padding: "var(--s1) var(--s2)",
-                                  "border-radius": "var(--r-sm)",
-                                  border: "1px solid var(--accent)",
-                                  background: "var(--surface-1)",
-                                  color: "var(--text-high)",
-                                  "font-family": "inherit",
-                                  "font-size": "var(--t-sm)",
-                                }}
-                              />
-                              <button
-                                type="button"
-                                aria-label="Save name"
-                                title="Save"
-                                disabled={renameDraft().trim().length === 0}
-                                onClick={() => commitRename(voice.id)}
-                                style={{
-                                  display: "flex",
-                                  background: "transparent",
-                                  border: "none",
-                                  color:
-                                    renameDraft().trim().length === 0
-                                      ? "var(--text-low)"
-                                      : "var(--accent)",
-                                  cursor:
-                                    renameDraft().trim().length === 0
-                                      ? "default"
-                                      : "pointer",
                                 }}
                               >
-                                <Sigil name="check" size={15} />
-                              </button>
-                              <button
-                                type="button"
-                                aria-label="Cancel rename"
-                                title="Cancel"
-                                onClick={() => cancelRename(voice.id)}
-                                style={{
-                                  display: "flex",
-                                  background: "transparent",
-                                  border: "none",
-                                  color: "var(--text-low)",
-                                  cursor: "pointer",
-                                }}
-                              >
-                                <Sigil name="x" size={15} />
-                              </button>
-                             </div>
+                                <input
+                                  type="text"
+                                  value={renameDraft()}
+                                  onInput={(e) =>
+                                    setRenameDraft(e.currentTarget.value)
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      e.preventDefault();
+                                      commitRename(voice.id);
+                                    } else if (e.key === "Escape") {
+                                      e.preventDefault();
+                                      cancelRename(voice.id);
+                                    }
+                                  }}
+                                  ref={(el) => {
+                                    // Focus + select so typing replaces the old
+                                    // name immediately.
+                                    queueMicrotask(() => {
+                                      el.focus();
+                                      el.select();
+                                    });
+                                  }}
+                                  maxlength={MAX_VOICE_NAME}
+                                  aria-label={`Rename ${voice.name}`}
+                                  style={{
+                                    flex: 1,
+                                    "min-width": 0,
+                                    padding: "var(--s1) var(--s2)",
+                                    "border-radius": "var(--r-sm)",
+                                    border: "1px solid var(--accent)",
+                                    background: "var(--surface-1)",
+                                    color: "var(--text-high)",
+                                    "font-family": "inherit",
+                                    "font-size": "var(--t-sm)",
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  aria-label="Save name"
+                                  title="Save"
+                                  disabled={renameDraft().trim().length === 0}
+                                  onClick={() => commitRename(voice.id)}
+                                  style={{
+                                    display: "flex",
+                                    background: "transparent",
+                                    border: "none",
+                                    color:
+                                      renameDraft().trim().length === 0
+                                        ? "var(--text-low)"
+                                        : "var(--accent)",
+                                    cursor:
+                                      renameDraft().trim().length === 0
+                                        ? "default"
+                                        : "pointer",
+                                  }}
+                                >
+                                  <Sigil name="check" size={15} />
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label="Cancel rename"
+                                  title="Cancel"
+                                  onClick={() => cancelRename(voice.id)}
+                                  style={{
+                                    display: "flex",
+                                    background: "transparent",
+                                    border: "none",
+                                    color: "var(--text-low)",
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  <Sigil name="x" size={15} />
+                                </button>
+                              </div>
                               {/* Why a rejected rename failed, right where the
                                   correction happens — the shared clone-error
                                   line sits below the whole grid. */}
@@ -477,117 +477,117 @@ export function SpeakScreen(): JSX.Element {
                             </div>
                           }
                         >
-                        <button
-                          type="button"
-                          role="radio"
-                          aria-checked={selected()}
-                          onClick={() => app.setSelectedTtsVoice(voice.id)}
-                          style={{
-                            display: "flex",
-                            "align-items": "center",
-                            gap: "var(--s2)",
-                            flex: 1,
-                            padding: "var(--s3) var(--s4)",
-                            background: "transparent",
-                            border: "none",
-                            color: "var(--text-high)",
-                            cursor: "pointer",
-                            "text-align": "left",
-                          }}
-                        >
-                          <span
-                            style={{
-                              color: selected() ? "var(--accent)" : "var(--text-low)",
-                              display: "flex",
-                            }}
-                          >
-                            <Sigil name="mic" size={16} />
-                          </span>
-                          <span
+                          <button
+                            type="button"
+                            role="radio"
+                            aria-checked={selected()}
+                            onClick={() => app.setSelectedTtsVoice(voice.id)}
                             style={{
                               display: "flex",
-                              "flex-direction": "column",
-                              "min-width": 0,
+                              "align-items": "center",
+                              gap: "var(--s2)",
+                              flex: 1,
+                              padding: "var(--s3) var(--s4)",
+                              background: "transparent",
+                              border: "none",
+                              color: "var(--text-high)",
+                              cursor: "pointer",
+                              "text-align": "left",
                             }}
                           >
                             <span
                               style={{
+                                color: selected() ? "var(--accent)" : "var(--text-low)",
                                 display: "flex",
-                                "align-items": "center",
-                                gap: "var(--s2)",
+                              }}
+                            >
+                              <Sigil name="mic" size={16} />
+                            </span>
+                            <span
+                              style={{
+                                display: "flex",
+                                "flex-direction": "column",
                                 "min-width": 0,
                               }}
                             >
                               <span
                                 style={{
-                                  overflow: "hidden",
-                                  "text-overflow": "ellipsis",
-                                  "white-space": "nowrap",
+                                  display: "flex",
+                                  "align-items": "center",
+                                  gap: "var(--s2)",
+                                  "min-width": 0,
                                 }}
                               >
-                                {voice.name}
+                                <span
+                                  style={{
+                                    overflow: "hidden",
+                                    "text-overflow": "ellipsis",
+                                    "white-space": "nowrap",
+                                  }}
+                                >
+                                  {voice.name}
+                                </span>
+                                {/* v1.25.0: which engine cloned this voice —
+                                    accent (VoxCPM) supports the Clone quality
+                                    control; timbre (OpenVoice) does not. */}
+                                <Show when={voice.engine === "voxcpm"} fallback={
+                                  <Badge tone="info">timbre</Badge>
+                                }>
+                                  <Badge tone="accent">accent</Badge>
+                                </Show>
                               </span>
-                              {/* v1.25.0: which engine cloned this voice —
-                                  accent (VoxCPM) supports the Clone quality
-                                  control; timbre (OpenVoice) does not. */}
-                              <Show when={voice.engine === "voxcpm"} fallback={
-                                <Badge tone="info">timbre</Badge>
-                              }>
-                                <Badge tone="accent">accent</Badge>
+                              <Show when={voice.baseName}>
+                                <span
+                                  style={{
+                                    "font-size": "0.72rem",
+                                    color: "var(--text-low)",
+                                  }}
+                                >
+                                  based on {voice.baseName}
+                                </span>
                               </Show>
                             </span>
-                            <Show when={voice.baseName}>
-                              <span
-                                style={{
-                                  "font-size": "0.72rem",
-                                  color: "var(--text-low)",
-                                }}
-                              >
-                                based on {voice.baseName}
-                              </span>
-                            </Show>
-                          </span>
-                        </button>
-                        {/* v1.43.0: rename — swaps this card into an inline
-                            editor. Only the label changes; the voice keeps its
-                            id, so the selection and saved clips are unaffected. */}
-                        <button
-                          type="button"
-                          aria-label={`Rename ${voice.name}`}
-                          title="Rename this voice"
-                          data-rename-for={voice.id}
-                          onClick={() => beginRename(voice.id, voice.name)}
-                          style={{
-                            display: "flex",
-                            "align-items": "center",
-                            padding: "0 var(--s3)",
-                            background: "transparent",
-                            border: "none",
-                            "border-left": "1px solid var(--line)",
-                            color: "var(--text-low)",
-                            cursor: "pointer",
-                          }}
-                        >
-                          <Sigil name="pencil" size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`Delete ${voice.name}`}
-                          title="Delete this voice"
-                          onClick={() => void app.removeClonedVoice(voice.id)}
-                          style={{
-                            display: "flex",
-                            "align-items": "center",
-                            padding: "0 var(--s3)",
-                            background: "transparent",
-                            border: "none",
-                            "border-left": "1px solid var(--line)",
-                            color: "var(--text-low)",
-                            cursor: "pointer",
-                          }}
-                        >
-                          <Sigil name="trash" size={14} />
-                        </button>
+                          </button>
+                          {/* v1.43.0: rename — swaps this card into an inline
+                              editor. Only the label changes; the voice keeps its
+                              id, so the selection and saved clips are unaffected. */}
+                          <button
+                            type="button"
+                            aria-label={`Rename ${voice.name}`}
+                            title="Rename this voice"
+                            data-rename-for={voice.id}
+                            onClick={() => beginRename(voice.id, voice.name)}
+                            style={{
+                              display: "flex",
+                              "align-items": "center",
+                              padding: "0 var(--s3)",
+                              background: "transparent",
+                              border: "none",
+                              "border-left": "1px solid var(--line)",
+                              color: "var(--text-low)",
+                              cursor: "pointer",
+                            }}
+                          >
+                            <Sigil name="pencil" size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Delete ${voice.name}`}
+                            title="Delete this voice"
+                            onClick={() => void app.removeClonedVoice(voice.id)}
+                            style={{
+                              display: "flex",
+                              "align-items": "center",
+                              padding: "0 var(--s3)",
+                              background: "transparent",
+                              border: "none",
+                              "border-left": "1px solid var(--line)",
+                              color: "var(--text-low)",
+                              cursor: "pointer",
+                            }}
+                          >
+                            <Sigil name="trash" size={14} />
+                          </button>
                         </Show>
                       </div>
                     );
