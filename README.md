@@ -12,6 +12,8 @@ Each tagged release publishes both an **MSI** and an **NSIS** installer. Grab th
 
 The installers are not yet code-signed, so Windows SmartScreen will warn before running one. Click **More info → Run anyway**.
 
+Each release lists **SHA-256 checksums** for the `.msi` and `-setup.exe` in its notes and attaches a `SHA256SUMS.txt`, so you can verify a download (`Get-FileHash <file> -Algorithm SHA256` in PowerShell, or `sha256sum -c SHA256SUMS.txt`).
+
 ## What it does
 
 - **Real-time microphone effects** — a live, reorderable chain of **19 effects**:

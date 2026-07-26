@@ -4,6 +4,16 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.44.0] — 2026-07-20 — Release checksums + CI runner refresh
+
+### Added
+
+- **SHA-256 checksums for every release.** Each release now lists the `.msi` and `-setup.exe` checksums in its notes and attaches a `SHA256SUMS.txt`, so a download can be verified (`Get-FileHash … -Algorithm SHA256`, or `sha256sum -c`).
+
+### Changed
+
+- **CI and release builds moved from `windows-2022` to `windows-2025`** — GitHub is retiring the 2022 runner image. No functional change; the pinned `cmake`, Node 22, and toolchain steps are unchanged.
+
 ## [1.43.0] — 2026-07-19 — Rename your cloned voices
 
 ### Added

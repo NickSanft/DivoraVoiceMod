@@ -13,7 +13,7 @@ concurrency:
 jobs:
   frontend:
     name: Frontend (typecheck, test)
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
 
@@ -35,7 +35,7 @@ jobs:
 
   e2e:
     name: E2E (Playwright)
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
 
@@ -68,7 +68,7 @@ jobs:
 
   rust:
     name: Rust (fmt, clippy, test)
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
 
@@ -77,8 +77,10 @@ jobs:
           components: rustfmt, clippy
 
       # symphonia-adapter-libopus → opusic-sys vendors libopus and builds
-      # it from C source via cmake. windows-2022 ships cmake by default
+      # it from C source via cmake. windows-2025 ships cmake by default
       # but this guarantees it's on PATH if the image base changes.
+      # (windows-2025 = VS 2026 / MSVC v18 since GitHub's June 2026 image
+      # repoint; the pinned cmake/cc crates in Cargo.lock support it.)
       - uses: lukka/get-cmake@latest
 
       - uses: Swatinem/rust-cache@v2
@@ -106,7 +108,7 @@ jobs:
 
       - name: cargo test
         # The `CI=true` env var is checked by audio-device tests to
-        # skip cpal/WASAPI enumeration on the headless windows-2022
+        # skip cpal/WASAPI enumeration on the headless windows-2025
         # runner — those calls intermittently STATUS_ACCESS_VIOLATION
         # under parallel test execution (real hardware is fine).
         env:
@@ -115,7 +117,7 @@ jobs:
 
   build:
     name: Tauri debug build
-    runs-on: windows-2022
+    runs-on: windows-2025
     needs: [rust, frontend]
     steps:
       - uses: actions/checkout@v6
