@@ -13,6 +13,7 @@
 //! re-silence it) and before any downstream loudness limiter. Zero latency,
 //! no per-buffer allocation, RT-safe.
 
+use super::envelope::{coeff_secs, EnvelopeFollower};
 use super::{AudioEffect, EffectKind};
 
 /// Fixed high-pass corner (Hz): strip the low rumble so the hiss sits up in
@@ -35,7 +36,7 @@ pub struct Breath {
     rng: u32,
     hp_lp: f32,
     lp: f32,
-    env: f32,
+    env: EnvelopeFollower,
 }
 
 impl Breath {
@@ -53,7 +54,7 @@ impl Breath {
             rng: 0x2545_f491,
             hp_lp: 0.0,
             lp: 0.0,
-            env: 0.0,
+            env: EnvelopeFollower::new(0.0),
         }
     }
 
@@ -89,8 +90,8 @@ impl AudioEffect for Breath {
         // Envelope follower: fast attack (catch the onset), slow release (the
         // hiss lingers and swells like a fuse) — the SAME shape as VintageNoise
         // but used to gate the noise UP instead of ducking it down.
-        let atk = (-1.0 / (0.008 * sr)).exp();
-        let rel = (-1.0 / (0.180 * sr)).exp();
+        let atk = coeff_secs(0.008, sr);
+        let rel = coeff_secs(0.180, sr);
         // Noise band-pass: fixed HP to strip rumble, `color`-swept LP for
         // dark↔bright (≈ 3.5 kHz dark … 8 kHz bright).
         let hp_c = (-two_pi * BREATH_HP_HZ / sr).exp();
@@ -106,9 +107,8 @@ impl AudioEffect for Breath {
 
             // Input-level follower → 0..1 gate that RISES with the voice.
             let lvl = x.abs();
-            let c = if lvl > self.env { atk } else { rel };
-            self.env = c * self.env + (1.0 - c) * lvl;
-            let follow = (self.env * sens_mult).min(1.0);
+            let env = self.env.attack_on_rise(lvl, atk, rel);
+            let follow = (env * sens_mult).min(1.0);
             let noise_gain = self.amount * (floor + (1.0 - floor) * follow);
 
             // Band-passed white noise (HP then LP) → sits in the sss/air band.
@@ -140,7 +140,7 @@ impl AudioEffect for Breath {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            self.env = 0.0;
+            self.env.reset(0.0);
         }
     }
 

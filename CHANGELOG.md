@@ -4,6 +4,16 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.45.0] — 2026-09-04 — Shared envelope follower (internal)
+
+### Changed
+
+- **Five effects now share one envelope follower.** Breath, Vintage Noise, the Noise Gate, the Compressor, and the De-esser had each grown their own copy of the same one-pole follower; they now use a single shared implementation. **No audible change** — the output is bit-identical, verified by digesting every effect's output across three sample rates before and after. Groundwork for reactive effects.
+
+### Fixed
+
+- **The De-esser's follower had lost its divide-by-zero guard** that the Compressor's copy still had. Inert in practice (its time constants are constants), but the shared implementation now guards every follower uniformly.
+
 ## [1.44.0] — 2026-07-20 — Release checksums + CI runner refresh
 
 ### Added

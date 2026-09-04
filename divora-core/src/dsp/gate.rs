@@ -7,6 +7,7 @@
 //! gate; at a low ratio + small range it's a gentle expander. All timing is
 //! sample-rate-aware.
 
+use super::envelope::{coeff_ms, coeff_secs, EnvelopeFollower};
 use super::{AudioEffect, EffectKind};
 
 /// Soft downward expander (a superset of the old hard gate).
@@ -20,8 +21,8 @@ pub struct NoiseGate {
     /// Maximum attenuation below the threshold, in dB (the floor).
     range_db: f32,
     hold_ms: f32,
-    envelope: f32,
-    gain: f32,
+    envelope: EnvelopeFollower,
+    gain: EnvelopeFollower,
     /// Remaining "hold open" countdown in samples.
     hold_left: u32,
 }
@@ -37,8 +38,8 @@ impl NoiseGate {
             release_ms: 120.0,
             range_db: 60.0,
             hold_ms: 20.0,
-            envelope: 0.0,
-            gain: 1.0,
+            envelope: EnvelopeFollower::new(0.0),
+            gain: EnvelopeFollower::new(1.0),
             hold_left: 0,
         }
     }
@@ -56,26 +57,21 @@ impl AudioEffect for NoiseGate {
         let sr = sample_rate.max(1) as f32;
         let open_amp = 10_f32.powf(self.threshold_db / 20.0);
         // Sample-rate-aware one-pole coefficients (attack/release time constants).
-        let env_atk = (-1.0 / (0.001 * sr)).exp(); // 1 ms envelope attack
-        let env_rel = (-1.0 / (0.050 * sr)).exp(); // 50 ms envelope release
-        let gain_atk = (-1.0 / ((self.attack_ms / 1000.0).max(1e-5) * sr)).exp();
-        let gain_rel = (-1.0 / ((self.release_ms / 1000.0).max(1e-5) * sr)).exp();
+        let env_atk = coeff_secs(0.001, sr); // 1 ms envelope attack
+        let env_rel = coeff_secs(0.050, sr); // 50 ms envelope release
+        let gain_atk = coeff_ms(self.attack_ms, sr);
+        let gain_rel = coeff_ms(self.release_ms, sr);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let hold_samples = (self.hold_ms / 1000.0 * sr) as u32;
         for sample in buffer.iter_mut() {
             let x = if sample.is_finite() { *sample } else { 0.0 };
             let abs = x.abs();
             // Peak envelope follower.
-            let ec = if abs > self.envelope {
-                env_atk
-            } else {
-                env_rel
-            };
-            self.envelope = ec * self.envelope + (1.0 - ec) * abs;
+            let envelope = self.envelope.attack_on_rise(abs, env_atk, env_rel);
 
             // Hold: refresh while above threshold; count down once below, so a
             // brief dip doesn't slam the gate shut (anti-chatter).
-            if self.envelope >= open_amp {
+            if envelope >= open_amp {
                 self.hold_left = hold_samples;
             } else if self.hold_left > 0 {
                 self.hold_left -= 1;
@@ -84,23 +80,18 @@ impl AudioEffect for NoiseGate {
             // Target gain: fully open above threshold / during hold, else a
             // downward-expansion reduction proportional to dB below threshold,
             // clamped to the `range` floor.
-            let target = if self.envelope >= open_amp || self.hold_left > 0 {
+            let target = if envelope >= open_amp || self.hold_left > 0 {
                 1.0
             } else {
-                let env_db = 20.0 * self.envelope.max(1e-9).log10();
+                let env_db = 20.0 * envelope.max(1e-9).log10();
                 let below = (self.threshold_db - env_db).max(0.0);
                 let reduction = (below * (self.ratio - 1.0)).min(self.range_db);
                 10_f32.powf(-reduction / 20.0)
             };
 
             // Smooth toward the target (fast when opening, slow when closing).
-            let gc = if target > self.gain {
-                gain_atk
-            } else {
-                gain_rel
-            };
-            self.gain = gc * self.gain + (1.0 - gc) * target;
-            *sample = x * self.gain;
+            let gain = self.gain.attack_on_rise(target, gain_atk, gain_rel);
+            *sample = x * gain;
         }
     }
 
@@ -123,7 +114,7 @@ impl AudioEffect for NoiseGate {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            self.gain = 1.0; // open when disabled so signal passes through
+            self.gain.reset(1.0); // open when disabled so signal passes through
         }
     }
 

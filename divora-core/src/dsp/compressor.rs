@@ -9,6 +9,7 @@
 //! gain-reduction (dB) domain, which is click-free and matches how
 //! hardware compressors behave.
 
+use super::envelope::{coeff_ms, EnvelopeFollower};
 use super::{AudioEffect, EffectKind};
 
 /// Soft-knee width in dB (fixed). Wide enough to be musical, narrow
@@ -23,7 +24,7 @@ pub struct Compressor {
     release_ms: f32,
     makeup_db: f32,
     /// Current gain reduction in dB (≤ 0), smoothed across samples.
-    env_db: f32,
+    env_db: EnvelopeFollower,
 }
 
 impl Compressor {
@@ -36,7 +37,7 @@ impl Compressor {
             attack_ms: 10.0,
             release_ms: 120.0,
             makeup_db: 0.0,
-            env_db: 0.0,
+            env_db: EnvelopeFollower::new(0.0),
         }
     }
 
@@ -73,9 +74,8 @@ impl AudioEffect for Compressor {
         let sr = sample_rate.max(1) as f32;
         // One-pole smoothing coefficients (computed per buffer, not per
         // sample — no allocation, cheap).
-        let smoothing = |ms: f32| (-1.0 / ((ms / 1000.0).max(1e-4) * sr)).exp();
-        let attack_coeff = smoothing(self.attack_ms);
-        let release_coeff = smoothing(self.release_ms);
+        let attack_coeff = coeff_ms(self.attack_ms, sr);
+        let release_coeff = coeff_ms(self.release_ms, sr);
         let makeup_lin = 10_f32.powf(self.makeup_db / 20.0);
 
         for sample in buffer.iter_mut() {
@@ -87,14 +87,11 @@ impl AudioEffect for Compressor {
 
             // Attack when more reduction is needed (gain dropping), release
             // when backing off. Both move env_db toward target_db.
-            let coeff = if target_db < self.env_db {
-                attack_coeff
-            } else {
-                release_coeff
-            };
-            self.env_db = coeff * self.env_db + (1.0 - coeff) * target_db;
+            let env_db = self
+                .env_db
+                .attack_on_fall(target_db, attack_coeff, release_coeff);
 
-            let gain = 10_f32.powf(self.env_db / 20.0) * makeup_lin;
+            let gain = 10_f32.powf(env_db / 20.0) * makeup_lin;
             let out = x * gain;
             *sample = if out.is_finite() { out } else { 0.0 };
         }
@@ -118,7 +115,7 @@ impl AudioEffect for Compressor {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            self.env_db = 0.0; // reset so a re-enable doesn't jump
+            self.env_db.reset(0.0); // reset so a re-enable doesn't jump
         }
     }
 

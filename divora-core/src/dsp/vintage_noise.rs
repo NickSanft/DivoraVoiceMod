@@ -10,6 +10,7 @@
 //! voice" to "real". **Run it LAST** — after the gate (which would otherwise
 //! re-silence the bed) and before the downstream loudness limiter.
 
+use super::envelope::{coeff_secs, EnvelopeFollower};
 use super::{AudioEffect, EffectKind};
 
 /// One-pole low-pass corner (Hz) for the "dark" end of the hiss colour.
@@ -32,7 +33,7 @@ pub struct VintageNoise {
     hiss_lp: f32,
     hum_phase: f32,
     crackle_env: f32,
-    duck_env: f32,
+    duck_env: EnvelopeFollower,
 }
 
 impl VintageNoise {
@@ -50,7 +51,7 @@ impl VintageNoise {
             hiss_lp: 0.0,
             hum_phase: 0.0,
             crackle_env: 0.0,
-            duck_env: 0.0,
+            duck_env: EnvelopeFollower::new(0.0),
         }
     }
 
@@ -90,8 +91,8 @@ impl AudioEffect for VintageNoise {
         let two_pi = 2.0 * std::f32::consts::PI;
         // Ducking follower: fast attack (catch speech), slow release (bed swells
         // back in the gaps).
-        let duck_atk = (-1.0 / (0.002 * sr)).exp();
-        let duck_rel = (-1.0 / (0.150 * sr)).exp();
+        let duck_atk = coeff_secs(0.002, sr);
+        let duck_rel = coeff_secs(0.150, sr);
         let hum_inc = self.hum_hz / sr; // cycles per sample
         let hiss_lp_c = (-two_pi * HISS_LP_HZ / sr).exp();
         let crackle_decay = (-1.0 / ((CRACKLE_DECAY_MS / 1000.0) * sr)).exp();
@@ -103,13 +104,8 @@ impl AudioEffect for VintageNoise {
 
             // Input-level follower → 0..1 duck gate.
             let lvl = x.abs();
-            let c = if lvl > self.duck_env {
-                duck_atk
-            } else {
-                duck_rel
-            };
-            self.duck_env = c * self.duck_env + (1.0 - c) * lvl;
-            let gate = (self.duck_env * DUCK_SENSITIVITY).min(1.0);
+            let duck = self.duck_env.attack_on_rise(lvl, duck_atk, duck_rel);
+            let gate = (duck * DUCK_SENSITIVITY).min(1.0);
             let bed_gain = 1.0 - self.duck * gate;
 
             // Hiss: white noise, blended dark↔bright by `tone`.
@@ -156,7 +152,7 @@ impl AudioEffect for VintageNoise {
         self.enabled = enabled;
         if !enabled {
             self.crackle_env = 0.0;
-            self.duck_env = 0.0;
+            self.duck_env.reset(0.0);
         }
     }
 

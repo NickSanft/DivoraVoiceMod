@@ -9,6 +9,7 @@
 
 use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 
+use super::envelope::{coeff_ms, EnvelopeFollower};
 use super::{AudioEffect, EffectKind};
 
 const Q: f32 = 0.707;
@@ -21,7 +22,7 @@ pub struct DeEsser {
     range_db: f32,
     hp: DirectForm1<f32>,
     /// Smoothed gain reduction (dB, ≤ 0) applied to the high band.
-    env_db: f32,
+    env_db: EnvelopeFollower,
     sample_rate: u32,
 }
 
@@ -35,7 +36,7 @@ impl DeEsser {
             threshold_db: -30.0,
             range_db: 12.0,
             hp: DirectForm1::<f32>::new(hp_coeffs(sr, 6000.0)),
-            env_db: 0.0,
+            env_db: EnvelopeFollower::new(0.0),
             sample_rate: sr,
         };
         d.rebuild();
@@ -75,9 +76,8 @@ impl AudioEffect for DeEsser {
         #[allow(clippy::cast_precision_loss)]
         let sr = sample_rate.max(1) as f32;
         // De-essing is fast: short attack, moderate release.
-        let smoothing = |ms: f32| (-1.0 / ((ms / 1000.0) * sr)).exp();
-        let attack_coeff = smoothing(1.0);
-        let release_coeff = smoothing(60.0);
+        let attack_coeff = coeff_ms(1.0, sr);
+        let release_coeff = coeff_ms(60.0, sr);
 
         for sample in buffer.iter_mut() {
             let x = if sample.is_finite() { *sample } else { 0.0 };
@@ -89,15 +89,12 @@ impl AudioEffect for DeEsser {
             let over = (level_db - self.threshold_db).max(0.0);
             let target_db = -over.min(self.range_db); // reduction, ≤ 0
 
-            let coeff = if target_db < self.env_db {
-                attack_coeff
-            } else {
-                release_coeff
-            };
-            self.env_db = coeff * self.env_db + (1.0 - coeff) * target_db;
+            let env_db = self
+                .env_db
+                .attack_on_fall(target_db, attack_coeff, release_coeff);
 
             // gain ∈ (0, 1]; subtract the attenuated fraction of the band.
-            let gain = 10_f32.powf(self.env_db / 20.0);
+            let gain = 10_f32.powf(env_db / 20.0);
             let out = x - high * (1.0 - gain);
             *sample = if out.is_finite() { out } else { 0.0 };
         }
@@ -122,7 +119,7 @@ impl AudioEffect for DeEsser {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            self.env_db = 0.0;
+            self.env_db.reset(0.0);
         }
     }
 

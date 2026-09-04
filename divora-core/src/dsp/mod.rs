@@ -27,6 +27,7 @@ mod deesser;
 mod denoiser;
 mod distortion;
 mod echo;
+mod envelope;
 mod eq;
 mod formant;
 mod gate;
