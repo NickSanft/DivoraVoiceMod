@@ -889,10 +889,8 @@ fn load_cloned_voice(voices_dir: &Path, id: &str) -> Option<ClonedVoice> {
     if bytes.len() != 256 * 4 {
         return None;
     }
-    let se = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let (quads, _tail) = bytes.as_chunks::<4>();
+    let se = quads.iter().copied().map(f32::from_le_bytes).collect();
     let base = meta.map_or_else(|| CLONE_BASE_VOICE.to_string(), |m| m.base);
     Some(ClonedVoice::OpenVoice { se, base })
 }

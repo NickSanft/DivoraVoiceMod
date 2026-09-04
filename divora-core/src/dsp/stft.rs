@@ -124,14 +124,10 @@ impl Stft {
     /// chain's `reset()` plumbing wires this in when the engine restarts.
     #[allow(dead_code)] // used by tests; not part of `AudioEffect::reset` yet
     pub fn reset(&mut self) {
-        for s in &mut self.in_ring {
-            *s = 0.0;
-        }
+        self.in_ring.fill(0.0);
         self.in_pos = 0;
         self.in_fill = 0;
-        for s in &mut self.out_ring {
-            *s = 0.0;
-        }
+        self.out_ring.fill(0.0);
         self.out_pos = 0;
     }
 

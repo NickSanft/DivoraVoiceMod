@@ -302,10 +302,8 @@ mod tests {
 
         // Strongest check: cosine vs the dumped Python embedding > 0.999.
         let bytes = std::fs::read(format!("{res}/_spike/accent/spkr/ref16k.emb.f32")).unwrap();
-        let py: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let (quads, _tail) = bytes.as_chunks::<4>();
+        let py: Vec<f32> = quads.iter().copied().map(f32::from_le_bytes).collect();
         assert_eq!(py.len(), 256);
         let cos = cosine(&emb, &py);
         assert!(cos > 0.999, "rust-vs-python embedding cosine {cos}");
