@@ -57,6 +57,7 @@ resolved `T` or a thrown string on the JS side.
 | `set_effect_enabled` | `index`, `enabled` | — |
 | `clear_effect_chain` | — | — |
 | `set_voice_model` | `index`, `path?` | — |
+| `set_reactive_config` | `config: ReactiveConfig` | — / v1.46.0 (one whole config; route targets outside the modulation whitelist are dropped, not rejected) |
 
 ### Presets
 
@@ -159,8 +160,13 @@ StreamInfo        { inputName, outputName, monitorName (nullable),
 EngineStatus      { running, monitoring, input: Levels, output: Levels,
                     dspLatencyMs, recording, loudnessGainDb }
 LevelUpdate       { input: Levels, output: Levels, running, monitoring,
-                    dspLatencyMs, recording, loudnessGainDb }
+                    dspLatencyMs, recording, loudnessGainDb,
+                    deviceLost, modEnv }        // modEnv v1.46.0, 0..1
 EffectSpec        { kind: EffectKindWire, enabled, params: {string: number} }
+ReactiveConfig    { enabled, intensity, floorDb, ceilDb,           // v1.46.0
+                    attackMs, holdMs, releaseMs,
+                    routes: ReactiveRouteSpec[] }
+ReactiveRouteSpec { kind: EffectKindWire, nth, key, base, depth }   // v1.46.0
 VoiceInfo         { id, name, path, sizeBytes }
 OnnxRuntimeStatus { runtimeAvailable, voicesDir }
 TtsVoiceInfo      { id, name, lang, installed }      // v1.17.0

@@ -4,6 +4,14 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- **Reactive effects — engine groundwork (not yet exposed in the UI).** The dry
+  microphone envelope can now drive effect parameters: raise your voice and the
+  routed parameter moves with it. Measured on the pre-effects signal so it can
+  never feed back on itself, with a whitelist restricting modulation to
+  parameters that are safe to move continuously. The controls land next.
+
 ## [1.45.0] — 2026-09-04 — Shared envelope follower (internal)
 
 ### Changed

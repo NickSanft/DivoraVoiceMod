@@ -34,6 +34,7 @@ mod gate;
 mod harmonizer;
 mod pitch;
 mod radio_bandpass;
+mod reactive;
 mod reverb;
 mod robot;
 mod stft;
@@ -55,6 +56,10 @@ pub use gate::NoiseGate;
 pub use harmonizer::Harmonizer;
 pub use pitch::PitchShift;
 pub use radio_bandpass::RadioBandpass;
+pub use reactive::{
+    mod_target_range, ModRoute, ReactiveConfig, ReactiveModulator, ReactiveRouteSpec,
+    ReactiveSource, ResolvedReactive, DEFAULT_CEIL_DB, DEFAULT_FLOOR_DB,
+};
 pub use reverb::Reverb;
 pub use robot::Robot;
 pub use tremolo::Tremolo;
@@ -285,6 +290,35 @@ impl EffectChain {
     #[must_use]
     pub fn kind_at(&self, index: usize) -> Option<EffectKind> {
         self.effects.get(index).map(|e| e.kind())
+    }
+
+    /// Index of the `nth` (0-based) occurrence of `kind`, if present.
+    ///
+    /// Used by reactive modulation, which addresses its targets by kind +
+    /// occurrence rather than raw index: `SetChain` rebuilds the whole chain
+    /// on every preset switch, and a drag-reorder shuffles positions, so a
+    /// stored index would silently start pointing at a different effect.
+    /// Resolving fresh each block is a scan of at most a couple of dozen
+    /// entries and cannot go stale.
+    #[must_use]
+    pub fn index_of_kind(&self, kind: EffectKind, nth: u8) -> Option<usize> {
+        self.effects
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind() == kind)
+            .nth(nth as usize)
+            .map(|(index, _)| index)
+    }
+
+    /// Set one parameter by index, without allocating.
+    ///
+    /// [`DspCommand::SetParam`] carries an owned `String`, so driving
+    /// modulation through the command channel would allocate per message and
+    /// free on the audio thread. This is the per-buffer path.
+    pub fn set_param_at(&mut self, index: usize, key: &str, value: f32) {
+        if let Some(effect) = self.effects.get_mut(index) {
+            effect.set_param(key, value);
+        }
     }
 
     pub fn clear(&mut self) {

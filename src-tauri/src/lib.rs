@@ -18,7 +18,7 @@ use divora_core::audio::{
     list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, Levels, StreamInfo,
     VirtualMicStatus,
 };
-use divora_core::dsp::{onnx_runtime_available, DspCommand, EffectSpec};
+use divora_core::dsp::{onnx_runtime_available, DspCommand, EffectSpec, ReactiveConfig};
 use divora_core::presets::{bundled_presets, Preset, PresetStore, PresetTag};
 use divora_core::soundboard::{
     decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
@@ -55,6 +55,9 @@ struct LevelUpdate {
     /// v1.39.0: true when device-loss auto-recovery gave up (engine stopped,
     /// no audio) — drives the "device lost — restart" banner.
     device_lost: bool,
+    /// v1.46.0: current reactive-modulation depth, 0..=1 (0 when the feature
+    /// is off). Drives the live envelope meter.
+    mod_env: f32,
 }
 
 /// One-shot status snapshot used by the frontend at startup and after
@@ -241,6 +244,17 @@ fn audio_engine_status(state: State<'_, AppState>) -> EngineStatus {
 #[tauri::command]
 fn set_effect_chain(state: State<'_, AppState>, specs: Vec<EffectSpec>) {
     state.engine.send_dsp(DspCommand::SetChain { specs });
+}
+
+/// v1.46.0: replace the whole reactive-modulation configuration.
+///
+/// Sent as one message rather than per-field setters so the audio thread can
+/// never observe a half-applied state. Routes naming a parameter outside the
+/// modulation whitelist are dropped in `divora-core` rather than rejected
+/// here, so a newer or older frontend cannot wedge the engine.
+#[tauri::command]
+fn set_reactive_config(state: State<'_, AppState>, config: ReactiveConfig) {
+    state.engine.send_reactive(config);
 }
 
 #[tauri::command]
@@ -1678,6 +1692,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
                 recording: engine.is_recording(),
                 loudness_gain_db: engine.loudness_gain_db(),
                 device_lost: engine.device_recovery_failed(),
+                mod_env: engine.reactive_depth(),
             };
             if app.emit("audio-levels", &payload).is_err() {
                 // App is shutting down (no receivers / window gone).
@@ -1950,6 +1965,7 @@ pub fn run() {
             set_loudness_target,
             audio_engine_status,
             set_effect_chain,
+            set_reactive_config,
             set_effect_param,
             set_effect_enabled,
             clear_effect_chain,
@@ -2160,6 +2176,7 @@ mod tests {
             recording: false,
             loudness_gain_db: 0.0,
             device_lost: false,
+            mod_env: 0.0,
         };
         assert_eq!(
             sorted_keys(&serde_json::to_value(&u).unwrap()),
@@ -2168,6 +2185,7 @@ mod tests {
                 "dspLatencyMs",
                 "input",
                 "loudnessGainDb",
+                "modEnv",
                 "monitoring",
                 "output",
                 "recording",

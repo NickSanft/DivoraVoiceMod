@@ -27,7 +27,7 @@ use super::loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS};
 use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
-use crate::dsp::{DspCommand, EffectChain};
+use crate::dsp::{DspCommand, EffectChain, ReactiveConfig, ReactiveModulator, ResolvedReactive};
 use crate::soundboard::{SoundboardCommand, SoundboardMixer};
 
 /// Capacity of the SPSC ring buffer used between input and output
@@ -76,6 +76,10 @@ enum Command {
     Stop,
     SetMonitor(bool),
     Dsp(DspCommand),
+    /// v1.46.0: replace the whole reactive-modulation configuration.
+    /// Sent as one message so the audio thread can never observe a
+    /// half-applied state (e.g. new routes against an old intensity).
+    Reactive(Box<ReactiveConfig>),
     Soundboard(SoundboardCommand),
     StartRecording {
         path: PathBuf,
@@ -213,6 +217,11 @@ impl AudioEngine {
         let _ = self.tx.send(Command::Dsp(cmd));
     }
 
+    /// v1.46.0: replace the reactive-modulation configuration.
+    pub fn send_reactive(&self, cfg: ReactiveConfig) {
+        let _ = self.tx.send(Command::Reactive(Box::new(cfg)));
+    }
+
     /// Send a soundboard command (play / stop / stop-all). Forwarded
     /// through the engine thread to the live output callback.
     pub fn send_soundboard(&self, cmd: SoundboardCommand) {
@@ -334,6 +343,13 @@ impl AudioEngine {
     pub fn dsp_latency_ms(&self) -> f32 {
         self.state.load_dsp_latency_ms()
     }
+
+    /// v1.46.0: current reactive-modulation depth, 0..=1. 0 when the
+    /// feature is off or the engine is stopped.
+    #[must_use]
+    pub fn reactive_depth(&self) -> f32 {
+        self.state.load_reactive_depth()
+    }
 }
 
 impl Default for AudioEngine {
@@ -365,6 +381,7 @@ struct StartedStreams {
     streams: RunningStreams,
     info: StreamInfo,
     dsp_tx: Sender<DspCommand>,
+    reactive_tx: Sender<ResolvedReactive>,
     sb_tx: SyncSender<SoundboardCommand>,
     recording_tx: Sender<RecordingCommand>,
     writer: JoinHandle<()>,
@@ -378,6 +395,7 @@ struct StartedStreams {
 fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<EngineState>) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<Sender<DspCommand>> = None;
+    let mut reactive_tx: Option<Sender<ResolvedReactive>> = None;
     let mut sb_tx: Option<SyncSender<SoundboardCommand>> = None;
     let mut recording_tx: Option<Sender<RecordingCommand>> = None;
     let mut writer: Option<JoinHandle<()>> = None;
@@ -393,6 +411,10 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
     // restore it — a rebuild constructs a fresh mixer at unity, which would
     // otherwise silently jump the user's chosen volume back to 100%.
     let mut last_master_gain: f32 = 1.0;
+    // v1.46.0: remember the reactive config for the same reason — a
+    // device-loss rebuild constructs a fresh modulator with no routes, which
+    // would silently switch the feature off mid-call.
+    let mut last_reactive = ReactiveConfig::default();
 
     // Tear down the current session's streams + recording writers.
     // Dropping a writer's `tx` disconnects its channel, which makes it
@@ -405,6 +427,7 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
             state.recording.store(false, Ordering::Release);
             state.reference_recording.store(false, Ordering::Release);
             drop(recording_tx.take());
+            drop(reactive_tx.take());
             drop(reference_tx.take());
             if let Some(h) = writer.take() {
                 let _ = h.join();
@@ -413,6 +436,9 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                 let _ = h.join();
             }
             state.running.store(false, Ordering::Release);
+            // The meter must not freeze at the last depth once the engine
+            // is down — `reactive_depth()` documents 0 when stopped.
+            state.store_reactive_depth(0.0);
         }};
     }
 
@@ -426,6 +452,7 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                 Ok(started) => {
                     state.running.store(true, Ordering::Release);
                     dsp_tx = Some(started.dsp_tx);
+                    reactive_tx = Some(started.reactive_tx);
                     sb_tx = Some(started.sb_tx);
                     recording_tx = Some(started.recording_tx);
                     writer = Some(started.writer);
@@ -436,6 +463,11 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                     // mixer so a rebuild doesn't reset the user's volume.
                     if let Some(tx) = &sb_tx {
                         let _ = tx.try_send(SoundboardCommand::SetMasterGain(last_master_gain));
+                    }
+                    // Same for reactive modulation: re-apply onto the fresh
+                    // modulator so a rebuild doesn't drop the routing.
+                    if let Some(tx) = &reactive_tx {
+                        let _ = tx.send(last_reactive.resolve());
                     }
                     Ok(started.info)
                 }
@@ -536,6 +568,15 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                 if let Some(tx) = &dsp_tx {
                     let _ = tx.send(dsp_cmd);
                 }
+            }
+            Command::Reactive(cfg) => {
+                // Resolve HERE, on the engine thread — the audio callback must
+                // not run the whitelist filter_map or drop the config's owned
+                // Strings. It receives a ready-made route table instead.
+                if let Some(tx) = &reactive_tx {
+                    let _ = tx.send(cfg.resolve());
+                }
+                last_reactive = *cfg;
             }
             Command::Soundboard(sb_cmd) => {
                 // Snoop the master gain so a device-loss rebuild can restore it
@@ -718,6 +759,7 @@ fn start_streams(
     let (reference_tx, reference_rx) = channel::<RecordingCommand>();
 
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
+    let (reactive_tx, reactive_rx) = channel::<ResolvedReactive>();
     let (sb_tx, sb_rx) = sync_channel::<SoundboardCommand>(SB_CHANNEL_CAPACITY);
 
     let input_stream = build_input_stream(
@@ -737,6 +779,7 @@ fn start_streams(
         consumer,
         state.clone(),
         dsp_rx,
+        reactive_rx,
         sb_rx,
         input_rate,
         output_rate,
@@ -813,6 +856,7 @@ fn start_streams(
         },
         info,
         dsp_tx,
+        reactive_tx,
         sb_tx,
         recording_tx,
         writer,
@@ -906,6 +950,7 @@ fn build_output_stream(
     mut consumer: RingConsumer,
     state: Arc<EngineState>,
     dsp_rx: Receiver<DspCommand>,
+    reactive_rx: Receiver<ResolvedReactive>,
     sb_rx: Receiver<SoundboardCommand>,
     input_rate: u32,
     output_rate: u32,
@@ -947,6 +992,10 @@ fn build_output_stream(
 
     let mut meter = LevelMeter::new();
     let mut chain = EffectChain::new();
+    // v1.46.0: reactive modulation lives BESIDE the chain, never inside it —
+    // `SetChain` replaces the chain wholesale on every preset switch, which
+    // would invalidate any routing stored within it.
+    let mut modulator = ReactiveModulator::new();
     let mut soundboard = SoundboardMixer::new();
     // v1.7.0: post-chain output loudness normalizer (auto-gain + limiter).
     let mut loudness = LoudnessNormalizer::new();
@@ -971,6 +1020,14 @@ fn build_output_stream(
                 }
                 // Drain any pending DSP + soundboard commands before
                 // processing audio.
+                // v1.46.0: reactive config, drained BEFORE the DSP drain.
+                // `configure` restores the outgoing routes to their authored
+                // values, and those bases were authored against the CURRENT
+                // chain — so the restore has to land before a `SetChain` in the
+                // same buffer replaces it.
+                while let Ok(cfg) = reactive_rx.try_recv() {
+                    modulator.configure(&cfg, &mut chain);
+                }
                 while let Ok(cmd) = dsp_rx.try_recv() {
                     chain.apply(cmd);
                 }
@@ -1045,12 +1102,14 @@ fn build_output_stream(
                     &mut mono[..native_frames],
                     &mut sb[..native_frames],
                     &mut chain,
+                    &mut modulator,
                     &mut loudness,
                     &mut soundboard,
                     input_rate,
                 );
                 // Publish the makeup gain for the UI "it's working" readout.
                 state_for_callback.store_loudness_gain_db(loudness.gain_db());
+                state_for_callback.store_reactive_depth(modulator.depth());
 
                 // Phase 13: tap the processed, input-rate mono into the
                 // monitor ring (if a monitor device is active) BEFORE this
@@ -1293,10 +1352,18 @@ fn mix_voice_and_soundboard(
     mono: &mut [f32],
     soundboard_out: &mut [f32],
     chain: &mut EffectChain,
+    modulator: &mut ReactiveModulator,
     loudness: &mut LoudnessNormalizer,
     soundboard: &mut SoundboardMixer,
     sample_rate: u32,
 ) {
+    // v1.46.0: `mono` is the DRY, pre-effects mic signal at exactly this point
+    // — the only place on this thread where that is true. Measuring here is
+    // what makes the modulation feedback-free: following the chain's own
+    // output would mean louder -> more drive -> louder. It must also run
+    // before `loudness`, whose entire job is removing the level variation the
+    // follower needs.
+    modulator.apply(mono, chain, sample_rate);
     chain.process(mono, sample_rate);
     loudness.process(mono, sample_rate);
     soundboard.mix_into(soundboard_out, sample_rate);
@@ -1404,7 +1471,7 @@ mod tests {
         drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine,
         LoudnessNormalizer, StreamInfo, MAX_FRAMES_PER_CALLBACK, RING_BUFFER_FRAMES,
     };
-    use crate::dsp::EffectChain;
+    use crate::dsp::{EffectChain, ReactiveModulator};
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
     use ringbuf::traits::{Producer, Split};
     use ringbuf::HeapRb;
@@ -1608,10 +1675,13 @@ mod tests {
         let mut sb_out = vec![0.0_f32; 480];
         // Loudness normalizer defaults to disabled → bit-exact passthrough.
         let mut loudness = LoudnessNormalizer::new();
+        // Disabled by default, so it is inert here.
+        let mut modulator = ReactiveModulator::new();
         mix_voice_and_soundboard(
             &mut mono,
             &mut sb_out,
             &mut chain,
+            &mut modulator,
             &mut loudness,
             &mut sb,
             48_000,
@@ -1642,10 +1712,13 @@ mod tests {
         let mut mono = vec![0.10_f32; 480];
         let mut sb_out = vec![0.0_f32; 480];
         let mut loudness = LoudnessNormalizer::new();
+        // Disabled by default, so it is inert here.
+        let mut modulator = ReactiveModulator::new();
         mix_voice_and_soundboard(
             &mut mono,
             &mut sb_out,
             &mut chain,
+            &mut modulator,
             &mut loudness,
             &mut sb,
             48_000,
@@ -1657,5 +1730,344 @@ mod tests {
             );
             assert!(s.abs() < 1e-9, "no clip → empty soundboard buffer, got {s}");
         }
+    }
+    // ---- v1.46.0: reactive modulation wiring ----
+
+    /// A phase-continuous 440 Hz tone at `amp`. Must be AC: the modulator's
+    /// detector high-passes at 110 Hz, so a DC buffer reads as silence (which
+    /// is correct, and makes a constant-value test signal useless here).
+    struct Tone {
+        phase: f32,
+    }
+
+    impl Tone {
+        fn new() -> Self {
+            Self { phase: 0.0 }
+        }
+        fn block(&mut self, amp: f32, frames: usize) -> Vec<f32> {
+            let inc = std::f32::consts::TAU * 440.0 / 48_000.0;
+            (0..frames)
+                .map(|_| {
+                    self.phase = (self.phase + inc) % std::f32::consts::TAU;
+                    amp * self.phase.sin()
+                })
+                .collect()
+        }
+    }
+
+    /// Build a chain of one Distortion so a route has something to target.
+    fn distortion_chain(drive: f32) -> EffectChain {
+        use crate::dsp::{EffectKind, EffectSpec};
+        let mut params = std::collections::HashMap::new();
+        params.insert("drive".to_string(), drive);
+        EffectChain::from_specs(&[EffectSpec {
+            kind: EffectKind::Distortion,
+            enabled: true,
+            params,
+        }])
+    }
+
+    fn rage_config(enabled: bool, base: f32) -> crate::dsp::ResolvedReactive {
+        use crate::dsp::{EffectKind, ReactiveConfig, ReactiveRouteSpec};
+        ReactiveConfig {
+            enabled,
+            intensity: 1.0,
+            routes: vec![ReactiveRouteSpec {
+                kind: EffectKind::Distortion,
+                nth: 0,
+                key: "drive".to_string(),
+                base,
+                depth: 45.0,
+            }],
+            ..ReactiveConfig::default()
+        }
+        .resolve()
+    }
+
+    /// The load-bearing property: the modulator observes the DRY buffer, so
+    /// what the chain does to the signal cannot feed back into the modulation.
+    ///
+    /// Two things this test learned the hard way. It must drive
+    /// `mix_voice_and_soundboard`, because the call order there IS the property
+    /// under test. And the two chains must differ in a way that survives the
+    /// comparison: an earlier version used distortion at drive 10 vs 100, but
+    /// `tanh` saturates both to a similar level, so inverting the production
+    /// order still passed. Comparing a PASSTHROUGH chain against a heavily
+    /// saturating one makes the observed levels differ enormously if the
+    /// modulator ever sees post-chain audio.
+    ///
+    /// Neither modulator carries routes: this isolates what they OBSERVE from
+    /// what they write.
+    #[test]
+    fn modulation_source_is_dry_so_it_cannot_self_feed() {
+        use crate::dsp::{ReactiveConfig, ReactiveModulator};
+        let observe_only = ReactiveConfig {
+            enabled: true,
+            intensity: 1.0,
+            routes: vec![],
+            ..ReactiveConfig::default()
+        }
+        .resolve();
+
+        let mut passthrough = EffectChain::new();
+        let mut saturating = distortion_chain(90.0);
+        let mut m_dry = ReactiveModulator::new();
+        let mut m_hot = ReactiveModulator::new();
+        m_dry.configure(&observe_only, &mut passthrough);
+        m_hot.configure(&observe_only, &mut saturating);
+
+        let mut loud1 = LoudnessNormalizer::new();
+        let mut loud2 = LoudnessNormalizer::new();
+        let mut sb1 = SoundboardMixer::new();
+        let mut sb2 = SoundboardMixer::new();
+
+        let mut t1 = Tone::new();
+        let mut t2 = Tone::new();
+        for _ in 0..60 {
+            let mut a = t1.block(0.15, 480);
+            let mut b = t2.block(0.15, 480);
+            let mut o1 = vec![0.0_f32; 480];
+            let mut o2 = vec![0.0_f32; 480];
+            mix_voice_and_soundboard(
+                &mut a,
+                &mut o1,
+                &mut passthrough,
+                &mut m_dry,
+                &mut loud1,
+                &mut sb1,
+                48_000,
+            );
+            mix_voice_and_soundboard(
+                &mut b,
+                &mut o2,
+                &mut saturating,
+                &mut m_hot,
+                &mut loud2,
+                &mut sb2,
+                48_000,
+            );
+        }
+
+        // Must actually be modulating, or this compares two zeros and would
+        // pass with the feature entirely broken.
+        assert!(
+            m_dry.depth() > 0.1 && m_dry.depth() < 0.99,
+            "test signal must land inside the window, got {}",
+            m_dry.depth()
+        );
+        assert!(
+            (m_dry.depth() - m_hot.depth()).abs() < 1e-6,
+            "depth must follow the DRY input only — a saturating chain must not \
+             raise it (passthrough {}, saturating {})",
+            m_dry.depth(),
+            m_hot.depth()
+        );
+    }
+
+    /// Switching the feature off must put every routed parameter back to its
+    /// authored value, not leave it frozen mid-sweep.
+    #[test]
+    fn disabling_restores_the_authored_base() {
+        use crate::dsp::ReactiveModulator;
+        let mut chain = distortion_chain(10.0);
+        let mut m = ReactiveModulator::new();
+        m.configure(&rage_config(true, 10.0), &mut chain);
+
+        // Drive it loud so the parameter is well away from its base.
+        let mut tone = Tone::new();
+        for _ in 0..80 {
+            let buf = tone.block(0.4, 480);
+            m.apply(&buf, &mut chain, 48_000);
+        }
+        assert!(m.depth() > 0.5, "should be modulating, got {}", m.depth());
+
+        // Disable, then run one more block so the restore fires.
+        m.configure(&rage_config(false, 10.0), &mut chain);
+        let buf = tone.block(0.4, 480);
+        m.apply(&buf, &mut chain, 48_000);
+
+        // Assert the PARAMETER came back, not merely that depth reads zero.
+        // `configure` zeroes depth by itself, so a depth-only assertion stays
+        // green even with `restore_bases` deleted entirely. `AudioEffect` has
+        // no getter, so compare behaviour against a pristine chain.
+        assert!(
+            chains_agree(&mut chain, &mut distortion_chain(10.0)),
+            "disabling must restore the authored drive"
+        );
+    }
+
+    /// Push a ramp through both chains and report whether they behave
+    /// identically — the only way to observe a parameter, since effects expose
+    /// no getters.
+    fn chains_agree(a: &mut EffectChain, b: &mut EffectChain) -> bool {
+        let mut pa = vec![0.0_f32; 64];
+        let mut pb = vec![0.0_f32; 64];
+        for (i, (x, y)) in pa.iter_mut().zip(pb.iter_mut()).enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let v = ((i as f32) / 32.0 - 1.0) * 0.5;
+            *x = v;
+            *y = v;
+        }
+        a.process(&mut pa, 48_000);
+        b.process(&mut pb, 48_000);
+        let diff: f32 = pa.iter().zip(&pb).map(|(x, y)| (x - y).abs()).sum();
+        diff < 1e-4
+    }
+
+    /// Re-pointing a route at a different parameter must release the old one.
+    /// `restore_bases` can only iterate the routes it currently holds, so the
+    /// outgoing table has to be restored BEFORE it is replaced — otherwise the
+    /// abandoned target keeps whatever the modulation last wrote, forever.
+    #[test]
+    fn repointing_a_route_releases_the_previous_target() {
+        use crate::dsp::{EffectKind, ReactiveConfig, ReactiveModulator, ReactiveRouteSpec};
+        let mut chain = distortion_chain(10.0);
+        let mut m = ReactiveModulator::new();
+        m.configure(&rage_config(true, 10.0), &mut chain);
+
+        let mut tone = Tone::new();
+        for _ in 0..80 {
+            let buf = tone.block(0.4, 480);
+            m.apply(&buf, &mut chain, 48_000);
+        }
+        assert!(m.depth() > 0.5, "should be modulating, got {}", m.depth());
+
+        // Re-point at Reverb.mix; Distortion.drive must return to 10.
+        let repointed = ReactiveConfig {
+            enabled: true,
+            intensity: 1.0,
+            routes: vec![ReactiveRouteSpec {
+                kind: EffectKind::Reverb,
+                nth: 0,
+                key: "mix".to_string(),
+                base: 20.0,
+                depth: 30.0,
+            }],
+            ..ReactiveConfig::default()
+        }
+        .resolve();
+        m.configure(&repointed, &mut chain);
+
+        assert!(
+            chains_agree(&mut chain, &mut distortion_chain(10.0)),
+            "re-pointing must release the old target"
+        );
+    }
+
+    /// Disabling by clearing the route list must still restore. A UI turning
+    /// the panel off may plausibly send `{enabled: false, routes: []}`, which
+    /// leaves `restore_bases` nothing to iterate unless the outgoing table is
+    /// flushed first.
+    #[test]
+    fn disabling_with_an_empty_route_list_still_restores() {
+        use crate::dsp::{ReactiveConfig, ReactiveModulator};
+        let mut chain = distortion_chain(10.0);
+        let mut m = ReactiveModulator::new();
+        m.configure(&rage_config(true, 10.0), &mut chain);
+
+        let mut tone = Tone::new();
+        for _ in 0..80 {
+            let buf = tone.block(0.4, 480);
+            m.apply(&buf, &mut chain, 48_000);
+        }
+        assert!(m.depth() > 0.5, "should be modulating, got {}", m.depth());
+
+        let cleared = ReactiveConfig {
+            enabled: false,
+            routes: vec![],
+            ..ReactiveConfig::default()
+        }
+        .resolve();
+        m.configure(&cleared, &mut chain);
+
+        assert!(
+            chains_agree(&mut chain, &mut distortion_chain(10.0)),
+            "clearing the routes must still restore the authored drive"
+        );
+    }
+
+    /// A buggy or hostile client cannot poison the audio path with an absurd
+    /// depth: `1e39` arrives from JSON as `f32::INFINITY`, and at rest
+    /// `inf.mul_add(0.0, base)` is NaN — which would propagate to the device.
+    #[test]
+    fn an_absurd_depth_cannot_produce_nan() {
+        use crate::dsp::{EffectKind, ReactiveConfig, ReactiveRouteSpec};
+        let cfg = ReactiveConfig {
+            enabled: true,
+            routes: vec![ReactiveRouteSpec {
+                kind: EffectKind::Distortion,
+                nth: 0,
+                key: "drive".to_string(),
+                base: 10.0,
+                // What a JSON `1e39` actually becomes after the f64 -> f32
+                // narrowing serde performs (rustc rejects the literal itself).
+                depth: f32::INFINITY,
+            }],
+            ..ReactiveConfig::default()
+        }
+        .resolve();
+        assert_eq!(cfg.routes.len(), 1);
+        for shaped in [0.0_f32, 0.5, 1.0] {
+            let v = cfg.routes[0].value_at(shaped);
+            assert!(v.is_finite(), "value_at({shaped}) must be finite, got {v}");
+        }
+    }
+
+    /// A route naming a parameter the whitelist does not allow is dropped, so
+    /// a stale or hostile config cannot reach a click-prone parameter.
+    #[test]
+    fn routes_outside_the_whitelist_are_dropped() {
+        use crate::dsp::{EffectKind, ReactiveConfig, ReactiveRouteSpec};
+        let cfg = ReactiveConfig {
+            enabled: true,
+            routes: vec![
+                // Allowed.
+                ReactiveRouteSpec {
+                    kind: EffectKind::Distortion,
+                    nth: 0,
+                    key: "drive".to_string(),
+                    base: 10.0,
+                    depth: 20.0,
+                },
+                // Delay-time: moving it jumps the read head. Never routable.
+                ReactiveRouteSpec {
+                    kind: EffectKind::Echo,
+                    nth: 0,
+                    key: "time".to_string(),
+                    base: 100.0,
+                    depth: 50.0,
+                },
+                // Filter frequency: rebuilds stateful biquads. Never routable.
+                ReactiveRouteSpec {
+                    kind: EffectKind::Eq,
+                    nth: 0,
+                    key: "low".to_string(),
+                    base: 0.0,
+                    depth: 6.0,
+                },
+            ],
+            ..ReactiveConfig::default()
+        };
+        let resolved = cfg.resolve_routes();
+        assert_eq!(resolved.len(), 1, "only the whitelisted route survives");
+        assert_eq!(resolved[0].key, "drive");
+    }
+
+    /// Routes address targets by kind + occurrence, so reordering the chain
+    /// re-resolves rather than pointing at whatever now sits at an old index.
+    #[test]
+    fn routes_follow_the_effect_across_a_reorder() {
+        use crate::dsp::{EffectKind, EffectSpec};
+        let spec = |kind: EffectKind| EffectSpec {
+            kind,
+            enabled: true,
+            params: std::collections::HashMap::new(),
+        };
+        let a = EffectChain::from_specs(&[spec(EffectKind::Reverb), spec(EffectKind::Distortion)]);
+        let b = EffectChain::from_specs(&[spec(EffectKind::Distortion), spec(EffectKind::Reverb)]);
+        assert_eq!(a.index_of_kind(EffectKind::Distortion, 0), Some(1));
+        assert_eq!(b.index_of_kind(EffectKind::Distortion, 0), Some(0));
+        // A kind that isn't present resolves to nothing rather than index 0.
+        assert_eq!(a.index_of_kind(EffectKind::Echo, 0), None);
     }
 }

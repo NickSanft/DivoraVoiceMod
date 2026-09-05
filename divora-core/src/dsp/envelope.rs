@@ -69,6 +69,15 @@ impl EnvelopeFollower {
         Self { value: initial }
     }
 
+    /// The current smoothed value, without advancing. Needed by callers that
+    /// map the envelope to something else on a slower cadence than they feed
+    /// it (see `dsp::reactive`, which accumulates per sample but maps once
+    /// per block).
+    #[must_use]
+    pub(crate) const fn value(&self) -> f32 {
+        self.value
+    }
+
     /// Force the stored value — used when an effect is disabled so a
     /// re-enable doesn't jump from stale state.
     pub(crate) const fn reset(&mut self, value: f32) {

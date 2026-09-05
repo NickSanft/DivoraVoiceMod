@@ -49,6 +49,11 @@ pub struct EngineState {
     /// Phase 14: latency ADDED by the active DSP chain, in milliseconds
     /// (f32 bit pattern). Written by the output callback each buffer.
     pub dsp_latency_ms_bits: AtomicU32,
+    /// v1.46.0: current reactive-modulation depth, 0..=1 (f32 bit pattern).
+    /// Written by the output callback each buffer; drives the UI meter.
+    /// Rests at 0.0, which is also the correct value when the feature is
+    /// off, so the derived `Default` needs no special-casing here.
+    pub reactive_depth_bits: AtomicU32,
     /// v1.6.0: gain applied to the monitor ("hear yourself") stream
     /// (f32 bit pattern). 1.0 = unity. Set from the UI; read by the
     /// monitor callback. `Default` leaves this 0.0, so `AudioEngine::new`
@@ -104,6 +109,16 @@ impl EngineState {
     #[must_use]
     pub fn load_dsp_latency_ms(&self) -> f32 {
         f32::from_bits(self.dsp_latency_ms_bits.load(Ordering::Acquire))
+    }
+
+    pub fn store_reactive_depth(&self, depth: f32) {
+        self.reactive_depth_bits
+            .store(depth.to_bits(), Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn load_reactive_depth(&self) -> f32 {
+        f32::from_bits(self.reactive_depth_bits.load(Ordering::Acquire))
     }
 
     pub fn store_monitor_gain(&self, gain: f32) {
