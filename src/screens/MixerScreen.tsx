@@ -20,6 +20,10 @@ import { SparkLayer } from "../components/SparkLayer";
 import { SpellCircle } from "../components/SpellCircle";
 import { Toggle } from "../components/Toggle";
 import { statusMeta } from "../shell/statusMeta";
+import {
+  REACTIVE_CEIL_DB,
+  REACTIVE_FLOOR_DB,
+} from "../data/reactive";
 import { useApp } from "../stores/app";
 import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
@@ -255,6 +259,7 @@ function RightRail(): JSX.Element {
       <VoiceStatusCard />
       <PushToModulateCard />
       <MonitorCard />
+      <ReactiveCard />
       <LoudnessCard />
       <RecordCard />
       <Inspector />
@@ -484,6 +489,187 @@ function MonitorCard(): JSX.Element {
           {pct()}%
         </span>
       </div>
+    </div>
+  );
+}
+
+// v1.46.0: reactive effects — the dry voice envelope drives the chain, so
+// raising your voice hardens the character ("Rage": drive, plus a little
+// reverb). Global and post-preset like LoudnessCard, not a per-preset effect.
+//
+// The live envelope strip is the important control here, not decoration: the
+// feature's real failure mode is not being too weak, it's reading as "my voice
+// is drifting on its own". Showing exactly what the follower hears, next to
+// the window it maps onto, makes every parameter move attributable.
+function ReactiveCard(): JSX.Element {
+  const app = useApp();
+  const on = (): boolean => app.reactiveEnabled();
+  const depth = (): number => (on() ? app.modEnv() : 0);
+  const pct = (): number => Math.round(Math.min(1, Math.max(0, depth())) * 100);
+
+  return (
+    <div
+      class="card"
+      style={{
+        padding: "var(--s4)",
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+            color: "var(--text-mid)",
+          }}
+        >
+          <Sigil name="bolt" size={20} style={{ color: "var(--indigo)" }} />
+          <div>
+            <div style={{ "font-size": "var(--t-sm)", "font-weight": 600 }}>
+              Reactive
+            </div>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+              Raise your voice, harden the character
+            </div>
+          </div>
+        </div>
+        <Toggle
+          on={on()}
+          onChange={(next) => app.setReactiveEnabled(next)}
+          ariaLabel="Reactive effects"
+        />
+      </div>
+
+      {/* The guardrail: enabling this with nothing to drive would look broken.
+          Say so instead of silently doing nothing. */}
+      {/* The live region itself is always mounted and only its CONTENT is
+          toggled — a region inserted together with its text is commonly missed
+          by screen readers. */}
+      <div role="status" aria-live="polite">
+        <Show when={on() && !app.reactiveHasTarget()}>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s2)",
+              "font-size": "var(--t-xs)",
+              color: "var(--text-mid)",
+              background: "var(--surface-2)",
+              border: "1px solid var(--line)",
+              "border-radius": "var(--r-sm)",
+              padding: "var(--s2) var(--s3)",
+            }}
+          >
+            <Sigil name="info" size={14} />
+            <span>
+              This preset has no Distortion to drive — add one in Presets, or
+              switch to a voice that uses it.
+            </span>
+          </div>
+        </Show>
+      </div>
+
+      {/* Intensity: the single control. Scales every route's depth. */}
+      <div style={{ display: "flex", "align-items": "center", gap: "var(--s3)" }}>
+        <span class="eyebrow" style={{ color: "var(--text-lo)", "flex-shrink": 0 }}>
+          Intensity
+        </span>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          step="5"
+          value={app.reactiveIntensity()}
+          disabled={!on()}
+          onInput={(e) =>
+            app.setReactiveIntensity(parseFloat(e.currentTarget.value))
+          }
+          aria-label="Reactive intensity"
+          style={{ flex: 1, opacity: on() ? 1 : 0.5 }}
+        />
+        <span
+          class="tnum"
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+            width: "52px",
+            "text-align": "right",
+          }}
+        >
+          {app.reactiveIntensity()}%
+        </span>
+      </div>
+
+      {/* Live envelope strip. The fill is what the follower currently hears,
+          mapped across the response window — so a user calibrates by talking
+          rather than by reasoning about dBFS. */}
+      <Show when={on() && app.engineRunning()}>
+        <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              "justify-content": "space-between",
+              "font-size": "var(--t-xs)",
+              color: "var(--text-lo)",
+            }}
+          >
+            <span class="eyebrow">Envelope</span>
+            <span class="tnum" style={{ color: "var(--indigo)" }}>
+              {pct()}%
+            </span>
+          </div>
+          <div
+            role="meter"
+            aria-label="Reactive envelope"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={pct()}
+            style={{
+              position: "relative",
+              height: "8px",
+              "border-radius": "999px",
+              background: "var(--surface-2)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                position: "absolute",
+                inset: "0 auto 0 0",
+                width: `${pct()}%`,
+                background: "var(--indigo)",
+                "border-radius": "999px",
+                // Cosmetic only — the follower already smooths the value; this
+                // just keeps the 30 Hz event cadence from looking steppy.
+                transition: "width 90ms linear",
+              }}
+            />
+          </div>
+          <div
+            style={{
+              display: "flex",
+              "justify-content": "space-between",
+              "font-size": "var(--t-xs)",
+              color: "var(--text-lo)",
+            }}
+          >
+            <span class="tnum">{REACTIVE_FLOOR_DB} dB</span>
+            <span>quiet → shout</span>
+            <span class="tnum">{REACTIVE_CEIL_DB} dB</span>
+          </div>
+        </div>
+      </Show>
     </div>
   );
 }

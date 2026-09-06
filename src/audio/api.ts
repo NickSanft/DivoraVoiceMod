@@ -62,6 +62,9 @@ export interface LevelUpdate {
   /** v1.39.0: true when device-loss auto-recovery gave up (engine stopped, no
    *  audio) — drives the "device lost — restart" banner. */
   deviceLost: boolean;
+  /** v1.46.0: current reactive-modulation depth, 0..1 (0 when the feature is
+   *  off or the engine is stopped). Drives the live envelope meter. */
+  modEnv: number;
 }
 
 export async function listInputDevices(): Promise<DeviceInfo[]> {
@@ -164,6 +167,47 @@ export interface EffectSpec {
 
 export async function setEffectChain(specs: EffectSpec[]): Promise<void> {
   await invoke("set_effect_chain", { specs });
+}
+
+/**
+ * v1.46.0: one modulation route — the dry-voice envelope moves `key` on the
+ * `nth` occurrence of `kind`, away from the preset-authored `base`.
+ */
+export interface ReactiveRouteSpec {
+  kind: EffectKindWire;
+  /** Which occurrence of `kind` in the chain (0 = the first). */
+  nth: number;
+  key: string;
+  /** The authored value the modulation offsets from. */
+  base: number;
+  /** Signed: negative moves the parameter down as the voice rises. */
+  depth: number;
+}
+
+/**
+ * v1.46.0: the whole reactive-modulation configuration.
+ *
+ * Sent as one message rather than per-field setters, so the audio thread can
+ * never see a half-applied state. Routes naming a parameter outside the
+ * backend's modulation whitelist are dropped rather than rejected.
+ */
+export interface ReactiveConfig {
+  enabled: boolean;
+  /** Master scale over every route's depth, 0..1. */
+  intensity: number;
+  floorDb: number;
+  ceilDb: number;
+  attackMs: number;
+  holdMs: number;
+  releaseMs: number;
+  routes: ReactiveRouteSpec[];
+}
+
+/** v1.46.0: replace the reactive-modulation configuration. */
+export async function setReactiveConfig(
+  config: ReactiveConfig,
+): Promise<void> {
+  await invoke("set_reactive_config", { config });
 }
 
 export async function setEffectParam(

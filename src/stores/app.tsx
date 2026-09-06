@@ -63,6 +63,7 @@ import {
   setLoudnessEnabled as setLoudnessEnabledCmd,
   setLoudnessTarget as setLoudnessTargetCmd,
   setEffectChain as setEffectChainCmd,
+  setReactiveConfig as setReactiveConfigCmd,
   setEffectEnabled as setEffectEnabledCmd,
   setEffectParam as setEffectParamCmd,
   setSoundboardMasterGain as setSoundboardMasterGainCmd,
@@ -95,6 +96,17 @@ import {
   type WirePreset,
 } from "../audio/api";
 import {
+  paramDefault,
+  RAGE_PRIMARY,
+  RAGE_TARGETS,
+  REACTIVE_ATTACK_MS,
+  REACTIVE_CEIL_DB,
+  REACTIVE_DEFAULT_INTENSITY,
+  REACTIVE_FLOOR_DB,
+  REACTIVE_HOLD_MS,
+  REACTIVE_RELEASE_MS,
+} from "../data/reactive";
+import {
   computeCalibration,
   type CalibrationResult,
 } from "../audio/calibration";
@@ -105,6 +117,7 @@ import {
   recognize as recognizeUnistroke,
   type UnistrokeTemplate,
 } from "../data/unistroke";
+import type { ReactiveConfig, ReactiveRouteSpec } from "../audio/api";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
@@ -189,6 +202,11 @@ export interface AbSnapshots {
 export type HotkeyAction = "ptm" | "panic" | "monitor";
 
 /** localStorage keys for Phase 8 persistence (tile metadata + recent folders). */
+/** Reactive intensity is a 0..100 percentage everywhere in the UI. */
+function clampIntensity(pct: number): number {
+  return Math.min(100, Math.max(0, Math.round(pct)));
+}
+
 const STORAGE_KEYS = {
   tileColors: "divora.tileColors",
   tileOrder: "divora.tileOrder",
@@ -213,6 +231,7 @@ const STORAGE_KEYS = {
   glyphBindings: "divora.glyphBindings",
   customGlyphs: "divora.customGlyphs",
   overlay: "divora.overlay",
+  reactive: "divora.reactive",
   ttsVoice: "divora.ttsVoice",
   ttsVolume: "divora.ttsVolume",
   ttsPreviewOnly: "divora.ttsPreviewOnly",
@@ -390,6 +409,21 @@ export interface AppState {
    *  no audio) — drives the "device lost — restart" banner. */
   deviceLost: () => boolean;
   setDeviceLost: Setter<boolean>;
+  /** v1.46.0: live reactive-modulation depth, 0..1, from the audio thread. */
+  modEnv: () => number;
+  setModEnv: Setter<number>;
+  /** v1.46.0: whether reactive effects are driving the chain. */
+  reactiveEnabled: () => boolean;
+  setReactiveEnabled: (on: boolean) => void;
+  /** v1.46.0: master depth scale, 0..100. */
+  reactiveIntensity: () => number;
+  setReactiveIntensity: (pct: number) => void;
+  /**
+   * v1.46.0: whether the active chain contains the effect "Rage" drives.
+   * False means enabling it would do nothing audible, so the UI offers to add
+   * one rather than silently having no effect.
+   */
+  reactiveHasTarget: () => boolean;
   /** Phase 16: full path of the most recent recording (for the hint). */
   recordingPath: () => string | null;
 
@@ -964,6 +998,118 @@ export function createAppState(): AppState {
   // v1.39.0: true when the backend's device-loss auto-recovery gave up — the
   // engine is stopped with no audio. Confirmed by the ~30 Hz level event.
   const [deviceLost, setDeviceLost] = createSignal(false);
+
+  // ---- v1.46.0: reactive effects ----
+  const [modEnv, setModEnv] = createSignal(0);
+  const persistedReactive = loadJson<{ enabled: boolean; intensity: number }>(
+    STORAGE_KEYS.reactive,
+    { enabled: false, intensity: REACTIVE_DEFAULT_INTENSITY },
+  );
+  const [reactiveEnabled, setReactiveEnabledRaw] = createSignal(
+    !!persistedReactive.enabled,
+  );
+  const [reactiveIntensity, setReactiveIntensityRaw] = createSignal(
+    // Clamp on load as well as on write — a hand-edited or corrupt
+    // localStorage value would otherwise render as "900%" beside a slider
+    // pegged at its maximum.
+    clampIntensity(
+      typeof persistedReactive.intensity === "number"
+        ? persistedReactive.intensity
+        : REACTIVE_DEFAULT_INTENSITY,
+    ),
+  );
+
+  const reactiveHasTarget = (): boolean =>
+    chain().some((e) => e.id === RAGE_PRIMARY && e.enabled);
+
+  /**
+   * Build the wire routes from the CURRENT chain, reading each target's
+   * authored value as the base the modulation offsets from.
+   *
+   * Deriving them here — rather than storing bases — is what keeps them
+   * correct across a preset switch: the backend addresses targets by kind and
+   * offsets from whatever base it was handed, so a stale base would make the
+   * modulation push the new preset away from the OLD preset's authored value.
+   */
+  const reactiveRoutes = (): ReactiveRouteSpec[] => {
+    const entries = chain();
+    return RAGE_TARGETS.flatMap((t) => {
+      // Find the first ENABLED entry of this kind, but report its occurrence
+      // index among ALL entries of the kind — the backend's `index_of_kind`
+      // counts every occurrence, enabled or not. Reporting 0 unconditionally
+      // would target a disabled duplicate sitting earlier in the chain.
+      let seen = 0;
+      for (const entry of entries) {
+        if (entry.id !== t.id) continue;
+        if (entry.enabled) {
+          return [
+            {
+              kind: t.id as ReactiveRouteSpec["kind"],
+              nth: seen,
+              key: t.key,
+              base: entry.vals[t.key] ?? paramDefault(t.id, t.key),
+              depth: t.depth,
+            },
+          ];
+        }
+        seen += 1;
+      }
+      return [];
+    });
+  };
+
+  const reactiveConfig = (): ReactiveConfig => ({
+    enabled: reactiveEnabled(),
+    intensity: reactiveIntensity() / 100,
+    floorDb: REACTIVE_FLOOR_DB,
+    ceilDb: REACTIVE_CEIL_DB,
+    attackMs: REACTIVE_ATTACK_MS,
+    holdMs: REACTIVE_HOLD_MS,
+    releaseMs: REACTIVE_RELEASE_MS,
+    // While off, send an empty table: the backend restores each outgoing
+    // route to its authored value, and the config then stops changing with
+    // the chain, so the dedupe below keeps a disabled feature silent on the
+    // wire.
+    routes: reactiveEnabled() ? reactiveRoutes() : [],
+  });
+
+  // Last config actually sent, so redundant re-sends are dropped. Without
+  // this, dragging the Intensity slider would fire a message per input event.
+  let lastReactiveSent = "";
+
+  const syncReactive = (): void => {
+    if (!engineRunning()) {
+      // A fresh engine session starts with no reactive config, so forget what
+      // we sent — the next start must re-send rather than dedupe itself away.
+      lastReactiveSent = "";
+      return;
+    }
+    const cfg = reactiveConfig();
+    const json = JSON.stringify(cfg);
+    if (json === lastReactiveSent) return;
+    lastReactiveSent = json;
+    void setReactiveConfigCmd(cfg);
+  };
+
+  const persistReactive = (): void => {
+    saveJson(STORAGE_KEYS.reactive, {
+      enabled: reactiveEnabled(),
+      intensity: reactiveIntensity(),
+    });
+  };
+
+  // Neither setter syncs explicitly: the effect below tracks every input the
+  // config derives from, so a change here re-sends by construction.
+  const setReactiveEnabled = (on: boolean): void => {
+    setReactiveEnabledRaw(on);
+    if (!on) setModEnv(0);
+    persistReactive();
+  };
+
+  const setReactiveIntensity = (pct: number): void => {
+    setReactiveIntensityRaw(clampIntensity(pct));
+    persistReactive();
+  };
   const [recordingPath, setRecordingPath] = createSignal<string | null>(null);
 
   const preset = createMemo<Preset>(
@@ -1207,6 +1353,28 @@ export function createAppState(): AppState {
     void setEffectChainCmd(chainToSpecs(chain()));
     applyActiveVoice();
   };
+
+  // v1.46.0: keep the backend's reactive config in step with everything it
+  // derives from.
+  //
+  // This is an effect rather than calls bolted onto each mutator because the
+  // config depends on the LIVE CHAIN, and the chain changes through many
+  // paths — preset switch, an Inspector slider, toggling an effect, a
+  // reorder, an A/B swap — plus the engine starting. An earlier version hung
+  // the re-send off `syncChain()`, which turned out to have no production
+  // callers at all, so none of it ran: the backend kept offsetting from the
+  // previous preset's authored values, and an Inspector edit was overwritten
+  // on the next buffer. Tracking the inputs makes every path correct by
+  // construction instead of by remembering to call something.
+  createEffect(() => {
+    // Tracked reads. `chain()` covers every chain mutation; `engineRunning()`
+    // covers a fresh session (including one rebuilt after device loss).
+    reactiveEnabled();
+    reactiveIntensity();
+    chain();
+    engineRunning();
+    syncReactive();
+  });
 
   // Send a full SetChain when either the active preset changes or the
   // engine starts up.
@@ -2608,6 +2776,13 @@ export function createAppState(): AppState {
     setIsRecording,
     deviceLost,
     setDeviceLost,
+    modEnv,
+    setModEnv,
+    reactiveEnabled,
+    setReactiveEnabled,
+    reactiveIntensity,
+    setReactiveIntensity,
+    reactiveHasTarget,
     recordingPath,
 
     refreshDevices,

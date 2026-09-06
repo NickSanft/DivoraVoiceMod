@@ -2177,6 +2177,214 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     );
   });
 
+  // ---- v1.46.0: reactive effects ----
+
+  it("reactive routes take their base from the ACTIVE preset (v1.46.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_tts_voices") return TWO_VOICES;
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    // A chain whose distortion is authored at drive 18.
+    result.setChains(result.viewedId(), [
+      { id: "distortion", enabled: true, vals: { drive: 18 } },
+      // 42, deliberately NOT the catalog default (25) — otherwise this
+      // assertion would pass even if the base fell through to the default.
+      { id: "reverb", enabled: true, vals: { size: 40, mix: 42 } },
+    ]);
+    result.setReactiveEnabled(true);
+
+    const call = invokeMock.mock.calls
+      .filter((c) => c[0] === "set_reactive_config")
+      .pop();
+    expect(call).toBeDefined();
+    const cfg = (call![1] as { config: any }).config;
+    expect(cfg.enabled).toBe(true);
+    const drive = cfg.routes.find((r: any) => r.key === "drive");
+    expect(drive).toBeDefined();
+    // The base is the preset's authored value, NOT the catalog default —
+    // otherwise the modulation would push away from the wrong starting point.
+    expect(drive.base).toBe(18);
+    const mix = cfg.routes.find((r: any) => r.key === "mix");
+    expect(mix.base).toBe(42);
+  });
+
+  it("reactive routes skip effects the preset does not use (v1.46.0)", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    result.setChains(result.viewedId(), [
+      { id: "eq", enabled: true, vals: { low: 0 } },
+    ]);
+    result.setReactiveEnabled(true);
+
+    const call = invokeMock.mock.calls
+      .filter((c) => c[0] === "set_reactive_config")
+      .pop();
+    const cfg = (call![1] as { config: any }).config;
+    expect(cfg.routes).toHaveLength(0);
+    // And the UI can tell the user why enabling it would do nothing.
+    expect(result.reactiveHasTarget()).toBe(false);
+  });
+
+  it("reactiveHasTarget requires the target to be ENABLED (v1.46.0)", () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    const id = result.viewedId();
+    result.setChains(id, [
+      { id: "distortion", enabled: false, vals: { drive: 18 } },
+    ]);
+    expect(result.reactiveHasTarget()).toBe(false);
+    result.setChains(id, [
+      { id: "distortion", enabled: true, vals: { drive: 18 } },
+    ]);
+    expect(result.reactiveHasTarget()).toBe(true);
+  });
+
+  it("intensity is sent as a 0..1 fraction and clamped (v1.46.0)", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    result.setChains(result.viewedId(), [
+      { id: "distortion", enabled: true, vals: { drive: 18 } },
+    ]);
+    result.setReactiveEnabled(true);
+    result.setReactiveIntensity(50);
+
+    const cfg = (
+      invokeMock.mock.calls
+        .filter((c) => c[0] === "set_reactive_config")
+        .pop()![1] as { config: any }
+    ).config;
+    expect(cfg.intensity).toBeCloseTo(0.5, 6);
+
+    // Out-of-range input is clamped rather than forwarded.
+    result.setReactiveIntensity(999);
+    expect(result.reactiveIntensity()).toBe(100);
+    result.setReactiveIntensity(-20);
+    expect(result.reactiveIntensity()).toBe(0);
+  });
+
+  it("disabling reactive zeroes the live meter (v1.46.0)", () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    result.setReactiveEnabled(true);
+    result.setModEnv(0.8);
+    expect(result.modEnv()).toBeCloseTo(0.8, 6);
+    result.setReactiveEnabled(false);
+    // Otherwise the meter would sit pinned at its last value after switch-off.
+    expect(result.modEnv()).toBe(0);
+  });
+
+  it("sends the config when the ENGINE STARTS, not just on toggle (v1.46.0)", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    // Enable while the engine is DOWN — the mirror of a persisted enabled:true
+    // being restored at launch before the engine comes up.
+    result.setEngineRunning(false);
+    result.setChains(result.viewedId(), [
+      { id: "distortion", enabled: true, vals: { drive: 18 } },
+    ]);
+    result.setReactiveEnabled(true);
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_reactive_config"),
+    ).toHaveLength(0);
+
+    // Starting the engine must push it, or the UI would read ON against a
+    // backend that never received a config and never modulates.
+    result.setEngineRunning(true);
+    const sent = invokeMock.mock.calls.filter(
+      (c) => c[0] === "set_reactive_config",
+    );
+    expect(sent.length).toBeGreaterThan(0);
+    expect((sent.pop()![1] as { config: any }).config.enabled).toBe(true);
+  });
+
+  it("re-sends with fresh bases when the live chain changes (v1.46.0)", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    const id = result.viewedId();
+    result.setEngineRunning(true);
+    result.setChains(id, [
+      { id: "distortion", enabled: true, vals: { drive: 18 } },
+    ]);
+    result.setReactiveEnabled(true);
+
+    const driveBase = (): number => {
+      const cfg = (
+        invokeMock.mock.calls
+          .filter((c) => c[0] === "set_reactive_config")
+          .pop()![1] as { config: any }
+      ).config;
+      return cfg.routes.find((r: any) => r.key === "drive").base;
+    };
+    expect(driveBase()).toBe(18);
+
+    // A chain edit (Inspector slider, preset switch, A/B swap — all land here)
+    // must refresh the base. Otherwise the backend keeps offsetting from the
+    // old authored value and overwrites the new one on the next buffer.
+    result.setChains(id, [
+      { id: "distortion", enabled: true, vals: { drive: 70 } },
+    ]);
+    expect(driveBase()).toBe(70);
+  });
+
+  it("addresses the first ENABLED effect by its true occurrence index (v1.46.0)", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    // Two distortions: the audible one is the second occurrence.
+    result.setChains(result.viewedId(), [
+      { id: "distortion", enabled: false, vals: { drive: 5 } },
+      { id: "distortion", enabled: true, vals: { drive: 60 } },
+    ]);
+    result.setReactiveEnabled(true);
+
+    const cfg = (
+      invokeMock.mock.calls
+        .filter((c) => c[0] === "set_reactive_config")
+        .pop()![1] as { config: any }
+    ).config;
+    const drive = cfg.routes.find((r: any) => r.key === "drive");
+    // The backend counts occurrences regardless of enabled, so nth must be 1 —
+    // sending 0 would modulate the silent, disabled entry instead.
+    expect(drive.nth).toBe(1);
+    expect(drive.base).toBe(60);
+  });
+
+  it("stops re-sending once disabled, and re-sends after a restart (v1.46.0)", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const { result } = setupApp();
+    const id = result.viewedId();
+    result.setEngineRunning(true);
+    result.setChains(id, [
+      { id: "distortion", enabled: true, vals: { drive: 18 } },
+    ]);
+    result.setReactiveEnabled(true);
+    result.setReactiveEnabled(false);
+    const afterDisable = invokeMock.mock.calls.filter(
+      (c) => c[0] === "set_reactive_config",
+    ).length;
+
+    // Chain churn while off must not produce traffic — the disabled config is
+    // constant, so the dedupe swallows it.
+    result.setChains(id, [
+      { id: "distortion", enabled: true, vals: { drive: 55 } },
+    ]);
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_reactive_config").length,
+    ).toBe(afterDisable);
+
+    // But a fresh engine session has no config, so stopping and starting must
+    // re-send rather than dedupe itself into silence.
+    result.setEngineRunning(false);
+    result.setEngineRunning(true);
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_reactive_config").length,
+    ).toBeGreaterThan(afterDisable);
+  });
+
   it("refreshCloneModelsStatus reflects backend readiness", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "clone_models_status") return { ready: true };

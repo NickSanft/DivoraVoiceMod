@@ -42,6 +42,7 @@ import {
   stopVoiceRecording,
   deleteClonedVoice,
   renameClonedVoice,
+  setReactiveConfig,
   cloneModelsStatus,
   downloadCloneModels,
   stopAllSoundboardClips,
@@ -532,6 +533,32 @@ describe("audio api", () => {
     expect(invokeMock).toHaveBeenCalledWith("delete_cloned_voice", {
       id: "my-voice",
     });
+  });
+
+  it("setReactiveConfig forwards the whole config (v1.46.0)", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    const config = {
+      enabled: true,
+      intensity: 0.7,
+      floorDb: -42,
+      ceilDb: -14,
+      attackMs: 12,
+      holdMs: 60,
+      releaseMs: 300,
+      routes: [
+        {
+          kind: "distortion" as const,
+          nth: 0,
+          key: "drive",
+          base: 18,
+          depth: 45,
+        },
+      ],
+    };
+    await setReactiveConfig(config);
+    // One message, not per-field setters — the audio thread must never see a
+    // half-applied config.
+    expect(invokeMock).toHaveBeenCalledWith("set_reactive_config", { config });
   });
 
   it("renameClonedVoice forwards the id + new name (v1.43.0)", async () => {

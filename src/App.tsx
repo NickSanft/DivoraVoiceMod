@@ -257,6 +257,7 @@ function Shell(): JSX.Element {
           app.setIsRecording(update.recording);
           app.setLoudnessGainDb(update.loudnessGainDb);
           app.setDeviceLost(update.deviceLost);
+          app.setModEnv(update.modEnv);
         });
       } catch (err) {
         app.setEngineError(`level subscription failed: ${String(err)}`);

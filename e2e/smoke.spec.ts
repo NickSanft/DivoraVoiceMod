@@ -252,6 +252,37 @@ test.describe("speak / text-to-speech (v1.17)", () => {
   });
 });
 
+test.describe("reactive effects (v1.46)", () => {
+  test("card renders, toggles, and warns when the preset has nothing to drive", async ({
+    page,
+  }) => {
+    await nav(page, "Mixer").click();
+
+    const toggle = page.getByRole("switch", { name: "Reactive effects" });
+    await expect(toggle).toBeVisible();
+    await expect(page.getByText(/Raise your voice, harden the character/i)).toBeVisible();
+
+    // Off by default, so an untouched install behaves exactly as before.
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-checked", "true");
+
+    // The seeded preset (Hollow King) has no Distortion, so enabling it would
+    // do nothing audible — the card has to say so rather than look broken.
+    await expect(page.getByText(/no Distortion to drive/i)).toBeVisible();
+
+    // Making a preset that DOES use distortion active clears the warning.
+    // Note this needs "Use", not just a preview click: the modulation targets
+    // the LIVE chain, so the warning must track the active voice.
+    await nav(page, "Presets").click();
+    await page.getByText("Static Wraith", { exact: true }).first().click();
+    await page.getByRole("button", { name: /^Use$/ }).click();
+    await nav(page, "Mixer").click();
+    await expect(page.getByText(/no Distortion to drive/i)).toHaveCount(0);
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 
