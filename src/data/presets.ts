@@ -199,10 +199,36 @@ export const FALLBACK_PRESETS: Preset[] = [
     desc: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",
     chain: [
       fx("gate", true, { thresh: -46 }),
-      fx("distortion", true, { drive: 65 }),
+      fx("bitcrush", true, { bits: 4, rate: 5000, drive: 45, mix: 100 }),
+      fx("distortion", true, { drive: 30 }),
       fx("robot", true, { freq: 180, mix: 45 }),
       fx("echo", true, { time: 60, fb: 55 }),
       fx("eq", true, { low: -2, mid: 4, high: 5 }),
+    ],
+  },
+  {
+    id: "arcade-cabinet",
+    name: "Arcade Cabinet",
+    color: "#F2B705",
+    glyph: "bolt",
+    tag: "Bundled",
+    desc: "A speech chip in a coin-op machine — crunchy, small, and shouting through a cabinet speaker.",
+    chain: [
+      fx("gate", true, { thresh: -48 }),
+      // The compressor is deliberately BEFORE the crusher: an even input level
+      // spreads speech evenly across the quantiser ladder, so the grain stays
+      // constant instead of pumping with the talker.
+      fx("compressor", true, {
+        thresh: -22,
+        ratio: 4,
+        attack: 8,
+        release: 120,
+        makeup: 4,
+      }),
+      fx("pitch", true, { shift: 3 }),
+      fx("bitcrush", true, { bits: 6, rate: 8000, drive: 25, mix: 100 }),
+      fx("radio_bandpass", true, { hp: 250, lp: 4000, peak: 1800, gain: 5, q: 2.5 }),
+      fx("eq", true, { low: -3, mid: 2, high: 2 }),
     ],
   },
   {

@@ -4,6 +4,17 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.48.0] — 2026-09-04 — Bitcrusher
+
+### Added
+
+- **Bitcrusher effect.** Retro digital destruction: coarsen the signal onto a rough ladder (**Bit depth**) and hold each sample (**Rate**) to fold the highs down into inharmonic grit. Where Distortion is smooth analogue warmth, this is the 8-bit, broken-machine sound — and the Rate is a real frequency, so a preset sounds the same on any sound card. **Drive** lifts quiet syllables clear of the coarse steps, and **Mix** blends it back with your dry voice.
+- **Arcade Cabinet** — a new voice: a speech chip in a coin-op machine, crunchy and small and shouting through a cabinet speaker.
+
+### Changed
+
+- **Corrupted now actually bit-crushes.** Its description has always promised "bit-crushed", but the chain was faking it with heavy distortion — which can only produce harmonic grit, never the digital fold-down the word means. It now uses the real thing, with the distortion backed off to suit.
+
 ## [1.47.0] — 2026-09-04 — Tap to hear a voice
 
 ### Added

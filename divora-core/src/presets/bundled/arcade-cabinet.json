@@ -1,0 +1,17 @@
+{
+  "id": "arcade-cabinet",
+  "version": 1,
+  "name": "Arcade Cabinet",
+  "color": "#F2B705",
+  "glyph": "bolt",
+  "tag": "Bundled",
+  "desc": "A speech chip in a coin-op machine — crunchy, small, and shouting through a cabinet speaker.",
+  "chain": [
+    { "id": "gate", "enabled": true, "vals": { "thresh": -48 } },
+    { "id": "compressor", "enabled": true, "vals": { "thresh": -22, "ratio": 4, "attack": 8, "release": 120, "makeup": 4 } },
+    { "id": "pitch", "enabled": true, "vals": { "shift": 3 } },
+    { "id": "bitcrush", "enabled": true, "vals": { "bits": 6, "rate": 8000, "drive": 25, "mix": 100 } },
+    { "id": "radio_bandpass", "enabled": true, "vals": { "hp": 250, "lp": 4000, "peak": 1800, "gain": 5, "q": 2.5 } },
+    { "id": "eq", "enabled": true, "vals": { "low": -3, "mid": 2, "high": 2 } }
+  ]
+}

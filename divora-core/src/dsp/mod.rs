@@ -20,6 +20,7 @@
 //! later phase. Formant ships a parallel band-pass colouring; the real
 //! LPC-based formant warp also lands later.
 
+mod bitcrush;
 mod breath;
 mod chorus;
 mod compressor;
@@ -43,6 +44,7 @@ mod vintage_noise;
 mod voice_convert;
 mod warble;
 
+pub use bitcrush::Bitcrush;
 pub use breath::Breath;
 pub use chorus::Chorus;
 pub use compressor::Compressor;
@@ -129,6 +131,12 @@ pub enum EffectKind {
     /// otherworldly wobble behind the Enderman voice; also sci-fi / seasick /
     /// theremin. Adds a small (~base-delay) latency.
     Warble,
+    /// v1.48.0: bitcrusher — amplitude quantisation + sample-and-hold
+    /// decimation. Distinct from `Distortion`'s smooth `tanh` waveshaper:
+    /// decimation folds high frequencies down as INHARMONIC images that move
+    /// downward as the speaker's pitch rises, which is the "8-bit / broken
+    /// machine" cue a waveshaper cannot produce. Zero latency.
+    Bitcrush,
 }
 
 /// Trait every effect implements. The audio thread holds a `Box<dyn
@@ -353,6 +361,7 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
         EffectKind::Tremolo => Box::new(Tremolo::new()),
         EffectKind::Breath => Box::new(Breath::new()),
         EffectKind::Warble => Box::new(Warble::new()),
+        EffectKind::Bitcrush => Box::new(Bitcrush::new()),
     };
     effect.set_enabled(spec.enabled);
     for (key, value) in &spec.params {

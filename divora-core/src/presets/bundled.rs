@@ -65,6 +65,10 @@ const BUNDLED: &[BundledSource] = &[
         json: include_str!("bundled/corrupted.json"),
     },
     BundledSource {
+        id: "arcade-cabinet",
+        json: include_str!("bundled/arcade-cabinet.json"),
+    },
+    BundledSource {
         id: "whisper-wraith",
         json: include_str!("bundled/whisper-wraith.json"),
     },
@@ -298,6 +302,7 @@ mod tests {
         );
         // The atmospheric utility voices are present.
         assert!(p("corrupted").is_some());
+        assert!(p("arcade-cabinet").is_some());
         assert!(p("whisper-wraith").is_some());
     }
 

@@ -8,7 +8,8 @@
   "desc": "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",
   "chain": [
     { "id": "gate", "enabled": true, "vals": { "thresh": -46 } },
-    { "id": "distortion", "enabled": true, "vals": { "drive": 65 } },
+    { "id": "bitcrush", "enabled": true, "vals": { "bits": 4, "rate": 5000, "drive": 45, "mix": 100 } },
+    { "id": "distortion", "enabled": true, "vals": { "drive": 30 } },
     { "id": "robot", "enabled": true, "vals": { "freq": 180, "mix": 45 } },
     { "id": "echo", "enabled": true, "vals": { "time": 60, "fb": 55 } },
     { "id": "eq", "enabled": true, "vals": { "low": -2, "mid": 4, "high": 5 } }

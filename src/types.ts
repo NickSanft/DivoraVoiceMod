@@ -30,6 +30,8 @@ export type EffectId =
   /** v1.37.0: warble — a pitch vibrato (an LFO-swept delay that bends the
    *  fundamental). The Enderman's otherworldly wobble; also sci-fi / seasick. */
   | "warble"
+  /** v1.48.0: bitcrusher — quantisation + sample-and-hold decimation. */
+  | "bitcrush"
   | "gate"
   | "denoiser"
   /** Phase 12: ONNX-backed voice conversion (LLVC-style). The active

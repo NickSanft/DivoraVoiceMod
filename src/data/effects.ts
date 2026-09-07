@@ -237,6 +237,21 @@ export const EFFECTS: Record<EffectId, EffectDef> = {
     ],
     readout: (v) => `${v.rate ?? 0} Hz · ${v.depth ?? 0}%`,
   },
+  bitcrush: {
+    id: "bitcrush",
+    name: "Bitcrusher",
+    sigil: "bolt",
+    desc: "Retro digital destruction — coarsens the signal onto a rough ladder (Bit depth) and holds each sample (Rate), folding the highs down as inharmonic grit. Unlike Distortion's smooth warmth, this is the 8-bit / broken-machine sound. Rate is a real frequency, so it sounds the same on any device.",
+    params: [
+      { key: "bits", label: "Bit depth", min: 1, max: 16, step: 1, unit: "bit", default: 8 },
+      { key: "rate", label: "Rate", min: 1000, max: 48000, step: 500, unit: "Hz", default: 8000 },
+      // Drive is not optional on a VOICE crusher: coarse depths have a dead
+      // zone that swallows quiet syllables, and this lifts speech clear of it.
+      { key: "drive", label: "Drive", min: 0, max: 100, step: 1, unit: "%", default: 0 },
+      { key: "mix", label: "Mix", min: 0, max: 100, step: 1, unit: "%", default: 100 },
+    ],
+    readout: (v) => `${v.bits ?? 8} bit · ${((v.rate ?? 8000) / 1000).toFixed(1)} kHz`,
+  },
   voice_convert: {
     id: "voice_convert",
     name: "Voice Convert",
@@ -262,6 +277,7 @@ export const EFFECT_ORDER: EffectId[] = [
   "deesser",
   "robot",
   "distortion",
+  "bitcrush",
   "echo",
   "reverb",
   "chorus",

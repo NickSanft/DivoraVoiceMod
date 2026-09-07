@@ -156,6 +156,7 @@ export type EffectKindWire =
   | "tremolo"
   | "breath"
   | "warble"
+  | "bitcrush"
   | "voice_convert";
 
 /** Wire format for one effect in the chain. */

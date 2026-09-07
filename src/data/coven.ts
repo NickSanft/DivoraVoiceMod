@@ -133,6 +133,11 @@ export const COVEN: CastMember[] = [
     lore: "A transmission eaten by the noise — bit-crushed, ring-modulated, breaking up.",
   },
   {
+    presetId: "arcade-cabinet",
+    kind: "dsp",
+    lore: "A speech chip in a coin-op machine — crunchy, small, and shouting through a cabinet speaker.",
+  },
+  {
     presetId: "whisper-wraith",
     kind: "dsp",
     lore: "Close enough to feel the breath — airy, intimate, and not quite alive.",

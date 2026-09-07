@@ -4,7 +4,7 @@ A free, open-source, real-time voice modulator **and on-device text-to-speech** 
 
 The visual identity is **"spellcraft for your voice"** — a calm utility tool wearing a dusk-lit arcane skin. See [`docs/mockups/`](docs/mockups/) for the design.
 
-> **Status: v1.43.0** — stable and shipping steady improvements. The v1.0 command + preset contract is frozen and additive-only across the 1.x line (see [`docs/STABLE-SURFACE.md`](docs/STABLE-SURFACE.md)). Since 1.0: on-device **text-to-speech ("Speak")**, **voice cloning** (accent-preserving *and* timbre-only), a **23-voice preset cast** (The Coven + Minecraft-mob and vintage-radio characters), a **19-effect** real-time chain, **MIDI / Stream Deck** control surfaces, a **stream overlay**, and reliability hardening (audio device-loss recovery, soundboard-freeze fix). Full history in [`CHANGELOG.md`](CHANGELOG.md).
+> **Status: v1.48.0** — stable and shipping steady improvements. The v1.0 command + preset contract is frozen and additive-only across the 1.x line (see [`docs/STABLE-SURFACE.md`](docs/STABLE-SURFACE.md)). Since 1.0: on-device **text-to-speech ("Speak")**, **voice cloning** (accent-preserving *and* timbre-only), a **24-voice preset cast** (The Coven + Minecraft-mob and vintage-radio characters), a **20-effect** real-time chain, **MIDI / Stream Deck** control surfaces, a **stream overlay**, and **reactive effects** that follow your voice, **tap-to-audition** voice previews, and reliability hardening (audio device-loss recovery, soundboard-freeze fix). Full history in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
@@ -16,18 +16,18 @@ Each release lists **SHA-256 checksums** for the `.msi` and `-setup.exe` in its 
 
 ## What it does
 
-- **Real-time microphone effects** — a live, reorderable chain of **19 effects**:
+- **Real-time microphone effects** — a live, reorderable chain of **20 effects**:
   - *Cleanup & dynamics* — noise gate (a soft downward expander), **RNNoise denoiser**, compressor, de-esser.
   - *Pitch & tone* — pitch (phase vocoder), formant (spectrum warp), 3-band EQ, radio band-pass.
-  - *Character & space* — robot, distortion, echo, reverb, chorus, harmonizer, tremolo, warble, breath (whisperizer), and vintage noise.
+  - *Character & space* — robot, distortion, **bitcrusher**, echo, reverb, chorus, harmonizer, tremolo, warble, breath (whisperizer), and vintage noise.
   - *AI* — **voice convert** (ONNX).
 
   Each effect has its own parameters and a live **"+N ms latency"** readout that updates as you toggle effects.
 - **On-device text-to-speech — "Speak."** Type text, pick a preset US/UK voice, and synthesize speech fully **on-device** (Kokoro-82M + espeak-ng) that plays through the output and mixes into your call/stream like the live mic. Includes a **saved-clips library** (replay, reuse, or load a clip back into the editor), a volume/preview control, an independent monitor toggle, and per-take progress.
 - **Voice cloning — "Your voices."** Add your own voice two ways: **record** a short on-screen sentence for an **accent-preserving** clone (VoxCPM reproduces your timbre *and* accent), or **import** a 20–30 s clip for a quick **timbre-only** clone (OpenVoice, recolors a preset toward you and auto-picks the closest base). Multi-take **best-of-N** reranking (Fast / Balanced / Best) picks the closest result, and you can **rename** cloned voices inline. Both engines' models download on demand (accent ~1.6 GB, timbre ~157 MB), so the installer stays small. Optional experimental **GPU (DirectML)** acceleration.
-- **The Coven — 23 bundled persona presets.** A browsable cast of character voices:
+- **The Coven — 24 bundled persona presets.** A browsable cast of character voices:
   - *The Coven (14):* Hollow King, Static Wraith, Velvet Demon, Choir of Ash, The Oracle, Seraph, Dirge, The Swarm, The Possessed, Leviathan, The Imp, Dispatch, Corrupted, Whisper Wraith.
-  - *Character voices (7):* Spirit Radio and Parlor Augur (vintage radio); Villager, Creeper, Zombie, Enderman, and Ghast (Minecraft-mob).
+  - *Character voices (8):* Spirit Radio and Parlor Augur (vintage radio); Villager, Creeper, Zombie, Enderman, and Ghast (Minecraft-mob); Arcade Cabinet (retro game).
   - *AI (1):* Deep Narrator. *Plus* Clean Passthrough.
 
   On top of the bundled cast: unlimited user presets with a full JSON editor, export/import, and **A/B compare** on the Mixer.
@@ -55,7 +55,7 @@ Each release lists **SHA-256 checksums** for the `.msi` and `-setup.exe` in its 
 
 ## Roadmap & known limitations
 
-DivoraVoice is feature-complete for v1 and shipping steady post-1.0 releases. Major work since 1.0 includes on-device TTS ("Speak"), voice cloning (VoxCPM accent-preserving + OpenVoice timbre), the Minecraft-mob and vintage-radio voice cast, seven new DSP effects (compressor, de-esser, tremolo, warble, breath, radio band-pass, vintage noise), MIDI / Stream Deck control surfaces, the stream overlay, and reliability hardening. The detailed per-release plan lives in [docs/PLAN.md](docs/PLAN.md).
+DivoraVoice is feature-complete for v1 and shipping steady post-1.0 releases. Major work since 1.0 includes on-device TTS ("Speak"), voice cloning (VoxCPM accent-preserving + OpenVoice timbre), the Minecraft-mob and vintage-radio voice cast, eight new DSP effects (compressor, de-esser, tremolo, warble, breath, radio band-pass, vintage noise, bitcrusher), MIDI / Stream Deck control surfaces, the stream overlay, and reliability hardening. The detailed per-release plan lives in [docs/PLAN.md](docs/PLAN.md).
 
 **Known limitations (today):**
 

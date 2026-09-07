@@ -262,7 +262,29 @@ const MOD_TARGETS: &[(EffectKind, &str, f32, f32)] = &[
     (EffectKind::Warble, "mix", 0.0, 100.0),
     (EffectKind::Breath, "amount", 0.0, 100.0),
     (EffectKind::Tremolo, "depth", 0.0, 100.0),
+    // Bitcrush: `mix` is a crossfade and `drive` a memoryless pre-gain,
+    // both squarely within the rule. `rate` and `bits` are deliberately
+    // absent — see the note below.
+    (EffectKind::Bitcrush, "mix", 0.0, 100.0),
+    (EffectKind::Bitcrush, "drive", 0.0, 100.0),
 ];
+
+// Why bitcrush `rate` and `bits` are NOT routable, since both look tempting:
+//
+// `rate` does not click — the phase accumulator stays continuous — but the
+// sample-and-hold comb is an audible PITCHED artifact, so stepping it at
+// block rate is a stairstepped glide. That is the filter-pole failure mode
+// arrived at by another route, and it belongs on the same side of the line.
+//
+// `bits` is out on MAGNITUDE, not continuity — the continuity argument would
+// prove too much, since `drive` here feeds a quantiser too and is therefore
+// also a step function of its parameter. The real distinction: a drive step
+// moves any one sample by at most a single quantiser step, which is by
+// construction the effect's own noise floor and is happening constantly
+// anyway; a `bits` step rescales the ENTIRE ladder at once, so every sample
+// moves together and the timbre audibly jumps. It is also unnecessary —
+// effective depth is bits + log2(drive), so routing `drive` already gives the
+// "shout and it shatters" percept through a target that is legal by the rule.
 
 /// Whether `kind`/`key` may be modulated, and the bounds if so.
 #[must_use]

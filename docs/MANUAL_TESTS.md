@@ -64,6 +64,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] In the Inspector, drag the Gate threshold slider → audible change within ~5 ms; OUT meter responds.
 - [ ] In the Inspector, drag the EQ Low slider → audible bass boost / cut.
 - [ ] In the Inspector, drag the Distortion drive → audible saturation that doesn't clip past unity.
+- [ ] **Bitcrusher (v1.48.0):** pick **Arcade Cabinet** → your voice sounds like a coin-op speech chip. In the Inspector drop **Bit depth** to 3 → obviously grittier and quieter syllables start dropping out; raise **Drive** → they come back. Drop **Rate** toward 2000 Hz → a metallic ringing that moves DOWN as your pitch goes up (that inharmonic motion is the point — Distortion cannot do it). Set Rate to 48000 with Bit depth 16 → effectively transparent. Check **Corrupted** still sounds right after its retrofit.
 - [ ] In the Inspector, drag the Reverb mix → tail builds smoothly.
 - [ ] In the Inspector, drag the Echo time → repeats spacing changes.
 - [ ] In the Inspector, drag the Robot mix → voice gains the carrier tone.
