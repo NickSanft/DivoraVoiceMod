@@ -76,6 +76,8 @@ import {
   stopSoundboardClip as stopSoundboardClipCmd,
   speak as speakCmd,
   stopSpeak as stopSpeakCmd,
+  previewVoice as previewVoiceCmd,
+  stopPreviewVoice as stopPreviewVoiceCmd,
   listSpeakClips as listSpeakClipsCmd,
   deleteSpeakClip as deleteSpeakClipCmd,
   setSpeakMonitor as setSpeakMonitorCmd,
@@ -418,6 +420,21 @@ export interface AppState {
   /** v1.46.0: master depth scale, 0..100. */
   reactiveIntensity: () => number;
   setReactiveIntensity: (pct: number) => void;
+  /**
+   * v1.47.0: the voice currently being auditioned, or null. Drives each card's
+   * play/stop affordance and its "rendering..." state.
+   */
+  previewingVoice: () => string | null;
+  /**
+   * v1.47.0: true while a preview is still being SYNTHESIZED rather than
+   * played. A cached voice resolves in milliseconds; an uncached clone takes
+   * seconds, and a button that looks identical either way invites a second tap.
+   */
+  previewRendering: () => boolean;
+  /** v1.47.0: play a short fixed sample in `voiceId` (monitor-only). */
+  previewVoice: (voiceId: string) => Promise<void>;
+  /** v1.47.0: stop the running audition. */
+  stopPreview: () => void;
   /**
    * v1.46.0: whether the active chain contains the effect "Rage" drives.
    * False means enabling it would do nothing audible, so the UI offers to add
@@ -2429,6 +2446,76 @@ export function createAppState(): AppState {
     }
   };
 
+  // ---- v1.47.0: tap-to-audition previews ----
+  const [previewingVoice, setPreviewingVoice] = createSignal<string | null>(null);
+  const [previewRendering, setPreviewRendering] = createSignal(false);
+  // Timer that returns a card from Stop to Play when the clip ends.
+  let previewTimer: number | null = null;
+  // Monotonic id for in-flight auditions. A render can take seconds on a
+  // cloned voice, so a result that arrives after the user has moved on must be
+  // dropped rather than played over the voice they actually asked for.
+  let previewGeneration = 0;
+
+  const previewVoice = async (voiceId: string): Promise<void> => {
+    if (!voiceId) return;
+    // Tapping the voice that is already auditioning stops it.
+    if (previewingVoice() === voiceId) {
+      stopPreview();
+      return;
+    }
+    previewGeneration += 1;
+    const generation = previewGeneration;
+    if (previewTimer !== null) {
+      window.clearTimeout(previewTimer);
+      previewTimer = null;
+    }
+    // Stop whatever is playing before starting the next one — the mixer takes
+    // an idle slot rather than replacing a same-id clip, so without this two
+    // voices would play at once.
+    void stopPreviewVoiceCmd();
+    setPreviewingVoice(voiceId);
+    setPreviewRendering(true);
+    setTtsError(null);
+    try {
+      // The GPU flag rides along: the backend shares ONE VoxCPM engine with
+      // Speak, and asking for a different mode rebuilds ~1.6 GB of ONNX.
+      const durationSecs = await previewVoiceCmd(voiceId, cloneGpu());
+      if (generation !== previewGeneration) return; // superseded
+      setPreviewRendering(false);
+      // Clear when the clip finishes so the card returns to its play state.
+      previewTimer = window.setTimeout(() => {
+        previewTimer = null;
+        if (generation === previewGeneration) setPreviewingVoice(null);
+      }, Math.max(250, durationSecs * 1000));
+    } catch (err) {
+      if (generation !== previewGeneration) return;
+      setPreviewingVoice(null);
+      setPreviewRendering(false);
+      setTtsError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    }
+  };
+
+  const stopPreview = (): void => {
+    // Bumping the generation orphans any in-flight render, so a slow result
+    // cannot arrive later and play unprompted.
+    previewGeneration += 1;
+    if (previewTimer !== null) {
+      window.clearTimeout(previewTimer);
+      previewTimer = null;
+    }
+    setPreviewingVoice(null);
+    setPreviewRendering(false);
+    // The backend bumps its OWN epoch here — that is what stops an in-flight
+    // render from playing once it finishes, since it cannot be aborted.
+    void stopPreviewVoiceCmd();
+  };
+
   const stopSpeaking = async (): Promise<void> => {
     setPlayingClips("tts", undefined as unknown as PlayingClip);
     try {
@@ -2783,6 +2870,10 @@ export function createAppState(): AppState {
     reactiveIntensity,
     setReactiveIntensity,
     reactiveHasTarget,
+    previewingVoice,
+    previewRendering,
+    previewVoice,
+    stopPreview,
     recordingPath,
 
     refreshDevices,

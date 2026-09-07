@@ -2385,6 +2385,153 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     ).toBeGreaterThan(afterDisable);
   });
 
+  // ---- v1.47.0: tap-to-audition previews ----
+
+  it("previewVoice plays a voice and marks it as auditioning (v1.47.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "preview_voice") return 1.5;
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.previewVoice("af_heart");
+    expect(invokeMock).toHaveBeenCalledWith("preview_voice", {
+      voiceId: "af_heart",
+      useGpu: false,
+    });
+    expect(result.previewingVoice()).toBe("af_heart");
+  });
+
+  it("previewing a second voice stops the first (v1.47.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "preview_voice") return 1.5;
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.previewVoice("af_heart");
+    invokeMock.mockClear();
+    await result.previewVoice("bm_george");
+    // Assert the SEQUENCE, not just that both happened: moving the stop after
+    // the play would silence every second tap, and a "was it called" assertion
+    // passes for that too. The mixer takes an idle slot rather than replacing a
+    // same-id clip, so without a stop-first both voices sound at once.
+    expect(invokeMock.mock.calls.map((c) => c[0])).toEqual([
+      "stop_preview_voice",
+      "preview_voice",
+    ]);
+    expect(result.previewingVoice()).toBe("bm_george");
+  });
+
+  it("tapping the auditioning voice again stops it (v1.47.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "preview_voice") return 1.5;
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.previewVoice("af_heart");
+    await result.previewVoice("af_heart");
+    expect(result.previewingVoice()).toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith("stop_preview_voice");
+  });
+
+  it("a superseded render does not steal the auditioning state back (v1.47.0)", async () => {
+    // NB: suppressing the AUDIO of an abandoned render is the backend's job —
+    // it bumps its own epoch and discards the result, because a spawn_blocking
+    // synthesis cannot be aborted. This test covers the store's half: a late
+    // result must not overwrite the voice the user has since chosen.
+    let releaseSlow: ((v: number) => void) | null = null;
+    invokeMock.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "preview_voice") {
+        if (args.voiceId === "slow-clone") {
+          return new Promise<number>((res) => {
+            releaseSlow = res;
+          });
+        }
+        return 1.0;
+      }
+      return undefined;
+    });
+    const { result } = setupApp();
+    const slow = result.previewVoice("slow-clone");
+    await result.previewVoice("af_heart");
+    expect(result.previewingVoice()).toBe("af_heart");
+
+    // The abandoned render finally lands — it must not steal the state back.
+    releaseSlow!(7.0);
+    await slow;
+    expect(result.previewingVoice()).toBe("af_heart");
+    // And it issues no further backend traffic for the abandoned voice.
+    const afterCalls = invokeMock.mock.calls.filter(
+      (c) => c[0] === "preview_voice" && (c[1] as any).voiceId === "slow-clone",
+    );
+    expect(afterCalls).toHaveLength(1);
+  });
+
+  it("the auto-clear timer returns the card to its play state (v1.47.0)", async () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "preview_voice") return 2.0;
+        return undefined;
+      });
+      const { result } = setupApp();
+      await result.previewVoice("af_heart");
+      expect(result.previewingVoice()).toBe("af_heart");
+      // Without this timer the card would sit on "Stop" forever and the next
+      // tap would become a stop-toggle instead of a replay.
+      vi.advanceTimersByTime(2100);
+      expect(result.previewingVoice()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an old clip's timer cannot clear the newly-auditioning voice (v1.47.0)", async () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockImplementation(async (cmd: string, args?: any) => {
+        if (cmd === "preview_voice") {
+          return args.voiceId === "short" ? 0.3 : 9.0;
+        }
+        return undefined;
+      });
+      const { result } = setupApp();
+      await result.previewVoice("short");
+      await result.previewVoice("long");
+      // The short clip's timer must have been cancelled when it was superseded.
+      vi.advanceTimersByTime(1000);
+      expect(result.previewingVoice()).toBe("long");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("previewVoice forwards the GPU setting (v1.47.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "preview_voice") return 1.0;
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setCloneGpu(true);
+    await result.previewVoice("my-clone");
+    // The backend shares one VoxCPM engine with Speak; asking for a different
+    // mode tears it down and rebuilds ~1.6 GB of ONNX graphs.
+    expect(invokeMock).toHaveBeenCalledWith("preview_voice", {
+      voiceId: "my-clone",
+      useGpu: true,
+    });
+  });
+
+  it("a failed preview clears the state and surfaces the error (v1.47.0)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "preview_voice") throw "voices are not installed";
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.previewVoice("af_heart");
+    expect(result.previewingVoice()).toBeNull();
+    expect(result.ttsError()).toBe("voices are not installed");
+  });
+
   it("refreshCloneModelsStatus reflects backend readiness", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "clone_models_status") return { ready: true };

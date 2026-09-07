@@ -4,6 +4,12 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.47.0] — 2026-09-04 — Tap to hear a voice
+
+### Added
+
+- **Preview a voice before you use it.** Every voice on the Speak screen — preset and your own clones — now has a ▶ button that plays a short sample, so you can shop for a voice by ear instead of typing something and hoping. Previews play to your monitor only (never into the call), say the same line every time so voices are comparable, and are cached after the first play, so hearing one again is instant. Picking a voice and previewing it are separate taps, so selecting a clone never kicks off a render you didn't ask for.
+
 ## [1.46.0] — 2026-09-04 — Reactive effects
 
 ### Added

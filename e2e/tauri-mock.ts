@@ -140,6 +140,8 @@ export async function installTauriMock(
           throw "text-to-speech voices are not installed";
         },
         stop_speak: () => null,
+        preview_voice: () => 1.2,
+        stop_preview_voice: () => null,
         list_speak_clips: () => [],
         speak_clips_dir: () => "C:/mock/speak-clips",
         open_speak_clips_folder: () => null,

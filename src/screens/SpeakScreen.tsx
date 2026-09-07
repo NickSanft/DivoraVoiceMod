@@ -67,6 +67,54 @@ export function SpeakScreen(): JSX.Element {
     })();
   });
 
+  // v1.47.0: the audition affordance. A sibling of the select target, never a
+  // descendant of it: `role="radio"` is a leaf role, so a nested button would
+  // be unreachable to assistive tech. Selecting and auditioning are also
+  // deliberately separate gestures — tapping a cloned voice merely to make it
+  // active must not kick off seconds of synthesis nobody asked for.
+  const AuditionButton = (props: {
+    voiceId: string;
+    voiceName: string;
+    disabled?: boolean;
+    disabledReason?: string;
+  }): JSX.Element => {
+    const active = (): boolean => app.previewingVoice() === props.voiceId;
+    // Rendering is visually distinct from playing: an uncached clone takes
+    // seconds, and a button that looks the same either way reads as hung — the
+    // natural response being a second tap, which just orphans the first render.
+    const rendering = (): boolean => active() && app.previewRendering();
+    const label = (): string =>
+      rendering()
+        ? `Rendering a preview of ${props.voiceName}`
+        : active()
+          ? `Stop preview of ${props.voiceName}`
+          : `Preview ${props.voiceName}`;
+    return (
+      <button
+        type="button"
+        // The accessible NAME flips rather than using aria-pressed: this is a
+        // transient action, not a toggle state.
+        aria-label={label()}
+        title={props.disabled ? props.disabledReason : label()}
+        disabled={props.disabled}
+        onClick={() => void app.previewVoice(props.voiceId)}
+        style={{
+          display: "flex",
+          "align-items": "center",
+          padding: "0 var(--s3)",
+          background: "transparent",
+          border: "none",
+          "border-left": "1px solid var(--line)",
+          color: active() ? "var(--accent)" : "var(--text-low)",
+          cursor: props.disabled ? "default" : "pointer",
+          opacity: props.disabled ? 0.4 : 1,
+        }}
+      >
+        <Sigil name={rendering() ? "refresh" : active() ? "stop" : "play"} size={14} />
+      </button>
+    );
+  };
+
   const openClipsFolder = (): void => {
     void openSpeakClipsFolder();
   };
@@ -264,17 +312,14 @@ export function SpeakScreen(): JSX.Element {
                 const selected = (): boolean =>
                   app.selectedTtsVoice() === voice.id;
                 return (
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={selected()}
-                    onClick={() => app.setSelectedTtsVoice(voice.id)}
+                  // The card is a ROW, not a single button: the audition
+                  // control has to be a sibling of the radio rather than
+                  // inside it (see AuditionButton).
+                  <div
                     style={{
                       display: "flex",
-                      "align-items": "center",
-                      "justify-content": "space-between",
-                      gap: "var(--s2)",
-                      padding: "var(--s3) var(--s4)",
+                      "align-items": "stretch",
+                      gap: "var(--s1)",
                       "border-radius": "var(--r-md)",
                       border: `1px solid ${
                         selected() ? "var(--accent)" : "var(--line)"
@@ -282,34 +327,72 @@ export function SpeakScreen(): JSX.Element {
                       background: selected()
                         ? "var(--accent-soft, var(--surface-2))"
                         : "var(--surface-1)",
-                      color: "var(--text-high)",
-                      cursor: "pointer",
-                      "text-align": "left",
+                      overflow: "hidden",
                     }}
                   >
-                    <span
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={selected()}
+                      onClick={() => app.setSelectedTtsVoice(voice.id)}
                       style={{
                         display: "flex",
                         "align-items": "center",
+                        "justify-content": "space-between",
                         gap: "var(--s2)",
+                        flex: 1,
+                        "min-width": 0,
+                        padding: "var(--s3) var(--s4)",
+                        background: "transparent",
+                        border: "none",
+                        color: "var(--text-high)",
+                        cursor: "pointer",
+                        "text-align": "left",
                       }}
                     >
                       <span
                         style={{
-                          color: selected()
-                            ? "var(--accent)"
-                            : "var(--text-low)",
                           display: "flex",
+                          "align-items": "center",
+                          gap: "var(--s2)",
+                          "min-width": 0,
                         }}
                       >
-                        <Sigil name="wave" size={16} />
+                        <span
+                          style={{
+                            color: selected()
+                              ? "var(--accent)"
+                              : "var(--text-low)",
+                            display: "flex",
+                          }}
+                        >
+                          <Sigil name="wave" size={16} />
+                        </span>
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                            "white-space": "nowrap",
+                          }}
+                        >
+                          {voice.name}
+                        </span>
                       </span>
-                      {voice.name}
-                    </span>
-                    <Show when={!voice.installed}>
-                      <Badge tone="warning">Soon</Badge>
-                    </Show>
-                  </button>
+                      <Show when={!voice.installed}>
+                        <Badge tone="warning">Soon</Badge>
+                      </Show>
+                    </button>
+                    <AuditionButton
+                      voiceId={voice.id}
+                      voiceName={voice.name}
+                      disabled={!voice.installed || !app.engineRunning()}
+                      disabledReason={
+                        !voice.installed
+                          ? "This voice isn't installed yet"
+                          : "Start the engine to hear a preview"
+                      }
+                    />
+                  </div>
                 );
               }}
             </For>
@@ -548,6 +631,12 @@ export function SpeakScreen(): JSX.Element {
                               </Show>
                             </span>
                           </button>
+                          <AuditionButton
+                            voiceId={voice.id}
+                            voiceName={voice.name}
+                            disabled={!app.engineRunning()}
+                            disabledReason="Start the engine to hear a preview"
+                          />
                           {/* v1.43.0: rename — swaps this card into an inline
                               editor. Only the label changes; the voice keeps its
                               id, so the selection and saved clips are unaffected. */}

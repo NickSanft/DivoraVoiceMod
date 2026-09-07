@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,6 +82,14 @@ struct EngineStatus {
 /// active global-shortcut bindings.
 struct AppState {
     engine: Arc<AudioEngine>,
+    /// v1.47.0: monotonic id for the current audition.
+    ///
+    /// Preview synthesis runs on a blocking thread with no way to abort
+    /// it, so cancellation is expressed as invalidation instead: anything
+    /// that supersedes an audition bumps this, and a render whose captured
+    /// value no longer matches discards its result. Without it a slow
+    /// render lands late, stops whatever is playing, and plays itself.
+    preview_epoch: AtomicU64,
     preset_store: Arc<PresetStore>,
     clip_cache: Mutex<HashMap<String, DecodedClip>>,
     /// Maps a stable id (chosen by the frontend, e.g. "ptm") to the
@@ -651,6 +660,255 @@ async fn speak(
     })
     .await
     .map_err(|e| format!("synthesis task failed: {e}"))?
+}
+
+// ---- v1.47.0: tap-to-audition voice previews ----
+
+/// Mixer slot for auditions. Deliberately NOT [`TTS_CLIP_ID`]: a preview must
+/// not clobber the main Speak progress ring, and Speak's Stop must not kill a
+/// preview (or vice versa).
+const PREVIEW_CLIP_ID: &str = "tts-preview";
+
+/// The line every preview says.
+///
+/// Fixed rather than the user's own text for two reasons. Holding the content
+/// constant is what makes voices comparable by ear — the point of an audition.
+/// And a stable phrase is what makes the cache possible at all: keying on the
+/// text box would invalidate on every keystroke, which for a `VoxCPM` clone
+/// means paying seconds of synthesis per tap forever.
+///
+/// It carries a question and a statement, so you hear both rising and falling
+/// intonation, plus plosives and sibilants — and it is short, which bounds
+/// both synthesis cost and the rambling a single take can produce.
+const PREVIEW_TEXT: &str =
+    "Hi there — how does this sound to you? Give me a line and I'll read it back.";
+
+/// Bumped whenever [`PREVIEW_TEXT`] changes, so old cached audio is ignored
+/// without needing migration code. It is part of the preset cache filename and
+/// is checked against the clone sidecar.
+const PREVIEW_TEXT_VERSION: u32 = 1;
+
+/// Preset previews live in their own directory; presets have no per-voice
+/// folder to hang them off. Sibling of `speak-clips/`.
+fn preview_cache_dir(state: &AppState) -> PathBuf {
+    state.recordings_dir.parent().map_or_else(
+        || state.recordings_dir.join("preview-cache"),
+        |p| p.join("preview-cache"),
+    )
+}
+
+/// Where a voice's cached preview lives.
+///
+/// A cloned voice keeps its preview INSIDE its own directory, next to
+/// `reference.wav` and `meta.json`. That placement buys correctness for free:
+/// deleting the voice deletes the preview with it, and a rename touches only
+/// `meta.json` (the id is stable), so a rename correctly does NOT invalidate —
+/// the label changed, the timbre did not.
+fn preview_path(state: &AppState, voice_id: &str) -> Option<PathBuf> {
+    if !is_safe_voice_id(voice_id) {
+        return None;
+    }
+    let cloned = cloned_voices_dir(&state.voices_dir).join(voice_id);
+    if cloned.is_dir() {
+        return Some(cloned.join(format!("preview-v{PREVIEW_TEXT_VERSION}.wav")));
+    }
+    Some(preview_cache_dir(state).join(format!("{voice_id}-v{PREVIEW_TEXT_VERSION}.wav")))
+}
+
+/// Read a cached preview back as raw mono samples.
+fn read_preview(path: &Path) -> Option<(Vec<f32>, u32)> {
+    let mut reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_format != hound::SampleFormat::Float {
+        return None;
+    }
+    // Fail on the FIRST read error rather than filtering errors away: hound
+    // drives this from the declared data-chunk length, so a truncated file
+    // yields Err at EOF. Dropping that would hand back a short-but-non-empty
+    // buffer and serve it as a valid cache hit — exactly what the temp-file
+    // write dance exists to prevent.
+    let samples = reader
+        .samples::<f32>()
+        .collect::<Result<Vec<f32>, _>>()
+        .ok()?;
+    if samples.is_empty() {
+        return None;
+    }
+    Some((samples, spec.sample_rate))
+}
+
+/// Write a rendered preview to the cache. Best-effort: a cache we cannot write
+/// costs a re-render next time, nothing more.
+fn write_preview(path: &Path, samples: &[f32], sample_rate: u32) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(?e, "could not create preview cache dir");
+            return;
+        }
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    // Write beside then rename, so an interrupted write cannot leave a
+    // truncated file that would then be served as a valid cache hit.
+    // Unique per call: two renders of the same voice can genuinely be in
+    // flight (one the user abandoned, plus the one they asked for next), and a
+    // shared temp name would let them interleave into a single file and publish
+    // one take's header over another take's tail.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = path.with_extension(format!("{}.{nanos}.part", std::process::id()));
+    match hound::WavWriter::create(&tmp, spec) {
+        Ok(mut w) => {
+            let mut write_failed = false;
+            for &sample in samples {
+                if w.write_sample(sample).is_err() {
+                    write_failed = true;
+                    break;
+                }
+            }
+            // A disk-full mid-write can still finalize cleanly, stamping a
+            // header for however many samples landed — so a write error is
+            // fatal rather than publishing a silently short preview.
+            if write_failed || w.finalize().is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(?e, "could not write preview wav");
+            // hound already opened the file, so a mid-header failure leaves
+            // debris nothing else would ever clean up.
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// v1.47.0: play a short fixed sample in `voice_id` so the user can shop for a
+/// voice by ear.
+///
+/// Deliberately a separate command rather than a flag on [`speak`], because
+/// three of its behaviours are wrong for an audition:
+///
+/// 1. `speak` saves every utterance to the user's Saved clips *before* it
+///    branches on `preview_only`, so auditions would fill that library with
+///    dozens of identical entries.
+/// 2. It renders at the user's best-of-N tier — up to 6 takes, tens of
+///    seconds. An audition answers "is this the right voice?", which one take
+///    answers, so this forces N=1.
+/// 3. It shares the `tts` mixer slot with the main Speak button.
+///
+/// Returns the clip duration in seconds. Cached renders return near-instantly.
+#[tauri::command]
+async fn preview_voice(
+    app: AppHandle,
+    voice_id: String,
+    use_gpu: Option<bool>,
+) -> Result<f32, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<f32, String> {
+        let state = app.state::<AppState>();
+        // Claim this audition. Anything that supersedes it — another preview or
+        // an explicit stop — bumps the epoch, and the check before playback
+        // then discards this render.
+        let epoch = state.preview_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let cache = preview_path(&state, &voice_id);
+
+        let cached = cache.as_deref().and_then(read_preview);
+        let (samples, sample_rate) = if let Some(hit) = cached {
+            hit
+        } else {
+            let to_err = |e: divora_core::tts::TtsError| e.to_string();
+            let audio = match load_cloned_voice(&state.voices_dir, &voice_id) {
+                // N=1: an audition is not a production take.
+                //
+                // The GPU flag is passed through rather than hardcoded:
+                // `speak_voxcpm` keeps ONE shared engine and rebuilds all four
+                // ONNX graphs (~1.6 GB) whenever the requested mode differs
+                // from the cached one. Forcing CPU here would tear down a GPU
+                // user's engine for an audition, then force another rebuild on
+                // their very next Speak.
+                Some(ClonedVoice::VoxCpm { reference }) => speak_voxcpm(
+                    &app,
+                    &state,
+                    PREVIEW_TEXT,
+                    &reference,
+                    1,
+                    use_gpu.unwrap_or(false),
+                )?,
+                Some(ClonedVoice::OpenVoice { se, base }) => divora_core::tts::synthesize_cloned(
+                    PREVIEW_TEXT,
+                    &base,
+                    &se,
+                    &state.tts_assets_dir,
+                    &clone_dir(&state),
+                    CLONE_TAU,
+                )
+                .map_err(to_err)?,
+                None => {
+                    divora_core::tts::synthesize(PREVIEW_TEXT, &voice_id, &state.tts_assets_dir)
+                        .map_err(to_err)?
+                }
+            };
+            if let Some(path) = cache.as_deref() {
+                write_preview(path, &audio.samples, audio.sample_rate);
+            }
+            (audio.samples, audio.sample_rate)
+        };
+
+        #[allow(clippy::cast_precision_loss)]
+        let duration_secs = if sample_rate == 0 {
+            0.0
+        } else {
+            samples.len() as f32 / sample_rate as f32
+        };
+
+        // Superseded while rendering? Drop the result silently: it must not
+        // stop the audition the user is actually listening to, and it must not
+        // play itself long after they moved on.
+        if state.preview_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(0.0);
+        }
+        // Stop any preview already playing BEFORE starting this one. The mixer
+        // takes an idle slot rather than replacing a same-id voice, so without
+        // this, shopping quickly through the grid plays several voices at once
+        // — the exact opposite of what an audition is for.
+        state.engine.send_soundboard(SoundboardCommand::Stop {
+            clip_id: PREVIEW_CLIP_ID.to_string(),
+        });
+        // Monitor-only: auditioning is for you, not for the call.
+        state
+            .engine
+            .send_soundboard(SoundboardCommand::PlayMonitorOnly {
+                clip_id: PREVIEW_CLIP_ID.to_string(),
+                samples: Arc::new(samples),
+                sample_rate,
+                gain: 1.0,
+            });
+        Ok(duration_secs)
+    })
+    .await
+    .map_err(|e| format!("preview task failed: {e}"))?
+}
+
+/// Stop a preview, and invalidate any render still in flight.
+///
+/// Bumping the epoch is the half that matters for an uncached clone: the mixer
+/// Stop only silences a clip that is already sounding, and the render itself
+/// cannot be aborted — so it is invalidated instead and discards its result.
+#[tauri::command]
+fn stop_preview_voice(state: State<'_, AppState>) {
+    state.preview_epoch.fetch_add(1, Ordering::AcqRel);
+    state.engine.send_soundboard(SoundboardCommand::Stop {
+        clip_id: PREVIEW_CLIP_ID.to_string(),
+    });
 }
 
 /// Stop any in-flight synthesized speech playing through the mixer.
@@ -1922,6 +2180,7 @@ pub fn run() {
 
             app.manage(AppState {
                 engine,
+                preview_epoch: AtomicU64::new(0),
                 preset_store,
                 clip_cache: Mutex::new(HashMap::new()),
                 shortcuts: Mutex::new(HashMap::new()),
@@ -1991,6 +2250,8 @@ pub fn run() {
             list_tts_voices,
             speak,
             stop_speak,
+            preview_voice,
+            stop_preview_voice,
             speak_clips_dir,
             open_speak_clips_folder,
             list_speak_clips,
@@ -2022,10 +2283,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloned_voices_dir, default_clone_base, list_cloned_voice_infos, rename_cloned_voice_in,
-        save_tts_clip, scan_voice_dir, slugify_preset_id, unique_preset_id, ClonedMeta,
-        EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
-        MAX_CLONE_NAME_LEN,
+        cloned_voices_dir, default_clone_base, list_cloned_voice_infos, read_preview,
+        rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, unique_preset_id,
+        write_preview, ClonedMeta, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip,
+        VoiceInfo, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION,
+        TTS_CLIP_ID,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2281,6 +2543,101 @@ mod tests {
         let mut out: Vec<VoiceInfo> = Vec::new();
         scan_voice_dir(&PathBuf::from("/no/such/voices/dir"), &mut out);
         assert!(out.is_empty());
+    }
+
+    // ---- v1.47.0: voice-preview cache ----
+
+    #[test]
+    fn preview_round_trips_through_the_cache() {
+        let dir = scratch("preview-rt");
+        let path = dir.join("preview-v1.wav");
+        let samples: Vec<f32> = (0..480)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / 24_000.0;
+                (t * 440.0).sin() * 0.4
+            })
+            .collect();
+        write_preview(&path, &samples, 24_000);
+        assert!(path.is_file(), "cache file should exist");
+
+        let (back, rate) = read_preview(&path).expect("cached preview must read back");
+        assert_eq!(rate, 24_000);
+        assert_eq!(back.len(), samples.len());
+        for (a, b) in samples.iter().zip(&back) {
+            assert!((a - b).abs() < 1e-6, "sample mismatch {a} vs {b}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A half-written file must not be served as a cache hit — the writer goes
+    /// through a `.part` file and renames, so an interrupted write leaves the
+    /// cache absent rather than truncated.
+    #[test]
+    fn an_interrupted_write_leaves_no_cache_entry() {
+        let dir = scratch("preview-partial");
+        let path = dir.join("preview-v1.wav");
+        fs::create_dir_all(&dir).unwrap();
+        // Simulate the debris of a failed write.
+        fs::write(path.with_extension("part"), b"not a wav").unwrap();
+        assert!(
+            read_preview(&path).is_none(),
+            "no cache entry should be visible"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_non_wav_file_is_not_treated_as_a_cache_hit() {
+        let dir = scratch("preview-junk");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preview-v1.wav");
+        fs::write(&path, b"definitely not a wav").unwrap();
+        assert!(read_preview(&path).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The filename carries the phrase version, so changing `PREVIEW_TEXT` in a
+    /// future release ignores every stale render with no migration code.
+    #[test]
+    fn the_cache_filename_is_version_stamped() {
+        let dir = scratch("preview-ver");
+        let path = dir.join(format!("preview-v{PREVIEW_TEXT_VERSION}.wav"));
+        write_preview(&path, &[0.1_f32; 64], 24_000);
+        assert!(path.is_file());
+        // A different version reads as a miss rather than as stale audio.
+        let other = dir.join(format!("preview-v{}.wav", PREVIEW_TEXT_VERSION + 1));
+        assert!(read_preview(&other).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The preview phrase is what makes caching viable, and it is also what a
+    /// user hears when comparing voices — pin its shape.
+    #[test]
+    fn the_preview_phrase_is_short_and_carries_both_intonations() {
+        let n = PREVIEW_TEXT.chars().count();
+        // Long enough to judge a voice, short enough to sit through and to
+        // bound synthesis cost on the slow (cloned) path.
+        assert!(
+            (40..=160).contains(&n),
+            "preview phrase should be 40-160 chars, got {n}"
+        );
+        assert!(
+            PREVIEW_TEXT.contains('?'),
+            "needs a question for rising intonation"
+        );
+        assert!(
+            PREVIEW_TEXT.contains('.'),
+            "needs a statement for falling intonation"
+        );
+    }
+
+    /// The preview slot must be distinct from the main Speak slot, or an
+    /// audition would clobber the Speak progress ring and the two Stop buttons
+    /// would kill each other.
+    #[test]
+    fn the_preview_clip_slot_is_distinct_from_speak() {
+        assert_ne!(PREVIEW_CLIP_ID, TTS_CLIP_ID);
     }
 
     // ---- v1.43.0: renaming a cloned voice ------------------------------

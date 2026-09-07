@@ -171,3 +171,55 @@ describe("SpeakScreen — rename a cloned voice (v1.43.0)", () => {
     expect(getByRole("textbox", { name: "Rename My Voice" })).toBeTruthy();
   });
 });
+
+describe("SpeakScreen — tap-to-audition previews (v1.47.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("the preset card keeps its radio semantics after the restructure", async () => {
+    seedInvoke([]);
+    const { findByRole } = setupScreen();
+    // The card was split from ONE role=radio button into a row (radio +
+    // sibling audition button), because role=radio is a leaf role and a nested
+    // button is unreachable to assistive tech. The radio must survive that.
+    const radio = await findByRole("radio", { name: /Aria/ });
+    expect(radio.getAttribute("aria-checked")).toBeTruthy();
+  });
+
+  it("exposes a Preview button per preset voice", async () => {
+    seedInvoke([]);
+    const { findByRole } = setupScreen();
+    const play = await findByRole("button", { name: "Preview Aria" });
+    expect(play).toBeTruthy();
+  });
+
+  it("disables the preview with a reason when the engine is stopped", async () => {
+    seedInvoke([]);
+    const { findByRole } = setupScreen();
+    const play = (await findByRole("button", {
+      name: "Preview Aria",
+    })) as HTMLButtonElement;
+    // The engine is stopped in this harness. Auditioning with no output stream
+    // would render into silence, which reads as a broken feature — so the
+    // button says why instead of doing nothing.
+    expect(play.disabled).toBe(true);
+    expect(play.getAttribute("title")).toMatch(/start the engine/i);
+  });
+
+  it("the audition button is a SIBLING of the radio, never a descendant", async () => {
+    seedInvoke([]);
+    const { findByRole } = setupScreen();
+    const radio = await findByRole("radio", { name: /Aria/ });
+    const play = await findByRole("button", { name: "Preview Aria" });
+    // role=radio is a leaf role: a nested button would be unreachable to
+    // assistive tech, which is the whole reason the preset card was split from
+    // a single button into a row.
+    expect(radio.contains(play)).toBe(false);
+  });
+});

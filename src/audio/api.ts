@@ -366,6 +366,28 @@ export async function speak(
   return invoke<number>("speak", { text, voiceId, gain, previewOnly, candidates, useGpu });
 }
 
+/**
+ * v1.47.0: play a short fixed sample in `voiceId` so a voice can be judged by
+ * ear before committing to it. Monitor-only, one take, and cached to disk —
+ * a repeat audition of the same voice is instant.
+ *
+ * Separate from {@link speak} on purpose: `speak` saves every utterance to the
+ * Saved clips library and renders at the user's best-of-N tier, neither of
+ * which is right for an audition.
+ */
+export async function previewVoice(
+  voiceId: string,
+  useGpu?: boolean,
+): Promise<number> {
+  return invoke<number>("preview_voice", { voiceId, useGpu });
+}
+
+/** v1.47.0: stop a preview that is currently playing. */
+export async function stopPreviewVoice(): Promise<void> {
+  await invoke("stop_preview_voice");
+}
+
+
 /** Stop any in-flight synthesized speech playing through the mixer. */
 export async function stopSpeak(): Promise<void> {
   await invoke("stop_speak");

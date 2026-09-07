@@ -43,6 +43,8 @@ import {
   deleteClonedVoice,
   renameClonedVoice,
   setReactiveConfig,
+  previewVoice,
+  stopPreviewVoice,
   cloneModelsStatus,
   downloadCloneModels,
   stopAllSoundboardClips,
@@ -533,6 +535,24 @@ describe("audio api", () => {
     expect(invokeMock).toHaveBeenCalledWith("delete_cloned_voice", {
       id: "my-voice",
     });
+  });
+
+  it("previewVoice forwards just the voice id (v1.47.0)", async () => {
+    invokeMock.mockResolvedValueOnce(1.4);
+    const secs = await previewVoice("af_heart");
+    // A distinct command, NOT speak with a flag: speak saves every utterance
+    // to the Saved clips library and renders at the user's best-of-N tier.
+    expect(invokeMock).toHaveBeenCalledWith("preview_voice", {
+      voiceId: "af_heart",
+      useGpu: undefined,
+    });
+    expect(secs).toBe(1.4);
+  });
+
+  it("stopPreviewVoice invokes stop_preview_voice (v1.47.0)", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await stopPreviewVoice();
+    expect(invokeMock).toHaveBeenCalledWith("stop_preview_voice");
   });
 
   it("setReactiveConfig forwards the whole config (v1.46.0)", async () => {
