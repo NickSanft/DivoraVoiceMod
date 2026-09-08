@@ -1,9 +1,10 @@
 import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
+import { changelogPlugin } from "./vite/changelog-plugin";
 
 export default defineConfig({
-  plugins: [solid()],
+  plugins: [solid(), changelogPlugin()],
   clearScreen: false,
   server: {
     port: 1420,

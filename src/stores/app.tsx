@@ -113,6 +113,14 @@ import {
   type CalibrationResult,
 } from "../audio/calibration";
 import { checkForUpdate, type UpdateInfo } from "../data/updates";
+import {
+  decideWhatsNew,
+  notesSince,
+  RELEASE_NOTES,
+  RENDER_CAP,
+  type ReleaseNote,
+  type WhatsNewContent,
+} from "../data/changelog";
 import { evaluateDiagnostics, type DiagCheck } from "../audio/diagnostics";
 import {
   makeTemplate,
@@ -240,7 +248,13 @@ const STORAGE_KEYS = {
   cloneQuality: "divora.cloneQuality",
   speakMonitor: "divora.speakMonitor",
   cloneGpu: "divora.cloneGpu",
+  whatsNewSeenVersion: "divora.whatsNewSeenVersion",
 } as const;
+
+/** The first-run wizard's own key (it manages its own state in
+ *  components/Wizard.tsx). Read here only to tell a brand-new install
+ *  apart from an existing user who just updated. */
+const WIZARD_SEEN_KEY = "divora.wizardSeen";
 
 /** Read + parse a JSON blob from localStorage; return `fallback` on miss / parse failure. */
 function loadJson<T>(key: string, fallback: T): T {
@@ -261,6 +275,29 @@ function saveJson(key: string, value: unknown): void {
     window.localStorage.setItem(key, JSON.stringify(value));
   } catch {
     /* quota, private mode, etc — non-fatal */
+  }
+}
+
+/** Read a bare string (not JSON) — for keys shared with code that stores
+ *  plain values, like the wizard's flag. */
+function loadRaw(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/** Write a bare string. Returns false when storage refused it, which the
+ *  what's-new trigger uses to avoid re-announcing on every launch. */
+function saveRaw(key: string, value: string): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    window.localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -715,6 +752,24 @@ export interface AppState {
   /** Run the update check. No-op when disabled, in a dev build, or off
    *  Tauri (browser / E2E never hit the network). */
   checkUpdates: () => Promise<void>;
+
+  // What's new (v1.49.0)
+  /** Release notes to show, or null when there's nothing to announce.
+   *  Content is bundled at build time — no network, no fetch to fail. */
+  whatsNewContent: () => WhatsNewContent | null;
+  /** The release the post-update banner is advertising, or null. */
+  whatsNewBanner: () => ReleaseNote | null;
+  /** True while the What's new panel is open. */
+  whatsNewOpen: () => boolean;
+  /** Open the panel. With no argument (Settings -> About) it shows the
+   *  most recent releases rather than only what changed for this user. */
+  openWhatsNew: () => void;
+  closeWhatsNew: () => void;
+  /** Hide the banner without opening the panel. */
+  dismissWhatsNewBanner: () => void;
+  /** Decide whether this launch should announce anything. Runs once per
+   *  process; silent on dev builds and brand-new installs. */
+  checkWhatsNew: () => Promise<void>;
 
   // Setup diagnostic (v1.13.0)
   /** Last "Test my setup" result, or null if never run. */
@@ -2228,6 +2283,69 @@ export function createAppState(): AppState {
     }
   };
 
+  // What's new (v1.49.0). Content is compiled in from CHANGELOG.md, so
+  // this never touches the network and can't disagree with the running
+  // build. See src/data/changelog.ts for the trigger rules.
+  const [whatsNewContent, setWhatsNewContent] =
+    createSignal<WhatsNewContent | null>(null);
+  const [whatsNewBanner, setWhatsNewBanner] = createSignal<ReleaseNote | null>(
+    null,
+  );
+  const [whatsNewOpen, setWhatsNewOpen] = createSignal(false);
+
+  const openWhatsNew = (): void => {
+    // Opened deliberately from Settings: show recent releases even when
+    // there's nothing new for this user, so the entry is never a dead end.
+    if (whatsNewContent() === null) {
+      setWhatsNewContent({
+        notes: RELEASE_NOTES.slice(0, RENDER_CAP),
+        moreCount: 0,
+        moreUnknown: RELEASE_NOTES.length > RENDER_CAP,
+      });
+    }
+    setWhatsNewBanner(null);
+    setWhatsNewOpen(true);
+  };
+  const closeWhatsNew = (): void => {
+    setWhatsNewOpen(false);
+  };
+  const dismissWhatsNewBanner = (): void => {
+    setWhatsNewBanner(null);
+  };
+
+  let whatsNewChecked = false;
+  const checkWhatsNew = async (): Promise<void> => {
+    // Once per process. A second pass could only re-announce something
+    // already dismissed.
+    if (whatsNewChecked) return;
+    whatsNewChecked = true;
+    let version: string | null = null;
+    try {
+      const { getVersion } = await import("@tauri-apps/api/app");
+      version = await getVersion().catch(() => null);
+    } catch {
+      return; // not under Tauri (browser preview / E2E)
+    }
+    const decision = decideWhatsNew({
+      version,
+      lastSeen: loadRaw(STORAGE_KEYS.whatsNewSeenVersion),
+      wizardSeen: loadRaw(WIZARD_SEEN_KEY) !== null,
+    });
+    if (decision.action === "none" || !version) return;
+
+    // Record BEFORE announcing, not on dismiss. If the user closes the app
+    // with the banner still up — or it never gets dismissed at all — the
+    // next launch must stay quiet. Firefox's "just updated on every start"
+    // bug is this write going missing; fail closed.
+    saveRaw(STORAGE_KEYS.whatsNewSeenVersion, version);
+    if (decision.action === "seed") return;
+
+    const content = notesSince(decision.since, version);
+    if (content.notes.length === 0) return;
+    setWhatsNewContent(content);
+    setWhatsNewBanner(content.notes[0] ?? null);
+  };
+
   // Setup diagnostic (v1.13.0). Frontend-orchestrated over existing
   // commands; careful with the engine — restores its prior run-state.
   const [diagnostics, setDiagnostics] = createSignal<DiagCheck[] | null>(null);
@@ -3043,6 +3161,13 @@ export function createAppState(): AppState {
     dismissUpdate,
     updateChecking,
     checkUpdates,
+    whatsNewContent,
+    whatsNewBanner,
+    whatsNewOpen,
+    openWhatsNew,
+    closeWhatsNew,
+    dismissWhatsNewBanner,
+    checkWhatsNew,
 
     diagnostics,
     diagnosing,

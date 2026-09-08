@@ -23,6 +23,7 @@ import {
 } from "./audio/api";
 import { OVERLAY_EVENT, overlayPayload } from "./overlay/state";
 import { Wizard } from "./components/Wizard";
+import { WhatsNewBanner, WhatsNewModal } from "./components/WhatsNew";
 import { Sidebar } from "./shell/Sidebar";
 import { Titlebar } from "./shell/Titlebar";
 import { MixerScreen } from "./screens/MixerScreen";
@@ -271,6 +272,11 @@ function Shell(): JSX.Element {
       // no telemetry; no-ops off Tauri / in dev). Never blocks startup.
       void app.checkUpdates();
 
+      // v1.49.0: decide whether this launch has anything to announce.
+      // Purely local (notes are compiled in), runs once per process, and
+      // stays silent on a brand-new install and on dev builds.
+      void app.checkWhatsNew();
+
       // Phase 15: re-scan the persisted soundboard folder (restored from
       // localStorage) so its tiles + per-tile hotkeys are live without
       // the user re-picking the folder each launch.
@@ -441,9 +447,11 @@ function Shell(): JSX.Element {
               <SettingsScreen />
             </Match>
           </Switch>
+          <WhatsNewBanner />
           <Wizard />
         </div>
       </div>
+      <WhatsNewModal />
     </div>
   );
 }

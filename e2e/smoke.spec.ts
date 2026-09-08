@@ -158,6 +158,37 @@ test.describe("in-app update check (v1.12)", () => {
   });
 });
 
+test.describe("what's new (v1.49)", () => {
+  test("About opens release notes with no network at all", async ({ page }) => {
+    // Fail any outbound request: the notes are compiled into the bundle,
+    // so the panel must render fully offline. If this ever starts fetching,
+    // this test is what catches it.
+    await page.route("**/*", (route) =>
+      route.request().url().startsWith("http://localhost")
+        ? route.continue()
+        : route.abort(),
+    );
+
+    await nav(page, "Settings").click();
+    await page.getByRole("button", { name: /What.s new/i }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible();
+    // Newest release, its headline, and formatted (not raw) markdown.
+    await expect(dialog.getByRole("heading", { level: 3 }).first()).toBeVisible();
+    await expect(dialog).not.toContainText("**");
+    await expect(
+      dialog.getByRole("button", { name: /Full changelog/i }),
+    ).toBeVisible();
+
+    // No banner off Tauri: there is no app version to compare against.
+    await expect(page.locator('[role="status"]')).toHaveCount(0);
+
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+  });
+});
+
 test.describe("setup diagnostic (v1.13)", () => {
   test("'Test my setup' runs and renders a results checklist", async ({
     page,

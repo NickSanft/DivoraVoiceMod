@@ -45,6 +45,10 @@ DivoraVoice ships one tagged release at a time. Each follows the **same loop**, 
    - `pnpm test`
    - `pnpm tauri build --debug --no-bundle`
 4. **Update [`CHANGELOG.md`](../CHANGELOG.md)** — a dated entry with Added / Changed / Fixed, the test deltas, and the local pre-push results.
+   - Since v1.49.0 the changelog has **a second audience**: `Added` / `Changed` / `Fixed` / `Removed` bullets from the newest releases are compiled into the app and shown in **What’s new** (see [`src/data/changelog-parse.ts`](../src/data/changelog-parse.ts)). Every other section (`Tests`, `Pre-push checklist`, `Architecture notes`, …) stays developer-only and never ships.
+   - So write each bullet’s **first sentence to stand alone in-app**, and keep the `— Title` on the version heading short — it becomes the headline.
+   - For a release with nothing user-visible, put `<!-- whatsnew:skip -->` under the heading (invisible on GitHub) to keep it out of the app.
+   - The heading format is parsed strictly; a shape the parser can’t read **fails the build** rather than silently emptying the panel.
 5. **Commit** with a detailed multi-line message.
 6. **Push** to `main`.
 7. **Watch CI** until green.

@@ -1,8 +1,9 @@
 import { defineConfig } from "vitest/config";
 import solid from "vite-plugin-solid";
+import { changelogPlugin } from "./vite/changelog-plugin";
 
 export default defineConfig({
-  plugins: [solid()],
+  plugins: [solid(), changelogPlugin()],
   test: {
     environment: "jsdom",
     globals: true,

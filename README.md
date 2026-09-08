@@ -44,6 +44,7 @@ Each release lists **SHA-256 checksums** for the `.msi` and `-setup.exe` in its 
 - **System tray** — minimize to tray so audio keeps running in the background during calls/games.
 - **First-run wizard** with VB-Cable detection + device picker + Discord routing instructions, plus a **"Test my setup"** routing diagnostic and **guided mic calibration** that auto-sets the noise gate.
 - **Light theme** alongside the arcane color moods, and a **privacy-respecting in-app update check** (one-way version read, no telemetry).
+- **What’s new** — after an update, a dismissible banner opens release notes covering everything since the version you were last on. The notes are compiled into the app, so the panel downloads nothing and always matches the build you’re running.
 - **Sub-30 ms end-to-end latency** on consumer hardware (sub-26 ms even with the phase-vocoder pitch shifter active).
 - **Automatic sample-rate matching** via rubato — mismatched mic/output rates no longer hard-fail.
 

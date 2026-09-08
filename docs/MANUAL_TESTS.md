@@ -460,6 +460,33 @@ resource dir), same as the AI voice-conversion models.
 - [ ] Force a GPU-unavailable case (machine without a usable DX12 GPU, or rename `DirectML.dll`): with the toggle on, **Speak** still produces correct audio — it **falls back to CPU** silently (never a hang or crash).
 - [ ] Restart with GPU on → the toggle persists and Speak still works.
 
+## What's new (v1.49.0)
+
+These need a real installed build — a dev build reports version `0.0.0` and
+deliberately does nothing here.
+
+- [ ] Install over an older version. On first launch a banner appears near the
+      bottom reading "Updated to v1.49.0 — What's new".
+- [ ] The banner does **not** block anything: the Mixer is fully usable behind
+      it, and Start/Stop still work with it on screen.
+- [ ] "See what's new" opens the panel; it lists **every** release since the one
+      previously installed, newest first, not just the newest.
+- [ ] Bold lead-ins and `code` spans render as formatting — no stray `**`
+      or backticks anywhere in the panel.
+- [ ] Close the panel and relaunch the app: **nothing** is announced again.
+- [ ] Dismiss the banner with × (without opening the panel), relaunch:
+      still nothing announced.
+- [ ] Quit with the banner still showing, relaunch: still nothing announced
+      (the version is recorded when shown, not when dismissed).
+- [ ] Settings → About → "What's new" opens the panel at any time, including
+      when nothing is new.
+- [ ] Escape closes the panel; so does clicking the dimmed backdrop.
+- [ ] "Full changelog" opens the GitHub CHANGELOG in the default browser.
+- [ ] Disconnect from the network entirely, then open the panel from About —
+      it renders identically (the notes ship with the app).
+- [ ] On a **fresh** install (clear `%APPDATA%` and browser storage first):
+      the first-run wizard appears and **no** what's-new banner is shown.
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.

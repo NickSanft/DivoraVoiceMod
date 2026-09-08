@@ -257,6 +257,7 @@ to defaults (never throw).
 | `divora.ttsVolume` | "Speak" playback volume (linear 0..2) — v1.18.0 |
 | `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
+| `divora.whatsNewSeenVersion` | last app version whose release notes were announced (bare string, not JSON) — v1.49.0 |
 
 ---
 

@@ -4,6 +4,41 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.49.0] — 2026-09-08 — What’s new
+
+### Added
+
+- **What’s new.** After an update a small banner names the release and opens a panel listing everything that changed **since the version you were last running** — not just the newest one, so skipping a few updates no longer hides anything. It’s a banner rather than a pop-up dialog on purpose: launching this app usually means you’re about to get on mic, and the first-run wizard is the only thing entitled to block. Reachable any time from **Settings → About**.
+- **The notes ship inside the app.** They’re compiled in from this changelog when the app is built, so opening the panel downloads nothing, works offline, and always describes the build you’re actually running — rather than the newest release on GitHub, which is a different thing whenever you’re a version or two behind.
+
+### Changed
+
+- **A brand-new install stays quiet.** Nothing is announced on a first launch — there is no “since” to report — and the panel is still there under Settings for anyone curious.
+
+### Tests
+
+- `changelog-parse.test.ts` (14) runs the parser against the **real** CHANGELOG.md, not a fixture: heading shapes, the `Unreleased` exclusion, developer-only section filtering, the skip marker, sub-bullets, inline bold/italic/code, and link flattening. Mutation-verified — accepting every section, ignoring the skip marker, emitting empty releases, and swallowing an unreadable heading each fail it.
+- `changelog.test.ts` (11) covers the trigger rules and the range query, including the dev-build case, a corrupt marker, and the “earlier releases exist beyond what we bundle” flag.
+- `WhatsNew.test.tsx` (13) drives the launch check end to end — fresh install, upgrade, multi-version gap, already-seen, dev build, once-per-process — plus markdown rendering as real elements and the banner/panel interactions.
+
+### Architecture notes
+
+- The parser runs at **build time** (`vite/changelog-plugin.ts` → `virtual:changelog`), so the bundle carries ~12 KB of typed entries instead of a 215 KB markdown file plus a runtime parser — and no markdown dependency joins a deliberately seven-dependency `package.json`. Rendering walks typed spans into real elements, so there is no `innerHTML` path for changelog text.
+- The plugin is registered in **both** `vite.config.ts` and `vitest.config.ts` (separate configs) from one shared factory, so the two can’t drift.
+- A heading the parser can’t read **throws during the build** rather than being skipped, so a future reformat fails CI instead of silently emptying the panel for users.
+- The seen-marker is written *before* the banner is shown, not on dismiss: closing the app with the banner still up must not re-announce on the next launch.
+
+### Pre-push checklist (local, 2026-09-08)
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (316)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (438, +38)
+- `pnpm test:e2e` — pass (15, +1)
+- `pnpm tauri build --debug --no-bundle` — pass
+- Bundle: parsed notes are 12,300 bytes for 12 releases (CHANGELOG.md itself is 218 KB). Verified in `dist/`: v1.45.0 (skip-marked) absent, `[Unreleased]` absent, and no `Tests` / `Pre-push checklist` content leaked.
+
 ## [1.48.0] — 2026-09-04 — Bitcrusher
 
 ### Added
@@ -28,6 +63,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 - **Reactive effects.** Raise your voice and the character hardens with it — the drive digs in and the room opens up, then settles back as you drop to a normal level. Turn it on from the Mixer and set one **Intensity** control; a live meter shows exactly what it's hearing, so you can calibrate by talking rather than guessing. It follows your **dry** voice, before any effects, so it can't feed back on itself, and it only moves parameters that are safe to move continuously — nothing that would click or ring. Off by default; an untouched install is unchanged.
 
 ## [1.45.0] — 2026-09-04 — Shared envelope follower (internal)
+
+<!-- whatsnew:skip -->
 
 ### Changed
 

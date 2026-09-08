@@ -29,6 +29,7 @@ import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
+import { openExternal } from "../lib/openExternal";
 import { EFFECTS } from "../data/effects";
 import {
   MYSTICAL_BALANCED,
@@ -48,21 +49,6 @@ import type {
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
 const ISSUES_URL = "https://github.com/NickSanft/DivoraVoiceMod/issues/new";
-
-// Open a URL in the user's default browser. Lazy-loads the Tauri shell
-// plugin so the screen still renders in a browser preview that doesn't
-// have the Tauri bridge.
-async function openExternal(url: string): Promise<void> {
-  try {
-    const { open } = await import("@tauri-apps/plugin-shell");
-    await open(url);
-  } catch (err) {
-    console.warn("[settings] external open failed", err);
-    // Fall back to a normal anchor in case we're running in a browser
-    // preview without the Tauri shell plugin.
-    if (typeof window !== "undefined") window.open(url, "_blank", "noopener");
-  }
-}
 
 // HotkeyCapture takes/returns `string[]` (one chip per key). The store
 // keeps a single Tauri accelerator string ("Ctrl+Shift+P", "Space", "").
@@ -2041,6 +2027,13 @@ function AboutSection(): JSX.Element {
               MIT License · Tauri + SolidJS
             </div>
           </div>
+          <Button
+            variant="secondary"
+            icon="bolt"
+            onClick={app.openWhatsNew}
+          >
+            What&rsquo;s new
+          </Button>
           <Button
             variant="secondary"
             icon="github"
