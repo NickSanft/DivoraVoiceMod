@@ -161,6 +161,39 @@ describe("parseChangelog structure", () => {
     expect(parseChangelog(SAMPLE).map((n) => n.version)).toEqual(["2.0.0"]);
   });
 
+  it("ignores a \"## \" line inside a fenced code block", () => {
+    // Otherwise a future entry showing sample changelog markup, or a shell
+    // comment, would be read as a version heading and throw the build.
+    const md = [
+      "## [1.0.0] — 2026-01-01 — Real",
+      "",
+      "### Added",
+      "",
+      "- a thing",
+      "",
+      "```sh",
+      "## not a heading",
+      "```",
+      "",
+    ].join("\n");
+    const notes = parseChangelog(md);
+    expect(notes.map((n) => n.version)).toEqual(["1.0.0"]);
+  });
+
+  it("only skips on the marker alone on its line", () => {
+    // A bullet that merely mentions the marker (documenting it) must not
+    // make the release disappear.
+    const md = [
+      "## [1.0.0] — 2026-01-01 — Real",
+      "",
+      "### Added",
+      "",
+      "- Mark internal entries with `" + SKIP_MARKER + "` to hide them.",
+      "",
+    ].join("\n");
+    expect(parseChangelog(md).map((n) => n.version)).toEqual(["1.0.0"]);
+  });
+
   it("throws on a heading it cannot read, rather than skipping it", () => {
     // Fails the BUILD on a CHANGELOG reformat instead of quietly shipping
     // users a panel that's missing releases.

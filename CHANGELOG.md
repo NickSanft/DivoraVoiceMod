@@ -27,6 +27,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 - The plugin is registered in **both** `vite.config.ts` and `vitest.config.ts` (separate configs) from one shared factory, so the two can’t drift.
 - A heading the parser can’t read **throws during the build** rather than being skipped, so a future reformat fails CI instead of silently emptying the panel for users.
 - The seen-marker is written *before* the banner is shown, not on dismiss: closing the app with the banner still up must not re-announce on the next launch.
+- The parser tracks fenced code blocks (so a future entry showing sample markup can’t be misread as a version heading and fail the build), and the skip marker must be **alone on its line** — with `includes`, an entry documenting the marker would have skipped itself.
 
 ### Pre-push checklist (local, 2026-09-08)
 
@@ -34,7 +35,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
 - `cargo test --workspace --all-features` — pass (316)
 - `pnpm typecheck` — pass
-- `pnpm test` — pass (438, +38)
+- `pnpm test` — pass (440, +40)
 - `pnpm test:e2e` — pass (15, +1)
 - `pnpm tauri build --debug --no-bundle` — pass
 - Bundle: parsed notes are 12,300 bytes for 12 releases (CHANGELOG.md itself is 218 KB). Verified in `dist/`: v1.45.0 (skip-marked) absent, `[Unreleased]` absent, and no `Tests` / `Pre-push checklist` content leaked.

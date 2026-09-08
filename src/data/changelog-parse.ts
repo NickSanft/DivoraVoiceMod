@@ -103,8 +103,13 @@ function splitBlocks(markdown: string): RawBlock[] {
   const lines = markdown.split(/\r?\n/);
   const blocks: RawBlock[] = [];
   let current: RawBlock | null = null;
+  let inFence = false;
   for (const line of lines) {
-    if (!line.startsWith("## ")) {
+    // A fenced block can legitimately contain a "## " line (a shell
+    // comment, a sample changelog). Without this it would be read as a
+    // version heading and throw the build.
+    if (line.trimStart().startsWith("```")) inFence = !inFence;
+    if (inFence || !line.startsWith("## ")) {
       current?.lines.push(line);
       continue;
     }
@@ -133,7 +138,10 @@ function splitBlocks(markdown: string): RawBlock[] {
 }
 
 function parseBlock(block: RawBlock): ReleaseNote | null {
-  if (block.lines.some((l) => l.includes(SKIP_MARKER))) return null;
+  // Must be the marker ALONE on its line. `includes` would let a bullet
+  // that merely mentions the marker (documenting it, say) skip its own
+  // release.
+  if (block.lines.some((l) => l.trim() === SKIP_MARKER)) return null;
 
   const lead: string[] = [];
   const sections: Section[] = [];
