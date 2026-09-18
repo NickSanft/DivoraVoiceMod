@@ -28,6 +28,7 @@ The visual identity is **"spellcraft for your voice"** — a calm utility tool (
 
 - Cross-platform support in v1 (Windows only).
 - Named celebrity voice clones (legal risk; Morgan Freeman has publicly objected to AI clones). Archetype personas only.
+- Third-party franchise or character names in the product (voice names, UI strings, changelog entries). A voice inspired by a game gets an **original** name; the game may be named once, in plain text, in the README, alongside a non-affiliation line. Rationale: a vocal *style* isn't copyrightable, but GitHub is this project's only distribution channel, and a franchise owner's notice can disable a whole repository network (Nintendo did exactly that to an Animal Crossing-themed UI library and its 377 forks on 2026-09-03). The asymmetry, not the merits, decides it. See Critter Chatter (v1.50.0).
 - Cloud features, sign-in, telemetry.
 - Custom virtual audio driver (defer indefinitely; using VB-Cable instead).
 - VST plugin export. (Future: VST3 *host* support for advanced users.)
