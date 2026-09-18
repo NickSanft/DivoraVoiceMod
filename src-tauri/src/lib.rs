@@ -552,10 +552,66 @@ fn set_soundboard_master_gain(state: State<'_, AppState>, gain: f32) {
 // ---- v1.17.0: text-to-speech ("Speak") ----
 
 /// Stable clip id for synthesized speech in the soundboard mixer, so `speak`
-/// replaces any in-flight utterance and `stop_speak` can target it.
+/// can stop the previous utterance and `stop_speak` can target it. The id alone
+/// replaces nothing — see [`speak_commands`].
 const TTS_CLIP_ID: &str = "tts";
 
-/// List the preset "Speak" voices, each flagged with whether its model assets
+/// The mixer commands that start a Speak utterance: stop the previous one, then
+/// play this one.
+///
+/// The Stop is load-bearing. The mixer takes an idle slot rather than replacing
+/// a same-id voice, so without it every press stacks another voice on top of
+/// the last. A multi-second Kokoro render mostly hid that; a babble render is
+/// near-instant, so rapid presses would talk over themselves.
+fn speak_commands(
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+    gain: f32,
+    preview_only: bool,
+) -> [SoundboardCommand; 2] {
+    let clip_id = TTS_CLIP_ID.to_string();
+    let stop = SoundboardCommand::Stop {
+        clip_id: clip_id.clone(),
+    };
+    // Preview → monitor-only (you hear it, the call doesn't); otherwise the
+    // normal both-paths play used by the soundboard.
+    let play = if preview_only {
+        SoundboardCommand::PlayMonitorOnly {
+            clip_id,
+            samples,
+            sample_rate,
+            gain,
+        }
+    } else {
+        SoundboardCommand::Play {
+            clip_id,
+            samples,
+            sample_rate,
+            gain,
+        }
+    };
+    [stop, play]
+}
+
+/// Hand every command from [`speak_commands`] to `sink`, in order.
+///
+/// The send loop lives here rather than inline in [`speak`] so a test can
+/// watch what actually reaches the engine: a version that sent only the Play
+/// would look fine in a test that checked `speak_commands` alone.
+fn emit_speak(
+    mut sink: impl FnMut(SoundboardCommand),
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+    gain: f32,
+    preview_only: bool,
+) {
+    for cmd in speak_commands(samples, sample_rate, gain, preview_only) {
+        sink(cmd);
+    }
+}
+
+/// List the built-in "Speak" voices — Kokoro presets, then the procedural
+/// Critter Chatter (babble) voices — each flagged with whether its model assets
 /// are installed (so the UI can show "voice not installed" instead of failing
 /// on Speak). Never touches the ONNX runtime — pure filesystem probing.
 #[tauri::command]
@@ -563,10 +619,11 @@ fn list_tts_voices(state: State<'_, AppState>) -> Vec<divora_core::tts::TtsVoice
     divora_core::tts::list_voices(&state.tts_assets_dir)
 }
 
-/// Synthesize `text` with preset `voice_id` and play it through the output by
-/// reusing the soundboard mixer seam (so a Discord/stream listener hears it
-/// too, mixed with the live mic). Returns the clip duration in seconds for the
-/// playback progress ring.
+/// Synthesize `text` with `voice_id` (a Kokoro preset, a procedural babble
+/// voice, or a cloned voice) and play it through the output by reusing the
+/// soundboard mixer seam (so a Discord/stream listener hears it too, mixed with
+/// the live mic). Any utterance still playing is stopped first. Returns the
+/// clip duration in seconds for the playback progress ring.
 ///
 /// `gain` (v1.18.0, optional, default 1.0) is the linear playback volume.
 /// `preview_only` (v1.18.0, optional, default false) routes the speech to the
@@ -574,8 +631,9 @@ fn list_tts_voices(state: State<'_, AppState>) -> Vec<divora_core::tts::TtsVoice
 ///
 /// Synthesis is batch work; it runs here on the command's worker thread (as
 /// `play_soundboard_clip` decodes synchronously). Until the Kokoro model is
-/// staged, `synthesize` returns `NotInstalled` immediately, surfaced to the UI
-/// as a graceful error string rather than a hang.
+/// staged, `synthesize` returns `NotInstalled` immediately for a preset,
+/// surfaced to the UI as a graceful error string rather than a hang. Babble
+/// voices need no assets and render in well under a second.
 #[tauri::command]
 async fn speak(
     app: AppHandle,
@@ -598,7 +656,10 @@ async fn speak(
         let state = app.state::<AppState>();
         // A cloned-voice id routes through its stored engine: `VoxCPM` (accent-
         // preserving, from the reference clip) or OpenVoice (timbre-only, from
-        // the stored SE on the `am_puck` base). A preset id → plain Kokoro.
+        // the stored SE on the `am_puck` base). Anything else → `synthesize`,
+        // which renders presets with Kokoro and babble ids procedurally. A
+        // babble id can never resolve as a clone (its ':' fails
+        // `is_safe_voice_id`), so it never reaches the `VoxCPM` engine.
         let to_err = |e: divora_core::tts::TtsError| {
             tracing::info!(error = %e, voice = %voice_id, "speak: synthesis unavailable");
             e.to_string()
@@ -636,26 +697,13 @@ async fn speak(
             &text,
             &voice_id,
         );
-        let gain = gain.unwrap_or(1.0);
-        let clip_id = TTS_CLIP_ID.to_string();
-        // Preview → monitor-only (you hear it, the call doesn't); otherwise the
-        // normal both-paths play used by the soundboard.
-        let cmd = if preview_only.unwrap_or(false) {
-            SoundboardCommand::PlayMonitorOnly {
-                clip_id,
-                samples,
-                sample_rate,
-                gain,
-            }
-        } else {
-            SoundboardCommand::Play {
-                clip_id,
-                samples,
-                sample_rate,
-                gain,
-            }
-        };
-        state.engine.send_soundboard(cmd);
+        emit_speak(
+            |cmd| state.engine.send_soundboard(cmd),
+            samples,
+            sample_rate,
+            gain.unwrap_or(1.0),
+            preview_only.unwrap_or(false),
+        );
         Ok(duration_secs)
     })
     .await
@@ -705,14 +753,24 @@ fn preview_cache_dir(state: &AppState) -> PathBuf {
 /// `meta.json` (the id is stable), so a rename correctly does NOT invalidate —
 /// the label changed, the timbre did not.
 fn preview_path(state: &AppState, voice_id: &str) -> Option<PathBuf> {
+    preview_path_in(&state.voices_dir, &preview_cache_dir(state), voice_id)
+}
+
+/// [`preview_path`] over explicit directories, so it is testable.
+///
+/// `None` means "don't cache". That is the answer for an unsafe id, and so for
+/// every babble id (the ':' fails [`is_safe_voice_id`]) — deliberately: a babble
+/// preview renders near-instantly, and a cached one would keep playing the old
+/// sound after the synthesiser changes in an update.
+fn preview_path_in(voices_dir: &Path, cache_dir: &Path, voice_id: &str) -> Option<PathBuf> {
     if !is_safe_voice_id(voice_id) {
         return None;
     }
-    let cloned = cloned_voices_dir(&state.voices_dir).join(voice_id);
+    let cloned = cloned_voices_dir(voices_dir).join(voice_id);
     if cloned.is_dir() {
         return Some(cloned.join(format!("preview-v{PREVIEW_TEXT_VERSION}.wav")));
     }
-    Some(preview_cache_dir(state).join(format!("{voice_id}-v{PREVIEW_TEXT_VERSION}.wav")))
+    Some(cache_dir.join(format!("{voice_id}-v{PREVIEW_TEXT_VERSION}.wav")))
 }
 
 /// Read a cached preview back as raw mono samples.
@@ -806,7 +864,8 @@ fn write_preview(path: &Path, samples: &[f32], sample_rate: u32) {
 ///    answers, so this forces N=1.
 /// 3. It shares the `tts` mixer slot with the main Speak button.
 ///
-/// Returns the clip duration in seconds. Cached renders return near-instantly.
+/// Returns the clip duration in seconds. Cached renders return near-instantly;
+/// babble voices are never cached (see [`preview_path_in`]) and don't need to be.
 #[tauri::command]
 async fn preview_voice(
     app: AppHandle,
@@ -1129,6 +1188,10 @@ fn cloned_voices_dir(voices_dir: &Path) -> PathBuf {
 }
 
 /// Whether `id` is a single safe path component (no separators / traversal).
+///
+/// This is also what keeps engine-namespaced ids such as `babble:bright` out of
+/// the cloned-voice and preview-cache paths: ':' is not allowed, so they can
+/// never name (or collide with) a folder on disk.
 fn is_safe_voice_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() < 128
@@ -1138,7 +1201,8 @@ fn is_safe_voice_id(id: &str) -> bool {
 }
 
 /// Resolve a stored cloned voice for synthesis. `None` if `id` isn't a cloned
-/// voice. Branches on the stored `engine`: `VoxCPM` voices carry a
+/// voice — including every preset and babble id, which callers then hand to
+/// `tts::synthesize`. Branches on the stored `engine`: `VoxCPM` voices carry a
 /// `reference.wav`; `OpenVoice` voices (incl. pre-v2, no meta) carry `se.bin`.
 fn load_cloned_voice(voices_dir: &Path, id: &str) -> Option<ClonedVoice> {
     if !is_safe_voice_id(id) {
@@ -2283,14 +2347,18 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloned_voices_dir, default_clone_base, list_cloned_voice_infos, read_preview,
-        rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, unique_preset_id,
-        write_preview, ClonedMeta, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip,
-        VoiceInfo, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION,
-        TTS_CLIP_ID,
+        cloned_voices_dir, default_clone_base, emit_speak, is_safe_voice_id,
+        list_cloned_voice_infos, load_cloned_voice, preview_path_in, read_preview,
+        rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
+        unique_preset_id, write_preview, ClonedMeta, EngineStatus, LevelUpdate, Levels,
+        OnnxRuntimeStatus, SpeakClip, VoiceInfo, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
+        PREVIEW_TEXT_VERSION, TTS_CLIP_ID,
     };
+    use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
+    use divora_core::tts::babble;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     #[test]
     fn save_tts_clip_writes_wav_and_parseable_meta() {
@@ -2638,6 +2706,122 @@ mod tests {
     #[test]
     fn the_preview_clip_slot_is_distinct_from_speak() {
         assert_ne!(PREVIEW_CLIP_ID, TTS_CLIP_ID);
+    }
+
+    // ---- v1.50.0: Speak never stacks; babble ids stay off disk ----
+
+    fn utterance() -> Arc<Vec<f32>> {
+        Arc::new(vec![0.25_f32; 4_800])
+    }
+
+    /// Why `speak` must stop before it plays: the mixer takes an idle slot
+    /// rather than replacing a voice with the same clip id, so two Plays of
+    /// `tts` sound at once.
+    #[test]
+    fn two_plays_of_the_same_clip_id_stack_in_the_mixer() {
+        let mut mixer = SoundboardMixer::new();
+        for _ in 0..2 {
+            mixer.apply(SoundboardCommand::Play {
+                clip_id: TTS_CLIP_ID.to_string(),
+                samples: utterance(),
+                sample_rate: 48_000,
+                gain: 1.0,
+            });
+        }
+        assert_eq!(mixer.active_voice_count(), 2);
+    }
+
+    #[test]
+    fn emit_speak_hands_over_both_commands_in_order() {
+        // Guards the send loop itself, not just what `speak_commands` builds:
+        // a version that emitted only the Play would still satisfy a test of
+        // `speak_commands` alone, and would bring back the stacking bug.
+        let mut sent: Vec<SoundboardCommand> = Vec::new();
+        emit_speak(|cmd| sent.push(cmd), utterance(), 24_000, 1.0, false);
+        assert_eq!(sent.len(), 2, "both commands must reach the engine");
+        assert!(matches!(&sent[0], SoundboardCommand::Stop { clip_id } if clip_id == TTS_CLIP_ID));
+        assert!(
+            matches!(&sent[1], SoundboardCommand::Play { clip_id, .. } if clip_id == TTS_CLIP_ID)
+        );
+    }
+
+    #[test]
+    fn speak_commands_stop_the_tts_slot_then_play_into_it() {
+        let [stop, play] = speak_commands(utterance(), 24_000, 0.5, false);
+        assert!(
+            matches!(&stop, SoundboardCommand::Stop { clip_id } if clip_id == TTS_CLIP_ID),
+            "first command must stop the previous utterance, got {stop:?}"
+        );
+        let SoundboardCommand::Play {
+            clip_id,
+            sample_rate,
+            gain,
+            ..
+        } = play
+        else {
+            panic!("expected a main-send Play, got {play:?}");
+        };
+        assert_eq!((clip_id.as_str(), sample_rate), (TTS_CLIP_ID, 24_000));
+        assert!((gain - 0.5).abs() < f32::EPSILON);
+
+        let [_, preview] = speak_commands(utterance(), 24_000, 1.0, true);
+        assert!(
+            matches!(&preview, SoundboardCommand::PlayMonitorOnly { clip_id, .. } if clip_id == TTS_CLIP_ID),
+            "preview-only must stay off the main send, got {preview:?}"
+        );
+    }
+
+    /// Rapid Speak presses — the babble case, where each render is near-instant
+    /// — leave exactly one utterance sounding, whichever path it plays on.
+    #[test]
+    fn repeated_speaks_never_overlap() {
+        let mut mixer = SoundboardMixer::new();
+        for preview_only in [false, false, true, false] {
+            for cmd in speak_commands(utterance(), 48_000, 1.0, preview_only) {
+                mixer.apply(cmd);
+            }
+            assert_eq!(mixer.active_voice_count(), 1);
+        }
+        // The survivor plays at its own level, not the sum of stacked takes.
+        let mut out = vec![0.0_f32; 64];
+        mixer.mix_into(&mut out, 48_000);
+        assert!((out[0] - 0.25).abs() < 1e-3, "out[0] = {}", out[0]);
+    }
+
+    /// A babble id must never resolve as a cloned voice. Besides routing to the
+    /// wrong engine, joining one onto a path is unsafe on NTFS, where `a:b`
+    /// names an alternate data stream of a file `a`.
+    #[test]
+    fn babble_ids_are_never_cloned_voice_ids() {
+        let voices = scratch("babble-not-clone");
+        // A real clone alongside, so a None below is the id's doing, not an
+        // empty directory's.
+        seed_clone(
+            &voices,
+            "bright",
+            Some(r#"{"name":"Bright","base":"am_puck","engine":"voxcpm"}"#),
+            "reference.wav",
+        );
+        assert!(load_cloned_voice(&voices, "bright").is_some());
+        for v in babble::VOICES {
+            assert!(!is_safe_voice_id(v.id), "{} must fail the path check", v.id);
+            assert!(load_cloned_voice(&voices, v.id).is_none());
+        }
+        fs::remove_dir_all(&voices).ok();
+    }
+
+    /// Babble previews render near-instantly, and a disk cache would go on
+    /// serving the old sound after the synthesiser changes in an update.
+    #[test]
+    fn babble_previews_are_never_disk_cached() {
+        let voices = scratch("babble-preview");
+        let cache = voices.join("preview-cache");
+        for v in babble::VOICES {
+            assert_eq!(preview_path_in(&voices, &cache, v.id), None);
+        }
+        // A preset still caches, so the None above is down to the id.
+        assert!(preview_path_in(&voices, &cache, "af_heart").is_some_and(|p| p.starts_with(&cache)));
+        fs::remove_dir_all(&voices).ok();
     }
 
     // ---- v1.43.0: renaming a cloned voice ------------------------------

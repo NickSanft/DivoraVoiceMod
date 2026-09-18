@@ -427,7 +427,7 @@ resource dir), same as the AI voice-conversion models.
 
 **Degradation (no assets — e.g. dev run before fetch):**
 
-- [ ] Voices show a **"Soon"** badge + a "Preset voices aren't installed yet" banner; pressing **Speak** shows a graceful "text-to-speech voices are not installed" notice — never a hang or crash (same as the AI voice-convert missing-model path).
+- [ ] Preset voices show a **"Soon"** badge + a "Preset voices aren't installed in this build" banner that points at Critter Chatter; pressing **Speak** with a preset selected shows a graceful "text-to-speech voices are not installed" notice — never a hang or crash (same as the AI voice-convert missing-model path). **Your voices** is hidden; **Saved clips** is still shown.
 
 **Your voices — cloning (v1.20.0 / download v1.21.0):**
 
@@ -459,6 +459,21 @@ resource dir), same as the AI voice-conversion models.
 - [ ] Enable the toggle → **Speak** the cloned voice → the output keeps your voice/accent (identical in character to CPU) and synthesis is modestly faster (~1.3× on the decode step). No crash, no garbled/robotic audio.
 - [ ] Force a GPU-unavailable case (machine without a usable DX12 GPU, or rename `DirectML.dll`): with the toggle on, **Speak** still produces correct audio — it **falls back to CPU** silently (never a hang or crash).
 - [ ] Restart with GPU on → the toggle persists and Speak still works.
+
+## Speak — Critter Chatter babble voices (v1.50.0)
+
+Procedural: no model and no download, so every check here should pass in the
+built app **and** in a source build with no voice assets at all.
+
+- [ ] Sidebar → **Speak** → a **Critter Chatter** group (caption "Playful babble · built in, no download") lists **Bright**, **Mellow**, **Gruff** below the preset voices. None shows a "Soon" badge.
+- [ ] Select each → type a sentence → **Speak** → you hear babble, one short syllable per letter, starting in well under a second. The three are audibly different (Bright highest and fastest, Gruff lowest and slowest).
+- [ ] Set output = **CABLE Input** and join a Discord call → a listener hears the babble mixed with your live mic. With **Preview only** on, you hear it in your monitor and the listener does **not**.
+- [ ] **Rapid repeat:** type a long line and press **Speak** 5–6 times quickly → only the newest take is audible; the takes never talk over each other. **Stop** silences it immediately. (Repeat once with a Kokoro preset in the built app — same result.)
+- [ ] **Audition:** with the engine running, press ▶ on a Critter Chatter card → a short sample plays in your monitor only; ▶ on another card mid-sample stops the first. With the engine stopped the ▶ is disabled with a "Start the engine" hint.
+- [ ] **Saved clips:** each Speak adds a clip → **Play** replays the same babble; **Load into editor** restores the text **and** re-selects the Critter Chatter voice.
+- [ ] **Persistence:** select **Gruff** → restart the app → Gruff is still selected (`divora.ttsVoice` holds `babble:gruff`).
+- [ ] **Source build without Kokoro assets** (skip `fetch-voice-assets.ps1`): the "aren't installed in this build" banner shows and **Your voices** is hidden, but every Critter Chatter check above still works, including **Saved clips**.
+- [ ] **Odd text:** Speak each of these → no crash, no hang, and a sensible result: `Grüße aus Köln — ça va?` (accented letters babble, the dash pauses, the `?` rises), `日本語 и кириллица` (non-Latin letters still babble), `Call 555-0123 at 9:30!` (digits babble), `🙂🎉` alone (nothing to voice → a graceful "no speakable text" notice), and a very long pasted paragraph (babbles to a capped length, the app stays responsive).
 
 ## What's new (v1.49.0)
 

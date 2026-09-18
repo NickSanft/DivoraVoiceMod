@@ -325,29 +325,39 @@ export async function setVoiceModel(
 
 // ---- Text-to-speech ("Speak") — v1.17.0 ----
 
-/** One preset "Speak" voice. `installed` is false until the Kokoro model +
- *  voice pack + espeak-ng are staged in the bundle, so the UI can show a
- *  clear "voice not installed" state instead of failing on Speak. */
+/** One built-in "Speak" voice: a Kokoro preset or a procedural Critter
+ *  Chatter voice. A Kokoro voice's `installed` is false until the Kokoro model
+ *  + voice pack + espeak-ng are staged, so the UI can show a clear "voice not
+ *  installed" state instead of failing on Speak. */
 export interface TtsVoiceInfo {
-  /** Kokoro voice id (e.g. "af_heart") — also the style-pack key. */
+  /** Stable voice id, persisted in settings and saved clips. A Kokoro id
+   *  (e.g. "af_heart") is also its style-pack key; a Critter Chatter id is
+   *  engine-namespaced (e.g. "babble:bright"). An id containing ':' is never a
+   *  cloned voice. */
   id: string;
   name: string;
   /** espeak language used to phonemize this voice (e.g. "en-us"). */
   lang: string;
-  /** True once every asset needed to synthesize is present on disk. */
+  /** True once every asset needed to synthesize is present on disk. Always
+   *  true for Critter Chatter voices, which need no assets. */
   installed: boolean;
+  /** Which engine renders the voice (v1.50.0). Absent from older backends,
+   *  where every voice was Kokoro — treat a missing value as "kokoro". */
+  engine?: "kokoro" | "babble";
 }
 
-/** List the preset Speak voices, each flagged with whether it's installed. */
+/** List the built-in Speak voices (Kokoro presets first, then Critter
+ *  Chatter), each flagged with whether it's installed. */
 export async function listTtsVoices(): Promise<TtsVoiceInfo[]> {
   return invoke<TtsVoiceInfo[]>("list_tts_voices");
 }
 
 /**
- * Synthesize `text` with the preset `voiceId` and play it through the output,
- * mixed with the live mic via the soundboard seam (so a Discord/stream
- * listener hears it too). Resolves to the clip's duration in seconds. Rejects
- * with a message (e.g. "voices are not installed") the UI can surface.
+ * Synthesize `text` with `voiceId` (a Kokoro preset, Critter Chatter, or cloned
+ * voice) and play it through the output, mixed with the live mic via the
+ * soundboard seam (so a Discord/stream listener hears it too). Any utterance
+ * still playing is stopped first. Resolves to the clip's duration in seconds.
+ * Rejects with a message (e.g. "voices are not installed") the UI can surface.
  *
  * `gain` (v1.18.0) is the linear playback volume (1.0 = unchanged).
  * `previewOnly` (v1.18.0) routes the speech to your local monitor only — you
@@ -370,7 +380,8 @@ export async function speak(
 /**
  * v1.47.0: play a short fixed sample in `voiceId` so a voice can be judged by
  * ear before committing to it. Monitor-only, one take, and cached to disk —
- * a repeat audition of the same voice is instant.
+ * a repeat audition of the same voice is instant. (Critter Chatter voices are
+ * not cached; they render near-instantly anyway.)
  *
  * Separate from {@link speak} on purpose: `speak` saves every utterance to the
  * Saved clips library and renders at the user's best-of-N tier, neither of

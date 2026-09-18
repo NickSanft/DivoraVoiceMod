@@ -139,10 +139,13 @@ function Shell(): JSX.Element {
       }
     };
     const up = (e: KeyboardEvent) => {
-      if (matches(e)) {
-        e.preventDefault();
-        app.setUi("pressed", false);
-      }
+      if (!matches(e)) return;
+      // Only swallow the key when nothing else wants it. Browsers activate a
+      // focused button on Space *keyup*, so preventing it unconditionally
+      // silently broke Space on every button and radio in the app. Releasing
+      // still clears the pressed state wherever focus ended up.
+      if (e.target === document.body) e.preventDefault();
+      app.setUi("pressed", false);
     };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);

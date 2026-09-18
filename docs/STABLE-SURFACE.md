@@ -19,6 +19,7 @@ accidental break fails CI before it ships:
 - Preset JSON schema + tag casing + legacy-load — `divora-core/src/presets/mod.rs` (`schema_freeze_tests`).
 - `StreamInfo` keys — `divora-core/src/audio/engine.rs`.
 - `EngineStatus` / `LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus` keys — `src-tauri/src/lib.rs`.
+- `TtsVoiceInfo` keys + the missing-`engine` default — `divora-core/src/tts/mod.rs`.
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - Every command wrapper's command-name string — `src/audio/api.test.ts`.
 
@@ -83,9 +84,9 @@ resolved `T` or a thrown string on the JS side.
 | Command | Args | Returns |
 |---|---|---|
 | `list_tts_voices` | — | `TtsVoiceInfo[]` |
-| `speak` | `text: string`, `voiceId: string` (preset id **or** cloned id), `gain?: number` (v1.18.0, default 1.0), `previewOnly?: bool` (v1.18.0, default false → monitor-only) | duration seconds `f32` / error (e.g. "voices are not installed") |
+| `speak` | `text: string`, `voiceId: string` (preset id, Critter Chatter id `babble:*` (v1.50.0), **or** cloned id), `gain?: number` (v1.18.0, default 1.0), `previewOnly?: bool` (v1.18.0, default false → monitor-only) | duration seconds `f32` / error (e.g. "voices are not installed") — stops any utterance still playing first (v1.50.0) |
 | `stop_speak` | — | — |
-| `preview_voice` | `voiceId: string`, `useGpu?: bool` | duration seconds `f32` / error — v1.47.0 (fixed phrase, monitor-only, one take, disk-cached) |
+| `preview_voice` | `voiceId: string`, `useGpu?: bool` | duration seconds `f32` / error — v1.47.0 (fixed phrase, monitor-only, one take, disk-cached; Critter Chatter voices are never disk-cached, v1.50.0) |
 | `stop_preview_voice` | — | — / v1.47.0 |
 | `clone_voice` | `name: string`, `referencePath: string` | `ClonedVoiceInfo` / error — v1.20.0 |
 | `start_voice_recording` | — | — / error ("start the engine first") — v1.23.0 |
@@ -97,6 +98,14 @@ resolved `T` or a thrown string on the JS side.
 | `download_clone_models` | — | — / error (downloads ~157 MB on-demand) — v1.21.0 |
 | `voxcpm_status` | — | `{ available: bool, readPrompt: string }` — v1.24.0 |
 | `download_voxcpm_models` | — | — / error (downloads ~1.6 GB on-demand) — v1.24.0 |
+
+**Voice ids (v1.50.0).** An id containing `:` is **engine-namespaced** and is
+never a cloned-voice id — cloned ids are a single safe path component
+(`[A-Za-z0-9_-]`), so the two can't collide and a namespaced id never touches
+the cloned-voice or preview-cache folders. The procedural Critter Chatter
+voices use the `babble:` namespace; their ids — `babble:bright`,
+`babble:mellow`, `babble:gruff` — are permanent, because they are persisted in
+`divora.ttsVoice` and in saved clips (display names may change; ids never do).
 
 ### Recording
 
@@ -171,7 +180,8 @@ ReactiveConfig    { enabled, intensity, floorDb, ceilDb,           // v1.46.0
 ReactiveRouteSpec { kind: EffectKindWire, nth, key, base, depth }   // v1.46.0
 VoiceInfo         { id, name, path, sizeBytes }
 OnnxRuntimeStatus { runtimeAvailable, voicesDir }
-TtsVoiceInfo      { id, name, lang, installed }      // v1.17.0
+TtsVoiceInfo      { id, name, lang, installed, engine }  // v1.17.0; engine v1.50.0:
+                  // "kokoro" | "babble" — absent reads as "kokoro"
 ClonedVoiceInfo   { id, name, baseName }             // v1.20.0; baseName v1.22.0
 CloneDownloadProgress { file, fileCount, received, total }  // v1.21.0
 SoundboardTile    { id, path, label, extension, sizeBytes, modifiedSecs? }
@@ -253,7 +263,7 @@ to defaults (never throw).
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
 | `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0 |
-| `divora.ttsVoice` | selected "Speak" preset voice id (or null) — v1.17.0 |
+| `divora.ttsVoice` | selected "Speak" voice id (or null) — v1.17.0: a preset id, a cloned id (v1.20.0), or a Critter Chatter `babble:*` id (v1.50.0) |
 | `divora.ttsVolume` | "Speak" playback volume (linear 0..2) — v1.18.0 |
 | `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |

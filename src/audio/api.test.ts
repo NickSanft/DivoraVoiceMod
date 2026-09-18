@@ -457,6 +457,39 @@ describe("audio api", () => {
     expect(voices[0]!.installed).toBe(false);
   });
 
+  it("listTtsVoices passes the engine through, and tolerates it missing (v1.50.0)", async () => {
+    invokeMock.mockResolvedValueOnce([
+      // An older backend: no engine field at all.
+      { id: "af_heart", name: "Aria", lang: "en-us", installed: false },
+      {
+        id: "babble:bright",
+        name: "Bright",
+        lang: "en-us",
+        installed: true,
+        engine: "babble",
+      },
+    ]);
+    const voices = await listTtsVoices();
+    expect(voices[0]!.engine).toBeUndefined();
+    expect(voices[1]).toEqual({
+      id: "babble:bright",
+      name: "Bright",
+      lang: "en-us",
+      installed: true,
+      engine: "babble",
+    });
+  });
+
+  it("speak forwards a Critter Chatter voice id untouched", async () => {
+    invokeMock.mockResolvedValueOnce(0.9);
+    const d = await speak("Hi!", "babble:gruff");
+    expect(invokeMock).toHaveBeenCalledWith(
+      "speak",
+      expect.objectContaining({ text: "Hi!", voiceId: "babble:gruff" }),
+    );
+    expect(d).toBe(0.9);
+  });
+
   it("speak forwards text + voiceId (default gain/preview) and returns the duration", async () => {
     invokeMock.mockResolvedValueOnce(1.8);
     const d = await speak("Hello there.", "af_heart");

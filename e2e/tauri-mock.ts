@@ -132,11 +132,20 @@ export async function installTauriMock(
         // v1.17.0: TTS scaffolding — preset voices exist but aren't
         // installed yet, and synthesis rejects with the graceful message
         // (mirrors the gated backend until the model assets are staged).
+        // v1.50.0: the Critter Chatter voices follow, always installed, and
+        // they are the only ids speak renders (as the real backend would in a
+        // build without Kokoro).
         list_tts_voices: () => [
-          { id: "af_heart", name: "Aria — warm (US)", lang: "en-us", installed: false },
-          { id: "bm_george", name: "George — crisp (UK)", lang: "en-gb", installed: false },
+          { id: "af_heart", name: "Aria — warm (US)", lang: "en-us", installed: false, engine: "kokoro" },
+          { id: "bm_george", name: "George — crisp (UK)", lang: "en-gb", installed: false, engine: "kokoro" },
+          { id: "babble:bright", name: "Bright", lang: "en-us", installed: true, engine: "babble" },
+          { id: "babble:mellow", name: "Mellow", lang: "en-us", installed: true, engine: "babble" },
+          { id: "babble:gruff", name: "Gruff", lang: "en-us", installed: true, engine: "babble" },
         ],
-        speak: () => {
+        speak: (a: any) => {
+          if (typeof a?.voiceId === "string" && a.voiceId.startsWith("babble:")) {
+            return 1.4;
+          }
           throw "text-to-speech voices are not installed";
         },
         stop_speak: () => null,

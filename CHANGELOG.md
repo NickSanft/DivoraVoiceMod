@@ -4,6 +4,47 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.50.0] — 2026-09-17 — Critter Chatter
+
+### Added
+
+- **Critter Chatter — three voices that babble.** A new kind of voice on the Speak screen: type anything and it chatters back one bright little syllable per letter, the way small animated characters “talk” in games. **Bright**, **Mellow** and **Gruff** differ in pitch, pace and the size of the throat they seem to come from. It follows your spelling closely enough that names and catchphrases almost come through, a question mark lifts the last sound, and an exclamation mark leans on it.
+- **It needs nothing downloaded.** The syllables are built from scratch in code rather than played back from recordings, so these voices work on a fresh install, offline, on any machine — including builds where the preset voice models aren’t present. As with every other voice, nothing you type leaves your computer.
+
+### Changed
+
+- **The Speak screen explains itself better when preset voices are missing.** The old notice said the voice models would “ship in an update”, which stopped being true once installers began bundling them — it now says they’re missing from *this build*, and points out that Critter Chatter still works.
+
+### Fixed
+
+- **Pressing Speak again no longer talks over itself.** Each utterance was added alongside whatever was already playing instead of replacing it, so repeated presses stacked up voices. A slow render mostly hid it; an instant one would not have.
+- **The spacebar activates buttons again.** The push-to-modulate listener swallowed every Space key release, including ones meant for a focused button or radio — so Space silently did nothing anywhere in the app. It now only swallows the key when nothing else wants it, and still releases push-to-modulate wherever focus ended up.
+
+### Tests
+
+- 83 tests for the new engine: spelling to syllables (every letter accounted for, checked against 5,000 generated strings), deterministic timing, and the synthesiser itself — vowel formants against published measurements, diphthong movement, nasal murmur, voiced-stop cues, fricative spectra, band limits, per-voice pitch, and silence at both ends of every syllable.
+- The synthesiser tests were hardened after a review found that 10 of 13 deliberate breakages went undetected, including swapped vowels and a step at the end of every syllable. All 10 now fail a test, verified by applying each breakage.
+- 10 new Rust tests and 12 frontend tests for the Speak wiring, plus an end-to-end test that a Critter Chatter voice speaks with no preset voices installed.
+
+### Architecture notes
+
+- Text → tokens → syllables → timed events → audio, with the syllable source behind a trait, so timing and levelling don’t depend on how a syllable is made. Rendering runs on a worker thread, never the audio callback.
+- Each voice synthesises its **own** syllable bank (pitch, vocal-tract scale and pace), built once on first use. The first version resampled a single bank per voice, which shifted formants, aliased sibilants when pitched up, and left the slowest voice reading only 44% of each syllable before its event ended.
+- Syllables are placed by where they *sound*, not where they start: a unit begins ahead of its slot by its own voicing delay, so k-, s- and sh-sounds no longer land late. Independently measured at a median 1.2 ms from the beat, 98% within 8 ms, worst case about 25 ms on r- and w-sounds.
+- Speak output skips the effect chain and the loudness stage, so the renderer levels every utterance to the same gated loudness the preset voices measure (−21.15 dBFS), and soft-limits under a peak ceiling.
+- Voice ids are namespaced `babble:<variant>`. The colon fails the cloned-voice id check, so these ids can never collide with a cloned voice folder and previews are never cached to disk — which also means a later change to the synthesiser can’t serve stale audio.
+
+### Pre-push checklist (local, 2026-09-17)
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (407: 369 core + 38 app, was 316)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (452, +14)
+- `pnpm test:e2e` — pass (16, +1)
+- `pnpm tauri build --debug --no-bundle` — pass
+- Rendered the three voices and measured: every line 0 clipped samples, gated loudness −21.15 dBFS, at most 0.0003 % of energy above 9 kHz, syllable-kept median 1.00 / worst 0.87. Bank build 35–51 ms per voice on first use; a preview line renders in about 1 ms afterwards.
+
 ## [1.49.0] — 2026-09-08 — What’s new
 
 ### Added

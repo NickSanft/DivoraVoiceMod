@@ -6,7 +6,7 @@
 // to showing a (renamed) voice afterwards.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { fireEvent, render, waitFor, within } from "@solidjs/testing-library";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -24,7 +24,7 @@ vi.mock("@tauri-apps/plugin-shell", () => ({
   open: vi.fn(async () => undefined),
 }));
 
-import { AppProvider } from "../stores/app";
+import { AppProvider, useApp } from "../stores/app";
 import { SpeakScreen } from "./SpeakScreen";
 
 /** One installed preset (so the "Your voices" section renders) + one clone. */
@@ -221,5 +221,142 @@ describe("SpeakScreen — tap-to-audition previews (v1.47.0)", () => {
     // assistive tech, which is the whole reason the preset card was split from
     // a single button into a row.
     expect(radio.contains(play)).toBe(false);
+  });
+});
+
+describe("SpeakScreen — Critter Chatter voices (v1.50.0)", () => {
+  const CRITTERS = [
+    { id: "babble:bright", name: "Bright", lang: "en-us", installed: true, engine: "babble" },
+    { id: "babble:mellow", name: "Mellow", lang: "en-us", installed: true, engine: "babble" },
+    { id: "babble:gruff", name: "Gruff", lang: "en-us", installed: true, engine: "babble" },
+  ];
+  const aria = (installed: boolean) => ({
+    id: "af_heart",
+    name: "Aria",
+    lang: "en-us",
+    installed,
+    engine: "kokoro",
+  });
+
+  function seedVoices(voices: object[]) {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_tts_voices":
+          return voices;
+        case "list_cloned_voices":
+        case "list_speak_clips":
+          return [];
+        case "clone_models_status":
+          return { ready: true };
+        case "preview_voice":
+          return 1.0;
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  /** Like setupScreen, but hands back the store so a test can start the engine. */
+  function setupWithApp() {
+    let captured: ReturnType<typeof useApp> | null = null;
+    function Inner() {
+      captured = useApp();
+      return <SpeakScreen />;
+    }
+    const utils = render(() => (
+      <AppProvider>
+        <Inner />
+      </AppProvider>
+    ));
+    return { ...utils, app: () => captured! };
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("renders its own labelled radiogroup, separate from the presets, with no Soon badge", async () => {
+    seedVoices([aria(false), ...CRITTERS]);
+    const { findByRole, getByRole } = setupScreen();
+
+    const group = await findByRole("radiogroup", { name: "Critter Chatter" });
+    expect(within(group).getAllByRole("radio").map((r) => r.textContent)).toEqual([
+      "Bright",
+      "Mellow",
+      "Gruff",
+    ]);
+    const caption = document.getElementById(group.getAttribute("aria-describedby")!);
+    expect(caption?.textContent).toMatch(/built in, no download/i);
+    // Always installed, so never promised as "Soon" — unlike the missing preset.
+    expect(within(group).queryByText("Soon")).toBeNull();
+
+    const presets = getByRole("radiogroup", { name: "Preset voice" });
+    expect(within(presets).queryByRole("radio", { name: /Bright/ })).toBeNull();
+    expect(within(presets).getByText("Soon")).toBeTruthy();
+  });
+
+  it("selecting one checks it and persists the id", async () => {
+    seedVoices([aria(false), ...CRITTERS]);
+    const { findByRole, getByRole } = setupScreen();
+
+    const gruff = await findByRole("radio", { name: /Gruff/ });
+    // Wait for the default selection, so the click is not overwritten by it.
+    await waitFor(() =>
+      expect(getByRole("radio", { name: /Aria/ }).getAttribute("aria-checked")).toBe("true"),
+    );
+    fireEvent.click(gruff);
+
+    expect(gruff.getAttribute("aria-checked")).toBe("true");
+    expect(getByRole("radio", { name: /Aria/ }).getAttribute("aria-checked")).toBe("false");
+    expect(window.localStorage.getItem("divora.ttsVoice")).toContain("babble:gruff");
+  });
+
+  it("auditions with the engine running even when Kokoro is missing", async () => {
+    seedVoices([aria(false), ...CRITTERS]);
+    const { findByRole, getByRole, app } = setupWithApp();
+    app().setEngineRunning(true);
+
+    const play = (await findByRole("button", { name: "Preview Bright" })) as HTMLButtonElement;
+    expect(play.disabled).toBe(false);
+    // The missing preset stays disabled, and says why.
+    const ariaPlay = getByRole("button", { name: "Preview Aria" }) as HTMLButtonElement;
+    expect(ariaPlay.disabled).toBe(true);
+    expect(ariaPlay.getAttribute("title")).toMatch(/isn't installed/i);
+
+    fireEvent.click(play);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "preview_voice",
+        expect.objectContaining({ voiceId: "babble:bright" }),
+      ),
+    );
+  });
+
+  it("without Kokoro: the banner points at Critter Chatter, cloning hides, Saved clips stays", async () => {
+    seedVoices([aria(false), ...CRITTERS]);
+    const { findByRole, getByText, queryByText, queryByRole } = setupScreen();
+    await findByRole("radiogroup", { name: "Critter Chatter" }); // voices loaded
+
+    const banner = getByText(/aren't installed in this build/i).closest("[role=status]");
+    expect(banner?.textContent).toMatch(/Critter Chatter/);
+    // Cloning renders through a Kokoro base, so it must not be offered here.
+    expect(queryByText("Your voices")).toBeNull();
+    expect(queryByRole("button", { name: /Pick a clip/ })).toBeNull();
+    // But there is something that can speak, so its clips stay reachable.
+    expect(getByText("Saved clips")).toBeTruthy();
+  });
+
+  it("with Kokoro installed: no banner, and cloning is offered", async () => {
+    seedVoices([aria(true), ...CRITTERS]);
+    const { findByText, queryByText } = setupScreen();
+
+    await findByText("Your voices");
+    expect(queryByText(/aren't installed/i)).toBeNull();
+    expect(queryByText("Saved clips")).toBeTruthy();
   });
 });

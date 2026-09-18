@@ -2,6 +2,8 @@
 //!
 //! Pipeline: `text → espeak-ng phonemes → Kokoro token ids → Kokoro ONNX
 //! (+ per-voice style vector) → f32 @ 24 kHz → soundboard mixer → output`.
+//! The procedural [`babble`] voices skip that pipeline — no model, no assets —
+//! and share only the id space, [`synthesize`], and the mixer hand-off.
 //!
 //! This module is the **scaffolding**. The pure tokenizer + chunker
 //! ([`tokens`]) and the espeak-ng subprocess wrapper ([`phonemize`]) are
@@ -17,6 +19,7 @@
 //! desktop-verified once `voice-assets-v2` carries the ~80 MB model. Gated
 //! here so the rest of the feature — UI, command surface, tests — ships now.
 
+pub mod babble;
 pub mod clone;
 pub mod kokoro;
 pub mod phonemize;
@@ -65,7 +68,12 @@ pub struct TtsAudio {
     pub sample_rate: u32,
 }
 
-/// A selectable preset voice. `installed` reflects whether the model assets
+/// [`TtsVoiceInfo::engine`] for a Kokoro preset voice.
+pub const ENGINE_KOKORO: &str = "kokoro";
+/// [`TtsVoiceInfo::engine`] for a procedural [`babble`] voice.
+pub const ENGINE_BABBLE: &str = "babble";
+
+/// A selectable built-in voice. `installed` reflects whether the model assets
 /// needed to actually synthesize are present on disk (so the UI can show a
 /// clear "voice not installed" instead of failing on Speak).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,8 +83,18 @@ pub struct TtsVoiceInfo {
     /// espeak language used to phonemize for this voice (e.g. `"en-us"`).
     pub lang: String,
     /// True once the Kokoro model, voice pack, config, and espeak-ng are all
-    /// present — the same condition [`synthesize`] gates on.
+    /// present — the same condition [`synthesize`] gates on. Always true for
+    /// babble voices, which need no assets.
     pub installed: bool,
+    /// Which engine renders this voice: [`ENGINE_KOKORO`] or [`ENGINE_BABBLE`]
+    /// (v1.50.0). Defaults to Kokoro so payloads from before the field existed
+    /// still deserialize — every voice then was a Kokoro preset.
+    #[serde(default = "default_voice_engine")]
+    pub engine: String,
+}
+
+fn default_voice_engine() -> String {
+    ENGINE_KOKORO.to_string()
 }
 
 /// Errors from the TTS pipeline. [`TtsError::NotInstalled`] is the one the
@@ -136,19 +154,31 @@ pub fn clone_models_present(clone_dir: &Path) -> bool {
     clone_dir.join(CLONE_EXTRACTOR_FILE).exists() && clone_dir.join(CLONE_CONVERTER_FILE).exists()
 }
 
-/// List the preset voices, each flagged with whether its assets are installed.
+/// List the built-in voices, each flagged with whether its assets are installed.
+///
+/// Kokoro presets come first, in their existing order: the UI defaults a fresh
+/// install to the first entry, and that default must not move. Babble voices
+/// follow, always installed.
 #[must_use]
 pub fn list_voices(asset_dir: &Path) -> Vec<TtsVoiceInfo> {
     let installed = TtsPaths::new(asset_dir).installed();
-    PRESET_VOICES
-        .iter()
-        .map(|&(id, name, lang)| TtsVoiceInfo {
-            id: id.to_string(),
-            name: name.to_string(),
-            lang: lang.to_string(),
-            installed,
-        })
-        .collect()
+    let presets = PRESET_VOICES.iter().map(|&(id, name, lang)| TtsVoiceInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        lang: lang.to_string(),
+        installed,
+        engine: ENGINE_KOKORO.to_string(),
+    });
+    let babble = babble::VOICES.iter().map(|v| TtsVoiceInfo {
+        id: v.id.to_string(),
+        name: v.name.to_string(),
+        // Nothing is phonemized; this only keeps the field meaningful for
+        // consumers that group voices by language.
+        lang: "en-us".to_string(),
+        installed: true,
+        engine: ENGINE_BABBLE.to_string(),
+    });
+    presets.chain(babble).collect()
 }
 
 /// The short, human label for a preset voice id — the part before the `" — "`
@@ -204,13 +234,19 @@ fn kokoro_render(
     Ok(())
 }
 
-/// Synthesize `text` with preset `voice_id`, returning 24 kHz mono audio ready
-/// for the soundboard mixer.
+/// Synthesize `text` with built-in `voice_id` (a Kokoro preset or a babble
+/// voice), returning 24 kHz mono audio ready for the soundboard mixer.
 ///
 /// Until the Kokoro model, voice pack, config, and espeak-ng are staged in
-/// `asset_dir`, this returns [`TtsError::NotInstalled`] without ever calling
-/// into `ort` (so it can't hang on the missing runtime).
+/// `asset_dir`, a preset returns [`TtsError::NotInstalled`] without ever
+/// calling into `ort` (so it can't hang on the missing runtime).
 pub fn synthesize(text: &str, voice_id: &str, asset_dir: &Path) -> Result<TtsAudio, TtsError> {
+    // Babble is procedural: it has no assets to gate on, so it is routed before
+    // the preset lookup and install check — otherwise a build without Kokoro
+    // would refuse a voice that works everywhere.
+    if babble::is_babble_id(voice_id) {
+        return babble::synthesize(text, voice_id);
+    }
     let voice = PRESET_VOICES
         .iter()
         .find(|&&(id, _, _)| id == voice_id)
@@ -383,14 +419,65 @@ mod tests {
     #[test]
     fn list_voices_returns_presets_uninstalled_without_assets() {
         let voices = list_voices(&empty_assets());
-        assert_eq!(voices.len(), PRESET_VOICES.len());
-        assert!(voices.iter().all(|v| !v.installed));
-        assert!(voices.iter().any(|v| v.id == "af_heart"));
-        // ids are unique.
+        assert_eq!(voices.len(), PRESET_VOICES.len() + babble::VOICES.len());
+        let kokoro: Vec<_> = voices
+            .iter()
+            .filter(|v| v.engine == ENGINE_KOKORO)
+            .collect();
+        assert_eq!(kokoro.len(), PRESET_VOICES.len());
+        assert!(kokoro.iter().all(|v| !v.installed));
+        assert!(kokoro.iter().any(|v| v.id == "af_heart"));
+        // ids are unique across both engines.
         let mut ids: Vec<_> = voices.iter().map(|v| v.id.clone()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), PRESET_VOICES.len());
+        assert_eq!(ids.len(), voices.len());
+    }
+
+    /// The UI defaults a fresh install to the FIRST listed voice, so the Kokoro
+    /// presets must lead, unchanged and in order, with babble strictly after.
+    #[test]
+    fn list_voices_keeps_kokoro_presets_first_and_in_order() {
+        let voices = list_voices(&empty_assets());
+        let (head, tail) = voices.split_at(PRESET_VOICES.len());
+        for (v, &(id, name, lang)) in head.iter().zip(PRESET_VOICES) {
+            assert_eq!((v.id.as_str(), v.name.as_str()), (id, name));
+            assert_eq!(v.lang, lang);
+            assert_eq!(v.engine, ENGINE_KOKORO);
+        }
+        assert!(tail.iter().all(|v| v.engine == ENGINE_BABBLE));
+    }
+
+    #[test]
+    fn babble_voices_are_listed_installed_without_assets() {
+        let voices = list_voices(&empty_assets());
+        let listed: Vec<_> = voices
+            .iter()
+            .filter(|v| v.engine == ENGINE_BABBLE)
+            .collect();
+        assert_eq!(listed.len(), babble::VOICES.len());
+        for (info, voice) in listed.iter().zip(babble::VOICES) {
+            assert_eq!(info.id, voice.id);
+            assert_eq!(info.name, voice.name);
+            assert_eq!(info.lang, "en-us");
+            assert!(info.installed, "{} needs no assets", info.id);
+        }
+    }
+
+    #[test]
+    fn synthesize_babble_works_without_assets() {
+        for v in babble::VOICES {
+            let audio = synthesize("Hello there!", v.id, &empty_assets())
+                .unwrap_or_else(|e| panic!("{} should render: {e:?}", v.id));
+            assert_eq!(audio.sample_rate, TTS_SAMPLE_RATE);
+            assert!(!audio.samples.is_empty());
+        }
+    }
+
+    #[test]
+    fn synthesize_unknown_babble_voice_is_unknown_not_uninstalled() {
+        let err = synthesize("Hello", "babble:nope", &empty_assets()).unwrap_err();
+        assert!(matches!(err, TtsError::UnknownVoice(_)), "got {err:?}");
     }
 
     #[test]
@@ -522,11 +609,24 @@ mod tests {
             name: "Aria".into(),
             lang: "en-us".into(),
             installed: false,
+            engine: ENGINE_KOKORO.into(),
         })
         .unwrap();
         assert!(json.contains("\"id\":\"af_heart\""));
         assert!(json.contains("\"name\":\"Aria\""));
         assert!(json.contains("\"lang\":\"en-us\""));
         assert!(json.contains("\"installed\":false"));
+        assert!(json.contains("\"engine\":\"kokoro\""));
+    }
+
+    /// `engine` is additive (v1.50.0): a payload from before it existed must
+    /// still load, and reads as the only engine there was then.
+    #[test]
+    fn voice_info_without_engine_defaults_to_kokoro() {
+        let info: TtsVoiceInfo = serde_json::from_str(
+            r#"{"id":"af_heart","name":"Aria","lang":"en-us","installed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(info.engine, ENGINE_KOKORO);
     }
 }

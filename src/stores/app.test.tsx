@@ -1925,6 +1925,65 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(result.selectedTtsVoice()).toBe("bm_george"); // unchanged
   });
 
+  // v1.50.0: Critter Chatter ids are engine-namespaced ("babble:*") and persist
+  // like any other voice id.
+  const WITH_BABBLE = [
+    ...TWO_VOICES,
+    {
+      id: "babble:bright",
+      name: "Bright",
+      lang: "en-us",
+      installed: true,
+      engine: "babble",
+    },
+    {
+      id: "babble:gruff",
+      name: "Gruff",
+      lang: "en-us",
+      installed: true,
+      engine: "babble",
+    },
+  ];
+
+  it("refreshTtsVoices keeps a persisted Critter Chatter selection", async () => {
+    window.localStorage.setItem("divora.ttsVoice", JSON.stringify("babble:gruff"));
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_tts_voices") return WITH_BABBLE;
+      return null;
+    });
+    const { result } = setupApp();
+    await result.refreshTtsVoices();
+    // Not reset to the first (uninstalled Kokoro) voice, and still persisted.
+    expect(result.selectedTtsVoice()).toBe("babble:gruff");
+    expect(window.localStorage.getItem("divora.ttsVoice")).toContain("babble:gruff");
+  });
+
+  it("refreshTtsVoices still defaults a fresh install to the first Kokoro preset", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_tts_voices") return WITH_BABBLE;
+      return null;
+    });
+    const { result } = setupApp();
+    await result.refreshTtsVoices();
+    expect(result.selectedTtsVoice()).toBe("af_heart");
+  });
+
+  it("speakText sends a Critter Chatter id to speak unchanged", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "speak") return 0.8;
+      return null;
+    });
+    const { result } = setupApp();
+    result.setSelectedTtsVoice("babble:bright");
+    result.setTtsText("Hi there!");
+    await result.speakText();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "speak",
+      expect.objectContaining({ text: "Hi there!", voiceId: "babble:bright" }),
+    );
+    expect(result.ttsError()).toBeNull();
+  });
+
   it("setSelectedTtsVoice persists to localStorage", () => {
     const { result } = setupApp();
     result.setSelectedTtsVoice("af_heart");

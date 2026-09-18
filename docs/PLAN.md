@@ -492,6 +492,7 @@ Jobs:
 - Community preset registry (GitHub-hosted JSON)
 - 30-second rolling clip recorder
 - Light theme — **shipped v1.11.0** (light/dark Tweaks axis)
+- Live-mic babble effect — Critter Chatter (v1.50.0, Speak only) as a real-time chain effect on the microphone; requested for a later release. Without text it can't be letter-accurate, so it would voice one syllable per detected speech onset instead. Research estimated **+15–30 ms** added latency. Needs a per-sample onset detector that is allocation-free on the audio thread (the babble renderer today allocates per utterance, so it can't simply be called from the callback).
 
 ## Conventions
 

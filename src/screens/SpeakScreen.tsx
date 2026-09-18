@@ -2,17 +2,22 @@
 // that plays through the output (mixed with the live mic via the soundboard
 // seam, so a Discord/stream listener hears it too).
 //
-// This is the **scaffolding**: the workspace, voice picker, and command
-// surface are live, but synthesis is gated behind "voice not installed"
-// until the Kokoro model + voice pack + espeak-ng are bundled. Pressing
-// Speak before then surfaces a graceful notice rather than failing silently.
+// Two kinds of built-in voice share the picker. Kokoro presets are gated behind
+// "voice not installed" until the Kokoro model + voice pack + espeak-ng are
+// staged (release installers bundle them; a source build may not). Critter
+// Chatter (v1.50.0) is procedural babble with no assets, so it always works —
+// including in a build where every Kokoro voice is missing.
 
 import { For, Show, createMemo, createSignal, onMount, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Sigil } from "../components/Sigil";
-import { openSpeakClipsFolder } from "../audio/api";
+import { openSpeakClipsFolder, type TtsVoiceInfo } from "../audio/api";
 import { useApp } from "../stores/app";
+
+/** A Critter Chatter voice. A voice without `engine` came from a backend that
+ *  predates the field, when every voice was Kokoro. */
+const isBabbleVoice = (voice: TtsVoiceInfo): boolean => voice.engine === "babble";
 
 export function SpeakScreen(): JSX.Element {
   const app = useApp();
@@ -126,8 +131,103 @@ export function SpeakScreen(): JSX.Element {
     }
   };
 
+  const presetVoices = createMemo(() =>
+    app.ttsVoices().filter((v) => !isBabbleVoice(v)),
+  );
+  const babbleVoices = createMemo(() => app.ttsVoices().filter(isBabbleVoice));
+  // Split on purpose. Timbre clones render through a Kokoro base, so the banner
+  // and "Your voices" follow Kokoro alone; Saved clips only needs *something*
+  // that can speak, and Critter Chatter always can.
+  const kokoroInstalled = (): boolean => presetVoices().some((v) => v.installed);
   const anyInstalled = (): boolean => app.ttsVoices().some((v) => v.installed);
   const hasText = (): boolean => app.ttsText().trim().length > 0;
+
+  // One selectable voice: a radio plus its sibling audition button. Shared by
+  // the preset and Critter Chatter groups so the two look identical.
+  const VoiceCard = (props: { voice: TtsVoiceInfo }): JSX.Element => {
+    const selected = (): boolean => app.selectedTtsVoice() === props.voice.id;
+    // Babble needs no assets, so a "Soon" badge would be a false promise.
+    const unavailable = (): boolean =>
+      !isBabbleVoice(props.voice) && !props.voice.installed;
+    return (
+      // The card is a ROW, not a single button: the audition control has to be
+      // a sibling of the radio rather than inside it (see AuditionButton).
+      <div
+        style={{
+          display: "flex",
+          "align-items": "stretch",
+          gap: "var(--s1)",
+          "border-radius": "var(--r-md)",
+          border: `1px solid ${selected() ? "var(--accent)" : "var(--line)"}`,
+          background: selected()
+            ? "var(--accent-soft, var(--surface-2))"
+            : "var(--surface-1)",
+          overflow: "hidden",
+        }}
+      >
+        <button
+          type="button"
+          role="radio"
+          aria-checked={selected()}
+          onClick={() => app.setSelectedTtsVoice(props.voice.id)}
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s2)",
+            flex: 1,
+            "min-width": 0,
+            padding: "var(--s3) var(--s4)",
+            background: "transparent",
+            border: "none",
+            color: "var(--text-high)",
+            cursor: "pointer",
+            "text-align": "left",
+          }}
+        >
+          <span
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "var(--s2)",
+              "min-width": 0,
+            }}
+          >
+            <span
+              style={{
+                color: selected() ? "var(--accent)" : "var(--text-low)",
+                display: "flex",
+              }}
+            >
+              <Sigil name="wave" size={16} />
+            </span>
+            <span
+              style={{
+                overflow: "hidden",
+                "text-overflow": "ellipsis",
+                "white-space": "nowrap",
+              }}
+            >
+              {props.voice.name}
+            </span>
+          </span>
+          <Show when={unavailable()}>
+            <Badge tone="warning">Soon</Badge>
+          </Show>
+        </button>
+        <AuditionButton
+          voiceId={props.voice.id}
+          voiceName={props.voice.name}
+          disabled={unavailable() || !app.engineRunning()}
+          disabledReason={
+            unavailable()
+              ? "This voice isn't installed yet"
+              : "Start the engine to hear a preview"
+          }
+        />
+      </div>
+    );
+  };
 
   // Best-of-N tiers for VoxCPM cloned voices (~7 s/take on CPU). The backend
   // generates N takes and a speaker-verification reranker keeps the one closest
@@ -202,7 +302,9 @@ export function SpeakScreen(): JSX.Element {
           </p>
         </div>
 
-        <Show when={!anyInstalled()}>
+        {/* Release installers bundle Kokoro, so this is mostly a source build.
+            It must not read as "Speak is broken": Critter Chatter still works. */}
+        <Show when={!kokoroInstalled()}>
           <div
             role="status"
             style={{
@@ -221,11 +323,12 @@ export function SpeakScreen(): JSX.Element {
             </span>
             <span>
               <strong style={{ color: "var(--text-high)" }}>
-                Preset voices aren't installed yet.
+                Preset voices aren't installed in this build.
               </strong>{" "}
-              The Speak workspace is ready — synthesis activates automatically
-              once the voice models ship in an update. Everything stays
-              on-device; no text ever leaves your machine.
+              Without their voice models (the release installer includes them),
+              the preset voices can't speak here and you can't add your own
+              voice. Critter Chatter needs no download and works right away.
+              Everything stays on-device; no text ever leaves your machine.
             </span>
           </div>
         </Show>
@@ -307,100 +410,70 @@ export function SpeakScreen(): JSX.Element {
               gap: "var(--s3)",
             }}
           >
-            <For each={app.ttsVoices()}>
-              {(voice) => {
-                const selected = (): boolean =>
-                  app.selectedTtsVoice() === voice.id;
-                return (
-                  // The card is a ROW, not a single button: the audition
-                  // control has to be a sibling of the radio rather than
-                  // inside it (see AuditionButton).
-                  <div
-                    style={{
-                      display: "flex",
-                      "align-items": "stretch",
-                      gap: "var(--s1)",
-                      "border-radius": "var(--r-md)",
-                      border: `1px solid ${
-                        selected() ? "var(--accent)" : "var(--line)"
-                      }`,
-                      background: selected()
-                        ? "var(--accent-soft, var(--surface-2))"
-                        : "var(--surface-1)",
-                      overflow: "hidden",
-                    }}
-                  >
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={selected()}
-                      onClick={() => app.setSelectedTtsVoice(voice.id)}
-                      style={{
-                        display: "flex",
-                        "align-items": "center",
-                        "justify-content": "space-between",
-                        gap: "var(--s2)",
-                        flex: 1,
-                        "min-width": 0,
-                        padding: "var(--s3) var(--s4)",
-                        background: "transparent",
-                        border: "none",
-                        color: "var(--text-high)",
-                        cursor: "pointer",
-                        "text-align": "left",
-                      }}
-                    >
-                      <span
-                        style={{
-                          display: "flex",
-                          "align-items": "center",
-                          gap: "var(--s2)",
-                          "min-width": 0,
-                        }}
-                      >
-                        <span
-                          style={{
-                            color: selected()
-                              ? "var(--accent)"
-                              : "var(--text-low)",
-                            display: "flex",
-                          }}
-                        >
-                          <Sigil name="wave" size={16} />
-                        </span>
-                        <span
-                          style={{
-                            overflow: "hidden",
-                            "text-overflow": "ellipsis",
-                            "white-space": "nowrap",
-                          }}
-                        >
-                          {voice.name}
-                        </span>
-                      </span>
-                      <Show when={!voice.installed}>
-                        <Badge tone="warning">Soon</Badge>
-                      </Show>
-                    </button>
-                    <AuditionButton
-                      voiceId={voice.id}
-                      voiceName={voice.name}
-                      disabled={!voice.installed || !app.engineRunning()}
-                      disabledReason={
-                        !voice.installed
-                          ? "This voice isn't installed yet"
-                          : "Start the engine to hear a preview"
-                      }
-                    />
-                  </div>
-                );
-              }}
+            <For each={presetVoices()}>
+              {(voice) => <VoiceCard voice={voice} />}
             </For>
           </div>
         </div>
 
-        {/* Your voices (cloned) — v1.20.0 */}
-        <Show when={anyInstalled()}>
+        {/* Critter Chatter — procedural babble, v1.50.0. Its own group rather
+            than more preset cards: it is a different kind of voice, and it is
+            the one that still works when the presets above are missing. */}
+        <Show when={babbleVoices().length > 0}>
+          <div
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              gap: "var(--s2)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                "align-items": "baseline",
+                gap: "var(--s2)",
+                "flex-wrap": "wrap",
+              }}
+            >
+              <span
+                id="critter-chatter-heading"
+                style={{
+                  "font-size": "var(--t-xs)",
+                  "text-transform": "uppercase",
+                  "letter-spacing": "0.08em",
+                  color: "var(--text-low)",
+                }}
+              >
+                Critter Chatter
+              </span>
+              <span
+                id="critter-chatter-caption"
+                style={{ "font-size": "var(--t-xs)", color: "var(--text-low)" }}
+              >
+                Playful babble · built in, no download
+              </span>
+            </div>
+            <div
+              role="radiogroup"
+              aria-labelledby="critter-chatter-heading"
+              aria-describedby="critter-chatter-caption"
+              style={{
+                display: "grid",
+                "grid-template-columns": "repeat(auto-fill, minmax(220px, 1fr))",
+                gap: "var(--s3)",
+              }}
+            >
+              <For each={babbleVoices()}>
+                {(voice) => <VoiceCard voice={voice} />}
+              </For>
+            </div>
+          </div>
+        </Show>
+
+        {/* Your voices (cloned) — v1.20.0. Timbre clones render through a
+            Kokoro base, so this stays gated on Kokoro as it always was:
+            Critter Chatter being available says nothing about cloning. */}
+        <Show when={kokoroInstalled()}>
           <div
             style={{
               display: "flex",

@@ -82,6 +82,37 @@ describe("App shell", () => {
 // We exercise both by clearing the recorded `invoke` calls AFTER mount
 // completes, then firing each event and asserting the audio-list
 // commands are issued.
+describe("App shell — push-to-modulate key handling", () => {
+  // The PTM listener swallows the hotkey so it never reaches the page. It
+  // must not swallow it from a focused control: browsers activate a button
+  // or radio on Space *keyup*, so preventing that everywhere silently broke
+  // Space on every button in the app, including the Speak voice cards.
+  function pressSpace(target: EventTarget): boolean {
+    const up = new KeyboardEvent("keyup", {
+      key: " ",
+      code: "Space",
+      bubbles: true,
+      cancelable: true,
+    });
+    target.dispatchEvent(up);
+    return up.defaultPrevented;
+  }
+
+  it("leaves Space alone when a control has focus", () => {
+    render(() => <App />);
+    const button = document.createElement("button");
+    document.body.append(button);
+    button.focus();
+    expect(pressSpace(button)).toBe(false);
+    button.remove();
+  });
+
+  it("still swallows Space for push-to-modulate when nothing has focus", () => {
+    render(() => <App />);
+    expect(pressSpace(document.body)).toBe(true);
+  });
+});
+
 describe("App shell — focus device refresh (v0.11.4)", () => {
   /** Wait one microtask cycle so onMount's async work settles. */
   const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));

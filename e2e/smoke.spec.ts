@@ -263,8 +263,8 @@ test.describe("speak / text-to-speech (v1.17)", () => {
     await expect(page.getByRole("radio", { name: /Aria/i })).toBeVisible();
     await expect(page.getByRole("radio", { name: /George/i })).toBeVisible();
 
-    // Scaffolding notice: voices aren't installed yet.
-    await expect(page.getByText(/aren't installed yet/i)).toBeVisible();
+    // Scaffolding notice: preset voices aren't installed in this build.
+    await expect(page.getByText(/aren't installed/i)).toBeVisible();
 
     // The Speak action button (scope to the primary btn to avoid the
     // sidebar's "Speak" nav button).
@@ -280,6 +280,43 @@ test.describe("speak / text-to-speech (v1.17)", () => {
     await page.getByPlaceholder(/echoes/i).fill("Hello from the coven");
     await page.locator("button.btn-primary", { hasText: "Speak" }).click();
     await expect(page.getByText(/voices are not installed/i)).toBeVisible();
+  });
+
+  test("a Critter Chatter voice speaks with no error, even with presets missing (v1.50)", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Speak").click();
+
+    const critters = page.getByRole("radiogroup", { name: "Critter Chatter" });
+    await expect(critters.getByRole("radio")).toHaveCount(3);
+    const gruff = critters.getByRole("radio", { name: /Gruff/ });
+    await gruff.click();
+    await expect(gruff).toHaveAttribute("aria-checked", "true");
+
+    await page.getByPlaceholder(/echoes/i).fill("Hello from the burrow!");
+    await page.locator("button.btn-primary", { hasText: "Speak" }).click();
+
+    // The mock renders only babble ids, so the right id reaching speak — and
+    // no error surfacing — is what proves the selection is wired through.
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (
+            window as unknown as {
+              __E2E_INVOKES__: Array<{ cmd: string; args: { voiceId?: string } }>;
+            }
+          ).__E2E_INVOKES__
+            .filter((i) => i.cmd === "speak")
+            .map((i) => i.args.voiceId),
+        ),
+      )
+      .toEqual(["babble:gruff"]);
+    await expect(
+      page.locator("button.btn-primary", { hasText: "Speak" }),
+    ).toBeEnabled();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
 });
 

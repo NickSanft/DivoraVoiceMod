@@ -521,9 +521,9 @@ export interface AppState {
   refreshVoiceLibrary: () => Promise<void>;
 
   // Text-to-speech ("Speak") — v1.17.0
-  /** Preset Speak voices (each flagged `installed`). */
+  /** Built-in Speak voices — Kokoro presets, then Critter Chatter (each flagged `installed`). */
   ttsVoices: () => TtsVoiceInfo[];
-  /** Selected preset voice id (persisted `divora.ttsVoice`); null until first load. */
+  /** Selected voice id — built-in or cloned (persisted `divora.ttsVoice`); null until first load. */
   selectedTtsVoice: () => string | null;
   setSelectedTtsVoice: (id: string) => void;
   /** Speak playback volume, linear 0..2 (persisted `divora.ttsVolume`). */
@@ -2483,8 +2483,9 @@ export function createAppState(): AppState {
       const list = await listTtsVoicesCmd();
       const next = Array.isArray(list) ? list : [];
       setTtsVoices(next);
-      // Default to the first preset when none is chosen, or the persisted one
-      // exists as neither a preset nor a cloned voice.
+      // Default to the first listed voice (a Kokoro preset — the backend lists
+      // those first) when none is chosen, or the persisted one exists as
+      // neither a built-in nor a cloned voice.
       const current = selectedTtsVoice();
       const first = next[0];
       const known =
