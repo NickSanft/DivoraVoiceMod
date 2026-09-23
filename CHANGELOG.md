@@ -4,7 +4,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
-## [1.50.0] — 2026-09-17 — Critter Chatter
+## [1.50.0] — 2026-09-23 — Critter Chatter
 
 ### Added
 
@@ -34,7 +34,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 - Speak output skips the effect chain and the loudness stage, so the renderer levels every utterance to the same gated loudness the preset voices measure (−21.15 dBFS), and soft-limits under a peak ceiling.
 - Voice ids are namespaced `babble:<variant>`. The colon fails the cloned-voice id check, so these ids can never collide with a cloned voice folder and previews are never cached to disk — which also means a later change to the synthesiser can’t serve stale audio.
 
-### Pre-push checklist (local, 2026-09-17)
+### Pre-push checklist (local, 2026-09-23)
 
 - `cargo fmt --all -- --check` — pass
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
