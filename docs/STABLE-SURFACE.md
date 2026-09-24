@@ -18,7 +18,8 @@ accidental break fails CI before it ships:
 
 - Preset JSON schema + tag casing + legacy-load — `divora-core/src/presets/mod.rs` (`schema_freeze_tests`).
 - `StreamInfo` keys — `divora-core/src/audio/engine.rs`.
-- `EngineStatus` / `LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus` keys — `src-tauri/src/lib.rs`.
+- `EngineStatus` / `LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus` / `VoiceReadingUpdate` keys — `src-tauri/src/lib.rs`.
+- `ReadingSnapshot` keys — `divora-core/src/audio/engine.rs`.
 - `TtsVoiceInfo` keys + the missing-`engine` default — `divora-core/src/tts/mod.rs`.
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - Every command wrapper's command-name string — `src/audio/api.test.ts`.
@@ -59,6 +60,13 @@ resolved `T` or a thrown string on the JS side.
 | `clear_effect_chain` | — | — |
 | `set_voice_model` | `index`, `path?` | — |
 | `set_reactive_config` | `config: ReactiveConfig` | — / v1.46.0 (one whole config; route targets outside the modulation whitelist are dropped, not rejected) |
+
+### Voice reading
+
+| Command | Args | Returns |
+|---|---|---|
+| `set_voice_reading_enabled` | `enabled: bool` | — (off by default; while off the audio callback copies nothing and no analysis runs) |
+| `voice_reading` | — | `VoiceReadingUpdate` (one-shot, for the panel's first paint) |
 
 ### Presets
 
@@ -156,6 +164,17 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
 | `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0) |
 | `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
+| `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
+
+**Why `voice-reading` is its own event and not a field on `LevelUpdate`.**
+Additive-only permits either, so this is a design choice, recorded here because
+it constrains what may be added later. The reading is a *window* measurement
+that changes about once a second, so riding the 30 Hz meter tick would resend
+identical numbers six times over. The feature is off by default, and a field on
+the always-on payload would carry an empty reading to every user who never
+opens the panel. And the panel's accessible summary is text: a value updating
+30 times a second is exactly what must never go near an `aria-live` region.
+`LevelUpdate` keeps meaning "meter tick" and gains no reading fields.
 
 ---
 
@@ -191,7 +210,43 @@ GlobalShortcutEvent { id, accelerator, state: "pressed" | "released" }
 MidiInputInfo     { id, name }                       // v1.9.0
 MidiMessage       { channel, kind, data1, data2 }    // v1.9.0; kind e.g.
                   // "note-on" | "note-off" | "control-change"
+ReadingMetrics    { energyDbfs, energyRangeDb, f0Hz, f0RangeSt,
+                    voicedRatio, paceOps, brightnessHz }
+VoiceReadingUpdate { state, dry: ReadingMetrics, wet: ReadingMetrics,
+                    words: string[], calibrated, wetBypassed,
+                    stale, ageMs }                   // wetBypassed v1.51.0
 ```
+
+**`VoiceReadingUpdate` notes (frozen).**
+
+- `state` is `"stopped" | "muted" | "quiet" | "speaking"`. The set is closed and
+  the four are distinct on purpose: stopped, muted and quiet-but-present look
+  identical at the meter, and collapsing them would let the panel go on
+  describing a signal it no longer has.
+- `dry` is the microphone **before any effect**; `wet` is the same voice
+  **after the chain**. Soundboard / Speak / Critter Chatter audio is mixed in
+  downstream of the wet tap, so it appears on neither half.
+- `words` carries the already-resolved vocabulary (`"wide range"`, not
+  `"narrow"`), never descriptor enum names, and never more than three. The
+  closed vocabulary in `divora-core/src/dsp/reading.rs` is the **only** source
+  of a shown word; the frontend keeps no list of its own, so there is one
+  place to audit.
+- `wetBypassed` (v1.51.0, additive) says the chain passed the signal through
+  over that window, so the two halves *should* read alike. It is **measured**
+  in the engine by correlating the taps, which is scale-invariant because the
+  loudness stage sits between the chain and the wet tap. Do not re-derive it
+  from the metrics here: they are summaries, and a level comparison is wrong
+  whenever loudness normalization is on.
+- Not every measured field is displayed. The card shows four numbers per half
+  — pitch, pitch range, level, pace. `energyRangeDb` and `brightnessHz` reach
+  the screen only through `words` (`flat`/`dynamic`, `dark`/`bright`), and
+  `voicedRatio` is measured, used to decide voicing, and never shown.
+- `stale` / `ageMs`: during a pause the last speaking window is **held** and
+  flagged rather than decayed. A readout drifting toward "quiet, flat, narrow"
+  through every pause would be a verdict on the speaker, not a measurement.
+- Every metric field is always a finite number. A silent window is −∞ dBFS
+  internally, which JSON cannot carry, so the bridge floors it (−120 dBFS)
+  rather than emitting `null`.
 
 `EffectKindWire` (frozen set; new kinds may be **added** after v1.0):
 
@@ -268,6 +323,14 @@ to defaults (never throw).
 | `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
 | `divora.wizardSeen` | first-run wizard completion flag |
 | `divora.whatsNewSeenVersion` | last app version whose release notes were announced (bare string, not JSON) — v1.49.0 |
+| `divora.voiceReading` | Voice reading panel on/off (`{ enabled }`, default false) |
+
+**Nothing derived from the user's voice is persisted.** The only Voice reading
+key is the switch above. The rolling baseline the descriptors are relative to
+is built in the engine, lives for the length of one session, and is never
+written to disk. It is invalidated by: switching the panel on, an engine
+start/stop, a device change, and device-loss recovery — each of those rebuilds
+the session, and the baseline dies with the worker thread that held it.
 
 ---
 

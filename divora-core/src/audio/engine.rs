@@ -10,15 +10,15 @@
 //! when monitor is off). DSP graph slots in between in Phase 3.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +27,10 @@ use super::loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS};
 use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
-use crate::dsp::{DspCommand, EffectChain, ReactiveConfig, ReactiveModulator, ResolvedReactive};
+use crate::dsp::{
+    Analyzer, DspCommand, EffectChain, InputFacts, Metrics, ReactiveConfig, ReactiveModulator,
+    ReadingState, ResolvedReactive, VoiceReading,
+};
 use crate::soundboard::{SoundboardCommand, SoundboardMixer};
 
 /// Capacity of the SPSC ring buffer used between input and output
@@ -51,6 +54,29 @@ const SB_CHANNEL_CAPACITY: usize = 256;
 /// starts. Caps recovery so a permanently-flapping device can't loop
 /// forever; a manual `Start` resets the budget. (v1.33.0)
 const MAX_AUTO_RECOVERIES: u32 = 8;
+
+/// How often the voice-reading worker drains its taps. Short enough that a
+/// `RING_BUFFER_FRAMES` ring cannot fill between passes even at 96 kHz (where
+/// 8192 frames is ~85 ms), long enough that an idle worker costs nothing.
+const READING_DRAIN_INTERVAL_MS: u64 = 20;
+
+/// How long a held reading stays on screen before the panel drops the numbers
+/// and shows only the state. A reading from four minutes ago is not a stale
+/// reading, it is a different conversation. In seconds, so it behaves
+/// identically at 44.1, 48 and 96 kHz.
+const READING_HOLD_SECS: u64 = 30;
+
+/// How long a `Speaking` verdict survives with no further analysis windows
+/// before it is demoted. A stalled output device keeps the engine's `running`
+/// flag true while producing no callbacks at all; without this the panel would
+/// sit on "live" indefinitely. In milliseconds, so it is the same wall-clock
+/// window at every sample rate.
+const READING_LIVE_TIMEOUT_MS: u64 = 2_000;
+
+/// How far from an exact octave a pitch jump can land and still be treated as
+/// a possible tracker error, in semitones. Also the window within which two
+/// consecutive readings count as agreeing with each other.
+const OCTAVE_TOLERANCE_ST: f32 = 1.5;
 
 /// Information about the live engine session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +146,9 @@ enum RecordingCommand {
 pub struct AudioEngine {
     tx: Sender<Command>,
     state: Arc<EngineState>,
+    /// Voice-reading gate + latest snapshot. Separate from `state` because
+    /// only this feature reads or writes it.
+    reading: Arc<ReadingTap>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -141,16 +170,19 @@ impl AudioEngine {
         // seed the target so the readout/stage have a sane value if enabled.
         state.store_loudness_target(DEFAULT_TARGET_DBFS);
         let state_clone = state.clone();
+        let reading = Arc::new(ReadingTap::default());
+        let reading_clone = reading.clone();
         // The engine thread keeps a Command sender so a stream's error
         // callback can ask it to rebuild the session after a device loss.
         let cmd_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("divora-audio".into())
-            .spawn(move || engine_thread(rx, cmd_tx, state_clone))
+            .spawn(move || engine_thread(rx, cmd_tx, state_clone, reading_clone))
             .expect("spawning the audio thread should not fail");
         Self {
             tx,
             state,
+            reading,
             handle: Some(handle),
         }
     }
@@ -350,6 +382,38 @@ impl AudioEngine {
     pub fn reactive_depth(&self) -> f32 {
         self.state.load_reactive_depth()
     }
+
+    /// Turn the voice-reading analysis on or off.
+    ///
+    /// Off is the default, and off means off: the audio callback copies
+    /// nothing into the taps and the worker runs no analysis. Switching it on
+    /// starts a fresh baseline — nothing carries over from the last time,
+    /// and nothing is written to disk.
+    pub fn set_reading_enabled(&self, enabled: bool) {
+        self.reading.enabled.store(enabled, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn reading_enabled(&self) -> bool {
+        self.reading.is_enabled()
+    }
+
+    /// Tell the reading the input is muted.
+    ///
+    /// A fact handed in, not a level guess — see [`ReadingFacts`]. Deliberately
+    /// NOT wired to push-to-modulate: with the key up the mic is still open
+    /// and only the chain is bypassed, so the dry reading stays valid and only
+    /// the after-effects half changes.
+    pub fn set_reading_muted(&self, muted: bool) {
+        self.reading.muted.store(muted, Ordering::Release);
+    }
+
+    /// The latest voice reading. Idle (measuring nothing) while the feature is
+    /// off, and held-but-flagged rather than decayed during pauses.
+    #[must_use]
+    pub fn voice_reading(&self) -> ReadingSnapshot {
+        self.reading.load()
+    }
 }
 
 impl Default for AudioEngine {
@@ -388,11 +452,20 @@ struct StartedStreams {
     /// v1.23.0: the dry-input reference recorder's channel + writer thread.
     reference_tx: Sender<RecordingCommand>,
     reference_writer: JoinHandle<()>,
+    /// The voice-reading worker. Dropping `reading_tx` disconnects its
+    /// keep-alive channel, which is how it learns the session is over.
+    reading_tx: Sender<()>,
+    reading_worker: JoinHandle<()>,
 }
 
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
 #[allow(clippy::too_many_lines)] // one command dispatch loop; clearer inline
-fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<EngineState>) {
+fn engine_thread(
+    rx: Receiver<Command>,
+    cmd_tx: Sender<Command>,
+    state: Arc<EngineState>,
+    reading: Arc<ReadingTap>,
+) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<Sender<DspCommand>> = None;
     let mut reactive_tx: Option<Sender<ResolvedReactive>> = None;
@@ -402,6 +475,10 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
     // v1.23.0: the parallel dry-input reference recorder (its own ring + writer).
     let mut reference_tx: Option<Sender<RecordingCommand>> = None;
     let mut reference_writer: Option<JoinHandle<()>> = None;
+    // The voice-reading worker + its keep-alive sender. Per-session, which is
+    // what makes an engine restart or a device change invalidate the baseline.
+    let mut reading_tx: Option<Sender<()>> = None;
+    let mut reading_worker: Option<JoinHandle<()>> = None;
     // v1.33.0: the devices of the live session, kept so a stream error can
     // rebuild on the same ones; and a counter that caps automatic recoveries
     // between manual starts so a flapping device can't loop forever.
@@ -435,10 +512,20 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
             if let Some(h) = reference_writer.take() {
                 let _ = h.join();
             }
+            drop(reading_tx.take());
+            if let Some(h) = reading_worker.take() {
+                let _ = h.join();
+            }
             state.running.store(false, Ordering::Release);
             // The meter must not freeze at the last depth once the engine
             // is down — `reactive_depth()` documents 0 when stopped.
             state.store_reactive_depth(0.0);
+            // Same for the reading: the worker is gone, so nothing would
+            // re-label the held window and the panel would go on showing a
+            // reading for a session that no longer exists. The baseline dies
+            // with the worker, which is the invalidation rule on an engine
+            // restart or a device change.
+            reading.store(ReadingSnapshot::idle(ReadingState::Stopped));
         }};
     }
 
@@ -448,7 +535,14 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
     // `StreamInfo` on success, the build error on failure.
     macro_rules! bring_up {
         ($in:expr, $out:expr, $mon:expr) => {{
-            match start_streams($in, $out, $mon, state.clone(), cmd_tx.clone()) {
+            match start_streams(
+                $in,
+                $out,
+                $mon,
+                state.clone(),
+                reading.clone(),
+                cmd_tx.clone(),
+            ) {
                 Ok(started) => {
                     state.running.store(true, Ordering::Release);
                     dsp_tx = Some(started.dsp_tx);
@@ -458,6 +552,8 @@ fn engine_thread(rx: Receiver<Command>, cmd_tx: Sender<Command>, state: Arc<Engi
                     writer = Some(started.writer);
                     reference_tx = Some(started.reference_tx);
                     reference_writer = Some(started.reference_writer);
+                    reading_tx = Some(started.reading_tx);
+                    reading_worker = Some(started.reading_worker);
                     current = Some(started.streams);
                     // Restore the soundboard master gain onto the fresh (unity)
                     // mixer so a rebuild doesn't reset the user's volume.
@@ -680,6 +776,8 @@ fn start_streams(
     output_name: Option<&str>,
     monitor_name: Option<&str>,
     state: Arc<EngineState>,
+    // The voice-reading gate + snapshot slot, shared with the panel.
+    reading: Arc<ReadingTap>,
     // v1.33.0: handed to the output stream's error callback so a device loss
     // can signal the engine thread to rebuild the session.
     cmd_tx: Sender<Command>,
@@ -758,6 +856,16 @@ fn start_streams(
     let (reference_producer, reference_consumer) = reference_rb.split();
     let (reference_tx, reference_rx) = channel::<RecordingCommand>();
 
+    // Voice-reading taps: the DRY mic and the chain's OUTPUT, on their own
+    // rings so the worker can compare the same moment on both. Always wired —
+    // the panel can be switched on mid-session — but the callback copies into
+    // them only while the panel is on, so off costs one atomic load a buffer.
+    let reading_dry_rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
+    let (reading_dry_producer, reading_dry_consumer) = reading_dry_rb.split();
+    let reading_wet_rb = HeapRb::<f32>::new(RING_BUFFER_FRAMES);
+    let (reading_wet_producer, reading_wet_consumer) = reading_wet_rb.split();
+    let (reading_tx, reading_alive) = channel::<()>();
+
     let (dsp_tx, dsp_rx) = channel::<DspCommand>();
     let (reactive_tx, reactive_rx) = channel::<ResolvedReactive>();
     let (sb_tx, sb_rx) = sync_channel::<SoundboardCommand>(SB_CHANNEL_CAPACITY);
@@ -786,6 +894,11 @@ fn start_streams(
         monitor_producer,
         has_monitor,
         recording_producer,
+        ReadingTaps {
+            dry: reading_dry_producer,
+            wet: reading_wet_producer,
+        },
+        reading.clone(),
         cmd_tx,
     )?;
 
@@ -848,6 +961,24 @@ fn start_streams(
         .spawn(move || recording_writer(reference_consumer, reference_rx, input_rate))
         .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
 
+    // The reading worker. Per-session like the writers above: it exits when
+    // `reading_tx` drops at teardown, and the rolling baseline it built goes
+    // with it, which is exactly the invalidation an engine restart or a device
+    // change should cause.
+    let reading_worker_handle = std::thread::Builder::new()
+        .name("divora-reading".into())
+        .spawn(move || {
+            reading_worker(
+                reading_dry_consumer,
+                reading_wet_consumer,
+                reading,
+                state,
+                reading_alive,
+                input_rate,
+            );
+        })
+        .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
+
     Ok(StartedStreams {
         streams: RunningStreams {
             _input: input_stream,
@@ -862,6 +993,8 @@ fn start_streams(
         writer,
         reference_tx,
         reference_writer,
+        reading_tx,
+        reading_worker: reading_worker_handle,
     })
 }
 
@@ -965,6 +1098,11 @@ fn build_output_stream(
     // ring while `state.recording` is set; a writer thread drains it to
     // a WAV file. Always wired — recording can begin mid-session.
     mut recording_producer: RingProducer,
+    // The voice-reading taps. The callback's only job here is two O(n) copies
+    // into preallocated rings, gated on an atomic; all analysis happens on the
+    // worker thread that drains them.
+    mut reading_taps: ReadingTaps,
+    reading: Arc<ReadingTap>,
     // v1.33.0: lets the stream's error callback ask the engine thread to
     // rebuild the session after a device loss (see `Command::StreamError`).
     cmd_tx: Sender<Command>,
@@ -1030,6 +1168,12 @@ fn build_output_stream(
                 }
                 while let Ok(cmd) = dsp_rx.try_recv() {
                     chain.apply(cmd);
+                    // The reading worker runs on another thread and cannot see
+                    // the chain, so it has to be told. Without this the
+                    // after-effects half kept showing the previous preset's
+                    // numbers for over a second while the card already named
+                    // the new one.
+                    reading.note_chain_changed();
                 }
                 while let Ok(cmd) = sb_rx.try_recv() {
                     soundboard.apply(cmd);
@@ -1098,6 +1242,18 @@ fn build_output_stream(
                 // them by the Speak monitor, independent of the mic monitor.
                 // Folded back into `mono` for the main send below.
                 let mut sb = [0f32; MAX_FRAMES_PER_CALLBACK];
+
+                // Voice reading, DRY half. `mono` is the raw mic here — the
+                // chain rewrites it in place below, so this is the one point
+                // on this thread where the untouched signal exists. Room is
+                // reserved in BOTH rings now so the WET copy after the chain
+                // cannot be the one that gets dropped, which would leave the
+                // two taps permanently out of step.
+                let tapping = reading_taps.armed(reading.is_enabled(), native_frames);
+                if tapping {
+                    reading_taps.push_dry(&mono[..native_frames]);
+                }
+
                 mix_voice_and_soundboard(
                     &mut mono[..native_frames],
                     &mut sb[..native_frames],
@@ -1110,6 +1266,15 @@ fn build_output_stream(
                 // Publish the makeup gain for the UI "it's working" readout.
                 state_for_callback.store_loudness_gain_db(loudness.gain_db());
                 state_for_callback.store_reactive_depth(modulator.depth());
+
+                // Voice reading, WET half — the chain's output, which is what
+                // the call hears from the mic. Taken HERE, before the
+                // soundboard is folded in below, so Speak / Critter Chatter /
+                // clip audio is on neither tap: those are mixed in after the
+                // chain and are not the user's voice.
+                if tapping {
+                    reading_taps.push_wet(&mono[..native_frames]);
+                }
 
                 // Phase 13: tap the processed, input-rate mono into the
                 // monitor ring (if a monitor device is active) BEFORE this
@@ -1369,6 +1534,610 @@ fn mix_voice_and_soundboard(
     soundboard.mix_into(soundboard_out, sample_rate);
 }
 
+// ---------------------------------------------------------------------------
+// Voice reading — the taps, the worker, and the seam the analysis plugs into.
+//
+// What this half owns: getting the DRY mic and the chain's OUTPUT off the
+// audio thread without allocating, deciding which of the four states the panel
+// is in, and holding the last speaking window rather than letting a readout
+// decay through every pause. What it deliberately does NOT own: the analysis
+// itself. See `crate::dsp::reading` for what a reading is and is not.
+// ---------------------------------------------------------------------------
+
+/// Facts the reading is **told** rather than left to infer from a quiet
+/// buffer.
+///
+/// Stopped, muted and quiet-but-present all look the same at the meter, and
+/// guessing between them is how a readout ends up publishing a verdict on the
+/// speaker every time they stop to breathe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadingFacts {
+    /// The engine is live. False means there is no signal to read, not a
+    /// quiet one.
+    pub running: bool,
+    /// Something outside the analysis knows the input is muted — an OS or
+    /// device mute. Push-to-modulate is deliberately not this: with the key
+    /// up the mic is still open and only the chain is bypassed.
+    pub muted: bool,
+    /// Every sample of a whole analysis window was exactly zero. A device or
+    /// OS mute produces that; a quiet room never does, which is what makes it
+    /// a fact about the input rather than a level threshold. A brief ring
+    /// underrun cannot trigger it either — it takes a window's worth.
+    pub digital_silence: bool,
+}
+
+impl ReadingFacts {
+    /// Resolve the state the panel shows.
+    ///
+    /// `measured` is the analyzer's verdict about the *signal*, so only
+    /// `Speaking` is taken from it; everything else collapses to `Quiet` and
+    /// the engine facts decide from there. An analyzer that could return
+    /// `Stopped` or `Muted` would be inferring exactly what this split exists
+    /// to keep it from inferring.
+    #[must_use]
+    fn resolve(self, measured: ReadingState) -> ReadingState {
+        if !self.running {
+            ReadingState::Stopped
+        } else if self.muted || self.digital_silence {
+            ReadingState::Muted
+        } else if matches!(measured, ReadingState::Speaking) {
+            ReadingState::Speaking
+        } else {
+            ReadingState::Quiet
+        }
+    }
+}
+
+/// The seam the voice-reading analysis plugs into.
+///
+/// A worker thread owns one of these and feeds it aligned dry/wet blocks;
+/// pitch tracking, spectra and the rolling baseline all live behind it, off
+/// the audio thread. Two things are contractual:
+///
+/// * `push` returns `Some` exactly when an analysis window completes, so the
+///   panel updates at the analysis rate rather than the callback rate.
+/// * the returned `state` is a verdict about the signal — `Speaking` or
+///   `Quiet`. The engine supplies stopped and muted (see [`ReadingFacts`]).
+pub trait ReadingAnalyzer: Send {
+    /// Feed one aligned pair of blocks, `dry` before the chain and `wet`
+    /// after it, both `sample_rate` Hz and the same length.
+    fn push(&mut self, dry: &[f32], wet: &[f32], sample_rate: u32) -> Option<VoiceReading>;
+
+    /// The effect chain changed, so anything measured from the wet tap
+    /// describes a chain that no longer exists.
+    fn note_chain_changed(&mut self);
+
+    /// Forget the rolling baseline.
+    ///
+    /// Called when the panel is switched on, and implied by a new session
+    /// (the worker is per-session), so a reading is never relative to a
+    /// baseline built on a different mic. The baseline is per-session by
+    /// design and is never written to disk — it derives from the user's
+    /// voice, and nothing derived from the user's voice is persisted.
+    fn reset(&mut self);
+}
+
+/// Bridges the analysis engine to the worker's seam.
+///
+/// Two things the seam doesn't carry and this fills in:
+///
+/// * the sample rate, which [`Analyzer`] wants once at construction while the
+///   seam passes it per block — so the analyzer is built on the first block
+///   and rebuilt if the device rate ever changes under it;
+/// * whether the chain was a passthrough over the window. Nothing in the
+///   engine holds a "bypassed" flag: push-to-modulate toggles effects one at
+///   a time, and a Clean preset is bypass by another name. So this measures
+///   it instead of trusting plumbing — see [`is_passthrough`] — which is
+///   right for every cause rather than the one we remembered to wire.
+struct LiveAnalyzer {
+    /// The rate it was built for, and the analyzer itself.
+    inner: Option<(u32, Analyzer)>,
+    /// Every block since the last reading was a passthrough. Reset when a
+    /// reading is emitted, so the flag describes that window and not just
+    /// its final block.
+    bypassed: bool,
+}
+
+impl Default for LiveAnalyzer {
+    fn default() -> Self {
+        Self {
+            inner: None,
+            bypassed: true,
+        }
+    }
+}
+
+impl ReadingAnalyzer for LiveAnalyzer {
+    fn push(&mut self, dry: &[f32], wet: &[f32], sample_rate: u32) -> Option<VoiceReading> {
+        if let Some(passthrough) = is_passthrough(dry, wet) {
+            self.bypassed &= passthrough;
+        }
+        let bypassed = self.bypassed;
+        let analyzer = match &mut self.inner {
+            Some((rate, analyzer)) if *rate == sample_rate => analyzer,
+            slot => {
+                *slot = Some((sample_rate, Analyzer::new(sample_rate)));
+                &mut slot.as_mut().expect("just set").1
+            }
+        };
+        // `engine_running` and `input_muted` are the engine's to answer, and
+        // it layers them on afterwards through `ReadingFacts::resolve`; what
+        // the analyzer decides here is only whether the signal is speech.
+        let facts = InputFacts {
+            engine_running: true,
+            input_muted: false,
+            chain_bypassed: bypassed,
+        };
+        let out = analyzer.observe(dry, wet, facts);
+        if out.is_some() {
+            self.bypassed = true;
+        }
+        out
+    }
+
+    fn note_chain_changed(&mut self) {
+        if let Some((_, analyzer)) = &mut self.inner {
+            analyzer.note_chain_changed();
+        }
+        self.bypassed = true;
+    }
+
+    fn reset(&mut self) {
+        if let Some((_, analyzer)) = &mut self.inner {
+            analyzer.reset_session();
+        }
+        self.bypassed = true;
+    }
+}
+
+/// Drop what is queued on both taps without losing their pairing.
+///
+/// Sized by WET, dropping the same count from each. Two independent drains
+/// race the callback: empty DRY, and if the panel is switched on before WET
+/// is emptied, one buffer's DRY half survives while its WET half is eaten.
+/// The taps are then misaligned by that buffer for the rest of the session
+/// and nothing resyncs them. DRY is pushed first, so `dry >= wet` always
+/// holds and equal skips keep the halves paired whatever the callback does
+/// in between; a DRY buffer whose WET half has not arrived yet is left
+/// alone, which is exactly right — its partner is on the way.
+fn drop_paired(
+    dry: &mut RingConsumer,
+    wet: &mut RingConsumer,
+    dry_buf: &mut [f32],
+    wet_buf: &mut [f32],
+) {
+    let mut skip = wet.occupied_len();
+    while skip > 0 {
+        let want = skip.min(wet_buf.len()).min(dry_buf.len());
+        let took = wet.pop_slice(&mut wet_buf[..want]);
+        if took == 0 {
+            break;
+        }
+        dry.pop_slice(&mut dry_buf[..took]);
+        skip -= took;
+    }
+}
+
+/// Whether `wet` is `dry` passed through, ignoring level.
+///
+/// Scale-invariant on purpose: the wet tap sits after the loudness stage, so
+/// a bypassed chain still arrives at a different level. `None` when the block
+/// is too quiet to tell, so silence never votes either way.
+fn is_passthrough(dry: &[f32], wet: &[f32]) -> Option<bool> {
+    const QUIET: f64 = 1e-9;
+    /// Correlation above this is the same waveform. Any real effect — even a
+    /// gentle EQ — lands far below it.
+    const SAME: f64 = 0.999;
+
+    let n = dry.len().min(wet.len());
+    let (mut dd, mut ww, mut dw) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for i in 0..n {
+        let (d, w) = (f64::from(dry[i]), f64::from(wet[i]));
+        dd += d * d;
+        ww += w * w;
+        dw += d * w;
+    }
+    if dd < QUIET || ww < QUIET {
+        return None;
+    }
+    Some(dw / (dd.sqrt() * ww.sqrt()) >= SAME)
+}
+
+/// Constructs the analyzer the reading worker runs.
+///
+/// The only place the analysis implementation is named. The taps, the worker,
+/// the freeze and the wire shape are all written against [`ReadingAnalyzer`].
+fn new_reading_analyzer() -> Box<dyn ReadingAnalyzer> {
+    Box::new(LiveAnalyzer::default())
+}
+
+/// What the panel shows: a reading, plus whether it is still live.
+///
+/// `stale` is the answer to this feature's worst failure mode. Most of a
+/// session is not speech, and a readout that decayed through the pauses toward
+/// "quiet, flat, narrow" would be delivering a verdict on the speaker several
+/// times a minute without printing a word. Instead the last speaking window is
+/// **held** and flagged, and `state` says why it is being held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingSnapshot {
+    /// The reading itself. Its own keys stay as `crate::dsp::reading` defines
+    /// them (`energy_dbfs`, `f0_hz`, …) — only this wrapper is camelCase.
+    pub reading: VoiceReading,
+    /// The metrics come from an earlier window, not from now.
+    pub stale: bool,
+    /// How long ago that window was measured, in ms. 0 while live.
+    pub age_ms: u32,
+}
+
+impl ReadingSnapshot {
+    /// A snapshot that measures nothing and holds nothing.
+    #[must_use]
+    pub fn idle(state: ReadingState) -> Self {
+        Self {
+            reading: VoiceReading::idle(state),
+            stale: false,
+            age_ms: 0,
+        }
+    }
+}
+
+/// Shared state for the voice-reading panel.
+///
+/// Lives beside [`EngineState`] rather than inside it because only this
+/// feature touches it. The audio callback reads `enabled` and nothing else —
+/// there is no lock on the realtime path. The `Mutex` sits between the worker
+/// thread and the UI thread, neither of which is realtime.
+#[derive(Debug)]
+pub struct ReadingTap {
+    enabled: AtomicBool,
+    muted: AtomicBool,
+    /// The chain changed since the worker last looked.
+    ///
+    /// Set on the audio thread (one relaxed store beside the command it
+    /// already applied) and taken by the worker, because the two run on
+    /// different threads and the worker cannot see the chain.
+    chain_changed: AtomicBool,
+    snapshot: Mutex<ReadingSnapshot>,
+}
+
+impl Default for ReadingTap {
+    fn default() -> Self {
+        Self {
+            // Off by default: no analysis runs unless the user asks for it.
+            enabled: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
+            chain_changed: AtomicBool::new(false),
+            snapshot: Mutex::new(ReadingSnapshot::idle(ReadingState::Stopped)),
+        }
+    }
+}
+
+impl ReadingTap {
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Acquire)
+    }
+
+    /// Tell the reading the effect chain changed under it.
+    pub fn note_chain_changed(&self) {
+        self.chain_changed.store(true, Ordering::Release);
+    }
+
+    /// Whether the chain changed since this was last asked, clearing the flag.
+    fn take_chain_changed(&self) -> bool {
+        self.chain_changed.swap(false, Ordering::AcqRel)
+    }
+
+    /// A poisoned lock means the worker panicked mid-write. The value behind
+    /// it is a plain snapshot, so carrying on with it beats taking the UI
+    /// thread down as well.
+    fn store(&self, snapshot: ReadingSnapshot) {
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = snapshot;
+    }
+
+    fn load(&self) -> ReadingSnapshot {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The producer ends of the two taps, owned by the output callback.
+///
+/// Both or neither. The DRY copy is taken before the chain overwrites the
+/// buffer in place and the WET copy after it, so a push that landed on one
+/// ring and was truncated on the other would slide the two taps out of step
+/// for the rest of the session — the later readings would compare a speaker
+/// against a different moment of themselves.
+struct ReadingTaps {
+    dry: RingProducer,
+    wet: RingProducer,
+}
+
+impl ReadingTaps {
+    /// Whether this callback taps. Checked once, before the DRY copy, and the
+    /// answer still holds at the WET copy: only this thread pushes, and the
+    /// worker only ever frees space, so the room reserved here cannot vanish.
+    fn armed(&self, enabled: bool, frames: usize) -> bool {
+        enabled && frames > 0 && self.dry.vacant_len() >= frames && self.wet.vacant_len() >= frames
+    }
+
+    fn push_dry(&mut self, block: &[f32]) {
+        let _ = self.dry.push_slice(block);
+    }
+
+    fn push_wet(&mut self, block: &[f32]) {
+        let _ = self.wet.push_slice(block);
+    }
+}
+
+/// Semitone distance from `a` to `b`.
+fn semitones_between(a: f32, b: f32) -> f32 {
+    12.0 * (b / a).log2()
+}
+
+/// Whether `b` sits within [`OCTAVE_TOLERANCE_ST`] of an exact octave (or two)
+/// from `a` — the shape of an f0 tracker locking onto the wrong harmonic.
+fn is_octave_jump(a: f32, b: f32) -> bool {
+    if !(a.is_finite() && b.is_finite()) || a <= 0.0 || b <= 0.0 {
+        return false;
+    }
+    let st = semitones_between(a, b).abs();
+    (st - 12.0).abs() <= OCTAVE_TOLERANCE_ST || (st - 24.0).abs() <= OCTAVE_TOLERANCE_ST
+}
+
+/// Whether two windows landed close enough to be the same answer twice.
+fn pitches_agree(a: f32, b: f32) -> bool {
+    a > 0.0 && b > 0.0 && semitones_between(a, b).abs() <= OCTAVE_TOLERANCE_ST
+}
+
+/// Holds back the pitch jump an f0 tracker makes when it locks onto the wrong
+/// harmonic.
+///
+/// Octave errors are what users actually see. On a gaming headset behind a
+/// gate and a denoiser the tracker will halve or double from time to time, and
+/// a pitch readout flickering between two answers is worse than no readout at
+/// all. So a move landing near an exact octave is not shown until a second
+/// window agrees with it: a real change of register survives one window's
+/// delay, a tracker error does not repeat cleanly.
+///
+/// DRY only. The WET half is *supposed* to jump an octave the moment a preset
+/// says so — that is the entire point of the after-effects reading — and a
+/// confirm-before-showing rule there would fight the feature.
+#[derive(Debug, Default)]
+struct OctaveGuard {
+    /// The last pitch pair actually shown.
+    last: Option<(f32, f32)>,
+    /// An unconfirmed jump, waiting for a second window to agree.
+    pending: Option<f32>,
+}
+
+impl OctaveGuard {
+    fn reset(&mut self) {
+        self.last = None;
+        self.pending = None;
+    }
+
+    /// Replace this window's pitch pair with the last accepted one when the
+    /// jump looks like a tracker error. The guard only ever holds a value
+    /// back; it never invents one.
+    fn apply(&mut self, metrics: &mut Metrics) {
+        let f0 = metrics.f0_hz;
+        if !f0.is_finite() || f0 <= 0.0 {
+            // Nothing voiced. A pause is not a confirmation, so drop any
+            // pending jump rather than let silence vouch for it.
+            self.pending = None;
+            return;
+        }
+        let Some((last_f0, last_range)) = self.last else {
+            self.accept(metrics);
+            return;
+        };
+        if !is_octave_jump(last_f0, f0) {
+            self.accept(metrics);
+            return;
+        }
+        if self.pending.is_some_and(|p| pitches_agree(p, f0)) {
+            self.accept(metrics);
+        } else {
+            self.pending = Some(f0);
+            metrics.f0_hz = last_f0;
+            metrics.f0_range_st = last_range;
+        }
+    }
+
+    fn accept(&mut self, metrics: &Metrics) {
+        self.last = Some((metrics.f0_hz, metrics.f0_range_st));
+        self.pending = None;
+    }
+}
+
+/// Build the snapshot to publish: the held window, re-labelled with the
+/// current state, or nothing once it is too old to mean anything.
+///
+/// Never a decayed version of it. Freezing is the point — a readout that
+/// drifted toward "quiet, flat, narrow" through every pause would be passing
+/// judgement on the speaker rather than reporting a measurement.
+fn reading_snapshot(
+    held: Option<&(VoiceReading, Instant)>,
+    state: ReadingState,
+) -> ReadingSnapshot {
+    let Some((reading, at)) = held else {
+        return ReadingSnapshot::idle(state);
+    };
+    let age = at.elapsed();
+    if age.as_secs() >= READING_HOLD_SECS {
+        // Dropping the stale NUMBERS does not un-learn the baseline. Returning
+        // a bare idle here made the panel announce "still listening — not
+        // enough speech yet to compare against" after any 30 second pause,
+        // which is false: the analyzer stays calibrated for the session. The
+        // same silence at 29 seconds correctly read "too quiet to measure",
+        // so the panel got less truthful the longer it waited.
+        let mut expired = ReadingSnapshot::idle(state);
+        expired.reading.calibrated = reading.calibrated;
+        return expired;
+    }
+    let held_over = !matches!(state, ReadingState::Speaking);
+    let mut reading = reading.clone();
+    reading.state = state;
+    // Keep the flag honest. This path re-labels the last *speaking* reading
+    // rather than using the analyzer's own held output — which is what keeps
+    // the phrase on screen through a pause instead of blinking it out — but
+    // it left `held` reading false on a snapshot whose `stale` was true, on a
+    // surface the docs describe as frozen.
+    reading.held = held_over;
+    ReadingSnapshot {
+        reading,
+        stale: held_over,
+        age_ms: if held_over {
+            u32::try_from(age.as_millis()).unwrap_or(u32::MAX)
+        } else {
+            0
+        },
+    }
+}
+
+/// Whether a `Speaking` verdict has gone stale because no analysis window has
+/// completed in a while.
+///
+/// The same failure as a decaying readout wearing a different costume: a
+/// stalled device stops producing callbacks while the engine still reports
+/// itself running, and the panel would go on claiming a live reading of a
+/// signal that stopped arriving.
+fn live_verdict_expired(measured: ReadingState, since_last_window: Duration) -> bool {
+    matches!(measured, ReadingState::Speaking)
+        && since_last_window >= Duration::from_millis(READING_LIVE_TIMEOUT_MS)
+}
+
+/// The voice-reading worker thread.
+///
+/// Owns the consumer ends of both taps plus the analyzer, and publishes a
+/// snapshot the UI thread reads. Everything expensive — pitch tracking, FFTs,
+/// the baseline — happens here and never in the callback. Exits when `alive`
+/// disconnects at teardown, which is also what invalidates the baseline: a new
+/// session gets a new worker and therefore a new one.
+#[allow(clippy::needless_pass_by_value)] // owns everything for the thread's lifetime
+fn reading_worker(
+    mut dry: RingConsumer,
+    mut wet: RingConsumer,
+    tap: Arc<ReadingTap>,
+    state: Arc<EngineState>,
+    alive: Receiver<()>,
+    sample_rate: u32,
+) {
+    let mut analyzer = new_reading_analyzer();
+    let mut guard = OctaveGuard::default();
+    let mut held: Option<(VoiceReading, Instant)> = None;
+    let mut measured = ReadingState::Quiet;
+    let mut last_window = Instant::now();
+    let mut was_enabled = false;
+    let mut all_zero = true;
+    let mut dry_buf = [0f32; MAX_FRAMES_PER_CALLBACK];
+    let mut wet_buf = [0f32; MAX_FRAMES_PER_CALLBACK];
+
+    loop {
+        if matches!(alive.try_recv(), Err(TryRecvError::Disconnected)) {
+            return;
+        }
+        let enabled = tap.is_enabled();
+        if enabled != was_enabled {
+            was_enabled = enabled;
+            // Switching the panel on starts a fresh baseline; switching it off
+            // throws away what it had. Neither survives to disk.
+            analyzer.reset();
+            guard.reset();
+            held = None;
+            measured = ReadingState::Quiet;
+            last_window = Instant::now();
+            all_zero = true;
+        }
+
+        let mut facts = ReadingFacts {
+            running: state.running.load(Ordering::Acquire),
+            muted: tap.is_muted(),
+            digital_silence: false,
+        };
+
+        // Drop the wet window whenever the chain changed under it: those
+        // samples describe a chain that no longer exists, and holding them
+        // meant the card named the new preset beside the old one's numbers.
+        // Taken every pass, enabled or not, so the flag never goes stale.
+        if tap.take_chain_changed() {
+            analyzer.note_chain_changed();
+        }
+
+        if !enabled {
+            // Discard anything the callback pushed around the edge of the
+            // toggle, so stale audio never lands at the head of a new window.
+            //
+            // Drop the SAME COUNT from each, sized by WET. Two independent
+            // unbounded drains race the callback: empty DRY, and if the panel
+            // is switched on before WET is emptied, one buffer's DRY half
+            // survives while its WET half is eaten. The taps are then
+            // misaligned by that buffer for the rest of the session, and
+            // nothing resyncs them — review reproduced it. DRY is pushed
+            // first, so `dry_occupied >= wet_occupied` always holds and equal
+            // skips keep the halves paired whatever the callback does in
+            // between.
+            drop_paired(&mut dry, &mut wet, &mut dry_buf, &mut wet_buf);
+            tap.store(ReadingSnapshot::idle(facts.resolve(ReadingState::Quiet)));
+            std::thread::sleep(Duration::from_millis(READING_DRAIN_INTERVAL_MS));
+            continue;
+        }
+
+        let mut published = false;
+        loop {
+            // Size the drain by WET. It is pushed after the chain runs, so it
+            // trails DRY by at most one buffer; draining by DRY would eat
+            // samples whose WET half has not been written yet and the two taps
+            // would never line up again.
+            let want = wet.occupied_len().min(MAX_FRAMES_PER_CALLBACK);
+            if want == 0 {
+                break;
+            }
+            let n_wet = wet.pop_slice(&mut wet_buf[..want]);
+            let n = dry.pop_slice(&mut dry_buf[..n_wet]).min(n_wet);
+            if n == 0 {
+                break;
+            }
+            all_zero &= dry_buf[..n].iter().all(|s| *s == 0.0);
+            if let Some(mut reading) = analyzer.push(&dry_buf[..n], &wet_buf[..n], sample_rate) {
+                facts.digital_silence = all_zero;
+                all_zero = true;
+                measured = reading.state;
+                let resolved = facts.resolve(measured);
+                if matches!(resolved, ReadingState::Speaking) {
+                    guard.apply(&mut reading.dry);
+                    reading.state = resolved;
+                    held = Some((reading, Instant::now()));
+                }
+                tap.store(reading_snapshot(held.as_ref(), resolved));
+                last_window = Instant::now();
+                published = true;
+            }
+        }
+
+        if !published {
+            // Keep the state honest even when no audio arrives at all: the
+            // engine stopping mid-pause produces no windows, and the panel
+            // must not go on showing a reading for a session that is down.
+            // This also keeps `age_ms` ticking while a held reading is shown.
+            if live_verdict_expired(measured, last_window.elapsed()) {
+                measured = ReadingState::Quiet;
+            }
+            facts.digital_silence = false;
+            tap.store(reading_snapshot(held.as_ref(), facts.resolve(measured)));
+        }
+
+        std::thread::sleep(Duration::from_millis(READING_DRAIN_INTERVAL_MS));
+    }
+}
+
 /// The WAV writer the recording thread holds while a file is open.
 type RecordingFile = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
 
@@ -1468,14 +2237,19 @@ fn recording_writer(mut consumer: RingConsumer, rx: Receiver<RecordingCommand>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_recording, main_output_plays, mix_voice_and_soundboard, AudioEngine,
-        LoudnessNormalizer, StreamInfo, MAX_FRAMES_PER_CALLBACK, RING_BUFFER_FRAMES,
+        drain_recording, drop_paired, is_octave_jump, is_passthrough, live_verdict_expired,
+        main_output_plays, mix_voice_and_soundboard, new_reading_analyzer, reading_snapshot,
+        AudioEngine, LoudnessNormalizer, OctaveGuard, ReadingFacts, ReadingSnapshot, ReadingTap,
+        ReadingTaps, StreamInfo, MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
     };
-    use crate::dsp::{EffectChain, ReactiveModulator};
+    use crate::dsp::{
+        Descriptor, EffectChain, Metrics, ReactiveModulator, ReadingState, VoiceReading,
+    };
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
-    use ringbuf::traits::{Producer, Split};
+    use ringbuf::traits::{Observer, Producer, Split};
     use ringbuf::HeapRb;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     /// Phase 13 gating truth table: the main output (the "send") always
     /// plays when a separate monitor device exists, so routing to
@@ -2053,6 +2827,343 @@ mod tests {
         assert_eq!(resolved[0].key, "drive");
     }
 
+    // -----------------------------------------------------------------
+    // Voice reading
+    // -----------------------------------------------------------------
+
+    /// A tap pair wired to real rings, so the tests exercise the same code
+    /// the audio callback runs rather than a stand-in for it.
+    fn taps() -> (ReadingTaps, super::RingConsumer, super::RingConsumer) {
+        let (dp, dc) = HeapRb::<f32>::new(RING_BUFFER_FRAMES).split();
+        let (wp, wc) = HeapRb::<f32>::new(RING_BUFFER_FRAMES).split();
+        (ReadingTaps { dry: dp, wet: wp }, dc, wc)
+    }
+
+    /// Run one callback's worth of tapping exactly as the output callback
+    /// does: arm once, copy DRY, then copy WET after the chain would have run.
+    fn tap_one_buffer(t: &mut ReadingTaps, enabled: bool, frames: usize) -> bool {
+        let block = vec![0.5f32; frames];
+        let armed = t.armed(enabled, frames);
+        if armed {
+            t.push_dry(&block);
+            t.push_wet(&block);
+        }
+        armed
+    }
+
+    /// Off means off. The switch defaults off, and while it is off the audio
+    /// callback copies NOTHING — no samples reach the worker, so no analysis
+    /// of the user's voice can happen at all.
+    #[test]
+    fn a_disabled_panel_taps_nothing() {
+        let (mut t, dry, wet) = taps();
+        for _ in 0..8 {
+            assert!(!tap_one_buffer(&mut t, false, 256), "tapped while disabled");
+        }
+        assert_eq!(dry.occupied_len(), 0, "dry samples reached the worker");
+        assert_eq!(wet.occupied_len(), 0, "wet samples reached the worker");
+
+        // And the same taps do carry audio once it is switched on, so the
+        // assertion above is about the gate and not about broken plumbing.
+        assert!(tap_one_buffer(&mut t, true, 256));
+        assert_eq!(dry.occupied_len(), 256);
+        assert_eq!(wet.occupied_len(), 256);
+    }
+
+    /// The two taps are pushed together or not at all. A buffer that landed
+    /// on one ring and was truncated on the other would leave the worker
+    /// comparing a speaker against a different moment of themselves for the
+    /// rest of the session.
+    #[test]
+    fn the_taps_drop_a_buffer_together_or_not_at_all() {
+        let (mut t, dry, wet) = taps();
+        // Fill the rings to just under capacity, then ask for more than fits.
+        let frames = RING_BUFFER_FRAMES - 64;
+        assert!(tap_one_buffer(&mut t, true, frames));
+        assert!(
+            !tap_one_buffer(&mut t, true, 256),
+            "tapped without room for both halves"
+        );
+        assert_eq!(dry.occupied_len(), wet.occupied_len());
+        // A zero-length buffer is not a tap either (it would arm the WET copy
+        // for a DRY copy that never happened).
+        assert!(!t.armed(true, 0));
+    }
+
+    /// Stopped, muted and quiet-but-present all look the same at the meter.
+    /// The engine hands the first two in as facts; only `Speaking` comes from
+    /// the measurement, and the facts always win.
+    #[test]
+    fn the_state_comes_from_facts_not_from_a_quiet_buffer() {
+        let facts = |running, muted, silence| ReadingFacts {
+            running,
+            muted,
+            digital_silence: silence,
+        };
+        // Engine down beats everything, including a measurement that somehow
+        // still claims speech.
+        assert_eq!(
+            facts(false, false, false).resolve(ReadingState::Speaking),
+            ReadingState::Stopped
+        );
+        assert_eq!(
+            facts(false, true, true).resolve(ReadingState::Quiet),
+            ReadingState::Stopped
+        );
+        // Muted is told, and digital silence (what a device mute produces)
+        // counts as the same fact.
+        assert_eq!(
+            facts(true, true, false).resolve(ReadingState::Speaking),
+            ReadingState::Muted
+        );
+        assert_eq!(
+            facts(true, false, true).resolve(ReadingState::Speaking),
+            ReadingState::Muted
+        );
+        // Running, not muted, signal present: now the measurement decides.
+        assert_eq!(
+            facts(true, false, false).resolve(ReadingState::Speaking),
+            ReadingState::Speaking
+        );
+        assert_eq!(
+            facts(true, false, false).resolve(ReadingState::Quiet),
+            ReadingState::Quiet
+        );
+        // An analyzer that tried to claim an engine fact is not believed.
+        assert_eq!(
+            facts(true, false, false).resolve(ReadingState::Stopped),
+            ReadingState::Quiet
+        );
+        assert_eq!(
+            facts(true, false, false).resolve(ReadingState::Muted),
+            ReadingState::Quiet
+        );
+    }
+
+    fn speaking_window() -> VoiceReading {
+        VoiceReading {
+            state: ReadingState::Speaking,
+            dry: Metrics {
+                energy_dbfs: -18.0,
+                energy_range_db: 9.0,
+                f0_hz: 120.0,
+                f0_range_st: 7.0,
+                voiced_ratio: 0.6,
+                pace_ops: 4.0,
+                brightness_hz: 2200.0,
+            },
+            wet: Metrics::silent(),
+            descriptors: vec![Descriptor::Bright, Descriptor::Wide],
+            calibrated: true,
+            held: false,
+            held_descriptors: Vec::new(),
+            wet_bypassed: false,
+            wet_settled: true,
+        }
+    }
+
+    /// A pause holds the last speaking window instead of decaying toward
+    /// "quiet, flat, narrow" — which would amount to a verdict on the speaker
+    /// several times a minute — and the snapshot says it is being held.
+    #[test]
+    fn a_pause_freezes_the_last_speaking_window() {
+        let held = (speaking_window(), Instant::now());
+
+        let live = reading_snapshot(Some(&held), ReadingState::Speaking);
+        assert!(!live.stale);
+        assert_eq!(live.age_ms, 0);
+        assert_eq!(live.reading.state, ReadingState::Speaking);
+
+        for state in [
+            ReadingState::Quiet,
+            ReadingState::Muted,
+            ReadingState::Stopped,
+        ] {
+            let frozen = reading_snapshot(Some(&held), state);
+            assert!(frozen.stale, "{state:?} showed a held window as live");
+            assert_eq!(frozen.reading.state, state, "{state:?} lost its state");
+            // The numbers are the SAME ones, unchanged — not decayed toward a
+            // quieter, flatter, narrower version of the speaker.
+            assert_eq!(frozen.reading.dry, held.0.dry);
+            assert_eq!(frozen.reading.descriptors, held.0.descriptors);
+        }
+    }
+
+    /// With nothing measured yet there is nothing to hold, so the panel shows
+    /// the state and no numbers at all rather than an empty-looking reading
+    /// dressed up as live.
+    #[test]
+    fn nothing_measured_yet_is_not_a_stale_reading() {
+        let snap = reading_snapshot(None, ReadingState::Quiet);
+        assert!(!snap.stale);
+        assert!(snap.reading.descriptors.is_empty());
+        assert!(!snap.reading.calibrated);
+    }
+
+    /// A held window expires. A reading from four minutes ago is not a stale
+    /// reading, it is a different conversation.
+    #[test]
+    fn a_held_window_expires_instead_of_ageing_forever() {
+        let stale_at = Instant::now()
+            .checked_sub(Duration::from_secs(READING_HOLD_SECS + 1))
+            .expect("the clock is far enough past boot to step back 31 s");
+        let old = (speaking_window(), stale_at);
+        let snap = reading_snapshot(Some(&old), ReadingState::Quiet);
+        assert!(!snap.stale, "an expired window was shown as merely stale");
+        assert!(snap.reading.descriptors.is_empty());
+        assert_eq!(snap.reading.state, ReadingState::Quiet);
+    }
+
+    /// Octave errors are what users actually see on a gaming headset behind a
+    /// gate and a denoiser. A jump that lands near an exact octave is held
+    /// back until a second window agrees with it; a real change of register
+    /// costs one window, a tracker glitch never lands twice.
+    #[test]
+    fn an_unconfirmed_octave_jump_is_not_shown() {
+        assert!(is_octave_jump(120.0, 240.0));
+        assert!(is_octave_jump(240.0, 120.0));
+        assert!(!is_octave_jump(120.0, 150.0));
+
+        let mut guard = OctaveGuard::default();
+        let mut first = Metrics {
+            f0_hz: 120.0,
+            f0_range_st: 6.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut first);
+        assert!(
+            (first.f0_hz - 120.0).abs() < 1e-3,
+            "the first window stands"
+        );
+
+        // A doubled window is held back, pitch AND range: a mid-window flip
+        // inflates the range too, so showing one without the other would still
+        // flicker.
+        let mut flip = Metrics {
+            f0_hz: 241.0,
+            f0_range_st: 19.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut flip);
+        assert!(
+            (flip.f0_hz - 120.0).abs() < 1e-3,
+            "an octave flip was shown"
+        );
+        assert!((flip.f0_range_st - 6.0).abs() < 1e-3);
+
+        // A second window agreeing with the jump makes it real.
+        let mut confirm = Metrics {
+            f0_hz: 239.0,
+            f0_range_st: 8.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut confirm);
+        assert!(
+            (confirm.f0_hz - 239.0).abs() < 1e-3,
+            "a real jump never landed"
+        );
+
+        // An ordinary move is never delayed.
+        let mut ordinary = Metrics {
+            f0_hz: 250.0,
+            f0_range_st: 5.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut ordinary);
+        assert!((ordinary.f0_hz - 250.0).abs() < 1e-3);
+    }
+
+    /// An unvoiced window does not vouch for a pending jump: a pause between
+    /// two glitched windows must not be read as confirmation.
+    #[test]
+    fn a_pause_does_not_confirm_an_octave_jump() {
+        let mut guard = OctaveGuard::default();
+        let mut base = Metrics {
+            f0_hz: 110.0,
+            f0_range_st: 5.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut base);
+        let mut flip = Metrics {
+            f0_hz: 220.0,
+            f0_range_st: 15.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut flip);
+        assert!((flip.f0_hz - 110.0).abs() < 1e-3);
+
+        // Nothing voiced (f0 == 0 per the Metrics contract).
+        let mut pause = Metrics::silent();
+        guard.apply(&mut pause);
+
+        let mut again = Metrics {
+            f0_hz: 220.0,
+            f0_range_st: 15.0,
+            ..Metrics::silent()
+        };
+        guard.apply(&mut again);
+        assert!(
+            (again.f0_hz - 110.0).abs() < 1e-3,
+            "a pause confirmed an unconfirmed jump"
+        );
+    }
+
+    /// A device that stalls without clearing the engine's `running` flag
+    /// produces no further windows. The last `Speaking` verdict must not
+    /// outlive the audio that justified it.
+    #[test]
+    fn a_live_verdict_does_not_outlive_the_audio() {
+        assert!(!live_verdict_expired(
+            ReadingState::Speaking,
+            Duration::from_millis(500)
+        ));
+        assert!(live_verdict_expired(
+            ReadingState::Speaking,
+            Duration::from_secs(5)
+        ));
+        // Only a live verdict expires; the quiet states are already honest.
+        for state in [
+            ReadingState::Quiet,
+            ReadingState::Muted,
+            ReadingState::Stopped,
+        ] {
+            assert!(!live_verdict_expired(state, Duration::from_secs(60)));
+        }
+    }
+
+    /// A fresh engine reads nothing and the feature is off. This is the
+    /// default a user who never opens the panel lives with.
+    #[test]
+    fn a_fresh_engine_has_the_reading_switched_off() {
+        let engine = AudioEngine::new();
+        assert!(!engine.reading_enabled());
+        let snap = engine.voice_reading();
+        assert_eq!(snap.reading.state, ReadingState::Stopped);
+        assert!(snap.reading.descriptors.is_empty());
+        assert!(!snap.reading.calibrated);
+        assert!(!snap.stale);
+        engine.set_reading_enabled(true);
+        assert!(engine.reading_enabled());
+        engine.set_reading_enabled(false);
+        assert!(!engine.reading_enabled());
+        // The muted fact is an input, never inferred; it defaults off.
+        engine.set_reading_muted(true);
+        drop(engine);
+    }
+
+    /// The reading crosses the Tauri bridge, so its wrapper keys are a
+    /// contract. See `docs/STABLE-SURFACE.md`.
+    #[test]
+    fn reading_snapshot_json_keys_are_frozen() {
+        let snap = ReadingSnapshot::idle(ReadingState::Quiet);
+        let v = serde_json::to_value(&snap).unwrap();
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["ageMs", "reading", "stale"]);
+        // The state serializes as the lowercase word the UI switches on.
+        assert_eq!(v["reading"]["state"], "quiet");
+    }
+
     /// Routes address targets by kind + occurrence, so reordering the chain
     /// re-resolves rather than pointing at whatever now sits at an old index.
     #[test]
@@ -2069,5 +3180,169 @@ mod tests {
         assert_eq!(b.index_of_kind(EffectKind::Distortion, 0), Some(0));
         // A kind that isn't present resolves to nothing rather than index 0.
         assert_eq!(a.index_of_kind(EffectKind::Echo, 0), None);
+    }
+
+    /// Feed the seam real speech-like audio and require a real measurement.
+    ///
+    /// This is the test that would have caught shipping the placeholder: it
+    /// returned `Quiet` with silent metrics for every input, so the panel
+    /// would have rendered "still listening" forever while every other test
+    /// passed. Anything that measures nothing fails here.
+    #[test]
+    fn the_wired_analyzer_actually_measures_the_signal() {
+        const RATE: u32 = 48_000;
+        const F0: f64 = 150.0;
+        let mut analyzer = new_reading_analyzer();
+        let mut reading = None;
+        let mut phase = 0.0_f64;
+        // A buzz, not a sine: harmonics are what a pitch tracker keys on, and
+        // a bare sine would let a weak implementation look good.
+        for _ in 0..400 {
+            let mut block = [0.0_f32; 512];
+            for s in &mut block {
+                phase = (phase + F0 / f64::from(RATE)) % 1.0;
+                let buzz = (1..=6)
+                    .map(|h| (std::f64::consts::TAU * phase * f64::from(h)).sin() / f64::from(h));
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *s = (buzz.sum::<f64>() * 0.2) as f32;
+                }
+            }
+            if let Some(r) = analyzer.push(&block, &block, RATE) {
+                reading = Some(r);
+            }
+        }
+        let r = reading.expect("a window of speech-like audio produced no reading");
+        assert_eq!(
+            r.state,
+            ReadingState::Speaking,
+            "steady voiced buzz read as {:?}",
+            r.state
+        );
+        assert!(
+            (r.dry.f0_hz - 150.0).abs() < 15.0,
+            "pitch read as {} Hz, expected about {F0}",
+            r.dry.f0_hz
+        );
+        assert!(
+            r.dry.voiced_ratio > 0.5,
+            "voiced ratio {}",
+            r.dry.voiced_ratio
+        );
+        assert!(r.dry.energy_dbfs.is_finite() && r.dry.energy_dbfs < 0.0);
+    }
+
+    #[test]
+    fn a_long_pause_does_not_claim_the_baseline_was_never_learned() {
+        // After READING_HOLD_SECS the held numbers are dropped, and the panel
+        // renders "still listening" from `calibrated: false`. That is a claim
+        // about what the app knows, and it is untrue — the baseline lives in
+        // the analyzer until the session ends.
+        let mut reading = speaking_window();
+        reading.calibrated = true;
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(READING_HOLD_SECS + 1))
+            .expect("a clock this far from the epoch");
+        let snap = reading_snapshot(Some(&(reading, expired)), ReadingState::Quiet);
+        assert!(
+            snap.reading.calibrated,
+            "a long pause un-learned the baseline"
+        );
+        assert_eq!(snap.reading.state, ReadingState::Quiet);
+
+        // A session that never heard speech still reports uncalibrated.
+        let fresh = reading_snapshot(None, ReadingState::Quiet);
+        assert!(!fresh.reading.calibrated);
+    }
+
+    #[test]
+    fn a_chain_change_is_signalled_across_the_thread_boundary() {
+        // The analyzer has always had note_chain_changed; nothing called it.
+        // The audio thread applies the command and the reading runs on
+        // another thread, so the flag is the only way it can learn. Review
+        // measured the consequence: the after-effects half kept the previous
+        // preset's numbers for 1.25 s while the card already named the new
+        // preset, and wet_settled could never go false.
+        let tap = ReadingTap::default();
+        assert!(!tap.take_chain_changed(), "nothing has changed yet");
+
+        tap.note_chain_changed();
+        assert!(tap.take_chain_changed(), "the change did not cross");
+        assert!(!tap.take_chain_changed(), "the flag was not cleared");
+
+        // Several commands before the worker looks are still one change.
+        tap.note_chain_changed();
+        tap.note_chain_changed();
+        assert!(tap.take_chain_changed());
+        assert!(!tap.take_chain_changed());
+    }
+
+    #[test]
+    fn discarding_a_stale_tap_keeps_the_two_halves_paired() {
+        // The panel-toggle race. The old code drained each tap to empty in
+        // turn, so a callback landing between the two drains left one
+        // buffer's DRY half alive with its WET half eaten -- the taps then
+        // paired WET sample k with DRY sample k-N for the rest of the
+        // session, and nothing resynced them.
+        use ringbuf::traits::{Consumer, Observer, Producer, Split};
+        use ringbuf::HeapRb;
+
+        let (mut dry_p, mut dry_c) = HeapRb::<f32>::new(RING_BUFFER_FRAMES).split();
+        let (mut wet_p, mut wet_c) = HeapRb::<f32>::new(RING_BUFFER_FRAMES).split();
+        let (mut dry_buf, mut wet_buf) = ([0.0_f32; 256], [0.0_f32; 256]);
+
+        // Three paired buffers, then a DRY half whose WET half has not been
+        // written yet -- exactly what the callback leaves mid-buffer.
+        for tag in [1.0_f32, 2.0, 3.0] {
+            dry_p.push_slice(&[tag; 64]);
+            wet_p.push_slice(&[tag; 64]);
+        }
+        dry_p.push_slice(&[4.0; 64]);
+
+        drop_paired(&mut dry_c, &mut wet_c, &mut dry_buf, &mut wet_buf);
+
+        // The unpaired DRY half survives, because its partner is on the way.
+        assert_eq!(wet_c.occupied_len(), 0, "wet should be empty");
+        assert_eq!(
+            dry_c.occupied_len(),
+            64,
+            "the unpaired dry half must remain"
+        );
+        // And it is the right one: the next wet buffer belongs with tag 4.
+        let n = dry_c.pop_slice(&mut dry_buf);
+        assert_eq!(n, 64);
+        assert!(
+            dry_buf[..n].iter().all(|&s| (s - 4.0).abs() < f32::EPSILON),
+            "kept the wrong buffer: {:?}",
+            &dry_buf[..4]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn a_bypassed_chain_is_detected_by_measurement_not_plumbing() {
+        // Nothing in the engine holds a "bypassed" flag, so this is measured.
+        // Identical buffers are a passthrough whatever caused it; a gained
+        // copy still is (the wet tap sits after the loudness stage); a
+        // different waveform is not; silence votes neither way.
+        let dry: Vec<f32> = (0..512)
+            .map(|i| ((f64::from(i) * 0.05).sin() * 0.3) as f32)
+            .collect();
+        let gained: Vec<f32> = dry.iter().map(|s| s * 0.4).collect();
+        let shifted: Vec<f32> = (0..512)
+            .map(|i| ((f64::from(i) * 0.09).sin() * 0.3) as f32)
+            .collect();
+        assert_eq!(is_passthrough(&dry, &dry), Some(true));
+        assert_eq!(
+            is_passthrough(&dry, &gained),
+            Some(true),
+            "level alone is not processing"
+        );
+        assert_eq!(is_passthrough(&dry, &shifted), Some(false));
+        assert_eq!(
+            is_passthrough(&[0.0; 512], &[0.0; 512]),
+            None,
+            "silence must abstain"
+        );
     }
 }

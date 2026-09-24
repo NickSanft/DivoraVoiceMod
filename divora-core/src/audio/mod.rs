@@ -20,7 +20,7 @@ mod state;
 mod virtual_mic;
 
 pub use devices::{list_input_devices, list_output_devices, DeviceInfo};
-pub use engine::{AudioEngine, StreamInfo};
+pub use engine::{AudioEngine, ReadingAnalyzer, ReadingFacts, ReadingSnapshot, StreamInfo};
 pub use level::LevelMeter;
 pub use loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS, MAX_TARGET_DBFS, MIN_TARGET_DBFS};
 pub use resampler::MonoResampler;

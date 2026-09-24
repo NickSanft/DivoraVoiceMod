@@ -16,10 +16,13 @@ use std::time::Duration;
 
 use divora_core::audio::{
     detect_virtual_mic as detect_virtual_mic_core, list_input_devices as list_input_devices_core,
-    list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, Levels, StreamInfo,
-    VirtualMicStatus,
+    list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, Levels,
+    ReadingSnapshot, StreamInfo, VirtualMicStatus,
 };
-use divora_core::dsp::{onnx_runtime_available, DspCommand, EffectSpec, ReactiveConfig};
+use divora_core::dsp::{
+    onnx_runtime_available, DspCommand, EffectSpec, Metrics, ReactiveConfig, ReadingState,
+    MAX_DESCRIPTORS,
+};
 use divora_core::presets::{bundled_presets, Preset, PresetStore, PresetTag};
 use divora_core::soundboard::{
     decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
@@ -59,6 +62,105 @@ struct LevelUpdate {
     /// v1.46.0: current reactive-modulation depth, 0..=1 (0 when the feature
     /// is off). Drives the live envelope meter.
     mod_env: f32,
+}
+
+/// Level shown when a window measured nothing.
+///
+/// `Metrics::silent()` uses −∞ dBFS, which `serde_json` writes as `null`. The
+/// panel would then have to special-case a null it never shows anyway (it
+/// only renders numbers when there is a reading), so the bridge floors it to
+/// a number instead of shipping a hole in the payload.
+const READING_FLOOR_DBFS: f32 = -120.0;
+
+/// One acoustic measurement of one signal, camelCase for the bridge.
+///
+/// Mirrors `divora_core::dsp::Metrics` rather than re-exporting it: the core
+/// type serializes `snake_case`, and every key on this surface is camelCase.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadingMetrics {
+    energy_dbfs: f32,
+    energy_range_db: f32,
+    f0_hz: f32,
+    f0_range_st: f32,
+    voiced_ratio: f32,
+    pace_ops: f32,
+    brightness_hz: f32,
+}
+
+impl ReadingMetrics {
+    /// Non-finite values are floored rather than shipped: JSON has no
+    /// infinity, so they would otherwise arrive as `null`.
+    fn from_core(m: Metrics) -> Self {
+        let finite = |v: f32, fallback: f32| if v.is_finite() { v } else { fallback };
+        Self {
+            energy_dbfs: finite(m.energy_dbfs, READING_FLOOR_DBFS),
+            energy_range_db: finite(m.energy_range_db, 0.0),
+            f0_hz: finite(m.f0_hz, 0.0),
+            f0_range_st: finite(m.f0_range_st, 0.0),
+            voiced_ratio: finite(m.voiced_ratio, 0.0),
+            pace_ops: finite(m.pace_ops, 0.0),
+            brightness_hz: finite(m.brightness_hz, 0.0),
+        }
+    }
+}
+
+/// Payload of the `voice-reading` event and of the `voice_reading` command.
+///
+/// `words` carries the already-resolved vocabulary rather than the descriptor
+/// names, deliberately: the closed vocabulary in `divora_core::dsp::reading`
+/// is the only place a shown word may come from, and a second word table on
+/// the frontend would be a second place it could drift to. The frontend
+/// renders what it is handed and owns no list of its own.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceReadingUpdate {
+    /// "stopped" | "muted" | "quiet" | "speaking".
+    state: ReadingState,
+    /// The mic, before any effect.
+    dry: ReadingMetrics,
+    /// The same voice after the chain — what the call hears. Not the
+    /// soundboard: Speak and clips are mixed in after this tap.
+    wet: ReadingMetrics,
+    words: Vec<&'static str>,
+    calibrated: bool,
+    /// The chain passed the signal through unchanged over this window, so the
+    /// two halves *should* read alike.
+    ///
+    /// Measured in the engine by correlating the taps, which is scale
+    /// invariant — the wet tap sits after the loudness stage, so a bypassed
+    /// chain still arrives at a different level. The frontend cannot work
+    /// this out for itself: it only sees summary numbers, and its own
+    /// attempt required the levels to match, which they do not when loudness
+    /// normalization is on.
+    wet_bypassed: bool,
+    /// The numbers come from an earlier window, held rather than decayed.
+    stale: bool,
+    age_ms: u32,
+}
+
+impl VoiceReadingUpdate {
+    fn from_snapshot(snap: &ReadingSnapshot) -> Self {
+        Self {
+            state: snap.reading.state,
+            dry: ReadingMetrics::from_core(snap.reading.dry),
+            wet: ReadingMetrics::from_core(snap.reading.wet),
+            wet_bypassed: snap.reading.wet_bypassed,
+            // Capped here as well as at the source. More than three stops
+            // reading as a description and starts reading as a verdict, and
+            // that limit should not depend on who filled the vector.
+            words: snap
+                .reading
+                .descriptors
+                .iter()
+                .take(MAX_DESCRIPTORS)
+                .map(|d| d.word())
+                .collect(),
+            calibrated: snap.reading.calibrated,
+            stale: snap.stale,
+            age_ms: snap.age_ms,
+        }
+    }
 }
 
 /// One-shot status snapshot used by the frontend at startup and after
@@ -264,6 +366,22 @@ fn set_effect_chain(state: State<'_, AppState>, specs: Vec<EffectSpec>) {
 #[tauri::command]
 fn set_reactive_config(state: State<'_, AppState>, config: ReactiveConfig) {
     state.engine.send_reactive(config);
+}
+
+/// Turn the voice-reading panel's analysis on or off.
+///
+/// Off is the default and nothing runs until this says otherwise: with it off
+/// the audio callback copies nothing, so no audio of the user's voice reaches
+/// the analysis at all.
+#[tauri::command]
+fn set_voice_reading_enabled(state: State<'_, AppState>, enabled: bool) {
+    state.engine.set_reading_enabled(enabled);
+}
+
+/// One-shot reading, for the panel's first paint before the first event.
+#[tauri::command]
+fn voice_reading(state: State<'_, AppState>) -> VoiceReadingUpdate {
+    VoiceReadingUpdate::from_snapshot(&state.engine.voice_reading())
 }
 
 #[tauri::command]
@@ -2024,6 +2142,36 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
         .expect("spawning the level-emitter thread should not fail");
 }
 
+/// Spawn the `voice-reading` emitter (~5 Hz, and only while the panel is on).
+///
+/// Its own event rather than more fields on `audio-levels`, for three
+/// reasons. The reading is a window measurement that changes about once a
+/// second, so riding a 30 Hz meter tick would send the same numbers six times
+/// over. The feature is off by default, and a field on the always-on payload
+/// would carry an empty reading to every user who never opens the panel.
+/// And the panel's accessible summary is text: at 30 Hz it would be a value
+/// that changes many times a second, which is precisely what must not go near
+/// a live region. Additive either way under `docs/STABLE-SURFACE.md`; this
+/// keeps `LevelUpdate` meaning what it has always meant.
+fn spawn_reading_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
+    std::thread::Builder::new()
+        .name("divora-reading-emitter".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(200));
+            // Silent while off: nothing is being measured, so there is
+            // nothing to say and no reason to wake the frontend.
+            if !engine.reading_enabled() {
+                continue;
+            }
+            let payload = VoiceReadingUpdate::from_snapshot(&engine.voice_reading());
+            if app.emit("voice-reading", &payload).is_err() {
+                // App is shutting down (no receivers / window gone).
+                break;
+            }
+        })
+        .expect("spawning the reading-emitter thread should not fail");
+}
+
 /// Reveal + focus the main window (from a tray click / "Show" menu).
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -2109,6 +2257,7 @@ pub fn run() {
 
             let engine = Arc::new(AudioEngine::new());
             spawn_level_emitter(app.handle().clone(), engine.clone());
+            spawn_reading_emitter(app.handle().clone(), engine.clone());
 
             // Locate %APPDATA%\DivoraVoice\presets\ (or platform equivalent)
             // and prepare the user preset store. Failures here are logged
@@ -2289,6 +2438,8 @@ pub fn run() {
             audio_engine_status,
             set_effect_chain,
             set_reactive_config,
+            set_voice_reading_enabled,
+            voice_reading,
             set_effect_param,
             set_effect_enabled,
             clear_effect_chain,
@@ -2351,9 +2502,11 @@ mod tests {
         list_cloned_voice_infos, load_cloned_voice, preview_path_in, read_preview,
         rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
         unique_preset_id, write_preview, ClonedMeta, EngineStatus, LevelUpdate, Levels,
-        OnnxRuntimeStatus, SpeakClip, VoiceInfo, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
-        PREVIEW_TEXT_VERSION, TTS_CLIP_ID,
+        OnnxRuntimeStatus, SpeakClip, VoiceInfo, VoiceReadingUpdate, MAX_CLONE_NAME_LEN,
+        PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
     };
+    use divora_core::audio::ReadingSnapshot;
+    use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
     use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
     use divora_core::tts::babble;
     use std::fs;
@@ -2522,6 +2675,165 @@ mod tests {
                 "running"
             ]
         );
+    }
+
+    #[test]
+    fn every_word_on_the_wire_comes_from_the_vocabulary() {
+        // Provenance, swept rather than spot-checked. `words` is a plain
+        // Vec<&str>, so nothing in the type stops this bridge appending a
+        // string of its own — review proved it by pushing "sounds anxious"
+        // here behind an `if !calibrated`, which the one existing test could
+        // not reach because it builds a single calibrated snapshot.
+        let vocabulary: std::collections::HashSet<&str> =
+            Descriptor::ALL.iter().map(|d| d.word()).collect();
+        let states = [
+            ReadingState::Stopped,
+            ReadingState::Muted,
+            ReadingState::Quiet,
+            ReadingState::Speaking,
+        ];
+        for state in states {
+            for calibrated in [false, true] {
+                for stale in [false, true] {
+                    for descriptors in [
+                        Vec::new(),
+                        vec![Descriptor::Steady],
+                        Descriptor::ALL.to_vec(),
+                    ] {
+                        let snap = ReadingSnapshot {
+                            reading: VoiceReading {
+                                state,
+                                dry: Metrics::silent(),
+                                wet: Metrics::silent(),
+                                descriptors,
+                                calibrated,
+                                held: stale,
+                                held_descriptors: Vec::new(),
+                                wet_bypassed: false,
+                                wet_settled: true,
+                            },
+                            stale,
+                            age_ms: 0,
+                        };
+                        let u = VoiceReadingUpdate::from_snapshot(&snap);
+                        assert!(
+                            u.words.len() <= MAX_DESCRIPTORS,
+                            "{state:?}/{calibrated}/{stale}: {} words",
+                            u.words.len()
+                        );
+                        for w in &u.words {
+                            assert!(
+                                vocabulary.contains(w),
+                                "{state:?}/{calibrated}/{stale}: {w:?} is not a vocabulary word"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn voice_reading_update_json_keys_are_frozen() {
+        let u = VoiceReadingUpdate::from_snapshot(&ReadingSnapshot::idle(ReadingState::Stopped));
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&u).unwrap()),
+            [
+                "ageMs",
+                "calibrated",
+                "dry",
+                "stale",
+                "state",
+                "wet",
+                // Additive: the engine measures passthrough by correlating
+                // the taps, and the panel must not re-derive it from these
+                // summaries — that comparison is wrong with loudness on.
+                "wetBypassed",
+                "words"
+            ]
+        );
+        let v = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["state"], "stopped");
+        assert_eq!(
+            sorted_keys(&v["dry"]),
+            [
+                "brightnessHz",
+                "energyDbfs",
+                "energyRangeDb",
+                "f0Hz",
+                "f0RangeSt",
+                "paceOps",
+                "voicedRatio"
+            ]
+        );
+    }
+
+    /// A silent window is −∞ dBFS, which JSON cannot carry: serialized as-is
+    /// it arrives as `null` and every number on the panel becomes a
+    /// null-check. The bridge floors it to a real number instead.
+    #[test]
+    fn a_silent_window_crosses_the_bridge_as_numbers() {
+        let u = VoiceReadingUpdate::from_snapshot(&ReadingSnapshot::idle(ReadingState::Quiet));
+        let v = serde_json::to_value(&u).unwrap();
+        for half in ["dry", "wet"] {
+            for key in [
+                "brightnessHz",
+                "energyDbfs",
+                "energyRangeDb",
+                "f0Hz",
+                "f0RangeSt",
+                "paceOps",
+                "voicedRatio",
+            ] {
+                assert!(
+                    v[half][key].is_f64(),
+                    "{half}.{key} is not a number: {:?}",
+                    v[half][key]
+                );
+            }
+        }
+        assert!(
+            (v["dry"]["energyDbfs"].as_f64().unwrap() - f64::from(READING_FLOOR_DBFS)).abs() < 1e-6
+        );
+    }
+
+    /// The panel shows words, never descriptor names, and never more than
+    /// three of them — past three it stops reading as a description of a
+    /// sound and starts reading as a verdict on a person. Capped here as
+    /// well as at the source so it does not depend on who filled the list.
+    #[test]
+    fn the_wire_sends_vocabulary_words_capped_at_three() {
+        let snap = ReadingSnapshot {
+            reading: VoiceReading {
+                state: ReadingState::Speaking,
+                dry: Metrics::silent(),
+                wet: Metrics::silent(),
+                descriptors: vec![
+                    Descriptor::Bright,
+                    Descriptor::Wide,
+                    Descriptor::Fast,
+                    Descriptor::Loud,
+                ],
+                calibrated: true,
+                held: false,
+                held_descriptors: Vec::new(),
+                wet_bypassed: false,
+                wet_settled: true,
+            },
+            stale: false,
+            age_ms: 0,
+        };
+        let u = VoiceReadingUpdate::from_snapshot(&snap);
+        assert_eq!(u.words.len(), MAX_DESCRIPTORS);
+        assert_eq!(u.words, ["bright", "wide range", "fast"]);
+        // Every word came from the vocabulary's own `word()`, so the
+        // frontend never needs a list of its own to drift from.
+        for w in &u.words {
+            assert!(
+                Descriptor::ALL.iter().any(|d| d.word() == *w),
+                "{w} is off-vocabulary"
+            );
+        }
     }
 
     #[test]

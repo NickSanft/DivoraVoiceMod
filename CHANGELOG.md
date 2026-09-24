@@ -4,6 +4,41 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.51.0] — 2026-09-24 — Voice reading
+
+### Added
+
+- **Voice reading — see what your voice is actually doing.** An optional Mixer panel, off by default, that measures the sound and shows it two ways: **your voice**, read from the microphone before any effect, and **after effects**, read from what the call actually hears. Pitch, pitch range, level, pace and tone as numbers, plus a short phrase — “bright, wide range, fast” — that also carries level movement and brightness. It answers **“am I going flat on this stream?”** and **“is my character voice still landing?”**, the second of which nothing else can answer, because the app is the only thing that knows both sides of its own chain.
+- **It measures a signal, and says nothing about you.** No model, no download, no network, and no label naming a feeling — that last one is a deliberate limit, not a missing feature. Everything is compared against your own voice from earlier in the session, and that baseline never leaves memory or reaches disk.
+- **It stays quiet when it has nothing to say.** Most of a session is not speech, so during a pause the panel **holds** the last measured window, greys it and says how long ago it was, rather than sliding toward “quiet, flat, narrow” and handing down a verdict several times a minute. Muted, engine-stopped and quiet-but-present are three separate states with three separate messages.
+
+### Fixed
+
+- **The spacebar and buttons.** Unrelated to the panel but found while building it: holding-to-modulate swallowed every spacebar release, so pressing Space on any button or radio in the app silently did nothing.
+
+### Tests
+
+- 60 tests for the analysis — pitch against synthetic tones, buzzes and a missing fundamental; brightness; the freeze on silence; the baseline; descriptor hysteresis; identical results at 44.1, 48 and 96 kHz — plus engine tests for the taps and the panel's states, and an end-to-end test that the card renders and toggles.
+- Four adversarial reviews of the merged feature found eight blocking defects, every one of which is now fixed with a test that fails without the fix. The worst was in the honesty guarantee itself: the closed vocabulary was checked by a list of banned words, and review defeated it twice — once by renaming a word to “bored”, once by adding a word the audit never reached. The vocabulary is now generated from a single list, so a word cannot exist outside the audit, and a test pins the exact thirteen.
+
+### Architecture notes
+
+- Analysis never runs on the audio thread. The callback copies the dry and wet signals into preallocated lock-free rings and does nothing else; a worker drains both and publishes a snapshot. With the panel off the callback does one atomic load per buffer.
+- The dry tap is the only point on that thread where the untouched microphone exists — before the chain, before the loudness stage. Speak and soundboard audio are on neither tap.
+- The two halves must stay sample-aligned. Toggling the panel used to drain each ring separately, which could permanently pair one half with the other's past; they are now discarded together, sized by the half that trails.
+- Whether the chain is passing the signal through is **measured**, by correlating the two taps, rather than inferred from which effects are switched on — so push-to-modulate, a Clean preset and every other cause are all covered, including ones nobody thought of.
+- The pitch search reaches 1 kHz because the after-effects half is the point: at a 400 Hz ceiling a voice pitched up an octave read at exactly half, silently, and the panel reported that a +12 semitone preset had changed nothing.
+
+### Pre-push checklist (local, 2026-09-24)
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (483: 441 core + 42 app, was 407)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (472, +20)
+- `pnpm test:e2e` — pass (17, +1; one vacuous test removed and replaced with two real unit tests)
+- `pnpm tauri build --debug --no-bundle` — pass
+
 ## [1.50.0] — 2026-09-23 — Critter Chatter
 
 ### Added

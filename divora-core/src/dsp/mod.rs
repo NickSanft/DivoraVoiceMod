@@ -36,6 +36,7 @@ mod harmonizer;
 mod pitch;
 mod radio_bandpass;
 mod reactive;
+mod reading;
 mod reverb;
 mod robot;
 mod stft;
@@ -61,6 +62,10 @@ pub use radio_bandpass::RadioBandpass;
 pub use reactive::{
     mod_target_range, ModRoute, ReactiveConfig, ReactiveModulator, ReactiveRouteSpec,
     ReactiveSource, ResolvedReactive, DEFAULT_CEIL_DB, DEFAULT_FLOOR_DB,
+};
+pub use reading::{
+    Analyzer, Descriptor, InputFacts, Metrics, ReadingState, VoiceReading, F0_MAX_HZ, F0_MIN_HZ,
+    MAX_DESCRIPTORS, READING_EMIT_S, READING_WINDOW_S,
 };
 pub use reverb::Reverb;
 pub use robot::Robot;

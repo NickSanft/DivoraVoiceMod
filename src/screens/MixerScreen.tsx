@@ -25,6 +25,7 @@ import {
   REACTIVE_FLOOR_DB,
 } from "../data/reactive";
 import { useApp } from "../stores/app";
+import type { ReadingMetrics, VoiceReadingUpdate } from "../audio/api";
 import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
 export function MixerScreen(): JSX.Element {
@@ -260,6 +261,7 @@ function RightRail(): JSX.Element {
       <PushToModulateCard />
       <MonitorCard />
       <ReactiveCard />
+      <VoiceReadingCard />
       <LoudnessCard />
       <RecordCard />
       <Inspector />
@@ -668,6 +670,494 @@ function ReactiveCard(): JSX.Element {
             <span>quiet → shout</span>
             <span class="tnum">{REACTIVE_CEIL_DB} dB</span>
           </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Voice reading — a live readout of the MEASURED ACOUSTIC PROPERTIES of the
+// signal: level, level movement, pitch height, pitch range, pace, brightness.
+//
+// It is not emotion recognition, and that is a product decision rather than
+// squeamishness. Voice alone carries intensity, not pleasantness — strip the
+// words and an arousal score survives while a valence score does not — and
+// this app pitch-shifts, bitcrushes and ring-modulates on top of that. So
+// every word on screen describes a SIGNAL. The vocabulary lives in
+// `divora-core/src/dsp/reading.rs` behind a test, and the backend sends the
+// resolved words: this file renders what it is handed and owns no list of its
+// own, so there is exactly one place a word can enter the product.
+//
+// In-app only. Deliberately not on the stream overlay: an audience cannot
+// check a reading, and a guest on the mic would be read too.
+// ---------------------------------------------------------------------------
+
+/** What the card is showing, and why. */
+export interface ReadingView {
+  /** The headline. Also what (coarsely) gets announced. */
+  kind: "stopped" | "muted" | "quiet" | "listening" | "held" | "live";
+  /** Whether there are numbers worth rendering at all. */
+  hasNumbers: boolean;
+  /** Those numbers were measured earlier and are being held, not measured now. */
+  stale: boolean;
+}
+
+/**
+ * Resolve the payload into what the card shows.
+ *
+ * The four backend states are kept distinct on purpose. Most of a session is
+ * not speech, and a panel that let every pause read as "quiet, flat, narrow"
+ * would be delivering a verdict on the speaker several times a minute without
+ * printing a word. A pause holds the last measured window and says it is held.
+ */
+export function readingView(
+  reading: VoiceReadingUpdate | null,
+  engineRunning: boolean,
+): ReadingView {
+  if (!reading) {
+    return {
+      kind: engineRunning ? "listening" : "stopped",
+      hasNumbers: false,
+      stale: false,
+    };
+  }
+  const stale = reading.stale;
+  // Held numbers still deserve showing — visibly stale — because "your last
+  // measured window" is useful and "nothing" is not. What they must never do
+  // is look live.
+  const hasNumbers = reading.state === "speaking" || stale;
+  let kind: ReadingView["kind"];
+  if (reading.state === "stopped") {
+    kind = "stopped";
+  } else if (reading.state === "muted") {
+    kind = "muted";
+  } else if (reading.state === "speaking") {
+    // Raw measurements are valid immediately; only the descriptors need a
+    // baseline to be relative to, so say which one is missing.
+    kind = reading.calibrated ? "live" : "listening";
+  } else if (stale) {
+    kind = "held";
+  } else {
+    kind = reading.calibrated ? "quiet" : "listening";
+  }
+  return { kind, hasNumbers, stale };
+}
+
+/**
+ * The single sentence the card announces.
+ *
+ * Coarse on purpose. `live`, `quiet` and `held` collapse into one line
+ * because they alternate every second or two while somebody talks, and a
+ * screen reader repeating "live… paused… live" through a conversation is the
+ * same defect as putting a number in a live region.
+ */
+export function readingAnnouncement(view: ReadingView): string {
+  switch (view.kind) {
+    case "stopped":
+      return "Engine stopped. Nothing to read.";
+    case "muted":
+      return "Input is silent.";
+    case "listening":
+      return "Still listening. Not enough speech yet to compare against.";
+    default:
+      return "Reading the microphone.";
+  }
+}
+
+/** The visible headline. Changes freely; never announced. */
+function readingHeadline(view: ReadingView): string {
+  switch (view.kind) {
+    case "stopped":
+      return "Engine stopped";
+    case "muted":
+      return "Input silent";
+    case "quiet":
+      return "Too quiet to measure";
+    case "listening":
+      return "Still listening";
+    case "held":
+      return "Paused";
+    default:
+      return "Live";
+  }
+}
+
+/** "measured 8 s ago" / "measured 1.2 s ago" for a held window. */
+function agoLabel(ms: number): string {
+  const secs = ms / 1000;
+  return secs < 10
+    ? `measured ${secs.toFixed(1)} s ago`
+    : `measured ${Math.round(secs)} s ago`;
+}
+
+/**
+ * One measured number.
+ *
+ * `role="meter"`, and emphatically NOT inside a live region. These update
+ * several times a second; a live region would make a screen reader talk
+ * continuously and render the app unusable. A meter is read when the user asks
+ * for it and never interrupts. The one live region on this card holds the
+ * state sentence, which changes rarely by construction.
+ */
+function Readout(props: {
+  /** Short visible label. */
+  label: string;
+  /** Full label for assistive tech, e.g. "Pitch, after effects". */
+  ariaLabel: string;
+  shown: string;
+  spoken: string;
+  value: number;
+  min: number;
+  max: number;
+  dim?: boolean;
+}): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "flex",
+        "align-items": "baseline",
+        "justify-content": "space-between",
+        gap: "var(--s2)",
+      }}
+    >
+      <span class="eyebrow" style={{ color: "var(--text-lo)" }} aria-hidden="true">
+        {props.label}
+      </span>
+      <span
+        class="tnum"
+        role="meter"
+        aria-label={props.ariaLabel}
+        aria-valuemin={props.min}
+        aria-valuemax={props.max}
+        aria-valuenow={props.value}
+        aria-valuetext={props.spoken}
+        style={{
+          "font-size": "var(--t-xs)",
+          color: props.dim ? "var(--text-lo)" : "var(--text-mid)",
+        }}
+      >
+        {props.shown}
+      </span>
+    </div>
+  );
+}
+
+/** The four numbers, for one half of the reading. */
+function ReadoutGroup(props: {
+  /** "your voice" / "after effects" — suffixed onto each accessible label. */
+  half: string;
+  metrics: ReadingMetrics;
+  dim?: boolean;
+}): JSX.Element {
+  const m = () => props.metrics;
+  return (
+    <div
+      style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}
+    >
+      <Readout
+        label="Pitch"
+        ariaLabel={`Pitch, ${props.half}`}
+        shown={`${Math.round(m().f0Hz)} Hz`}
+        spoken={`${Math.round(m().f0Hz)} hertz`}
+        value={m().f0Hz}
+        min={50}
+        // The detector reaches 1 kHz since v1.51.0, because a voice
+        // pitched up an octave is the after-effects half's whole point. A
+        // 500 ceiling here left a screen reader computing the percentage
+        // against the wrong range for exactly those readings.
+        max={1000}
+        dim={props.dim}
+      />
+      <Readout
+        label="Range"
+        ariaLabel={`Pitch range, ${props.half}`}
+        shown={`${m().f0RangeSt.toFixed(1)} st`}
+        spoken={`${m().f0RangeSt.toFixed(1)} semitones`}
+        value={m().f0RangeSt}
+        min={0}
+        max={24}
+        dim={props.dim}
+      />
+      <Readout
+        label="Level"
+        ariaLabel={`Level, ${props.half}`}
+        shown={`${m().energyDbfs.toFixed(1)} dB`}
+        spoken={`${m().energyDbfs.toFixed(1)} decibels`}
+        value={m().energyDbfs}
+        min={-60}
+        max={0}
+        dim={props.dim}
+      />
+      <Readout
+        label="Pace"
+        ariaLabel={`Pace, ${props.half}`}
+        // Whole onsets only. The describer refuses to call a pace change
+        // under 1.5/s anything at all, on the grounds that a 2.5 s window
+        // holds ~10 onsets so the count's own scatter is ~±1.3/s — printing
+        // a tenth would show that scatter as if it were a measurement of the
+        // speaker. And the unit is on screen: "4/s" alone reads as syllables,
+        // which is exactly what this is not.
+        shown={`${Math.round(m().paceOps)} onsets/s`}
+        spoken={`${Math.round(m().paceOps)} onsets per second`}
+        value={m().paceOps}
+        min={0}
+        max={12}
+        dim={props.dim}
+      />
+      <Readout
+        label="Tone"
+        ariaLabel={`Tone, ${props.half}`}
+        // Brightness earns a row because of what this app's presets DO. A
+        // bitcrusher, an EQ, a distortion or a reverb moves tone and level
+        // movement while barely touching pitch, range, level or pace — so
+        // without this the after-effects half showed four numbers nearly
+        // identical to the microphone half on exactly those presets, and the
+        // only conclusion available to the user was "the preset stopped
+        // working". That is the misread the passing-through banner exists to
+        // prevent, arriving through a different door.
+        shown={`${Math.round(m().brightnessHz)} Hz`}
+        spoken={`${Math.round(m().brightnessHz)} hertz centre`}
+        value={m().brightnessHz}
+        min={0}
+        max={6000}
+        dim={props.dim}
+      />
+    </div>
+  );
+}
+
+function VoiceReadingCard(): JSX.Element {
+  const app = useApp();
+  const on = (): boolean => app.voiceReadingOn();
+  const reading = (): VoiceReadingUpdate | null => app.voiceReading();
+  const view = (): ReadingView => readingView(reading(), app.engineRunning());
+  const phrase = (): string => (reading()?.words ?? []).join(", ");
+  const passthrough = (): boolean => {
+    const r = reading();
+    // The engine measures this by correlating the two taps and puts the
+    // answer on the wire. Re-deriving it here from the summary numbers was
+    // wrong whenever loudness normalization was on, because that comparison
+    // required the levels to match and the loudness stage sits between the
+    // chain and the wet tap.
+    return !!r && view().hasNumbers && r.wetBypassed;
+  };
+
+  return (
+    <div
+      class="card"
+      style={{
+        padding: "var(--s4)",
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+            color: "var(--text-mid)",
+          }}
+        >
+          <Sigil name="eye" size={20} style={{ color: "var(--indigo)" }} />
+          <div>
+            <div style={{ "font-size": "var(--t-sm)", "font-weight": 600 }}>
+              Voice reading
+            </div>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+              What the signal measures
+            </div>
+          </div>
+        </div>
+        <Toggle
+          on={on()}
+          onChange={(next) => app.setVoiceReadingOn(next)}
+          ariaLabel="Voice reading"
+        />
+      </div>
+
+      {/* The card's ONLY live region. It is always mounted (a region inserted
+          together with its text is commonly missed) and holds a sentence that
+          changes rarely — never a number, never the phrase. */}
+      <div role="status" aria-live="polite">
+        <Show when={on()}>
+          <span style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+            {readingAnnouncement(view())}
+          </span>
+        </Show>
+      </div>
+
+      <Show when={on()}>
+        {/* Visible state chip. Not announced: live/paused alternate every
+            second or two while somebody talks. */}
+        <div
+          data-testid="reading-state"
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s2)",
+            "font-size": "var(--t-xs)",
+          }}
+        >
+          <span
+            class="eyebrow"
+            style={{
+              color: view().kind === "live" ? "var(--indigo)" : "var(--text-lo)",
+            }}
+          >
+            {readingHeadline(view())}
+          </span>
+          <Show when={view().stale && reading()}>
+            {(r) => (
+              <span class="tnum" style={{ color: "var(--text-lo)" }}>
+                {agoLabel(r().ageMs)}
+              </span>
+            )}
+          </Show>
+        </div>
+
+        {/* ---- Your voice: the mic, before any effect. ---- */}
+        <div
+          data-testid="reading-dry"
+          style={{
+            display: "flex",
+            "flex-direction": "column",
+            gap: "var(--s2)",
+            padding: "var(--s3)",
+            background: "var(--surface-2)",
+            border: "1px solid var(--line)",
+            "border-radius": "var(--r-sm)",
+            // Held numbers must not look live.
+            opacity: view().stale ? 0.6 : 1,
+          }}
+        >
+          <span class="eyebrow" style={{ color: "var(--text-mid)" }}>
+            Your voice
+          </span>
+          <Show
+            when={view().hasNumbers && reading()}
+            fallback={
+              <span
+                style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}
+              >
+                Nothing measured yet.
+              </span>
+            }
+          >
+            {(r) => (
+              <>
+                <Show when={phrase()}>
+                  <div
+                    data-testid="reading-phrase"
+                    style={{
+                      "font-size": "var(--t-sm)",
+                      color: "var(--text-hi)",
+                    }}
+                  >
+                    {phrase()}
+                  </div>
+                </Show>
+                <ReadoutGroup
+                  half="your voice"
+                  metrics={r().dry}
+                  dim={view().stale}
+                />
+              </>
+            )}
+          </Show>
+        </div>
+
+        {/* ---- After effects: the chain's output. ---- */}
+        <div
+          data-testid="reading-wet"
+          style={{
+            display: "flex",
+            "flex-direction": "column",
+            gap: "var(--s2)",
+            padding: "var(--s3)",
+            background: "var(--surface-2)",
+            border: "1px solid var(--line)",
+            "border-radius": "var(--r-sm)",
+            opacity: view().stale ? 0.6 : 1,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              "align-items": "baseline",
+              "justify-content": "space-between",
+              gap: "var(--s2)",
+            }}
+          >
+            <span class="eyebrow" style={{ color: "var(--text-mid)" }}>
+              After effects
+            </span>
+            <span
+              style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}
+            >
+              {app.preset().name}
+            </span>
+          </div>
+          <span style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+            The chain's output — what the call hears. A preset change moves
+            these numbers on its own; the microphone half is unaffected.
+          </span>
+          <Show
+            when={view().hasNumbers && reading()}
+            fallback={
+              <span
+                style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}
+              >
+                Nothing measured yet.
+              </span>
+            }
+          >
+            {(r) => (
+              <>
+                <Show when={passthrough()}>
+                  <div
+                    data-testid="reading-passthrough"
+                    style={{
+                      "font-size": "var(--t-xs)",
+                      color: "var(--text-mid)",
+                    }}
+                  >
+                    No measured difference from the microphone half — the chain
+                    is passing the signal through.
+                  </div>
+                </Show>
+                <ReadoutGroup
+                  half="after effects"
+                  metrics={r().wet}
+                  dim={view().stale}
+                />
+              </>
+            )}
+          </Show>
+        </div>
+
+        <div
+          data-testid="reading-disclaimer"
+          style={{
+            "font-size": "var(--t-xs)",
+            color: "var(--text-lo)",
+            "line-height": 1.5,
+          }}
+        >
+          Measured properties of the sound — level, pitch, pace, brightness.
+          Not a reading of the person speaking. Stays in the app; never on the
+          stream overlay.
         </div>
       </Show>
     </div>

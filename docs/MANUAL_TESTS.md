@@ -502,6 +502,133 @@ deliberately does nothing here.
 - [ ] On a **fresh** install (clear `%APPDATA%` and browser storage first):
       the first-run wizard appears and **no** what's-new banner is shown.
 
+## Voice reading
+
+The panel reports **measured acoustic properties of a signal**. Five are shown
+as numbers per half — pitch, pitch range, level, pace, tone — and level
+movement reaches the screen only as a word in the phrase (`flat` / `dynamic`).
+Voiced ratio is measured and used to decide voicing, but never displayed. It is not emotion recognition and must never read as though it were,
+so most of this section is about what the panel says when it has *nothing* to
+report. Those are
+the cases CI cannot reach and the ones where this feature usually goes wrong.
+
+**Off by default**
+
+- [ ] On a fresh install the Mixer's **Voice reading** card is present with its
+      switch **off**, and the card shows no numbers and no phrase.
+- [ ] With it off, run the app for a few minutes with the engine live: CPU is
+      unchanged from a run without the card (nothing is analyzed).
+- [ ] Turn it on, quit, relaunch → it comes back on. Turn it off, relaunch →
+      it comes back off.
+
+**Speaking vs silence — the freeze**
+
+- [ ] Engine running, panel on. Speak normally for ~10 seconds: the state reads
+      **Live**, the phrase appears (at most three words), and Pitch / Range /
+      Level / Pace all move.
+- [ ] Stop talking and stay still for a full minute. The state changes to
+      **Paused** with a "measured N s ago" counter that keeps climbing, and the
+      numbers **hold at the last speaking window** — they must NOT drift down
+      toward a quieter, flatter, narrower reading. Watch the phrase too: it
+      must not change at all while paused.
+- [ ] Keep not talking for over 30 seconds: the held numbers disappear and both
+      halves read "Nothing measured yet." The state must be **Too quiet to
+      measure** — NOT "Still listening", which would claim the panel has not
+      heard enough speech to compare against, when it has. (A reading from
+      minutes ago is not a
+      stale reading.)
+- [ ] Speak again: the panel goes back to **Live** within about a second.
+
+**Mute vs engine stopped vs quiet-but-present**
+
+- [ ] Mute the mic **at the device / in Windows** (a real mute, producing
+      digital silence) while the panel is on → the state reads **Input
+      silent**, not "too quiet". Unmute → it recovers.
+- [ ] Stop the engine from the Mixer → the state reads **Engine stopped**
+      within a second, and any held numbers are cleared. Start it again → the
+      panel starts over with **Still listening**.
+- [ ] Sit in a quiet room with the mic live and say nothing, with no device
+      mute → the state reads **Too quiet to measure** (or **Paused**, if a
+      window was measured earlier), *not* **Input silent**. These three must
+      never be confused: they mean different things and each has its own words.
+- [ ] Unplug the mic mid-session (device-loss recovery rebuilds the session) →
+      the panel does not keep showing the old reading, and a new baseline is
+      built after the rebuild.
+
+**Push-to-modulate with the key up**
+
+- [ ] Set push-to-modulate to "Hold to apply" and leave the key **up**, engine
+      running, panel on. Speak.
+- [ ] The **Your voice** half keeps reading normally: the mic is still open,
+      only the chain is bypassed. It must not read as muted or stopped.
+- [ ] The **After effects** half shows "No measured difference from the
+      microphone half — the chain is passing the signal through." It must not
+      look like a failure, and there must be no wording suggesting the preset
+      stopped working.
+- [ ] Hold the key down and keep speaking: the after-effects half diverges from
+      the microphone half (pitch and/or brightness move) while the microphone
+      half is unchanged.
+- [ ] **Repeat the whole block with Loudness normalization ON.** This is the
+      case that matters: the passing-through note is measured by correlating
+      the two taps, and the loudness stage sits between the chain and the wet
+      tap, so a bypassed chain still arrives at a different level. With
+      loudness on, the note must still appear. (A version that compared the
+      two halves' levels instead passed this block with loudness off and
+      failed silently with it on.)
+
+**A preset switch moves only the after-effects half**
+
+- [ ] Speak steadily while switching from a neutral preset to one with a large
+      pitch shift (e.g. Hollow King, −5 semitones).
+- [ ] The **After effects** pitch jumps by roughly the preset's shift within a
+      window or two. The **Your voice** pitch does **not** move.
+- [ ] The card names the active preset next to "After effects", and carries the
+      line saying a preset change moves those numbers on its own.
+- [ ] Switch back and forth a few times: only the second half ever reacts.
+
+**A headset in a noisy room (the octave-error case)**
+
+- [ ] Use a gaming headset in a room with fan / keyboard / background noise,
+      with the gate and denoiser enabled, and talk for two or three minutes.
+- [ ] Watch **Your voice → Pitch** and **Range**. A single window that halves
+      or doubles the pitch must **not** appear on screen — the guard holds a
+      suspected octave jump until a second window agrees with it.
+- [ ] Deliberately change register (speak in a much higher or lower voice and
+      hold it): the new pitch does land, after at most one extra window.
+- [ ] The Range readout must not flicker between two very different values
+      while the voice is steady.
+
+**Speak / soundboard are on neither half**
+
+- [ ] With the panel on and the engine live, play a soundboard clip or a Speak
+      utterance while **not** talking. Neither half reacts — that audio is
+      mixed in after the chain, downstream of both taps. (This is correct, not
+      a bug: the panel reads the microphone, not the mix.)
+
+**Honesty + accessibility**
+
+- [ ] Read every word on the card in each state. Nothing names a feeling
+      (happy / sad / angry / stressed / calm / confident / nervous / mood /
+      emotion), and nothing addresses the user in the second person about their
+      state ("you sound…", "you seem…").
+- [ ] The card carries its one-line "measured properties of the sound — not a
+      reading of the person speaking" note.
+- [ ] Start a screen reader (Narrator or NVDA), turn the panel on, and talk for
+      a minute. **The reader must stay quiet** while the numbers move. It may
+      announce the state sentence when it changes (stopped / silent / still
+      listening / reading), and it must read the values only when the user
+      navigates to them. Continuous narration while speaking is a failure.
+- [ ] Navigate to a value with the screen reader: it reads a label that names
+      which half it belongs to ("Pitch, your voice" vs "Pitch, after effects")
+      and a spoken value ("118 hertz").
+
+**Not on the overlay**
+
+- [ ] Open the stream overlay with the panel on and speak. Nothing from the
+      reading appears on the overlay — no phrase, no numbers, no state. This is
+      deliberate: an overlay audience cannot check a reading, and a guest on
+      the mic would be read too.
+
 ## Stress
 
 - [ ] Switch presets rapidly (1 per second) for 30 seconds — no crashes, no leaks.

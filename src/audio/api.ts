@@ -67,6 +67,112 @@ export interface LevelUpdate {
   modEnv: number;
 }
 
+/** Why the panel is or isn't showing a live reading.
+ *
+ *  Four states, not one low-level catch-all: stopped, muted and
+ *  quiet-but-present all look identical at the meter, and a panel that
+ *  couldn't tell them apart would go on describing a signal it no longer has.
+ */
+export type VoiceReadingState = "stopped" | "muted" | "quiet" | "speaking";
+
+/** Acoustic properties of one signal over one analysis window.
+ *
+ *  Every field is a measurement of the sound. None of them is an inference
+ *  about the person making it. */
+export interface ReadingMetrics {
+  /** Level of the window, dBFS. */
+  energyDbfs: number;
+  /** How much the level moves within the window, dB (p90 − p10). */
+  energyRangeDb: number;
+  /** Median pitch of the voiced frames, Hz. 0 when nothing was voiced. */
+  f0Hz: number;
+  /** Pitch spread across the voiced frames, semitones (p90 − p10). */
+  f0RangeSt: number;
+  /** Share of frames that were voiced, 0..1. */
+  voicedRatio: number;
+  /** Voiced onsets per second — a proxy for pace, not a syllable count. */
+  paceOps: number;
+  /** Spectral centroid, Hz. */
+  brightnessHz: number;
+}
+
+/** Payload of the `voice-reading` event and of the `voiceReading` command. */
+export interface VoiceReadingUpdate {
+  state: VoiceReadingState;
+  /** The mic, before any effect. */
+  dry: ReadingMetrics;
+  /** The same voice after the chain — what the call hears. Soundboard and
+   *  Speak audio is mixed in after this tap, so it is on neither half. */
+  wet: ReadingMetrics;
+  /** The words to show, already resolved by the backend from its closed
+   *  vocabulary. The frontend renders what it is handed and deliberately
+   *  carries no word list of its own — one list, one place to audit. */
+  words: string[];
+  /** True once enough speech has been heard for the baseline to mean
+   *  anything. Until then the panel says it is still listening. */
+  calibrated: boolean;
+  /**
+   * The chain passed the signal through unchanged over this window, so the
+   * two halves should read alike. Measured in the engine by correlating the
+   * taps — scale-invariant, because the wet tap sits after the loudness
+   * stage. Do not try to re-derive this from the numbers here: they are
+   * summaries, and a level comparison is wrong whenever loudness
+   * normalization is on.
+   */
+  wetBypassed: boolean;
+  /** The numbers come from an earlier window, held rather than decayed. */
+  stale: boolean;
+  /** How long ago that window was measured, ms. 0 while live. */
+  ageMs: number;
+}
+
+const SILENT_METRICS: ReadingMetrics = {
+  energyDbfs: -120,
+  energyRangeDb: 0,
+  f0Hz: 0,
+  f0RangeSt: 0,
+  voicedRatio: 0,
+  paceOps: 0,
+  brightnessHz: 0,
+};
+
+/** A reading that measures nothing. The panel's state before anything is on. */
+export const IDLE_VOICE_READING: VoiceReadingUpdate = {
+  state: "stopped",
+  dry: SILENT_METRICS,
+  wet: SILENT_METRICS,
+  words: [],
+  calibrated: false,
+  wetBypassed: false,
+  stale: false,
+  ageMs: 0,
+};
+
+/** Turn the voice-reading analysis on or off. Off is the default, and while
+ *  it is off the audio callback copies nothing — no analysis runs. */
+export async function setVoiceReadingEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_voice_reading_enabled", { enabled });
+}
+
+/** One-shot reading, so the panel can paint before the first event lands. */
+export async function getVoiceReading(): Promise<VoiceReadingUpdate> {
+  return invoke<VoiceReadingUpdate>("voice_reading");
+}
+
+/**
+ * Subscribe to `voice-reading` events (~5 Hz, and only while the panel is
+ * on). Its own event rather than a field on `audio-levels`: a window
+ * measurement that changes about once a second has no business riding a
+ * 30 Hz meter tick, and nothing is sent at all while the feature is off.
+ */
+export async function subscribeVoiceReading(
+  handler: (update: VoiceReadingUpdate) => void,
+): Promise<UnlistenFn> {
+  return listen<VoiceReadingUpdate>("voice-reading", (event) =>
+    handler(event.payload),
+  );
+}
+
 export async function listInputDevices(): Promise<DeviceInfo[]> {
   return invoke<DeviceInfo[]>("list_audio_input_devices");
 }

@@ -351,6 +351,112 @@ test.describe("reactive effects (v1.46)", () => {
   });
 });
 
+test.describe("voice reading", () => {
+  test("card renders, is off by default, and toggles on a live reading", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Mixer").click();
+
+    const toggle = page.getByRole("switch", { name: "Voice reading" });
+    await expect(toggle).toBeVisible();
+    // Off by default: an untouched install analyzes nothing.
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await expect(page.getByTestId("reading-dry")).toHaveCount(0);
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(
+      await page.evaluate(() =>
+        (
+          window as unknown as {
+            __E2E_INVOKES__: Array<{ cmd: string; args: unknown }>;
+          }
+        ).__E2E_INVOKES__.some(
+          (i) =>
+            i.cmd === "set_voice_reading_enabled" &&
+            (i.args as { enabled: boolean }).enabled === true,
+        ),
+      ),
+    ).toBe(true);
+
+    // A speaking window arrives: both halves render, clearly separated, with
+    // the after-effects half labelled as the chain's output.
+    await page.evaluate(() => {
+      const m = {
+        energyDbfs: -17.4,
+        energyRangeDb: 9.2,
+        f0Hz: 118,
+        f0RangeSt: 7.3,
+        voicedRatio: 0.62,
+        paceOps: 4.1,
+        brightnessHz: 2280,
+      };
+      (
+        window as unknown as {
+          __E2E_EMIT__: (e: string, p: unknown) => void;
+        }
+      ).__E2E_EMIT__("voice-reading", {
+        state: "speaking",
+        dry: m,
+        wet: { ...m, f0Hz: 84, brightnessHz: 1450 },
+        words: ["bright", "wide range", "fast"],
+        calibrated: true,
+        stale: false,
+        ageMs: 0,
+      });
+    });
+
+    await expect(page.getByTestId("reading-phrase")).toHaveText(
+      "bright, wide range, fast",
+    );
+    await expect(page.getByTestId("reading-dry")).toContainText("118 Hz");
+    await expect(page.getByTestId("reading-wet")).toContainText("84 Hz");
+    await expect(page.getByTestId("reading-wet")).toContainText(
+      /chain's output/i,
+    );
+    await expect(page.getByTestId("reading-disclaimer")).toContainText(
+      /not a reading of the person/i,
+    );
+
+    // A pause holds that window and says so rather than decaying.
+    await page.evaluate(() => {
+      const m = {
+        energyDbfs: -17.4,
+        energyRangeDb: 9.2,
+        f0Hz: 118,
+        f0RangeSt: 7.3,
+        voicedRatio: 0.62,
+        paceOps: 4.1,
+        brightnessHz: 2280,
+      };
+      (
+        window as unknown as {
+          __E2E_EMIT__: (e: string, p: unknown) => void;
+        }
+      ).__E2E_EMIT__("voice-reading", {
+        state: "quiet",
+        dry: m,
+        wet: { ...m, f0Hz: 84, brightnessHz: 1450 },
+        words: ["bright", "wide range", "fast"],
+        calibrated: true,
+        stale: true,
+        ageMs: 3400,
+      });
+    });
+    await expect(page.getByTestId("reading-state")).toContainText(/paused/i);
+    await expect(page.getByTestId("reading-state")).toContainText(/3\.4 s ago/i);
+    await expect(page.getByTestId("reading-dry")).toContainText("118 Hz");
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await expect(page.getByTestId("reading-dry")).toHaveCount(0);
+
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 

@@ -55,6 +55,9 @@ import {
   subscribeGlobalShortcut,
   subscribeLevels,
   subscribeMidi,
+  subscribeVoiceReading,
+  getVoiceReading,
+  setVoiceReadingEnabled,
   unregisterAllGlobalShortcuts,
   unregisterGlobalShortcut,
 } from "./api";
@@ -656,5 +659,47 @@ describe("audio api", () => {
     });
     expect(listenMock.mock.calls[0]?.[0]).toBe("midi-message");
     expect(captured).toMatchObject({ kind: "note-on", data1: 60 });
+  });
+
+  it("setVoiceReadingEnabled forwards the flag", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await setVoiceReadingEnabled(true);
+    expect(invokeMock).toHaveBeenCalledWith("set_voice_reading_enabled", {
+      enabled: true,
+    });
+  });
+
+  it("getVoiceReading invokes voice_reading", async () => {
+    invokeMock.mockResolvedValueOnce({ state: "quiet", words: [] });
+    const r = await getVoiceReading();
+    expect(invokeMock).toHaveBeenCalledWith("voice_reading");
+    expect(r.state).toBe("quiet");
+  });
+
+  it("subscribeVoiceReading listens on its OWN event, not audio-levels", async () => {
+    // Its own event at ~5 Hz: a window measurement that moves about once a
+    // second has no business riding the 30 Hz meter tick, and nothing is
+    // emitted at all while the panel is off.
+    let captured: unknown = null;
+    listenMock.mockImplementationOnce(
+      async (_event: string, handler: (e: { payload: unknown }) => void) => {
+        handler({
+          payload: {
+            state: "speaking",
+            words: ["bright", "wide range"],
+            stale: false,
+            ageMs: 0,
+          },
+        });
+        return () => {
+          /* unlisten */
+        };
+      },
+    );
+    await subscribeVoiceReading((update) => {
+      captured = update;
+    });
+    expect(listenMock.mock.calls[0]?.[0]).toBe("voice-reading");
+    expect(captured).toMatchObject({ state: "speaking" });
   });
 });

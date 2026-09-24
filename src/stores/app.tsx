@@ -17,6 +17,7 @@ import {
   createMemo,
   createSignal,
   on,
+  onCleanup,
   type JSX,
   type Setter,
   useContext,
@@ -81,6 +82,9 @@ import {
   listSpeakClips as listSpeakClipsCmd,
   deleteSpeakClip as deleteSpeakClipCmd,
   setSpeakMonitor as setSpeakMonitorCmd,
+  setVoiceReadingEnabled as setVoiceReadingEnabledCmd,
+  getVoiceReading as getVoiceReadingCmd,
+  subscribeVoiceReading,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
@@ -95,6 +99,7 @@ import {
   type TtsVoiceInfo,
   type VirtualMicStatus,
   type VoiceInfo,
+  type VoiceReadingUpdate,
   type WirePreset,
 } from "../audio/api";
 import {
@@ -249,6 +254,10 @@ const STORAGE_KEYS = {
   speakMonitor: "divora.speakMonitor",
   cloneGpu: "divora.cloneGpu",
   whatsNewSeenVersion: "divora.whatsNewSeenVersion",
+  // Only the on/off switch is remembered. Nothing derived from the user's
+  // voice is ever written to disk — the rolling baseline the descriptors are
+  // relative to lives in the engine for the life of a session and dies there.
+  voiceReading: "divora.voiceReading",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -457,6 +466,13 @@ export interface AppState {
   /** v1.46.0: master depth scale, 0..100. */
   reactiveIntensity: () => number;
   setReactiveIntensity: (pct: number) => void;
+  /** Whether the Voice reading panel is analyzing. Off by default; while it
+   *  is off the backend copies no audio at all. */
+  voiceReadingOn: () => boolean;
+  setVoiceReadingOn: (on: boolean) => void;
+  /** The latest reading, or null when nothing is being measured. */
+  voiceReading: () => VoiceReadingUpdate | null;
+  setVoiceReading: Setter<VoiceReadingUpdate | null>;
   /**
    * v1.47.0: the voice currently being auditioned, or null. Drives each card's
    * play/stop affordance and its "rendering..." state.
@@ -1182,6 +1198,72 @@ export function createAppState(): AppState {
     setReactiveIntensityRaw(clampIntensity(pct));
     persistReactive();
   };
+
+  // ---- Voice reading ----
+  //
+  // Only the switch is persisted. The rolling baseline the descriptors are
+  // relative to is derived from the user's voice and lives in the engine for
+  // the life of a session; nothing derived from the voice reaches disk.
+  const persistedReading = loadJson<{ enabled: boolean }>(
+    STORAGE_KEYS.voiceReading,
+    { enabled: false },
+  );
+  const [voiceReadingOn, setVoiceReadingOnRaw] = createSignal(
+    !!persistedReading.enabled,
+  );
+  const [voiceReading, setVoiceReading] =
+    createSignal<VoiceReadingUpdate | null>(null);
+
+  const setVoiceReadingOn = (on: boolean): void => {
+    setVoiceReadingOnRaw(on);
+    // Drop the reading the moment the switch goes off. Leaving the last
+    // window on screen would keep showing a measurement of something that is
+    // no longer being measured — the same lie as a decaying readout, just
+    // frozen instead of drifting.
+    if (!on) setVoiceReading(null);
+    saveJson(STORAGE_KEYS.voiceReading, { enabled: on });
+    void setVoiceReadingEnabledCmd(on).catch(() => {
+      /* browser preview without the Tauri bridge */
+    });
+  };
+
+  // One subscription for the life of the provider. The backend stays silent
+  // while the feature is off, so an inactive panel costs one idle listener
+  // rather than a subscribe/unsubscribe race on every toggle.
+  let readingUnlisten: (() => void) | null = null;
+  void (async () => {
+    try {
+      readingUnlisten = await subscribeVoiceReading((update) => {
+        // Late events can arrive just after the switch goes off; the switch
+        // is the authority on whether anything should be shown.
+        if (voiceReadingOn()) setVoiceReading(update);
+      });
+    } catch {
+      /* browser preview without the Tauri bridge */
+    }
+  })();
+  onCleanup(() => {
+    if (readingUnlisten) readingUnlisten();
+    readingUnlisten = null;
+  });
+
+  // Push the persisted switch to the backend once, and paint immediately from
+  // a one-shot read rather than waiting up to a fifth of a second for the
+  // first event.
+  createEffect(
+    on(voiceReadingOn, (on) => {
+      if (!on) return;
+      void (async () => {
+        try {
+          await setVoiceReadingEnabledCmd(true);
+          const first = await getVoiceReadingCmd();
+          if (voiceReadingOn()) setVoiceReading(first);
+        } catch {
+          /* browser preview without the Tauri bridge */
+        }
+      })();
+    }),
+  );
   const [recordingPath, setRecordingPath] = createSignal<string | null>(null);
 
   const preset = createMemo<Preset>(
@@ -2989,6 +3071,10 @@ export function createAppState(): AppState {
     reactiveIntensity,
     setReactiveIntensity,
     reactiveHasTarget,
+    voiceReadingOn,
+    setVoiceReadingOn,
+    voiceReading,
+    setVoiceReading,
     previewingVoice,
     previewRendering,
     previewVoice,

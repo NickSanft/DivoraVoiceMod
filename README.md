@@ -33,6 +33,7 @@ Each release lists **SHA-256 checksums** for the `.msi` and `-setup.exe` in its 
 
   On top of the bundled cast: unlimited user presets with a full JSON editor, export/import, and **A/B compare** on the Mixer.
 - **AI voice conversion** — an ONNX-Runtime `VoiceConvert` effect with a bundled streaming LLVC narrator (~13 ms) and **bring-your-own `.onnx` model** support. Degrades to passthrough (never hangs) when no model or runtime is present. See [`docs/voice-models/`](docs/voice-models/).
+- **Voice reading** — an optional Mixer panel (off by default) that measures the **acoustic properties of the signal** and shows them two ways: **your voice**, read from the dry microphone before any effect, and **after effects**, read from the chain's output — what the call actually hears. It shows five numbers per half — pitch, pitch range, level, pace and tone — and a short phrase describing the sound ("bright, wide range, fast"), which is also where level movement appears. It answers "am I going flat on this stream?" and "is my demon voice still landing?" without guessing at anything. During a pause it **holds** the last measured window and says so rather than quietly decaying; muted, engine-stopped and quiet-but-present are three separate states with three separate messages. The per-session baseline it compares against never leaves memory, and nothing appears on the stream overlay.
 - **Loudness normalization** — an optional output stage (auto-gain + brick-wall limiter, zero added latency) that keeps your *perceived* level steady across presets and never clips.
 - **Monitor output routing** — an independent second output, so the main send can go to VB-Cable (→ Discord / games) while you still hear yourself on headphones, with a separate monitor volume.
 - **VB-Cable bridge** — DivoraVoice pours the modulated voice into `CABLE Input`; Discord / Zoom / OBS pick it up from `CABLE Output`. The first-run wizard walks you through it.
@@ -52,6 +53,7 @@ Each release lists **SHA-256 checksums** for the `.msi` and `-setup.exe` in its 
 ## What it doesn't do (and won't)
 
 - Named celebrity voice clones. Persona archetypes only — cloning ("Your voices") clones **your own** recorded voice, and AI voice convert is bring-your-own-model.
+- **Emotion labels.** "Voice reading" reports what a *signal* is — loud, flat, wide, fast, bright — and will never report what a person *is*. Not squeamishness: the axis people mean by "what emotion is this" is carried by the words, not the voice (strip prosody and a model's valence score largely survives; strip the words and its arousal score collapses), and this app pitch-shifts, bitcrushes and ring-modulates on top of that — a formant shift alone costs a published four-class emotion model 18 points of accuracy. On a modulated voice the claim would be indefensible, and under EU AI Act Recital 18 the word on screen is the whole difference between a meter and a regulated emotion-recognition system. The vocabulary is a closed list in `divora-core/src/dsp/reading.rs`, guarded by a test.
 - Cloud, accounts, telemetry, upsells.
 - Cross-platform (yet). Windows only for v1.
 

@@ -94,8 +94,13 @@ describe("notesSince", () => {
   it("flags — without a number — that older releases exist beyond the bundle", () => {
     // Someone updating from a year-old build. We hold ~12 releases, so the
     // true remainder is unknowable; printing a count would be a lie.
+    // Read the running version off the bundle rather than naming one: with a
+    // hardcoded ceiling this test drifted every release, because each new
+    // entry pushes an old one out of the window and fewer notes fall below
+    // the named version until the cap stops being reached at all.
     const oldest = RELEASE_NOTES[RELEASE_NOTES.length - 1]!.version;
-    const got = notesSince("0.1.0", "1.48.0");
+    const current = RELEASE_NOTES[0]!.version;
+    const got = notesSince("0.1.0", current);
     expect(got.moreUnknown).toBe(true);
     expect(got.notes).toHaveLength(RENDER_CAP);
     expect(oldest).not.toBe("0.1.0");

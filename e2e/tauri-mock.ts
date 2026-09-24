@@ -156,6 +156,32 @@ export async function installTauriMock(
         open_speak_clips_folder: () => null,
         delete_speak_clip: () => null,
         set_reactive_config: () => null,
+        set_voice_reading_enabled: () => null,
+        voice_reading: () => ({
+          state: "quiet",
+          dry: {
+            energyDbfs: -120,
+            energyRangeDb: 0,
+            f0Hz: 0,
+            f0RangeSt: 0,
+            voicedRatio: 0,
+            paceOps: 0,
+            brightnessHz: 0,
+          },
+          wet: {
+            energyDbfs: -120,
+            energyRangeDb: 0,
+            f0Hz: 0,
+            f0RangeSt: 0,
+            voicedRatio: 0,
+            paceOps: 0,
+            brightnessHz: 0,
+          },
+          words: [],
+          calibrated: false,
+          stale: false,
+          ageMs: 0,
+        }),
         list_cloned_voices: () => [],
         clone_voice: () => {
           throw "text-to-speech voices are not installed";
