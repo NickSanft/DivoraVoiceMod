@@ -20,7 +20,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ### Architecture notes
 
-- The audio callback's contract is the same as it always was — no allocation, no deallocation, no locks, no syscalls — and two paths were breaking it. Both are now split the same way: the control thread prepares (`DspEdit::prepare`), the callback moves, and a bounded ring carries what it displaced to a `divora-graveyard` thread. The ring is lock-free and preallocated rather than a channel, because a channel's `try_send` may have to wake a parked receiver, and that is a syscall in the callback.
+- The audio callback's contract is the same as it always was — no allocation, no deallocation, no locks, no syscalls — and three paths were breaking it: the effect chain, the voice model and the reactive route table. All three are now split the same way: the control thread prepares (`DspEdit::prepare`, `ReactiveConfig::resolve`), the callback moves, and a bounded ring carries what it displaced to a `divora-graveyard` thread. The ring is lock-free and preallocated rather than a channel, because a channel's `try_send` may have to wake a parked receiver, and that is a syscall in the callback.
 - **Both** queues from the engine thread to the callback are now bounded: an unbounded `mpsc` allocates its blocks on the sending side and frees them on the *receiving* one, which here is the audio thread.
 - One free remains in the callback and is documented rather than papered over: `SetParam` drops its owned key string. It is one small free rather than a hundred, it predates this work, and the fix (intern the keys) is left for its own change — with a test holding it at exactly one until then.
 
