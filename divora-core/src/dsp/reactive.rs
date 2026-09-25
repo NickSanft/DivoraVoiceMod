@@ -403,8 +403,9 @@ impl ReactiveConfig {
 ///
 /// Resolution happens on the engine thread so the audio callback never runs
 /// the `filter_map`/`collect`, nor drops the incoming config's `String`s.
-/// Handing the callback this type instead leaves it a single `Vec` free when
-/// it swaps the route table.
+/// Handing the callback this type instead leaves it nothing to free: it swaps
+/// the route tables and sends this shell, now holding the old one, out to the
+/// graveyard.
 #[derive(Debug, Clone)]
 pub struct ResolvedReactive {
     pub enabled: bool,
@@ -479,10 +480,19 @@ impl ReactiveModulator {
     /// will hit routinely: sending `{enabled: false, routes: []}` to turn the
     /// panel off, and editing a route to target a different parameter.
     ///
-    /// Called from the command drain at the top of the output callback (the
-    /// same place `DspCommand::SetChain` is applied). It frees the previous
-    /// route `Vec`; resolution itself already happened on the engine thread.
-    pub fn configure(&mut self, cfg: &ResolvedReactive, chain: &mut EffectChain) {
+    /// Called from the command drain at the top of the output callback, just
+    /// above the DSP drain that applies a [`DspEdit::ReplaceChain`] — that
+    /// order matters, because the bases restored here were authored against
+    /// the chain a replacement is about to retire. Resolution itself already
+    /// happened on the engine thread.
+    ///
+    /// Takes `cfg` by `&mut` and **swaps** the route tables rather than
+    /// copying: copying frees nothing but grows this `Vec` when the new table
+    /// is longer, and then the caller drops the config — one allocation and
+    /// two frees, in the callback, on every preset switch and every Inspector
+    /// slider move. After the swap `cfg` owns the table this modulator was
+    /// using, which is what the caller sends to the graveyard.
+    pub fn configure(&mut self, cfg: &mut ResolvedReactive, chain: &mut EffectChain) {
         if self.needs_restore {
             self.restore_bases(chain);
             self.needs_restore = false;
@@ -491,8 +501,7 @@ impl ReactiveModulator {
         self.source.set_window(cfg.floor_db, cfg.ceil_db);
         self.source
             .set_timing(cfg.attack_ms, cfg.hold_ms, cfg.release_ms);
-        self.routes.clear();
-        self.routes.extend_from_slice(&cfg.routes);
+        std::mem::swap(&mut self.routes, &mut cfg.routes);
         self.set_enabled(cfg.enabled);
     }
 

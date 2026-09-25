@@ -21,6 +21,10 @@ mod virtual_mic;
 
 pub use devices::{list_input_devices, list_output_devices, DeviceInfo};
 pub use engine::{AudioEngine, ReadingAnalyzer, ReadingFacts, ReadingSnapshot, StreamInfo};
+// Engine internals the allocation proof in `tests/` has to name. It needs its
+// own binary for a `#[global_allocator]`, so it sees only what is exported.
+#[doc(hidden)]
+pub use engine::{drain_dsp_edits, drain_reactive_edits, ReadingTap};
 pub use level::LevelMeter;
 pub use loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS, MAX_TARGET_DBFS, MIN_TARGET_DBFS};
 pub use resampler::MonoResampler;

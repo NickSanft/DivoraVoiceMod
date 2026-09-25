@@ -274,6 +274,10 @@ pub enum Displaced {
     /// A voice-conversion model — its ONNX session, any load still in flight,
     /// and the strings naming it.
     VoiceModel(VoiceModel),
+    /// A reactive configuration carrying the route table it displaced.
+    /// [`ReactiveModulator::configure`] swaps rather than copies, so what
+    /// comes back here is the PREVIOUS table in the incoming config's shell.
+    Reactive(ResolvedReactive),
 }
 
 /// A chain edit in the form the audio callback can apply.
@@ -372,7 +376,10 @@ impl EffectChain {
     /// Apply a single edit, handing back anything it displaced.
     ///
     /// Called from the audio callback when draining the edit channel, so
-    /// nothing in here allocates, frees, locks or blocks. The return value is
+    /// no structural edit here allocates, frees, locks or blocks. `SetParam`
+    /// is the exception and always has been: it drops the owned key string it
+    /// was sent, one free on the audio thread, on the most frequent edit there
+    /// is. Interning those keys is the follow-up. The return value is
     /// the whole point: this cannot see the engine's channels, so a displaced
     /// chain leaves through the caller, which routes it to the graveyard
     /// thread (see [`Displaced`]).
@@ -468,13 +475,6 @@ impl EffectChain {
         if let Some(effect) = self.effects.get_mut(index) {
             effect.set_param(key, value);
         }
-    }
-
-    /// Drop every effect, freeing them **on this thread**. Not for the audio
-    /// callback: its way to empty the chain is [`DspEdit::Clear`], which hands
-    /// the effects out instead of freeing them where it cannot afford to.
-    pub fn clear(&mut self) {
-        self.effects.clear();
     }
 }
 

@@ -60,10 +60,22 @@ const SB_CHANNEL_CAPACITY: usize = 256;
 /// for.
 const DSP_CHANNEL_CAPACITY: usize = 64;
 
-/// Capacity of the graveyard ring — chains (and voice models) the audio
-/// callback displaced, for [`graveyard_thread`] to free. Deep enough that
-/// someone mashing preset buttons cannot outrun the drain interval below.
-const GRAVEYARD_CAPACITY: usize = 16;
+/// Capacity of the bounded engine→audio reactive-config queue.
+///
+/// Bounded for the same reason as [`DSP_CHANNEL_CAPACITY`], and it matters
+/// more here: a reactive config is re-sent on every chain change, so a preset
+/// switch and every Inspector slider move each put one through. Overflow
+/// drops the config — the modulation then offsets from the previous bases
+/// until the next send — and needs a callback that has stopped draining.
+const REACTIVE_CHANNEL_CAPACITY: usize = 64;
+
+/// Capacity of the graveyard ring — chains, voice models and reactive route
+/// tables the audio callback displaced, for [`graveyard_thread`] to free.
+/// Deep enough that an Inspector drag (which sends a reactive config per
+/// change) or someone mashing preset buttons cannot outrun the drain interval
+/// below. Overflow is safe — `try_push` hands the value back and it is freed
+/// inline, which is just what the callback did before any of this.
+const GRAVEYARD_CAPACITY: usize = 64;
 
 /// How often the graveyard thread drains. It polls instead of blocking on a
 /// channel because a parked receiver has to be woken, and the only sender is
@@ -274,6 +286,15 @@ impl AudioEngine {
     /// model starts an ONNX load, neither of which the audio callback may do.
     /// Every caller keeps sending plain `DspCommand`s, so the whole fix lives
     /// at this one seam.
+    ///
+    /// That puts the build on whichever thread calls this — for a preset
+    /// switch, the Tauri command thread. It is a real cost (tens of
+    /// milliseconds for a chain with a resampler in it) paid somewhere it is
+    /// allowed to be paid, and it depends on `set_effect_chain` and
+    /// `set_voice_model` staying **sync** Tauri commands: `async` ones run on
+    /// the main async runtime, where blocking would stall every other
+    /// command. If either has to become `async`, wrap this in
+    /// `spawn_blocking` rather than moving the build back down.
     pub fn send_dsp(&self, cmd: DspCommand) {
         if let Some(edit) = DspEdit::prepare(cmd) {
             let _ = self.tx.send(Command::Dsp(edit));
@@ -476,7 +497,7 @@ struct StartedStreams {
     streams: RunningStreams,
     info: StreamInfo,
     dsp_tx: SyncSender<DspEdit>,
-    reactive_tx: Sender<ResolvedReactive>,
+    reactive_tx: SyncSender<ResolvedReactive>,
     sb_tx: SyncSender<SoundboardCommand>,
     recording_tx: Sender<RecordingCommand>,
     writer: JoinHandle<()>,
@@ -503,7 +524,7 @@ fn engine_thread(
 ) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<SyncSender<DspEdit>> = None;
-    let mut reactive_tx: Option<Sender<ResolvedReactive>> = None;
+    let mut reactive_tx: Option<SyncSender<ResolvedReactive>> = None;
     let mut sb_tx: Option<SyncSender<SoundboardCommand>> = None;
     let mut recording_tx: Option<Sender<RecordingCommand>> = None;
     let mut writer: Option<JoinHandle<()>> = None;
@@ -560,6 +581,11 @@ fn engine_thread(
             // everything it was handed.
             drop(graveyard_tx.take());
             if let Some(h) = graveyard.take() {
+                // Worst case this waits one poll interval
+                // ([`GRAVEYARD_DRAIN_INTERVAL_MS`]) for the thread to notice
+                // the hang-up. Stop and device-rebuild both go through here,
+                // so that is the ceiling on how long either can take —
+                // bounded and small, but not zero.
                 let _ = h.join();
             }
             state.running.store(false, Ordering::Release);
@@ -611,7 +637,7 @@ fn engine_thread(
                     // Same for reactive modulation: re-apply onto the fresh
                     // modulator so a rebuild doesn't drop the routing.
                     if let Some(tx) = &reactive_tx {
-                        let _ = tx.send(last_reactive.resolve());
+                        let _ = tx.try_send(last_reactive.resolve());
                     }
                     Ok(started.info)
                 }
@@ -727,7 +753,7 @@ fn engine_thread(
                 // not run the whitelist filter_map or drop the config's owned
                 // Strings. It receives a ready-made route table instead.
                 if let Some(tx) = &reactive_tx {
-                    let _ = tx.send(cfg.resolve());
+                    let _ = tx.try_send(cfg.resolve());
                 }
                 last_reactive = *cfg;
             }
@@ -932,7 +958,7 @@ fn start_streams(
     let (graveyard_tx, graveyard_alive) = channel::<()>();
 
     let (dsp_tx, dsp_rx) = sync_channel::<DspEdit>(DSP_CHANNEL_CAPACITY);
-    let (reactive_tx, reactive_rx) = channel::<ResolvedReactive>();
+    let (reactive_tx, reactive_rx) = sync_channel::<ResolvedReactive>(REACTIVE_CHANNEL_CAPACITY);
     let (sb_tx, sb_rx) = sync_channel::<SoundboardCommand>(SB_CHANNEL_CAPACITY);
 
     let input_stream = build_input_stream(
@@ -1107,12 +1133,44 @@ fn graveyard_thread(mut bin: GraveConsumer, alive: Receiver<()>) {
     }
 }
 
+/// Apply every pending reactive configuration, at the top of an output buffer.
+///
+/// Drained BEFORE [`drain_dsp_edits`]: `configure` restores the outgoing
+/// routes to their authored values, and those bases were authored against the
+/// CURRENT chain — so the restore has to land before a `ReplaceChain` in the
+/// same buffer retires it.
+///
+/// `pub` on the same terms as [`drain_dsp_edits`], and for the same test.
+#[doc(hidden)]
+pub fn drain_reactive_edits(
+    rx: &Receiver<ResolvedReactive>,
+    modulator: &mut ReactiveModulator,
+    chain: &mut EffectChain,
+    graveyard: &mut GraveProducer,
+) {
+    while let Ok(mut cfg) = rx.try_recv() {
+        // `configure` swaps the route tables, so `cfg` leaves holding the OLD
+        // one — out to the graveyard with it, rather than dropping a `Vec`
+        // here.
+        modulator.configure(&mut cfg, chain);
+        let _ = graveyard.try_push(Displaced::Reactive(cfg));
+    }
+}
+
 /// Apply every pending chain edit, at the top of an output buffer.
 ///
 /// Its own function so a test can run exactly what the callback runs: each
 /// edit applied, everything it displaces handed to the graveyard rather than
 /// freed here, and the voice reading told the chain moved under it.
-fn drain_dsp_edits(
+///
+/// `pub` only so `tests/rt_chain_swap_allocations.rs` can count allocations
+/// around **this** function rather than around a copy of it. A copy is not a
+/// proof: the copy stays allocation-free while the real callback regresses.
+/// It needs a separate test binary for its `#[global_allocator]`, so it can
+/// only reach what the crate exports. Not part of the API — hidden, and
+/// nothing outside the engine should call it.
+#[doc(hidden)]
+pub fn drain_dsp_edits(
     rx: &Receiver<DspEdit>,
     chain: &mut EffectChain,
     graveyard: &mut GraveProducer,
@@ -1300,12 +1358,15 @@ fn build_output_stream(
                 // values, and those bases were authored against the CURRENT
                 // chain — so the restore has to land before a `SetChain` in the
                 // same buffer replaces it.
-                while let Ok(cfg) = reactive_rx.try_recv() {
-                    modulator.configure(&cfg, &mut chain);
-                }
+                drain_reactive_edits(&reactive_rx, &mut modulator, &mut chain, &mut graveyard);
                 // Structural changes arrive already built (`DspEdit`) and
-                // what they displace leaves through the graveyard, so nothing
-                // in this drain allocates or frees.
+                // what they displace leaves through the graveyard, so no
+                // structural edit in this drain allocates or frees. One thing
+                // here still frees and it is not worth claiming otherwise:
+                // `SetParam` drops the owned key string it was sent, once per
+                // slider tick. Interning those keys is the follow-up;
+                // `tests/rt_chain_swap_allocations.rs` pins it at exactly one
+                // so it cannot grow in the meantime.
                 drain_dsp_edits(&dsp_rx, &mut chain, &mut graveyard, &reading);
                 while let Ok(cmd) = sb_rx.try_recv() {
                     soundboard.apply(cmd);
@@ -2388,6 +2449,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// The callback's reactive drain, minus the graveyard: `configure` takes
+    /// the config by `&mut` so it can swap the route table out, and these
+    /// tests reuse their configs, so hand it a copy.
+    fn configure(
+        m: &mut ReactiveModulator,
+        cfg: &crate::dsp::ResolvedReactive,
+        chain: &mut EffectChain,
+    ) {
+        let mut owned = cfg.clone();
+        m.configure(&mut owned, chain);
+    }
+
     /// Phase 13 gating truth table: the main output (the "send") always
     /// plays when a separate monitor device exists, so routing to
     /// VB-Cable keeps reaching Discord regardless of the monitor toggle;
@@ -2724,8 +2797,8 @@ mod tests {
         let mut saturating = distortion_chain(90.0);
         let mut m_dry = ReactiveModulator::new();
         let mut m_hot = ReactiveModulator::new();
-        m_dry.configure(&observe_only, &mut passthrough);
-        m_hot.configure(&observe_only, &mut saturating);
+        configure(&mut m_dry, &observe_only, &mut passthrough);
+        configure(&mut m_hot, &observe_only, &mut saturating);
 
         let mut loud1 = LoudnessNormalizer::new();
         let mut loud2 = LoudnessNormalizer::new();
@@ -2782,7 +2855,7 @@ mod tests {
         use crate::dsp::ReactiveModulator;
         let mut chain = distortion_chain(10.0);
         let mut m = ReactiveModulator::new();
-        m.configure(&rage_config(true, 10.0), &mut chain);
+        configure(&mut m, &rage_config(true, 10.0), &mut chain);
 
         // Drive it loud so the parameter is well away from its base.
         let mut tone = Tone::new();
@@ -2793,7 +2866,7 @@ mod tests {
         assert!(m.depth() > 0.5, "should be modulating, got {}", m.depth());
 
         // Disable, then run one more block so the restore fires.
-        m.configure(&rage_config(false, 10.0), &mut chain);
+        configure(&mut m, &rage_config(false, 10.0), &mut chain);
         let buf = tone.block(0.4, 480);
         m.apply(&buf, &mut chain, 48_000);
 
@@ -2834,7 +2907,7 @@ mod tests {
         use crate::dsp::{EffectKind, ReactiveConfig, ReactiveModulator, ReactiveRouteSpec};
         let mut chain = distortion_chain(10.0);
         let mut m = ReactiveModulator::new();
-        m.configure(&rage_config(true, 10.0), &mut chain);
+        configure(&mut m, &rage_config(true, 10.0), &mut chain);
 
         let mut tone = Tone::new();
         for _ in 0..80 {
@@ -2857,7 +2930,7 @@ mod tests {
             ..ReactiveConfig::default()
         }
         .resolve();
-        m.configure(&repointed, &mut chain);
+        configure(&mut m, &repointed, &mut chain);
 
         assert!(
             chains_agree(&mut chain, &mut distortion_chain(10.0)),
@@ -2874,7 +2947,7 @@ mod tests {
         use crate::dsp::{ReactiveConfig, ReactiveModulator};
         let mut chain = distortion_chain(10.0);
         let mut m = ReactiveModulator::new();
-        m.configure(&rage_config(true, 10.0), &mut chain);
+        configure(&mut m, &rage_config(true, 10.0), &mut chain);
 
         let mut tone = Tone::new();
         for _ in 0..80 {
@@ -2889,7 +2962,7 @@ mod tests {
             ..ReactiveConfig::default()
         }
         .resolve();
-        m.configure(&cleared, &mut chain);
+        configure(&mut m, &cleared, &mut chain);
 
         assert!(
             chains_agree(&mut chain, &mut distortion_chain(10.0)),
@@ -3398,7 +3471,7 @@ mod tests {
         // Routed at base drive 0, so anything the modulation writes shows up.
         let mut chain = distortion_chain(0.0);
         let mut modulator = ReactiveModulator::new();
-        modulator.configure(&rage_config(true, 0.0), &mut chain);
+        configure(&mut modulator, &rage_config(true, 0.0), &mut chain);
 
         // The replacement puts a (disabled, so inert) gate in front: the
         // distortion the route names is now at index 1.

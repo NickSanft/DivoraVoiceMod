@@ -228,12 +228,6 @@ impl VoiceModel {
     }
 }
 
-impl Default for VoiceModel {
-    fn default() -> Self {
-        Self::none()
-    }
-}
-
 /// In-place voice converter. Holds optional ONNX session, optional
 /// resamplers, and the streaming buffers that bridge native-rate audio
 /// callbacks to fixed-rate model chunks.

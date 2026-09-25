@@ -274,7 +274,9 @@ src/
 
 - `EffectChain` is owned by the audio output callback. No locks; no contention with the UI thread.
 - The UI sends `DspCommand`s, which `AudioEngine::send_dsp` lowers into `DspEdit`s **on the calling thread** — that is where a chain is built and a voice-model load is started. They travel a bounded SPSC channel, recreated on every engine start, that the callback drains at the top of each buffer.
-- `EffectChain::apply(edit)` is the single mutation point, and it allocates and frees nothing: a `ReplaceChain` swaps in an already-built chain and **returns** the one it displaced (as does `Clear`), for the per-session graveyard thread to drop. `SetParam` / `SetEnabled` mutate in place.
+- `EffectChain::apply(edit)` is the single mutation point, and no **structural** edit through it allocates or frees: a `ReplaceChain` swaps in an already-built chain and **returns** the one it displaced (as does `Clear`), for the per-session graveyard thread to drop. `SetParam` / `SetEnabled` mutate in place.
+- The reactive-modulation queue beside it works the same way and for the same reason — it is on the preset-switch path too, since the config is re-sent on every chain change. It is bounded, and `ReactiveModulator::configure` **swaps** the route tables rather than copying, so the config leaves through the graveyard carrying the table it displaced.
+- One free remains in the callback, and it is documented rather than papered over: `SetParam` drops the owned key string it was sent, once per slider tick. `divora-core/tests/rt_chain_swap_allocations.rs` asserts it at exactly one — that test drives the real drain functions, not copies of them, and pins the zeros for everything else.
 - Engine restarts (Stop → Start) clear the chain; the frontend re-sends `SetChain` via a `createEffect` on `(presetId, engineRunning)`.
 
 ### Frontend chain sync
