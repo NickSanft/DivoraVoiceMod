@@ -28,8 +28,8 @@ use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
 use crate::dsp::{
-    Analyzer, DspCommand, EffectChain, InputFacts, Metrics, ReactiveConfig, ReactiveModulator,
-    ReadingState, ResolvedReactive, VoiceReading,
+    Analyzer, Displaced, DspCommand, DspEdit, EffectChain, InputFacts, Metrics, ReactiveConfig,
+    ReactiveModulator, ReadingState, ResolvedReactive, VoiceReading,
 };
 use crate::soundboard::{SoundboardCommand, SoundboardMixer};
 
@@ -49,6 +49,27 @@ const MAX_FRAMES_PER_CALLBACK: usize = 4096;
 /// the queue cannot grow without bound and OOM the whole process; excess
 /// plays are dropped (`try_send`) instead. (v1.33.0)
 const SB_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the bounded engine→audio DSP edit queue.
+///
+/// Bounded so the callback's `try_recv` never frees anything: an unbounded
+/// `mpsc` allocates its blocks on the sending side and frees them on the
+/// RECEIVING one, which here is the audio thread. Deep enough for any burst
+/// of UI edits between two buffers; overflow drops the edit, which needs a
+/// callback that has stopped draining — the case device-loss recovery exists
+/// for.
+const DSP_CHANNEL_CAPACITY: usize = 64;
+
+/// Capacity of the graveyard ring — chains (and voice models) the audio
+/// callback displaced, for [`graveyard_thread`] to free. Deep enough that
+/// someone mashing preset buttons cannot outrun the drain interval below.
+const GRAVEYARD_CAPACITY: usize = 16;
+
+/// How often the graveyard thread drains. It polls instead of blocking on a
+/// channel because a parked receiver has to be woken, and the only sender is
+/// the audio callback — the one thread that must not make a syscall. Freeing
+/// a displaced chain up to this late costs nothing but the memory.
+const GRAVEYARD_DRAIN_INTERVAL_MS: u64 = 50;
 
 /// Max automatic session rebuilds (after stream errors) between manual
 /// starts. Caps recovery so a permanently-flapping device can't loop
@@ -101,7 +122,9 @@ enum Command {
     },
     Stop,
     SetMonitor(bool),
-    Dsp(DspCommand),
+    /// A chain edit the caller already prepared (built the chain, started the
+    /// model load) — see [`DspEdit::prepare`].
+    Dsp(DspEdit),
     /// v1.46.0: replace the whole reactive-modulation configuration.
     /// Sent as one message so the audio thread can never observe a
     /// half-applied state (e.g. new routes against an old intensity).
@@ -245,8 +268,16 @@ impl AudioEngine {
 
     /// Send a DSP command (chain build, parameter sweep, etc.). The
     /// audio thread drains these at the top of each output buffer.
+    ///
+    /// The command is lowered to a [`DspEdit`] **here, on the calling
+    /// thread**: a `SetChain` boxes and constructs every effect, and a voice
+    /// model starts an ONNX load, neither of which the audio callback may do.
+    /// Every caller keeps sending plain `DspCommand`s, so the whole fix lives
+    /// at this one seam.
     pub fn send_dsp(&self, cmd: DspCommand) {
-        let _ = self.tx.send(Command::Dsp(cmd));
+        if let Some(edit) = DspEdit::prepare(cmd) {
+            let _ = self.tx.send(Command::Dsp(edit));
+        }
     }
 
     /// v1.46.0: replace the reactive-modulation configuration.
@@ -444,7 +475,7 @@ struct RunningStreams {
 struct StartedStreams {
     streams: RunningStreams,
     info: StreamInfo,
-    dsp_tx: Sender<DspCommand>,
+    dsp_tx: SyncSender<DspEdit>,
     reactive_tx: Sender<ResolvedReactive>,
     sb_tx: SyncSender<SoundboardCommand>,
     recording_tx: Sender<RecordingCommand>,
@@ -456,6 +487,10 @@ struct StartedStreams {
     /// keep-alive channel, which is how it learns the session is over.
     reading_tx: Sender<()>,
     reading_worker: JoinHandle<()>,
+    /// The graveyard thread, which frees the chains the callback displaces.
+    /// Same keep-alive shutdown as the workers above.
+    graveyard_tx: Sender<()>,
+    graveyard: JoinHandle<()>,
 }
 
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
@@ -467,7 +502,7 @@ fn engine_thread(
     reading: Arc<ReadingTap>,
 ) {
     let mut current: Option<RunningStreams> = None;
-    let mut dsp_tx: Option<Sender<DspCommand>> = None;
+    let mut dsp_tx: Option<SyncSender<DspEdit>> = None;
     let mut reactive_tx: Option<Sender<ResolvedReactive>> = None;
     let mut sb_tx: Option<SyncSender<SoundboardCommand>> = None;
     let mut recording_tx: Option<Sender<RecordingCommand>> = None;
@@ -479,6 +514,10 @@ fn engine_thread(
     // what makes an engine restart or a device change invalidate the baseline.
     let mut reading_tx: Option<Sender<()>> = None;
     let mut reading_worker: Option<JoinHandle<()>> = None;
+    // The graveyard thread + its keep-alive sender. Per-session like the
+    // workers, so an engine restart cannot leave one behind.
+    let mut graveyard_tx: Option<Sender<()>> = None;
+    let mut graveyard: Option<JoinHandle<()>> = None;
     // v1.33.0: the devices of the live session, kept so a stream error can
     // rebuild on the same ones; and a counter that caps automatic recoveries
     // between manual starts so a flapping device can't loop forever.
@@ -514,6 +553,13 @@ fn engine_thread(
             }
             drop(reading_tx.take());
             if let Some(h) = reading_worker.take() {
+                let _ = h.join();
+            }
+            // Last, and only after `current` dropped the streams above: the
+            // callback is gone by now, so the graveyard's final pass sees
+            // everything it was handed.
+            drop(graveyard_tx.take());
+            if let Some(h) = graveyard.take() {
                 let _ = h.join();
             }
             state.running.store(false, Ordering::Release);
@@ -554,6 +600,8 @@ fn engine_thread(
                     reference_writer = Some(started.reference_writer);
                     reading_tx = Some(started.reading_tx);
                     reading_worker = Some(started.reading_worker);
+                    graveyard_tx = Some(started.graveyard_tx);
+                    graveyard = Some(started.graveyard);
                     current = Some(started.streams);
                     // Restore the soundboard master gain onto the fresh (unity)
                     // mixer so a rebuild doesn't reset the user's volume.
@@ -660,9 +708,18 @@ fn engine_thread(
             Command::SetMonitor(enabled) => {
                 state.monitor.store(enabled, Ordering::Release);
             }
-            Command::Dsp(dsp_cmd) => {
+            Command::Dsp(edit) => {
                 if let Some(tx) = &dsp_tx {
-                    let _ = tx.send(dsp_cmd);
+                    // Bounded + non-blocking, for the same reason as the
+                    // soundboard queue below: the audio callback is the only
+                    // consumer, and the engine thread must never block on it.
+                    // A rejected edit is dropped HERE, off the audio thread.
+                    if tx.try_send(edit).is_err() {
+                        tracing::warn!(
+                            "DSP edit queue full — dropped a chain edit; \
+                             the audio callback is not draining"
+                        );
+                    }
                 }
             }
             Command::Reactive(cfg) => {
@@ -866,7 +923,15 @@ fn start_streams(
     let (reading_wet_producer, reading_wet_consumer) = reading_wet_rb.split();
     let (reading_tx, reading_alive) = channel::<()>();
 
-    let (dsp_tx, dsp_rx) = channel::<DspCommand>();
+    // The graveyard ring. Chains the callback swaps out leave this way, to a
+    // thread that can afford to drop them. A lock-free, preallocated SPSC ring
+    // rather than a channel: `try_send` on a bounded channel may have to wake a
+    // parked receiver, and that is a syscall in the callback.
+    let grave_rb = HeapRb::<Displaced>::new(GRAVEYARD_CAPACITY);
+    let (grave_producer, grave_consumer) = grave_rb.split();
+    let (graveyard_tx, graveyard_alive) = channel::<()>();
+
+    let (dsp_tx, dsp_rx) = sync_channel::<DspEdit>(DSP_CHANNEL_CAPACITY);
     let (reactive_tx, reactive_rx) = channel::<ResolvedReactive>();
     let (sb_tx, sb_rx) = sync_channel::<SoundboardCommand>(SB_CHANNEL_CAPACITY);
 
@@ -899,6 +964,7 @@ fn start_streams(
             wet: reading_wet_producer,
         },
         reading.clone(),
+        grave_producer,
         cmd_tx,
     )?;
 
@@ -961,6 +1027,14 @@ fn start_streams(
         .spawn(move || recording_writer(reference_consumer, reference_rx, input_rate))
         .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
 
+    // The graveyard. Per-session like the writers: it exits when
+    // `graveyard_tx` drops at teardown, after the streams are gone, so its
+    // last pass sees everything the callback handed over.
+    let graveyard = std::thread::Builder::new()
+        .name("divora-graveyard".into())
+        .spawn(move || graveyard_thread(grave_consumer, graveyard_alive))
+        .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
+
     // The reading worker. Per-session like the writers above: it exits when
     // `reading_tx` drops at teardown, and the rolling baseline it built goes
     // with it, which is exactly the invalidation an engine restart or a device
@@ -995,11 +1069,71 @@ fn start_streams(
         reference_writer,
         reading_tx,
         reading_worker: reading_worker_handle,
+        graveyard_tx,
+        graveyard,
     })
 }
 
 type RingProducer = <HeapRb<f32> as Split>::Prod;
 type RingConsumer = <HeapRb<f32> as Split>::Cons;
+
+/// The graveyard ring's ends: what the audio callback displaced, on its way
+/// to the thread that frees it.
+type GraveProducer = <HeapRb<Displaced> as Split>::Prod;
+type GraveConsumer = <HeapRb<Displaced> as Split>::Cons;
+
+/// Free what the audio callback displaced.
+///
+/// A preset switch replaces the whole effect chain. Building the new one
+/// already happens on the control thread (see [`DspEdit::prepare`]); this is
+/// the other half — dropping the OLD one, which means freeing every boxed
+/// effect and everything in it: STFT rings, reverb combs, harmonizer state,
+/// an ONNX session. The callback hands it over through the ring and moves on.
+///
+/// Polls rather than blocking on a channel, because a parked receiver has to
+/// be woken and the producer is the audio thread. Sleeping between passes
+/// costs a wake every [`GRAVEYARD_DRAIN_INTERVAL_MS`] while a session is up.
+#[allow(clippy::needless_pass_by_value)] // owns the keep-alive for its lifetime
+fn graveyard_thread(mut bin: GraveConsumer, alive: Receiver<()>) {
+    loop {
+        // Dropping each value IS the work; nothing else to do with it.
+        while bin.try_pop().is_some() {}
+        if matches!(alive.try_recv(), Err(TryRecvError::Disconnected)) {
+            // Teardown drops the streams before this channel, so the callback
+            // has already stopped and the pass above emptied the ring.
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(GRAVEYARD_DRAIN_INTERVAL_MS));
+    }
+}
+
+/// Apply every pending chain edit, at the top of an output buffer.
+///
+/// Its own function so a test can run exactly what the callback runs: each
+/// edit applied, everything it displaces handed to the graveyard rather than
+/// freed here, and the voice reading told the chain moved under it.
+fn drain_dsp_edits(
+    rx: &Receiver<DspEdit>,
+    chain: &mut EffectChain,
+    graveyard: &mut GraveProducer,
+    reading: &ReadingTap,
+) {
+    while let Ok(edit) = rx.try_recv() {
+        if let Some(displaced) = chain.apply(edit) {
+            // Getting this out of the callback is the whole point. `try_push`
+            // hands it back on a full ring — the graveyard thread has not woken
+            // while several chains were replaced — and letting it drop right
+            // here is the honest fallback: one bounded, rare hitch rather than
+            // a leak or a blocked callback.
+            let _ = graveyard.try_push(displaced);
+        }
+        // The reading worker runs on another thread and cannot see the chain,
+        // so it has to be told. Without this the after-effects half kept
+        // showing the previous preset's numbers for over a second while the
+        // card already named the new one.
+        reading.note_chain_changed();
+    }
+}
 
 fn build_input_stream(
     device: &Device,
@@ -1082,7 +1216,7 @@ fn build_output_stream(
     channels: u16,
     mut consumer: RingConsumer,
     state: Arc<EngineState>,
-    dsp_rx: Receiver<DspCommand>,
+    dsp_rx: Receiver<DspEdit>,
     reactive_rx: Receiver<ResolvedReactive>,
     sb_rx: Receiver<SoundboardCommand>,
     input_rate: u32,
@@ -1103,6 +1237,9 @@ fn build_output_stream(
     // worker thread that drains them.
     mut reading_taps: ReadingTaps,
     reading: Arc<ReadingTap>,
+    // Where a displaced chain goes instead of being dropped here. See
+    // [`graveyard_thread`].
+    mut graveyard: GraveProducer,
     // v1.33.0: lets the stream's error callback ask the engine thread to
     // rebuild the session after a device loss (see `Command::StreamError`).
     cmd_tx: Sender<Command>,
@@ -1166,15 +1303,10 @@ fn build_output_stream(
                 while let Ok(cfg) = reactive_rx.try_recv() {
                     modulator.configure(&cfg, &mut chain);
                 }
-                while let Ok(cmd) = dsp_rx.try_recv() {
-                    chain.apply(cmd);
-                    // The reading worker runs on another thread and cannot see
-                    // the chain, so it has to be told. Without this the
-                    // after-effects half kept showing the previous preset's
-                    // numbers for over a second while the card already named
-                    // the new one.
-                    reading.note_chain_changed();
-                }
+                // Structural changes arrive already built (`DspEdit`) and
+                // what they displace leaves through the graveyard, so nothing
+                // in this drain allocates or frees.
+                drain_dsp_edits(&dsp_rx, &mut chain, &mut graveyard, &reading);
                 while let Ok(cmd) = sb_rx.try_recv() {
                     soundboard.apply(cmd);
                 }
@@ -2237,17 +2369,22 @@ fn recording_writer(mut consumer: RingConsumer, rx: Receiver<RecordingCommand>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_recording, drop_paired, is_octave_jump, is_passthrough, live_verdict_expired,
-        main_output_plays, mix_voice_and_soundboard, new_reading_analyzer, reading_snapshot,
-        AudioEngine, LoudnessNormalizer, OctaveGuard, ReadingFacts, ReadingSnapshot, ReadingTap,
-        ReadingTaps, StreamInfo, MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
+        drain_dsp_edits, drain_recording, drop_paired, graveyard_thread, is_octave_jump,
+        is_passthrough, live_verdict_expired, main_output_plays, mix_voice_and_soundboard,
+        new_reading_analyzer, reading_snapshot, AudioEngine, LoudnessNormalizer, OctaveGuard,
+        ReadingFacts, ReadingSnapshot, ReadingTap, ReadingTaps, StreamInfo,
+        MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
     };
+    use crate::dsp::witness::witnessed_chain;
     use crate::dsp::{
-        Descriptor, EffectChain, Metrics, ReactiveModulator, ReadingState, VoiceReading,
+        Descriptor, Displaced, DspEdit, EffectChain, Metrics, ReactiveModulator, ReadingState,
+        VoiceReading,
     };
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
     use ringbuf::traits::{Observer, Producer, Split};
     use ringbuf::HeapRb;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3162,6 +3299,154 @@ mod tests {
         assert_eq!(keys, ["ageMs", "reading", "stale"]);
         // The state serializes as the lowercase word the UI switches on.
         assert_eq!(v["reading"]["state"], "quiet");
+    }
+
+    // ---- the chain swap: built off-thread, freed off-thread ----
+
+    /// The graveyard frees what the callback hands it — and then stops, when
+    /// the session does.
+    #[test]
+    fn the_graveyard_frees_a_displaced_chain_and_then_exits() {
+        let (mut handover, bin) = HeapRb::<Displaced>::new(4).split();
+        let (alive_tx, alive_rx) = channel::<()>();
+        let (chain, freed) = witnessed_chain();
+        assert!(handover.try_push(Displaced::Chain(chain)).is_ok());
+
+        let worker = std::thread::spawn(move || graveyard_thread(bin, alive_rx));
+        let start = Instant::now();
+        while !freed.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            freed.load(Ordering::SeqCst),
+            "the graveyard never freed the chain it was handed"
+        );
+
+        // Teardown: dropping the keep-alive is the only shutdown signal, and
+        // it must be enough — a leaked thread per session is a leak per
+        // device-loss rebuild.
+        drop(alive_tx);
+        worker.join().expect("the graveyard thread should exit");
+    }
+
+    /// A full graveyard must not block the callback. The overflow is freed
+    /// inline instead — a bounded, rare hitch rather than a leak.
+    #[test]
+    fn a_full_graveyard_falls_back_to_freeing_inline() {
+        // Room for exactly one, and nothing draining it.
+        let (mut handover, _bin) = HeapRb::<Displaced>::new(1).split();
+        let (tx, rx) = sync_channel::<DspEdit>(4);
+        let reading = ReadingTap::default();
+
+        let (live, first_freed) = witnessed_chain();
+        let (second, second_freed) = witnessed_chain();
+        let (third, third_freed) = witnessed_chain();
+        let mut chain = live;
+        tx.send(DspEdit::ReplaceChain(second)).expect("queued");
+        tx.send(DspEdit::ReplaceChain(third)).expect("queued");
+
+        // Two replacements, one slot: this returns rather than blocking.
+        drain_dsp_edits(&rx, &mut chain, &mut handover, &reading);
+
+        assert_eq!(handover.occupied_len(), 1, "the one slot should be taken");
+        assert!(
+            !first_freed.load(Ordering::SeqCst),
+            "the chain that reached the graveyard must not be freed by the callback"
+        );
+        assert!(
+            second_freed.load(Ordering::SeqCst),
+            "the overflow chain should have been freed inline, not leaked"
+        );
+        assert!(
+            !third_freed.load(Ordering::SeqCst),
+            "the live chain must be left alone"
+        );
+    }
+
+    /// v1.51.0 wired the voice reading to the command drain: the wet tap
+    /// describes a chain that no longer exists once one is swapped in.
+    #[test]
+    fn a_chain_replacement_still_tells_the_reading() {
+        let (mut handover, _bin) = HeapRb::<Displaced>::new(4).split();
+        let (tx, rx) = sync_channel::<DspEdit>(4);
+        let reading = ReadingTap::default();
+        let mut chain = EffectChain::new();
+        assert!(
+            !reading.take_chain_changed(),
+            "nothing has changed the chain yet"
+        );
+
+        tx.send(DspEdit::ReplaceChain(distortion_chain(20.0)))
+            .expect("queued");
+        drain_dsp_edits(&rx, &mut chain, &mut handover, &reading);
+
+        assert_eq!(chain.len(), 1, "the prebuilt chain should be live");
+        assert!(
+            reading.take_chain_changed(),
+            "the reading was never told the chain moved under it"
+        );
+    }
+
+    /// Routes live BESIDE the chain and address effects by kind + occurrence,
+    /// so a replacement has to keep working — including when the effect they
+    /// name has moved to a different index in the new chain.
+    #[test]
+    fn reactive_routes_resolve_onto_a_swapped_in_chain() {
+        use crate::dsp::{EffectKind, EffectSpec};
+        use std::collections::HashMap;
+
+        // Routed at base drive 0, so anything the modulation writes shows up.
+        let mut chain = distortion_chain(0.0);
+        let mut modulator = ReactiveModulator::new();
+        modulator.configure(&rage_config(true, 0.0), &mut chain);
+
+        // The replacement puts a (disabled, so inert) gate in front: the
+        // distortion the route names is now at index 1.
+        let built = || {
+            let mut params = HashMap::new();
+            params.insert("drive".to_string(), 0.0);
+            EffectChain::from_specs(&[
+                EffectSpec {
+                    kind: EffectKind::Gate,
+                    enabled: false,
+                    params: HashMap::new(),
+                },
+                EffectSpec {
+                    kind: EffectKind::Distortion,
+                    enabled: true,
+                    params,
+                },
+            ])
+        };
+        let displaced = chain.apply(DspEdit::ReplaceChain(built()));
+        assert!(displaced.is_some(), "the old chain must come back");
+        assert_eq!(chain.index_of_kind(EffectKind::Distortion, 0), Some(1));
+
+        // Drive it loud enough to modulate, writing into the NEW chain.
+        let mut tone = Tone::new();
+        for _ in 0..60 {
+            let buf = tone.block(0.3, 480);
+            modulator.apply(&buf, &mut chain, 48_000);
+        }
+        assert!(
+            modulator.depth() > 0.1,
+            "test signal must actually modulate, got {}",
+            modulator.depth()
+        );
+
+        // Same input through the modulated chain and an untouched copy of it.
+        let mut modulated = tone.block(0.3, 480);
+        let mut untouched = modulated.clone();
+        chain.process(&mut modulated, 48_000);
+        built().process(&mut untouched, 48_000);
+        let delta = modulated
+            .iter()
+            .zip(&untouched)
+            .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            delta > 1e-3,
+            "the route never reached the swapped-in chain's distortion (delta {delta})"
+        );
     }
 
     /// Routes address targets by kind + occurrence, so reordering the chain

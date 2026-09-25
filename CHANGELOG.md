@@ -4,6 +4,22 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- **A preset switch no longer builds and frees the effect chain on the audio thread.** Switching voices rebuilt the whole chain *inside* the output callback: every effect boxed and its buffers allocated, and the previous chain freed on the spot — 129 allocations and 129 deallocations for a five-effect chain, around 100 µs of a callback that has a few milliseconds to work with, and a worst case nobody can bound, because an allocator is free to take a lock or ask the OS for pages. The chain is now built on the thread that asked for it and swapped in with a single move, and the chain it displaces leaves the callback for a thread whose only job is to drop it. `Clear` takes the same route.
+- **A voice-model change no longer spawns a thread from the audio callback**, and no longer frees an ONNX session there either. The load always happened off-thread; *starting* it did not. Both now happen on the control thread, and the displaced model — session, in-flight load and all — goes to the same graveyard.
+- **Re-selecting the voice that is already loaded no longer unloads it.** The model was dropped before the "same file, nothing to do" check, so a second click on the active voice left the effect in passthrough until a different voice was picked.
+
+### Tests
+
+- A counting global allocator around a simulated callback: a chain replacement and a `Clear`, drained and applied exactly as the output callback does it, must allocate and free **nothing**. It fails on the old code (205 deallocations). It also measures what the old path did in the same run, so a broken allocator hook cannot let it pass by measuring nothing.
+- Plus: the displaced chain is handed back rather than dropped; the graveyard thread frees it and exits when the session does; a full graveyard falls back to freeing inline instead of blocking; reactive routes re-resolve onto a swapped-in chain; and the voice reading is still told when the chain moves under it.
+
+### Architecture notes
+
+- The audio callback's contract is the same as it always was — no allocation, no deallocation, no locks, no syscalls — and two paths were breaking it. Both are now split the same way: the control thread prepares (`DspEdit::prepare`), the callback moves, and a bounded ring carries what it displaced to a `divora-graveyard` thread. The ring is lock-free and preallocated rather than a channel, because a channel's `try_send` may have to wake a parked receiver, and that is a syscall in the callback.
+- The queue from the engine thread to the callback is now bounded as well: an unbounded `mpsc` allocates its blocks on the sending side and frees them on the *receiving* one, which here is the audio thread.
+
 ## [1.51.0] — 2026-09-24 — Voice reading
 
 ### Added

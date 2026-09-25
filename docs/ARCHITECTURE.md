@@ -273,8 +273,8 @@ src/
 ### DSP architecture
 
 - `EffectChain` is owned by the audio output callback. No locks; no contention with the UI thread.
-- The UI sends `DspCommand`s through a SPSC `mpsc` channel that's recreated on every engine start. The callback drains the channel at the top of each buffer.
-- `EffectChain::apply(cmd)` is the single mutation point. `SetChain` allocates (rebuilds the `Vec<Box<dyn AudioEffect>>`); `SetParam` / `SetEnabled` mutate in place.
+- The UI sends `DspCommand`s, which `AudioEngine::send_dsp` lowers into `DspEdit`s **on the calling thread** — that is where a chain is built and a voice-model load is started. They travel a bounded SPSC channel, recreated on every engine start, that the callback drains at the top of each buffer.
+- `EffectChain::apply(edit)` is the single mutation point, and it allocates and frees nothing: a `ReplaceChain` swaps in an already-built chain and **returns** the one it displaced (as does `Clear`), for the per-session graveyard thread to drop. `SetParam` / `SetEnabled` mutate in place.
 - Engine restarts (Stop → Start) clear the chain; the frontend re-sends `SetChain` via a `createEffect` on `(presetId, engineRunning)`.
 
 ### Frontend chain sync
@@ -316,7 +316,7 @@ User picks a different preset (Phase 4 will surface this)
 ### Phase 3 quality caveats
 
 - Pitch / Formant are placeholders that respond to sliders but don't preserve formants / harmonic structure. Real algorithms (phase vocoder, LPC) land in a later phase.
-- `SetChain` allocates on the audio callback. Acceptable for Phase 3; can be moved off-thread in Phase 8 polish.
+- ~~`SetChain` allocates on the audio callback.~~ Fixed: the chain is built on the control thread and the displaced one is freed on a graveyard thread — see the DSP architecture bullets above, and `divora-core/tests/rt_chain_swap_allocations.rs`, which counts allocations in the callback and requires zero.
 - No global hotkey yet; PTM still goes through the in-app `Space` listener. Global hotkey registration via `tauri-plugin-global-shortcut` lands with the Settings hotkey UI.
 
 ## Phase 4 — presets + A/B compare
@@ -1018,9 +1018,12 @@ The `VoiceConvert` effect (`divora-core/src/dsp/voice_convert.rs`) runs an
 ONNX voice-conversion model over the mic stream via the `ort` crate
 (ONNX Runtime). The reference model is **LLVC** (KoeAI, MIT). It is an
 ordinary chain effect (`EffectKind::VoiceConvert`) with one extra seam:
-`AudioEffect::set_resource` carries the active `.onnx` model **path**
+`AudioEffect::install` carries the active model as a `Prepared::VoiceModel`
 (numbers go through `set_param`; this carries the things that aren't
-numbers). `DspCommand::SetResource` is the matching wire command.
+numbers). `DspCommand::SetResource` is the matching wire command; the
+`VoiceModel` is built — and its ONNX load started — on the control thread,
+and the model it displaces is handed back for the graveyard thread to drop,
+so no session is ever loaded or freed on the audio thread.
 
 **Graceful degradation is the invariant.** When the ONNX runtime DLL or
 the model file is missing, or a model's tensor shapes don't match either
