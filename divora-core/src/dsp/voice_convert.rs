@@ -42,11 +42,12 @@
 //!
 //! The Tauri layer is the source of truth for the voice library
 //! directory (`%APPDATA%/DivoraVoice/voices/` on Windows). This
-//! effect doesn't know about that path — the model file path is
-//! handed in via `set_model_path`, called from the audio engine when
-//! the UI changes the active voice. Loading happens lazily on the
-//! first `process` call after the path changes, so the audio thread
-//! never blocks the user-facing UI.
+//! effect doesn't know about that path — it is handed in as a
+//! [`VoiceModel`], built by the control thread that heard the UI change
+//! the active voice. That thread derives the name and starts the ONNX
+//! load; the audio thread's whole part is moving the new model in and
+//! handing the old one back to be freed elsewhere. The session itself
+//! lands on a later `process`, through `poll_loader`.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -65,7 +66,11 @@ use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-use super::{AudioEffect, EffectKind};
+use super::{AudioEffect, Displaced, EffectKind, Prepared};
+
+/// The `DspCommand::SetResource` key that carries a voice-model path.
+/// `DspEdit::prepare` matches on it to know a `VoiceModel` is what to build.
+pub const MODEL_RESOURCE_KEY: &str = "model";
 
 /// Sample rate the model was trained at. Off-rate input bypasses.
 pub const MODEL_RATE: u32 = 16_000;
@@ -108,6 +113,24 @@ struct StreamCaches {
 }
 
 impl StreamCaches {
+    /// Zero every tensor **without reallocating**.
+    ///
+    /// `zeros()` builds five `Vec`s, and `clear_pipeline` — which resets the
+    /// caches — is reachable from `process`: a bypassed callback with buffered
+    /// state clears the pipeline, so building fresh ones there would allocate
+    /// (and free the old ones) in the audio callback.
+    fn zero_in_place(&mut self) {
+        for cache in [
+            &mut self.enc_buf,
+            &mut self.dec_buf,
+            &mut self.out_buf,
+            &mut self.cpc,
+            &mut self.front,
+        ] {
+            cache.fill(0.0);
+        }
+    }
+
     fn zeros() -> Self {
         Self {
             enc_buf: vec![0.0; ENC_BUF_SHAPE.iter().product()],
@@ -119,25 +142,106 @@ impl StreamCaches {
     }
 }
 
+/// A voice-conversion model: which file, the load still in flight, and the
+/// session once it has arrived.
+///
+/// One struct so that changing voice is a single `mem::replace` — the audio
+/// thread swaps the new model in and hands this whole thing back for another
+/// thread to drop. Freeing it means dropping an ONNX session, which is far
+/// too much work for a callback (see [`Displaced`]).
+///
+/// Built by [`VoiceModel::start`] on a control thread, which is also where
+/// the loader thread is spawned.
+pub struct VoiceModel {
+    /// Voice name shown in the UI, derived from the file stem. `None` means
+    /// passthrough.
+    voice: Option<String>,
+    /// Path of the model, used to detect redundant reloads of the same file.
+    path: Option<PathBuf>,
+    /// Receiver for the background load. `Session::builder` can be slow
+    /// (graph optimization) or, with a missing runtime DLL, can even block,
+    /// so it never runs on the audio thread; `process` polls this with
+    /// `try_recv` until the session arrives.
+    ///
+    /// Kept even once the load has landed: dropping the receiver frees the
+    /// channel, and `poll_loader` runs on the audio thread. It goes when the
+    /// whole model is retired, on the graveyard thread.
+    loader: Option<mpsc::Receiver<Option<Box<Session>>>>,
+    /// Whether `loader` may still produce a session — cleared on the value or
+    /// the hang-up, so a settled load costs nothing per callback.
+    loading: bool,
+    /// ONNX session — `None` when no model is loaded or the load failed.
+    /// Boxed so retiring one is a pointer move, not a copy of the session.
+    session: Option<Box<Session>>,
+    /// v1.3.0: true when the loaded model exposes the streaming
+    /// cache-tensor contract (detected at load by an `enc_buf` input).
+    streaming: bool,
+}
+
+impl VoiceModel {
+    /// The empty model: passthrough, nothing loading.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            voice: None,
+            path: None,
+            loader: None,
+            loading: false,
+            session: None,
+            streaming: false,
+        }
+    }
+
+    /// Name this model after `path` and **start loading it**, on a thread of
+    /// its own.
+    ///
+    /// Call from a control thread; the point of the type is that the audio
+    /// thread gets handed the result of this instead of doing it. An empty or
+    /// absent path is the passthrough model, and spawns nothing.
+    #[must_use]
+    pub fn start(path: Option<String>) -> Self {
+        let path = path.filter(|s| !s.is_empty()).map(PathBuf::from);
+        let voice = path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned());
+        let loader = path.as_ref().map(|p| {
+            let (tx, rx) = mpsc::channel();
+            let p = p.clone();
+            // Detached: if the user switches again before it finishes, the
+            // receiver is retired with the old model and the send becomes a
+            // no-op (rx hung up).
+            std::thread::spawn(move || {
+                let _ = tx.send(load_session(&p).map(Box::new));
+            });
+            rx
+        });
+        let loading = loader.is_some();
+        Self {
+            voice,
+            path,
+            loader,
+            loading,
+            session: None,
+            streaming: false,
+        }
+    }
+}
+
+impl Default for VoiceModel {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
 /// In-place voice converter. Holds optional ONNX session, optional
 /// resamplers, and the streaming buffers that bridge native-rate audio
 /// callbacks to fixed-rate model chunks.
 pub struct VoiceConverter {
     enabled: bool,
     mix: f32,
-    /// Currently active voice name (matched against files in the voices
-    /// directory). `None` means passthrough.
-    voice: Option<String>,
-    /// Absolute path of the active model, used to detect redundant
-    /// reloads of the same file.
-    loaded_path: Option<PathBuf>,
-    /// Receiver for an in-flight background load. A voice change spawns
-    /// a loader thread (so the audio thread never blocks on
-    /// `Session::builder`) and stashes the rx here; `process` polls it
-    /// with `try_recv` each callback until the session arrives.
-    loader: Option<mpsc::Receiver<Option<Session>>>,
-    /// ONNX session — `None` when no model is loaded or load failed.
-    session: Option<Session>,
+    /// The model in use, swapped whole by [`VoiceConverter::install`].
+    model: VoiceModel,
     /// 48 kHz → 16 kHz pre-inference resampler.
     down: Option<MonoSinc>,
     /// 16 kHz → 48 kHz post-inference resampler.
@@ -156,9 +260,6 @@ pub struct VoiceConverter {
     /// Last sample rate observed; used to detect device changes that
     /// require a resampler rebuild.
     last_rate: u32,
-    /// v1.3.0: true when the loaded model exposes the streaming
-    /// cache-tensor contract (detected at load by an `enc_buf` input).
-    streaming: bool,
     /// v1.3.0: streaming cache state, threaded between chunks. Reset to
     /// zero on (re)load and whenever the pipeline clears.
     caches: StreamCaches,
@@ -170,10 +271,7 @@ impl VoiceConverter {
         Self {
             enabled: false,
             mix: 1.0,
-            voice: None,
-            loaded_path: None,
-            loader: None,
-            session: None,
+            model: VoiceModel::none(),
             down: None,
             up: None,
             native_in: VecDeque::with_capacity(NATIVE_RATE as usize),
@@ -182,64 +280,33 @@ impl VoiceConverter {
             native_out: VecDeque::with_capacity(NATIVE_RATE as usize),
             dry_delay: VecDeque::with_capacity(NATIVE_RATE as usize),
             last_rate: 0,
-            streaming: false,
             caches: StreamCaches::zeros(),
-        }
-    }
-
-    /// Switch to a different voice model. The ONNX session is built on
-    /// a background thread — `load_session` can be slow (graph
-    /// optimization) or, with a missing runtime DLL, can even block, so
-    /// it must never run on the audio thread. The result lands via
-    /// `try_recv` in `process`. Pass `None` to clear (passthrough).
-    pub fn set_model_path(&mut self, voice: Option<String>, path: Option<PathBuf>) {
-        self.voice = voice;
-        // Drop the current session immediately so we don't keep
-        // converting with the old voice while the new one loads.
-        self.session = None;
-        self.clear_pipeline();
-
-        match path {
-            Some(p) if Some(&p) != self.loaded_path.as_ref() => {
-                self.loaded_path = Some(p.clone());
-                let (tx, rx) = mpsc::channel();
-                // Detached loader thread; if the user switches again
-                // before it finishes, we just drop this rx and the
-                // send becomes a no-op (rx hung up).
-                std::thread::spawn(move || {
-                    let _ = tx.send(load_session(&p));
-                });
-                self.loader = Some(rx);
-            }
-            Some(_) => {
-                // Same path already loaded/loading — nothing to do.
-            }
-            None => {
-                self.loaded_path = None;
-                self.loader = None;
-            }
         }
     }
 
     /// Poll the background loader (if any). Cheap `try_recv`; called at
     /// the top of every `process`.
     fn poll_loader(&mut self) {
-        if let Some(rx) = self.loader.as_ref() {
-            match rx.try_recv() {
-                Ok(session) => {
-                    self.streaming = session.as_ref().is_some_and(session_is_streaming);
-                    self.session = session;
-                    self.loader = None;
-                    // Fresh model → fresh streaming state.
-                    self.caches = StreamCaches::zeros();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Still loading; stay in passthrough this callback.
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Loader thread vanished without a value — give up.
-                    self.loader = None;
-                }
+        let Some(rx) = self.model.loader.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(session) => {
+                self.model.streaming = session.as_deref().is_some_and(session_is_streaming);
+                self.model.session = session;
+                self.model.loading = false;
+                // Fresh model → fresh streaming state. In place: this runs on
+                // the audio thread.
+                self.caches.zero_in_place();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Still loading; stay in passthrough this callback.
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Loader thread vanished without a value — give up. The
+                // receiver stays until the model is retired; dropping it here
+                // would free the channel on the audio thread.
+                self.model.loading = false;
             }
         }
     }
@@ -247,13 +314,13 @@ impl VoiceConverter {
     /// Name of the active voice, or `None` if passthrough.
     #[must_use]
     pub fn voice(&self) -> Option<&str> {
-        self.voice.as_deref()
+        self.model.voice.as_deref()
     }
 
     /// Whether an ONNX session is currently loaded and ready.
     #[must_use]
     pub fn is_model_loaded(&self) -> bool {
-        self.session.is_some()
+        self.model.session.is_some()
     }
 
     fn clear_pipeline(&mut self) {
@@ -263,7 +330,9 @@ impl VoiceConverter {
         self.native_out.clear();
         self.dry_delay.clear();
         // Reset streaming cache + lookahead so re-engagement starts clean.
-        self.caches = StreamCaches::zeros();
+        // In place: `process` reaches this when it bypasses with buffered
+        // state, and fresh `Vec`s there would allocate in the callback.
+        self.caches.zero_in_place();
         if let Some(d) = self.down.as_mut() {
             d.reset();
         }
@@ -293,7 +362,7 @@ impl VoiceConverter {
     /// streaming (small, stateful chunks) or non-streaming (one big
     /// stateless chunk).
     fn drain_chunks(&mut self) {
-        let chunk_len = if self.streaming {
+        let chunk_len = if self.model.streaming {
             STREAM_CHUNK_16K
         } else {
             CHUNK_16K
@@ -303,11 +372,11 @@ impl VoiceConverter {
             for slot in &mut chunk {
                 *slot = self.chunk_in.pop_front().unwrap_or(0.0);
             }
-            let converted = if self.streaming {
+            let converted = if self.model.streaming {
                 // Disjoint borrows of `session` + `caches`.
-                run_inference_streaming(self.session.as_mut(), &mut self.caches, &chunk)
+                run_inference_streaming(self.model.session.as_deref_mut(), &mut self.caches, &chunk)
             } else {
-                run_inference(self.session.as_mut(), &chunk)
+                run_inference(self.model.session.as_deref_mut(), &chunk)
             };
             for s in converted {
                 self.chunk_out.push_back(s);
@@ -325,13 +394,13 @@ impl Default for VoiceConverter {
 impl AudioEffect for VoiceConverter {
     fn process(&mut self, buffer: &mut [f32], sample_rate: u32) {
         // Pick up a background-loaded session if one just finished.
-        if self.loader.is_some() {
+        if self.model.loading {
             self.poll_loader();
         }
 
         // Bypass conditions: disabled, no model, off-rate input.
         let bypass = !self.enabled
-            || self.session.is_none()
+            || self.model.session.is_none()
             || sample_rate != NATIVE_RATE
             || self.mix < 1e-4;
         if bypass {
@@ -443,19 +512,25 @@ impl AudioEffect for VoiceConverter {
         EffectKind::VoiceConvert
     }
 
-    /// `key == "model"` sets the active ONNX model path. The voice name
-    /// shown in the UI is derived from the file stem. `None` clears
-    /// back to passthrough.
-    fn set_resource(&mut self, key: &str, value: Option<&str>) {
-        if key != "model" {
-            return;
+    /// Take the voice model prepared for us and hand back the one it
+    /// replaces. Both are single moves; the freeing happens elsewhere.
+    fn install(&mut self, resource: Prepared) -> Option<Displaced> {
+        let Prepared::VoiceModel(incoming) = resource;
+        // The same file arrives again routinely: the UI re-points the active
+        // voice after every preset switch, because a `SetChain` builds a
+        // VoiceConvert with no model. On a chain that was NOT rebuilt, taking
+        // that at face value would tear a working session down and reload it
+        // — a second of passthrough for no reason — so keep what we have and
+        // retire the redundant load instead.
+        if incoming.path.is_some() && incoming.path == self.model.path {
+            return Some(Displaced::VoiceModel(incoming));
         }
-        let path = value.filter(|s| !s.is_empty()).map(PathBuf::from);
-        let voice = path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().into_owned());
-        self.set_model_path(voice, path);
+        // One move each way. The old session, the load still in flight and
+        // the strings naming it all leave together.
+        let displaced = std::mem::replace(&mut self.model, incoming);
+        // A new voice must not inherit the previous one's buffered audio.
+        self.clear_pipeline();
+        Some(Displaced::VoiceModel(displaced))
     }
 
     fn latency_samples(&self, sample_rate: u32) -> usize {
@@ -463,8 +538,8 @@ impl AudioEffect for VoiceConverter {
         // models use the small 208-sample chunk (≈ 13 ms); non-streaming
         // models the full 4096 (≈ 256 ms). Only incurred when a model is
         // actually loaded — passthrough adds nothing.
-        if self.session.is_some() {
-            let chunk = if self.streaming {
+        if self.model.session.is_some() {
+            let chunk = if self.model.streaming {
                 STREAM_CHUNK_16K
             } else {
                 CHUNK_16K
@@ -781,10 +856,20 @@ fn run_inference_streaming(
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // bypass paths are bit-exact passthroughs
 mod tests {
-    use super::{AudioEffect, EffectKind, VoiceConverter, NATIVE_RATE};
+    use super::{
+        AudioEffect, Displaced, EffectKind, Prepared, VoiceConverter, VoiceModel, NATIVE_RATE,
+    };
 
     fn run(vc: &mut VoiceConverter, buf: &mut [f32]) {
         vc.process(buf, NATIVE_RATE);
+    }
+
+    /// Point the effect at a model the way the engine does: prepared on this
+    /// (control) thread, then installed. Returns what the change displaced.
+    fn install(vc: &mut VoiceConverter, path: Option<&str>) -> Option<Displaced> {
+        vc.install(Prepared::VoiceModel(VoiceModel::start(
+            path.map(str::to_owned),
+        )))
     }
 
     #[test]
@@ -824,10 +909,10 @@ mod tests {
     }
 
     #[test]
-    fn set_model_path_to_none_keeps_passthrough() {
+    fn installing_no_model_keeps_passthrough() {
         let mut vc = VoiceConverter::new();
         vc.set_enabled(true);
-        vc.set_model_path(None, None);
+        let _ = install(&mut vc, None);
         let mut buf = [0.5_f32; 64];
         let before = buf;
         run(&mut vc, &mut buf);
@@ -839,10 +924,7 @@ mod tests {
     fn missing_file_does_not_panic() {
         let mut vc = VoiceConverter::new();
         vc.set_enabled(true);
-        vc.set_model_path(
-            Some("does-not-exist".into()),
-            Some(std::path::PathBuf::from("/tmp/does-not-exist.onnx")),
-        );
+        let _ = install(&mut vc, Some("/tmp/does-not-exist.onnx"));
         let mut buf = [0.5_f32; 64];
         // No panic; the effect just stays in passthrough.
         run(&mut vc, &mut buf);
@@ -885,43 +967,65 @@ mod tests {
     }
 
     #[test]
-    fn set_resource_model_derives_voice_name_from_file_stem() {
+    fn installing_a_model_derives_the_voice_name_from_the_file_stem() {
         let mut vc = VoiceConverter::new();
-        vc.set_resource("model", Some("/voices/deep-narrator.onnx"));
+        let _ = install(&mut vc, Some("/voices/deep-narrator.onnx"));
         assert_eq!(vc.voice(), Some("deep-narrator"));
     }
 
     #[test]
-    fn set_resource_model_none_clears_voice() {
+    fn installing_no_model_clears_the_voice() {
         let mut vc = VoiceConverter::new();
-        vc.set_resource("model", Some("/voices/whisper.onnx"));
+        let _ = install(&mut vc, Some("/voices/whisper.onnx"));
         assert_eq!(vc.voice(), Some("whisper"));
-        vc.set_resource("model", None);
+        let _ = install(&mut vc, None);
         assert!(vc.voice().is_none());
     }
 
     #[test]
-    fn set_resource_empty_string_clears_voice() {
+    fn an_empty_path_clears_the_voice() {
         let mut vc = VoiceConverter::new();
-        vc.set_resource("model", Some("/voices/whisper.onnx"));
-        vc.set_resource("model", Some(""));
+        let _ = install(&mut vc, Some("/voices/whisper.onnx"));
+        let _ = install(&mut vc, Some(""));
         assert!(vc.voice().is_none());
     }
 
+    /// The model the change displaced comes back out, so the graveyard thread
+    /// frees the ONNX session rather than the audio callback.
     #[test]
-    fn set_resource_unknown_key_is_a_no_op() {
+    fn install_hands_the_previous_model_back() {
         let mut vc = VoiceConverter::new();
-        vc.set_resource("model", Some("/voices/sage.onnx"));
-        vc.set_resource("nonsense", Some("/voices/other.onnx"));
-        // The bogus key must not change the active voice.
+        let _ = install(&mut vc, Some("/voices/whisper.onnx"));
+        let displaced = install(&mut vc, Some("/voices/sage.onnx"));
+        let Some(Displaced::VoiceModel(old)) = displaced else {
+            panic!("the previous model must be handed back, not dropped");
+        };
+        assert_eq!(old.voice.as_deref(), Some("whisper"));
+        assert_eq!(vc.voice(), Some("sage"));
+    }
+
+    /// The UI re-points the active voice after every preset switch, so the
+    /// same path arrives again on a chain that was not rebuilt. That must not
+    /// reload: it is the live session that would go away.
+    #[test]
+    fn installing_the_same_path_keeps_the_model_it_has() {
+        let mut vc = VoiceConverter::new();
+        let _ = install(&mut vc, Some("/voices/sage.onnx"));
+        let displaced = install(&mut vc, Some("/voices/sage.onnx"));
+        let Some(Displaced::VoiceModel(redundant)) = displaced else {
+            panic!("the redundant load must be handed back");
+        };
+        // What came back is the INCOMING model (the one we didn't install),
+        // and the effect kept the one it already had.
+        assert_eq!(redundant.voice.as_deref(), Some("sage"));
         assert_eq!(vc.voice(), Some("sage"));
     }
 
     #[test]
-    fn set_resource_missing_file_stays_passthrough_and_never_hangs() {
+    fn a_missing_file_stays_passthrough_and_never_hangs() {
         let mut vc = VoiceConverter::new();
         vc.set_enabled(true);
-        vc.set_resource("model", Some("/tmp/does-not-exist.onnx"));
+        let _ = install(&mut vc, Some("/tmp/does-not-exist.onnx"));
         // Spin a few callbacks so the background loader thread (which
         // returns None for a missing file) has time to land. The poll
         // must never block; the effect stays in passthrough.

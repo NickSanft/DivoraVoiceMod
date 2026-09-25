@@ -5,9 +5,20 @@
 //! ### Audio-thread ownership model
 //!
 //! `EffectChain` is owned exclusively by the audio output callback. The
-//! UI sends `DspCommand`s through a SPSC channel; the callback drains
-//! the channel at the top of each buffer, applies any structural or
+//! UI sends [`DspCommand`]s, which `AudioEngine::send_dsp` lowers into
+//! [`DspEdit`]s on the calling thread; the callback drains those from a
+//! bounded channel at the top of each buffer, applies any structural or
 //! parameter changes, and then runs `process` on the mono buffer.
+//!
+//! The two enums exist because the callback must not allocate, free,
+//! lock or spawn. Building a chain does the first — every effect is
+//! boxed and the constructors allocate their STFT rings, comb buffers
+//! and harmonizer state — and *replacing* one also frees the chain it
+//! displaces. So a `SetChain` is built into a whole [`EffectChain`] on
+//! the control thread and arrives as [`DspEdit::ReplaceChain`], and
+//! [`EffectChain::apply`] hands what it displaced back to the caller as
+//! [`Displaced`] instead of dropping it: the engine passes that to a
+//! graveyard thread, which does the freeing.
 //!
 //! Effects implementations *are allowed* to allocate at construction
 //! and on sample-rate change, but never during normal `process` calls.
@@ -71,7 +82,7 @@ pub use reverb::Reverb;
 pub use robot::Robot;
 pub use tremolo::Tremolo;
 pub use vintage_noise::VintageNoise;
-pub use voice_convert::{onnx_runtime_available, VoiceConverter};
+pub use voice_convert::{onnx_runtime_available, VoiceConverter, VoiceModel, MODEL_RESOURCE_KEY};
 pub use warble::Warble;
 
 use std::collections::HashMap;
@@ -162,12 +173,19 @@ pub trait AudioEffect: Send {
 
     fn kind(&self) -> EffectKind;
 
-    /// Set a string-valued resource on the effect — e.g. the file path
-    /// of the ONNX model the `VoiceConvert` effect should load. `f32`
-    /// params go through `set_param`; this carries the things that
-    /// aren't numbers. `None` clears the resource. Default no-op, so
-    /// only effects that actually have a string resource override it.
-    fn set_resource(&mut self, _key: &str, _value: Option<&str>) {}
+    /// Install a resource prepared OFF the audio thread — e.g. the ONNX
+    /// model the `VoiceConvert` effect should use, whose session is
+    /// already loading on a control thread. `f32` params go through
+    /// `set_param`; this carries the things that aren't numbers.
+    ///
+    /// Returns whatever the change displaced — an old ONNX session, the
+    /// strings naming it — so the audio thread can hand that to the
+    /// graveyard rather than free it. The default implementation has no
+    /// resource to install, so it hands the whole thing straight back;
+    /// only effects that actually have one override this.
+    fn install(&mut self, resource: Prepared) -> Option<Displaced> {
+        Some(resource.displaced())
+    }
 
     /// Phase 14: the algorithmic latency this effect ADDS to the signal
     /// path, in samples at `sample_rate`, when it's actively processing.
@@ -217,6 +235,113 @@ pub enum DspCommand {
     Clear,
 }
 
+/// A resource prepared off the audio thread, ready for an effect to install
+/// with a handful of moves.
+///
+/// Everything slow or allocating about the change — deriving the voice name,
+/// owning the path, starting the ONNX session load on its own thread — has
+/// already happened on the control thread that built this.
+pub enum Prepared {
+    /// The voice-conversion model `VoiceConvert` should use. A [`VoiceModel`]
+    /// naming no path clears the effect back to passthrough.
+    VoiceModel(VoiceModel),
+}
+
+impl Prepared {
+    /// Turn a resource that was never installed into something for the
+    /// graveyard — the effect it named is gone (a stale index from a chain
+    /// that has since moved on), and the audio thread must not free it.
+    #[must_use]
+    pub fn displaced(self) -> Displaced {
+        match self {
+            Self::VoiceModel(model) => Displaced::VoiceModel(model),
+        }
+    }
+}
+
+/// Something the audio callback swapped OUT of the live chain and must not
+/// free itself.
+///
+/// Dropping a chain frees every boxed effect and everything inside it — STFT
+/// rings, reverb combs, harmonizer state, an ONNX session — which is a
+/// deallocation storm no callback can afford. So the callback hands these to
+/// the engine's graveyard: a bounded ring that a dedicated thread drains and
+/// drops.
+pub enum Displaced {
+    /// A whole chain: the one a `ReplaceChain` pushed out, or the effects a
+    /// `Clear` emptied.
+    Chain(EffectChain),
+    /// A voice-conversion model — its ONNX session, any load still in flight,
+    /// and the strings naming it.
+    VoiceModel(VoiceModel),
+}
+
+/// A chain edit in the form the audio callback can apply.
+///
+/// [`DspCommand`] is what the UI sends; a `DspEdit` is the same intent with
+/// the allocating, blocking, thread-spawning parts already done. They are two
+/// types rather than one enum with an extra variant so the compiler enforces
+/// the distinction: the callback's channel carries `DspEdit`, so a chain that
+/// has not been built yet cannot reach it.
+pub enum DspEdit {
+    /// Replace the live chain with one built off the audio thread.
+    ///
+    /// By value, not boxed, on purpose: installing a `Box<EffectChain>` means
+    /// moving out of the box and then FREEING the box, in the callback, which
+    /// is the class of thing this type exists to avoid. A chain is one `Vec`.
+    ReplaceChain(EffectChain),
+    SetParam {
+        index: usize,
+        key: String,
+        value: f32,
+    },
+    SetEnabled {
+        index: usize,
+        enabled: bool,
+    },
+    /// Install a prepared resource on the effect at `index`.
+    SetResource {
+        index: usize,
+        resource: Prepared,
+    },
+    /// Empty the chain. Like `ReplaceChain`, the effects leave through
+    /// [`EffectChain::apply`]'s return value — `Vec::clear` would drop them
+    /// on the spot.
+    Clear,
+}
+
+impl DspEdit {
+    /// Lower a UI command into a realtime-safe edit.
+    ///
+    /// **Call this on a control thread.** It is where a chain gets built and
+    /// a model load gets started, precisely so the audio callback does
+    /// neither; `AudioEngine::send_dsp` is the one caller that matters.
+    ///
+    /// `None` when the command asks for something nothing here can prepare
+    /// (a resource key no effect claims), which is how a newer or older
+    /// frontend fails safe instead of wedging the engine.
+    #[must_use]
+    pub fn prepare(cmd: DspCommand) -> Option<Self> {
+        Some(match cmd {
+            // The build — every effect boxed, every constructor allocating —
+            // happens HERE, on the caller's thread.
+            DspCommand::SetChain { specs } => Self::ReplaceChain(EffectChain::from_specs(&specs)),
+            DspCommand::SetParam { index, key, value } => Self::SetParam { index, key, value },
+            DspCommand::SetEnabled { index, enabled } => Self::SetEnabled { index, enabled },
+            // Same thing for a voice model: `VoiceModel::start` spawns the
+            // loader thread, so the callback only moves the result in.
+            DspCommand::SetResource { index, key, value } if key == MODEL_RESOURCE_KEY => {
+                Self::SetResource {
+                    index,
+                    resource: Prepared::VoiceModel(VoiceModel::start(value)),
+                }
+            }
+            DspCommand::SetResource { .. } => return None,
+            DspCommand::Clear => Self::Clear,
+        })
+    }
+}
+
 /// Ordered list of effects, audio-thread-owned.
 pub struct EffectChain {
     effects: Vec<Box<dyn AudioEffect>>,
@@ -230,8 +355,11 @@ impl EffectChain {
         }
     }
 
-    /// Build a chain from a list of specs. Allocates; called only
-    /// when the UI sends `SetChain` (not per buffer).
+    /// Build a chain from a list of specs.
+    ///
+    /// Allocates, once per effect plus whatever each constructor reserves, so
+    /// this runs on a control thread — see [`DspEdit::prepare`]. Never in the
+    /// audio callback.
     #[must_use]
     pub fn from_specs(specs: &[EffectSpec]) -> Self {
         let mut chain = Self::new();
@@ -241,31 +369,39 @@ impl EffectChain {
         chain
     }
 
-    /// Apply a single command. Called from the audio callback when
-    /// draining the SPSC channel.
-    pub fn apply(&mut self, cmd: DspCommand) {
-        match cmd {
-            DspCommand::SetChain { specs } => {
-                *self = Self::from_specs(&specs);
-            }
-            DspCommand::SetParam { index, key, value } => {
+    /// Apply a single edit, handing back anything it displaced.
+    ///
+    /// Called from the audio callback when draining the edit channel, so
+    /// nothing in here allocates, frees, locks or blocks. The return value is
+    /// the whole point: this cannot see the engine's channels, so a displaced
+    /// chain leaves through the caller, which routes it to the graveyard
+    /// thread (see [`Displaced`]).
+    #[must_use = "a displaced chain must be freed off the audio thread"]
+    pub fn apply(&mut self, edit: DspEdit) -> Option<Displaced> {
+        match edit {
+            DspEdit::ReplaceChain(chain) => Some(Displaced::Chain(std::mem::replace(self, chain))),
+            DspEdit::SetParam { index, key, value } => {
                 if let Some(effect) = self.effects.get_mut(index) {
                     effect.set_param(&key, value);
                 }
+                None
             }
-            DspCommand::SetEnabled { index, enabled } => {
+            DspEdit::SetEnabled { index, enabled } => {
                 if let Some(effect) = self.effects.get_mut(index) {
                     effect.set_enabled(enabled);
                 }
+                None
             }
-            DspCommand::SetResource { index, key, value } => {
-                if let Some(effect) = self.effects.get_mut(index) {
-                    effect.set_resource(&key, value.as_deref());
-                }
-            }
-            DspCommand::Clear => {
-                self.effects.clear();
-            }
+            DspEdit::SetResource { index, resource } => match self.effects.get_mut(index) {
+                Some(effect) => effect.install(resource),
+                // Nothing at that index any more: hand the prepared resource
+                // back rather than dropping it here.
+                None => Some(resource.displaced()),
+            },
+            // An empty chain allocates nothing, so a swap is the realtime-safe
+            // way to clear: `Vec::clear` would drop every boxed effect — and
+            // an ONNX session with them — inside the callback.
+            DspEdit::Clear => Some(Displaced::Chain(std::mem::take(self))),
         }
     }
 
@@ -334,6 +470,9 @@ impl EffectChain {
         }
     }
 
+    /// Drop every effect, freeing them **on this thread**. Not for the audio
+    /// callback: its way to empty the chain is [`DspEdit::Clear`], which hands
+    /// the effects out instead of freeing them where it cannot afford to.
     pub fn clear(&mut self) {
         self.effects.clear();
     }
@@ -375,10 +514,55 @@ fn build_effect(spec: &EffectSpec) -> Box<dyn AudioEffect> {
     effect
 }
 
+/// Test-only, and shared with the audio engine's tests: an effect that
+/// reports its own destruction.
+///
+/// It is how a test tells "freed right here" — which in production is the
+/// audio callback — from "handed off to be freed where that is affordable".
+#[cfg(test)]
+pub(crate) mod witness {
+    use super::{AudioEffect, EffectChain, EffectKind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    pub(crate) struct DropWitness(Arc<AtomicBool>);
+
+    impl Drop for DropWitness {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AudioEffect for DropWitness {
+        fn process(&mut self, _: &mut [f32], _: u32) {}
+        fn set_param(&mut self, _: &str, _: f32) {}
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _: bool) {}
+        fn kind(&self) -> EffectKind {
+            EffectKind::Gate
+        }
+    }
+
+    /// A one-effect chain, plus the flag that says when that chain was freed.
+    pub(crate) fn witnessed_chain() -> (EffectChain, Arc<AtomicBool>) {
+        let freed = Arc::new(AtomicBool::new(false));
+        let mut chain = EffectChain::new();
+        chain.effects.push(Box::new(DropWitness(freed.clone())));
+        (chain, freed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AudioEffect, EffectChain, EffectKind, EffectSpec, NoiseGate};
+    use super::witness::witnessed_chain;
+    use super::{
+        AudioEffect, Displaced, DspCommand, DspEdit, EffectChain, EffectKind, EffectSpec,
+        NoiseGate, Prepared, VoiceModel,
+    };
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     #[test]
     #[allow(clippy::float_cmp)] // empty chain is a bit-exact identity
@@ -440,7 +624,7 @@ mod tests {
         let mut gate = NoiseGate::new();
         gate.set_enabled(true);
         chain.effects.push(Box::new(gate));
-        chain.apply(super::DspCommand::SetParam {
+        let displaced = chain.apply(DspEdit::SetParam {
             index: 0,
             key: "thresh".into(),
             value: -30.0,
@@ -448,20 +632,118 @@ mod tests {
         // No panic and no out-of-bounds; behaviour verified in
         // each effect's own tests.
         assert_eq!(chain.len(), 1);
+        assert!(displaced.is_none(), "a param change displaces nothing");
     }
 
     #[test]
-    fn set_chain_replaces_the_chain() {
+    fn replace_chain_swaps_in_the_prebuilt_chain() {
         let mut chain = EffectChain::new();
-        chain.apply(super::DspCommand::SetChain {
-            specs: vec![EffectSpec {
-                kind: EffectKind::Echo,
-                enabled: true,
-                params: HashMap::new(),
-            }],
-        });
+        let built = EffectChain::from_specs(&[spec(EffectKind::Echo, true)]);
+        let _ = chain.apply(DspEdit::ReplaceChain(built));
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.kind_at(0), Some(EffectKind::Echo));
+    }
+
+    /// The defect this whole seam exists for: replacing the chain used to free
+    /// the old one on the audio thread. It must leave through the return value.
+    #[test]
+    fn replace_chain_hands_the_old_chain_back_instead_of_freeing_it() {
+        let (mut chain, freed) = witnessed_chain();
+
+        let displaced = chain
+            .apply(DspEdit::ReplaceChain(EffectChain::from_specs(&[spec(
+                EffectKind::Echo,
+                true,
+            )])))
+            .expect("the displaced chain must come back");
+        assert!(
+            !freed.load(Ordering::SeqCst),
+            "the old chain was freed inside apply — in production that is the audio callback"
+        );
+        assert_eq!(chain.kind_at(0), Some(EffectKind::Echo));
+
+        // What the graveyard thread does, here done inline.
+        drop(displaced);
+        assert!(
+            freed.load(Ordering::SeqCst),
+            "the displaced chain was never freed at all"
+        );
+    }
+
+    /// `Clear` has the same problem: `Vec::clear` drops every boxed effect.
+    #[test]
+    fn clear_hands_the_effects_back_instead_of_freeing_them() {
+        let (mut chain, freed) = witnessed_chain();
+
+        let displaced = chain
+            .apply(DspEdit::Clear)
+            .expect("a cleared chain's effects must come back");
+        assert!(chain.is_empty(), "Clear must leave an empty chain");
+        assert!(matches!(displaced, Displaced::Chain(_)));
+        assert!(
+            !freed.load(Ordering::SeqCst),
+            "Clear freed the effects inside apply"
+        );
+        drop(displaced);
+        assert!(freed.load(Ordering::SeqCst));
+    }
+
+    /// `prepare` is the control-thread half: the chain is fully built before
+    /// anything reaches the audio thread, which is what makes the swap cheap.
+    #[test]
+    fn prepare_builds_the_chain_on_the_calling_thread() {
+        let edit = DspEdit::prepare(DspCommand::SetChain {
+            specs: vec![spec(EffectKind::Gate, true), spec(EffectKind::Reverb, true)],
+        })
+        .expect("a SetChain always prepares");
+        match edit {
+            DspEdit::ReplaceChain(chain) => {
+                assert_eq!(chain.len(), 2);
+                assert_eq!(chain.kind_at(1), Some(EffectKind::Reverb));
+            }
+            _ => panic!("a SetChain must arrive as a built chain"),
+        }
+    }
+
+    #[test]
+    fn prepare_starts_a_voice_model_load() {
+        let edit = DspEdit::prepare(DspCommand::SetResource {
+            index: 3,
+            key: super::MODEL_RESOURCE_KEY.to_string(),
+            value: Some("/voices/sage.onnx".into()),
+        })
+        .expect("a model resource always prepares");
+        assert!(matches!(
+            edit,
+            DspEdit::SetResource {
+                index: 3,
+                resource: Prepared::VoiceModel(_)
+            }
+        ));
+    }
+
+    /// A key no effect claims produces no edit at all, rather than something
+    /// the audio thread has to sort out.
+    #[test]
+    fn prepare_rejects_a_resource_key_nothing_claims() {
+        assert!(DspEdit::prepare(DspCommand::SetResource {
+            index: 0,
+            key: "nonsense".into(),
+            value: Some("/voices/other.onnx".into()),
+        })
+        .is_none());
+    }
+
+    /// A resource can name an index the chain no longer has (it was rebuilt
+    /// under the command). It must come back out, not be freed here.
+    #[test]
+    fn a_resource_for_a_missing_index_comes_straight_back() {
+        let mut chain = EffectChain::new();
+        let displaced = chain.apply(DspEdit::SetResource {
+            index: 7,
+            resource: Prepared::VoiceModel(VoiceModel::start(None)),
+        });
+        assert!(matches!(displaced, Some(Displaced::VoiceModel(_))));
     }
 
     fn spec(kind: EffectKind, enabled: bool) -> EffectSpec {

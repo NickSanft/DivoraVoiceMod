@@ -21,7 +21,7 @@ use divora_core::audio::{
 };
 use divora_core::dsp::{
     onnx_runtime_available, DspCommand, EffectSpec, Metrics, ReactiveConfig, ReadingState,
-    MAX_DESCRIPTORS,
+    MAX_DESCRIPTORS, MODEL_RESOURCE_KEY,
 };
 use divora_core::presets::{bundled_presets, Preset, PresetStore, PresetTag};
 use divora_core::soundboard::{
@@ -575,7 +575,10 @@ fn onnx_runtime_status(state: State<'_, AppState>) -> OnnxRuntimeStatus {
 fn set_voice_model(state: State<'_, AppState>, index: usize, path: Option<String>) {
     state.engine.send_dsp(DspCommand::SetResource {
         index,
-        key: "model".to_string(),
+        // The shared constant, not a literal: the engine matches on this key
+        // to know it should prepare a voice model, and a silent mismatch
+        // would leave the effect in passthrough with nothing to show why.
+        key: MODEL_RESOURCE_KEY.to_string(),
         value: path,
     });
 }
