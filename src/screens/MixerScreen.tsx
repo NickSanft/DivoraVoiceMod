@@ -1155,7 +1155,7 @@ function VoiceReadingCard(): JSX.Element {
             "line-height": 1.5,
           }}
         >
-          Measured properties of the sound — level, pitch, pace, brightness.
+          Measured properties of the sound — pitch, range, level, pace, tone.
           Not a reading of the person speaking. Stays in the app; never on the
           stream overlay.
         </div>
