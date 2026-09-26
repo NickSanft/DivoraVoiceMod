@@ -336,7 +336,17 @@ impl VoiceConverter {
     }
 
     /// Ensure both resamplers exist + are sized for the engine's
-    /// current sample rate. Called on rate change.
+    /// current sample rate.
+    ///
+    /// Called from `process`, i.e. **on the audio thread**, on every buffer —
+    /// not just on a rate change, whatever the old wording here implied. It
+    /// returns immediately once both slots are filled, but a `SetChain` builds
+    /// a fresh `VoiceConverter` with both back to `None`, so the pair is
+    /// rebuilt in the callback after every preset switch: ~1060 allocations,
+    /// ~784 frees, ~0.8 ms. That is a known violation of the callback's
+    /// contract, larger than anything the v1.51.1 work moved off the thread,
+    /// and the fix is to build the pair in [`DspEdit::prepare`] and carry it
+    /// across `install`.
     fn ensure_resamplers(&mut self, rate: u32) {
         if self.last_rate == rate && self.down.is_some() && self.up.is_some() {
             return;

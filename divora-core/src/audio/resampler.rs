@@ -135,9 +135,18 @@ impl MonoResampler {
                     if take < frames_out {
                         // Caller's slice is full but rubato handed us
                         // more — stash the remainder for next time.
-                        // (Won't happen in steady state because `out` is
-                        // sized to a multiple of `chunk`, but defensive
-                        // here.)
+                        //
+                        // WRONG, AND NOT DEFENSIVE. The claim this comment
+                        // used to make — that `out` is a multiple of `chunk`
+                        // in steady state — is unfounded: `out` is the
+                        // device's own frame count and the engine asks for
+                        // `BufferSize::Default`, so 480 (WASAPI shared 10 ms
+                        // at 48 kHz) and 441 both land here on EVERY buffer.
+                        // Two bugs follow. The `to_vec` allocates and frees on
+                        // the audio thread once per callback; and `leftover`
+                        // is resampler OUTPUT being spliced into `pending`,
+                        // the INPUT queue — at index 0, ahead of older input
+                        // — which is audible corruption, not a stash.
                         let leftover = &self.output_buf[0][take..frames_out].to_vec();
                         self.pending.splice(0..0, leftover.iter().copied());
                     }

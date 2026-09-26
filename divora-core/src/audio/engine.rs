@@ -62,11 +62,14 @@ const DSP_CHANNEL_CAPACITY: usize = 64;
 
 /// Capacity of the bounded engine→audio reactive-config queue.
 ///
-/// Bounded for the same reason as [`DSP_CHANNEL_CAPACITY`], and it matters
-/// more here: a reactive config is re-sent on every chain change, so a preset
-/// switch and every Inspector slider move each put one through. Overflow
-/// drops the config — the modulation then offsets from the previous bases
-/// until the next send — and needs a callback that has stopped draining.
+/// Bounded for the same reason as [`DSP_CHANNEL_CAPACITY`]. Sized for the busy
+/// case rather than the common one: WITH the panel on, a config goes out on
+/// every preset switch and on every input event of a slider the route table
+/// actually names. With it off — the default — the config is constant and the
+/// frontend's own dedupe swallows chain churn, so one goes out per engine
+/// start and no more. Overflow drops the config — the modulation then offsets
+/// from the previous bases until the next send, and `bring_up!` re-sends the
+/// newest one on any rebuild — and needs a callback that has stopped draining.
 const REACTIVE_CHANNEL_CAPACITY: usize = 64;
 
 /// Capacity of the graveyard ring — chains, voice models and reactive route
@@ -287,14 +290,20 @@ impl AudioEngine {
     /// Every caller keeps sending plain `DspCommand`s, so the whole fix lives
     /// at this one seam.
     ///
-    /// That puts the build on whichever thread calls this — for a preset
-    /// switch, the Tauri command thread. It is a real cost (tens of
-    /// milliseconds for a chain with a resampler in it) paid somewhere it is
-    /// allowed to be paid, and it depends on `set_effect_chain` and
-    /// `set_voice_model` staying **sync** Tauri commands: `async` ones run on
-    /// the main async runtime, where blocking would stall every other
-    /// command. If either has to become `async`, wrap this in
-    /// `spawn_blocking` rather than moving the build back down.
+    /// That puts the build on whichever thread calls this. Today, for a preset
+    /// switch, that is the `WebView2` message thread — the window's event loop —
+    /// because `set_effect_chain` and `set_voice_model` are plain `fn`
+    /// commands, and a sync `#[tauri::command]` runs inline in the IPC
+    /// handler. It is small enough to get away with: ~0.1–0.2 ms even for a
+    /// chain containing every effect kind, measured in release. Nothing here
+    /// builds a resampler — `VoiceConverter::new` leaves both of its slots
+    /// `None` — and the one genuinely slow thing on this path, the ONNX model
+    /// load, is already off-thread inside [`VoiceModel::start`].
+    ///
+    /// If that ever stops being small, make the command `async` and use
+    /// `spawn_blocking`, which is what moves work OFF the event loop; do not
+    /// move the build back into the callback. `speak` learned this the hard
+    /// way in v1.27.0 — see the comment on it in `src-tauri/src/lib.rs`.
     pub fn send_dsp(&self, cmd: DspCommand) {
         if let Some(edit) = DspEdit::prepare(cmd) {
             let _ = self.tx.send(Command::Dsp(edit));
@@ -583,9 +592,10 @@ fn engine_thread(
             if let Some(h) = graveyard.take() {
                 // Worst case this waits one poll interval
                 // ([`GRAVEYARD_DRAIN_INTERVAL_MS`]) for the thread to notice
-                // the hang-up. Stop and device-rebuild both go through here,
-                // so that is the ceiling on how long either can take —
-                // bounded and small, but not zero.
+                // the hang-up — that is the ceiling on what THIS join adds,
+                // not on Stop as a whole: the writer and reading joins above
+                // have their own intervals, and a writer finalizes a WAV on
+                // the way out.
                 let _ = h.join();
             }
             state.running.store(false, Ordering::Release);
@@ -1361,12 +1371,19 @@ fn build_output_stream(
                 drain_reactive_edits(&reactive_rx, &mut modulator, &mut chain, &mut graveyard);
                 // Structural changes arrive already built (`DspEdit`) and
                 // what they displace leaves through the graveyard, so no
-                // structural edit in this drain allocates or frees. One thing
-                // here still frees and it is not worth claiming otherwise:
-                // `SetParam` drops the owned key string it was sent, once per
-                // slider tick. Interning those keys is the follow-up;
+                // structural edit in this drain allocates or frees. `SetParam`
+                // still drops the owned key string it was sent, once per
+                // slider tick; interning those keys is the follow-up, and
                 // `tests/rt_chain_swap_allocations.rs` pins it at exactly one
                 // so it cannot grow in the meantime.
+                //
+                // That is a claim about THIS drain and nothing else. Further
+                // down the same callback the soundboard drain frees on a Play
+                // or a Stop, `MonoResampler::process` allocates once per
+                // buffer when the device rates differ, and `VoiceConverter`
+                // builds its sinc resamplers and runs inference here. All
+                // three predate this work and none is fixed; do not read the
+                // line above as covering the whole callback.
                 drain_dsp_edits(&dsp_rx, &mut chain, &mut graveyard, &reading);
                 while let Ok(cmd) = sb_rx.try_recv() {
                     soundboard.apply(cmd);

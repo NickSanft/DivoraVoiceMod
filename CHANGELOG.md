@@ -4,11 +4,13 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.51.1] — 2026-09-26 — Fix: preset switching off the audio thread
+
 ### Fixed
 
 - **A preset switch no longer builds and frees the effect chain on the audio thread.** Switching voices rebuilt the whole chain *inside* the output callback: every effect boxed and its buffers allocated, and the previous chain freed on the spot — 129 allocations and 129 deallocations for a five-effect chain, around 100 µs of a callback that has a few milliseconds to work with, and a worst case nobody can bound, because an allocator is free to take a lock or ask the OS for pages. The chain is now built on the thread that asked for it and swapped in with a single move, and the chain it displaces leaves the callback for a thread whose only job is to drop it. `Clear` takes the same route.
 - **A voice-model change no longer spawns a thread from the audio callback**, and no longer frees an ONNX session there either. The load always happened off-thread; *starting* it did not. Both now happen on the control thread, and the displaced model — session, in-flight load and all — goes to the same graveyard.
-- **Reactive modulation no longer allocates in the audio callback either.** It sits one line above the chain drain in the same callback, and it is on the preset-switch path — the config is re-sent on every chain change, so every preset switch and every Inspector slider move put one through. Its queue was unbounded (which frees on the *receiving* side, the audio thread), and installing a config copied the route table in, which freed the one it was handed and allocated whenever the new table was longer. The queue is now bounded and the tables are swapped, so the config leaves through the graveyard carrying the old table with it.
+- **Reactive modulation no longer allocates in the audio callback either.** It sits one line above the chain drain in the same callback, and with the reactive panel on it is squarely on the preset-switch path: a config goes out on every preset switch, and on every input event of a slider the modulation actually targets. (With the panel off — the default — the config never changes, so the app sends one per engine start and dedupes the rest.) Its queue was unbounded (which frees on the *receiving* side, the audio thread), and installing a config copied the route table in, which freed the one it was handed and allocated whenever the new table was longer. The queue is now bounded and the tables are swapped, so the config leaves through the graveyard carrying the old table with it.
 - **Re-selecting the voice that is already loaded no longer unloads it.** The model was dropped before the "same file, nothing to do" check, so a second click on the active voice left the effect in passthrough until a different voice was picked.
 
 ### Tests
@@ -20,9 +22,20 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ### Architecture notes
 
-- The audio callback's contract is the same as it always was — no allocation, no deallocation, no locks, no syscalls — and three paths were breaking it: the effect chain, the voice model and the reactive route table. All three are now split the same way: the control thread prepares (`DspEdit::prepare`, `ReactiveConfig::resolve`), the callback moves, and a bounded ring carries what it displaced to a `divora-graveyard` thread. The ring is lock-free and preallocated rather than a channel, because a channel's `try_send` may have to wake a parked receiver, and that is a syscall in the callback.
-- **Both** queues from the engine thread to the callback are now bounded: an unbounded `mpsc` allocates its blocks on the sending side and frees them on the *receiving* one, which here is the audio thread.
-- One free remains in the callback and is documented rather than papered over: `SetParam` drops its owned key string. It is one small free rather than a hundred, it predates this work, and the fix (intern the keys) is left for its own change — with a test holding it at exactly one until then.
+- The audio callback's contract is the same as it always was — no allocation, no deallocation, no locks, no syscalls — and three paths **through the command drain** were breaking it: the effect chain, the voice model and the reactive route table. All three are now split the same way: the control thread prepares (`DspEdit::prepare`, `ReactiveConfig::resolve`), the callback moves, and a bounded ring carries what it displaced to a `divora-graveyard` thread. The ring is lock-free and preallocated rather than a channel, because a channel's `try_send` may have to wake a parked receiver, and that is a syscall in the callback.
+- The DSP-edit and reactive-config queues are now bounded too — the soundboard queue has been since v1.33.0, so all three engine→callback queues are — because an unbounded `mpsc` allocates its blocks on the sending side and frees them on the *receiving* one, which here is the audio thread.
+- In the drain itself, one free remains: `SetParam` drops its owned key string. It is one small free rather than a hundred, it predates this work, and the fix (intern the keys) is left for its own change — with a test holding it at exactly one until then.
+- **The rest of the callback is a different story, and an audit run before this release measured it rather than assuming.** Three pre-existing violations are bigger than the one just fixed, and none is touched here: `VoiceConverter` builds its two sinc resamplers *inside* the callback after every preset switch (~1060 allocations, ~784 frees, ~0.8 ms) and then allocates ~105 times per inference chunk; `MonoResampler::process` allocates and frees once per buffer whenever the input and output devices run at different rates — and, in the same two lines, splices output-rate samples back into its input queue, which is audible corruption; and the soundboard drain frees a decoded clip on a Play or a Stop. They are written down here, and at each site, so a scoped claim is not read as a whole-callback one. Each has its own follow-up.
+
+### Pre-push checklist (local, 2026-09-26)
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` — pass (498: 452 core + 42 app + 4 integration, was 495)
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (472)
+- `pnpm test:e2e` — pass (17)
+- `pnpm tauri build --debug --no-bundle` — pass
 
 ## [1.51.0] — 2026-09-24 — Voice reading
 

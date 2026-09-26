@@ -23,10 +23,20 @@
 //!   the new route table is longer than the old one, which a copy would have
 //!   grown into;
 //! * `SetParam` frees exactly once — the owned key string it was sent. That
-//!   is the one free left on the audio thread, on the most frequent edit
-//!   there is, and it is asserted rather than excused so it cannot grow
-//!   quietly and so interning the keys will fail this test and take the
-//!   comments claiming it with it;
+//!   is the one free left in the DRAIN, on the most frequent edit there is,
+//!   and it is asserted rather than excused so it cannot grow quietly and so
+//!   interning the keys will fail this test and take the comments claiming it
+//!   with it;
+//!
+//! What is NOT pinned, and must not be read into the zeros above: the rest of
+//! the output callback. `VoiceConverter::process` builds two sinc resamplers
+//! in the callback after every preset switch and allocates per inference
+//! chunk; `MonoResampler::process` allocates once per buffer when the device
+//! rates differ; the soundboard drain frees a decoded clip on a Play or a
+//! Stop. All three predate this file, all three are documented at their sites,
+//! and none of them is in scope here — this binary measures the command and
+//! config drains, with no resampler, no voice model session, no soundboard and
+//! no inference in the context it builds.
 //! * the counter is live — proved in the same run by measuring what the code
 //!   used to do in that same place (build the replacement inline, drop the
 //!   chain it displaced) and requiring that to be non-zero. Without this a

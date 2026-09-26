@@ -489,9 +489,11 @@ impl ReactiveModulator {
     /// Takes `cfg` by `&mut` and **swaps** the route tables rather than
     /// copying: copying frees nothing but grows this `Vec` when the new table
     /// is longer, and then the caller drops the config — one allocation and
-    /// two frees, in the callback, on every preset switch and every Inspector
-    /// slider move. After the swap `cfg` owns the table this modulator was
-    /// using, which is what the caller sends to the graveyard.
+    /// two frees, in the callback, every time a config arrives. With the panel
+    /// on that is every preset switch and every input event of a slider the
+    /// route table names; with it off the frontend sends one per engine start
+    /// and dedupes the rest. After the swap `cfg` owns the table this
+    /// modulator was using, which is what the caller sends to the graveyard.
     pub fn configure(&mut self, cfg: &mut ResolvedReactive, chain: &mut EffectChain) {
         if self.needs_restore {
             self.restore_bases(chain);
