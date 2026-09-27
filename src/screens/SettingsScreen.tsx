@@ -19,6 +19,7 @@ import { HotkeyCapture } from "../components/HotkeyCapture";
 import { IconButton } from "../components/IconButton";
 import { DMark } from "../components/DMark";
 import { Kbd } from "../components/Kbd";
+import { isResampling } from "../audio/api";
 import { HMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
 import { Select, type SelectOption } from "../components/Select";
@@ -184,8 +185,17 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
     if (app.engineError()) return `Error: ${app.engineError()}`;
     if (app.engineRunning()) {
       const info = app.streamInfo();
-      if (info) return `Running at ${info.sampleRate} Hz`;
-      return "Running";
+      if (!info) return "Running";
+      // Say both rates when they differ. Before v1.51.2 only one was carried
+      // here, so a mismatch was invisible — and the path that handled it was
+      // wrecking the audio. Windows sets each device's rate on its own, so a
+      // user can land here without touching anything.
+      if (!isResampling(info)) return `Running at ${info.sampleRate} Hz`;
+      const parts = [`${info.sampleRate} Hz in`, `${info.outputRate} Hz out`];
+      if (info.monitorRate !== null && info.monitorRate !== info.sampleRate) {
+        parts.push(`${info.monitorRate} Hz monitor`);
+      }
+      return `Running, resampling: ${parts.join(" → ")}`;
     }
     return "Stopped";
   };

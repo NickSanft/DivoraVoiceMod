@@ -31,12 +31,17 @@
 //! What is NOT pinned, and must not be read into the zeros above: the rest of
 //! the output callback. `VoiceConverter::process` builds two sinc resamplers
 //! in the callback after every preset switch and allocates per inference
-//! chunk; `MonoResampler::process` allocates once per buffer when the device
-//! rates differ; the soundboard drain frees a decoded clip on a Play or a
-//! Stop. All three predate this file, all three are documented at their sites,
-//! and none of them is in scope here — this binary measures the command and
-//! config drains, with no resampler, no voice model session, no soundboard and
-//! no inference in the context it builds.
+//! chunk; the soundboard drain frees a decoded clip on a Play or a Stop. Both
+//! predate this file, both are documented at their sites, and neither is in
+//! scope here — this binary measures the command and config drains, with no
+//! resampler, no voice model session, no soundboard and no inference in the
+//! context it builds.
+//!
+//! `MonoResampler` used to be on that list. It is pinned now, in its own
+//! binary — `tests/rt_resampler.rs`, which drives the real `resample_pop` and
+//! `resample_render` through a two-clock ring harness. A pointer rather than
+//! silence, so the two files cannot drift: do not read *its* zeros as covering
+//! the voice converter either.
 //! * the counter is live — proved in the same run by measuring what the code
 //!   used to do in that same place (build the replacement inline, drop the
 //!   chain it displaced) and requiring that to be non-zero. Without this a

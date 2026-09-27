@@ -205,6 +205,8 @@ export async function installTauriMock(
           outputName: a?.outputName ?? "Mock Speakers",
           monitorName: a?.monitorName ?? null,
           sampleRate: 48000,
+          outputRate: 48000,
+          monitorRate: a?.monitorName ? 48000 : null,
           inputChannels: 1,
           outputChannels: 2,
         }),

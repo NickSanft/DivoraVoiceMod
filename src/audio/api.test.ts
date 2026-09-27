@@ -11,6 +11,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  isResampling,
   clearEffectChain,
   closeMidiInput,
   deleteUserPreset,
@@ -701,5 +702,48 @@ describe("audio api", () => {
     });
     expect(listenMock.mock.calls[0]?.[0]).toBe("voice-reading");
     expect(captured).toMatchObject({ state: "speaking" });
+  });
+});
+
+describe("isResampling (v1.51.2)", () => {
+  const base = {
+    inputName: "in",
+    outputName: "out",
+    monitorName: null,
+    sampleRate: 48_000,
+    outputRate: 48_000,
+    monitorRate: null,
+    inputChannels: 1,
+    outputChannels: 2,
+  };
+
+  it("is false when every device agrees", () => {
+    expect(isResampling(base)).toBe(false);
+    expect(isResampling({ ...base, monitorRate: 48_000 })).toBe(false);
+  });
+
+  it("is true when the main output disagrees", () => {
+    expect(isResampling({ ...base, outputRate: 44_100 })).toBe(true);
+  });
+
+  it("stays quiet when a rate is missing, rather than inventing a mismatch", () => {
+    // An older backend paired with this frontend sends no `outputRate`. A naive
+    // `!==` reads that as a mismatch and puts "resampling 48000 -> undefined Hz"
+    // on the Mixer. The e2e mock had exactly this shape and the suite stayed
+    // green, so this is the assertion that would have caught it.
+    const stale = { ...base } as Record<string, unknown>;
+    delete stale.outputRate;
+    delete stale.monitorRate;
+    expect(isResampling(stale as unknown as typeof base)).toBe(false);
+    expect(isResampling({ ...base, outputRate: 0 })).toBe(false);
+    expect(isResampling({ ...base, outputRate: Number.NaN })).toBe(false);
+  });
+
+  it("is true when only the MONITOR disagrees", () => {
+    // The monitor stream resamples independently and is fed by the output
+    // callback rather than the input device, so it is its own case — missing
+    // it would leave a user with a clean-looking Mixer and a resampled
+    // headphone mix.
+    expect(isResampling({ ...base, monitorRate: 44_100 })).toBe(true);
   });
 });

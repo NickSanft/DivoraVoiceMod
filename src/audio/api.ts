@@ -27,9 +27,32 @@ export interface StreamInfo {
   outputName: string;
   /** Phase 13: separate monitor ("hear yourself") device, if active. */
   monitorName: string | null;
+  /** The engine's own rate — the input device's. The chain, the soundboard mix,
+   *  the recorder and the voice reading all run here. */
   sampleRate: number;
+  /** The main output device's rate (v1.51.2). Different from `sampleRate`
+   *  means every buffer is resampled on the way out. */
+  outputRate: number;
+  /** The separate monitor device's rate, when one is active (v1.51.2). */
+  monitorRate: number | null;
   inputChannels: number;
   outputChannels: number;
+}
+
+/** Whether any output is being resampled from the engine's rate.
+ *
+ *  Defensive about missing rates on purpose. `outputRate` arrived in v1.51.2,
+ *  so an older backend paired with this frontend sends no such key — and a
+ *  naive `!==` reads `undefined` as a mismatch and puts "resampling 48000 →
+ *  undefined Hz" on the Mixer. Absent or nonsensical means "nothing to report",
+ *  which is the safe direction: the worst case is staying quiet about a real
+ *  mismatch, rather than inventing one. */
+export function isResampling(info: StreamInfo): boolean {
+  const engine = info.sampleRate;
+  if (!Number.isFinite(engine) || engine <= 0) return false;
+  const differs = (rate: number | null | undefined): boolean =>
+    typeof rate === "number" && Number.isFinite(rate) && rate > 0 && rate !== engine;
+  return differs(info.outputRate) || differs(info.monitorRate);
 }
 
 /** One-shot engine status (running flag + last known levels). */
