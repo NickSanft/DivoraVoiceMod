@@ -277,7 +277,7 @@ src/
 - `EffectChain::apply(edit)` is the single mutation point, and no **structural** edit through it allocates or frees: a `ReplaceChain` swaps in an already-built chain and **returns** the one it displaced (as does `Clear`), for the per-session graveyard thread to drop. `SetParam` / `SetEnabled` mutate in place.
 - The reactive-modulation queue beside it works the same way and for the same reason — with the reactive panel on it is on the preset-switch path too, since a config goes out on every preset switch and every input event of a targeted slider (with the panel off the config is constant and the frontend dedupes it away). It is bounded, and `ReactiveModulator::configure` **swaps** the route tables rather than copying, so the config leaves through the graveyard carrying the table it displaced.
 - One free remains **in the drain**: `SetParam` drops the owned key string it was sent, once per slider tick. `divora-core/tests/rt_chain_swap_allocations.rs` asserts it at exactly one — that test drives the real drain functions, not copies of them, and pins the zeros for everything else.
-- Further down the same callback the contract is still broken, on paths none of this touched, and they are larger: `VoiceConverter::process` builds two sinc resamplers after every preset switch (~1060 allocations / ~784 frees / ~0.8 ms) and allocates ~105 times per inference chunk; `MonoResampler::process` allocates and frees once per buffer when the input and output device rates differ, and in the same two lines splices output-rate samples into its input queue (audible corruption, not just an allocation); and the soundboard drain frees a decoded clip on a Play or a Stop. Measured, written down at each site, and each tracked as its own fix — the drain's zeros are not a whole-callback claim.
+- Further down the same callback the contract is still broken, on paths none of this touched, and they are larger: `VoiceConverter::process` builds two sinc resamplers after every preset switch (~1060 allocations / ~784 frees / ~0.8 ms) and allocates ~105 times per inference chunk; and the soundboard drain frees a decoded clip on a Play or a Stop. Measured, written down at each site, and each tracked as its own fix — the drain's zeros are not a whole-callback claim. (`MonoResampler` was on this list too; v1.51.2 fixed it and pinned it in `tests/rt_resampler.rs`.)
 - Engine restarts (Stop → Start) clear the chain; the frontend re-sends `SetChain` via a `createEffect` on `(presetId, engineRunning)`.
 
 ### Frontend chain sync
@@ -851,6 +851,12 @@ Phases pass through untouched — formant shifting moves the *shape* of the spec
 
 Engine picks `engine_rate = input_rate`. The DSP chain and soundboard mix both run at `engine_rate`. The output callback feeds the chain's mono output into the resampler when needed; if rates match, the resampler is `None` and samples pass through directly.
 
+**Exact fit (v1.51.2).** Each round is sized to the device's own frame count with `Resampler::set_chunk_size`, so one `process` call produces exactly the buffer being filled and nothing is queued between callbacks. `resample_pop` asks the resampler what this buffer needs and pops that much; `resample_render` hands the whole DSP buffer plus a count, so no call site picks a bound. Both are `#[doc(hidden)] pub` for `divora-core/tests/rt_resampler.rs`, whose two-clock harness drives them rather than a copy.
+
+Getting there fixed a badly broken path. A fixed 256-frame chunk against an arbitrary device frame count (480 is the WASAPI shared-mode 10 ms buffer at 48 kHz) overshot on every buffer, and the overshoot was "stashed" by splicing resampler **output** into the **input** queue. The engine also asked for a whole extra chunk every callback, so it demanded more native audio than the input device produces — the ring was permanently empty, the zero-fill ran on 499 of every 500 callbacks, and a third of every block reaching the DSP chain, the recorder, the monitor mix and the voice reading was injected silence. Measured on a 440 Hz tone: **0.00 dB** of the output was the input, at every rate pair tested. It is now 136–145 dB.
+
+A small cushion (two rounds, filled once at session start) absorbs the beat between the input device's lump size and the output buffer's — 441 frames arriving every 10 ms against 405 wanted every 9.19 ms, which starves roughly every twelfth callback from an empty ring. The cushion primes and then always serves: holding off on a transient dip would trade a 0.25 ms zero tail for a whole silent 10 ms buffer, and measured, 13% of buffers went silent that way.
+
 ### Latency budget
 
 | Stage | Samples | Time @ 48 kHz |
@@ -858,8 +864,10 @@ Engine picks `engine_rate = input_rate`. The DSP chain and soundboard mix both r
 | cpal input buffer | ~256 | 5.3 ms |
 | Internal SPSC ring | depends on jitter | ~0–10 ms |
 | STFT analysis window | 1024 | 21.3 ms (only when pitch / formant active) |
-| Resampler delay | ~64 | 1.3 ms (only when rates differ) |
+| Resampler cushion + delay | ~2 rounds + ~64 | ~11 ms (only when rates differ) |
 | **Total** | | **~26 ms** (under 30 ms goal) |
+
+The resampler row was "~64 samples, 1.3 ms" until v1.51.2, and that was wrong by four orders of magnitude: the input queue grew without bound — 5.4 s of backlog after 10 s of audio, 32 s after 60 s — so the real figure was unbounded and climbing. The exact-fit rewrite queues nothing; what remains is the priming cushion (two rounds, about 10 ms at 44.1 kHz) plus rubato's own group delay.
 
 ## Phase 10 — polish (RNNoise denoiser + README rewrite)
 

@@ -25,7 +25,7 @@ import {
   REACTIVE_FLOOR_DB,
 } from "../data/reactive";
 import { useApp } from "../stores/app";
-import type { ReadingMetrics, VoiceReadingUpdate } from "../audio/api";
+import { isResampling, type ReadingMetrics, type VoiceReadingUpdate } from "../audio/api";
 import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
 export function MixerScreen(): JSX.Element {
@@ -220,7 +220,22 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
         <div style={{ "font-size": "var(--t-sm)", color: "var(--text-lo)" }}>
           {props.activeCount} of {props.totalCount} runes active
           <Show when={app.streamInfo()}>
-            {(info) => <span> · routed via {info().outputName}</span>}
+            {(info) => (
+              <>
+                <span> · routed via {info().outputName}</span>
+                {/* v1.51.2: say so when the two devices disagree on a rate.
+                    Nothing used to, because StreamInfo carried one rate — and
+                    the code that bridged the gap was destroying the audio. */}
+                <Show when={isResampling(info())}>
+                  <span
+                    title={`Your input runs at ${info().sampleRate} Hz and the output at ${info().outputRate} Hz, so every buffer is resampled. Setting both devices to the same rate in Windows sound settings avoids the conversion.`}
+                  >
+                    {" · resampling "}
+                    {info().sampleRate} → {info().outputRate} Hz
+                  </span>
+                </Show>
+              </>
+            )}
           </Show>
           <Show when={app.engineRunning() && app.dspLatencyMs() >= 0.5}>
             <span title="Latency added by the active effects (e.g. Voice Convert ≈ 256 ms, Denoiser ≈ 10 ms)">

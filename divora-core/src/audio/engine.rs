@@ -123,9 +123,32 @@ pub struct StreamInfo {
     /// Phase 13: separate monitor ("hear yourself") output device, if
     /// one is active. `None` when monitoring rides the main output.
     pub monitor_name: Option<String>,
+    /// The engine's own rate: the DSP chain, the soundboard mix, the recorder
+    /// and the voice reading all run here, and it is the INPUT device's rate.
     pub sample_rate: u32,
+    /// The main output device's rate. Different from [`Self::sample_rate`]
+    /// means every buffer is resampled on its way out.
+    ///
+    /// Additive in v1.51.2, and the reason is worth stating: until then this
+    /// struct carried a single rate, so nothing in the app could report — or
+    /// even represent — a mismatch between the two devices, while the path
+    /// that handled it was quietly destroying the audio. Windows sets each
+    /// device's rate independently and can change it behind us, so a user can
+    /// land in that state without doing anything.
+    pub output_rate: u32,
+    /// The separate monitor device's rate, when one is active.
+    pub monitor_rate: Option<u32>,
     pub input_channels: u16,
     pub output_channels: u16,
+}
+
+impl StreamInfo {
+    /// Whether any output is being resampled from the engine's rate.
+    #[must_use]
+    pub fn resampling(&self) -> bool {
+        self.output_rate != self.sample_rate
+            || self.monitor_rate.is_some_and(|m| m != self.sample_rate)
+    }
 }
 
 enum Command {
@@ -1006,11 +1029,13 @@ fn start_streams(
 
     // Build the monitor stream last so the tap producer is already wired
     // into the main output above.
+    let mut monitor_rate: Option<u32> = None;
     let monitor_stream = if let (Some(md), Some(mc)) = (monitor_device, monitor_consumer) {
         let m_default = md
             .default_output_config()
             .map_err(|e| AudioEngineError::DefaultConfig(e.to_string()))?;
         let m_rate = m_default.sample_rate().0;
+        monitor_rate = Some(m_rate);
         let m_channels = m_default.channels();
         let m_format = m_default.sample_format();
         let m_config: StreamConfig = m_default.into();
@@ -1044,6 +1069,8 @@ fn start_streams(
         output_name: output_name_str,
         monitor_name: monitor_name_str,
         sample_rate: input_rate,
+        output_rate,
+        monitor_rate,
         input_channels,
         output_channels,
     };
@@ -1140,6 +1167,132 @@ fn graveyard_thread(mut bin: GraveConsumer, alive: Receiver<()>) {
             return;
         }
         std::thread::sleep(Duration::from_millis(GRAVEYARD_DRAIN_INTERVAL_MS));
+    }
+}
+
+/// Keeps a small cushion of native-rate audio in the input ring, for the
+/// callbacks that resample.
+///
+/// Supply and demand match on average — the resampler asks for exactly what
+/// each buffer needs — but they arrive in different lump sizes. A 44.1 kHz
+/// input device delivers 441 frames every 10 ms; a 441-frame output buffer at
+/// 48 kHz wants 405 of them every 9.19 ms. Those two rhythms beat against each
+/// other, so from a near-empty ring roughly every twelfth callback comes up ~11
+/// frames short, for ever. Device jitter does the same thing less predictably.
+///
+/// Before v1.51.2 this was invisible because the engine over-asked by a whole
+/// chunk every callback: the ring was *always* empty and a third of every block
+/// was zero-fill. Asking for the right amount exposes the cushion question
+/// instead of answering it by accident.
+///
+/// So: at session start, hold off until the ring has twice what a round needs.
+/// After that, always serve — even a round that comes up short.
+///
+/// That asymmetry is the whole design, and it is a choice between two costs.
+/// Holding off on a *transient* dip means writing a whole silent buffer, which
+/// is 10 ms of nothing and an audible click; measured, the latch kept dropping
+/// and 13% of buffers went silent. Serving short instead means an 11-frame zero
+/// tail on roughly one buffer in twelve — 0.25 ms, ~0.2% of samples — which
+/// [`MonoResampler::run`] handles and counts. The dip is unavoidable without a
+/// cushion of about three rounds (~28 ms of latency, against a ~26 ms budget
+/// for the whole pipeline), so the tiny pad is the right trade.
+///
+/// The real fix for the dip is clock-drift correction, which is why
+/// `MAX_RATIO_TRIM` leaves the door open.
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct RingCushion {
+    primed: bool,
+}
+
+impl RingCushion {
+    /// Should this callback consume? `false` means write silence and let the
+    /// ring fill — do NOT run a resampler round, because feeding it zeros puts
+    /// them through the filter instead of merely delaying it.
+    ///
+    /// Only ever `false` while priming at session start.
+    #[doc(hidden)]
+    pub fn ready(&mut self, occupancy: usize, need: usize) -> bool {
+        if self.primed {
+            return true;
+        }
+        // Two rounds' worth: one to serve this buffer, one of slack.
+        if occupancy >= need.saturating_mul(2) {
+            self.primed = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the session has finished priming. Diagnostic; the callback does
+    /// not branch on it.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn primed(&self) -> bool {
+        self.primed
+    }
+}
+
+/// The resample step's input half: size this round, honour the cushion, and
+/// pop that much native-rate audio out of the ring.
+///
+/// Returns how many frames landed at the front of `native`, and whether this
+/// buffer is being served at all — `false` means the cushion is still filling
+/// and the caller should write silence.
+///
+/// `native.len()` doubles as the budget for how much native-rate audio one
+/// round may need, which is why the caller hands over its whole DSP buffer.
+///
+/// `pub` on the same terms as [`drain_dsp_edits`]: `tests/rt_resampler.rs`
+/// drives THIS, so its two-clock harness exercises the real sizing, the real
+/// cushion and the real pop instead of a copy of them. A copy would be worse
+/// than useless here, because the sizing arithmetic *was* the defect.
+#[doc(hidden)]
+pub fn resample_pop(
+    consumer: &mut RingConsumer,
+    resampler: Option<&mut MonoResampler>,
+    cushion: &mut RingCushion,
+    out_frames: usize,
+    native: &mut [f32],
+) -> (usize, bool) {
+    let Some(r) = resampler else {
+        // Rates match: one native frame per output frame, no resampler at all.
+        let want = out_frames.min(native.len());
+        return (consumer.pop_slice(&mut native[..want]), true);
+    };
+    // Ask the resampler what this buffer needs. Do not estimate it — and above
+    // all do not estimate it and then add a chunk "to be safe", which is what
+    // put silence into a third of every block before v1.51.2.
+    let need = r.prepare_within(out_frames, native.len());
+    if !cushion.ready(consumer.occupied_len(), need) {
+        return (0, false);
+    }
+    (consumer.pop_slice(&mut native[..need]), true)
+}
+
+/// The resample step's output half: render `block` native-rate frames from the
+/// front of `native` into `out`, and report how many output frames were written.
+///
+/// Passing `native` whole with `block` as a separate count is deliberate; see
+/// [`MonoResampler::run`].
+#[doc(hidden)]
+pub fn resample_render(
+    resampler: Option<&mut MonoResampler>,
+    serving: bool,
+    native: &[f32],
+    block: usize,
+    out: &mut [f32],
+) -> usize {
+    match resampler {
+        // Still filling the cushion: silence, and crucially no round — zeros
+        // pushed through the sinc filter are not a delay, they are a signal.
+        Some(_) if !serving => 0,
+        Some(r) => r.run(native, block, out),
+        None => {
+            let n = block.min(out.len()).min(native.len());
+            out[..n].copy_from_slice(&native[..n]);
+            n
+        }
     }
 }
 
@@ -1346,13 +1499,20 @@ fn build_output_stream(
     let state_for_callback = state.clone();
 
     // When input + output rates disagree we drop a streaming
-    // `MonoResampler` into the callback. It buffers native-rate samples
-    // from the engine and produces output-rate samples on demand.
+    // `MonoResampler` into the callback. Each round is sized to the device's
+    // own frame count, so it produces exactly what this buffer needs and
+    // queues nothing between callbacks. The `MAX_FRAMES_PER_CALLBACK` argument
+    // is the ceiling on that, not a per-round size.
     let mut resampler: Option<MonoResampler> = if input_rate == output_rate {
         None
     } else {
-        Some(MonoResampler::new(input_rate, output_rate, 256)?)
+        Some(MonoResampler::new(
+            input_rate,
+            output_rate,
+            MAX_FRAMES_PER_CALLBACK,
+        )?)
     };
+    let mut cushion = RingCushion::default();
 
     let stream = device
         .build_output_stream(
@@ -1402,34 +1562,24 @@ fn build_output_stream(
                 let out_frames = out_frames.min(MAX_FRAMES_PER_CALLBACK);
                 let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
 
-                // How many native-rate frames do we need this round?
-                // With no resampler: out_frames (1:1). With a
-                // resampler: ceil(out_frames * input_rate / output_rate)
-                // — but we read in chunks of `resampler.input_frames_next()`
-                // so the cumulative size approaches the right total.
-                let native_frames = if let Some(r) = resampler.as_ref() {
-                    // Aim for slightly more native frames than strictly
-                    // needed so the resampler always has a fresh chunk
-                    // ready. We size by the input ratio plus the
-                    // resampler's own next-needed count.
-                    let ratio_num = u64::from(input_rate);
-                    let ratio_den = u64::from(output_rate);
-                    let scaled = u64::try_from(out_frames)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(ratio_num)
-                        / ratio_den.max(1);
-                    let approx = usize::try_from(scaled).unwrap_or(MAX_FRAMES_PER_CALLBACK)
-                        + r.input_frames_next();
-                    approx.min(MAX_FRAMES_PER_CALLBACK)
-                } else {
-                    out_frames
-                };
-
-                let popped = consumer.pop_slice(&mut mono[..native_frames]);
-                let zero_from = popped;
-                for slot in &mut mono[zero_from..native_frames] {
-                    *slot = 0.0;
-                }
+                // Size this round, wait for the cushion, and take what the ring
+                // actually had. Everything downstream is sized by `block`, so a
+                // short ring costs a shorter block rather than a block padded
+                // with silence.
+                //
+                // Until v1.51.2 this estimated the count and then added a whole
+                // chunk on top as a "keep one ready" hedge, so the engine asked
+                // for more native audio than the input device produces, for
+                // ever. The ring could never keep up, and a THIRD of every block
+                // reaching the DSP chain, the recorder, the monitor mix and the
+                // voice reading was zero-fill.
+                let (block, serving) = resample_pop(
+                    &mut consumer,
+                    resampler.as_mut(),
+                    &mut cushion,
+                    out_frames,
+                    &mut mono,
+                );
 
                 // v1.7.0: refresh the loudness stage's params from shared
                 // state (cheap atomic loads) so the Mixer toggle/slider
@@ -1459,14 +1609,14 @@ fn build_output_stream(
                 // reserved in BOTH rings now so the WET copy after the chain
                 // cannot be the one that gets dropped, which would leave the
                 // two taps permanently out of step.
-                let tapping = reading_taps.armed(reading.is_enabled(), native_frames);
+                let tapping = reading_taps.armed(reading.is_enabled(), block);
                 if tapping {
-                    reading_taps.push_dry(&mono[..native_frames]);
+                    reading_taps.push_dry(&mono[..block]);
                 }
 
                 mix_voice_and_soundboard(
-                    &mut mono[..native_frames],
-                    &mut sb[..native_frames],
+                    &mut mono[..block],
+                    &mut sb[..block],
                     &mut chain,
                     &mut modulator,
                     &mut loudness,
@@ -1483,7 +1633,7 @@ fn build_output_stream(
                 // clip audio is on neither tap: those are mixed in after the
                 // chain and are not the user's voice.
                 if tapping {
-                    reading_taps.push_wet(&mono[..native_frames]);
+                    reading_taps.push_wet(&mono[..block]);
                 }
 
                 // Phase 13: tap the processed, input-rate mono into the
@@ -1511,30 +1661,30 @@ fn build_output_stream(
                     // is then played ungated in the monitor stream.
                     let mut mon = [0f32; MAX_FRAMES_PER_CALLBACK];
                     if mic_mon {
-                        mon[..native_frames].copy_from_slice(&mono[..native_frames]);
+                        mon[..block].copy_from_slice(&mono[..block]);
                     }
                     if speak_mon {
-                        for (m, &s) in mon[..native_frames].iter_mut().zip(&sb[..native_frames]) {
+                        for (m, &s) in mon[..block].iter_mut().zip(&sb[..block]) {
                             *m += s;
                         }
-                        soundboard.mix_monitor_into(&mut mon[..native_frames], input_rate);
+                        soundboard.mix_monitor_into(&mut mon[..block], input_rate);
                     } else {
                         // Still advance the monitor-only voices so clips play through.
                         let mut scratch = [0f32; MAX_FRAMES_PER_CALLBACK];
-                        soundboard.mix_monitor_into(&mut scratch[..native_frames], input_rate);
+                        soundboard.mix_monitor_into(&mut scratch[..block], input_rate);
                     }
-                    let _ = mp.push_slice(&mon[..native_frames]);
+                    let _ = mp.push_slice(&mon[..block]);
                 } else {
                     // No separate monitor device: the single output carries the
                     // monitor-only voices too (gated downstream by the monitor
                     // toggle, exactly as before).
-                    soundboard.mix_monitor_into(&mut mono[..native_frames], input_rate);
+                    soundboard.mix_monitor_into(&mut mono[..block], input_rate);
                 }
 
                 // Fold the soundboard `Play` voices back into `mono` for the main
                 // send (the call always hears Speak/soundboard output) and the
                 // recording tap below.
-                for (m, &s) in mono[..native_frames].iter_mut().zip(&sb[..native_frames]) {
+                for (m, &s) in mono[..block].iter_mut().zip(&sb[..block]) {
                     *m += s;
                 }
 
@@ -1544,21 +1694,24 @@ fn build_output_stream(
                 // samples (a brief gap in the file) rather than stalling
                 // the audio thread with file I/O.
                 if state_for_callback.recording.load(Ordering::Acquire) {
-                    let _ = recording_producer.push_slice(&mono[..native_frames]);
+                    let _ = recording_producer.push_slice(&mono[..block]);
                 }
 
-                // Now hand the native-rate buffer to the output
-                // pipeline. Either a passthrough (rates match) or via
-                // the resampler.
+                // Now hand the native-rate buffer to the output pipeline.
+                // Either a passthrough (rates match) or via the resampler.
+                //
+                // `&mono` whole, with `block` as a separate count: the callee
+                // slices it, so there is no bound here for a future edit to get
+                // wrong. That is not stylistic — a call site choosing its own
+                // bound is precisely the defect v1.51.2 fixed.
                 let mut output_mono = [0f32; MAX_FRAMES_PER_CALLBACK];
-                let written_out = if let Some(r) = resampler.as_mut() {
-                    r.push_input(&mono[..native_frames]);
-                    r.process(&mut output_mono[..out_frames])
-                } else {
-                    let n = native_frames.min(out_frames);
-                    output_mono[..n].copy_from_slice(&mono[..n]);
-                    n
-                };
+                let written_out = resample_render(
+                    resampler.as_mut(),
+                    serving,
+                    &mono,
+                    block,
+                    &mut output_mono[..out_frames],
+                );
 
                 // Phase 13 gating: when a separate monitor device is
                 // active, the main output is the *send* (e.g. to
@@ -1636,8 +1789,13 @@ fn build_monitor_stream(
     let mut resampler: Option<MonoResampler> = if input_rate == monitor_rate {
         None
     } else {
-        Some(MonoResampler::new(input_rate, monitor_rate, 256)?)
+        Some(MonoResampler::new(
+            input_rate,
+            monitor_rate,
+            MAX_FRAMES_PER_CALLBACK,
+        )?)
     };
+    let mut cushion = RingCushion::default();
 
     let stream = device
         .build_output_stream(
@@ -1654,35 +1812,29 @@ fn build_monitor_stream(
                 let monitor_gain = state.load_monitor_gain();
                 let out_frames = (data.len() / channels).min(MAX_FRAMES_PER_CALLBACK);
 
-                // Match the main output's native-frame sizing so the
-                // resampler is fed a consistent amount per round.
-                let native_frames = if let Some(r) = resampler.as_ref() {
-                    let scaled = u64::try_from(out_frames)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(u64::from(input_rate))
-                        / u64::from(monitor_rate).max(1);
-                    let approx = usize::try_from(scaled).unwrap_or(MAX_FRAMES_PER_CALLBACK)
-                        + r.input_frames_next();
-                    approx.min(MAX_FRAMES_PER_CALLBACK)
-                } else {
-                    out_frames
-                };
-
+                // The same two calls as the main output, and it has to be that
+                // way: that callback is this ring's ONLY producer, pushing one
+                // `block` per callback. Fix one end's arithmetic without the
+                // other and the ring either pins full (32.6% of samples dropped,
+                // monitor 186 ms behind for ever) or starves (27 725 zeros a
+                // second). They change together.
                 let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
-                let popped = consumer.pop_slice(&mut mono[..native_frames]);
-                for slot in &mut mono[popped..native_frames] {
-                    *slot = 0.0;
-                }
+                let (block, serving) = resample_pop(
+                    &mut consumer,
+                    resampler.as_mut(),
+                    &mut cushion,
+                    out_frames,
+                    &mut mono,
+                );
 
                 let mut output_mono = [0f32; MAX_FRAMES_PER_CALLBACK];
-                let written_out = if let Some(r) = resampler.as_mut() {
-                    r.push_input(&mono[..native_frames]);
-                    r.process(&mut output_mono[..out_frames])
-                } else {
-                    let n = native_frames.min(out_frames);
-                    output_mono[..n].copy_from_slice(&mono[..n]);
-                    n
-                };
+                let written_out = resample_render(
+                    resampler.as_mut(),
+                    serving,
+                    &mono,
+                    block,
+                    &mut output_mono[..out_frames],
+                );
 
                 for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
                     let sample = if i < written_out {
@@ -2502,6 +2654,8 @@ mod tests {
             output_name: "out".into(),
             monitor_name: Some("mon".into()),
             sample_rate: 48_000,
+            output_rate: 48_000,
+            monitor_rate: Some(48_000),
             input_channels: 1,
             output_channels: 2,
         };
@@ -2514,8 +2668,10 @@ mod tests {
                 "inputChannels",
                 "inputName",
                 "monitorName",
+                "monitorRate",
                 "outputChannels",
                 "outputName",
+                "outputRate",
                 "sampleRate"
             ]
         );

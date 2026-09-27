@@ -4,6 +4,30 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- **Your voice is no longer destroyed when your microphone and your output device run at different sample rates.** Not degraded — destroyed: a 440 Hz tone came out with **none** of its energy at 440 Hz, sitting 42 dB below the noise it was buried in. Three things were wrong at once, and this is the common case the moment a virtual cable is in the chain, because Windows sets each device's rate on its own. The resampler was built to emit a fixed 256-sample block while the sound card asks for whatever size it likes (480, usually) — so it overshot every single buffer, and the overshoot was "saved for next time" by feeding *finished output* back into the *input* queue. That queue also grew for ever, because the engine asked for more audio each buffer than your microphone actually produces: 5 seconds of backlog after 10 seconds, 32 seconds after a minute, and a third of everything reaching the effects, the recorder, the headphone mix and the Voice reading panel was silence the engine had invented to fill the gap. Every buffer is now sized to what the sound card asked for, so there is no overshoot, nothing is queued, and nothing is invented. Measured on the same tone: **136 to 145 dB** of it now survives, at every rate pair.
+- **Recordings and the headphone mix were getting the same invented silence**, since both are fed from the buffer the effects run on. Both are clean now.
+- **The Mixer and Settings say when your devices disagree.** Nothing did before — the app could not even represent two different rates internally, so the one condition that triggered all of the above was invisible. The Mixer header now reads "resampling 44100 → 48000 Hz" with a note that matching them in Windows avoids the conversion.
+
+### Changed
+
+- **Restarting the engine no longer carries a sliver of the previous session's audio into the new one.** The resampler's filter history survived a restart; it is cleared now.
+
+### Tests
+
+- A new test binary, `divora-core/tests/rt_resampler.rs`, with **eleven** tests over six sample-rate pairs and four device buffer sizes: a ramp that must stay a ramp (any reordered or dropped sample breaks its slope), a tone that must survive by signal-to-noise against an analytic fit, every buffer filled exactly, zero allocations on the audio thread, nothing accumulating over a minute of audio, the headphone chain, and the startup cushion priming once and then padding nothing.
+- **The harness is the test.** A saturating one — handing the callback a full slice every time — reports the *broken* code as perfectly clean at a 512-frame buffer: peak 0.5000, zero discontinuities, 440.00 Hz. That is how the audit that found this originally concluded 512 was fine. The real answer for that same configuration is thousands of discontinuities, because the defect that dominates is starvation, and a saturating harness feeds the starvation away. So this one drives two independent device clocks through a real ring buffer, and it records the silence a skipped buffer leaves behind — without that, a stutter is invisible, because the collected output simply has no gap in it.
+- Each test was checked by putting an original defect back at its real site: the over-ask (3 tests fail), the fixed 256-frame block (8), an allocation (1), a cushion that never primes (3), a restart that forgets its filter history (1). One mutation survives and the reason is recorded in the file — the zero-fill is unreachable while the cushion holds, and the assertion that pins *that* is what fails if the cushion goes.
+- Plus a rendered-DOM test that the rate-mismatch indication appears when the devices disagree, stays away when they agree, and catches a monitor device that disagrees on its own.
+
+### Architecture notes
+
+- The whole family came from one impedance mismatch: a fixed output block against an arbitrary requested size. `rubato`'s `set_chunk_size` removes it rather than managing it — no holdover buffer to bound, no queue whose depth needs a controller, no `drain` memmove, and no buffer left for a caller to grow. An earlier plan for this fix kept the queue and added a holdover; it worked, and it would have been a correct fix to a problem that did not need to exist.
+- `resample_pop` and `resample_render` are `#[doc(hidden)] pub` so the test drives the real functions. That is not ceremony: the sizing arithmetic **was** the defect, so a test that reimplemented it would have proved nothing about the callback.
+- A cushion of two rounds is filled once at session start, because supply and demand match on average but arrive in different lump sizes — 441 frames every 10 ms against 405 wanted every 9.19 ms — which starves roughly every twelfth callback from an empty ring. It primes and then always serves: holding off on a transient dip trades a 0.25 ms zero tail for a whole silent 10 ms buffer, and measured that way 13% of buffers went silent. The permanent fix for the dip is clock-drift correction, so the resampler is now built with the headroom that makes it possible later — it had none, which made a drift trim impossible without rebuilding the resampler on the audio thread.
+- Not fixed, and now pinned as a known limit rather than left to look like it works: a device buffer big enough that a steep downsample needs more input than one DSP block holds (48 kHz → 16 kHz at 4096 frames wants 12 288). The round is shortened instead of under-fed, and a test asserts that.
+
 ## [1.51.1] — 2026-09-26 — Fix: preset switching off the audio thread
 
 ### Fixed
