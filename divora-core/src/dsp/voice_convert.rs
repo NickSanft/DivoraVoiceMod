@@ -62,9 +62,14 @@ use std::{
 };
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
-use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
+
+// The one resampler wrapper, shared with the engine's device-rate bridge. This
+// module used to keep a private copy "so it compiles without a circular
+// dependency" — modules within a crate may reference each other freely, so
+// there was nothing to avoid, and the copy diverged exactly as duplicates do:
+// it kept the fixed-chunk shape whose overshoot handling was the v1.51.2
+// defect, discarding the excess outright rather than splicing it anywhere.
+use crate::audio::MonoResampler;
 
 use super::{AudioEffect, Displaced, EffectKind, Prepared};
 
@@ -81,6 +86,10 @@ pub const NATIVE_RATE: u32 = 48_000;
 /// fallback for models that only expose the single-tensor `audio` →
 /// `output` contract.
 pub const CHUNK_16K: usize = 4096;
+
+/// Output frames per upsampling round, 16 kHz → native. Sized to a typical
+/// device callback so the converted audio comes back in device-shaped pieces.
+pub const UP_CHUNK: usize = 256;
 
 // ---- v1.3.0: streaming LLVC contract -------------------------------------
 //
@@ -237,9 +246,31 @@ pub struct VoiceConverter {
     /// The model in use, swapped whole by [`VoiceConverter::install`].
     model: VoiceModel,
     /// 48 kHz → 16 kHz pre-inference resampler.
-    down: Option<MonoSinc>,
-    /// 16 kHz → 48 kHz post-inference resampler.
-    up: Option<MonoSinc>,
+    ///
+    /// Built in [`VoiceConverter::new`], i.e. on whichever control thread
+    /// `DspEdit::prepare` runs on — never in the callback. Until v1.51.3 these
+    /// were built lazily from `process`, and because a `SetChain` hands the
+    /// callback a fresh converter with both slots empty, the pair was rebuilt
+    /// *there* after every preset switch: 1060 allocations, 784 frees and
+    /// ~0.84 ms inside a callback with a few milliseconds of budget — eight
+    /// times the cost of the chain rebuild v1.51.1 moved off the thread.
+    ///
+    /// `Option` only because construction can in principle fail; it cannot in
+    /// practice, since every parameter is a constant. `None` means passthrough
+    /// for the life of this instance, and nothing tries to fill it later.
+    down: Option<MonoResampler>,
+    /// 16 kHz → 48 kHz post-inference resampler. Built with [`Self::down`].
+    up: Option<MonoResampler>,
+    /// Contiguous scratch for moving queued samples into a resampler, and for
+    /// taking its output back out. Sized once, in `new`; the phases reuse them
+    /// rather than allocating a batch and an output buffer per round.
+    batch: Vec<f32>,
+    resampled: Vec<f32>,
+    /// Scratch for one inference chunk. Separate from [`Self::batch`] on
+    /// purpose: `drain_chunks` runs BETWEEN the two resampling phases, and one
+    /// buffer serving three uses in sequence is a correct-today arrangement
+    /// that a later edit would quietly break.
+    chunk_scratch: Vec<f32>,
     /// Native-rate input samples queued for downsampling.
     native_in: VecDeque<f32>,
     /// 16 kHz samples queued for the next inference chunk.
@@ -251,9 +282,6 @@ pub struct VoiceConverter {
     /// Dry copy of native-rate input, delayed to align with the wet
     /// stream for a glitch-free wet/dry crossfade.
     dry_delay: VecDeque<f32>,
-    /// Last sample rate observed; used to detect device changes that
-    /// require a resampler rebuild.
-    last_rate: u32,
     /// v1.3.0: streaming cache state, threaded between chunks. Reset to
     /// zero on (re)load and whenever the pipeline clears.
     caches: StreamCaches,
@@ -262,19 +290,92 @@ pub struct VoiceConverter {
 impl VoiceConverter {
     #[must_use]
     pub fn new() -> Self {
+        // NATIVE_RATE and MODEL_RATE, not parameters: `process` bypasses at any
+        // other input rate (see its `bypass` condition), so this pair is only
+        // ever valid for one rate pair and there is nothing left to decide at
+        // runtime. That is what lets them be built here, off the audio thread.
+        let down = MonoResampler::new(NATIVE_RATE, MODEL_RATE, CHUNK_16K).ok();
+        let up = MonoResampler::new(MODEL_RATE, NATIVE_RATE, UP_CHUNK).ok();
+        let batch_len = down
+            .as_ref()
+            .map_or(0, MonoResampler::max_input_frames)
+            .max(up.as_ref().map_or(0, MonoResampler::max_input_frames));
         Self {
             enabled: false,
             mix: 1.0,
             model: VoiceModel::none(),
-            down: None,
-            up: None,
+            down,
+            up,
+            batch: vec![0.0; batch_len],
+            resampled: vec![0.0; CHUNK_16K.max(UP_CHUNK)],
+            chunk_scratch: vec![0.0; CHUNK_16K.max(STREAM_CHUNK_16K)],
             native_in: VecDeque::with_capacity(NATIVE_RATE as usize),
             chunk_in: VecDeque::with_capacity(CHUNK_16K * 2),
             chunk_out: VecDeque::with_capacity(CHUNK_16K * 2),
             native_out: VecDeque::with_capacity(NATIVE_RATE as usize),
             dry_delay: VecDeque::with_capacity(NATIVE_RATE as usize),
-            last_rate: 0,
             caches: StreamCaches::zeros(),
+        }
+    }
+
+    /// Drain `native_in` through the downsampler into `chunk_in`, as many
+    /// whole rounds as the queued input allows.
+    ///
+    /// Allocation-free: the batch and the output both live in scratch sized in
+    /// [`Self::new`]. Its own method so a test can drive it without an ONNX
+    /// session — `process` bypasses without one, and CI has no ONNX runtime, so
+    /// this is the only way the resampling half is reachable from a test.
+    pub(crate) fn downsample_queued(&mut self) {
+        Self::resample_rounds(
+            self.down.as_mut(),
+            &mut self.native_in,
+            &mut self.chunk_in,
+            &mut self.batch,
+            &mut self.resampled,
+            CHUNK_16K,
+        );
+    }
+
+    /// Drain `chunk_out` through the upsampler into `native_out`. See
+    /// [`Self::downsample_queued`].
+    pub(crate) fn upsample_queued(&mut self) {
+        Self::resample_rounds(
+            self.up.as_mut(),
+            &mut self.chunk_out,
+            &mut self.native_out,
+            &mut self.batch,
+            &mut self.resampled,
+            UP_CHUNK,
+        );
+    }
+
+    /// One direction's worth of rounds. An associated function taking the
+    /// pieces rather than `&mut self`, because both phases need two different
+    /// queues of the same struct mutably at once.
+    fn resample_rounds(
+        resampler: Option<&mut MonoResampler>,
+        input: &mut VecDeque<f32>,
+        output: &mut VecDeque<f32>,
+        batch: &mut [f32],
+        scratch: &mut [f32],
+        out_frames: usize,
+    ) {
+        let Some(r) = resampler else {
+            return;
+        };
+        loop {
+            let need = r.prepare_within(out_frames, batch.len());
+            if need == 0 || input.len() < need {
+                break;
+            }
+            for slot in &mut batch[..need] {
+                *slot = input.pop_front().unwrap_or(0.0);
+            }
+            let wrote = r.run(batch, need, &mut scratch[..out_frames]);
+            if wrote == 0 {
+                break;
+            }
+            output.extend(scratch[..wrote].iter().copied());
         }
     }
 
@@ -335,31 +436,6 @@ impl VoiceConverter {
         }
     }
 
-    /// Ensure both resamplers exist + are sized for the engine's
-    /// current sample rate.
-    ///
-    /// Called from `process`, i.e. **on the audio thread**, on every buffer —
-    /// not just on a rate change, whatever the old wording here implied. It
-    /// returns immediately once both slots are filled, but a `SetChain` builds
-    /// a fresh `VoiceConverter` with both back to `None`, so the pair is
-    /// rebuilt in the callback after every preset switch: ~1060 allocations,
-    /// ~784 frees, ~0.8 ms. That is a known violation of the callback's
-    /// contract, larger than anything the v1.51.1 work moved off the thread,
-    /// and the fix is to build the pair in [`DspEdit::prepare`] and carry it
-    /// across `install`.
-    fn ensure_resamplers(&mut self, rate: u32) {
-        if self.last_rate == rate && self.down.is_some() && self.up.is_some() {
-            return;
-        }
-        self.last_rate = rate;
-        // Sized to produce one 16 kHz chunk per round when we have at
-        // least one chunk's worth of native input queued. Output chunk
-        // for upsampling matches the native callback size we typically
-        // see (256 samples in our resampler module's default).
-        self.down = MonoSinc::new(rate, MODEL_RATE, CHUNK_16K).ok();
-        self.up = MonoSinc::new(MODEL_RATE, rate, 256).ok();
-    }
-
     /// Drain `chunk_in` whenever a full inference chunk has accumulated;
     /// run inference; push the converted samples onto `chunk_out`. The
     /// chunk size + inference path depend on whether the loaded model is
@@ -372,15 +448,20 @@ impl VoiceConverter {
             CHUNK_16K
         };
         while self.chunk_in.len() >= chunk_len {
-            let mut chunk = vec![0f32; chunk_len];
-            for slot in &mut chunk {
+            // Reuse the scratch rather than allocating a chunk per round.
+            debug_assert!(chunk_len <= self.chunk_scratch.len());
+            if chunk_len > self.chunk_scratch.len() {
+                return;
+            }
+            let chunk = &mut self.chunk_scratch[..chunk_len];
+            for slot in chunk.iter_mut() {
                 *slot = self.chunk_in.pop_front().unwrap_or(0.0);
             }
             let converted = if self.model.streaming {
                 // Disjoint borrows of `session` + `caches`.
-                run_inference_streaming(self.model.session.as_deref_mut(), &mut self.caches, &chunk)
+                run_inference_streaming(self.model.session.as_deref_mut(), &mut self.caches, chunk)
             } else {
-                run_inference(self.model.session.as_deref_mut(), &chunk)
+                run_inference(self.model.session.as_deref_mut(), chunk)
             };
             for s in converted {
                 self.chunk_out.push_back(s);
@@ -415,7 +496,8 @@ impl AudioEffect for VoiceConverter {
             return;
         }
 
-        self.ensure_resamplers(sample_rate);
+        // Both were built in `new`, on a control thread. If either is missing
+        // this effect is passthrough for good; the callback does not build one.
         if self.down.is_none() || self.up.is_none() {
             return;
         }
@@ -426,57 +508,14 @@ impl AudioEffect for VoiceConverter {
             self.dry_delay.push_back(s);
         }
 
-        // Phase 2: downsample as many 16k samples as we can. We borrow
-        // the resampler in a tight scope so `drain_chunks()` (which
-        // borrows `&mut self`) can run between phases without a
-        // simultaneous-borrow conflict.
-        {
-            let Some(down) = self.down.as_mut() else {
-                return;
-            };
-            loop {
-                let needed = down.input_frames_next();
-                if self.native_in.len() < needed {
-                    break;
-                }
-                let mut batch = Vec::with_capacity(needed);
-                for _ in 0..needed {
-                    batch.push(self.native_in.pop_front().unwrap_or(0.0));
-                }
-                down.push(&batch);
-                let mut out = vec![0f32; CHUNK_16K];
-                let written = down.process(&mut out);
-                for &s in out.iter().take(written) {
-                    self.chunk_in.push_back(s);
-                }
-            }
-        }
+        // Phase 2: downsample as many 16k samples as we can.
+        self.downsample_queued();
 
         // Phase 3: run inference on any complete 16k chunks.
         self.drain_chunks();
 
         // Phase 4: upsample 16k → native and queue to `native_out`.
-        if !self.chunk_out.is_empty() {
-            let Some(up) = self.up.as_mut() else {
-                return;
-            };
-            loop {
-                let needed = up.input_frames_next();
-                if self.chunk_out.len() < needed {
-                    break;
-                }
-                let mut batch = Vec::with_capacity(needed);
-                for _ in 0..needed {
-                    batch.push(self.chunk_out.pop_front().unwrap_or(0.0));
-                }
-                up.push(&batch);
-                let mut out = vec![0f32; 256];
-                let written = up.process(&mut out);
-                for &s in out.iter().take(written) {
-                    self.native_out.push_back(s);
-                }
-            }
-        }
+        self.upsample_queued();
 
         // Phase 5: write `native_out` (wet) + `dry_delay` (dry) back
         // into the output buffer with the wet/dry mix. During warm-up
@@ -552,71 +591,6 @@ impl AudioEffect for VoiceConverter {
         } else {
             0
         }
-    }
-}
-
-/// Thin wrapper around `SincFixedOut` matching the shape we use here.
-/// Identical to `crate::audio::resampler::MonoResampler` but kept local
-/// so this module compiles without a circular dependency.
-struct MonoSinc {
-    inner: SincFixedOut<f32>,
-    input_buf: Vec<Vec<f32>>,
-    output_buf: Vec<Vec<f32>>,
-    pending: Vec<f32>,
-}
-
-impl MonoSinc {
-    fn new(input_rate: u32, output_rate: u32, chunk_out: usize) -> Result<Self, String> {
-        let ratio = f64::from(output_rate) / f64::from(input_rate);
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 128,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let inner = SincFixedOut::<f32>::new(ratio, 1.0, params, chunk_out, 1)
-            .map_err(|e| e.to_string())?;
-        let max_in = inner.input_frames_max();
-        Ok(Self {
-            inner,
-            input_buf: vec![Vec::with_capacity(max_in)],
-            output_buf: vec![vec![0f32; chunk_out]],
-            pending: Vec::with_capacity(max_in * 4),
-        })
-    }
-
-    fn input_frames_next(&self) -> usize {
-        self.inner.input_frames_next()
-    }
-
-    fn push(&mut self, samples: &[f32]) {
-        self.pending.extend_from_slice(samples);
-    }
-
-    fn process(&mut self, out: &mut [f32]) -> usize {
-        let need = self.inner.input_frames_next();
-        if self.pending.len() < need {
-            return 0;
-        }
-        self.input_buf[0].clear();
-        self.input_buf[0].extend_from_slice(&self.pending[..need]);
-        self.pending.drain(..need);
-        match self
-            .inner
-            .process_into_buffer(&self.input_buf, &mut self.output_buf, None)
-        {
-            Ok((_, frames_out)) => {
-                let take = frames_out.min(out.len());
-                out[..take].copy_from_slice(&self.output_buf[0][..take]);
-                take
-            }
-            Err(_) => 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.pending.clear();
     }
 }
 
@@ -853,7 +827,12 @@ fn run_inference_streaming(
     caches.dec_buf = dec;
     caches.out_buf = ob;
     caches.cpc = cpc;
-    caches.front = chunk[chunk.len() - STREAM_FRONT..].to_vec();
+    // In place: `front` is already `STREAM_FRONT` long and this runs on the
+    // audio thread, so assigning a fresh `to_vec` here allocated one and freed
+    // the previous one on every streaming chunk.
+    caches
+        .front
+        .copy_from_slice(&chunk[chunk.len() - STREAM_FRONT..]);
     out
 }
 
@@ -861,7 +840,8 @@ fn run_inference_streaming(
 #[allow(clippy::float_cmp)] // bypass paths are bit-exact passthroughs
 mod tests {
     use super::{
-        AudioEffect, Displaced, EffectKind, Prepared, VoiceConverter, VoiceModel, NATIVE_RATE,
+        AudioEffect, Displaced, EffectKind, Prepared, VoiceConverter, VoiceModel, CHUNK_16K,
+        MODEL_RATE, NATIVE_RATE, UP_CHUNK,
     };
 
     fn run(vc: &mut VoiceConverter, buf: &mut [f32]) {
@@ -1124,5 +1104,184 @@ mod tests {
             "streaming output must differ from input (mean|d|={mean})"
         );
         eprintln!("streaming LLVC OK: mean|delta|={mean:.4}");
+    }
+
+    // ---- the resampling phases: RT-safety and correctness ------------------
+    //
+    // Until v1.51.3 `VoiceConverter::new` left both resamplers unbuilt and
+    // `process` filled them in lazily, ON THE AUDIO THREAD. Because a
+    // `SetChain` hands the callback a brand-new converter with both slots
+    // empty, the pair was rebuilt there after every preset switch: measured
+    // 1060 allocations, 784 frees and ~0.84 ms inside a callback with a few
+    // milliseconds of budget — eight times the cost of the chain rebuild
+    // v1.51.1 moved off the thread. Each round then allocated twice more, a
+    // batch and an output buffer, for ~105 allocations per inference round.
+    //
+    // These tests live in the crate rather than in `tests/` so they can reach
+    // `pub(crate)` phases and private queues without adding test-only public
+    // API to a production type. The counting allocator is per-thread, which is
+    // what makes it safe in the shared test binary — see `crate::alloc_probe`.
+    //
+    // NOT covered here: inference. `drain_chunks` needs a loaded ONNX session
+    // and CI has no ONNX runtime, so nothing below reaches it. That path still
+    // allocates (ort builds tensors per call) and, far worse, blocks for 14–16
+    // ms in the callback with the bundled non-streaming model. That is an
+    // architectural problem needing its own thread and a latency-compensating
+    // queue; it is deliberately out of scope, and these zeros say nothing
+    // about it.
+
+    use crate::alloc_probe::{arm, disarm};
+
+    /// Stand in for inference so phase 4 has input without an ONNX session:
+    /// 16 kHz in becomes 16 kHz out, unchanged.
+    fn pass_chunks_through(vc: &mut VoiceConverter) {
+        while let Some(s) = vc.chunk_in.pop_front() {
+            vc.chunk_out.push_back(s);
+        }
+    }
+
+    fn queue_native(vc: &mut VoiceConverter, block: &[f32]) {
+        for &s in block {
+            vc.native_in.push_back(s);
+        }
+    }
+
+    /// Building a converter is where the cost belongs. Measuring it also proves
+    /// the constructor really does the work — a `new` that had gone lazy again
+    /// would read as suspiciously cheap.
+    #[test]
+    fn the_resamplers_are_built_when_the_converter_is_constructed() {
+        let warm = VoiceConverter::new();
+        assert!(warm.down.is_some() && warm.up.is_some(), "built eagerly");
+        drop(warm);
+
+        arm();
+        let vc = VoiceConverter::new();
+        let (allocs, frees) = disarm();
+        assert!(
+            vc.down.is_some() && vc.up.is_some(),
+            "a fresh converter must arrive with both resamplers ready, so the \
+             audio thread never has to build one"
+        );
+        assert!(
+            allocs > 200,
+            "only {allocs} allocations to construct a converter — two 128-tap \
+             sinc tables at 128x oversampling cost far more than that, so the \
+             build has probably gone lazy again"
+        );
+        eprintln!("VoiceConverter::new: {allocs} allocations, {frees} frees");
+    }
+
+    /// The callback's half allocates and frees nothing.
+    #[test]
+    fn the_resampling_phases_allocate_nothing() {
+        let mut vc = VoiceConverter::new();
+
+        // Prime one round of each direction outside the window, so first-call
+        // effects are not attributed to the steady state.
+        queue_native(&mut vc, &vec![0.1_f32; CHUNK_16K * 4]);
+        vc.downsample_queued();
+        pass_chunks_through(&mut vc);
+        vc.upsample_queued();
+        vc.native_out.clear();
+
+        let block = vec![0.25_f32; 480];
+        let mut total = (0_usize, 0_usize);
+        for _ in 0..2000 {
+            // Queueing is the caller's business; what is measured is the phases.
+            queue_native(&mut vc, &block);
+            arm();
+            vc.downsample_queued();
+            let (a1, f1) = disarm();
+            pass_chunks_through(&mut vc);
+            arm();
+            vc.upsample_queued();
+            let (a2, f2) = disarm();
+            total.0 += a1 + a2;
+            total.1 += f1 + f2;
+            // Keep the output queue from growing without bound and reallocating
+            // inside a measured window for reasons that are the test's fault.
+            vc.native_out.clear();
+        }
+        assert_eq!(
+            total,
+            (0, 0),
+            "{} allocations and {} frees across 2000 callbacks of resampling",
+            total.0,
+            total.1
+        );
+    }
+
+    /// And the phases are still correct: the rates come out right and a tone
+    /// survives the round trip. A zero-allocation path that produced silence
+    /// would pass the test above.
+    #[test]
+    fn the_phases_convert_at_the_right_rates_and_keep_the_signal() {
+        let mut vc = VoiceConverter::new();
+        let n = NATIVE_RATE as usize;
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                (f64::from(i as u32) * 440.0 * std::f64::consts::TAU / f64::from(NATIVE_RATE)).sin()
+                    as f32
+                    * 0.5
+            })
+            .collect();
+        queue_native(&mut vc, &input);
+        vc.downsample_queued();
+
+        // One second in gives about one second at the model rate, minus the
+        // tail short of a whole round.
+        let down = vc.chunk_in.len();
+        let want = MODEL_RATE as usize;
+        assert!(
+            down <= want && down + CHUNK_16K >= want,
+            "1 s at {NATIVE_RATE} Hz gave {down} samples at {MODEL_RATE} Hz, \
+             wanted about {want}"
+        );
+
+        pass_chunks_through(&mut vc);
+        vc.upsample_queued();
+        let up = vc.native_out.len();
+        assert!(
+            up <= down * 3 + UP_CHUNK && up + UP_CHUNK * 4 >= down * 3,
+            "{down} samples at {MODEL_RATE} Hz gave back {up} at {NATIVE_RATE} Hz"
+        );
+
+        let out: Vec<f32> = vc.native_out.iter().copied().collect();
+        let body = &out[out.len() / 4..];
+        let peak = body.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+        assert!((peak - 0.5).abs() < 0.05, "peak {peak:.4}, expected ~0.5");
+        let worst = body
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst < 0.1,
+            "worst adjacent step {worst:.4} — discontinuous"
+        );
+    }
+
+    /// The preset-switch case specifically: a brand-new converter's FIRST
+    /// resampling round must cost nothing. This is the one that used to pay
+    /// 1060 allocations.
+    #[test]
+    fn a_fresh_converters_first_round_costs_nothing() {
+        let mut vc = VoiceConverter::new();
+        queue_native(&mut vc, &vec![0.2_f32; CHUNK_16K * 4]);
+
+        arm();
+        vc.downsample_queued();
+        let (allocs, frees) = disarm();
+
+        assert!(
+            !vc.chunk_in.is_empty(),
+            "the first round produced nothing, so this proves nothing"
+        );
+        assert_eq!(
+            (allocs, frees),
+            (0, 0),
+            "a fresh converter's first resampling round cost {allocs} \
+             allocations and {frees} frees — the build is back in the callback"
+        );
     }
 }

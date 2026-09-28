@@ -240,6 +240,14 @@ impl MonoResampler {
         self.need
     }
 
+    /// The most native-rate frames any round up to `max_out_frames` can ask
+    /// for. A caller staging its own input needs a buffer this big and never
+    /// bigger.
+    #[must_use]
+    pub fn max_input_frames(&self) -> usize {
+        self.stage[0].len()
+    }
+
     /// Rounds so far that ran with a zero-filled tail. A session that climbs
     /// steadily here is starved, not drifting.
     #[must_use]

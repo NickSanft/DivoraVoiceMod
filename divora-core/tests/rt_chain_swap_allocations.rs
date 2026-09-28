@@ -29,19 +29,23 @@
 //!   with it;
 //!
 //! What is NOT pinned, and must not be read into the zeros above: the rest of
-//! the output callback. `VoiceConverter::process` builds two sinc resamplers
-//! in the callback after every preset switch and allocates per inference
-//! chunk; the soundboard drain frees a decoded clip on a Play or a Stop. Both
-//! predate this file, both are documented at their sites, and neither is in
-//! scope here — this binary measures the command and config drains, with no
-//! resampler, no voice model session, no soundboard and no inference in the
-//! context it builds.
+//! the output callback. The soundboard drain frees a decoded clip on a Play or
+//! a Stop, and `VoiceConverter`'s INFERENCE still allocates and blocks for
+//! 14–16 ms. Both predate this file, both are documented at their sites, and
+//! neither is in scope here — this binary measures the command and config
+//! drains, with no resampler, no voice model session, no soundboard and no
+//! inference in the context it builds.
 //!
-//! `MonoResampler` used to be on that list. It is pinned now, in its own
-//! binary — `tests/rt_resampler.rs`, which drives the real `resample_pop` and
-//! `resample_render` through a two-clock ring harness. A pointer rather than
-//! silence, so the two files cannot drift: do not read *its* zeros as covering
-//! the voice converter either.
+//! Two things that used to be on that list have their own coverage now, and
+//! this is a pointer rather than silence so the files cannot drift:
+//!
+//! * the device-rate bridge, in `tests/rt_resampler.rs`, which drives the real
+//!   `resample_pop` and `resample_render` through a two-clock ring harness;
+//! * `VoiceConvert`'s resampling phases, in that module's own unit tests — they
+//!   are `pub(crate)`, so they are measured from inside the crate using
+//!   `crate::alloc_probe` rather than from a fourth test binary.
+//!
+//! Do not read any of those zeros as covering the others.
 //! * the counter is live — proved in the same run by measuring what the code
 //!   used to do in that same place (build the replacement inline, drop the
 //!   chain it displaced) and requiring that to be non-zero. Without this a

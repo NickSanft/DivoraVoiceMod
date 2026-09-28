@@ -317,11 +317,21 @@ impl AudioEngine {
     /// switch, that is the `WebView2` message thread — the window's event loop —
     /// because `set_effect_chain` and `set_voice_model` are plain `fn`
     /// commands, and a sync `#[tauri::command]` runs inline in the IPC
-    /// handler. It is small enough to get away with: ~0.1–0.2 ms even for a
-    /// chain containing every effect kind, measured in release. Nothing here
-    /// builds a resampler — `VoiceConverter::new` leaves both of its slots
-    /// `None` — and the one genuinely slow thing on this path, the ONNX model
-    /// load, is already off-thread inside [`VoiceModel::start`].
+    /// handler. It is still small enough to get away with, but the figure has
+    /// moved and the reason is worth knowing: measured in release, a five-effect
+    /// chain builds in ~124 µs and the same chain **with a `VoiceConvert` in
+    /// it** in ~833 µs. Almost all of that difference is the converter's two
+    /// 128-tap sinc resamplers, which v1.51.3 moved here precisely because they
+    /// were being built in the audio callback instead — where 0.84 ms is a
+    /// dropout rather than 5% of one UI frame. That is the trade, made
+    /// deliberately.
+    ///
+    /// The one genuinely slow thing on this path, the ONNX model load, is
+    /// already off-thread inside [`VoiceModel::start`]. If the sinc cost ever
+    /// does matter, `oversampling_factor` is the knob: measured, dropping it
+    /// from 128 to 32 is 4.9× cheaper to build with an unchanged stopband,
+    /// where cutting `sinc_len` instead would let a full-scale tone alias back
+    /// at −29 dB.
     ///
     /// If that ever stops being small, make the command `async` and use
     /// `spawn_blocking`, which is what moves work OFF the event loop; do not
