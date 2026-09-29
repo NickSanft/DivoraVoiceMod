@@ -28,22 +28,23 @@
 //!   interning the keys will fail this test and take the comments claiming it
 //!   with it;
 //!
-//! What is NOT pinned, and must not be read into the zeros above: the rest of
-//! the output callback. The soundboard drain frees a decoded clip on a Play or
-//! a Stop, and `VoiceConverter`'s INFERENCE still allocates and blocks for
-//! 14–16 ms. Both predate this file, both are documented at their sites, and
-//! neither is in scope here — this binary measures the command and config
-//! drains, with no resampler, no voice model session, no soundboard and no
-//! inference in the context it builds.
+//! What is NOT pinned, and must not be read into the zeros above: this binary
+//! measures the command and config drains, with no resampler, no voice model
+//! session, no soundboard and no inference in the context it builds. One thing
+//! in the callback is still outside every one of these files —
+//! `VoiceConverter`'s INFERENCE, which allocates and blocks for 14–16 ms with
+//! the bundled model. That is architectural, documented at its site, and
+//! deliberately unfixed.
 //!
-//! Two things that used to be on that list have their own coverage now, and
-//! this is a pointer rather than silence so the files cannot drift:
+//! Everything else that used to be on this list has its own coverage now, and
+//! these are pointers rather than silence so the files cannot drift:
 //!
 //! * the device-rate bridge, in `tests/rt_resampler.rs`, which drives the real
 //!   `resample_pop` and `resample_render` through a two-clock ring harness;
-//! * `VoiceConvert`'s resampling phases, in that module's own unit tests — they
-//!   are `pub(crate)`, so they are measured from inside the crate using
-//!   `crate::alloc_probe` rather than from a fourth test binary.
+//! * `VoiceConvert`'s resampling phases and the soundboard drain, in their own
+//!   modules' unit tests — both reach `pub(crate)` internals, so they are
+//!   measured from inside the crate using `crate::alloc_probe` rather than from
+//!   more test binaries.
 //!
 //! Do not read any of those zeros as covering the others.
 //! * the counter is live — proved in the same run by measuring what the code

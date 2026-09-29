@@ -1556,7 +1556,18 @@ fn build_output_stream(
                 // line above as covering the whole callback.
                 drain_dsp_edits(&dsp_rx, &mut chain, &mut graveyard, &reading);
                 while let Ok(cmd) = sb_rx.try_recv() {
-                    soundboard.apply(cmd);
+                    // A Play displaces whatever held the slot and a Stop
+                    // arrives owning a name; both leave through the graveyard
+                    // rather than being freed here. The clip is the one that
+                    // matters: when this callback holds its last reference,
+                    // stealing the slot frees the whole decoded buffer —
+                    // measured at 1.9 MB for a ten-second clip.
+                    if let Some(retired) = soundboard.apply(cmd) {
+                        let _ = graveyard.try_push(Displaced::Audio {
+                            clip_id: retired.clip_id,
+                            samples: retired.samples,
+                        });
+                    }
                 }
 
                 // Phase 14: publish the chain's added latency (ms) for
@@ -2831,12 +2842,14 @@ mod tests {
         // Inject a 4096-sample clip of constant 0.25 at 48 kHz so the
         // voice doesn't run dry within the 480-sample mix window.
         let clip = Arc::new(vec![0.25_f32; 4096]);
-        sb.apply(SoundboardCommand::Play {
+        // The retirement goes to the graveyard in production; here there is
+        // nothing to route it to, so drop it off the audio thread's behalf.
+        drop(sb.apply(SoundboardCommand::Play {
             clip_id: "test".to_string(),
             samples: clip,
             sample_rate: 48_000,
             gain: 1.0,
-        });
+        }));
         // Pretend the mic delivered a 480-sample buffer of constant 0.10.
         let mut mono = vec![0.10_f32; 480];
         let mut sb_out = vec![0.0_f32; 480];
@@ -3558,6 +3571,43 @@ mod tests {
     }
 
     // ---- the chain swap: built off-thread, freed off-thread ----
+
+    /// The soundboard seam. `SoundboardMixer::apply` hands back what it retired
+    /// and its own tests prove that costs nothing, but nothing in those tests
+    /// can see whether this callback then *routes* it or just drops it — and
+    /// dropping it puts the free straight back where it was. `#[must_use]`
+    /// catches an accidental discard; it cannot catch a deliberate one.
+    ///
+    /// So this reads the source. It is a grep, and it is the honest limit of
+    /// what can be checked without a real audio device.
+    ///
+    /// Every needle is assembled with `concat!` from halves, because
+    /// `include_str!` pulls in THIS function too: a needle written as one
+    /// literal matches the assertion that looks for it, so the positive checks
+    /// would pass with the drain deleted and the negative one could never pass
+    /// at all. The split halves do not appear joined anywhere in the file
+    /// except at the site being checked.
+    #[test]
+    fn the_soundboard_drain_routes_what_it_retires_to_the_graveyard() {
+        let src = include_str!("engine.rs");
+        let keeps = concat!("if let Some(retired) = soundboard", ".apply(cmd)");
+        assert!(
+            src.contains(keeps),
+            "the soundboard drain must keep what `apply` hands back"
+        );
+        let routes = concat!("graveyard.try_push(Displaced", "::Audio {");
+        assert!(
+            src.contains(routes),
+            "and push it to the graveyard rather than dropping it in the callback"
+        );
+        // A `drop(..)` here would satisfy `#[must_use]` while restoring the
+        // defect, so name that specific shape.
+        let discards = concat!("drop(soundboard", ".apply(");
+        assert!(
+            !src.contains(discards),
+            "dropping the retirement in the callback IS the defect this fixed"
+        );
+    }
 
     /// The graveyard frees what the callback hands it — and then stops, when
     /// the session does.

@@ -278,6 +278,16 @@ pub enum Displaced {
     /// [`ReactiveModulator::configure`] swaps rather than copies, so what
     /// comes back here is the PREVIOUS table in the incoming config's shell.
     Reactive(ResolvedReactive),
+    /// Owned audio the soundboard retired: a displaced voice's name and
+    /// decoded clip, or a `Stop`'s own name.
+    ///
+    /// The fields are inline rather than a `soundboard` type so this module
+    /// stays clear of that one; the engine, which already knows both, bridges
+    /// them.
+    Audio {
+        clip_id: String,
+        samples: Option<std::sync::Arc<Vec<f32>>>,
+    },
 }
 
 /// A chain edit in the form the audio callback can apply.

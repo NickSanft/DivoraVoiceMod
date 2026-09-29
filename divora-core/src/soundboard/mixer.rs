@@ -51,6 +51,26 @@ pub enum SoundboardCommand {
     SetMasterGain(f32),
 }
 
+/// Owned audio the audio callback took out of the mixer and must not free.
+///
+/// Playing a clip replaces whatever occupied the voice slot, and stopping one
+/// arrives carrying an owned name. Both used to be dropped on the spot. The
+/// counts were small — one free for a `Stop`, one for a `Play` into a fresh
+/// slot — but the third case is the one that matters: when the callback holds
+/// the last reference to a decoded clip, stealing that slot frees the whole
+/// buffer there. Measured at 3 frees for a 1.9 MB clip, one of which is the
+/// 1.9 MB itself.
+///
+/// So it leaves instead, by the same route as a displaced effect chain: out
+/// through a preallocated ring to the `divora-graveyard` thread.
+pub struct RetiredAudio {
+    /// A displaced voice's clip name, or a `Stop`'s own owned name.
+    pub clip_id: String,
+    /// The decoded clip a displaced voice held, if it had one. `None` for a
+    /// `Stop`, which displaces nothing.
+    pub samples: Option<Arc<Vec<f32>>>,
+}
+
 /// Wire-format snapshot of a playing voice for the UI's progress UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -111,9 +131,14 @@ impl SoundboardMixer {
         }
     }
 
-    /// Apply a single command. Called from the audio callback after
-    /// draining the SPSC channel.
-    pub fn apply(&mut self, cmd: SoundboardCommand) {
+    /// Apply a single command, handing back any owned audio it retired.
+    ///
+    /// Called from the audio callback after draining the SPSC channel, so the
+    /// return value is the whole point: this cannot see the engine's graveyard
+    /// ring, so what it displaces leaves through the caller. Dropping the
+    /// return value instead of routing it does exactly what this change fixed.
+    #[must_use]
+    pub fn apply(&mut self, cmd: SoundboardCommand) -> Option<RetiredAudio> {
         match cmd {
             SoundboardCommand::Play {
                 clip_id,
@@ -127,14 +152,34 @@ impl SoundboardMixer {
                 sample_rate,
                 gain,
             } => self.play(clip_id, samples, sample_rate, gain, true),
-            SoundboardCommand::Stop { clip_id } => self.stop(&clip_id),
-            SoundboardCommand::StopAll => self.stop_all(),
+            // The command owns this string and the mixer has no home for it, so
+            // it has to leave rather than be dropped here.
+            SoundboardCommand::Stop { clip_id } => {
+                self.stop(&clip_id);
+                Some(RetiredAudio {
+                    clip_id,
+                    samples: None,
+                })
+            }
+            // Neither of these owns anything: `stop_all` only clears flags, and
+            // a gain is a float.
+            SoundboardCommand::StopAll => {
+                self.stop_all();
+                None
+            }
             SoundboardCommand::SetMasterGain(g) => {
                 self.master_gain = g.clamp(0.0, 4.0);
+                None
             }
         }
     }
 
+    /// Start a voice, returning whatever occupied the slot it took.
+    ///
+    /// `mem::replace` rather than assignment: `*v = Voice { .. }` drops the
+    /// previous occupant right here, and an idle slot still owns an `Arc`, a
+    /// stopped slot still owns its decoded clip, and both own a name. Handing
+    /// the occupant back is what keeps those frees off the audio thread.
     fn play(
         &mut self,
         clip_id: String,
@@ -142,39 +187,38 @@ impl SoundboardMixer {
         sample_rate: u32,
         gain: f32,
         monitor_only: bool,
-    ) {
+    ) -> Option<RetiredAudio> {
         self.counter = self.counter.wrapping_add(1);
         let started_at = self.counter;
         let gain = gain.clamp(0.0, 4.0);
-        // Prefer an idle slot.
-        for v in &mut self.voices {
-            if !v.active {
-                *v = Voice {
-                    clip_id,
-                    samples,
-                    sample_rate,
-                    gain,
-                    monitor_only,
-                    position: 0.0,
-                    active: true,
-                    started_at,
-                };
-                return;
-            }
-        }
-        // All slots busy — steal the oldest.
-        if let Some(oldest) = self.voices.iter_mut().min_by_key(|v| v.started_at) {
-            *oldest = Voice {
-                clip_id,
-                samples,
-                sample_rate,
-                gain,
-                monitor_only,
-                position: 0.0,
-                active: true,
-                started_at,
-            };
-        }
+        let fresh = Voice {
+            clip_id,
+            samples,
+            sample_rate,
+            gain,
+            monitor_only,
+            position: 0.0,
+            active: true,
+            started_at,
+        };
+        // Prefer an idle slot; otherwise steal the oldest. Found by index and
+        // then taken mutably once, because searching mutably and falling back
+        // mutably would be two overlapping borrows of the same array.
+        let idle = self.voices.iter().position(|v| !v.active);
+        let index = match idle {
+            Some(i) => i,
+            None => self
+                .voices
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| v.started_at)
+                .map(|(i, _)| i)?,
+        };
+        let displaced = std::mem::replace(&mut self.voices[index], fresh);
+        Some(RetiredAudio {
+            clip_id: displaced.clip_id,
+            samples: Some(displaced.samples),
+        })
     }
 
     fn stop(&mut self, clip_id: &str) {
@@ -277,6 +321,13 @@ impl Default for SoundboardMixer {
 #[cfg(test)]
 mod tests {
     use super::{SoundboardCommand, SoundboardMixer, MAX_VOICES};
+
+    /// Apply a command and drop what it retired, which is what the graveyard
+    /// thread does with it — just not on the audio thread.
+    fn apply(m: &mut SoundboardMixer, cmd: SoundboardCommand) {
+        drop(m.apply(cmd));
+    }
+
     use std::sync::Arc;
 
     fn ramp(samples: usize) -> Arc<Vec<f32>> {
@@ -300,12 +351,15 @@ mod tests {
     #[test]
     fn play_adds_into_output() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::Play {
-            clip_id: "a".into(),
-            samples: Arc::new(vec![0.5_f32; 128]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "a".into(),
+                samples: Arc::new(vec![0.5_f32; 128]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         let mut out = vec![0.0_f32; 64];
         m.mix_into(&mut out, 48_000);
         for s in &out {
@@ -316,12 +370,15 @@ mod tests {
     #[test]
     fn voice_deactivates_at_end_of_buffer() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::Play {
-            clip_id: "a".into(),
-            samples: Arc::new(vec![0.5_f32; 32]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "a".into(),
+                samples: Arc::new(vec![0.5_f32; 32]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         assert_eq!(m.active_voice_count(), 1);
         let mut out = vec![0.0_f32; 128];
         m.mix_into(&mut out, 48_000);
@@ -331,22 +388,31 @@ mod tests {
     #[test]
     fn stop_deactivates_matching_voice() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::Play {
-            clip_id: "keep".into(),
-            samples: Arc::new(vec![0.5_f32; 1024]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
-        m.apply(SoundboardCommand::Play {
-            clip_id: "kill".into(),
-            samples: Arc::new(vec![0.5_f32; 1024]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "keep".into(),
+                samples: Arc::new(vec![0.5_f32; 1024]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "kill".into(),
+                samples: Arc::new(vec![0.5_f32; 1024]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         assert_eq!(m.active_voice_count(), 2);
-        m.apply(SoundboardCommand::Stop {
-            clip_id: "kill".into(),
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Stop {
+                clip_id: "kill".into(),
+            },
+        );
         assert_eq!(m.active_voice_count(), 1);
     }
 
@@ -354,15 +420,18 @@ mod tests {
     fn stop_all_clears_every_voice() {
         let mut m = SoundboardMixer::new();
         for i in 0..4 {
-            m.apply(SoundboardCommand::Play {
-                clip_id: format!("v{i}"),
-                samples: Arc::new(vec![0.5_f32; 1024]),
-                sample_rate: 48_000,
-                gain: 1.0,
-            });
+            apply(
+                &mut m,
+                SoundboardCommand::Play {
+                    clip_id: format!("v{i}"),
+                    samples: Arc::new(vec![0.5_f32; 1024]),
+                    sample_rate: 48_000,
+                    gain: 1.0,
+                },
+            );
         }
         assert_eq!(m.active_voice_count(), 4);
-        m.apply(SoundboardCommand::StopAll);
+        apply(&mut m, SoundboardCommand::StopAll);
         assert_eq!(m.active_voice_count(), 0);
     }
 
@@ -373,12 +442,15 @@ mod tests {
         // position should be ~N/2 source samples.
         let mut m = SoundboardMixer::new();
         let clip = ramp(2_000);
-        m.apply(SoundboardCommand::Play {
-            clip_id: "slow".into(),
-            samples: clip.clone(),
-            sample_rate: 24_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "slow".into(),
+                samples: clip.clone(),
+                sample_rate: 24_000,
+                gain: 1.0,
+            },
+        );
         let mut out = vec![0.0_f32; 1_000];
         m.mix_into(&mut out, 48_000);
         // After 1000 output samples at 24/48 ratio = 500 source samples.
@@ -391,12 +463,15 @@ mod tests {
     fn polyphony_sums_voices() {
         let mut m = SoundboardMixer::new();
         for _ in 0..3 {
-            m.apply(SoundboardCommand::Play {
-                clip_id: "x".into(),
-                samples: Arc::new(vec![0.3_f32; 1024]),
-                sample_rate: 48_000,
-                gain: 1.0,
-            });
+            apply(
+                &mut m,
+                SoundboardCommand::Play {
+                    clip_id: "x".into(),
+                    samples: Arc::new(vec![0.3_f32; 1024]),
+                    sample_rate: 48_000,
+                    gain: 1.0,
+                },
+            );
         }
         let mut out = vec![0.0_f32; 64];
         m.mix_into(&mut out, 48_000);
@@ -412,21 +487,27 @@ mod tests {
     fn max_voices_steals_oldest() {
         let mut m = SoundboardMixer::new();
         for i in 0..MAX_VOICES {
-            m.apply(SoundboardCommand::Play {
-                clip_id: format!("voice-{i}"),
-                samples: Arc::new(vec![0.1_f32; 4096]),
-                sample_rate: 48_000,
-                gain: 1.0,
-            });
+            apply(
+                &mut m,
+                SoundboardCommand::Play {
+                    clip_id: format!("voice-{i}"),
+                    samples: Arc::new(vec![0.1_f32; 4096]),
+                    sample_rate: 48_000,
+                    gain: 1.0,
+                },
+            );
         }
         assert_eq!(m.active_voice_count(), MAX_VOICES);
         // Add a 17th — should bump the oldest.
-        m.apply(SoundboardCommand::Play {
-            clip_id: "voice-new".into(),
-            samples: Arc::new(vec![0.1_f32; 4096]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "voice-new".into(),
+                samples: Arc::new(vec![0.1_f32; 4096]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         assert_eq!(m.active_voice_count(), MAX_VOICES);
         let snap = m.snapshot(48_000);
         assert!(snap.iter().any(|s| s.clip_id == "voice-new"));
@@ -437,12 +518,15 @@ mod tests {
     #[test]
     fn per_voice_gain_scales_output() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::Play {
-            clip_id: "g".into(),
-            samples: Arc::new(vec![0.5_f32; 128]),
-            sample_rate: 48_000,
-            gain: 0.5,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "g".into(),
+                samples: Arc::new(vec![0.5_f32; 128]),
+                sample_rate: 48_000,
+                gain: 0.5,
+            },
+        );
         let mut out = vec![0.0_f32; 64];
         m.mix_into(&mut out, 48_000);
         for s in &out {
@@ -456,13 +540,16 @@ mod tests {
     #[test]
     fn master_gain_scales_every_voice() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::SetMasterGain(0.5));
-        m.apply(SoundboardCommand::Play {
-            clip_id: "g".into(),
-            samples: Arc::new(vec![0.4_f32; 128]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(&mut m, SoundboardCommand::SetMasterGain(0.5));
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "g".into(),
+                samples: Arc::new(vec![0.4_f32; 128]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         let mut out = vec![0.0_f32; 64];
         m.mix_into(&mut out, 48_000);
         for s in &out {
@@ -473,13 +560,16 @@ mod tests {
     #[test]
     fn gains_clamp_to_safe_range() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::SetMasterGain(99.0)); // clamps to 4.0
-        m.apply(SoundboardCommand::Play {
-            clip_id: "g".into(),
-            samples: Arc::new(vec![0.1_f32; 128]),
-            sample_rate: 48_000,
-            gain: 99.0, // clamps to 4.0
-        });
+        apply(&mut m, SoundboardCommand::SetMasterGain(99.0)); // clamps to 4.0
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "g".into(),
+                samples: Arc::new(vec![0.1_f32; 128]),
+                sample_rate: 48_000,
+                gain: 99.0, // clamps to 4.0
+            },
+        );
         let mut out = vec![0.0_f32; 64];
         m.mix_into(&mut out, 48_000);
         // 0.1 × 4.0 (gain) × 4.0 (master) = 1.6 — clamped, not exploded.
@@ -491,12 +581,15 @@ mod tests {
     #[test]
     fn snapshot_reports_duration_and_progress() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::Play {
-            clip_id: "progress".into(),
-            samples: Arc::new(vec![0.1_f32; 9_600]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "progress".into(),
+                samples: Arc::new(vec![0.1_f32; 9_600]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         let mut out = vec![0.0_f32; 480]; // 10 ms at 48 kHz
         m.mix_into(&mut out, 48_000);
         let snap = m.snapshot(48_000);
@@ -509,18 +602,24 @@ mod tests {
     #[test]
     fn monitor_only_routes_to_monitor_path_not_main_send() {
         let mut m = SoundboardMixer::new();
-        m.apply(SoundboardCommand::Play {
-            clip_id: "main".into(),
-            samples: Arc::new(vec![0.5_f32; 1024]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
-        m.apply(SoundboardCommand::PlayMonitorOnly {
-            clip_id: "preview".into(),
-            samples: Arc::new(vec![0.5_f32; 1024]),
-            sample_rate: 48_000,
-            gain: 1.0,
-        });
+        apply(
+            &mut m,
+            SoundboardCommand::Play {
+                clip_id: "main".into(),
+                samples: Arc::new(vec![0.5_f32; 1024]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
+        apply(
+            &mut m,
+            SoundboardCommand::PlayMonitorOnly {
+                clip_id: "preview".into(),
+                samples: Arc::new(vec![0.5_f32; 1024]),
+                sample_rate: 48_000,
+                gain: 1.0,
+            },
+        );
         // Main send carries ONLY the normal clip (~0.5); if the monitor-only
         // clip leaked in it'd sum to ~1.0.
         let mut main = vec![0.0_f32; 64];
@@ -539,5 +638,175 @@ mod tests {
             "mon[0] = {} (expected ~0.5)",
             mon[0]
         );
+    }
+
+    // ---- the drain frees nothing on the audio thread ------------------------
+    //
+    // `apply` runs in the output callback. Until v1.51.2 it dropped what it
+    // displaced right there: a `Play` replaced a voice slot with `*v = Voice`,
+    // and a `Stop` arrived owning a name that had nowhere to go. Measured on
+    // this mixer before the change — 1 free for a `Stop`, 1 for a `Play` into a
+    // never-used slot, and **3 for a `Play` that steals a slot holding the last
+    // reference to a 1.9 MB decoded clip**, one of those three being the 1.9 MB
+    // itself. That last one is why this is worth fixing: not the count, the size.
+    //
+    // The counting allocator is per-thread, so these are safe alongside the
+    // rest of the suite — see `crate::alloc_probe`.
+
+    use crate::alloc_probe::{arm, disarm};
+
+    /// A clip nothing else owns, so retiring it is a real deallocation.
+    fn lone_clip(len: usize) -> Arc<Vec<f32>> {
+        Arc::new(vec![0.2_f32; len])
+    }
+
+    fn play(clip_id: &str, samples: Arc<Vec<f32>>) -> SoundboardCommand {
+        SoundboardCommand::Play {
+            clip_id: clip_id.to_string(),
+            samples,
+            sample_rate: 48_000,
+            gain: 1.0,
+        }
+    }
+
+    /// Measure one `apply`, retiring what it hands back the way the engine does
+    /// — outside the window, standing in for the graveyard thread.
+    fn measure(m: &mut SoundboardMixer, cmd: SoundboardCommand) -> (usize, usize) {
+        arm();
+        let retired = m.apply(cmd);
+        let counts = disarm();
+        drop(retired);
+        counts
+    }
+
+    #[test]
+    fn a_play_into_a_fresh_slot_frees_nothing() {
+        let mut m = SoundboardMixer::new();
+        let clip = lone_clip(1024);
+        // Warm: the first `to_string` and `vec!` are the caller's, not ours.
+        let cmd = play("first", clip);
+        assert_eq!(
+            measure(&mut m, cmd),
+            (0, 0),
+            "a never-used slot still owns an `Arc`, and dropping it here is a \
+             free on the audio thread"
+        );
+    }
+
+    #[test]
+    fn a_stop_frees_nothing_even_though_it_owns_its_name() {
+        let mut m = SoundboardMixer::new();
+        drop(m.apply(play("a", lone_clip(64))));
+        let cmd = SoundboardCommand::Stop {
+            clip_id: "a".to_string(),
+        };
+        assert_eq!(
+            measure(&mut m, cmd),
+            (0, 0),
+            "the `Stop`'s own owned name has no home in the mixer, so it has to \
+             leave rather than be dropped in the callback"
+        );
+    }
+
+    /// The case that matters: every slot holds a clip nothing else owns, so
+    /// stealing one used to free the whole decoded buffer in the callback.
+    #[test]
+    fn stealing_a_slot_does_not_free_the_clip_it_held() {
+        let mut m = SoundboardMixer::new();
+        for i in 0..MAX_VOICES {
+            drop(m.apply(play(&format!("lone{i}"), lone_clip(480_000))));
+        }
+        let cmd = play("next", lone_clip(64));
+        let (allocs, frees) = measure(&mut m, cmd);
+        assert_eq!(
+            (allocs, frees),
+            (0, 0),
+            "stealing a slot cost {allocs} allocations and {frees} frees — one \
+             of those frees is a 1.9 MB buffer, inside a callback with a few \
+             milliseconds of budget"
+        );
+    }
+
+    #[test]
+    fn stop_all_and_a_gain_change_retire_nothing_at_all() {
+        let mut m = SoundboardMixer::new();
+        for i in 0..4 {
+            drop(m.apply(play(&format!("c{i}"), lone_clip(128))));
+        }
+        // `stop_all` only clears flags and a gain is a float, so there is
+        // nothing owned to hand back — and nothing to free either.
+        arm();
+        let a = m.apply(SoundboardCommand::StopAll);
+        let b = m.apply(SoundboardCommand::SetMasterGain(0.5));
+        let counts = disarm();
+        assert!(a.is_none() && b.is_none(), "neither retires anything");
+        assert_eq!(counts, (0, 0));
+    }
+
+    /// A long run, because a single measured call can miss a cost that only
+    /// appears once a slot has been reused.
+    #[test]
+    fn a_thousand_plays_and_stops_free_nothing() {
+        let mut m = SoundboardMixer::new();
+        let shared = lone_clip(4096);
+        let mut total = (0_usize, 0_usize);
+        for i in 0..1000 {
+            let cmd = play(&format!("c{i}"), Arc::clone(&shared));
+            let (a1, f1) = measure(&mut m, cmd);
+            let stop = SoundboardCommand::Stop {
+                clip_id: format!("c{i}"),
+            };
+            let (a2, f2) = measure(&mut m, stop);
+            total.0 += a1 + a2;
+            total.1 += f1 + f2;
+        }
+        assert_eq!(
+            total,
+            (0, 0),
+            "{} allocations and {} frees across 1000 play/stop pairs",
+            total.0,
+            total.1
+        );
+    }
+
+    /// Retiring the occupant must not change what the mixer does. A slot that
+    /// was playing is replaced, an idle slot is filled, and the retired value
+    /// carries exactly what left.
+    #[test]
+    fn what_comes_back_is_what_the_slot_was_holding() {
+        let mut m = SoundboardMixer::new();
+        // A fresh slot hands back its placeholder: no name, an empty clip.
+        let first = m
+            .apply(play("one", lone_clip(32)))
+            .expect("something retired");
+        assert!(first.clip_id.is_empty(), "a never-used slot has no name");
+        assert_eq!(
+            first.samples.as_deref().map(Vec::len),
+            Some(0),
+            "a never-used slot holds an empty clip"
+        );
+        assert_eq!(m.active_voice_count(), 1);
+
+        // Fill the rest, then steal: the retired value is the oldest voice.
+        for i in 1..MAX_VOICES {
+            drop(m.apply(play(&format!("v{i}"), lone_clip(32))));
+        }
+        assert_eq!(m.active_voice_count(), MAX_VOICES);
+        let stolen = m
+            .apply(play("late", lone_clip(32)))
+            .expect("something retired");
+        assert_eq!(stolen.clip_id, "one", "the oldest voice should be stolen");
+        assert_eq!(stolen.samples.as_deref().map(Vec::len), Some(32));
+        assert_eq!(m.active_voice_count(), MAX_VOICES, "still full");
+
+        // A `Stop` retires only its own name.
+        let stopped = m
+            .apply(SoundboardCommand::Stop {
+                clip_id: "v1".to_string(),
+            })
+            .expect("the name has to leave");
+        assert_eq!(stopped.clip_id, "v1");
+        assert!(stopped.samples.is_none(), "a Stop displaces no clip");
+        assert_eq!(m.active_voice_count(), MAX_VOICES - 1);
     }
 }

@@ -3036,12 +3036,14 @@ mod tests {
     fn two_plays_of_the_same_clip_id_stack_in_the_mixer() {
         let mut mixer = SoundboardMixer::new();
         for _ in 0..2 {
-            mixer.apply(SoundboardCommand::Play {
+            // The engine routes the retirement to the graveyard; here there is
+            // nowhere to route it, so drop it off the audio thread's behalf.
+            drop(mixer.apply(SoundboardCommand::Play {
                 clip_id: TTS_CLIP_ID.to_string(),
                 samples: utterance(),
                 sample_rate: 48_000,
                 gain: 1.0,
-            });
+            }));
         }
         assert_eq!(mixer.active_voice_count(), 2);
     }
@@ -3093,7 +3095,7 @@ mod tests {
         let mut mixer = SoundboardMixer::new();
         for preview_only in [false, false, true, false] {
             for cmd in speak_commands(utterance(), 48_000, 1.0, preview_only) {
-                mixer.apply(cmd);
+                drop(mixer.apply(cmd));
             }
             assert_eq!(mixer.active_voice_count(), 1);
         }
