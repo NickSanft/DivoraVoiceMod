@@ -41,7 +41,8 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] The slider is disabled (greyed) when Monitor is toggled off.
 - [ ] Set a non-default volume (e.g. 150 %), restart the app → the slider restores to 150 % and the level matches on the next engine start.
 - [ ] When engine is stopped, Mixer shows "Engine offline" card with a clickable Settings link.
-- [ ] Sample-rate mismatch test: pick devices with different default sample rates (e.g., 44.1 kHz mic + 48 kHz output) → start fails with a clear "sample-rate mismatch" error message.
+- [ ] Sample-rate mismatch (rewritten for v1.51.2 — this step used to expect a start failure, which has been impossible since v0.9 resampled instead): pick devices with different default sample rates (e.g. 44.1 kHz mic + 48 kHz output) → the engine starts, the Mixer header reads "resampling 44100 → 48000 Hz", Settings reads "Running, resampling: 44100 → 48000 Hz to the output", and **your voice sounds clean** — no buzz, no chop, no gaps. Before v1.51.2 this configuration mangled the audio badly enough that the input tone sat 41 dB under the noise.
+- [ ] Monitor-only mismatch: set the separate monitor device to a rate the mic and main output share → the Mixer names the **monitor** ("resampling 48000 → 44100 Hz monitor"), not two identical numbers, and the headphone mix is clean too.
 
 ## Loudness normalization (v1.7.0)
 

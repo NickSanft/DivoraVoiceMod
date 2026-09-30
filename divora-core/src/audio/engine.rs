@@ -72,8 +72,10 @@ const DSP_CHANNEL_CAPACITY: usize = 64;
 /// newest one on any rebuild — and needs a callback that has stopped draining.
 const REACTIVE_CHANNEL_CAPACITY: usize = 64;
 
-/// Capacity of the graveyard ring — chains, voice models and reactive route
-/// tables the audio callback displaced, for [`graveyard_thread`] to free.
+/// Capacity of the graveyard ring — everything the audio callback displaced and
+/// must not free, for [`graveyard_thread`] to drop: effect chains, voice models,
+/// reactive route tables, and (since v1.51.2) retired soundboard clips, which
+/// are both the largest payload here and the most frequent.
 /// Deep enough that an Inspector drag (which sends a reactive config per
 /// change) or someone mashing preset buttons cannot outrun the drain interval
 /// below. Overflow is safe — `try_push` hands the value back and it is freed
@@ -321,7 +323,7 @@ impl AudioEngine {
     /// moved and the reason is worth knowing: measured in release, a five-effect
     /// chain builds in ~124 µs and the same chain **with a `VoiceConvert` in
     /// it** in ~833 µs. Almost all of that difference is the converter's two
-    /// 128-tap sinc resamplers, which v1.51.3 moved here precisely because they
+    /// 128-tap sinc resamplers, which v1.51.2 moved here precisely because they
     /// were being built in the audio callback instead — where 0.84 ms is a
     /// dropout rather than 5% of one UI frame. That is the trade, made
     /// deliberately.
@@ -1198,11 +1200,22 @@ fn graveyard_thread(mut bin: GraveConsumer, alive: Receiver<()>) {
 /// So: at session start, hold off until the ring has twice what a round needs.
 /// After that, always serve — even a round that comes up short.
 ///
+/// Two rounds has to stay comfortably inside [`RING_BUFFER_FRAMES`], or the
+/// cushion could only ever prime from a ring that is essentially full. At the
+/// device buffers Windows actually hands out (480–1056 frames) the deepest
+/// round measured is 2432 native frames against a ring of 8192, better than
+/// 3× margin; `the_steady_state_primes_once_and_then_pads_nothing` pins it by
+/// requiring the ring's peak to stay stationary and under capacity across every
+/// rate pair the suite covers.
+///
 /// That asymmetry is the whole design, and it is a choice between two costs.
 /// Holding off on a *transient* dip means writing a whole silent buffer, which
-/// is 10 ms of nothing and an audible click; measured, the latch kept dropping
-/// and 13% of buffers went silent. Serving short instead means an 11-frame zero
-/// tail on roughly one buffer in twelve — 0.25 ms, ~0.2% of samples — which
+/// is 10 ms of nothing and an audible click. Under ideal clocks the two designs
+/// are indistinguishable — both go silent 2–3 times, all at priming — so the
+/// case for this one is jitter: with the input device's block size varying by
+/// ±120 frames, dropping the latch on each dip measured 9–10 silent buffers over
+/// 30 s against 1–2 here. Serving short instead means a zero tail of a few
+/// frames on the rare buffer that comes up short — 0.25 ms — which
 /// [`MonoResampler::run`] handles and counts. The dip is unavoidable without a
 /// cushion of about three rounds (~28 ms of latency, against a ~26 ms budget
 /// for the whole pipeline), so the tiny pad is the right trade.
@@ -1246,9 +1259,19 @@ impl RingCushion {
 /// The resample step's input half: size this round, honour the cushion, and
 /// pop that much native-rate audio out of the ring.
 ///
-/// Returns how many frames landed at the front of `native`, and whether this
-/// buffer is being served at all — `false` means the cushion is still filling
-/// and the caller should write silence.
+/// Returns `(block, span)`:
+///
+/// * `span` is the callback's input-rate timeline — exactly what the resampler
+///   needs to fill this device buffer. It does not depend on the ring, and the
+///   caller sizes everything that is NOT fed from the ring by it: the soundboard
+///   mix, the monitor tap, the recorder.
+/// * `block <= span` is how many microphone frames actually arrived. The voice
+///   path and the voice-reading taps are sized by this, and the caller zeroes
+///   `native[block..span]`, which is what a microphone dropout sounds like.
+///
+/// The cushion gates `block`, never `span`. Conflating the two is what silenced
+/// the soundboard when a capture stream died: `mix_filtered` returns on an empty
+/// slice, so its voices produced nothing and never advanced.
 ///
 /// `native.len()` doubles as the budget for how much native-rate audio one
 /// round may need, which is why the caller hands over its whole DSP buffer.
@@ -1264,46 +1287,61 @@ pub fn resample_pop(
     cushion: &mut RingCushion,
     out_frames: usize,
     native: &mut [f32],
-) -> (usize, bool) {
+) -> (usize, usize) {
     let Some(r) = resampler else {
         // Rates match: one native frame per output frame, no resampler at all.
-        let want = out_frames.min(native.len());
-        return (consumer.pop_slice(&mut native[..want]), true);
+        let span = out_frames.min(native.len());
+        let block = consumer.pop_slice(&mut native[..span]);
+        zero_gap(native, block, span);
+        return (block, span);
     };
     // Ask the resampler what this buffer needs. Do not estimate it — and above
     // all do not estimate it and then add a chunk "to be safe", which is what
     // put silence into a third of every block before v1.51.2.
-    let need = r.prepare_within(out_frames, native.len());
-    if !cushion.ready(consumer.occupied_len(), need) {
-        return (0, false);
-    }
-    (consumer.pop_slice(&mut native[..need]), true)
+    let span = r.prepare_within(out_frames, native.len());
+    let block = if cushion.ready(consumer.occupied_len(), span) {
+        consumer.pop_slice(&mut native[..span])
+    } else {
+        0
+    };
+    zero_gap(native, block, span);
+    (block, span)
 }
 
-/// The resample step's output half: render `block` native-rate frames from the
+/// Silence the microphone gap, so a short or empty ring costs the voice and
+/// nothing else. Cheap and bounded: empty in steady state, and at most one
+/// round when a capture stream dies.
+fn zero_gap(native: &mut [f32], block: usize, span: usize) {
+    let end = span.min(native.len());
+    if block < end {
+        native[block..end].fill(0.0);
+    }
+}
+
+/// The resample step's output half: render `span` native-rate frames from the
 /// front of `native` into `out`, and report how many output frames were written.
 ///
-/// Passing `native` whole with `block` as a separate count is deliberate; see
+/// `span`, not the microphone's `block`: by this point the caller has zeroed the
+/// microphone gap and mixed the soundboard in over the whole span, so the buffer
+/// is full-length real audio even when the ring gave nothing. Running the round
+/// unconditionally is what keeps a soundboard clip playing over a dead mic.
+///
+/// Passing `native` whole with a separate count is deliberate; see
 /// [`MonoResampler::run`].
 #[doc(hidden)]
 pub fn resample_render(
     resampler: Option<&mut MonoResampler>,
-    serving: bool,
     native: &[f32],
-    block: usize,
+    span: usize,
     out: &mut [f32],
 ) -> usize {
-    match resampler {
-        // Still filling the cushion: silence, and crucially no round — zeros
-        // pushed through the sinc filter are not a delay, they are a signal.
-        Some(_) if !serving => 0,
-        Some(r) => r.run(native, block, out),
-        None => {
-            let n = block.min(out.len()).min(native.len());
-            out[..n].copy_from_slice(&native[..n]);
-            n
-        }
+    if let Some(r) = resampler {
+        return r.run(native, span, out);
     }
+    // Rates match: straight copy, no resampler in the path at all.
+    let n = span.min(out.len()).min(native.len());
+    out[..n].copy_from_slice(&native[..n]);
+    n
 }
 
 /// Apply every pending reactive configuration, at the top of an output buffer.
@@ -1547,13 +1585,16 @@ fn build_output_stream(
                 // `tests/rt_chain_swap_allocations.rs` pins it at exactly one
                 // so it cannot grow in the meantime.
                 //
-                // That is a claim about THIS drain and nothing else. Further
-                // down the same callback the soundboard drain frees on a Play
-                // or a Stop, `MonoResampler::process` allocates once per
-                // buffer when the device rates differ, and `VoiceConverter`
-                // builds its sinc resamplers and runs inference here. All
-                // three predate this work and none is fixed; do not read the
-                // line above as covering the whole callback.
+                // That is a claim about THIS drain and nothing else — but the
+                // list that used to follow it is out of date in the other
+                // direction now. The soundboard drain below no longer frees, the
+                // device-rate resampler no longer allocates per buffer, and
+                // `VoiceConverter` no longer builds its sinc pair here; v1.51.2
+                // fixed all three. What is left in this callback is
+                // `VoiceConvert` INFERENCE, which allocates and overruns the
+                // deadline badly (~83–106 ms on one callback in twenty-six with
+                // the bundled model). Still do not read the line above as
+                // covering the whole callback.
                 drain_dsp_edits(&dsp_rx, &mut chain, &mut graveyard, &reading);
                 while let Ok(cmd) = sb_rx.try_recv() {
                     // A Play displaces whatever held the slot and a Stop
@@ -1583,18 +1624,26 @@ fn build_output_stream(
                 let out_frames = out_frames.min(MAX_FRAMES_PER_CALLBACK);
                 let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
 
-                // Size this round, wait for the cushion, and take what the ring
-                // actually had. Everything downstream is sized by `block`, so a
-                // short ring costs a shorter block rather than a block padded
-                // with silence.
+                // Two lengths, and the difference matters. `span` is this
+                // callback's input-rate timeline — exactly what the resampler
+                // needs — and sizes everything NOT fed from the input ring: the
+                // soundboard mix, the monitor tap, the recorder. `block` is the
+                // microphone frames that actually arrived, and sizes the voice
+                // and its reading taps; `resample_pop` has already zeroed the
+                // gap between them.
                 //
-                // Until v1.51.2 this estimated the count and then added a whole
-                // chunk on top as a "keep one ready" hedge, so the engine asked
-                // for more native audio than the input device produces, for
-                // ever. The ring could never keep up, and a THIRD of every block
-                // reaching the DSP chain, the recorder, the monitor mix and the
-                // voice reading was zero-fill.
-                let (block, serving) = resample_pop(
+                // Conflating them silenced the soundboard whenever the ring ran
+                // dry, because `mix_filtered` returns on an empty slice, so its
+                // voices produced nothing and never advanced — a dead capture
+                // stream left every tile and every Speak preview silent for the
+                // rest of the session.
+                //
+                // Until v1.51.2 `span` was estimated and then had a whole chunk
+                // added as a "keep one ready" hedge, so the engine asked for
+                // more native audio than the input device produces, for ever:
+                // the ring could never keep up, and a THIRD of every block was
+                // zero-fill rather than the empty gap it is now.
+                let (block, span) = resample_pop(
                     &mut consumer,
                     resampler.as_mut(),
                     &mut cushion,
@@ -1630,14 +1679,17 @@ fn build_output_stream(
                 // reserved in BOTH rings now so the WET copy after the chain
                 // cannot be the one that gets dropped, which would leave the
                 // two taps permanently out of step.
+                // `block`, not `span`: these two measure the user's VOICE, and
+                // a microphone gap is not part of it. Identical in steady state,
+                // where the gap is empty.
                 let tapping = reading_taps.armed(reading.is_enabled(), block);
                 if tapping {
                     reading_taps.push_dry(&mono[..block]);
                 }
 
                 mix_voice_and_soundboard(
-                    &mut mono[..block],
-                    &mut sb[..block],
+                    &mut mono[..span],
+                    &mut sb[..span],
                     &mut chain,
                     &mut modulator,
                     &mut loudness,
@@ -1682,30 +1734,30 @@ fn build_output_stream(
                     // is then played ungated in the monitor stream.
                     let mut mon = [0f32; MAX_FRAMES_PER_CALLBACK];
                     if mic_mon {
-                        mon[..block].copy_from_slice(&mono[..block]);
+                        mon[..span].copy_from_slice(&mono[..span]);
                     }
                     if speak_mon {
-                        for (m, &s) in mon[..block].iter_mut().zip(&sb[..block]) {
+                        for (m, &s) in mon[..span].iter_mut().zip(&sb[..span]) {
                             *m += s;
                         }
-                        soundboard.mix_monitor_into(&mut mon[..block], input_rate);
+                        soundboard.mix_monitor_into(&mut mon[..span], input_rate);
                     } else {
                         // Still advance the monitor-only voices so clips play through.
                         let mut scratch = [0f32; MAX_FRAMES_PER_CALLBACK];
-                        soundboard.mix_monitor_into(&mut scratch[..block], input_rate);
+                        soundboard.mix_monitor_into(&mut scratch[..span], input_rate);
                     }
-                    let _ = mp.push_slice(&mon[..block]);
+                    let _ = mp.push_slice(&mon[..span]);
                 } else {
                     // No separate monitor device: the single output carries the
                     // monitor-only voices too (gated downstream by the monitor
                     // toggle, exactly as before).
-                    soundboard.mix_monitor_into(&mut mono[..block], input_rate);
+                    soundboard.mix_monitor_into(&mut mono[..span], input_rate);
                 }
 
                 // Fold the soundboard `Play` voices back into `mono` for the main
                 // send (the call always hears Speak/soundboard output) and the
                 // recording tap below.
-                for (m, &s) in mono[..block].iter_mut().zip(&sb[..block]) {
+                for (m, &s) in mono[..span].iter_mut().zip(&sb[..span]) {
                     *m += s;
                 }
 
@@ -1715,22 +1767,21 @@ fn build_output_stream(
                 // samples (a brief gap in the file) rather than stalling
                 // the audio thread with file I/O.
                 if state_for_callback.recording.load(Ordering::Acquire) {
-                    let _ = recording_producer.push_slice(&mono[..block]);
+                    let _ = recording_producer.push_slice(&mono[..span]);
                 }
 
                 // Now hand the native-rate buffer to the output pipeline.
                 // Either a passthrough (rates match) or via the resampler.
                 //
-                // `&mono` whole, with `block` as a separate count: the callee
+                // `&mono` whole, with `span` as a separate count: the callee
                 // slices it, so there is no bound here for a future edit to get
                 // wrong. That is not stylistic — a call site choosing its own
                 // bound is precisely the defect v1.51.2 fixed.
                 let mut output_mono = [0f32; MAX_FRAMES_PER_CALLBACK];
                 let written_out = resample_render(
                     resampler.as_mut(),
-                    serving,
                     &mono,
-                    block,
+                    span,
                     &mut output_mono[..out_frames],
                 );
 
@@ -1840,7 +1891,7 @@ fn build_monitor_stream(
                 // monitor 186 ms behind for ever) or starves (27 725 zeros a
                 // second). They change together.
                 let mut mono = [0f32; MAX_FRAMES_PER_CALLBACK];
-                let (block, serving) = resample_pop(
+                let (_block, span) = resample_pop(
                     &mut consumer,
                     resampler.as_mut(),
                     &mut cushion,
@@ -1851,9 +1902,8 @@ fn build_monitor_stream(
                 let mut output_mono = [0f32; MAX_FRAMES_PER_CALLBACK];
                 let written_out = resample_render(
                     resampler.as_mut(),
-                    serving,
                     &mono,
-                    block,
+                    span,
                     &mut output_mono[..out_frames],
                 );
 

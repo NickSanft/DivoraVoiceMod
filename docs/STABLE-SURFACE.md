@@ -218,6 +218,17 @@ VoiceReadingUpdate { state, dry: ReadingMetrics, wet: ReadingMetrics,
                     stale, ageMs }                   // wetBypassed v1.51.0
 ```
 
+**`StreamInfo` notes.**
+
+- `outputRate` and `monitorRate` (v1.51.2, additive) are the main output's and
+  the separate monitor's device rates; `sampleRate` remains the **engine's**
+  rate, which is the input device's. Any of them differing means that output is
+  resampled. They exist because the struct used to carry one rate, so nothing
+  in the app could report — or represent — two devices disagreeing, while the
+  path that bridged the gap was destroying the audio. Windows sets each device's
+  rate independently and can change it behind the app, so a user can land there
+  without doing anything.
+
 **`VoiceReadingUpdate` notes (frozen).**
 
 - `state` is `"stopped" | "muted" | "quiet" | "speaking"`. The set is closed and
@@ -232,15 +243,6 @@ VoiceReadingUpdate { state, dry: ReadingMetrics, wet: ReadingMetrics,
   closed vocabulary in `divora-core/src/dsp/reading.rs` is the **only** source
   of a shown word; the frontend keeps no list of its own, so there is one
   place to audit.
-- `outputRate` and `monitorRate` (v1.51.2, additive) are the main output's and
-  the separate monitor's device rates; `sampleRate` remains the **engine's**
-  rate, which is the input device's. Any of them differing means that output is
-  resampled. They exist because the struct used to carry one rate, so nothing
-  in the app could report — or represent — two devices disagreeing, while the
-  path that bridged the gap was destroying the audio. Windows sets each device's
-  rate independently and can change it behind the app, so a user can land there
-  without doing anything.
-
 - `wetBypassed` (v1.51.0, additive) says the chain passed the signal through
   over that window, so the two halves *should* read alike. It is **measured**
   in the engine by correlating the taps, which is scale-invariant because the

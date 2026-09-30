@@ -21,8 +21,10 @@
 //!
 //! * the overshoot (480 frames wanted, two 256-frame rounds produced) was
 //!   "stashed" by splicing resampler OUTPUT into the INPUT queue, at index 0,
-//!   ahead of older input. Measured on a 440 Hz tone: **0.00 dB** SNR, i.e.
-//!   the input tone explained none of the output energy;
+//!   ahead of older input. Measured on a 440 Hz tone at 44.1 → 48 kHz with a
+//!   480-frame buffer: the tone sat **41 dB below** the noise it was buried in,
+//!   and across the six rate pairs the suite covers the figure ranged from
+//!   −15 dB to −74 dB. It is 136–145 dB now, and tight;
 //! * the `to_vec` that stash needed allocated and freed on the audio thread
 //!   once per buffer;
 //! * and because the caller topped the input queue up by a fixed amount every
@@ -148,6 +150,17 @@ impl MonoResampler {
     /// to one the budget can serve and returns the smaller need; the caller
     /// then writes fewer frames and the fan-out silences the rest. Check
     /// [`Self::prepared_out_frames`] if you need to know it happened.
+    ///
+    /// That is only half the cost, and the other half is worse: the round's
+    /// INPUT demand falls in step, so the callback consumes less than a
+    /// real-time's worth of native audio while the input device keeps producing
+    /// a full one. The ring pins full and the engine's `push_slice` discards the
+    /// same fraction of the microphone signal for the rest of the session.
+    /// [`Self::underruns`] stays at 0 throughout — it counts short feeds, and
+    /// this is the opposite — so the one diagnostic here will NOT show it.
+    /// Reachable only where the tests already declare a known limit: measured,
+    /// every output device on a normal Windows box hands cpal 480–1056 frames,
+    /// at which the budget first binds around a 192 kHz input.
     pub fn prepare_within(&mut self, out_frames: usize, native_budget: usize) -> usize {
         let mut want = out_frames.clamp(1, self.max_out_frames);
         loop {
@@ -219,9 +232,12 @@ impl MonoResampler {
                 out[..n].copy_from_slice(&self.output_buf[0][..n]);
                 n
             }
-            // Only reachable on a buffer-shape mismatch, which the types above
-            // make unreachable. Nothing is consumed, so the next round retries
-            // with the same input rather than dropping it.
+            // Only reachable on a buffer-shape mismatch, which the types
+            // above make unreachable. Rubato consumes nothing on this path —
+            // but the CALLERS already have: the engine popped those frames out
+            // of the ring and `VoiceConverter` out of its `VecDeque`, and
+            // neither can rewind. So if a change ever makes this reachable, it
+            // drops a buffer of audio per occurrence; it does not retry.
             Err(_) => 0,
         }
     }
@@ -259,8 +275,13 @@ impl MonoResampler {
     /// clean state without rebuilding the resampler.
     ///
     /// Also resets rubato itself, which holds a sinc history and a fractional
-    /// read position — without that, the first output of a new session is
-    /// blended with the previous one's tail. `reset` restores rubato's chunk
+    /// read position. Without that, re-engaging a converter blends its first
+    /// output with the last engagement's tail — measured at 48 → 16 kHz, peak
+    /// 0.926 of the previous engagement survived. Not an engine restart: a
+    /// restart drops the streams that own the resampler and builds a new one, so
+    /// nothing could carry across. The path that mattered is
+    /// `VoiceConverter::clear_pipeline`, i.e. toggling the effect, switching
+    /// voice, or passing through bypass. `reset` restores rubato's chunk
     /// size to its maximum, which is harmless here because
     /// [`Self::prepare_within`] sets it again every round, but it is why that
     /// call is unconditional.

@@ -11,6 +11,9 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  resamplingLegs,
+  resamplingSummary,
+  resamplingDetail,
   isResampling,
   clearEffectChain,
   closeMidiInput,
@@ -745,5 +748,65 @@ describe("isResampling (v1.51.2)", () => {
     // it would leave a user with a clean-looking Mixer and a resampled
     // headphone mix.
     expect(isResampling({ ...base, monitorRate: 44_100 })).toBe(true);
+  });
+});
+
+describe("resamplingSummary / resamplingLegs (v1.51.2)", () => {
+  const base = {
+    inputName: "in",
+    outputName: "out",
+    monitorName: null as string | null,
+    sampleRate: 48_000,
+    outputRate: 48_000,
+    monitorRate: null as number | null,
+    inputChannels: 1,
+    outputChannels: 2,
+  };
+
+  it("has nothing to say when every device agrees", () => {
+    expect(resamplingLegs(base)).toEqual([]);
+    expect(resamplingSummary(base)).toBeNull();
+    expect(resamplingDetail(base)).toBe("");
+  });
+
+  it("leaves a lone output leg unlabelled", () => {
+    const info = { ...base, sampleRate: 44_100 };
+    expect(resamplingSummary(info)).toBe("44100 → 48000 Hz");
+  });
+
+  it("labels a monitor-only mismatch, and never prints two identical rates", () => {
+    // The bug this replaced: the badge hard-coded engine→output, so this case
+    // rendered "48000 → 48000 Hz" and the monitor rate — the one number the
+    // user has to act on — appeared nowhere.
+    const info = { ...base, monitorRate: 44_100, monitorName: "Headphones" };
+    expect(resamplingLegs(info)).toEqual([
+      { device: "monitor", from: 48_000, to: 44_100 },
+    ]);
+    expect(resamplingSummary(info)).toBe("48000 → 44100 Hz monitor");
+    expect(resamplingSummary(info)).not.toContain("48000 → 48000");
+    expect(resamplingDetail(info)).toContain("monitor device at 44100 Hz");
+    expect(resamplingDetail(info)).not.toContain("output device");
+  });
+
+  it("names both legs when both disagree, from the ENGINE rate each time", () => {
+    // Not a chain: the monitor converts from the engine rate, not from the
+    // output's, so both legs start at 44100.
+    const info = { ...base, sampleRate: 44_100, monitorRate: 96_000 };
+    expect(resamplingLegs(info)).toEqual([
+      { device: "output", from: 44_100, to: 48_000 },
+      { device: "monitor", from: 44_100, to: 96_000 },
+    ]);
+    expect(resamplingSummary(info)).toBe(
+      "44100 → 48000 Hz output, 44100 → 96000 Hz monitor",
+    );
+  });
+
+  it("stays quiet on a missing or nonsensical rate", () => {
+    const stale = { ...base } as Record<string, unknown>;
+    delete stale.outputRate;
+    delete stale.monitorRate;
+    expect(resamplingSummary(stale as unknown as typeof base)).toBeNull();
+    expect(resamplingSummary({ ...base, outputRate: 0 })).toBeNull();
+    expect(resamplingSummary({ ...base, outputRate: Number.NaN })).toBeNull();
   });
 });

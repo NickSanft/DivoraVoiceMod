@@ -234,26 +234,26 @@ impl TwoClock {
     fn output_tick(&mut self) {
         let mut mono = [0f32; MAX_FRAMES];
         self.census.ring.push(self.cons.occupied_len());
-        let (block, serving) = resample_pop(
+        let (block, span) = resample_pop(
             &mut self.cons,
             self.r.as_mut(),
             &mut self.cushion,
             self.out_frames,
             &mut mono,
         );
-        if !serving {
+        if block == 0 && span > 0 {
+            // The cushion is still filling, so the microphone contributed
+            // nothing to this buffer. The round still runs: everything that is
+            // not fed from the input ring (the soundboard, the monitor tap) has
+            // its own timeline and must not be silenced along with the voice.
             self.census.filling += 1;
         }
-        let asked = self
-            .r
-            .as_ref()
-            .map_or(self.out_frames, MonoResampler::prepared_need);
+        let asked = span;
         let mut output_mono = [0f32; MAX_FRAMES];
         let wrote = resample_render(
             self.r.as_mut(),
-            serving,
             &mono,
-            block,
+            span,
             &mut output_mono[..self.out_frames],
         );
         // Everything the DEVICE received, including the silence a short or
@@ -454,9 +454,10 @@ fn every_callback_fills_the_device_buffer() {
 }
 
 /// The signal that comes out is the signal that went in. This is the assertion
-/// that actually matters: a spike or peak check passes on silence, and the
-/// pre-fix output measured **0.00 dB** here — the input tone explained none of
-/// the output energy.
+/// that actually matters: a spike or peak check passes on silence. The pre-fix
+/// output measured **−41 dB** here at 44.1 → 48 kHz with a 480-frame buffer —
+/// the tone 41 dB beneath the noise it was buried in — and between −15 dB and
+/// −74 dB across the rest of the grid.
 #[test]
 fn the_output_is_genuinely_the_input_tone() {
     for (inr, outr) in PAIRS {
@@ -549,8 +550,8 @@ fn the_resample_step_allocates_nothing() {
             // Warm a round outside the window, so first-call effects are not
             // attributed to the steady state.
             top_up(&mut prod);
-            let (b, sv) = resample_pop(&mut cons, Some(&mut r), &mut cushion, ofr, &mut mono);
-            resample_render(Some(&mut r), sv, &mono, b, &mut out[..ofr]);
+            let (_b, span) = resample_pop(&mut cons, Some(&mut r), &mut cushion, ofr, &mut mono);
+            resample_render(Some(&mut r), &mono, span, &mut out[..ofr]);
 
             let mut total = (0_usize, 0_usize);
             for _ in 0..500 {
@@ -558,8 +559,9 @@ fn the_resample_step_allocates_nothing() {
                 // callback's, so it stays outside the armed window.
                 top_up(&mut prod);
                 arm();
-                let (b, sv) = resample_pop(&mut cons, Some(&mut r), &mut cushion, ofr, &mut mono);
-                resample_render(Some(&mut r), sv, &mono, b, &mut out[..ofr]);
+                let (_b, span) =
+                    resample_pop(&mut cons, Some(&mut r), &mut cushion, ofr, &mut mono);
+                resample_render(Some(&mut r), &mono, span, &mut out[..ofr]);
                 let (a, f) = disarm();
                 total.0 += a;
                 total.1 += f;
@@ -622,10 +624,12 @@ fn a_steep_downsample_lowers_the_output_count_rather_than_underfeeding() {
     assert_eq!(r.prepared_out_frames(), 480, "480 out needs {need} in");
 }
 
-/// `reset` must leave nothing of the previous session: rubato holds a sinc
+/// `reset` must leave nothing of the previous engagement: rubato holds a sinc
 /// history and a fractional read position, and before v1.51.2 `reset` cleared
-/// neither, so the first audio of a new session was blended with the old one's
-/// tail.
+/// neither. The engine itself was never affected — a restart drops the streams
+/// that own the resampler — but `VoiceConverter::clear_pipeline` calls this on
+/// every toggle, voice switch and pass through bypass, and there the first audio
+/// of the new engagement carried the last one's tail (peak 0.926 at 48 → 16 kHz).
 #[test]
 fn reset_leaves_nothing_behind() {
     let mut r = MonoResampler::new(44_100, 48_000, MAX_FRAMES).expect("construct");
@@ -785,6 +789,53 @@ fn the_steady_state_primes_once_and_then_pads_nothing() {
     }
 }
 
+/// A dry input ring must cost the VOICE and nothing else.
+///
+/// `resample_pop` reports two lengths: `block`, the microphone frames that
+/// arrived, and `span`, the callback's own input-rate timeline. Sizing the whole
+/// callback by `block` silenced the soundboard whenever the ring ran dry —
+/// `SoundboardMixer::mix_filtered` returns on an empty slice, so its voices
+/// produced nothing AND never advanced, staying active for ever. A dead capture
+/// stream is reachable (cpal breaks its WASAPI input loop on any error and the
+/// engine's input `err_fn` only logs, unlike the output one which requests a
+/// rebuild), so that left every soundboard tile and Speak preview silent for the
+/// rest of the session — where the previous release still played them over a
+/// dead mic.
+///
+/// So: with an empty ring, `span` must still be a full round, the gap must be
+/// silent rather than stale, and the render must still fill the device buffer.
+#[test]
+fn an_empty_ring_still_reports_a_full_span_to_mix_into() {
+    for (inr, outr) in PAIRS {
+        for ofr in OUT_FRAMES {
+            let (_prod, mut cons) = HeapRb::<f32>::new(RING_FRAMES).split();
+            let mut r = MonoResampler::new(inr, outr, MAX_FRAMES).expect("construct");
+            let mut cushion = RingCushion::default();
+            let mut mono = [0.5f32; MAX_FRAMES]; // pre-dirtied, to catch a stale gap
+            let mut out = [0f32; MAX_FRAMES];
+
+            // Nothing was ever pushed: the microphone is dead.
+            let (block, span) = resample_pop(&mut cons, Some(&mut r), &mut cushion, ofr, &mut mono);
+            assert_eq!(block, 0, "{inr}->{outr} ofr={ofr}: the ring is empty");
+            assert!(
+                span > 0,
+                "{inr}->{outr} ofr={ofr}: span must still be a full round, or the \
+                 soundboard has nothing to mix into and its voices freeze"
+            );
+            assert!(
+                mono[..span].iter().all(|s| *s == 0.0),
+                "{inr}->{outr} ofr={ofr}: the microphone gap must be silent, not stale"
+            );
+            let wrote = resample_render(Some(&mut r), &mono, span, &mut out[..ofr]);
+            assert_eq!(
+                wrote, ofr,
+                "{inr}->{outr} ofr={ofr}: wrote {wrote} of {ofr} — the device buffer \
+                 must still be filled, so a soundboard clip is audible over a dead mic"
+            );
+        }
+    }
+}
+
 /// The seam. There is no audio device in CI, so nothing here proves a real
 /// cpal callback runs the code above — this checks at the source level that
 /// both callbacks still drive the resampler the way these tests do, and that
@@ -794,11 +845,21 @@ fn the_steady_state_primes_once_and_then_pads_nothing() {
 #[test]
 fn the_engine_still_calls_the_resampler_the_tested_way() {
     let src = include_str!("../src/audio/engine.rs");
-    let pops = src.matches("let (block, serving) = resample_pop(").count();
+    // Split so this assertion cannot match itself — `include_str!` pulls in this
+    // function too.
+    let pops = src.matches(concat!(", span) = resample", "_pop(")).count();
     assert_eq!(
         pops, 2,
         "expected the output and monitor callbacks to each size their pop with \
-         `resample_pop`, found {pops}"
+         `resample_pop` and bind its `span`, found {pops}"
+    );
+    // And that the two lengths stay distinct at the site that has both. Sizing
+    // the whole callback by the microphone's `block` is what silenced the
+    // soundboard whenever the input ring ran dry.
+    assert!(
+        src.contains(concat!("let (block, span) = resample", "_pop(")),
+        "the output callback must keep the microphone's `block` separate from the \
+         callback's `span`"
     );
     let renders = src.matches("let written_out = resample_render(").count();
     assert_eq!(

@@ -25,7 +25,12 @@ import {
   REACTIVE_FLOOR_DB,
 } from "../data/reactive";
 import { useApp } from "../stores/app";
-import { isResampling, type ReadingMetrics, type VoiceReadingUpdate } from "../audio/api";
+import {
+  resamplingDetail,
+  resamplingSummary,
+  type ReadingMetrics,
+  type VoiceReadingUpdate,
+} from "../audio/api";
 import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
 
 export function MixerScreen(): JSX.Element {
@@ -223,16 +228,20 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
             {(info) => (
               <>
                 <span> · routed via {info().outputName}</span>
-                {/* v1.51.2: say so when the two devices disagree on a rate.
-                    Nothing used to, because StreamInfo carried one rate — and
-                    the code that bridged the gap was destroying the audio. */}
-                <Show when={isResampling(info())}>
-                  <span
-                    title={`Your input runs at ${info().sampleRate} Hz and the output at ${info().outputRate} Hz, so every buffer is resampled. Setting both devices to the same rate in Windows sound settings avoids the conversion.`}
-                  >
-                    {" · resampling "}
-                    {info().sampleRate} → {info().outputRate} Hz
-                  </span>
+                {/* v1.51.2: say so when a device disagrees on a rate. Nothing
+                    used to, because StreamInfo carried one rate — and the code
+                    that bridged the gap was destroying the audio. The summary
+                    names the legs that actually differ: the monitor converts
+                    from the engine rate independently of the main output, so
+                    naming the engine→output pair here printed two identical
+                    numbers whenever only the headphones were mismatched. */}
+                <Show when={resamplingSummary(info())}>
+                  {(summary) => (
+                    <span title={resamplingDetail(info())}>
+                      {" · resampling "}
+                      {summary()}
+                    </span>
+                  )}
                 </Show>
               </>
             )}

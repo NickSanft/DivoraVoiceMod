@@ -3,8 +3,8 @@
 // This exists because of the history, not because the markup is tricky. Until
 // v1.51.2 `StreamInfo` carried a single sample rate, so the app could not
 // report — or even represent — two devices disagreeing, while the code that
-// bridged the gap was destroying the audio: measured 0.00 dB of the input tone
-// surviving to the output. A user could sit in that state indefinitely with
+// bridged the gap was destroying the audio: the input tone ended up 41 dB below
+// the noise it was buried in. A user could sit in that state indefinitely with
 // nothing on screen to suggest why their voice sounded wrong.
 //
 // So the indication is load-bearing, and a badge that silently stops rendering
@@ -97,10 +97,9 @@ describe("the rate-mismatch indication", () => {
       expect(app().engineRunning()).toBe(true);
     });
     await waitFor(() => {
-      // Both rates, so the user can see WHICH pair to reconcile in Windows.
-      expect(container.textContent).toContain("resampling");
-      expect(container.textContent).toContain("44100");
-      expect(container.textContent).toContain("48000");
+      // The exact string, so a badge that renders the wrong pair of rates
+      // cannot pass. A lone output leg needs no label.
+      expect(container.textContent).toContain("resampling 44100 → 48000 Hz");
     });
   });
 
@@ -117,10 +116,15 @@ describe("the rate-mismatch indication", () => {
     expect(container.textContent).not.toContain("resampling");
   });
 
-  it("notices a monitor device that disagrees even when the main output does not", async () => {
-    // The monitor stream resamples independently, and it is fed BY the output
-    // callback rather than by the input device — a case the engine has to size
-    // separately and this indication has to cover.
+  it("names the monitor when only the monitor disagrees", async () => {
+    // The monitor converts from the ENGINE rate, independently of the main
+    // output. The first version of this badge hard-coded the engine→output pair,
+    // so this case rendered "resampling 48000 → 48000 Hz" — two identical
+    // numbers — with a tooltip asserting the output was resampled when it was
+    // not, and the 44100 Hz monitor appeared nowhere.
+    //
+    // That shipped past an earlier version of this very test, which asserted
+    // only `toContain("resampling")`. Hence the exact string.
     const { app, container } = setup({
       sampleRate: 48_000,
       outputRate: 48_000,
@@ -131,7 +135,25 @@ describe("the rate-mismatch indication", () => {
       expect(app().engineRunning()).toBe(true);
     });
     await waitFor(() => {
-      expect(container.textContent).toContain("resampling");
+      expect(container.textContent).toContain("resampling 48000 → 44100 Hz monitor");
+    });
+    expect(container.textContent).not.toContain("48000 → 48000");
+  });
+
+  it("names both legs when the output and the monitor each disagree", async () => {
+    const { app, container } = setup({
+      sampleRate: 44_100,
+      outputRate: 48_000,
+      monitorRate: 96_000,
+    });
+    await app().startEngine();
+    await waitFor(() => {
+      expect(app().engineRunning()).toBe(true);
+    });
+    await waitFor(() => {
+      // Both, and labelled, because which device to change is the actionable part.
+      expect(container.textContent).toContain("44100 → 48000 Hz output");
+      expect(container.textContent).toContain("44100 → 96000 Hz monitor");
     });
   });
 });

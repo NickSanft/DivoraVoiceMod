@@ -248,7 +248,7 @@ pub struct VoiceConverter {
     /// 48 kHz → 16 kHz pre-inference resampler.
     ///
     /// Built in [`VoiceConverter::new`], i.e. on whichever control thread
-    /// `DspEdit::prepare` runs on — never in the callback. Until v1.51.3 these
+    /// `DspEdit::prepare` runs on — never in the callback. Until v1.51.2 these
     /// were built lazily from `process`, and because a `SetChain` hands the
     /// callback a fresh converter with both slots empty, the pair was rebuilt
     /// *there* after every preset switch: 1060 allocations, 784 frees and
@@ -1108,14 +1108,15 @@ mod tests {
 
     // ---- the resampling phases: RT-safety and correctness ------------------
     //
-    // Until v1.51.3 `VoiceConverter::new` left both resamplers unbuilt and
+    // Until v1.51.2 `VoiceConverter::new` left both resamplers unbuilt and
     // `process` filled them in lazily, ON THE AUDIO THREAD. Because a
     // `SetChain` hands the callback a brand-new converter with both slots
     // empty, the pair was rebuilt there after every preset switch: measured
     // 1060 allocations, 784 frees and ~0.84 ms inside a callback with a few
     // milliseconds of budget — eight times the cost of the chain rebuild
     // v1.51.1 moved off the thread. Each round then allocated twice more, a
-    // batch and an output buffer, for ~105 allocations per inference round.
+    // batch and an output buffer: 98 allocations and 98 frees per inference
+    // chunk, deterministically — two per round, 49 rounds (one down, 48 up).
     //
     // These tests live in the crate rather than in `tests/` so they can reach
     // `pub(crate)` phases and private queues without adding test-only public

@@ -36,7 +36,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # Phase 12.4: fetch the voice-conversion binaries (onnxruntime.dll
-      # + the LLVC model) from the `voice-assets-v1` release into
+      # + the LLVC model) from the `voice-assets-v2` release into
       # src-tauri/resources/. They're not in git (binaries); the
       # bundle-overlay config references them so the installer ships
       # voice conversion working out of the box. The base config has no

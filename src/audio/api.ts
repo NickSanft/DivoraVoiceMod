@@ -39,6 +39,67 @@ export interface StreamInfo {
   outputChannels: number;
 }
 
+/** One conversion actually happening: which device, and between which rates. */
+export interface ResampleLeg {
+  device: "output" | "monitor";
+  from: number;
+  to: number;
+}
+
+/** The conversions actually happening, which is not always the one you expect.
+ *
+ *  The monitor device converts from the ENGINE rate independently of the main
+ *  output, so a session can resample for the headphones and not for the call, or
+ *  for both at different rates. Naming the engine-to-output pair unconditionally
+ *  printed "48000 → 48000 Hz" in exactly that case and never showed the monitor
+ *  rate at all. */
+export function resamplingLegs(info: StreamInfo): ResampleLeg[] {
+  const engine = info.sampleRate;
+  if (!Number.isFinite(engine) || engine <= 0) return [];
+  const usable = (rate: number | null | undefined): rate is number =>
+    typeof rate === "number" && Number.isFinite(rate) && rate > 0 && rate !== engine;
+  const legs: ResampleLeg[] = [];
+  if (usable(info.outputRate)) {
+    legs.push({ device: "output", from: engine, to: info.outputRate });
+  }
+  if (usable(info.monitorRate)) {
+    legs.push({ device: "monitor", from: engine, to: info.monitorRate });
+  }
+  return legs;
+}
+
+/** A compact summary for a header, or `null` when nothing is being converted.
+ *
+ *  A lone output leg needs no label — it is the common case and the only device
+ *  in play. Anything involving the monitor says so, because "which device" is
+ *  the actionable part. */
+export function resamplingSummary(info: StreamInfo): string | null {
+  const legs = resamplingLegs(info);
+  if (legs.length === 0) return null;
+  if (legs.length === 1 && legs[0]!.device === "output") {
+    return `${legs[0]!.from} → ${legs[0]!.to} Hz`;
+  }
+  return legs.map((l) => `${l.from} → ${l.to} Hz ${l.device}`).join(", ");
+}
+
+/** The long form, for a tooltip: what is converting and what to do about it. */
+export function resamplingDetail(info: StreamInfo): string {
+  const legs = resamplingLegs(info);
+  if (legs.length === 0) return "";
+  const which = legs
+    .map((l) =>
+      l.device === "output"
+        ? `the output device at ${l.to} Hz`
+        : `the monitor device at ${l.to} Hz`,
+    )
+    .join(" and ");
+  return (
+    `Your input runs at ${info.sampleRate} Hz and ${which}, so every buffer is ` +
+    `converted on its way there. Setting them to the same rate in Windows sound ` +
+    `settings avoids the conversion.`
+  );
+}
+
 /** Whether any output is being resampled from the engine's rate.
  *
  *  Defensive about missing rates on purpose. `outputRate` arrived in v1.51.2,
