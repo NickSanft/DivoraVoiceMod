@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.51.4] — 2026-10-13 — Fix: hotkeys that forgot their keys
+
 ### Fixed
 
 - **Your push-to-modulate, panic and monitor hotkeys now survive a restart.** They were only ever held in memory, so every launch started with all three unbound, although the notes since the hotkeys first shipped said they were kept. They are saved now, and come back working without re-binding.
@@ -27,6 +29,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
   - a stored "Ctrl+Win+M" registering as "Ctrl+Super+M", and a new "Win+F9" as "Super+F9";
   - a soundboard tile with the Windows key registering as "Super+1".
 - **Verified by putting each defect back:** removing the save fails the restart test; letting "Win" through fails six tests.
+- **The What's-new range test no longer pins version numbers.** Only the newest 12 releases ship in the app, so pinned versions age out of the window: stamping this release pushed 1.42.0 out, and the test failed on correct behaviour. It now takes its range from what is bundled, plus a check that the internal 1.45.0 release is not shipped.
 - **The hotkey test block now clears `localStorage` before each test.** Bindings persist now, and one test's binding would otherwise leak into the "the default registers nothing system-wide" guard beside it.
 - **Checked in the real app,** in the debug build driven over WebView2's DevTools protocol. The binding was set through the Settings control as a user would, and registration was read back from the shortcut plugin's own `is_registered`.
   - **11 checks passed:**

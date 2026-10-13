@@ -71,17 +71,34 @@ describe("notesSince", () => {
     expect(got.moreCount).toBe(0);
   });
 
-  it("returns the range, newest first, skipping internal releases", () => {
-    const got = notesSince("1.42.0", "1.48.0");
-    // 1.45.0 carries the whatsnew:skip marker.
-    expect(got.notes.map((n) => n.version)).toEqual([
-      "1.48.0",
-      "1.47.0",
-      "1.46.0",
-      "1.44.0",
-      "1.43.0",
-    ]);
+  it("returns the range, newest first", () => {
+    // Taken from what is bundled now rather than pinned to version numbers:
+    // only the newest BUNDLED_RELEASES ship, so pinned versions age out of
+    // the window with every release (v1.51.4 pushed 1.42.0 out, and this
+    // test failed on correct behaviour). `since` is a bundled release, so
+    // nothing between it and `current` can be missing.
+    const versions = RELEASE_NOTES.map((n) => n.version);
+    const current = versions[1]!;
+    const since = versions[6]!;
+    const got = notesSince(since, current);
+    expect(got.notes.map((n) => n.version)).toEqual(versions.slice(1, 6));
     expect(got.moreUnknown).toBe(false);
+  });
+
+  it("an internal release is never bundled", () => {
+    // 1.45.0 carries the whatsnew:skip marker. While it still sits between
+    // bundled releases (1.46.0 and 1.44.0 at v1.51.4) its absence shows the
+    // marker is honoured on the real changelog; once it ages out of the
+    // window this passes trivially, and the parser's fixture test
+    // (changelog-parse.test.ts, SKIP_MARKER) is what still guards the rule.
+    expect(RELEASE_NOTES.map((n) => n.version)).not.toContain("1.45.0");
+  });
+
+  it("a marker older than everything bundled reports the rest as unknown", () => {
+    const oldest = RELEASE_NOTES[RELEASE_NOTES.length - 1]!.version;
+    const got = notesSince("0.0.1", RELEASE_NOTES[0]!.version);
+    expect(oldest).not.toBe("0.0.1");
+    expect(got.moreUnknown).toBe(true);
   });
 
   it("never shows a release newer than the running build", () => {
