@@ -135,6 +135,14 @@ import {
 import type { ReactiveConfig, ReactiveRouteSpec } from "../audio/api";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
+import {
+  isSavablePosition,
+  mergeOverlayPrefs,
+  placeOverlay,
+  readGeometry,
+  readOverlayBg,
+  type OverlayGeometry,
+} from "../overlay/geometry";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
@@ -955,21 +963,173 @@ export function createAppState(): AppState {
   };
 
   // Stream overlay (v1.16.0). A second transparent Tauri window renders
-  // the spell circle for OBS; the main window pushes state to it (App.tsx).
+  // the spell circle for OBS; the main window pushes state to it (App.tsx,
+  // via overlay/sync.ts).
+  //
+  // v1.51.3: the window remembers where it was (in physical pixels, see
+  // overlay/geometry.ts), opens there without taking focus, and really
+  // closes when switched off (lib.rs `hides_on_close`).
+  const storedOverlay = loadJson<unknown>(STORAGE_KEYS.overlay, null);
   const [overlayOpen, setOverlayOpen] = createSignal(false);
   const [overlayBg, setOverlayBgRaw] = createSignal<OverlayBg>(
-    loadJson<{ bg: OverlayBg }>(STORAGE_KEYS.overlay, { bg: "transparent" }).bg,
+    readOverlayBg(
+      typeof storedOverlay === "object" && storedOverlay !== null
+        ? (storedOverlay as { bg?: unknown }).bg
+        : undefined,
+    ),
   );
+  let overlayGeometry: OverlayGeometry | null = readGeometry(storedOverlay);
+  const saveOverlayPrefs = (): void => {
+    saveJson(
+      STORAGE_KEYS.overlay,
+      mergeOverlayPrefs(loadJson<unknown>(STORAGE_KEYS.overlay, null), overlayBg(), overlayGeometry),
+    );
+  };
   const setOverlayBg = (bg: OverlayBg): void => {
     setOverlayBgRaw(bg);
-    saveJson(STORAGE_KEYS.overlay, { bg });
+    saveOverlayPrefs();
   };
+
+  type OverlayWindow = import("@tauri-apps/api/webviewWindow").WebviewWindow;
+  let overlayUnlisten: Array<() => void> = [];
+  let overlaySaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Read where the overlay is now and remember it. */
+  const saveOverlayGeometry = async (w: OverlayWindow): Promise<void> => {
+    try {
+      if (await w.isMinimized()) return;
+      const [pos, size] = await Promise.all([w.outerPosition(), w.innerSize()]);
+      if (!isSavablePosition(pos.x, pos.y) || size.width <= 0 || size.height <= 0) return;
+      // The monitor under the overlay's centre. (`currentMonitor()` would be
+      // the monitor of the window *calling* it, which is main.) Both are in
+      // physical pixels, as `MonitorFromPoint` expects.
+      const { monitorFromPoint } = await import("@tauri-apps/api/window");
+      const monitor = await monitorFromPoint(
+        pos.x + size.width / 2,
+        pos.y + size.height / 2,
+      );
+      overlayGeometry = {
+        x: pos.x,
+        y: pos.y,
+        w: size.width,
+        h: size.height,
+        ...(monitor?.name ? { monitor: monitor.name } : {}),
+        ...(monitor ? { scale: monitor.scaleFactor } : {}),
+      };
+      saveOverlayPrefs();
+    } catch {
+      /* the window went away mid-read: keep the last good geometry */
+    }
+  };
+  const stopTrackingOverlay = (): void => {
+    if (overlaySaveTimer !== null) clearTimeout(overlaySaveTimer);
+    overlaySaveTimer = null;
+    for (const un of overlayUnlisten) un();
+    overlayUnlisten = [];
+  };
+  /** Save after a move or resize settles; a drag fires dozens of events. */
+  const trackOverlay = async (w: OverlayWindow): Promise<void> => {
+    stopTrackingOverlay();
+    const schedule = (): void => {
+      if (overlaySaveTimer !== null) clearTimeout(overlaySaveTimer);
+      overlaySaveTimer = setTimeout(() => {
+        overlaySaveTimer = null;
+        void saveOverlayGeometry(w);
+      }, 400);
+    };
+    try {
+      overlayUnlisten.push(await w.onMoved(schedule), await w.onResized(schedule));
+    } catch {
+      /* tracking is a convenience; the window still works without it */
+    }
+  };
+
+  let overlayCloseUnlisten: (() => void) | null = null;
+  /** Notice when this overlay window goes away (its own close, Alt+F4, the
+   *  app's toggle), so `overlayOpen` never claims a window that isn't there.
+   *  Every path that leaves a visible overlay goes through here, including a
+   *  main-window reload (F5) that finds one still on screen. */
+  const watchOverlayClose = async (w: OverlayWindow): Promise<void> => {
+    overlayCloseUnlisten?.();
+    overlayCloseUnlisten = null;
+    try {
+      overlayCloseUnlisten = await w.once("tauri://destroyed", () => {
+        overlayCloseUnlisten = null;
+        stopTrackingOverlay();
+        setOverlayOpen(false);
+      });
+    } catch {
+      /* not under Tauri */
+    }
+  };
+
+  /** Put a new overlay where it was last time, then show it. */
+  const placeAndShowOverlay = async (w: OverlayWindow): Promise<void> => {
+    const saved = overlayGeometry;
+    if (saved) {
+      try {
+        const win = await import("@tauri-apps/api/window");
+        const [monitors, primary] = await Promise.all([
+          win.availableMonitors(),
+          win.primaryMonitor(),
+        ]);
+        const rect = placeOverlay(
+          saved,
+          monitors.map((m) => ({
+            name: m.name,
+            x: m.position.x,
+            y: m.position.y,
+            width: m.size.width,
+            height: m.size.height,
+            scaleFactor: m.scaleFactor,
+          })),
+          primary?.name ?? null,
+        );
+        if (rect) {
+          const { PhysicalPosition, PhysicalSize } = await import("@tauri-apps/api/dpi");
+          const pos = new PhysicalPosition(rect.x, rect.y);
+          const size = new PhysicalSize(rect.width, rect.height);
+          // Windows rescales a window (WM_DPICHANGED) whenever most of it
+          // crosses onto a monitor with a different scale, and that can
+          // happen on the resize as well as on the move. So size it, move
+          // it, then read back and repeat until it is exactly where and as
+          // big as it should be (bounded: the rect lies wholly on one
+          // monitor, so a second pass has nothing left to rescale).
+          for (let attempt = 0; attempt < 3; attempt++) {
+            await w.setSize(size);
+            await w.setPosition(pos);
+            const [p, s] = await Promise.all([w.outerPosition(), w.innerSize()]);
+            if (p.x === rect.x && p.y === rect.y && s.width === rect.width && s.height === rect.height) {
+              break;
+            }
+          }
+        }
+      } catch {
+        /* keep the default position rather than not showing it */
+      }
+    }
+    try {
+      // Created with `focus: false`, so this first show doesn't take focus
+      // from whatever the user is in (tao shows it SW_SHOWNOACTIVATE).
+      await w.show();
+    } catch {
+      /* ignore */
+    }
+    await trackOverlay(w);
+  };
+
   const openOverlay = async (): Promise<void> => {
     try {
       const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
       const existing = await WebviewWindow.getByLabel("overlay");
       if (existing) {
+        // It exists but may be hidden: show it, or the toggle reads "on"
+        // over a window nobody can see. Then take charge of it as if we had
+        // just created it, or its close and its moves would go unnoticed.
+        await existing.show();
         setOverlayOpen(true);
+        await watchOverlayClose(existing);
+        await trackOverlay(existing);
         return;
       }
       const w = new WebviewWindow("overlay", {
@@ -979,24 +1139,61 @@ export function createAppState(): AppState {
         height: 480,
         transparent: true,
         decorations: false,
+        // An undecorated transparent window keeps a 1 px border unless the
+        // shadow is off (tauri #8308).
+        shadow: false,
         alwaysOnTop: true,
+        skipTaskbar: true,
         resizable: true,
+        maximizable: false,
+        // Hidden until it is in place, and it never takes focus on open.
+        visible: false,
+        focus: false,
       });
-      void w.once("tauri://created", () => setOverlayOpen(true));
+      void watchOverlayClose(w);
+      void w.once("tauri://created", () => {
+        setOverlayOpen(true);
+        void placeAndShowOverlay(w);
+      });
       void w.once("tauri://error", () => setOverlayOpen(false));
-      void w.once("tauri://destroyed", () => setOverlayOpen(false));
     } catch {
-      /* not under Tauri (browser / E2E) — overlay is desktop-only */
+      /* not under Tauri (browser / E2E): overlay is desktop-only */
     }
   };
+  // A reload of the main window (F5 / Ctrl+R) restarts this store while
+  // the overlay stays on screen. Adopt it, so the toggle reads "on" and its
+  // close and moves are noticed. No-op when there is none, or off Tauri.
+  void (async () => {
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const existing = await WebviewWindow.getByLabel("overlay");
+      if (existing && (await existing.isVisible())) {
+        setOverlayOpen(true);
+        await watchOverlayClose(existing);
+        await trackOverlay(existing);
+      }
+    } catch {
+      /* not under Tauri */
+    }
+  })();
+
   const closeOverlay = async (): Promise<void> => {
     try {
       const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
       const w = await WebviewWindow.getByLabel("overlay");
-      if (w) await w.close();
+      if (w) {
+        // A move that hasn't settled yet would otherwise be lost.
+        if (overlaySaveTimer !== null) {
+          stopTrackingOverlay();
+          await saveOverlayGeometry(w);
+        }
+        // Destroys it since v1.51.3: only `main` hides on close.
+        await w.close();
+      }
     } catch {
       /* ignore */
     }
+    stopTrackingOverlay();
     setOverlayOpen(false);
   };
 

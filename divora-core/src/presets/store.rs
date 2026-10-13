@@ -28,7 +28,7 @@ pub enum PresetStoreError {
 }
 
 /// File-backed user preset store. Tauri shell constructs one of these
-/// pointing at `%APPDATA%\DivoraVoice\presets\` (or the platform
+/// pointing at `%APPDATA%\com.divora.voicemod\presets\` (or the platform
 /// equivalent); divora-core itself stays path-agnostic so tests can use
 /// a `tempfile` directory.
 pub struct PresetStore {

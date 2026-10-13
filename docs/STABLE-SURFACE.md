@@ -163,6 +163,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
 | `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0) |
+| `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3) |
 | `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
 
@@ -329,7 +330,7 @@ to defaults (never throw).
 | `divora.updateCheckEnabled` | opt-out for the in-app update check (default true) — v1.12.0 |
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
-| `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0 |
+| `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0; plus the window's last place, all optional (`x`, `y`, `w`, `h` in physical pixels, `monitor` name, `scale` factor) — v1.51.3. A `{ bg }`-only blob still loads, and unknown keys are kept on save |
 | `divora.ttsVoice` | selected "Speak" voice id (or null) — v1.17.0: a preset id, a cloned id (v1.20.0), or a Critter Chatter `babble:*` id (v1.50.0) |
 | `divora.ttsVolume` | "Speak" playback volume (linear 0..2) — v1.18.0 |
 | `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
@@ -348,7 +349,7 @@ the session, and the baseline dies with the worker thread that held it.
 
 ## 6. On-disk layout
 
-Under `%APPDATA%\DivoraVoice\` (created at startup, best-effort):
+Under `%APPDATA%\com.divora.voicemod\` (created at startup, best-effort):
 
 ```
 presets/<id>.json        user presets (see §4)

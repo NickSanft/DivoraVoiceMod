@@ -21,7 +21,8 @@ import {
   subscribeMidi,
   subscribeTtsProgress,
 } from "./audio/api";
-import { OVERLAY_EVENT, overlayPayload } from "./overlay/state";
+import { overlayPayload } from "./overlay/state";
+import { syncOverlay } from "./overlay/sync";
 import { Wizard } from "./components/Wizard";
 import { WhatsNewBanner, WhatsNewModal } from "./components/WhatsNew";
 import { Sidebar } from "./shell/Sidebar";
@@ -93,27 +94,30 @@ function Shell(): JSX.Element {
   // v1.16.0: while the stream overlay is open, push the spell-circle state
   // to it over the Tauri event bus on every change (status / chain / tweaks
   // / bg mode). The overlay animates on its own from there — no per-frame
-  // traffic. No-op off Tauri.
-  createEffect(() => {
-    if (!app.overlayOpen()) return;
-    const payload = overlayPayload({
-      chain: app.chain(),
-      status: app.status(),
-      motion: app.tweaks.motion,
-      mystical: app.tweaks.mystical,
-      mood: app.tweaks.mood,
-      accent: app.tweaks.accent,
-      theme: app.tweaks.theme,
-      bg: app.overlayBg(),
-    });
-    void (async () => {
-      try {
-        const { emit } = await import("@tauri-apps/api/event");
-        await emit(OVERLAY_EVENT, payload);
-      } catch {
-        /* not under Tauri */
-      }
-    })();
+  // traffic. v1.51.3: and again whenever the overlay says it is listening
+  // (`overlay:ready`), so the push made as it opens is never lost. No-op off
+  // Tauri.
+  syncOverlay({
+    isOpen: app.overlayOpen,
+    payload: () =>
+      overlayPayload({
+        chain: app.chain(),
+        status: app.status(),
+        motion: app.tweaks.motion,
+        mystical: app.tweaks.mystical,
+        mood: app.tweaks.mood,
+        accent: app.tweaks.accent,
+        theme: app.tweaks.theme,
+        bg: app.overlayBg(),
+      }),
+    emit: async (event, payload) => {
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit(event, payload);
+    },
+    listen: async (event, handler) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen(event, handler);
+    },
   });
 
   // Push-to-modulate fallback (in-app keyboard). The system-level

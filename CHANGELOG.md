@@ -4,6 +4,75 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- **The stream overlay can be switched off and on again.** Switching it off only *hid* the window: closing any window was turned into "hide to tray", which is meant for the main window alone. Switching it back on found the hidden window and never showed it, so the toggle read "on" with nothing on screen until you restarted the app. The overlay now closes for real and comes back every time.
+- **You can move the overlay.** Press anywhere on it that isn't one of the circle's buttons and drag. Before, it stayed wherever Windows first put it. Double-clicking it does nothing, so it can't be blown up to fill the screen by accident.
+- **The overlay opens where you left it**, at the same size, on the same screen. That includes a screen running a different display scaling from the others. If that screen isn't connected any more, it opens fully on one that is: whichever screen now sits where it was, or else your main screen.
+- **No thin border around the overlay.** A transparent window without a frame still drew a 1-pixel outline unless its shadow was switched off.
+- **The overlay has no taskbar button, and opening it doesn't take focus** from the game or app you're in.
+- **The overlay never shows a default circle first.** The first update was sent as the window was being created, before the overlay was listening, so it could show a default circle until you next changed something. Now it asks for your current voice once it is listening, and draws nothing until that arrives.
+- **The overlay's lettering matches the app.** The circle's status word and effect names were drawn in a fallback system font, because the overlay never loaded the app's fonts.
+
+### Tests
+
+- `src/overlay/geometry.test.ts` (28) covers the placement arithmetic:
+  - unchanged placement;
+  - an unplugged second screen;
+  - **the primary chosen when it isn't listed first** (`availableMonitors()` doesn't promise an order);
+  - a screen moved into an unplugged one's place;
+  - a renamed monitor, and monitors without names;
+  - negative coordinates;
+  - mixed 100 %/150 % scaling;
+  - a display whose scaling changed;
+  - clamping and the minimum size.
+
+  It also covers persistence: `{ bg }`-only blobs from v1.16.0, unknown keys kept on save, stale geometry removed, and the minimised parking spot never saved. One of these tests caught a bug before it shipped: `"toString" in OVERLAY_BG_COLOR` is true through the prototype, so a corrupted stored value would have been taken as a background mode. Verified by putting the defect back: removing the primary fallback fails the primary-first test.
+- `src/overlay/sync.test.ts` (5) drives the **real** `syncOverlay` that App.tsx calls, through an in-memory event bus. It covers:
+  - the ready re-push sends the state as it is *now*;
+  - nothing is sent while the overlay is closed;
+  - the listener goes away with its owner, even if the owner is disposed before `listen` resolves;
+  - an unavailable bus never throws.
+
+  Verified by putting the defect back: without the re-push, the first test fails.
+- `src/overlay/drag.test.ts` (5): what starts a window drag — not buttons or anything inside them, not the second press of a double-click, not other mouse buttons, and SVG drawing does start one.
+- `overlay:ready` joins `overlay:state` in the event-name freeze. The no-voice-reading source scan now also covers `src/overlay.tsx`, the overlay's entry file.
+- Rust: `only_the_main_window_hides_on_close` tests the real predicate the window-event handler calls.
+- **Checked in the real app, not only in tests.** The debug build was driven over WebView2's DevTools protocol, with the native windows read through Win32 and the taskbar through UI Automation.
+  - **26 checks passed:**
+    - three off/on cycles, each showing exactly one visible overlay, destroying it when switched off, and keeping the toggle in step;
+    - no overlay button in the taskbar;
+    - not maximised on open, nor after a double-click;
+    - the Mixer's five nodes on the overlay as soon as it opened;
+    - both of the app's fonts loaded in the overlay;
+    - a moved position saved, and restored on reopen;
+    - after a main-window reload, the overlay still on screen, the toggle reading "on", and switching off destroying it;
+    - the same position restored after quitting and relaunching the app.
+  - **The same harness fails the old code.** With "hide every window on close" and the missing `show()` put back, 9 checks fail, including the exact symptom: the toggle reads "on" and no visible overlay exists.
+  - **Not measured:**
+    - **Focus.** The session was locked during the run, so the lock screen owned the foreground and focus couldn't be judged; the claim rests on tao showing a window created with `focus: false` as `SW_SHOWNOACTIVATE`.
+    - **The border.** No pixel inspection was possible on a locked screen; it rests on tauri #8308.
+    - **Mixed scaling and unplugging.** This machine has one display; these are covered by the unit tests and listed in `docs/MANUAL_TESTS.md`.
+
+### Architecture notes
+
+- `on_window_event` hides on close only when `hides_on_close(window.label())` is true, which is `main` only, so every other window closes for real.
+- **The overlay window is created with:**
+  - `shadow: false`, `skipTaskbar`, `maximizable: false`;
+  - `visible: false` and `focus: false`, so tao's first show uses `SW_SHOWNOACTIVATE`.
+
+  It is placed in **physical** pixels, then shown. Windows rescales a window that crosses onto a monitor with a different scale, on a resize as well as a move, so placement sets the size, then the position, reads both back, and repeats (at most three times) until they are exact. Creation-time `x`/`y`/`width`/`height` are logical, which is what misplaces windows on scaled displays.
+- **Every path that leaves a visible overlay takes charge of it.** It watches for the window's `tauri://destroyed` and tracks its moves. Those paths are a new window, an existing one being shown again, and one found still on screen at start-up after the main window reloads (F5 / Ctrl+R reload a WebView2 page). Before, only a newly created window was watched, so an overlay adopted after a reload could be closed with Alt+F4 while the toggle still read "on".
+- **Geometry is saved** 400 ms after a move or resize settles. It is read with `outerPosition`/`innerSize` and `monitorFromPoint` at the overlay's centre. `currentMonitor()` answers for the calling window, which is main.
+- **New event `overlay:ready`** (overlay → main, no payload). `divora.overlay` gains optional `x`, `y`, `w`, `h`, `monitor` and `scale`. Both are additive, and both are recorded in `docs/STABLE-SURFACE.md`.
+- **The overlay drags with its own handler,** not `data-tauri-drag-region`. Tauri's drag script toggles maximise on a double-click for any resizable window.
+- **Two new capability grants:** `core:window:allow-set-position` and `core:window:allow-set-size`, so main can place the overlay.
+- **`rust-version` is now 1.89, and it is enforced.** The workspace declared 1.80, but neither crate inherited it, so nothing checked it, and it was false anyway: `symphonia-adapter-libopus` 0.3.0 requires 1.89. Both crates now inherit the declaration, so cargo refuses older toolchains and clippy's `incompatible_msrv` lint applies. Clippy is clean with it, and `cargo +1.89 check --workspace --all-targets --all-features` passes.
+- **The docs said the app's data lives in `%APPDATA%\DivoraVoice`; it is `%APPDATA%\com.divora.voicemod`** (the Tauri identifier).
+  - **Where:** corrected in 27 places — code comments, both Cargo manifests, a test fixture, STABLE-SURFACE, ARCHITECTURE, PLAN, MANUAL_TESTS and the asset-fetch script. The CHANGELOG's history is left as written.
+  - **The clean-install step:** it said "wipe `%APPDATA%\DivoraVoice\`", which wiped nothing. It now names both folders, because the app's settings live in the WebView2 profile under `%LOCALAPPDATA%\com.divora.voicemod\`, not with its files.
+- `docs/ARCHITECTURE.md` gains the overlay section it never had.
+
 ## [1.51.2] — 2026-09-30 — Fix: audio that broke when your devices disagreed
 
 ### Fixed

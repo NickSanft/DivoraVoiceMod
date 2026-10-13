@@ -81,7 +81,7 @@ DivoraVoice is feature-complete for v1 and shipping steady post-1.0 releases. Ma
 
 ## Building from source
 
-Prerequisites: Rust stable (MSRV 1.80), Node 22+, pnpm 10+, **cmake** (needed to build the vendored libopus C source pulled in by symphonia's Opus adapter).
+Prerequisites: Rust stable (MSRV 1.89), Node 22+, pnpm 10+, **cmake** (needed to build the vendored libopus C source pulled in by symphonia's Opus adapter).
 
 ```powershell
 pnpm install

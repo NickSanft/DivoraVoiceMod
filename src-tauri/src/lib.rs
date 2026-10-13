@@ -198,7 +198,7 @@ struct AppState {
     /// `Shortcut` we registered for it. Used to unregister cleanly.
     shortcuts: Mutex<HashMap<String, Shortcut>>,
     /// Phase 12: directory the user drops voice-conversion `.onnx`
-    /// models into (`%APPDATA%/DivoraVoice/voices/`). Created at
+    /// models into (`%APPDATA%/com.divora.voicemod/voices/`). Created at
     /// startup; surfaced to the UI so it can list + open it.
     voices_dir: PathBuf,
     /// Phase 12.4: read-only directory of voices shipped in the
@@ -214,16 +214,16 @@ struct AppState {
     /// degrades to a clear error rather than synthesizing.
     tts_assets_dir: PathBuf,
     /// v1.21.0: user-writable dir the voice-cloning models are
-    /// **downloaded** into on demand (`%APPDATA%/DivoraVoice/tts/`). They're
+    /// **downloaded** into on demand (`%APPDATA%/com.divora.voicemod/tts/`). They're
     /// no longer bundled (kept the installer small); cloning prompts a
     /// one-time download into here.
     clone_models_dir: PathBuf,
     /// Phase 16: directory recordings are written to
-    /// (`%APPDATA%/DivoraVoice/recordings/`). Created at startup;
+    /// (`%APPDATA%/com.divora.voicemod/recordings/`). Created at startup;
     /// surfaced to the UI so it can open it + show where files land.
     recordings_dir: PathBuf,
     /// v1.14.0: directory the rolling log file is written to
-    /// (`%APPDATA%/DivoraVoice/logs/`). Created at startup; surfaced to
+    /// (`%APPDATA%/com.divora.voicemod/logs/`). Created at startup; surfaced to
     /// the UI's "Open logs folder" support affordance.
     logs_dir: PathBuf,
     /// v1.9.0: the live MIDI input connection, if a control surface is
@@ -1117,7 +1117,7 @@ struct SpeakClip {
     path: String,
 }
 
-/// Directory saved Speak clips are written to (`%APPDATA%/DivoraVoice/
+/// Directory saved Speak clips are written to (`%APPDATA%/com.divora.voicemod/
 /// speak-clips/`), a sibling of the recordings dir. Created lazily on first save.
 fn speak_clips_path(state: &AppState) -> PathBuf {
     state.recordings_dir.parent().map_or_else(
@@ -2175,6 +2175,18 @@ fn spawn_reading_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
         .expect("spawning the reading-emitter thread should not fail");
 }
 
+/// Whether a close request on the window labelled `label` should hide it
+/// instead of closing it.
+///
+/// Only the main window hides to the tray (Phase 15). Until v1.51.3 the
+/// handler hid *every* window, so the stream overlay's `close()` only hid it:
+/// it was never destroyed, `tauri://destroyed` never fired, and the next
+/// "Show overlay window" found the hidden window and left it hidden.
+#[doc(hidden)]
+pub fn hides_on_close(label: &str) -> bool {
+    label == "main"
+}
+
 /// Reveal + focus the main window (from a tray click / "Show" menu).
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -2229,19 +2241,23 @@ pub fn run() {
                 .with_handler(global_shortcut_handler)
                 .build(),
         )
-        // Phase 15: closing the window hides it to the tray instead of
+        // Phase 15: closing the main window hides it to the tray instead of
         // quitting, so audio (and Discord routing) keep running in the
-        // background. "Quit" in the tray menu exits for real.
+        // background. "Quit" in the tray menu exits for real. Only `main`:
+        // every other window (the stream overlay) closes for real — see
+        // `hides_on_close`.
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if hides_on_close(window.label()) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .setup(|app| {
             // v1.14.0: install file logging first so both startup and
             // runtime tracing events land in a rolling daily log under
-            // %APPDATA%/DivoraVoice/logs/ — nothing collected them before
+            // %APPDATA%/com.divora.voicemod/logs/ — nothing collected them before
             // (there was no subscriber), so logs were silently dropped.
             let logs_dir = match app.path().app_data_dir() {
                 Ok(dir) => dir.join("logs"),
@@ -2262,7 +2278,7 @@ pub fn run() {
             spawn_level_emitter(app.handle().clone(), engine.clone());
             spawn_reading_emitter(app.handle().clone(), engine.clone());
 
-            // Locate %APPDATA%\DivoraVoice\presets\ (or platform equivalent)
+            // Locate %APPDATA%\com.divora.voicemod\presets\ (or platform equivalent)
             // and prepare the user preset store. Failures here are logged
             // but non-fatal — the bundled presets still ship.
             let presets_dir = match app.path().app_data_dir() {
@@ -2381,7 +2397,7 @@ pub fn run() {
             };
 
             // v1.21.0: user dir the OpenVoice cloning models download into
-            // (`%APPDATA%/DivoraVoice/tts/`). Best-effort create.
+            // (`%APPDATA%/com.divora.voicemod/tts/`). Best-effort create.
             let clone_models_dir = match app.path().app_data_dir() {
                 Ok(dir) => dir.join("tts"),
                 Err(e) => {
@@ -2501,7 +2517,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloned_voices_dir, default_clone_base, emit_speak, is_safe_voice_id,
+        cloned_voices_dir, default_clone_base, emit_speak, hides_on_close, is_safe_voice_id,
         list_cloned_voice_infos, load_cloned_voice, preview_path_in, read_preview,
         rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
         unique_preset_id, write_preview, ClonedMeta, EngineStatus, LevelUpdate, Levels,
@@ -2515,6 +2531,18 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    #[test]
+    fn only_the_main_window_hides_on_close() {
+        // The main window hides to the tray so audio keeps running.
+        assert!(hides_on_close("main"));
+        // The overlay must really close: a hidden overlay is never destroyed,
+        // so the frontend's toggle and the window disagree from then on.
+        assert!(!hides_on_close("overlay"));
+        // Any future window (per-monitor overlays) closes for real by default.
+        assert!(!hides_on_close("overlay-2"));
+        assert!(!hides_on_close(""));
+    }
 
     #[test]
     fn save_tts_clip_writes_wav_and_parseable_meta() {

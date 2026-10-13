@@ -295,7 +295,7 @@ describe("audio api", () => {
   });
 
   it("recordingsDir invokes recordings_dir", async () => {
-    invokeMock.mockResolvedValueOnce("C:/Users/me/AppData/Roaming/DivoraVoice/recordings");
+    invokeMock.mockResolvedValueOnce("C:/Users/me/AppData/Roaming/com.divora.voicemod/recordings");
     const dir = await recordingsDir();
     expect(invokeMock).toHaveBeenCalledWith("recordings_dir");
     expect(dir).toContain("recordings");

@@ -59,7 +59,7 @@ $ttsFiles = @(
 # NOTE: the OpenVoice cloning models (openvoice-extractor.onnx +
 # openvoice-converter.onnx, ~157 MB) are intentionally NOT bundled (v1.21.0) —
 # they're downloaded on demand from the voice-assets-v2 release into
-# %APPDATA%/DivoraVoice/tts/ the first time a user clones a voice.
+# %APPDATA%/com.divora.voicemod/tts/ the first time a user clones a voice.
 foreach ($f in $ttsFiles) {
   $dest = Join-Path $tts $f
   gh release download $tag --repo $repo --pattern $f --output $dest --clobber

@@ -352,7 +352,7 @@ src/
 ### Preset persistence
 
 ```
-%APPDATA%\DivoraVoice\presets\
+%APPDATA%\com.divora.voicemod\presets\
 ├── my-voice.json           ← user preset (Tag: User)
 ├── radio-host.json         ← user preset
 └── ...
@@ -1111,7 +1111,7 @@ processed-mono tap** (the same signal sent to the main output / VB-Cable),
 so a take matches the call audio sample-for-sample. A dedicated **writer
 thread** drains a lock-free ring to disk — **no file I/O ever runs on the
 real-time callback**. Hot samples clamp to the i16 range (no wrap). Files
-land in `%APPDATA%/DivoraVoice/recordings/`. Commands:
+land in `%APPDATA%/com.divora.voicemod/recordings/`. Commands:
 `start_recording` / `stop_recording` / `recordings_dir`; a `recording`
 flag rides the `audio-levels` event.
 
@@ -1161,3 +1161,132 @@ see the [CHANGELOG](../CHANGELOG.md) for the blow-by-blow:
   voice only (soundboard clips, already user-leveled, pass through).
   Commands `set_loudness_enabled` / `set_loudness_target`; a
   `loudnessGainDb` field on the `audio-levels` event drives the readout.
+
+## Stream overlay window (v1.16.0; window fixes v1.51.3)
+
+The overlay is a second `WebviewWindow` labelled `overlay`, created on demand
+by the store (`openOverlay` in `src/stores/app.tsx`) and loaded from a second
+Vite entry (`overlay.html` → `src/overlay.tsx`, `rollupOptions.input` in
+`vite.config.ts`). It renders only the `SpellCircle`. It has no store and no
+engine of its own.
+
+### Window
+
+Created with:
+
+- **Frameless and transparent:** `transparent`, `decorations: false`, and
+  `shadow: false`. An undecorated transparent window keeps a 1 px border while
+  its shadow is on (tauri #8308).
+- **On top, not on the taskbar:** `alwaysOnTop`, `skipTaskbar`.
+- **Resizable but not maximisable:** `resizable`, `maximizable: false`.
+- **Hidden and unfocused:** `visible: false`, `focus: false`.
+
+It is created hidden, placed, then shown. `focus: false` makes tao mark the
+window `MARKER_DONT_FOCUS`, so its first show uses `SW_SHOWNOACTIVATE`
+(tao `window_state.rs`). Opening the overlay therefore never takes focus from
+a game.
+
+### State
+
+- **Main → overlay:** `overlay:state` (`OverlayState`), a broadcast `emit` from
+  `syncOverlay` (`src/overlay/sync.ts`) whenever the chain, the status, the
+  tweaks or the background mode change while the overlay is open. The overlay
+  animates on its own between pushes.
+- **Overlay → main:** `overlay:ready` (no payload), emitted once the overlay's
+  `overlay:state` listener is registered. Main answers with the current state.
+  `tauri://created` fires when the native window exists, which is before the
+  overlay's page is listening, so the push sent on open could reach nobody.
+  The ready signal is sent right after the listener is registered, not after
+  a paint: the window is still hidden while main places it, and a hidden page
+  may not run animation frames.
+- **The overlay draws nothing until the first state arrives.** Main shows the
+  window as soon as it is placed, which can be before the state reaches it,
+  and a first frame of the default circle would be captured by OBS.
+
+### Lifecycle
+
+`on_window_event` in `src-tauri/src/lib.rs` turns `CloseRequested` into "hide
+to tray" only for `main`, through `hides_on_close(label)`. Until v1.51.3 it did
+this for every window. The overlay's `close()` then only hid it, so
+`tauri://destroyed` never fired, and the next open found the hidden window and
+left it hidden. Now `close()` destroys the overlay, and `tauri://destroyed`
+clears `overlayOpen`.
+
+Every path that leaves a visible overlay registers that `tauri://destroyed`
+listener and the geometry tracking:
+
+- a new window;
+- an existing one being shown again;
+- one found still on screen when the store starts.
+
+The last case is a reload of the main page: F5 / Ctrl+R reload a WebView2
+page, and the overlay window survives it.
+
+### Geometry
+
+Everything is in **physical pixels**, because Tauri reports monitors,
+`outerPosition`, `innerSize`, `onMoved` and `onResized` in physical pixels,
+while the `x`/`y`/`width`/`height` a window is created with are logical.
+
+**Saving.** After a move or resize settles (400 ms), main reads the overlay's
+`outerPosition` and `innerSize`. It also reads the monitor under the overlay's
+centre (`monitorFromPoint`). `currentMonitor()` would not do: it answers for
+the window calling it, which is main. All of this is stored in
+`divora.overlay` as `{ bg, x, y, w, h, monitor?, scale? }`. Keys the build
+doesn't know are carried through. The minimised parking spot (−32000) is
+never saved.
+
+**Restoring.** `placeOverlay` (`src/overlay/geometry.ts`) picks the monitor:
+
+1. the monitor saved by name;
+2. else the monitor the old rectangle overlaps most;
+3. else the primary;
+4. else the first monitor.
+
+It then scales the size by the ratio of scale factors, so the window keeps its
+apparent size if that display's scaling changed. Finally it clamps the
+rectangle fully onto the monitor, with a minimum of 120 px.
+
+Main applies the result by setting the size, then the position, then reading
+both back, repeating until they match, at most three times. Windows rescales
+a window (`WM_DPICHANGED`) when most of it crosses onto a monitor with a
+different scale, and that can happen during the resize as well as during the
+move. The target rectangle lies wholly on one monitor, so a second pass has
+nothing left to rescale.
+
+### Moving it
+
+A plain left press anywhere that isn't a button starts `startDragging()`
+(`src/overlay/drag.ts`). It doesn't use `data-tauri-drag-region`, because
+Tauri's drag script toggles maximise on a double-click for any resizable
+window (`internal_toggle_maximize` checks `is_resizable` only). That would
+blow a transparent, always-on-top window up to the whole screen.
+
+### Permissions
+
+`capabilities/default.json` applies to both windows. v1.51.3 adds
+`core:window:allow-set-position` and `core:window:allow-set-size`, so main can
+place the overlay. The rest comes from `core:default` or was already granted:
+monitor queries, positions and sizes, `is-minimized`, `start-dragging`,
+`show`, `close`, and event emit/listen. A separate, narrower capability for
+the overlay is planned with the scene editor (see
+[`research/stream-studio.md`](research/stream-studio.md)).
+
+### What the overlay never shows
+
+It never shows the voice reading. `src/overlay/state.test.ts` scans every
+non-test source file in `src/overlay/` for reading identifiers.
+
+### Tests
+
+- `geometry.test.ts`: placement across monitors, including mixed
+  100 %/150 % scaling, unplugged and renamed monitors, and negative
+  coordinates; persistence back-compat.
+- `sync.test.ts`: drives the real `syncOverlay`, including the ready
+  re-push. Removing that re-push fails the test.
+- `drag.test.ts`: the press rule.
+- `state.test.ts`: event names.
+- Rust: `only_the_main_window_hides_on_close`.
+
+Drag, border, taskbar, focus and reopen behaviour can only be checked on a
+desktop: see "Stream overlay" in [`MANUAL_TESTS.md`](MANUAL_TESTS.md).

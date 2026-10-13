@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Audio engine and DSP primitives for Divora"
 
 [lints]
@@ -33,7 +34,7 @@ nnnoiseless = { version = "0.5", default-features = false }
 # a registry refresh doesn't drift onto a newer rc with different
 # API surface.
 #
-# Missing model files at `%APPDATA%/DivoraVoice/voices/<name>.onnx`
+# Missing model files at `%APPDATA%/com.divora.voicemod/voices/<name>.onnx`
 # also degrade to passthrough — the effect compiles and runs
 # without any ONNX assets on disk.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-24"] }

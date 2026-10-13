@@ -6,7 +6,7 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## Setup
 
-- [ ] Fresh install on a clean machine (or wipe `%APPDATA%\DivoraVoice\`).
+- [ ] Fresh install on a clean machine (or quit the app and wipe both `%APPDATA%\com.divora.voicemod\` — presets, voices, models, recordings, logs — and `%LOCALAPPDATA%\com.divora.voicemod\`, the WebView2 profile that holds every `divora.*` setting: wizard, devices, overlay placement).
 - [ ] VB-Cable installed.
 - [ ] At least one wired headset connected.
 - [ ] Discord, Zoom, and OBS Studio installed.
@@ -90,7 +90,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Delete button is disabled on Bundled presets.
 - [ ] Duplicate on a Bundled preset creates a User preset with " Copy" appended; switches to it; left list shows it under "User".
 - [ ] Edit a duplicated preset (move a slider), click Save → preset persists; restart app → changes survive.
-- [ ] Delete a user preset → file disappears from `%APPDATA%\DivoraVoice\presets\`; left list updates; active preset falls back to the first remaining one.
+- [ ] Delete a user preset → file disappears from `%APPDATA%\com.divora.voicemod\presets\`; left list updates; active preset falls back to the first remaining one.
 - [ ] Manually replacing a bundled JSON file via a build does not overwrite any user preset.
 - [ ] Manually corrupting a user preset JSON does not crash the app — it's silently skipped from the list.
 
@@ -409,6 +409,14 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Set background = **Green** (or Magenta) → the overlay fills solid green → add a **Chroma Key** filter in OBS → the green is removed, leaving the circle.
 - [ ] Close the overlay window's toggle (or the window's own close) → the window disappears and the toggle reflects it.
 - [ ] Restart the app → the background-mode choice is restored.
+- [ ] (v1.51.3) Toggle the overlay **off and on three times** → it reappears every time, and the toggle always matches what is on screen.
+- [ ] (v1.51.3) Opening it **does not take focus**: click into another app, switch the overlay on, and keep typing → the keystrokes still go to that app.
+- [ ] (v1.51.3) **No border** around the transparent window, and **no taskbar button** for it.
+- [ ] (v1.51.3) **Drag** it by the circle (not a node button) → it moves. **Double-click** the circle → nothing happens (it does not fill the screen).
+- [ ] (v1.51.3) The circle's status word and node names use the app's fonts (Bricolage / Space Mono), not a system font.
+- [ ] (v1.51.3) Move it, then **restart the app** and switch it on → it opens where you left it, at the same size.
+- [ ] (v1.51.3) **Mixed scaling:** with a 100 % and a 150 % display, leave it on the 150 % one and restart → same place, same apparent size. Leave it on the second display, unplug that display, switch it on → it opens fully on the main display.
+- [ ] (v1.51.3) It shows the **current** preset's chain the instant it opens (no default circle first).
 
 ## Speak — text-to-speech (v1.17.0)
 
@@ -432,7 +440,7 @@ resource dir), same as the AI voice-conversion models.
 
 **Your voices — cloning (v1.20.0 / download v1.21.0):**
 
-- [ ] **First run (models not downloaded):** Speak → **Your voices** shows a **Download voice-cloning models (~157 MB)** button. Click it → a progress % appears → on completion the **Add your voice** controls replace it. (Models land in `%APPDATA%/DivoraVoice/tts/`; not in the installer.)
+- [ ] **First run (models not downloaded):** Speak → **Your voices** shows a **Download voice-cloning models (~157 MB)** button. Click it → a progress % appears → on completion the **Add your voice** controls replace it. (Models land in `%APPDATA%/com.divora.voicemod/tts/`; not in the installer.)
 - [ ] Restart → the models are still present (no re-download); **Add your voice** is shown directly.
 - [ ] Type a name → **Pick a clip** → choose a clean 20–30 s WAV of a voice → after a moment it appears in the list and is auto-selected.
 - [ ] **Record in-app (v1.23.0):** with the engine running, type a name → **Record** (button shows **Stop & save**, a "Recording…" hint appears) → speak 20–30 s → **Stop & save** → the voice is cloned, appears, and is auto-selected (same quality as an imported clip). The transient clip is not left behind in `%TEMP%\DivoraVoice`.
@@ -443,12 +451,12 @@ resource dir), same as the AI voice-conversion models.
 - [ ] **Rename (v1.43.0):** click the **pencil** on a cloned voice → the card becomes an inline editor, already focused with the name selected → type a new name → **Enter** (or ✓) → the card shows the new name, it stays selected if it was, and the **"based on …"** caption + engine badge are unchanged. **Escape** (or ✕) discards the edit and returns focus to the pencil. Restart → the new name persists. Rename it to blank → nothing is saved and the editor stays open.
 - [ ] **Reactive (v1.46.0):** on the Mixer, pick a distortion-y voice (Static Wraith / Creeper), turn **Reactive** on → speak normally, then raise your voice: the grit builds as you get louder and eases back within about a second. The **Envelope** meter tracks your level. Turn Intensity to 0 → no movement; to 100 → strongest. Switch to a preset with no Distortion → the card says so. Toggle off mid-sentence → the voice returns to the preset's authored sound with no click. Restart → the on/off state and Intensity persist.
 - [ ] **Delete** a cloned voice (trash icon) → it disappears; if it was selected, the selection falls back to a preset.
-- [ ] Restart the app → cloned voices persist (stored under `%APPDATA%/DivoraVoice/voices/cloned/`); a selected cloned voice is restored.
+- [ ] Restart the app → cloned voices persist (stored under `%APPDATA%/com.divora.voicemod/voices/cloned/`); a selected cloned voice is restored.
 - [ ] Pick a junk/too-short file → a graceful error appears (no crash).
 
 **Accent-preserving cloning — VoxCPM (v1.24.0):**
 
-- [ ] **Download (first run):** Speak → **Your voices** shows **Accent-preserving clones (~1.6 GB)**. Click → progress % → on completion it disappears (models in `%APPDATA%/DivoraVoice/tts/`; not bundled).
+- [ ] **Download (first run):** Speak → **Your voices** shows **Accent-preserving clones (~1.6 GB)**. Click → progress % → on completion it disappears (models in `%APPDATA%/com.divora.voicemod/tts/`; not bundled).
 - [ ] **Record an accent clone:** with the engine running + accent models present, type a name → **Record** → the hint shows a **fixed sentence to read aloud** (not "speak naturally") → read it → **Stop & save** → the voice appears (no "based on …" caption — it's not preset-based).
 - [ ] **Speak it:** type text → **Speak** the recorded voice → the output keeps **your accent and prosody** (not a US/UK preset accent), mixed into a call. Compare to an OpenVoice clone of the same voice (timbre-only) — the accent difference should be audible. (First utterance loads the engine — a few seconds; later ones are quicker.)
 - [ ] **Import stays timbre-only:** **Pick a clip** still produces an OpenVoice clone (timbre-only, with a "based on …" caption) even when the accent models are present.

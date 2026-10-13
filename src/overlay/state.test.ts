@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ChainEntry } from "../types";
-import { OVERLAY_BG_COLOR, OVERLAY_EVENT, overlayPayload } from "./state";
+import { OVERLAY_BG_COLOR, OVERLAY_EVENT, OVERLAY_READY_EVENT, overlayPayload } from "./state";
 
 describe("overlay state", () => {
   it("overlayPayload bundles the live values verbatim", () => {
@@ -31,6 +31,8 @@ describe("overlay state", () => {
 
   it("the event name + chroma colours are stable", () => {
     expect(OVERLAY_EVENT).toBe("overlay:state");
+    // v1.51.3; frozen in STABLE-SURFACE §2 like `overlay:state`.
+    expect(OVERLAY_READY_EVENT).toBe("overlay:ready");
     expect(OVERLAY_BG_COLOR.transparent).toBe("transparent");
     expect(OVERLAY_BG_COLOR.green).toMatch(/^#[0-9a-f]{6}$/i);
     expect(OVERLAY_BG_COLOR.magenta).toMatch(/^#[0-9a-f]{6}$/i);
@@ -75,11 +77,14 @@ describe("the overlay carries no voice reading", () => {
     // store directly, so check the source of the whole overlay surface.
     const dir = join(process.cwd(), "src", "overlay");
     const banned = /voiceReading|voice_reading|VoiceReading|wetBypassed|brightnessHz|paceOps/;
-    for (const name of readdirSync(dir)) {
-      if (!name.endsWith(".ts") && !name.endsWith(".tsx")) continue;
-      if (name.endsWith(".test.ts")) continue;
-      const source = readFileSync(join(dir, name), "utf8");
-      expect(source, `${name} references the voice reading`).not.toMatch(banned);
+    const files = readdirSync(dir)
+      .filter((n) => (n.endsWith(".ts") || n.endsWith(".tsx")) && !n.endsWith(".test.ts"))
+      .map((n) => join(dir, n));
+    // The overlay window's own entry lives one level up (v1.51.3).
+    files.push(join(process.cwd(), "src", "overlay.tsx"));
+    for (const file of files) {
+      const source = readFileSync(file, "utf8");
+      expect(source, `${file} references the voice reading`).not.toMatch(banned);
     }
   });
 });

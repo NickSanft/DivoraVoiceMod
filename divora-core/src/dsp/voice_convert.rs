@@ -41,7 +41,7 @@
 //! ### Where models live
 //!
 //! The Tauri layer is the source of truth for the voice library
-//! directory (`%APPDATA%/DivoraVoice/voices/` on Windows). This
+//! directory (`%APPDATA%/com.divora.voicemod/voices/` on Windows). This
 //! effect doesn't know about that path — it is handed in as a
 //! [`VoiceModel`], built by the control thread that heard the UI change
 //! the active voice. That thread derives the name and starts the ONNX

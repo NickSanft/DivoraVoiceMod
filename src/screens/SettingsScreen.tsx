@@ -1974,7 +1974,8 @@ function StreamOverlaySection(): JSX.Element {
           a Window Capture that supports alpha, or pick{" "}
           <strong style={{ color: "var(--text-mid)" }}>Green</strong> /{" "}
           <strong style={{ color: "var(--text-mid)" }}>Magenta</strong> and add
-          a Chroma Key filter.
+          a Chroma Key filter. Drag the circle to move the window; it
+          reopens where you left it.
         </div>
       </div>
     </section>

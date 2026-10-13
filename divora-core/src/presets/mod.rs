@@ -16,7 +16,7 @@
 //!   would refuse. To customise a bundled preset the UI offers
 //!   *Save as…*, which writes a new user preset.
 //! - **User** presets live as JSON files under the store's `base_dir`
-//!   (the Tauri shell points this at `%APPDATA%\DivoraVoice\presets\`).
+//!   (the Tauri shell points this at `%APPDATA%\com.divora.voicemod\presets\`).
 //!   The file name is `<id>.json`.
 
 mod bundled;

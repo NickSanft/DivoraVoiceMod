@@ -8,6 +8,12 @@ import type { ChainEntry, TweaksState, VoiceStatus } from "../types";
 /** The Tauri event the main window emits and the overlay listens for. */
 export const OVERLAY_EVENT = "overlay:state";
 
+/** v1.51.3: the overlay emits this (no payload) once its `overlay:state`
+ *  listener is registered; the main window answers with the current state.
+ *  Without it the push sent when the window opened could arrive before the
+ *  overlay's page was listening. */
+export const OVERLAY_READY_EVENT = "overlay:ready";
+
 /** Background mode for the overlay window's content. The window itself is
  *  always created transparent; this controls what sits behind the circle:
  *  nothing (alpha, for OBS Window Capture with transparency) or a solid
