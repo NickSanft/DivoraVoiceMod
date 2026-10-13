@@ -4,6 +4,45 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- **Your push-to-modulate, panic and monitor hotkeys now survive a restart.** They were only ever held in memory, so every launch started with all three unbound, although the notes since the hotkeys first shipped said they were kept. They are saved now, and come back working without re-binding.
+- **Hotkeys that use the Windows key now register.** Settings shows that key as "Win", and that name went straight to the app's shortcut parser, which only knows the key as "Super", so every such binding was quietly refused and the key did nothing. This also applies to soundboard tile hotkeys, including ones you set before this fix: they register the next time the app starts. A binding can still fail without a message:
+  - most often because Windows or another app already uses that combination; many Windows-key combinations belong to Windows itself;
+  - some keys can't be used for a global hotkey at all, such as Shift with a number or symbol.
+
+  If a binding doesn't fire, pick another combination.
+
+### Tests
+
+- `src/data/hotkeys.test.ts` (9) covers:
+  - chips to accelerator, with "Win" (and "Meta") becoming "Super";
+  - accelerator to chips, with "Super", "Cmd" and "Command" shown as "Win";
+  - the round trip, normalization and idempotence;
+  - a "+" key never collapsing into a bare modifier: an earlier draft of the normalizer turned "Shift++" into "Shift", which the in-app push-to-modulate listener would have fired on for every Shift press;
+  - reading stored bindings: nothing stored, junk, unknown actions, non-strings, and an old "Win" binding.
+- **Store tests (4 new)** drive the real store:
+  - a binding written, and a fresh store (a restart) loading it and registering it;
+  - a bound push-to-modulate key restoring the in-app key;
+  - a stored "Ctrl+Win+M" registering as "Ctrl+Super+M", and a new "Win+F9" as "Super+F9";
+  - a soundboard tile with the Windows key registering as "Super+1".
+- **Verified by putting each defect back:** removing the save fails the restart test; letting "Win" through fails six tests.
+- **The hotkey test block now clears `localStorage` before each test.** Bindings persist now, and one test's binding would otherwise leak into the "the default registers nothing system-wide" guard beside it.
+- **Checked in the real app,** in the debug build driven over WebView2's DevTools protocol. The binding was set through the Settings control as a user would, and registration was read back from the shortcut plugin's own `is_registered`.
+  - **11 checks passed:**
+    - **The control case:** an accelerator written with "Win" is refused (`UnsupportedKey("Win")`), the defect itself.
+    - **Binding and saving:** pressing Ctrl+Alt+Win+F9 shows "Win" in the chip, saves `Ctrl+Alt+Super+F9`, and Windows has it registered, with no warning.
+    - **After quitting and relaunching:** it is still saved and shown, and registered again without re-binding.
+    - **Clearing:** it unregisters.
+  - **Windows owns many Win-key combinations.** The first attempt used Ctrl+Win+P, which Windows refused as already registered, which is why that case is called out above.
+  - **Not verified:** a physical key press, because the session was locked.
+
+### Architecture notes
+
+- **New `src/data/hotkeys.ts`** holds `keysToAccelerator`, `acceleratorToKeys`, `normalizeAccelerator` and `readHotkeyBindings`. Settings, the store's three actions and the soundboard tiles all build accelerators through it, so no path can hand "Win" to the backend again. Settings and the Mixer keep showing "Win", which is what Windows calls the key; the Mixer's push-to-modulate card now goes through `acceleratorToKeys` too, or it would have started reading "Super".
+- **New key `divora.hotkeyBindings`** = `{ ptm, panic, monitor }`, each `""` when unbound. All three default to empty, so a fresh install still registers nothing system-wide.
+- **`docs/STABLE-SURFACE.md` gains the global-shortcut id table:** `ptm`, `panic`, `monitor`, and the reserved `sb:` prefix. Later releases add their prefixes to it.
+
 ## [1.51.3] — 2026-10-13 — Fix: the stream overlay window
 
 ### Fixed

@@ -1365,6 +1365,65 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(undefined);
+    // v1.51.4: bindings persist now, so one test's binding must not leak
+    // into the next (the "default registers nothing" guard depends on it).
+    window.localStorage.clear();
+  });
+
+  it("a binding survives a restart (v1.51.4)", async () => {
+    const first = setupApp();
+    await first.result.setHotkeyBinding("panic", "Ctrl+Shift+P");
+    expect(JSON.parse(window.localStorage.getItem("divora.hotkeyBindings") ?? "{}")).toEqual({
+      ptm: "",
+      panic: "Ctrl+Shift+P",
+      monitor: "",
+    });
+    first.cleanup();
+
+    // A fresh store is a restart: the binding is back, and it registers.
+    const second = setupApp();
+    expect(second.result.hotkeyBindings.panic).toBe("Ctrl+Shift+P");
+    invokeMock.mockClear();
+    await second.result.syncHotkeyBindings();
+    const ids = invokeMock.mock.calls
+      .filter((c) => c[0] === "register_global_shortcut")
+      .map((c) => (c[1] as { id: string }).id);
+    expect(ids).toEqual(["panic"]);
+  });
+
+  it("a push-to-modulate binding also restores the in-app key", () => {
+    window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ ptm: "Ctrl+Alt+M" }));
+    const { result } = setupApp();
+    expect(result.hotkeyBindings.ptm).toBe("Ctrl+Alt+M");
+    expect(result.ui.ptmKey).toBe("Ctrl+Alt+M");
+  });
+
+  it("the Windows key registers as Super, including a binding saved as Win", async () => {
+    window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ monitor: "Ctrl+Win+M" }));
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.syncHotkeyBindings();
+    expect(invokeMock).toHaveBeenCalledWith("register_global_shortcut", {
+      id: "monitor",
+      accelerator: "Ctrl+Super+M",
+    });
+
+    invokeMock.mockClear();
+    await result.setHotkeyBinding("panic", "Win+F9");
+    expect(invokeMock).toHaveBeenCalledWith("register_global_shortcut", {
+      id: "panic",
+      accelerator: "Super+F9",
+    });
+  });
+
+  it("a soundboard tile hotkey with the Windows key registers as Super", async () => {
+    const { result } = setupApp();
+    invokeMock.mockClear();
+    await result.bindTileHotkey("clip-bell", ["Win", "1"]);
+    expect(invokeMock).toHaveBeenCalledWith("register_global_shortcut", {
+      id: "sb:clip-bell",
+      accelerator: "Super+1",
+    });
   });
 
   it("refreshVirtualMicStatus stores the backend status verbatim", async () => {

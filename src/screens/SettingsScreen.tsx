@@ -48,19 +48,15 @@ import type {
   TweaksState,
 } from "../types";
 
+import { acceleratorToKeys, keysToAccelerator } from "../data/hotkeys";
+
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
 const ISSUES_URL = "https://github.com/NickSanft/DivoraVoiceMod/issues/new";
 
 // HotkeyCapture takes/returns `string[]` (one chip per key). The store
 // keeps a single Tauri accelerator string ("Ctrl+Shift+P", "Space", "").
-function keysToAccelerator(keys: string[]): string {
-  return keys.join("+");
-}
-
-function acceleratorToKeys(accelerator: string): string[] {
-  if (!accelerator) return [];
-  return accelerator.split("+").map((k) => k.trim()).filter(Boolean);
-}
+// The converters live in data/hotkeys.ts (v1.51.4): the "Win" chip has to
+// become "Super" in the accelerator, or the registration fails.
 
 export function SettingsScreen(): JSX.Element {
   const app = useApp();

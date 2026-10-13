@@ -401,6 +401,12 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] The **Chorus** effect is also selectable (Mix + Depth); enabling it thickens/widens the voice; Mix = 0 is a clean passthrough.
 - [ ] **Presets — "In use" badge**: with the engine **stopped**, no preset shows the green "In use" badge in the editor (previously every voice showed it). With the engine **running**, the active preset shows "In use."
 
+## Hotkeys survive a restart (v1.51.4)
+
+- [ ] Settings → Hotkeys: bind push-to-modulate to **Ctrl+Alt+Win+F9** (the chip reads "Win"; it saves as `Ctrl+Alt+Super+F9`) → hold it while another app is focused → the voice modulates. Windows or another app owns many Win-key combinations (Ctrl+Win+P was taken on the verification machine); a taken one is refused and only logged (`[hotkey] register failed` in the devtools console), so pick another combination rather than counting it as a regression.
+- [ ] Bind panic and monitor too, quit from the tray, relaunch → all three are still shown **and still work** without re-binding.
+- [ ] Clear a binding, relaunch → it stays cleared, and the key is free in other apps.
+
 ## Stream overlay (v1.16.0)
 
 - [ ] Settings → Stream overlay → toggle **Show overlay window** on → a frameless, always-on-top window appears showing the spell circle.

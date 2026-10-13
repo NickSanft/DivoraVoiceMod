@@ -559,6 +559,11 @@ event.id  | event.state | action
 
 `syncHotkeyBindings()` is called once after subscribe; it re-registers every persisted accelerator so a Windows restart doesn't lose the bindings (Tauri's plugin loses its registrations when the process exits).
 
+**Persistence (v1.51.4).**
+
+- **What is saved:** the `ptm` / `panic` / `monitor` bindings, in `divora.hotkeyBindings`. They are read back through `readHotkeyBindings` (`src/data/hotkeys.ts`), which keeps only the known actions and only string values. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
+- **The Windows key:** the capture component labels it "Win", but the parser behind `register_global_shortcut` (global-hotkey 0.8.0) accepts only `Super` / `Cmd` / `Command`. `keysToAccelerator` and `normalizeAccelerator` turn "Win" into "Super" for every accelerator handed to the backend: the three actions, and soundboard tiles, including ones saved before the fix. `acceleratorToKeys` shows "Super" as "Win" again.
+
 ### Why two PTM listeners?
 
 The OS-level hotkey works while the app is unfocused but **does not** swallow the keypress from the focused app. So if a user is typing in Discord with PTM = Space, Discord still gets the spaces. To handle that, `App.tsx` also keeps an in-app `window.addEventListener("keydown")` that triggers the same `ui.pressed` flip when our window has focus AND the event target is `document.body`. Both listeners converge on the same store mutation; the user can't tell which fired.
@@ -767,7 +772,7 @@ clearTileHotkey(clipId)
 
 App restart
   └─► App.tsx onMount → syncHotkeyBindings()
-       └─► for each (clipId, keys) in tileHotkeys → register_global_shortcut(sb:<clipId>, keys.join("+"))
+       └─► for each (clipId, keys) in tileHotkeys → register_global_shortcut(sb:<clipId>, keysToAccelerator(keys))  ("Win" → "Super", v1.51.4)
 ```
 
 The `sb:` prefix keeps tile ids out of the PTM / panic / monitor namespace.

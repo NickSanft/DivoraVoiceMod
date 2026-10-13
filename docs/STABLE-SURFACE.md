@@ -143,6 +143,15 @@ voices use the `babble:` namespace; their ids — `babble:bright`,
 | `unregister_global_shortcut` | `id` | — / error |
 | `unregister_all_global_shortcuts` | — | — / error |
 
+**Global-shortcut ids** (the `id` argument above, and the `id` of the `global-shortcut` event). An id is a fixed action name or a reserved prefix; new ids are added, never renamed. Accelerators use the global-hotkey grammar, so the Windows key is `Super` (written "Win" only in the UI) — v1.51.4.
+
+| Id | Meaning |
+|---|---|
+| `ptm` | push-to-modulate (press and release) |
+| `panic` | stop all soundboard clips |
+| `monitor` | toggle hearing yourself |
+| `sb:<clipId>` | play one soundboard tile (prefix reserved) |
+
 ### MIDI control surfaces (v1.9.0)
 
 | Command | Args | Returns |
@@ -322,6 +331,7 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4. Unknown keys are ignored on load; "Win" is read as "Super" |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
 | `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |

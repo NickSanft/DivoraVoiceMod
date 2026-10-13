@@ -135,6 +135,7 @@ import {
 import type { ReactiveConfig, ReactiveRouteSpec } from "../audio/api";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
+import { keysToAccelerator, normalizeAccelerator, readHotkeyBindings } from "../data/hotkeys";
 import {
   isSavablePosition,
   mergeOverlayPrefs,
@@ -266,6 +267,9 @@ const STORAGE_KEYS = {
   // voice is ever written to disk — the rolling baseline the descriptors are
   // relative to lives in the engine for the life of a session and dies there.
   voiceReading: "divora.voiceReading",
+  // v1.51.4: push-to-modulate / panic / monitor global hotkeys. Never
+  // persisted before, although the docs said they were.
+  hotkeyBindings: "divora.hotkeyBindings",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -2285,7 +2289,7 @@ export function createAppState(): AppState {
   ): Promise<void> => {
     setTileHotkeys(clipId, keys);
     saveJson(STORAGE_KEYS.tileHotkeys, { ...tileHotkeys });
-    const accelerator = keys.join("+");
+    const accelerator = keysToAccelerator(keys);
     if (!accelerator) {
       try {
         await unregisterGlobalShortcutCmd(tileHotkeyId(clipId));
@@ -2338,15 +2342,24 @@ export function createAppState(): AppState {
 
   // Global hotkeys.
 
+  // v1.51.4: loaded from `divora.hotkeyBindings` (defaults stay empty, so
+  // nothing is registered system-wide until the user binds a key), and
+  // normalized so a binding saved with "Win" registers as "Super".
   const [hotkeyBindings, setHotkeyBindings] = createStore<Record<HotkeyAction, string>>({
     ...DEFAULT_HOTKEY_BINDINGS,
+    ...readHotkeyBindings(loadJson<unknown>(STORAGE_KEYS.hotkeyBindings, null)),
   });
+  // The in-app push-to-modulate listener follows the bound key, as it does
+  // when the key is set (below).
+  if (hotkeyBindings.ptm) setUi("ptmKey", hotkeyBindings.ptm);
 
   const setHotkeyBinding = async (
     action: HotkeyAction,
-    accelerator: string,
+    rawAccelerator: string,
   ): Promise<void> => {
+    const accelerator = normalizeAccelerator(rawAccelerator);
     setHotkeyBindings(action, accelerator);
+    saveJson(STORAGE_KEYS.hotkeyBindings, { ...hotkeyBindings });
     // PTM also drives the in-app fallback listener via ui.ptmKey.
     if (action === "ptm") {
       setUi("ptmKey", accelerator || "Space");
@@ -2384,7 +2397,7 @@ export function createAppState(): AppState {
     // global-shortcut listener in App.tsx.
     for (const [clipId, keys] of Object.entries(tileHotkeys)) {
       if (!keys || keys.length === 0) continue;
-      const accelerator = keys.join("+");
+      const accelerator = keysToAccelerator(keys);
       try {
         await registerGlobalShortcutCmd(tileHotkeyId(clipId), accelerator);
       } catch (err) {

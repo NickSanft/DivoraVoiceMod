@@ -25,6 +25,7 @@ import {
   REACTIVE_FLOOR_DB,
 } from "../data/reactive";
 import { useApp } from "../stores/app";
+import { acceleratorToKeys } from "../data/hotkeys";
 import {
   resamplingDetail,
   resamplingSummary,
@@ -390,6 +391,9 @@ function VoiceStatusCard(): JSX.Element {
 
 function PushToModulateCard(): JSX.Element {
   const app = useApp();
+  // Show the key the way Settings does: "Win", not the accelerator's
+  // "Super" (v1.51.4 stores the backend form).
+  const ptmLabel = (): string => acceleratorToKeys(app.ui.ptmKey).join("+") || "Space";
   const pressed = () => app.ui.pressed;
   return (
     <div class="card" style={{ padding: "var(--s4)" }}>
@@ -403,7 +407,7 @@ function PushToModulateCard(): JSX.Element {
         }}
       >
         <span class="eyebrow">Push to modulate</span>
-        <Kbd>{app.ui.ptmKey}</Kbd>
+        <Kbd>{ptmLabel()}</Kbd>
       </div>
       <Segmented<PtmMode>
         options={[
@@ -431,7 +435,7 @@ function PushToModulateCard(): JSX.Element {
           ? app.ui.ptmMode === "apply"
             ? "APPLYING"
             : "BYPASSED"
-          : `Hold to test · press ${app.ui.ptmKey}`}
+          : `Hold to test · press ${ptmLabel()}`}
       </button>
     </div>
   );

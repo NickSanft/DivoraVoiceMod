@@ -240,7 +240,7 @@ Version numbers are planning labels; a patch landing in between shifts the rest.
 
 **Changelog.** The Fixed bullets say what is literally true: these bindings never survived a restart, although the docs said they did.
 
-**Done when.** Ctrl+Super+P bound to push-to-modulate still fires after a restart.
+**Done when.** Ctrl+Alt+Win+F9 bound to push-to-modulate is still registered after a restart. (Ctrl+Win+P is owned by Windows on the verification machine.)
 
 ### v1.52.0 — Record your screen with your voice (10–15 days; spike gate on day 5)
 

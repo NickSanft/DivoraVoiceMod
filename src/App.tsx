@@ -196,9 +196,9 @@ function Shell(): JSX.Element {
         unlisten = null;
         return;
       }
-      // Push any persisted bindings into the backend so they survive
-      // a restart. Defaults: PTM = Space, others empty (so this is a
-      // no-op on first boot).
+      // Push the persisted bindings (`divora.hotkeyBindings`, v1.51.4)
+      // into the backend so they survive a restart. Every default is empty,
+      // so this is a no-op on first boot.
       await app.syncHotkeyBindings();
     })();
     onCleanup(() => {
