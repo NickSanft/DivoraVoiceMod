@@ -251,7 +251,9 @@ After v1.0, features follow standard semver:
 
 **Next up:** the v1.8–v1.10 roadmap is shipped (dynamics, control surfaces, guided mic calibration), plus light theme (v1.11) and the update check + E2E harness (v1.12). Shipped v1.13 setup diagnostic and v1.14 quick wins (preset import, logs/report affordance, README roadmap). **Standout features** track: v1.15 custom glyph casting and v1.16 spell-circle stream overlay both shipped. Further work follows standard semver — see "Further out" below.
 
-Further out (standard semver): VST3 host, OBS WebSocket, community preset registry, etc. (Light theme shipped — v1.11.0.)
+Further out (standard semver): VST3 host, community preset registry, etc. (Light theme shipped — v1.11.0.)
+
+**Planned — stream studio:** screen recording with your voice, game and Discord audio, a replay buffer, overlay Charms (pictures and GIFs), a real mic mute, Hourglass timers and opt-in OBS WebSocket control. Release-by-release plan, decisions and verified evidence in [`docs/research/stream-studio.md`](research/stream-studio.md).
 
 ## Roadmap detail — v1.8–v1.10 (all shipped)
 
@@ -490,9 +492,9 @@ Jobs:
 - MIDI controller bindings + Stream Deck integration — **shipped v1.9.0** (see roadmap detail)
 - Guided mic calibration — **shipped v1.10.0** (see roadmap detail)
 - VST3 plugin host inside the effect chain
-- OBS WebSocket integration
+- OBS WebSocket integration — **planned**, opt-in (see [`research/stream-studio.md`](research/stream-studio.md))
 - Community preset registry (GitHub-hosted JSON)
-- 30-second rolling clip recorder
+- 30-second rolling clip recorder — **planned** as the replay buffer (see [`research/stream-studio.md`](research/stream-studio.md))
 - Light theme — **shipped v1.11.0** (light/dark Tweaks axis)
 - Live-mic babble effect — Critter Chatter (v1.50.0, Speak only) as a real-time chain effect on the microphone; requested for a later release. Without text it can't be letter-accurate, so it would voice one syllable per detected speech onset instead. Research estimated **+15–30 ms** added latency. Needs a per-sample onset detector that is allocation-free on the audio thread (the babble renderer today allocates per utterance, so it can't simply be called from the callback).
 
