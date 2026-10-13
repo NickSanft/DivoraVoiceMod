@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.51.3] — 2026-10-13 — Fix: the stream overlay window
+
 ### Fixed
 
 - **The stream overlay can be switched off and on again.** Switching it off only *hid* the window: closing any window was turned into "hide to tray", which is meant for the main window alone. Switching it back on found the hidden window and never showed it, so the toggle read "on" with nothing on screen until you restarted the app. The overlay now closes for real and comes back every time.
