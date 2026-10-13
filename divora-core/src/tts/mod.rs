@@ -470,7 +470,7 @@ mod tests {
             let audio = synthesize("Hello there!", v.id, &empty_assets())
                 .unwrap_or_else(|e| panic!("{} should render: {e:?}", v.id));
             assert_eq!(audio.sample_rate, TTS_SAMPLE_RATE);
-            assert!(!audio.samples.is_empty());
+            assert_ne!(audio.samples, Vec::<f32>::new());
         }
     }
 

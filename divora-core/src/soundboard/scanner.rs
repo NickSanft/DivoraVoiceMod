@@ -126,7 +126,7 @@ mod tests {
     fn empty_folder_returns_empty_list() {
         let dir = tmp_dir();
         let tiles = scan_folder(&dir).unwrap();
-        assert!(tiles.is_empty());
+        assert_eq!(tiles, []);
     }
 
     #[test]

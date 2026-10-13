@@ -74,6 +74,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
   - **Where:** corrected in 27 places — code comments, both Cargo manifests, a test fixture, STABLE-SURFACE, ARCHITECTURE, PLAN, MANUAL_TESTS and the asset-fetch script. The CHANGELOG's history is left as written.
   - **The clean-install step:** it said "wipe `%APPDATA%\DivoraVoice\`", which wiped nothing. It now names both folders, because the app's settings live in the WebView2 profile under `%LOCALAPPDATA%\com.divora.voicemod\`, not with its files.
 - `docs/ARCHITECTURE.md` gains the overlay section it never had.
+- **Clippy 1.99** (stable since 2026-10-01) added `assert_is_empty`, which failed this release's first CI run on 18 existing test assertions in `divora-core`. They now use `assert_eq!` / `assert_ne!`, which print the value when they fail. Test code only; nothing the app does changes.
 
 ## [1.51.2] — 2026-09-30 — Fix: audio that broke when your devices disagreed
 

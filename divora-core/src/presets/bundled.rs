@@ -168,8 +168,8 @@ mod tests {
         let presets = bundled_presets();
         assert_eq!(presets.len(), bundled_preset_ids().len());
         for p in &presets {
-            assert!(!p.id.is_empty());
-            assert!(!p.name.is_empty());
+            assert_ne!(p.id, "");
+            assert_ne!(p.name, "");
             assert!(matches!(p.tag, PresetTag::Bundled));
         }
     }

@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn punctuation_only_text_has_no_events() {
         let s = schedule(" ?! ... \u{1F642} ", &FLAT, 0);
-        assert!(s.events.is_empty());
+        assert_eq!(s.events, []);
         assert_eq!(s.len, 0);
     }
 

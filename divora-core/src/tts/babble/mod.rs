@@ -369,7 +369,7 @@ mod tests {
         for v in VOICES {
             let audio = synthesize("Hi there!", v.id).expect("renders");
             assert_eq!(audio.sample_rate, TTS_SAMPLE_RATE);
-            assert!(!audio.samples.is_empty());
+            assert_ne!(audio.samples, Vec::<f32>::new());
             assert!(audio.samples.iter().all(|x| x.is_finite()));
         }
     }

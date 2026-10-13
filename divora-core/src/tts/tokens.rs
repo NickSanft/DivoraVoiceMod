@@ -159,8 +159,8 @@ mod tests {
 
     #[test]
     fn split_text_empty_is_empty() {
-        assert!(split_text("   ", 100).is_empty());
-        assert!(split_text("hi", 0).is_empty());
+        assert_eq!(split_text("   ", 100), Vec::<String>::new());
+        assert_eq!(split_text("hi", 0), Vec::<String>::new());
     }
 
     #[test]

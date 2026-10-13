@@ -537,7 +537,7 @@ mod tests {
             })
             .collect();
         let (got, _) = run(rate, &sig);
-        assert!(!got.is_empty());
+        assert_ne!(got, Vec::<f32>::new());
         for hz in got {
             assert!(
                 (hz - f0).abs() < 6.0,
@@ -567,7 +567,7 @@ mod tests {
             })
             .collect();
         let (got, _) = run(rate, &sig);
-        assert!(!got.is_empty());
+        assert_ne!(got, Vec::<f32>::new());
         let read = median(got);
         assert!(
             (read - f0).abs() < 8.0,

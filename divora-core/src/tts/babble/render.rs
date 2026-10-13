@@ -412,7 +412,7 @@ mod tests {
     fn output_is_finite_and_under_the_ceiling() {
         let s = schedule("HELLO!!! the quick brown fox... 12345 日本語", &P, 3);
         let out = render(&s, &Tones::new());
-        assert!(!out.is_empty());
+        assert_ne!(out, Vec::<f32>::new());
         assert!(out.iter().all(|x| x.is_finite()));
         assert!(out.iter().all(|x| x.abs() <= PEAK_CEILING));
     }
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn empty_schedule_renders_nothing() {
         let s = schedule("?!", &P, 3);
-        assert!(render(&s, &Tones::new()).is_empty());
+        assert_eq!(render(&s, &Tones::new()), Vec::<f32>::new());
     }
 
     #[test]

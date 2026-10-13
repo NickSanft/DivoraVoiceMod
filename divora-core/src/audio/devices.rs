@@ -96,7 +96,7 @@ mod tests {
         }
         let devices = list_input_devices();
         for d in &devices {
-            assert!(!d.name.is_empty());
+            assert_ne!(d.name, "");
             assert!(d.channels >= 1);
         }
     }
@@ -108,7 +108,7 @@ mod tests {
         }
         let devices = list_output_devices();
         for d in &devices {
-            assert!(!d.name.is_empty());
+            assert_ne!(d.name, "");
             assert!(d.channels >= 1);
         }
     }

@@ -3452,7 +3452,7 @@ mod tests {
     fn nothing_measured_yet_is_not_a_stale_reading() {
         let snap = reading_snapshot(None, ReadingState::Quiet);
         assert!(!snap.stale);
-        assert!(snap.reading.descriptors.is_empty());
+        assert_eq!(snap.reading.descriptors, []);
         assert!(!snap.reading.calibrated);
     }
 
@@ -3466,7 +3466,7 @@ mod tests {
         let old = (speaking_window(), stale_at);
         let snap = reading_snapshot(Some(&old), ReadingState::Quiet);
         assert!(!snap.stale, "an expired window was shown as merely stale");
-        assert!(snap.reading.descriptors.is_empty());
+        assert_eq!(snap.reading.descriptors, []);
         assert_eq!(snap.reading.state, ReadingState::Quiet);
     }
 
@@ -3595,7 +3595,7 @@ mod tests {
         assert!(!engine.reading_enabled());
         let snap = engine.voice_reading();
         assert_eq!(snap.reading.state, ReadingState::Stopped);
-        assert!(snap.reading.descriptors.is_empty());
+        assert_eq!(snap.reading.descriptors, []);
         assert!(!snap.reading.calibrated);
         assert!(!snap.stale);
         engine.set_reading_enabled(true);

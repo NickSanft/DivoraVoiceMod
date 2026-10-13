@@ -646,7 +646,7 @@ fn a_calibrated_speaker_gets_a_phrase_of_at_most_three_words() {
     let readings = calibrate(&mut a, &v);
     let r = last_speaking(&readings);
     assert!(r.calibrated);
-    assert!(!r.descriptors.is_empty());
+    assert_ne!(r.descriptors, []);
     assert!(
         r.descriptors.len() <= MAX_DESCRIPTORS,
         "{} words: {:?}",
