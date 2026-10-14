@@ -40,6 +40,15 @@ fn boxes(mut bytes: &[u8]) -> Vec<([u8; 4], &[u8])> {
     out
 }
 
+/// Which way the test went, in the test log even when it passes: libtest
+/// captures `print!`/`eprint!` from passing tests, but not writes to the
+/// stderr handle itself — and on CI "it encoded" and "it returned early" must
+/// be told apart.
+fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "encoder smoke: {line}");
+}
+
 fn temp_mp4(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("divora-{name}-{}.mp4", std::process::id()))
 }
@@ -100,20 +109,22 @@ fn the_software_writer_makes_a_readable_mp4() {
     let api = match api() {
         Ok(api) => api,
         Err(e) => {
-            eprintln!("skipped: Media Foundation does not load here ({e})");
+            say(&format!(
+                "skipped: Media Foundation does not load here ({e})"
+            ));
             return;
         }
     };
     let session = match api.session() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("skipped: MFStartup failed ({e})");
+            say(&format!("skipped: MFStartup failed ({e})"));
             return;
         }
     };
     let (h264, aac) = software_encoders(&session);
     if !h264 {
-        eprintln!("skipped: no H.264 encoder is registered here");
+        say("skipped: no H.264 encoder is registered here");
         return;
     }
     drop(session);
@@ -152,9 +163,16 @@ fn the_software_writer_makes_a_readable_mp4() {
         (seconds - 1.5).abs() < 0.1,
         "45 frames at 30 fps lasted {seconds:.3} s"
     );
-    if !aac {
-        eprintln!("note: no AAC encoder here; the audio track went unchecked");
-    }
+    say(&format!(
+        "encoded {} bytes: {} track(s), {seconds:.3} s{}",
+        bytes.len(),
+        tracks,
+        if aac {
+            ""
+        } else {
+            "; no AAC encoder here, so no audio track"
+        }
+    ));
 }
 
 /// The real thing: Windows Graphics Capture of the main screen, the GPU
