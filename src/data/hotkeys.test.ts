@@ -61,14 +61,34 @@ describe("normalizeAccelerator", () => {
 
 describe("readHotkeyBindings", () => {
   it("nothing stored: every action unbound", () => {
-    expect(readHotkeyBindings(null)).toEqual({ ptm: "", panic: "", monitor: "" });
-    expect(readHotkeyBindings("junk")).toEqual({ ptm: "", panic: "", monitor: "" });
-    expect(readHotkeyBindings([1, 2])).toEqual({ ptm: "", panic: "", monitor: "" });
+    const none = { ptm: "", panic: "", monitor: "", "rec:screen": "", "rec:wav": "" };
+    expect(readHotkeyBindings(null)).toEqual(none);
+    expect(readHotkeyBindings("junk")).toEqual(none);
+    expect(readHotkeyBindings([1, 2])).toEqual(none);
   });
 
   it("reads the known actions, ignores the rest, normalizes Win", () => {
     expect(
       readHotkeyBindings({ ptm: "Ctrl+Win+Space", panic: 7, monitor: "F8", "sb:x": "F1", future: "F2" }),
-    ).toEqual({ ptm: "Ctrl+Super+Space", panic: "", monitor: "F8" });
+    ).toEqual({
+      ptm: "Ctrl+Super+Space",
+      panic: "",
+      monitor: "F8",
+      "rec:screen": "",
+      "rec:wav": "",
+    });
+  });
+
+  // v1.52.0: a v1.51.4 save has no recorder keys; they read as unbound, and
+  // the recorders' own bindings round-trip.
+  it("reads the recorder hotkeys, and older saves without them", () => {
+    expect(readHotkeyBindings({ ptm: "F9" })).toMatchObject({
+      ptm: "F9",
+      "rec:screen": "",
+      "rec:wav": "",
+    });
+    expect(
+      readHotkeyBindings({ "rec:screen": "Ctrl+Alt+Win+F9", "rec:wav": "Ctrl+Alt+F10" }),
+    ).toMatchObject({ "rec:screen": "Ctrl+Alt+Super+F9", "rec:wav": "Ctrl+Alt+F10" });
   });
 });

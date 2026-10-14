@@ -16,8 +16,20 @@
 
 import type { HotkeyAction } from "../stores/app";
 
-/** The persisted actions, in a fixed order (also the order they register). */
-export const HOTKEY_ACTIONS: readonly HotkeyAction[] = ["ptm", "panic", "monitor"];
+/** The persisted actions, in a fixed order (also the order they register).
+ *  v1.52.0 adds the two recorders, under the reserved `rec:` prefix. */
+export const HOTKEY_ACTIONS: readonly HotkeyAction[] = [
+  "ptm",
+  "panic",
+  "monitor",
+  "rec:screen",
+  "rec:wav",
+];
+
+/** Every action unbound: the default, and what a missing key reads as. */
+export function unboundHotkeys(): Record<HotkeyAction, string> {
+  return Object.fromEntries(HOTKEY_ACTIONS.map((a) => [a, ""])) as Record<HotkeyAction, string>;
+}
 
 /** Names for the Windows key the parser rejects, mapped to one it accepts. */
 const WINDOWS_KEY_ALIASES = new Set(["WIN", "WINDOWS", "META"]);
@@ -62,7 +74,7 @@ export function normalizeAccelerator(accelerator: string): string {
  *  actions are read, only string values are kept, and every value is
  *  normalized — so a binding saved with "Win" before this fix registers. */
 export function readHotkeyBindings(raw: unknown): Record<HotkeyAction, string> {
-  const out = { ptm: "", panic: "", monitor: "" } as Record<HotkeyAction, string>;
+  const out = unboundHotkeys();
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return out;
   const o = raw as Record<string, unknown>;
   for (const action of HOTKEY_ACTIONS) {

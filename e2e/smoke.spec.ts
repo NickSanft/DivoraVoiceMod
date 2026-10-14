@@ -457,6 +457,136 @@ test.describe("voice reading", () => {
 
 });
 
+test.describe("screen recording (v1.52)", () => {
+  /** Fire a `screen-recording` event as the backend would. */
+  async function emitScreen(
+    page: import("@playwright/test").Page,
+    update: Record<string, unknown>,
+  ): Promise<void> {
+    await page.evaluate((u) => {
+      (
+        window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void }
+      ).__E2E_EMIT__("screen-recording", {
+        state: "idle",
+        path: null,
+        elapsedMs: 0,
+        droppedFrames: 0,
+        driftPpm: 0,
+        audioLostAt: null,
+        error: null,
+        ...u,
+      });
+    }, update);
+  }
+
+  test("the Mixer card follows a take from the backend's events", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Mixer").click();
+    const card = page.getByTestId("screen-record-card");
+    await expect(card).toBeVisible();
+    await expect(card).toContainText("Your modulated voice and soundboard");
+    await expect(page.getByTestId("screen-record-title")).toHaveText("Record screen");
+    // Two screens: the picker shows the main one.
+    await expect(card).toContainText("Screen 1 · 2560×1440 · main");
+    // The harness starts the engine, so Record is live and asks the backend
+    // for a take of the chosen screen with the default settings.
+    const toggle = page.getByTestId("screen-record-toggle");
+    await expect(toggle).toBeEnabled();
+    await toggle.click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (
+            window as unknown as {
+              __E2E_INVOKES__: Array<{ cmd: string; args: Record<string, unknown> }>;
+            }
+          ).__E2E_INVOKES__.find((i) => i.cmd === "start_screen_recording")?.args,
+        ),
+      )
+      .toMatchObject({
+        monitorId: "\\\\.\\DISPLAY1",
+        fps: 30,
+        quality: "balanced",
+        cursor: true,
+      });
+
+    await emitScreen(page, {
+      state: "recording",
+      path: "C:/mock/recordings/divora-screen-x.mp4",
+      elapsedMs: 42_000,
+    });
+    await expect(page.getByTestId("screen-record-title")).toHaveText("Recording · 0:42");
+    await expect(toggle).toHaveText("Stop");
+    await expect(toggle).toBeEnabled();
+
+    await emitScreen(page, {
+      state: "recording",
+      path: "C:/mock/recordings/divora-screen-x.mp4",
+      elapsedMs: 90_000,
+      audioLostAt: 83.4,
+    });
+    await expect(page.getByTestId("screen-record-audio-lost")).toContainText(
+      "Audio lost at 1:23",
+    );
+
+    await emitScreen(page, { state: "stopping", path: "C:/mock/recordings/divora-screen-x.mp4" });
+    await expect(page.getByTestId("screen-record-title")).toHaveText("Finishing the file…");
+    await expect(toggle).toBeDisabled();
+
+    await emitScreen(page, { state: "idle", path: "C:/mock/recordings/divora-screen-x.mp4" });
+    await expect(card).toContainText("Saved divora-screen-x.mp4");
+
+    await emitScreen(page, { state: "idle", error: "That screen isn't sending any picture" });
+    await expect(page.getByTestId("screen-record-error")).toHaveText(
+      "That screen isn't sending any picture",
+    );
+
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("the rec:screen and rec:wav hotkeys start their recorders", async ({ page }) => {
+    await nav(page, "Mixer").click();
+    await expect(page.getByTestId("screen-record-toggle")).toBeEnabled();
+    const invoked = (cmd: string) =>
+      page.evaluate(
+        (c) =>
+          (
+            window as unknown as { __E2E_INVOKES__: Array<{ cmd: string }> }
+          ).__E2E_INVOKES__.some((i) => i.cmd === c),
+        cmd,
+      );
+    const press = (id: string) =>
+      page.evaluate((i) => {
+        (
+          window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void }
+        ).__E2E_EMIT__("global-shortcut", { id: i, accelerator: "F9", state: "pressed" });
+      }, id);
+    await press("rec:screen");
+    await expect.poll(() => invoked("start_screen_recording")).toBe(true);
+    await press("rec:wav");
+    await expect.poll(() => invoked("start_recording")).toBe(true);
+  });
+
+  test("Settings has the recorder's rows and its hotkeys, and they persist", async ({ page }) => {
+    await nav(page, "Settings").click();
+    const rows = page.getByTestId("screen-recording-settings");
+    await expect(rows).toBeVisible();
+    await expect(rows).toContainText("Mock H.264 Encoder");
+    await rows.getByRole("tab", { name: "60 fps" }).click();
+    await rows.getByRole("tab", { name: "Sharpest" }).click();
+    expect(
+      await page.evaluate(() => JSON.parse(localStorage.getItem("divora.screenRecording") ?? "{}")),
+    ).toMatchObject({ fps: 60, quality: "high" });
+    // The recorders' hotkey rows (v1.52.0).
+    await expect(
+      page.getByText("Start or stop recording a screen with your voice and soundboard."),
+    ).toBeVisible();
+    await expect(page.getByText("Record voice (WAV)", { exact: true })).toBeVisible();
+  });
+});
+
 test.describe("first-run wizard (v0.7)", () => {
   test.use({ skipWizard: false });
 

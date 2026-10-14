@@ -20,6 +20,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 divora-core = { path = "../divora-core" }
+# v1.52.0: screen recording (Windows Graphics Capture + Media Foundation).
+divora-capture = { path = "../divora-capture" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"

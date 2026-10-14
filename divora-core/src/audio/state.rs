@@ -2,7 +2,7 @@
 //! thread reads. Lock-free via atomic loads/stores; f32 values are encoded
 //! through their bit pattern.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,18 @@ pub struct EngineState {
     /// (f32 bit pattern). Written by the output callback for the UI
     /// "it's working" readout; 0 dB while disabled.
     pub loudness_gain_db_bits: AtomicU32,
+    /// v1.52.0: true while a screen recording takes the voice and soundboard.
+    /// Gates the output callback's push into the screen recorder's tap — the
+    /// one atomic load it costs a buffer while nothing records.
+    pub av_recording: AtomicBool,
+    /// v1.52.0: engine-rate frames the screen recorder's tap could not keep,
+    /// since the take began: full rings in the callback, or a full channel to
+    /// the recorder. The recording has silence where they were.
+    pub av_dropped: AtomicU64,
+    /// v1.52.0: how old the newest microphone frame is, on average, when the
+    /// input callback hands it to the ring, in microseconds. Written by the
+    /// input callback only while a screen recording runs.
+    pub input_latency_us: AtomicU32,
 }
 
 impl EngineState {
@@ -158,6 +170,15 @@ impl EngineState {
     #[must_use]
     pub fn load_loudness_gain_db(&self) -> f32 {
         f32::from_bits(self.loudness_gain_db_bits.load(Ordering::Acquire))
+    }
+
+    pub fn store_input_latency_us(&self, us: u32) {
+        self.input_latency_us.store(us, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn load_input_latency_us(&self) -> u32 {
+        self.input_latency_us.load(Ordering::Relaxed)
     }
 }
 

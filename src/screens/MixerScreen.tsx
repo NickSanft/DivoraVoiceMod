@@ -9,12 +9,13 @@
 // (shape outline + preset name + "◆ SPELL CAST ◆"). Matches the
 // prototype's headline gesture: the Mixer *is* the casting surface.
 
-import { createSignal, onCleanup, Show, type JSX } from "solid-js";
+import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
 import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
 import { VMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
+import { Select } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { SparkLayer } from "../components/SparkLayer";
 import { SpellCircle } from "../components/SpellCircle";
@@ -26,6 +27,12 @@ import {
 } from "../data/reactive";
 import { useApp } from "../stores/app";
 import { acceleratorToKeys } from "../data/hotkeys";
+import {
+  formatClock,
+  monitorLabel,
+  pickMonitor,
+  screenBusy,
+} from "../data/screenRecording";
 import {
   resamplingDetail,
   resamplingSummary,
@@ -289,6 +296,7 @@ function RightRail(): JSX.Element {
       <VoiceReadingCard />
       <LoudnessCard />
       <RecordCard />
+      <ScreenRecordCard />
       <Inspector />
       <Show when={app.engineError()}>
         {(err) => (
@@ -1374,6 +1382,194 @@ function RecordCard(): JSX.Element {
       >
         {recording() ? "Stop" : "Record"}
       </button>
+    </div>
+  );
+}
+
+/** v1.52.0: record a screen with the modulated voice and the soundboard. */
+function ScreenRecordCard(): JSX.Element {
+  const app = useApp();
+  const [aboutOpen, setAboutOpen] = createSignal(false);
+  // The screens can change while the app runs; ask each time the card shows.
+  onMount(() => void app.refreshCapture());
+  const rec = () => app.screenRecording();
+  const phase = () => rec().state;
+  const busy = () => screenBusy(rec());
+  const recording = () => phase() === "recording";
+  const status = () => app.captureStatus();
+  const unsupported = () => {
+    const s = status();
+    return s && !s.supported ? (s.reason ?? "Screen recording isn't available.") : null;
+  };
+  const canStart = () => app.engineRunning() && !unsupported() && app.captureMonitors().length > 0;
+  const chosen = () => pickMonitor(app.captureMonitors(), app.screenSettings().monitorId);
+  const title = (): string => {
+    switch (phase()) {
+      case "starting":
+        return "Starting…";
+      case "recording":
+        return `Recording · ${formatClock(rec().elapsedMs)}`;
+      case "stopping":
+        return "Finishing the file…";
+      default:
+        return "Record screen";
+    }
+  };
+  const savedName = () => {
+    const p = app.screenRecordingPath();
+    return !busy() && p && !rec().error ? p.split(/[\\/]/).pop() : null;
+  };
+  return (
+    <div
+      class="card"
+      data-testid="screen-record-card"
+      style={{
+        padding: "var(--s4)",
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+            color: recording() ? "var(--danger)" : "var(--text-mid)",
+            "min-width": 0,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              animation: recording() ? "breathe 1.4s ease-in-out infinite" : "none",
+              flex: "none",
+            }}
+          >
+            <Sigil name="screen" size={20} />
+          </span>
+          <div style={{ "min-width": 0 }}>
+            <div
+              style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}
+              data-testid="screen-record-title"
+            >
+              {title()}
+            </div>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+              Your modulated voice and soundboard
+            </div>
+          </div>
+        </div>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          data-testid="screen-record-toggle"
+          disabled={phase() === "stopping" || (!busy() && !canStart())}
+          title={
+            busy()
+              ? "Stop recording the screen"
+              : unsupported() ??
+                (app.engineRunning() ? "Record the chosen screen" : "Start the engine to record")
+          }
+          style={{
+            height: "38px",
+            flex: "none",
+            ...(busy()
+              ? {
+                  background: "var(--danger-bg)",
+                  "border-color": "rgba(242, 86, 122, 0.5)",
+                  color: "var(--danger)",
+                }
+              : {}),
+          }}
+          onClick={() => void app.toggleScreenRecording()}
+        >
+          {busy() ? "Stop" : "Record"}
+        </button>
+      </div>
+
+      <Show when={!busy() && !unsupported() && app.captureMonitors().length > 1}>
+        <Select
+          icon="screen"
+          value={chosen()?.id ?? ""}
+          options={app.captureMonitors().map((m) => ({ value: m.id, label: monitorLabel(m) }))}
+          onChange={(id) => app.setScreenSettings({ monitorId: id })}
+        />
+      </Show>
+
+      <Show when={unsupported()}>
+        {(why) => (
+          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
+            {why()}
+          </div>
+        )}
+      </Show>
+      <Show when={rec().error}>
+        {(err) => (
+          <div
+            data-testid="screen-record-error"
+            style={{ "font-size": "var(--t-xs)", color: "var(--danger)", "line-height": 1.5 }}
+          >
+            {err()}
+          </div>
+        )}
+      </Show>
+      <Show when={busy() && rec().audioLostAt !== null}>
+        <div
+          data-testid="screen-record-audio-lost"
+          style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}
+        >
+          Audio lost at {formatClock((rec().audioLostAt ?? 0) * 1000)} — start the engine to
+          bring it back.
+        </div>
+      </Show>
+      <Show when={recording() && rec().droppedFrames > 0}>
+        <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+          {rec().droppedFrames} frame{rec().droppedFrames === 1 ? "" : "s"} skipped to keep up
+        </div>
+      </Show>
+      <Show when={savedName()}>
+        {(name) => (
+          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+            Saved <span class="mono">{name()}</span>
+          </div>
+        )}
+      </Show>
+
+      <Show when={!busy() && !unsupported()}>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          style={{ "align-self": "flex-start", padding: "0 4px", height: "auto" }}
+          aria-expanded={aboutOpen()}
+          onClick={() => setAboutOpen(!aboutOpen())}
+        >
+          About screen recording
+        </button>
+        <Show when={aboutOpen()}>
+          <ul
+            style={{
+              margin: 0,
+              "padding-left": "18px",
+              "font-size": "var(--t-xs)",
+              color: "var(--text-lo)",
+              "line-height": 1.5,
+            }}
+          >
+            <li>Windows draws a yellow border around the screen while it records.</li>
+            <li>Recording the screen Divora is on records Divora's own window too.</li>
+            <li>Recordings are SDR for now: an HDR screen may record washed-out.</li>
+          </ul>
+        </Show>
+      </Show>
     </div>
   );
 }

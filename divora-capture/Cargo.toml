@@ -1,0 +1,44 @@
+[package]
+name = "divora-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Screen capture and MP4 encoding for Divora (Windows Graphics Capture + Media Foundation)"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "1"
+tracing = "0.1"
+
+# v1.52.0: the `windows` crate at the 0.61 line Tauri already compiles
+# (tauri/tao/wry/webview2-com pin 0.61.3), so this adds no new copy — only
+# features. Media Foundation's *free functions* are never called through
+# these bindings: windows-link emits load-time (raw-dylib) imports, which
+# would stop the app launching on Windows N editions that ship without
+# Media Foundation. They are resolved at run time in `native::mf` instead.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Metadata",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "divora-core"]
+members = ["src-tauri", "divora-core", "divora-capture"]
 
 [workspace.package]
 edition = "2021"

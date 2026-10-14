@@ -22,6 +22,7 @@ import { Kbd } from "../components/Kbd";
 import { resamplingLegs } from "../audio/api";
 import { HMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
+import { Slider } from "../components/Slider";
 import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
@@ -49,6 +50,8 @@ import type {
 } from "../types";
 
 import { acceleratorToKeys, keysToAccelerator } from "../data/hotkeys";
+import { MAX_AV_OFFSET_MS } from "../data/screenRecording";
+import type { ScreenQuality } from "../audio/api";
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
 const ISSUES_URL = "https://github.com/NickSanft/DivoraVoiceMod/issues/new";
@@ -643,9 +646,11 @@ function RecordingsSection(): JSX.Element {
       >
         <p style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", margin: 0 }}>
           Use the <strong>Record</strong> button on the Mixer to capture the
-          modulated output (exactly what listeners hear) to a WAV file. Files
-          land in this folder, timestamped.
+          modulated output (exactly what listeners hear) to a WAV file, or
+          <strong> Record screen</strong> to capture a screen as an MP4 with your
+          modulated voice and soundboard. Files land in this folder, timestamped.
         </p>
+        <ScreenRecordingRows />
         <div
           style={{
             display: "flex",
@@ -701,6 +706,98 @@ function RecordingsSection(): JSX.Element {
         </Show>
       </div>
     </section>
+  );
+}
+
+/** v1.52.0: how the screen recorder records. */
+function ScreenRecordingRows(): JSX.Element {
+  const app = useApp();
+  const [advanced, setAdvanced] = createSignal(false);
+  const s = () => app.screenSettings();
+  onMount(() => {
+    if (!app.captureStatus()) void app.refreshCapture();
+  });
+  return (
+    <div
+      data-testid="screen-recording-settings"
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+        "border-top": "1px solid var(--line)",
+        "padding-top": "var(--s4)",
+      }}
+    >
+      <div class="eyebrow">Screen recording</div>
+      <Row label="Frame rate">
+        <Segmented<"30" | "60">
+          options={[
+            { value: "30", label: "30 fps" },
+            { value: "60", label: "60 fps" },
+          ]}
+          value={s().fps === 60 ? "60" : "30"}
+          onChange={(v) => app.setScreenSettings({ fps: v === "60" ? 60 : 30 })}
+        />
+      </Row>
+      <Row label="Quality">
+        <Segmented<ScreenQuality>
+          options={[
+            { value: "small", label: "Smaller files" },
+            { value: "balanced", label: "Balanced" },
+            { value: "high", label: "Sharpest" },
+          ]}
+          value={s().quality}
+          onChange={(v) => app.setScreenSettings({ quality: v })}
+        />
+      </Row>
+      <Row label="Show the mouse pointer">
+        <Toggle
+          on={s().cursor}
+          ariaLabel="Show the mouse pointer in screen recordings"
+          onChange={(v) => app.setScreenSettings({ cursor: v })}
+        />
+      </Row>
+      <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
+        Screens bigger than 2560×1440 are scaled down to fit, keeping their shape.
+        Windows' own encoders do the work — a graphics card's when Windows offers one.
+        <Show when={app.captureStatus()?.h264Encoder}>
+          {(name) => (
+            <>
+              {" "}
+              First choice here: <span class="mono">{name()}</span>.
+            </>
+          )}
+        </Show>
+      </div>
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        style={{ "align-self": "flex-start", padding: "0 4px", height: "auto" }}
+        aria-expanded={advanced()}
+        onClick={() => setAdvanced(!advanced())}
+      >
+        Advanced
+      </button>
+      <Show when={advanced()}>
+        <Row label={`A/V offset · ${s().avOffsetMs > 0 ? "+" : ""}${s().avOffsetMs} ms`}>
+          <div style={{ width: "220px" }}>
+            <Slider
+              value={s().avOffsetMs}
+              min={-MAX_AV_OFFSET_MS}
+              max={MAX_AV_OFFSET_MS}
+              step={5}
+              bipolar
+              ariaLabel="A/V offset in milliseconds"
+              onChange={(v) => app.setScreenSettings({ avOffsetMs: v })}
+            />
+          </div>
+        </Row>
+        <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
+          Only if your recordings' sound lands early or late against the picture:
+          positive moves the sound later. Leave it at 0 otherwise.
+        </div>
+      </Show>
+    </div>
   );
 }
 
@@ -965,6 +1062,18 @@ const HOTKEY_ROWS: HotkeyRowDef[] = [
     label: "Toggle monitor",
     desc: "Mute / unmute the headphone sidetone without stopping the engine.",
     icon: "monitor",
+  },
+  {
+    action: "rec:screen",
+    label: "Record screen",
+    desc: "Start or stop recording a screen with your voice and soundboard.",
+    icon: "screen",
+  },
+  {
+    action: "rec:wav",
+    label: "Record voice (WAV)",
+    desc: "Start or stop recording the modulated output to a WAV.",
+    icon: "record",
   },
 ];
 

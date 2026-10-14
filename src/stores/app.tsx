@@ -85,6 +85,15 @@ import {
   setVoiceReadingEnabled as setVoiceReadingEnabledCmd,
   getVoiceReading as getVoiceReadingCmd,
   subscribeVoiceReading,
+  screenCaptureStatus as screenCaptureStatusCmd,
+  listCaptureMonitors as listCaptureMonitorsCmd,
+  startScreenRecording as startScreenRecordingCmd,
+  stopScreenRecording as stopScreenRecordingCmd,
+  screenRecordingStatus as screenRecordingStatusCmd,
+  subscribeScreenRecording,
+  type CaptureMonitor,
+  type CaptureStatus,
+  type ScreenRecordingUpdate,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
@@ -119,6 +128,13 @@ import {
 } from "../audio/calibration";
 import { checkForUpdate, type UpdateInfo } from "../data/updates";
 import {
+  IDLE_SCREEN_RECORDING,
+  pickMonitor,
+  readScreenSettings,
+  screenFilename,
+  type ScreenSettings,
+} from "../data/screenRecording";
+import {
   decideWhatsNew,
   notesSince,
   RELEASE_NOTES,
@@ -135,7 +151,12 @@ import {
 import type { ReactiveConfig, ReactiveRouteSpec } from "../audio/api";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
-import { keysToAccelerator, normalizeAccelerator, readHotkeyBindings } from "../data/hotkeys";
+import {
+  keysToAccelerator,
+  normalizeAccelerator,
+  readHotkeyBindings,
+  unboundHotkeys,
+} from "../data/hotkeys";
 import {
   isSavablePosition,
   mergeOverlayPrefs,
@@ -222,8 +243,9 @@ export interface AbSnapshots {
   B: ChainEntry[];
 }
 
-/** Stable id used for the system-wide hotkeys we register. */
-export type HotkeyAction = "ptm" | "panic" | "monitor";
+/** Stable id used for the system-wide hotkeys we register. v1.52.0 adds the
+ *  recorders, under the reserved `rec:` prefix. */
+export type HotkeyAction = "ptm" | "panic" | "monitor" | "rec:screen" | "rec:wav";
 
 /** localStorage keys for Phase 8 persistence (tile metadata + recent folders). */
 /** Reactive intensity is a 0..100 percentage everywhere in the UI. */
@@ -270,6 +292,9 @@ const STORAGE_KEYS = {
   // v1.51.4: push-to-modulate / panic / monitor global hotkeys. Never
   // persisted before, although the docs said they were.
   hotkeyBindings: "divora.hotkeyBindings",
+  // v1.52.0: Settings → Recordings for the screen recorder, and the screen
+  // last picked on its card.
+  screenRecording: "divora.screenRecording",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -341,11 +366,7 @@ const RECENT_FOLDERS_MAX = 5;
  * Users who want a true global hotkey (e.g. to PTM while a game is
  * focused) can bind one explicitly in Settings → Hotkeys.
  */
-const DEFAULT_HOTKEY_BINDINGS: Record<HotkeyAction, string> = {
-  ptm: "",
-  panic: "",
-  monitor: "",
-};
+const DEFAULT_HOTKEY_BINDINGS: Record<HotkeyAction, string> = unboundHotkeys();
 
 const cloneChain = (entries: ChainEntry[]): ChainEntry[] =>
   entries.map((c) => ({ ...c, vals: { ...c.vals } }));
@@ -529,6 +550,21 @@ export interface AppState {
   setLoudnessGainDb: (db: number) => void;
   /** Phase 16: toggle recording the modulated output to a WAV file. */
   toggleRecording: () => Promise<void>;
+
+  // ---- v1.52.0: screen recording ----
+  /** Whether this PC can record the screen (`null` until asked). */
+  captureStatus: () => CaptureStatus | null;
+  captureMonitors: () => CaptureMonitor[];
+  /** Ask the backend again: the status (cached there) and the screens. */
+  refreshCapture: () => Promise<void>;
+  /** The latest `screen-recording` report. */
+  screenRecording: () => ScreenRecordingUpdate;
+  screenSettings: () => ScreenSettings;
+  setScreenSettings: (patch: Partial<ScreenSettings>) => void;
+  /** Start a take of the chosen screen, or stop the running one. */
+  toggleScreenRecording: () => Promise<void>;
+  /** The last finished (or current) take's MP4. */
+  screenRecordingPath: () => string | null;
   /** Phase 16: absolute path of the recordings directory. */
   getRecordingsDir: () => Promise<string>;
   /** v1.14.0: absolute path of the logs directory (for "Open logs folder"). */
@@ -1466,6 +1502,106 @@ export function createAppState(): AppState {
     }),
   );
   const [recordingPath, setRecordingPath] = createSignal<string | null>(null);
+
+  // ---- v1.52.0: screen recording ----
+  // The backend's `screen-recording` events are the truth about a take; the
+  // store only sets "starting" optimistically so the button answers at once.
+  const [captureStatus, setCaptureStatus] = createSignal<CaptureStatus | null>(null);
+  const [captureMonitors, setCaptureMonitors] = createSignal<CaptureMonitor[]>([]);
+  const [screenRecording, setScreenRecording] =
+    createSignal<ScreenRecordingUpdate>(IDLE_SCREEN_RECORDING);
+  const [screenRecordingPath, setScreenRecordingPath] = createSignal<string | null>(null);
+  const [screenSettings, setScreenSettingsRaw] = createSignal<ScreenSettings>(
+    readScreenSettings(loadJson<unknown>(STORAGE_KEYS.screenRecording, null)),
+  );
+  const setScreenSettings = (patch: Partial<ScreenSettings>): void => {
+    const next = readScreenSettings({ ...screenSettings(), ...patch });
+    setScreenSettingsRaw(next);
+    saveJson(STORAGE_KEYS.screenRecording, next);
+  };
+
+  // Asked for by the card when it mounts, not here: the first answer starts
+  // Media Foundation, which nothing should pay for until a recorder is shown.
+  const refreshCapture = async (): Promise<void> => {
+    try {
+      const status = await screenCaptureStatusCmd();
+      if (!status) return; // a bridge that answered nothing (tests, previews)
+      setCaptureStatus(status);
+      setCaptureMonitors(status.supported ? await listCaptureMonitorsCmd() : []);
+    } catch (err) {
+      console.warn("[screen] capture status unavailable", err);
+    }
+  };
+
+  let screenUnlisten: (() => void) | null = null;
+  void (async () => {
+    try {
+      screenUnlisten = await subscribeScreenRecording((update) => {
+        setScreenRecording(update);
+        if (update.path) setScreenRecordingPath(update.path);
+      });
+      // A window opened mid-take paints the take, not "idle".
+      setScreenRecording(await screenRecordingStatusCmd());
+    } catch {
+      /* browser preview without the Tauri bridge */
+    }
+  })();
+  onCleanup(() => {
+    if (screenUnlisten) screenUnlisten();
+    screenUnlisten = null;
+  });
+
+  const toggleScreenRecording = async (): Promise<void> => {
+    const phase = screenRecording().state;
+    if (phase === "stopping") return;
+    if (phase === "recording" || phase === "starting") {
+      try {
+        setScreenRecordingPath(await stopScreenRecordingCmd());
+      } catch (err) {
+        console.warn("[screen] stop failed", err);
+      }
+      return;
+    }
+    // Refused with the WAV recorder's own words.
+    if (!engineRunning()) {
+      setEngineError("Start the engine before recording.");
+      return;
+    }
+    if (!captureStatus()) await refreshCapture();
+    const status = captureStatus();
+    if (!status?.supported) {
+      setScreenRecording({
+        ...IDLE_SCREEN_RECORDING,
+        error: status?.reason ?? "Screen recording isn't available.",
+      });
+      return;
+    }
+    let monitors = captureMonitors();
+    if (monitors.length === 0) {
+      await refreshCapture();
+      monitors = captureMonitors();
+    }
+    const settings = screenSettings();
+    const monitor = pickMonitor(monitors, settings.monitorId);
+    if (!monitor) {
+      setScreenRecording({ ...IDLE_SCREEN_RECORDING, error: "No screen to record." });
+      return;
+    }
+    setScreenRecording({ ...IDLE_SCREEN_RECORDING, state: "starting" });
+    try {
+      const path = await startScreenRecordingCmd({
+        monitorId: monitor.id,
+        filename: screenFilename(new Date()),
+        fps: settings.fps,
+        quality: settings.quality,
+        cursor: settings.cursor,
+        avOffsetMs: settings.avOffsetMs,
+      });
+      setScreenRecordingPath(path);
+    } catch (err) {
+      setScreenRecording({ ...IDLE_SCREEN_RECORDING, error: String(err) });
+    }
+  };
 
   const preset = createMemo<Preset>(
     () => presets().find((p) => p.id === presetId()) ?? presets()[0] ?? firstPreset,
@@ -3307,6 +3443,15 @@ export function createAppState(): AppState {
     toggleRecording,
     getRecordingsDir,
     getLogsDir,
+
+    captureStatus,
+    captureMonitors,
+    refreshCapture,
+    screenRecording,
+    screenSettings,
+    setScreenSettings,
+    toggleScreenRecording,
+    screenRecordingPath,
 
     setChainParam,
     setChainEnabled,

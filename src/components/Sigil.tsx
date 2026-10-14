@@ -20,7 +20,7 @@ export type SigilName =
   | "compressor" | "deesser"
   | "mixer" | "soundboard" | "presets" | "settings"
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
-  | "lock" | "panic" | "play" | "stop"
+  | "lock" | "panic" | "play" | "stop" | "record" | "screen"
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
   | "download" | "external" | "trash" | "copy" | "info" | "warning"
@@ -188,6 +188,21 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
   panic: () => (
     <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
       <rect x="6" y="6" width="12" height="12" rx="2.5" />
+    </g>
+  ),
+  // v1.52.0: the recorders. A filled eye in a ring — a take running — and a
+  // screen with that eye at its centre.
+  record: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5">
+      <circle cx="12" cy="12" r="7.5" />
+      <circle cx="12" cy="12" r="3.6" fill="currentColor" stroke="none" />
+    </g>
+  ),
+  screen: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3.5" y="4.5" width="17" height="12" rx="2" />
+      <path d="M12 16.5 V19.5 M8.5 19.5 h7" />
+      <circle cx="12" cy="10.5" r="2.2" fill="currentColor" stroke="none" />
     </g>
   ),
   // ---------- UTILITY ----------

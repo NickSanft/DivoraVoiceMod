@@ -343,6 +343,20 @@ Version numbers are planning labels; a patch landing in between shifts the rest.
 - **Format:** SDR only.
 - **Crash recovery:** a crash mid-take loses that take, and the `.part` name says so.
 
+**As built (2026-10-14).**
+- **Spike gate:** passed on **rung 1** (sink writer + DXGI device manager → "NVIDIA H.264 Encoder MFT", read back). A 30 s take of the 3440×1440 screen at 30 fps had 900 frames, 0 dropped; it decoded cleanly and was tagged BT.709 studio range. The game-running drop figure was not measured. Rungs 2 and 3 were not needed, so v1.54.0 builds the directly driven encoder.
+- **Differences from the deliverables above:**
+  - **The anchor** is one `Instant::now()` in the output callback on the first buffer of a take, paired with that buffer's `StreamInstant`. cpal's instant is never parsed, and the drain needs no QPC cross-check. Per buffer the callback still reads no clock.
+  - **`AudioTimeline` reads the mix through a windowed sinc at `ClockFit`'s fitted positions** straight into 48 kHz, rather than driving `MonoResampler` and nudging its ratio. The ±0.5 % clamp bounds the glide. Steps, meaning a device that starved, are detected after cancelling scheduling jitter with each callback's device frame count.
+  - **Voice placement:** the jittery part (input latency + ring depth) is smoothed and moved only in a pause, or mid-word when 20 ms out. The chain's part is applied exactly.
+  - **Recorder transitions** are tested as a pure table (`screen.rs`) instead of with a mock `FrameSink`. There is no `FrameSink` trait, because the kill switch was not taken.
+  - **CPU fallback** is used where the device has no video support. It is forced on with `DIVORA_CAPTURE_CPU_CONVERT=1` and checked against the GPU path. The CPU path stretches a changed aspect; the GPU path letterboxes it.
+  - **The probe** also requires an AAC encoder. `DIVORA_PRETEND_NO_MEDIA_FOUNDATION=1` forces the "no Media Foundation" path for manual checks.
+- **Measured** (MANUAL_TESTS → Screen recording), on the soundboard path:
+  - **A/V offset:** −6 to −19 ms at 60 fps.
+  - **Drift over 10 minutes:** a fitted −7 ms, within frame-rate noise (11 events, −32 to +4.5 ms at 30 fps; one tick skipped). The audio clock was within 0.5 ppm, so real drift correction rests on the tests.
+  - **Not measured:** the voice path end to end. The machine had no physical microphone, and a test signal on the virtual cable could have reached a live call.
+
 ### v1.53.0 — Game and Discord audio in your recordings (6–9 days)
 
 **Goal.** Complete ask 1: the screen's own audio, mixed into the recording's single AAC track **without doubling your voice**.

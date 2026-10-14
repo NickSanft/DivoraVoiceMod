@@ -124,6 +124,24 @@ voices use the `babble:` namespace; their ids — `babble:bright`,
 | `start_recording` | `filename: string` | full destination path `string` / error |
 | `stop_recording` | — | — |
 
+### Screen recording (v1.52.0)
+
+All `async` except `screen_recording_status`, which only reads the latest
+report: the others wait on Windows, and a sync command would block the
+window's event loop.
+
+| Command | Args | Returns |
+|---|---|---|
+| `screen_capture_status` | — | `CaptureStatus` (never an error: an unsupported PC is `supported: false` with a `reason`) |
+| `list_capture_monitors` | — | `CaptureMonitor[]`, the main screen first |
+| `start_screen_recording` | `monitorId: string`, `filename: string`, `fps?: 30 \| 60`, `quality?: "small" \| "balanced" \| "high"`, `cursor?: bool`, `avOffsetMs?: number` (±500) | full destination path `string`, once the first frame is in / error ("Start the engine before recording." while the engine is stopped, the same words as the WAV recorder) |
+| `stop_screen_recording` | — | full path of the finished MP4 `string` / error |
+| `screen_recording_status` | — | `ScreenRecordingUpdate` (the latest report) |
+
+`filename` keeps only its last path component and is always written as `.mp4`,
+so nothing the frontend sends can leave `recordings/`. Unknown `quality`
+values read as `"balanced"`, and any `fps` but 60 as 30.
+
 ### Soundboard
 
 | Command | Args | Returns |
@@ -151,6 +169,7 @@ voices use the `babble:` namespace; their ids — `babble:bright`,
 | `panic` | stop all soundboard clips |
 | `monitor` | toggle hearing yourself |
 | `sb:<clipId>` | play one soundboard tile (prefix reserved) |
+| `rec:<recorder>` | start / stop a recorder (prefix reserved) — v1.52.0. Defined: `rec:screen` (the screen recorder), `rec:wav` (the WAV recorder). Both unbound by default |
 
 ### MIDI control surfaces (v1.9.0)
 
@@ -175,6 +194,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3) |
 | `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
+| `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise |
 
 **Why `voice-reading` is its own event and not a field on `LevelUpdate`.**
 Additive-only permits either, so this is a design choice, recorded here because
@@ -226,6 +246,14 @@ ReadingMetrics    { energyDbfs, energyRangeDb, f0Hz, f0RangeSt,
 VoiceReadingUpdate { state, dry: ReadingMetrics, wet: ReadingMetrics,
                     words: string[], calibrated, wetBypassed,
                     stale, ageMs }                   // wetBypassed v1.51.0
+CaptureStatus     { supported, reason (nullable), h264Encoder (nullable),
+                    hardware }                       // v1.52.0
+CaptureMonitor    { id, number, x, y, width, height, primary }  // v1.52.0;
+                  // id e.g. "\\.\DISPLAY1"; number 1-based, main first
+ScreenRecordingUpdate { state: "idle" | "starting" | "recording" | "stopping",
+                    path (nullable), elapsedMs, droppedFrames, driftPpm,
+                    audioLostAt (nullable, seconds into the take),
+                    error (nullable) }               // v1.52.0
 ```
 
 **`StreamInfo` notes.**
@@ -331,7 +359,8 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
-| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4. Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0 (a save without them reads them as unbound). Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0. Each field falls back to its default on its own when missing or malformed |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
 | `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |
@@ -367,6 +396,11 @@ voices/<id>.onnx         user-installed voice-conversion models
 voices/cloned/<id>/      user-cloned TTS voices (se.bin + meta.json) — v1.20.0
 tts/                     on-demand-downloaded OpenVoice cloning models — v1.21.0
 recordings/divora-<date>_<time>.wav   recorded modulated output (16-bit PCM mono)
+recordings/divora-screen-<date>_<time>.mp4   screen recording — v1.52.0: H.264 High
+                         (yuv420p, BT.709 studio range) + AAC-LC 48 kHz stereo 192 kbps.
+                         Written as `<name>.mp4.part` and renamed when finished, so a
+                         take cut short by a crash is left as an obviously
+                         incomplete `.part`
 ```
 
 Installer-bundled, read-only, next to the executable's resource dir:

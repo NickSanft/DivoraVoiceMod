@@ -160,11 +160,14 @@ function Shell(): JSX.Element {
   });
 
   // Global hotkey subscription. The backend emits `global-shortcut`
-  // events with the binding's id ("ptm" | "panic" | "monitor") and
-  // pressed/released state. We translate those into store mutations:
-  //   ptm     → set ui.pressed on press, clear on release
-  //   panic   → stop all soundboard clips on press
-  //   monitor → toggle sidetone on press
+  // events with the binding's id ("ptm" | "panic" | "monitor" |
+  // "rec:screen" | "rec:wav" | "sb:<clip>") and pressed/released state.
+  // We translate those into store mutations:
+  //   ptm        → set ui.pressed on press, clear on release
+  //   panic      → stop all soundboard clips on press
+  //   monitor    → toggle sidetone on press
+  //   rec:screen → start / stop the screen recording (v1.52.0)
+  //   rec:wav    → start / stop the WAV recording (v1.52.0)
   onMount(() => {
     let unlisten: UnlistenFn | null = null;
     let cancelled = false;
@@ -180,6 +183,10 @@ function Shell(): JSX.Element {
             void app.panicSoundboard();
           } else if (event.id === "monitor") {
             void app.toggleMonitor();
+          } else if (event.id === "rec:screen") {
+            void app.toggleScreenRecording();
+          } else if (event.id === "rec:wav") {
+            void app.toggleRecording();
           } else if (event.id.startsWith("sb:")) {
             // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
             // current scan still has it.

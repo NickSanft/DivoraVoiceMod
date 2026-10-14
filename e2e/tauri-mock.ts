@@ -197,6 +197,29 @@ export async function installTauriMock(
         download_voxcpm_models: () => null,
         download_clone_models: () => null,
         recordings_dir: () => "C:/mock/recordings",
+        // v1.52.0: screen recording. Supported, two screens, nothing running;
+        // takes are driven by firing `screen-recording` with __E2E_EMIT__.
+        screen_capture_status: () => ({
+          supported: true,
+          reason: null,
+          h264Encoder: "Mock H.264 Encoder",
+          hardware: true,
+        }),
+        list_capture_monitors: () => [
+          { id: "\\\\.\\DISPLAY1", number: 1, x: 0, y: 0, width: 2560, height: 1440, primary: true },
+          { id: "\\\\.\\DISPLAY2", number: 2, x: 2560, y: 0, width: 1920, height: 1080, primary: false },
+        ],
+        start_screen_recording: () => "C:/mock/recordings/divora-screen-x.mp4",
+        stop_screen_recording: () => "C:/mock/recordings/divora-screen-x.mp4",
+        screen_recording_status: () => ({
+          state: "idle",
+          path: null,
+          elapsedMs: 0,
+          droppedFrames: 0,
+          driftPpm: 0,
+          audioLostAt: null,
+          error: null,
+        }),
         preset_store_path: () => "C:/mock/presets",
         list_midi_inputs: () => [],
         audio_engine_status: () => engineStatus,

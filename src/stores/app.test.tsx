@@ -321,6 +321,124 @@ describe("app store — Phase 2 audio actions", () => {
     expect(result.isRecording()).toBe(false);
   });
 
+  // ---- v1.52.0: screen recording ---------------------------------------
+
+  const MONITORS = [
+    { id: "\\\\.\\DISPLAY1", number: 1, x: 0, y: 0, width: 2560, height: 1440, primary: true },
+    { id: "\\\\.\\DISPLAY2", number: 2, x: 2560, y: 0, width: 1920, height: 1080, primary: false },
+  ];
+
+  /** A backend with the engine and screen recording both working. */
+  function screenBackend(
+    status: {
+      supported: boolean;
+      reason: string | null;
+      h264Encoder: string | null;
+      hardware: boolean;
+    } = { supported: true, reason: null, h264Encoder: "X", hardware: true },
+  ) {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_audio_engine") {
+        return {
+          inputName: "Mic",
+          outputName: "CABLE Input",
+          sampleRate: 48000,
+          inputChannels: 1,
+          outputChannels: 2,
+        };
+      }
+      if (cmd === "screen_capture_status") return status;
+      if (cmd === "list_capture_monitors") return MONITORS;
+      if (cmd === "start_screen_recording") return "C:/rec/divora-screen-test.mp4";
+      if (cmd === "stop_screen_recording") return "C:/rec/divora-screen-test.mp4";
+      return null;
+    });
+  }
+
+  it("toggleScreenRecording refuses while the engine is stopped, as the WAV recorder does", async () => {
+    screenBackend();
+    const { result } = setupApp();
+    await result.toggleScreenRecording();
+    expect(result.engineError()).toBe("Start the engine before recording.");
+    expect(invokeMock).not.toHaveBeenCalledWith("start_screen_recording", expect.anything());
+  });
+
+  it("toggleScreenRecording records the saved screen with the saved settings, then stops", async () => {
+    window.localStorage.setItem(
+      "divora.screenRecording",
+      JSON.stringify({
+        monitorId: "\\\\.\\DISPLAY2",
+        fps: 60,
+        quality: "high",
+        cursor: false,
+        avOffsetMs: -20,
+      }),
+    );
+    screenBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    expect(invokeMock).toHaveBeenCalledWith("start_screen_recording", {
+      monitorId: "\\\\.\\DISPLAY2",
+      filename: expect.stringMatching(/^divora-screen-.*\.mp4$/),
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      avOffsetMs: -20,
+    });
+    expect(result.screenRecording().state).toBe("starting");
+    expect(result.screenRecordingPath()).toBe("C:/rec/divora-screen-test.mp4");
+
+    await result.toggleScreenRecording();
+    expect(invokeMock).toHaveBeenCalledWith("stop_screen_recording");
+  });
+
+  it("a screen that is gone falls back to the main one", async () => {
+    window.localStorage.setItem(
+      "divora.screenRecording",
+      JSON.stringify({ monitorId: "\\\\.\\DISPLAY9" }),
+    );
+    screenBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_screen_recording",
+      expect.objectContaining({ monitorId: "\\\\.\\DISPLAY1", fps: 30, quality: "balanced" }),
+    );
+  });
+
+  it("an unsupported PC says why on the card and never starts a take", async () => {
+    screenBackend({
+      supported: false,
+      reason: "Install the Media Feature Pack",
+      h264Encoder: null,
+      hardware: false,
+    });
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    expect(result.screenRecording().error).toBe("Install the Media Feature Pack");
+    expect(result.screenRecording().state).toBe("idle");
+    expect(invokeMock).not.toHaveBeenCalledWith("start_screen_recording", expect.anything());
+  });
+
+  it("a refused start puts the card back to idle with the reason", async () => {
+    screenBackend();
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "start_screen_recording") throw "That screen isn't sending any picture";
+      return base(cmd, args);
+    });
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    expect(result.screenRecording()).toMatchObject({
+      state: "idle",
+      error: "That screen isn't sending any picture",
+    });
+  });
+
   // ---- Phase 11: live device switching ---------------------------------
 
   it("changing selectedInput while running restarts the engine on the new device", async () => {
@@ -1377,6 +1495,9 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
       ptm: "",
       panic: "Ctrl+Shift+P",
       monitor: "",
+      // v1.52.0: the recorders' keys, saved unbound.
+      "rec:screen": "",
+      "rec:wav": "",
     });
     first.cleanup();
 

@@ -11,6 +11,7 @@
 //! silenced when monitor is off). The DSP graph slots in between input
 //! and output in Phase 3.
 
+mod av_tap;
 mod devices;
 mod engine;
 mod level;
@@ -19,6 +20,7 @@ mod resampler;
 mod state;
 mod virtual_mic;
 
+pub use av_tap::AvChunk;
 pub use devices::{list_input_devices, list_output_devices, DeviceInfo};
 pub use engine::{AudioEngine, ReadingAnalyzer, ReadingFacts, ReadingSnapshot, StreamInfo};
 // Engine internals the allocation proof in `tests/` has to name. It needs its

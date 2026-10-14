@@ -1295,3 +1295,110 @@ non-test source file in `src/overlay/` for reading identifiers.
 
 Drag, border, taskbar, focus and reopen behaviour can only be checked on a
 desktop: see "Stream overlay" in [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
+
+## Screen recording (v1.52.0)
+
+One monitor to an MP4 — H.264 High plus AAC-LC 48 kHz stereo 192 kbps — with
+the modulated voice and the soundboard. The plan, the encoder ladder and what
+comes next are in [`research/stream-studio.md`](research/stream-studio.md).
+
+### Crates
+
+- **`divora-capture`** (new) does the capturing and encoding and knows nothing
+  of the engine, tauri or cpal. Its pure parts are tested on any machine:
+  `pacer` (`FramePacer`), `sizing`, `nv12` (the CPU colour converter),
+  `clock_fit` (`ClockFit`) and `timeline` (`AudioTimeline`). Everything that
+  touches COM is under `native/`, the crate's only `unsafe` scope, and off
+  Windows `elsewhere.rs` reports "unavailable" through the same API.
+- **`divora-core`** gains the tap (`audio/av_tap.rs`) and nothing else that
+  knows about recording.
+- **`src-tauri`** gains `screen.rs`: `ScreenRecorder` in `AppState`, the
+  commands, the `screen-recording` event, and `EngineFeed`, which turns the
+  tap's chunks into the capture crate's.
+
+### Media Foundation is loaded at run time
+
+`native/mf.rs` loads `mfplat.dll` and `mfreadwrite.dll` with
+`LoadLibraryExW(… SYSTEM32)` and resolves every free function it uses with
+`GetProcAddress`. The `windows` crate would import them at load time, and on a
+Windows N edition without the Media Feature Pack the app would then not start
+at all. COM methods are vtable calls and import nothing.
+`src-tauri/tests/no_static_media_foundation.rs` reads the built
+`divora-app.exe`'s import tables, normal and delay-load, and fails on any
+`mf*.dll` — verified by adding one static call, which it caught.
+
+### The picture
+
+```
+WGC (CreateForMonitor, free-threaded pool of 2 BGRA buffers)
+  └─ FrameArrived only signals the recording thread
+divora-encoder thread (MTA COM, one per take)
+  ├─ drain: newest frame → `latest` (BGRA texture), pool buffer returned at once
+  ├─ FramePacer: constant-rate PTS (index·10⁷/fps); repeats on a still screen,
+  │   counts ticks it fell behind on
+  ├─ BGRA → NV12: the D3D11 video processor (BT.709, studio range, scaled to fit
+  │   2560×1440, letterboxed if the screen changes shape mid-take) — or, where
+  │   the device has no video support, a staging readback and
+  │   `nv12::bgra_to_nv12` on the CPU (which stretches a changed shape)
+  └─ sink writer (MPEG-4 by attribute, written as `.part`):
+      H.264 via the DXGI device manager → hardware encoder where there is one;
+      the encoder actually loaded is read back (`GetServiceForStream`)
+```
+
+### The sound
+
+The output callback taps two signals where the soundboard is still separate
+from the voice — after the chain and loudness, before the fold and before the
+monitor-only previews — into preallocated rings, plus one mark per buffer:
+cpal's callback instant, the buffer's index, the device frames it wrote, the
+input ring's depth before the pop, and the chain's latency. Idle, each
+callback does one atomic load. While recording, the output callback reads the
+input ring's depth and makes three ring pushes a buffer, and the input
+callback takes one timestamp difference and stores the input latency; one
+`Instant::now()` per run — on the first buffer of a take, and again after an
+engine restart — anchors cpal's instants to the clock the video uses. A buffer that doesn't fit in all three rings is
+dropped from all three and counted, so marks and frames can never pair up
+wrong. `av_tap.rs`'s tests measure the tap allocation-free (with a live-probe
+control) and check that what goes in comes out.
+
+The per-session `divora-av-tap` thread forwards every 5 ms over a bounded
+channel. The recorder's sender lives on the engine thread, outside any
+session, so a device-loss rebuild — or the user stopping and starting the
+engine — hands it to the new session: the take carries on, silent while there
+is no engine, and the event's `audioLostAt` says when that began.
+
+`AudioTimeline`, on the recording thread:
+
+1. **Steps.** A buffer well off `ClockFit`'s line (after cancelling scheduling
+   jitter with the device frames it wrote) is a stall the call heard too; it is
+   kept as silence, not averaged into the clock.
+2. **Drops.** A jump in the index is silence of exactly that length.
+3. **Placement.** The soundboard at its buffer's time. The voice earlier, by
+   input latency + the input ring's depth (smoothed; moved only in a pause, or
+   mid-word past 20 ms) + the chain's latency (exact; moves with the chain) —
+   so a non-streaming voice model's 256 ms doesn't put the voice a quarter of a
+   second behind the picture.
+4. **Clock.** `ClockFit` fits engine frames against the video's clock (drift
+   held to ±0.5 %), and a Kaiser-windowed sinc reads the mix at the fitted
+   positions straight into 48 kHz, so the track neither slides over a long take
+   nor depends on the engine's rate.
+
+A sample with no audio is written as silence once it is a second old, so the
+track never stalls the file; at the end the timeline waits up to 1.5 s for the
+audio to catch up to the last frame.
+
+### Tests
+
+- Pure: `FramePacer` (no drift over an hour), `ClockFit` (+80 ppm through ±5 ms
+  of jitter; a 100 ms step stands out), `AudioTimeline` (44.1/48/96/16 kHz
+  engines, drops, a stall, a rebuild at a new rate, voice and soundboard each
+  on their own time, a jittery wait that must not move a speaking voice — each
+  rule mutation-checked), the NV12 converter against the BT.709 reference
+  values, the recorder's phase table, filename sanitising and the wire keys.
+- `divora-capture/tests/encoder_smoke.rs`: the real writer, memory-input mode,
+  to whatever software H.264/AAC encoder Windows has, read back box by box —
+  returning early on a machine without Media Foundation or an encoder. Its
+  ignored sibling records the main screen for two seconds through WGC and the
+  GPU.
+- Measured end to end in the real app: see "Screen recording" in
+  [`MANUAL_TESTS.md`](MANUAL_TESTS.md).

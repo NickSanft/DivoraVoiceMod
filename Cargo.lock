@@ -909,6 +909,7 @@ dependencies = [
 name = "divora-app"
 version = "0.0.0"
 dependencies = [
+ "divora-capture",
  "divora-core",
  "hound",
  "midir",
@@ -923,6 +924,15 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "ureq",
+]
+
+[[package]]
+name = "divora-capture"
+version = "0.0.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]

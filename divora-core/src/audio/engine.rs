@@ -22,6 +22,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 use serde::{Deserialize, Serialize};
 
+use super::av_tap::{av_drain_thread, av_tap, AvBuffer, AvChunk, AvControl, AvTap};
 use super::level::LevelMeter;
 use super::loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS};
 use super::resampler::MonoResampler;
@@ -187,6 +188,15 @@ enum Command {
     /// session down and rebuilds on the same devices — device-loss recovery.
     /// Coalesced via [`EngineState::stream_error_pending`].
     StreamError,
+    /// v1.52.0: send the screen recorder's audio to `sink`, now and after any
+    /// device-loss rebuild, until [`Command::DetachAv`]. `reply` says whether
+    /// a session was live to take it.
+    AttachAv {
+        sink: SyncSender<AvChunk>,
+        reply: Sender<bool>,
+    },
+    /// v1.52.0: stop sending the screen recorder's audio.
+    DetachAv,
     Shutdown,
 }
 
@@ -400,6 +410,41 @@ impl AudioEngine {
         self.state.reference_recording.load(Ordering::Acquire)
     }
 
+    /// v1.52.0: send the screen recorder its audio — the voice after the
+    /// chain and the soundboard, each as its own signal (see
+    /// [`AvChunk`](super::AvChunk)) — until [`detach_av_tap`](Self::detach_av_tap).
+    ///
+    /// Survives a device-loss rebuild and a Stop/Start: the sender is held by
+    /// the engine thread, outside any session, and handed to each new one.
+    /// Returns false, attaching nothing, when no session is running.
+    pub fn attach_av_tap(&self, sink: SyncSender<AvChunk>) -> bool {
+        let (reply_tx, reply_rx) = channel();
+        if self
+            .tx
+            .send(Command::AttachAv {
+                sink,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.recv().unwrap_or(false)
+    }
+
+    /// v1.52.0: stop sending the screen recorder its audio. What the callback
+    /// had already tapped is forwarded first.
+    pub fn detach_av_tap(&self) {
+        let _ = self.tx.send(Command::DetachAv);
+    }
+
+    /// v1.52.0: engine-rate frames the screen recorder's tap has lost since
+    /// it was last attached.
+    #[must_use]
+    pub fn av_dropped_frames(&self) -> u64 {
+        self.state.av_dropped.load(Ordering::Relaxed)
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Acquire)
@@ -556,6 +601,10 @@ struct StartedStreams {
     /// Same keep-alive shutdown as the workers above.
     graveyard_tx: Sender<()>,
     graveyard: JoinHandle<()>,
+    /// v1.52.0: the screen recorder's drain thread and its control channel.
+    /// Dropping `av_ctl` ends the thread.
+    av_ctl: Sender<AvControl>,
+    av_drainer: JoinHandle<()>,
 }
 
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
@@ -583,6 +632,13 @@ fn engine_thread(
     // workers, so an engine restart cannot leave one behind.
     let mut graveyard_tx: Option<Sender<()>> = None;
     let mut graveyard: Option<JoinHandle<()>> = None;
+    // v1.52.0: the screen recorder's tap. The drain thread is per-session;
+    // the recorder's sender is NOT — it lives here, across sessions, so a
+    // device-loss rebuild hands it to the new session instead of silencing
+    // the rest of the take.
+    let mut av_ctl: Option<Sender<AvControl>> = None;
+    let mut av_drainer: Option<JoinHandle<()>> = None;
+    let mut av_sink: Option<SyncSender<AvChunk>> = None;
     // v1.33.0: the devices of the live session, kept so a stream error can
     // rebuild on the same ones; and a counter that caps automatic recoveries
     // between manual starts so a flapping device can't loop forever.
@@ -618,6 +674,12 @@ fn engine_thread(
             }
             drop(reading_tx.take());
             if let Some(h) = reading_worker.take() {
+                let _ = h.join();
+            }
+            // The streams are gone, so the tap has nothing more coming; the
+            // drain exits on the hang-up. `av_sink` stays: the take goes on.
+            drop(av_ctl.take());
+            if let Some(h) = av_drainer.take() {
                 let _ = h.join();
             }
             // Last, and only after `current` dropped the streams above: the
@@ -673,6 +735,12 @@ fn engine_thread(
                     reading_worker = Some(started.reading_worker);
                     graveyard_tx = Some(started.graveyard_tx);
                     graveyard = Some(started.graveyard);
+                    // A take in progress carries on into the new session.
+                    if let Some(sink) = &av_sink {
+                        let _ = started.av_ctl.send(AvControl::Attach(sink.clone()));
+                    }
+                    av_ctl = Some(started.av_ctl);
+                    av_drainer = Some(started.av_drainer);
                     current = Some(started.streams);
                     // Restore the soundboard master gain onto the fresh (unity)
                     // mixer so a rebuild doesn't reset the user's volume.
@@ -848,6 +916,30 @@ fn engine_thread(
                     let _ = reply.send(());
                 }
             }
+            Command::AttachAv { sink, reply } => {
+                let attached = match &av_ctl {
+                    Some(ctl) => {
+                        state.av_dropped.store(0, Ordering::Relaxed);
+                        // The drain learns of the recorder before the callback
+                        // starts tapping, so nothing is tapped with nowhere to go.
+                        let ok = ctl.send(AvControl::Attach(sink.clone())).is_ok();
+                        if ok {
+                            av_sink = Some(sink);
+                            state.av_recording.store(true, Ordering::Release);
+                        }
+                        ok
+                    }
+                    None => false,
+                };
+                let _ = reply.send(attached);
+            }
+            Command::DetachAv => {
+                state.av_recording.store(false, Ordering::Release);
+                av_sink = None;
+                if let Some(ctl) = &av_ctl {
+                    let _ = ctl.send(AvControl::Detach);
+                }
+            }
             Command::Shutdown => {
                 teardown!();
                 break;
@@ -1002,6 +1094,12 @@ fn start_streams(
     let (grave_producer, grave_consumer) = grave_rb.split();
     let (graveyard_tx, graveyard_alive) = channel::<()>();
 
+    // v1.52.0: the screen recorder's tap. Always wired, like the recorder
+    // above — a take can begin mid-session — and costs one atomic load a
+    // buffer while nothing records.
+    let (av_producer, av_drain) = av_tap::<cpal::StreamInstant>(input_rate, output_rate);
+    let (av_ctl, av_ctl_rx) = channel::<AvControl>();
+
     let (dsp_tx, dsp_rx) = sync_channel::<DspEdit>(DSP_CHANNEL_CAPACITY);
     let (reactive_tx, reactive_rx) = sync_channel::<ResolvedReactive>(REACTIVE_CHANNEL_CAPACITY);
     let (sb_tx, sb_rx) = sync_channel::<SoundboardCommand>(SB_CHANNEL_CAPACITY);
@@ -1014,6 +1112,7 @@ fn start_streams(
         producer,
         state.clone(),
         reference_producer,
+        input_rate,
     )?;
     let output_stream = build_output_stream(
         &output_device,
@@ -1036,6 +1135,7 @@ fn start_streams(
         },
         reading.clone(),
         grave_producer,
+        av_producer,
         cmd_tx,
     )?;
 
@@ -1110,6 +1210,14 @@ fn start_streams(
         .spawn(move || graveyard_thread(grave_consumer, graveyard_alive))
         .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
 
+    // v1.52.0: the screen recorder's drain. Per-session; idle (blocked on its
+    // control channel) until a take attaches.
+    let av_state = state.clone();
+    let av_drainer = std::thread::Builder::new()
+        .name("divora-av-tap".into())
+        .spawn(move || av_drain_thread(av_drain, av_ctl_rx, av_state))
+        .map_err(|e| AudioEngineError::StreamBuild(e.to_string()))?;
+
     // The reading worker. Per-session like the writers above: it exits when
     // `reading_tx` drops at teardown, and the rolling baseline it built goes
     // with it, which is exactly the invalidation an engine restart or a device
@@ -1146,6 +1254,8 @@ fn start_streams(
         reading_worker: reading_worker_handle,
         graveyard_tx,
         graveyard,
+        av_ctl,
+        av_drainer,
     })
 }
 
@@ -1404,6 +1514,7 @@ pub fn drain_dsp_edits(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // builder-style; each arg is necessary
 fn build_input_stream(
     device: &Device,
     config: &StreamConfig,
@@ -1416,6 +1527,8 @@ fn build_input_stream(
     // used as a voice-clone reference. Always wired — capture can begin
     // mid-session.
     mut reference_producer: RingProducer,
+    // v1.52.0: for the screen recorder's input-latency reading.
+    rate: u32,
 ) -> Result<Stream, AudioEngineError> {
     let device_name = device.name().unwrap_or_default();
     if sample_format != SampleFormat::F32 {
@@ -1438,7 +1551,7 @@ fn build_input_stream(
     let stream = device
         .build_input_stream(
             config,
-            move |data: &[f32], _info| {
+            move |data: &[f32], info: &cpal::InputCallbackInfo| {
                 if data.is_empty() || channels == 0 {
                     return;
                 }
@@ -1458,6 +1571,14 @@ fn build_input_stream(
                     written += 1;
                 }
                 let slice = &mono[..written];
+                // v1.52.0: how stale the voice is when it reaches the ring,
+                // for the screen recorder to place it — only while one runs.
+                if state.av_recording.load(Ordering::Acquire) {
+                    let ts = info.timestamp();
+                    if let Some(age) = ts.callback.duration_since(&ts.capture) {
+                        state.store_input_latency_us(input_age_us(age, written, rate));
+                    }
+                }
                 let _ = producer.push_slice(slice);
                 // v1.23.0: tap the dry mono for a clone reference when armed.
                 if state.reference_recording.load(Ordering::Acquire) {
@@ -1509,6 +1630,9 @@ fn build_output_stream(
     // Where a displaced chain goes instead of being dropped here. See
     // [`graveyard_thread`].
     mut graveyard: GraveProducer,
+    // v1.52.0: the screen recorder's tap — voice and soundboard, separately,
+    // with a mark per buffer. Pushes only while `state.av_recording` is set.
+    mut av: AvTap<cpal::StreamInstant>,
     // v1.33.0: lets the stream's error callback ask the engine thread to
     // rebuild the session after a device loss (see `Command::StreamError`).
     cmd_tx: Sender<Command>,
@@ -1565,7 +1689,7 @@ fn build_output_stream(
     let stream = device
         .build_output_stream(
             config,
-            move |data: &mut [f32], _info| {
+            move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 if data.is_empty() || channels == 0 {
                     return;
                 }
@@ -1615,8 +1739,9 @@ fn build_output_stream(
                 // the UI readout. Cheap — just sums enabled effects'
                 // fixed delays — and reflects the live chain, so it
                 // moves the moment Voice Convert / denoiser toggle.
+                let chain_latency = chain.latency_samples(input_rate);
                 #[allow(clippy::cast_precision_loss)]
-                let lat_ms = chain.latency_samples(input_rate) as f32 / input_rate as f32 * 1000.0;
+                let lat_ms = chain_latency as f32 / input_rate as f32 * 1000.0;
                 state_for_callback.store_dsp_latency_ms(lat_ms);
 
                 let monitoring = state_for_callback.monitor.load(Ordering::Acquire);
@@ -1643,6 +1768,11 @@ fn build_output_stream(
                 // more native audio than the input device produces, for ever:
                 // the ring could never keep up, and a THIRD of every block was
                 // zero-fill rather than the empty gap it is now.
+                // v1.52.0: the screen recorder's one atomic load a buffer. The
+                // ring depth it needs is read only while a take runs, and
+                // before the pop, while the oldest voice frame is still in it.
+                let av_armed = state_for_callback.av_recording.load(Ordering::Acquire);
+                let occupancy = if av_armed { consumer.occupied_len() } else { 0 };
                 let (block, span) = resample_pop(
                     &mut consumer,
                     resampler.as_mut(),
@@ -1708,6 +1838,25 @@ fn build_output_stream(
                 if tapping {
                     reading_taps.push_wet(&mono[..block]);
                 }
+
+                // v1.52.0: the screen recorder's tap, at the same point and for
+                // the same reason — the soundboard is still in `sb`, not yet
+                // folded in, and the monitor-only previews mixed in below are
+                // not part of the call. `span`, not `block`: the recorder needs
+                // the whole timeline, and a mic gap is silence on it.
+                av.tap(
+                    av_armed,
+                    AvBuffer {
+                        at: info.timestamp().callback,
+                        out_frames: u32::try_from(out_frames).unwrap_or(u32::MAX),
+                        occupancy: u32::try_from(occupancy).unwrap_or(u32::MAX),
+                        chain_latency: u32::try_from(chain_latency).unwrap_or(u32::MAX),
+                    },
+                    &mono[..span],
+                    &sb[..span],
+                    &state_for_callback.av_dropped,
+                    Instant::now,
+                );
 
                 // Phase 13: tap the processed, input-rate mono into the
                 // monitor ring (if a monitor device is active) BEFORE this
@@ -2569,6 +2718,17 @@ fn reading_worker(
 
         std::thread::sleep(Duration::from_millis(READING_DRAIN_INTERVAL_MS));
     }
+}
+
+/// The average age of the newest microphone frame when the input callback
+/// pushes it, in microseconds, from cpal's capture→callback age of the
+/// buffer's FIRST frame: minus the buffer itself (the newest frame is that
+/// much younger), plus half a buffer (on average the output callback runs
+/// half an input period after the push).
+fn input_age_us(first_frame_age: Duration, frames: usize, rate: u32) -> u32 {
+    let buffer_us = (frames as u64).saturating_mul(1_000_000) / u64::from(rate.max(1));
+    let age = u64::try_from(first_frame_age.as_micros()).unwrap_or(u64::MAX);
+    u32::try_from(age.saturating_sub(buffer_us / 2)).unwrap_or(u32::MAX)
 }
 
 /// The WAV writer the recording thread holds while a file is open.

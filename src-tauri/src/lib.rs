@@ -34,10 +34,15 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 mod midi;
+mod screen;
 use midi::{
     list_inputs as list_midi_inputs_core, open_input as open_midi_input_core, MidiInputInfo,
 };
 use midir::MidiInputConnection;
+use screen::{
+    monitor_dtos, sanitize_fps, screen_recording_path, CaptureStatusDto, MonitorDto, Quality,
+    ScreenRecorder, ScreenRecordingUpdate, StartRequest,
+};
 
 /// Payload of the periodic `audio-levels` event. Frontend listens with
 /// `tauri.event.listen("audio-levels", …)`.
@@ -241,6 +246,9 @@ struct AppState {
     /// requests a different mode, the engine is rebuilt (the `decode_step` swaps
     /// between the CPU and the `DirectML` fp16 build).
     voxcpm_engine: Mutex<Option<(bool, divora_core::tts::voxcpm::VoxCpmEngine)>>,
+    /// v1.52.0: the screen recorder. Outlives engine sessions — a take
+    /// carries on through a device-loss rebuild and a Stop/Start.
+    screen: Arc<ScreenRecorder>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -625,6 +633,81 @@ fn start_recording(state: State<'_, AppState>, filename: String) -> Result<Strin
 #[tauri::command]
 fn stop_recording(state: State<'_, AppState>) {
     state.engine.stop_recording();
+}
+
+// ---- v1.52.0: recording the screen ----
+//
+// All `async`: Tauri 2 runs a sync command on the main thread, which every
+// window shares, and these wait on Windows (Media Foundation's first start,
+// a take's first frame, the file being finished).
+
+/// Whether this PC can record the screen, and if not, what to tell the user.
+/// Checked once per run; the first call starts Media Foundation to find out.
+#[tauri::command]
+async fn screen_capture_status() -> Result<CaptureStatusDto, String> {
+    tauri::async_runtime::spawn_blocking(|| divora_capture::capture_status().into())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The screens that can be recorded, the main one first.
+#[tauri::command]
+async fn list_capture_monitors() -> Result<Vec<MonitorDto>, String> {
+    tauri::async_runtime::spawn_blocking(|| monitor_dtos(divora_capture::list_monitors()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Record `monitor_id` to `recordings/<filename>` (an `.mp4`, whatever the
+/// name says) with the modulated voice and the soundboard. Resolves once the
+/// first frame is in, with the file's full path; refuses while the engine
+/// is stopped, as the WAV recorder does.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // one per field of the invoke payload
+async fn start_screen_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    monitor_id: String,
+    filename: String,
+    fps: Option<u32>,
+    quality: Option<String>,
+    cursor: Option<bool>,
+    av_offset_ms: Option<i32>,
+) -> Result<String, String> {
+    std::fs::create_dir_all(&state.recordings_dir).map_err(|e| e.to_string())?;
+    let req = StartRequest {
+        monitor_id,
+        path: screen_recording_path(&state.recordings_dir, &filename),
+        fps: sanitize_fps(fps),
+        quality: Quality::parse(quality.as_deref()),
+        cursor: cursor.unwrap_or(true),
+        av_offset_ms: av_offset_ms.unwrap_or(0),
+    };
+    let recorder = Arc::clone(&state.screen);
+    let engine = Arc::clone(&state.engine);
+    tauri::async_runtime::spawn_blocking(move || recorder.start(&app, &engine, req))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Stop the take and wait for the MP4 to be finished; resolves with its path.
+#[tauri::command]
+async fn stop_screen_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let recorder = Arc::clone(&state.screen);
+    tauri::async_runtime::spawn_blocking(move || recorder.stop(&app))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// The latest `screen-recording` report, for a window that opens mid-take.
+#[tauri::command]
+fn screen_recording_status(state: State<'_, AppState>) -> ScreenRecordingUpdate {
+    state.screen.status()
 }
 
 #[tauri::command]
@@ -2210,7 +2293,16 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                // v1.52.0: a screen recording in progress is finished first;
+                // exiting under it would leave an unplayable `.part`.
+                if let Some(state) = app.try_state::<AppState>() {
+                    if state.screen.is_busy() {
+                        let _ = state.screen.stop(app);
+                    }
+                }
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -2425,6 +2517,7 @@ pub fn run() {
                 midi_connection: Mutex::new(None),
                 voice_recording_path: Mutex::new(None),
                 voxcpm_engine: Mutex::new(None),
+                screen: Arc::new(ScreenRecorder::default()),
             });
 
             // The window is created hidden (`visible: false`) so the user never
@@ -2476,6 +2569,11 @@ pub fn run() {
             logs_dir,
             start_recording,
             stop_recording,
+            screen_capture_status,
+            list_capture_monitors,
+            start_screen_recording,
+            stop_screen_recording,
+            screen_recording_status,
             scan_soundboard_folder,
             play_soundboard_clip,
             stop_soundboard_clip,

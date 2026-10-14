@@ -383,6 +383,26 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Start a second recording → it writes a new timestamped file without disturbing the first.
 - [ ] Shout into the mic (clip the input) → the recorded file saturates cleanly (no wrap-around static).
 
+## Screen recording (v1.52.0)
+
+- [ ] Mixer right rail shows a **Record screen** card under Record, sub-line "Your modulated voice and soundboard". With more than one screen, a picker lists them (`Screen 1 · 3440×1440 · main`, …). With the engine **stopped**, Record is disabled (tooltip "Start the engine to record").
+- [ ] Start the engine, pick a screen, click **Record** → "Starting…", then "Recording · 0:01" counting up; Windows draws a yellow border around that screen. Talk in the **Villager** preset and play a soundboard sting, then **Stop** → "Finishing the file…", then "Saved divora-screen-<date>_<time>.mp4".
+- [ ] The MP4 plays in Windows Media Player, VLC and a video editor (e.g. Clipchamp/DaVinci): the picture is the chosen screen (scaled to fit 2560×1440 when bigger, keeping its shape), the sound is your modulated voice plus the sting, and voice and picture line up (clap on camera or speak while typing — the sound should not trail the keystrokes).
+- [ ] Settings → Recordings: switch **60 fps** and **Sharpest**, turn the **mouse pointer** off, record again → the file is 60 fps, larger, and has no pointer.
+- [ ] Settings → Hotkeys → **Record screen**: bind a combination, focus a game or another app, press it → recording starts; press again → it stops and saves. **Record voice (WAV)** does the same for the WAV recorder.
+- [ ] Stop the engine mid-take → the card says "Audio lost at m:ss — start the engine to bring it back"; start it again → the line goes away, and the saved file has silence for exactly that stretch and sound after it.
+- [ ] Unplug the output device mid-take (Divora rebuilds the session) → the take carries on and the sound continues after the rebuild. *(Same re-attach path as Stop/Start; not yet run with a real unplug.)*
+- [ ] Mid-take, change the recorded screen's resolution (Settings → Display, or a game switching to exclusive fullscreen at another size) → the take continues; at a different shape the picture is letterboxed on black rather than stretched. *(Unit-tested geometry; not yet run on hardware.)*
+- [ ] Recording the screen Divora is on shows Divora's own window in the file.
+- [ ] Mid-take, right-click the tray icon → **Quit** → the app closes within a second or two, and the take is a finished, playable `.mp4` (no `.part` left behind).
+- [ ] **No Media Foundation:** quit, then run with `DIVORA_PRETEND_NO_MEDIA_FOUNDATION=1` set → the app starts normally, and the card says "Screen recording needs Windows' media components. Install the Media Feature Pack…" with Record disabled — never an error dialog.
+- [ ] **CPU fallback:** run with `DIVORA_CAPTURE_CPU_CONVERT=1` → recording still works (frames converted on the CPU); colours match a normal take.
+- [ ] Measured on the development machine (NVIDIA GPU, "NVIDIA H.264 Encoder MFT"; 3440×1440 main screen recorded at 2560×1070), soundboard click against an on-screen flash triggered in the same animation frame, engine on VB-Cable in / Realtek USB out with the output gated silent:
+  - **A/V offset, 60 fps, 5 events:** the sound lands **6–19 ms before** the picture (mean −12 ms). The flash reaches the screen a compositor frame after the click is queued, so a small negative offset is expected.
+  - **Engine stopped and restarted mid-take:** offsets −13 to −26 ms after the restart; `audioLostAt` reported 2.0 s.
+  - **10 minutes at 30 fps, an event every minute:** 11 events from 32 ms early to 4.5 ms late (mean −14 ms; most of the spread is the 33 ms frame), a fitted trend of −7 ms (within that frame-rate noise), 18,120 frames written with one tick skipped, and a measured audio clock of −0.4 ppm — so this take barely exercised drift correction.
+  - The voice path (microphone → chain → recording) was not measured end to end: the machine had no physical microphone, and a test signal on the virtual cable could have reached a live call. `timeline.rs`'s tests check the placement given the delays the engine reports, not that those match a real microphone — the talk test above is the check.
+
 ## The Coven — voice cast (v1.1.0)
 
 - [ ] The sidebar shows a **Coven** nav item (second, after Mixer). Click it → a gallery of character cards appears.

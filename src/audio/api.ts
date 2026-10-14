@@ -840,6 +840,85 @@ export async function stopRecording(): Promise<void> {
   await invoke("stop_recording");
 }
 
+// ---- Screen recording (v1.52.0) ----
+
+/** Whether this PC can record the screen; `reason` says why not. */
+export interface CaptureStatus {
+  supported: boolean;
+  reason: string | null;
+  /** The H.264 encoder Windows will try first, as it names itself. */
+  h264Encoder: string | null;
+  hardware: boolean;
+}
+
+/** A screen that can be recorded. */
+export interface CaptureMonitor {
+  /** Stable while the display layout is (`\\.\DISPLAY1`). */
+  id: string;
+  /** 1-based, main screen first. */
+  number: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  primary: boolean;
+}
+
+export type ScreenRecordingState = "idle" | "starting" | "recording" | "stopping";
+
+/** Payload of the `screen-recording` event (and `screen_recording_status`). */
+export interface ScreenRecordingUpdate {
+  state: ScreenRecordingState;
+  path: string | null;
+  elapsedMs: number;
+  droppedFrames: number;
+  driftPpm: number;
+  /** Seconds into the take where the engine stopped, while it stays stopped. */
+  audioLostAt: number | null;
+  error: string | null;
+}
+
+export type ScreenQuality = "small" | "balanced" | "high";
+
+export interface ScreenRecordingOptions {
+  monitorId: string;
+  /** The backend keeps only the last path component and forces `.mp4`. */
+  filename: string;
+  fps?: 30 | 60;
+  quality?: ScreenQuality;
+  cursor?: boolean;
+  /** Moves the sound against the picture; positive is later. ±500 ms. */
+  avOffsetMs?: number;
+}
+
+export async function screenCaptureStatus(): Promise<CaptureStatus> {
+  return invoke<CaptureStatus>("screen_capture_status");
+}
+
+export async function listCaptureMonitors(): Promise<CaptureMonitor[]> {
+  return invoke<CaptureMonitor[]>("list_capture_monitors");
+}
+
+/** Resolves with the MP4's full path once the first frame is in. */
+export async function startScreenRecording(opts: ScreenRecordingOptions): Promise<string> {
+  return invoke<string>("start_screen_recording", { ...opts });
+}
+
+/** Resolves with the finished MP4's path. */
+export async function stopScreenRecording(): Promise<string> {
+  return invoke<string>("stop_screen_recording");
+}
+
+export async function screenRecordingStatus(): Promise<ScreenRecordingUpdate> {
+  return invoke<ScreenRecordingUpdate>("screen_recording_status");
+}
+
+export async function subscribeScreenRecording(
+  handler: (update: ScreenRecordingUpdate) => void,
+): Promise<UnlistenFn> {
+  return listen<ScreenRecordingUpdate>("screen-recording", (e) => handler(e.payload));
+}
+
 // ---- Soundboard ----
 
 /** Wire format for one soundboard tile (output of `scan_soundboard_folder`). */

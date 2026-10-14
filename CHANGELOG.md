@@ -4,6 +4,69 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- **Record your screen with your voice.** A new **Record screen** card on the Mixer, under Record, captures a whole screen to an MP4 with your modulated voice and the soundboard, Speak included — Divora's own sound, not game or call audio. Pick the screen on the card when you have more than one. Files land in the recordings folder, named by date and time like the WAV recordings.
+- **Your voice is placed by when you spoke.** It reaches the recorder later than a soundboard sting does — through the microphone, a buffer and the effects; a bring-your-own voice model alone can add a quarter of a second. The recorder moves it back by those delays rather than placing it when it arrived, and keeps the sound on the picture's clock through a long take. If it still lands early or late on your setup, the A/V offset below adjusts it.
+- **One hotkey starts and stops it.** Settings → Hotkeys has **Record screen**, so a Stream Deck key works too, and **Record voice (WAV)** for the WAV recorder. Both are unbound until you set them.
+- **Settings → Recordings** gains frame rate (30 or 60 fps), quality (Smaller files, Balanced, Sharpest) and whether the mouse pointer shows. Under **Advanced** there is an A/V offset, up to half a second either way, for a setup where the sound still lands early or late.
+- **Nothing to install.** Windows' own H.264 and AAC encoders do the work, using your graphics card's encoder when Windows offers one. Screens bigger than 2560×1440 are scaled down to fit, keeping their shape.
+- **If the engine stops mid-take, the recording keeps going.** The card says "Audio lost at m:ss", and once the engine is started again the sound comes back into the same file.
+- **Quitting from the tray while a recording runs finishes the file before the app closes.**
+- **On a Windows "N" edition without the Media Feature Pack, the card says what to install** and Record stays off. The app itself still starts as before.
+- **Good to know:** recording needs the engine running and Windows 10 version 1903 or later. Recordings are SDR for now, so an HDR screen may look washed-out. Windows outlines the screen in yellow while it records, and recording the screen Divora is on includes Divora's own window.
+
+### Tests
+
+- **Engine tap** (`divora-core`, 7): a tapped buffer reaches the recorder unchanged, indexed and timed; a buffer that doesn't fit is dropped from all three rings and leaves an exact gap; re-arming starts a new epoch; leftovers from an earlier take are never placed; and the callback's part, `AvTap::tap`, allocates and frees nothing — armed, disarmed and dropping — with a control proving the allocation probe counts.
+- **Capture crate** (`divora-capture`, 37): `FramePacer` (no drift over an hour); `ClockFit` (+80 ppm found through ±5 ms of jitter, to under 2 ppm in ten minutes; a 100 ms step stands out); `AudioTimeline` (14: 16/44.1/48/96 kHz engines, drops, a stall, a rebuild at a new rate, voice and soundboard each on its own time, a 256 ms voice model, a jittery voice delay that must never move a speaking voice); the BGRA→NV12 converter against the BT.709 reference values; sizing and letterbox geometry; and the video's end time counting skipped frames — the audio track was being cut a frame short for each skip, which the ten-minute take below caught (23 ms).
+  - **Each timeline rule was checked by breaking it:** ignoring the chain's latency, never keeping a stall, a fixed clock, and moving the voice mid-word each fail a test. One test passed a broken build at first — its voice delay was a whole number of the test tone's periods — and was fixed.
+- **Encoder smoke test, in the CI test step:** the real MP4 writer with synthetic frames and a tone, through whatever software encoder Windows has, read back box by box (`ftyp`, `moov`, one video track — plus audio where an AAC encoder is registered — and 1.5 s). On a machine without Media Foundation or an H.264 encoder it returns early and says so, so the first CI log is checked for that line.
+- **Load-time import guard, on CI:** reads the built `divora-app.exe`'s import tables and fails on any `mf*.dll`. Verified by adding one static Media Foundation call, which it caught.
+- **App** (`src-tauri`, 6): the recorder's whole phase table, filename sanitising, frame rates, quality, the engine-chunk conversion, and the wire keys.
+- **Frontend:** settings, filenames, the stopwatch and the screen picker (6); the recorder hotkeys and older saves without them (1); the store's toggle — refused while the engine is stopped, the saved screen and settings, falling back to the main screen, an unsupported PC, a refused start (5); the new sigils (1). **E2E (3):** the Mixer card driven through a whole take by `screen-recording` events; the `rec:screen` and `rec:wav` hotkeys starting their recorders (removing the dispatch fails it); and the Settings rows saving frame rate and quality, with the two hotkey rows shown.
+- **Checked in the real app,** in the debug build driven over WebView2's DevTools protocol, with the engine on the virtual cable's input and its output gated silent:
+  - **A/V offset at 60 fps:** a soundboard click and an on-screen flash triggered in the same animation frame land with the sound **6–19 ms before** the picture (5 events, mean −12 ms).
+  - **Over ten minutes at 30 fps:** an event a minute, from 32 ms early to 4.5 ms late (11 events, mean −14 ms; most of the spread is the 33 ms frame), with a fitted trend of −7 ms — within that frame-rate noise; 18,120 frames written and one tick skipped. The audio clock here ran within 0.5 ppm of the picture's, so correcting real drift rests on the `ClockFit` and timeline tests.
+  - **Engine stopped and restarted mid-take:** "audio lost" reported at 2.0 s, cleared on restart, and the sound after it at −13 to −26 ms.
+  - **The Mixer card's own button** recorded and saved a file, and the card named it.
+  - **Quit from the tray menu, four minutes into a take:** the app exited 0.3 s later, leaving a finished, playable MP4 and no `.part`.
+  - **The CPU colour path,** forced on: the same picture as the GPU path, and a valid file.
+  - **The encoder each take actually loaded,** read back from the writer: "NVIDIA H.264 Encoder MFT", hardware.
+  - **Media Foundation treated as missing** (`DIVORA_PRETEND_NO_MEDIA_FOUNDATION=1`): the app starts, the card shows the Media Feature Pack hint with Record off, and a direct start is refused with the same words — no error, nothing in the console.
+  - **Not measured:** the voice path end to end. The machine had no physical microphone, and a test signal on the virtual cable could have reached a live call. The timeline tests check the placement given the delays the engine reports; that those match a real microphone was not measured.
+  - **Not exercised on hardware:** a real device unplug mid-take (the re-attach was exercised through Stop/Start, the same path), and a screen changing resolution mid-take (geometry unit-tested).
+
+### Architecture notes
+
+- **New crate `divora-capture`** with no tauri or cpal dependency: Windows Graphics Capture → Direct3D 11 video processor (BGRA→NV12, BT.709 studio range, scaled to fit) → Media Foundation sink writer (H.264 High + AAC-LC 48 kHz stereo 192 kbps, MPEG-4 by attribute). The encoder actually loaded is read back. Files are written as `.mp4.part` and renamed when finished. Its `native` module is the only production `unsafe` scope in the tree, and every block says why it holds.
+- **Media Foundation is loaded at run time** (`LoadLibraryExW`, System32 only, plus `GetProcAddress`), never imported, so the app still starts on Windows N.
+- **Fallbacks:** a Direct3D device without video support converts on the CPU (`nv12.rs`); a monitor that changes size mid-take recreates the capture pool and is fitted into the take's fixed size — letterboxed on the GPU path, stretched on the CPU fallback (geometry unit-tested; not yet exercised on hardware).
+- **The engine tap** sits where the soundboard is still separate from the voice. While recording: per output buffer, a ring-depth read and three ring pushes; per input buffer, a timestamp difference and an atomic store; one `Instant::now()` per run (a take, and again after each engine restart). Idle: one atomic load in each callback. The recorder's sender lives on the engine thread, outside any session, so a session rebuild re-attaches the same take (exercised through Stop/Start).
+- **`AudioTimeline`** keeps stalls as silence, fills drops exactly, places the voice earlier by input latency + input-ring depth (smoothed; moved in a pause, or mid-word once 20 ms out) + the chain's latency (exact), and reads the mix through a Kaiser-windowed sinc at `ClockFit`'s positions straight into 48 kHz.
+- **Differences from the plan, recorded in `docs/research/stream-studio.md`:**
+  - The per-take anchor is one `Instant::now()` in the callback, not a parse of cpal's private instant.
+  - The timeline resamples at fitted positions instead of nudging `MonoResampler`'s ratio.
+  - The recorder's transitions are a pure table rather than a mock `FrameSink`.
+- **Wire surface (additive):**
+  - **Commands:** `screen_capture_status`, `list_capture_monitors`, `start_screen_recording`, `stop_screen_recording`, `screen_recording_status`.
+  - **Event:** `screen-recording`.
+  - **Hotkey prefix:** `rec:` (`rec:screen`, `rec:wav`).
+  - **Storage:** key `divora.screenRecording`; `divora.hotkeyBindings` gains the two recorder keys.
+  - **Files:** `recordings/divora-screen-<date>_<time>.mp4`.
+
+### Pre-push checklist (local, 2026-10-14)
+
+- `rustup update stable` — rustc / clippy 1.99.0, unchanged
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace --all-features` (with `CI=true`) — pass: core 474 (+7), capture 37 + the encoder smoke test (new crate), app 49 (+6) + the import guard
+- `pnpm typecheck` — pass
+- `pnpm test` — pass (551, +13)
+- `pnpm test:e2e` — pass (20, +3)
+- `pnpm tauri build --debug --no-bundle` — pass
+- `cargo test -p divora-capture --test encoder_smoke -- --include-ignored` — pass, including the real two-second capture of the main screen
+
 ## [1.51.4] — 2026-10-13 — Fix: hotkeys that forgot their keys
 
 ### Fixed

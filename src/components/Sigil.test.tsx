@@ -22,6 +22,12 @@ describe("Sigil", () => {
     }
   });
 
+  it("includes the recorders' sigils (v1.52.0)", () => {
+    for (const name of ["record", "screen"] as const) {
+      expect(SIGIL_NAMES).toContain(name);
+    }
+  });
+
   it("includes every nav name in the catalog", () => {
     for (const name of ["mixer", "soundboard", "presets", "settings"] as const) {
       expect(SIGIL_NAMES).toContain(name);
