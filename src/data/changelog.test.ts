@@ -10,6 +10,7 @@ import {
   RENDER_CAP,
 } from "./changelog";
 import { BUNDLED_RELEASES } from "../../vite/changelog-plugin";
+import { isNewer } from "./version";
 
 describe("decideWhatsNew", () => {
   it("stays silent on a brand-new install", () => {
@@ -102,10 +103,16 @@ describe("notesSince", () => {
   });
 
   it("never shows a release newer than the running build", () => {
-    const got = notesSince("1.40.0", "1.43.0");
-    expect(got.notes.every((n) => n.version <= "1.43.0")).toBe(true);
-    expect(got.notes.map((n) => n.version)).toContain("1.43.0");
-    expect(got.notes.map((n) => n.version)).not.toContain("1.44.0");
+    // Taken from the bundle, not named: a pinned version ages out of the
+    // ~12-release window (1.43.0 did when 1.52.0 was stamped). And compared
+    // as versions, not strings — as strings "1.5.0" sorts after "1.43.0".
+    const running = RELEASE_NOTES[3]!.version;
+    const newer = RELEASE_NOTES[2]!.version;
+    const lastSeen = RELEASE_NOTES[7]!.version;
+    const got = notesSince(lastSeen, running);
+    expect(got.notes.every((n) => !isNewer(n.version, running))).toBe(true);
+    expect(got.notes.map((n) => n.version)).toContain(running);
+    expect(got.notes.map((n) => n.version)).not.toContain(newer);
   });
 
   it("flags — without a number — that older releases exist beyond the bundle", () => {

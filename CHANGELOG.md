@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.52.0] — 2026-10-14 — Record your screen with your voice
+
 ### Added
 
 - **Record your screen with your voice.** A new **Record screen** card on the Mixer, under Record, captures a whole screen to an MP4 with your modulated voice and the soundboard, Speak included — Divora's own sound, not game or call audio. Pick the screen on the card when you have more than one. Files land in the recordings folder, named by date and time like the WAV recordings.
@@ -25,6 +27,7 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 - **Load-time import guard, on CI:** reads the built `divora-app.exe`'s import tables and fails on any `mf*.dll`. Verified by adding one static Media Foundation call, which it caught.
 - **App** (`src-tauri`, 6): the recorder's whole phase table, filename sanitising, frame rates, quality, the engine-chunk conversion, and the wire keys.
 - **Frontend:** settings, filenames, the stopwatch and the screen picker (6); the recorder hotkeys and older saves without them (1); the store's toggle — refused while the engine is stopped, the saved screen and settings, falling back to the main screen, an unsupported PC, a refused start (5); the new sigils (1). **E2E (3):** the Mixer card driven through a whole take by `screen-recording` events; the `rec:screen` and `rec:wav` hotkeys starting their recorders (removing the dispatch fails it); and the Settings rows saving frame rate and quality, with the two hotkey rows shown.
+- **Two more What's-new tests no longer pin version numbers.** Stamping this release pushed 1.42.0, 1.43.0 and "Reactive effects" out of the 12 releases the app carries, and both tests failed on correct behaviour. They now take their versions from the bundle, and the range test compares versions as versions — as strings, "1.5.0" sorts after "1.43.0".
 - **Checked in the real app,** in the debug build driven over WebView2's DevTools protocol, with the engine on the virtual cable's input and its output gated silent:
   - **A/V offset at 60 fps:** a soundboard click and an on-screen flash triggered in the same animation frame land with the sound **6–19 ms before** the picture (5 events, mean −12 ms).
   - **Over ten minutes at 30 fps:** an event a minute, from 32 ms early to 4.5 ms late (11 events, mean −14 ms; most of the spread is the 33 ms frame), with a fitted trend of −7 ms — within that frame-rate noise; 18,120 frames written and one tick skipped. The audio clock here ran within 0.5 ppm of the picture's, so correcting real drift rests on the `ClockFit` and timeline tests.

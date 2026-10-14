@@ -87,13 +87,21 @@ describe("WhatsNew launch check", () => {
   });
 
   it("shows the whole range after skipping several releases", async () => {
-    window.localStorage.setItem(SEEN_KEY, "1.42.0");
+    // From the bundle, not named: pinned releases age out of the ~12 the app
+    // holds (1.42.0 and "Reactive effects" did when 1.52.0 was stamped).
+    // Last seen four releases back: those four show, the one seen does not.
+    const lastSeen = RELEASE_NOTES[4]!;
+    window.localStorage.setItem(SEEN_KEY, lastSeen.version);
     const { app, getByRole } = setup();
     await app().checkWhatsNew();
     app().openWhatsNew();
     const text = getByRole("dialog").textContent ?? "";
-    expect(text).toContain("Bitcrusher");
-    expect(text).toContain("Reactive effects");
+    for (const note of RELEASE_NOTES.slice(0, 4)) {
+      expect(text).toContain(note.title!);
+      expect(text).toContain(`v${note.version}`);
+    }
+    // By title: a later release's prose may mention the version number.
+    expect(text).not.toContain(lastSeen.title!);
     // v1.45.0 carries the whatsnew:skip marker.
     expect(text).not.toContain("Shared envelope follower");
   });
