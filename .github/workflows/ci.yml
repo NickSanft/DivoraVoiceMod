@@ -113,7 +113,9 @@ jobs:
       - name: windows crate copies (allowlist)
         shell: bash
         run: |
-          got=$(cargo tree --workspace --all-features -e normal --target x86_64-pc-windows-msvc --prefix none --format '{p}' | grep -E '^windows v[0-9]' | sed 's/ (\*)$//' | sort -u)
+          # --color never: CI's CARGO_TERM_COLOR=always colours the "(*)"
+          # marker, which then survives the trim and doubles an entry.
+          got=$(cargo tree --color never --workspace --all-features -e normal --target x86_64-pc-windows-msvc --prefix none --format '{p}' | grep -E '^windows v[0-9]' | sed -E 's/^(windows v[0-9.]+).*/\1/' | sort -u)
           want=$'windows v0.54.0\nwindows v0.56.0\nwindows v0.61.3'
           if [ "$got" != "$want" ]; then
             echo "windows crate copies changed:"; echo "$got"; exit 1
