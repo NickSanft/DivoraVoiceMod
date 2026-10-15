@@ -222,6 +222,11 @@ pub struct AudioEngine {
     /// Voice-reading gate + latest snapshot. Separate from `state` because
     /// only this feature reads or writes it.
     reading: Arc<ReadingTap>,
+    /// v1.53.0: the running session's devices, for the screen recorder's
+    /// desktop-audio guard. Written only by the engine thread, as a session
+    /// comes up (a device-loss rebuild included) or goes down; the audio
+    /// callbacks never touch it.
+    routing: Arc<Mutex<Option<StreamInfo>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -245,17 +250,20 @@ impl AudioEngine {
         let state_clone = state.clone();
         let reading = Arc::new(ReadingTap::default());
         let reading_clone = reading.clone();
+        let routing = Arc::new(Mutex::new(None));
+        let routing_clone = Arc::clone(&routing);
         // The engine thread keeps a Command sender so a stream's error
         // callback can ask it to rebuild the session after a device loss.
         let cmd_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("divora-audio".into())
-            .spawn(move || engine_thread(rx, cmd_tx, state_clone, reading_clone))
+            .spawn(move || engine_thread(rx, cmd_tx, state_clone, reading_clone, routing_clone))
             .expect("spawning the audio thread should not fail");
         Self {
             tx,
             state,
             reading,
+            routing,
             handle: Some(handle),
         }
     }
@@ -450,6 +458,17 @@ impl AudioEngine {
         self.state.running.load(Ordering::Acquire)
     }
 
+    /// v1.53.0: the devices the running session plays on and listens on —
+    /// after a device-loss rebuild, the ones it rebuilt on — or `None` while
+    /// stopped.
+    #[must_use]
+    pub fn stream_info(&self) -> Option<StreamInfo> {
+        self.routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// v1.39.0: true when device-loss auto-recovery gave up and the engine is
     /// stopped with no audio (drives the UI's "device lost — restart" banner).
     #[must_use]
@@ -614,6 +633,7 @@ fn engine_thread(
     cmd_tx: Sender<Command>,
     state: Arc<EngineState>,
     reading: Arc<ReadingTap>,
+    routing: Arc<Mutex<Option<StreamInfo>>>,
 ) {
     let mut current: Option<RunningStreams> = None;
     let mut dsp_tx: Option<SyncSender<DspEdit>> = None;
@@ -696,6 +716,7 @@ fn engine_thread(
                 let _ = h.join();
             }
             state.running.store(false, Ordering::Release);
+            *routing.lock().unwrap_or_else(PoisonError::into_inner) = None;
             // The meter must not freeze at the last depth once the engine
             // is down — `reactive_depth()` documents 0 when stopped.
             state.store_reactive_depth(0.0);
@@ -752,6 +773,8 @@ fn engine_thread(
                     if let Some(tx) = &reactive_tx {
                         let _ = tx.try_send(last_reactive.resolve());
                     }
+                    *routing.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(started.info.clone());
                     Ok(started.info)
                 }
                 Err(e) => Err(e),
@@ -2984,6 +3007,16 @@ mod tests {
         // Synchronous stop must still return (engine thread is alive).
         assert!(engine.stop_reference_recording());
         assert!(!engine.is_reference_recording());
+    }
+
+    /// v1.53.0: a stopped engine plays on no device, and a stop with nothing
+    /// running leaves it so.
+    #[test]
+    fn a_stopped_engine_has_no_routing() {
+        let engine = AudioEngine::new();
+        assert!(engine.stream_info().is_none());
+        engine.stop();
+        assert!(engine.stream_info().is_none());
     }
 
     /// v1.29.0: the Speak/soundboard monitor defaults on (TTS previews audible)

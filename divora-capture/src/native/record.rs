@@ -17,21 +17,18 @@ use super::wgc::MonitorCapture;
 use crate::error::CaptureError;
 use crate::pacer::{FramePacer, TICKS_PER_SECOND};
 use crate::sizing::{default_bitrate, output_size};
-use crate::take::{part_path, AudioFeed, AudioStats, RecordOptions, RecordStats, TakeObserver};
-use crate::timeline::{AudioChunk, AudioTimeline};
+use crate::take::{part_path, AudioFeed, RecordOptions, RecordStats, TakeObserver};
+use crate::track::AudioTrack;
 
 /// How long to wait for the very first frame before giving up: a monitor
 /// that is asleep produces none.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The longest the loop sleeps while there is audio to take in. A frame
-/// period at 30 fps is longer; the feed's channel would cope, but the track
-/// should not trail the picture by more than it must.
+/// The longest the loop goes without taking in audio, frames due or not. A
+/// frame period at 30 fps is longer; the queues would cope, but the track
+/// should not trail the picture by more than it must, and an encoder that
+/// can't keep up must not starve the audio of its turns.
 const AUDIO_POLL: Duration = Duration::from_millis(20);
-
-/// After the last frame, how long to wait for the audio to catch up to it:
-/// the slowest voice chain (≈ 256 ms) plus the drain, with room.
-const AUDIO_FLUSH_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// COM for this thread, for the life of the take.
 pub struct ComScope(bool);
@@ -190,70 +187,6 @@ impl Screen {
     }
 }
 
-/// The audio half of a take: the feed, the timeline it fills, and a scratch
-/// buffer reused between polls.
-struct AudioTrack<'a> {
-    feed: &'a mut dyn AudioFeed,
-    timeline: AudioTimeline,
-    chunks: Vec<AudioChunk>,
-    blocks: u64,
-}
-
-impl<'a> AudioTrack<'a> {
-    fn new(feed: &'a mut dyn AudioFeed) -> Self {
-        Self {
-            feed,
-            timeline: AudioTimeline::new(),
-            chunks: Vec::new(),
-            blocks: 0,
-        }
-    }
-
-    fn stats(&self) -> AudioStats {
-        AudioStats {
-            timeline: self.timeline.stats(),
-            blocks: self.blocks,
-        }
-    }
-
-    /// Take in what has arrived and write every block that is ready.
-    fn pump(&mut self, start: Instant, writer: &TakeWriter) -> Result<(), CaptureError> {
-        self.feed.poll(start, &mut self.chunks);
-        for c in self.chunks.drain(..) {
-            self.timeline.push(&c);
-        }
-        let now = start.elapsed().as_secs_f64();
-        for block in self.timeline.pump(now) {
-            writer.write_audio(&block)?;
-            self.blocks += 1;
-        }
-        Ok(())
-    }
-
-    /// Wait (briefly) for the audio to reach `end`, then write the rest of
-    /// the track through it.
-    fn finish(
-        &mut self,
-        start: Instant,
-        end: f64,
-        writer: &TakeWriter,
-    ) -> Result<(), CaptureError> {
-        let deadline = Instant::now() + AUDIO_FLUSH_TIMEOUT;
-        loop {
-            self.pump(start, writer)?;
-            if self.timeline.ready_until().is_none_or(|t| t >= end) || Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        for block in self.timeline.finish(end) {
-            writer.write_audio(&block)?;
-            self.blocks += 1;
-        }
-        Ok(())
-    }
-}
-
 /// Wait for the monitor's first frame: the number of frames that arrived,
 /// or `None` if `stop` was set first.
 fn first_frame(
@@ -278,6 +211,13 @@ fn first_frame(
             ));
         }
     }
+}
+
+/// Where the track ends: at the end of the last frame written, in seconds.
+fn end_seconds(pacer: &FramePacer) -> f64 {
+    #[allow(clippy::cast_precision_loss)] // ticks in a take: exact far past any length
+    let end = pacer.end_pts() as f64 / TICKS_PER_SECOND as f64;
+    end
 }
 
 /// How often [`TakeObserver::progress`] is called.
@@ -338,12 +278,14 @@ pub fn record_monitor(
         bitrate,
         audio.is_some(),
     )?;
-    let mut track = audio.map(AudioTrack::new);
+    let mut track = audio.map(|feed| AudioTrack::new(feed, opts.audio, path));
+    let mut write_audio = |block: &crate::timeline::AudioBlock| writer.write_audio(block);
     let mut pacer = FramePacer::new(fps);
     let start = Instant::now();
     let mut changed_since_write = true;
     observer.started();
     let mut last_progress = start;
+    let mut last_audio = start;
 
     loop {
         let elapsed = start.elapsed();
@@ -357,10 +299,15 @@ pub fn record_monitor(
                 stats.frames_repeated += 1;
             }
             changed_since_write = false;
-            continue;
+            // Frames due back to back (an encoder that can't keep up) still
+            // leave the audio its turns.
+            if last_audio.elapsed() < AUDIO_POLL {
+                continue;
+            }
         }
         if let Some(t) = track.as_mut() {
-            t.pump(start, &writer)?;
+            t.pump(start, &mut write_audio)?;
+            last_audio = Instant::now();
         }
         if last_progress.elapsed() >= PROGRESS_EVERY {
             last_progress = Instant::now();
@@ -393,15 +340,15 @@ pub fn record_monitor(
     } = screen;
     drop(capture);
     if let Some(t) = track.as_mut() {
-        // The track runs to the end of the last frame written.
-        #[allow(clippy::cast_precision_loss)] // ticks in a take: exact far past any length
-        let end = pacer.end_pts() as f64 / TICKS_PER_SECOND as f64;
-        t.finish(start, end, &writer)?;
-        stats.audio = Some(t.stats());
+        t.finish(start, end_seconds(&pacer), &mut write_audio)?;
     }
     writer.finish()?;
     drop(converter);
     drop(session);
     std::fs::rename(&part, path)?;
+    if let Some(mut t) = track {
+        t.finish_stems();
+        stats.audio = Some(t.stats());
+    }
     Ok(stats)
 }

@@ -106,6 +106,19 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # v1.53.0: the `windows` crate copies compiled in, pinned. Screen and
+      # desktop-audio capture are built on the 0.61 line Tauri already
+      # compiles (stream-studio.md); a dependency pulling in another copy
+      # — wasapi, windows-capture — must be a decision, not an accident.
+      - name: windows crate copies (allowlist)
+        shell: bash
+        run: |
+          got=$(cargo tree --workspace --all-features -e normal --target x86_64-pc-windows-msvc --prefix none --format '{p}' | grep -E '^windows v[0-9]' | sed 's/ (\*)$//' | sort -u)
+          want=$'windows v0.54.0\nwindows v0.56.0\nwindows v0.61.3'
+          if [ "$got" != "$want" ]; then
+            echo "windows crate copies changed:"; echo "$got"; exit 1
+          fi
+
       - name: cargo test
         # The `CI=true` env var is checked by audio-device tests to
         # skip cpal/WASAPI enumeration on the headless windows-2025

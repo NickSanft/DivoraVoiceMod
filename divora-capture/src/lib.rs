@@ -10,11 +10,15 @@
 //! crate's only `unsafe` scope.
 
 pub mod clock_fit;
+pub mod desktop;
+pub mod desktop_thread;
 pub mod nv12;
 pub mod pacer;
 pub mod sizing;
+pub mod stems;
 mod take;
 pub mod timeline;
+pub mod track;
 
 mod error;
 pub use error::CaptureError;
@@ -34,7 +38,12 @@ pub use take::{
 mod native;
 
 #[cfg(windows)]
-pub use native::{list_monitors, probe::capture_status, record::record_monitor};
+pub use native::{
+    list_monitors,
+    loopback::{list_playback_devices, process_loopback_available},
+    probe::capture_status,
+    record::record_monitor,
+};
 
 /// The real writer, for `tests/encoder_smoke.rs` to drive without a screen.
 /// Not part of the API: hidden, and nothing outside the tests should call it.
@@ -50,4 +59,7 @@ pub mod smoke {
 #[cfg(not(windows))]
 mod elsewhere;
 #[cfg(not(windows))]
-pub use elsewhere::{capture_status, list_monitors, record_monitor};
+pub use elsewhere::{
+    capture_status, list_monitors, list_playback_devices, process_loopback_available,
+    record_monitor,
+};

@@ -87,4 +87,15 @@ fn the_app_does_not_import_media_foundation() {
         "divora-app.exe imports Media Foundation at load time: {mf:?}. \
          Resolve it at run time in divora-capture's native::mf instead."
     );
+    // v1.53.0: desktop audio resolves `ActivateAudioInterfaceAsync`
+    // (mmdevapi.dll) and the multimedia scheduler (avrt.dll) at run time
+    // too, so the exe's imports are what they were.
+    let audio: Vec<_> = dlls
+        .iter()
+        .filter(|d| *d == "mmdevapi.dll" || *d == "avrt.dll")
+        .collect();
+    assert!(
+        audio.is_empty(),
+        "divora-app.exe imports {audio:?} at load time: resolve it at run time instead."
+    );
 }

@@ -876,6 +876,39 @@ export interface ScreenRecordingUpdate {
   /** Seconds into the take where the engine stopped, while it stays stopped. */
   audioLostAt: number | null;
   error: string | null;
+  /** v1.53.0: the desktop audio being recorded — `everything` or
+   *  `device:<id>` — and its name; null without desktop audio. */
+  desktopSourceId: string | null;
+  desktopSource: string | null;
+  /** How long the desktop audio has had nothing to hear, in seconds. */
+  desktopQuietSeconds: number | null;
+  /** The running engine's devices and monitor switches put Divora's own
+   *  voice or soundboard on the playback device being recorded, so it is
+   *  recorded twice whenever it plays — set whether or not anything is
+   *  playing right now; updated about once a second. */
+  desktopDoubled: boolean;
+  /** Seconds into the take where desktop audio stopped coming, while it
+   *  stays stopped (being retried). */
+  desktopLostAt: number | null;
+  /** Why the take has no desktop audio although it was asked for. */
+  desktopError: string | null;
+  /** Why the separate WAV files stopped (an error, or a WAV file's size
+   *  limit), never started, or couldn't be finished. */
+  stemsError: string | null;
+}
+
+/** What Divora itself plays on a playback device (v1.53.0). */
+export type DivoraPlays = "nothing" | "send" | "monitor" | "onlyOutput" | "unknown";
+
+/** A place desktop audio can be recorded from (v1.53.0). */
+export interface DesktopAudioSource {
+  /** `everything` or `device:<id>`: what `desktopAudio` takes. */
+  id: string;
+  label: string;
+  kind: "everything" | "device";
+  /** The Windows default playback device. */
+  isDefault: boolean;
+  divoraPlays: DivoraPlays;
 }
 
 export type ScreenQuality = "small" | "balanced" | "high";
@@ -889,6 +922,13 @@ export interface ScreenRecordingOptions {
   cursor?: boolean;
   /** Moves the sound against the picture; positive is later. ±500 ms. */
   avOffsetMs?: number;
+  /** v1.53.0: `everything` or `device:<id>`; absent or anything else is
+   *  no desktop audio. */
+  desktopAudio?: string;
+  /** Desktop audio's volume in dB, −30 to 0 (−6 when absent). */
+  desktopGainDb?: number;
+  /** Also save the voice and the desktop audio as separate WAV files. */
+  stems?: boolean;
 }
 
 export async function screenCaptureStatus(): Promise<CaptureStatus> {
@@ -897,6 +937,12 @@ export async function screenCaptureStatus(): Promise<CaptureStatus> {
 
 export async function listCaptureMonitors(): Promise<CaptureMonitor[]> {
   return invoke<CaptureMonitor[]>("list_capture_monitors");
+}
+
+/** v1.53.0: "Everything except Divora" where Windows can do it; otherwise
+ *  each playback device, with what Divora plays there. */
+export async function listDesktopAudioSources(): Promise<DesktopAudioSource[]> {
+  return invoke<DesktopAudioSource[]>("list_desktop_audio_sources");
 }
 
 /** Resolves with the MP4's full path once the first frame is in. */

@@ -40,7 +40,8 @@ use midi::{
 };
 use midir::MidiInputConnection;
 use screen::{
-    monitor_dtos, sanitize_fps, screen_recording_path, CaptureStatusDto, MonitorDto, Quality,
+    desktop_source_dtos, monitor_dtos, parse_desktop_source, sanitize_desktop_gain_db,
+    sanitize_fps, screen_recording_path, CaptureStatusDto, DesktopSourceDto, MonitorDto, Quality,
     ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
 
@@ -658,10 +659,32 @@ async fn list_capture_monitors() -> Result<Vec<MonitorDto>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// v1.53.0: where a screen recording's desktop audio can come from —
+/// "everything except Divora" where Windows can do that, otherwise each
+/// playback device, with what Divora itself plays there.
+#[tauri::command]
+async fn list_desktop_audio_sources(
+    state: State<'_, AppState>,
+) -> Result<Vec<DesktopSourceDto>, String> {
+    let engine = Arc::clone(&state.engine);
+    tauri::async_runtime::spawn_blocking(move || {
+        let everything = divora_capture::process_loopback_available();
+        let devices = if everything {
+            Vec::new()
+        } else {
+            divora_capture::list_playback_devices().unwrap_or_default()
+        };
+        desktop_source_dtos(everything, &devices, engine.stream_info().as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Record `monitor_id` to `recordings/<filename>` (an `.mp4`, whatever the
-/// name says) with the modulated voice and the soundboard. Resolves once the
-/// first frame is in, with the file's full path; refuses while the engine
-/// is stopped, as the WAV recorder does.
+/// name says) with the modulated voice and the soundboard — and, given
+/// `desktop_audio`, what the PC plays (v1.53.0). Resolves once the first
+/// frame is in, with the file's full path; refuses while the engine is
+/// stopped, as the WAV recorder does.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // one per field of the invoke payload
 async fn start_screen_recording(
@@ -673,6 +696,9 @@ async fn start_screen_recording(
     quality: Option<String>,
     cursor: Option<bool>,
     av_offset_ms: Option<i32>,
+    desktop_audio: Option<String>,
+    desktop_gain_db: Option<f64>,
+    stems: Option<bool>,
 ) -> Result<String, String> {
     std::fs::create_dir_all(&state.recordings_dir).map_err(|e| e.to_string())?;
     let req = StartRequest {
@@ -682,6 +708,9 @@ async fn start_screen_recording(
         quality: Quality::parse(quality.as_deref()),
         cursor: cursor.unwrap_or(true),
         av_offset_ms: av_offset_ms.unwrap_or(0),
+        desktop: parse_desktop_source(desktop_audio.as_deref()),
+        desktop_gain_db: sanitize_desktop_gain_db(desktop_gain_db),
+        stems: stems.unwrap_or(false),
     };
     let recorder = Arc::clone(&state.screen);
     let engine = Arc::clone(&state.engine);
@@ -2570,6 +2599,7 @@ pub fn run() {
             start_recording,
             stop_recording,
             screen_capture_status,
+            list_desktop_audio_sources,
             list_capture_monitors,
             start_screen_recording,
             stop_screen_recording,

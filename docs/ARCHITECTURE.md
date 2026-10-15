@@ -1299,7 +1299,9 @@ desktop: see "Stream overlay" in [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
 ## Screen recording (v1.52.0)
 
 One monitor to an MP4 — H.264 High plus AAC-LC 48 kHz stereo 192 kbps — with
-the modulated voice and the soundboard. The plan, the encoder ladder and what
+the modulated voice and the soundboard, and since v1.53.0 what the PC plays
+(on for a fresh install where Everything except Divora is offered; otherwise, and
+after an upgrade, off until a source is picked on the card). The plan, the encoder ladder and what
 comes next are in [`research/stream-studio.md`](research/stream-studio.md).
 
 ### Crates
@@ -1311,7 +1313,8 @@ comes next are in [`research/stream-studio.md`](research/stream-studio.md).
   touches COM is under `native/`, the crate's only `unsafe` scope, and off
   Windows `elsewhere.rs` reports "unavailable" through the same API.
 - **`divora-core`** gains the tap (`audio/av_tap.rs`) and nothing else that
-  knows about recording.
+  knows about recording — and, in v1.53.0, `AudioEngine::stream_info`, the
+  live session's devices, for the desktop-audio guard.
 - **`src-tauri`** gains `screen.rs`: `ScreenRecorder` in `AppState`, the
   commands, the `screen-recording` event, and `EngineFeed`, which turns the
   tap's chunks into the capture crate's.
@@ -1387,6 +1390,105 @@ A sample with no audio is written as silence once it is a second old, so the
 track never stalls the file; at the end the timeline waits up to 1.5 s for the
 audio to catch up to the last frame.
 
+### Desktop audio (v1.53.0)
+
+What the PC plays, mixed into the same AAC track. Two sources, one loop:
+
+- **Everything except Divora** — *process loopback*
+  (`ActivateAudioInterfaceAsync`, `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`
+  on Divora's own PID): every other process's audio, on whichever device it
+  plays, without Divora's voice, soundboard or monitor — or anything Divora
+  started — except on a device loopback can't hear: on the development PC,
+  the default Realtek USB speakers (which have a vendor virtual mixer) were
+  silent to both loopbacks. Whenever another app opens or closes a stream on
+  a device, Windows skips about 15 ms of that device's sound and then sends
+  30 ms of zeros (measured with a tone playing throughout on the same device;
+  endpoint loopback had the tone whole; other devices untested), which the
+  timeline counts as a gap.
+  Offered only after a trial activation works (and Windows 10 2004,
+  `UniversalApiContract` 10, or later).
+- **One playback device** — *endpoint loopback*, `device:<id>`: everything
+  that device plays, Divora included. Offered where process loopback isn't.
+
+Both are hand-written in `divora-capture` (`native/loopback.rs`) on the same
+`windows` 0.61 the crate already uses, and ask Windows for the same thing:
+48 kHz float stereo, converted from whatever the device runs at.
+`ActivateAudioInterfaceAsync` is resolved at run time like Media Foundation,
+so the exe gains no mmdevapi.dll import; its parameters live in a heap blob
+owned by the `#[implement]` completion handler — never dropped as a
+`PROPVARIANT`, whose `Drop` in windows 0.61 would hand them to
+`CoTaskMemFree`.
+
+```
+divora-loopback thread (MTA COM; while a stream is open, registered with the
+  │  multimedia scheduler's "Audio" task — avrt.dll resolved at run time — or at
+  │  HIGHEST priority where that fails)
+  desktop_thread::run — open, report, pump, reopen on loss (backoff 1 s → 30 s;
+  │  a hung activation is not retried, and says so: the card then shows a
+  │  final error, not "trying again"); generic over PacketSource/Opener so
+  │  CI drives it with scripted devices; a playback device's first packet
+  │  after a quiet wait is marked as a resume (silence before it, not loss)
+  ├─ wait ≤ 20 ms on the stream's event; every wake: GetNextPacketSize
+  │   (where a dead stream reports), ≤ 64 packets; a playback device that
+  │   timed out is asked GetCurrentPadding (an idle device sends nothing);
+  │   process loopback that sends no packet for 1 s is treated as lost (on
+  │   Windows 11 26200 it sends one every 10 ms, even in silence)
+  └─ per packet: packet_time (the packet's QPC on the Instant clock, from one
+      anchor pair; arrival − length if flagged or > 1 s off) → DesktopTap::ingest
+      (preallocated rings, all or nothing, no allocation — tested) → ReleaseBuffer
+recording thread: AudioTrack (track.rs) polls the engine and the desktop,
+  pushes both before asking the timeline what is ready
+```
+
+In `AudioTimeline` each source has its own lanes (`Lane<C>`, the resampling
+half of v1.52.0's epoch, made generic over channels): the engine's epochs as
+before, and desktop **runs**. A packet continues the open run only if it
+lands within 7.5 ms of the run's line (40 ms for one Windows could not time);
+anything else — a lost packet, an idle device coming back, a flagged break, a
+reopened device — starts a run on a line of its own, never a step bridged
+across the gap. A run's first three packets set where it sits rather than
+vote on it, and no resampler starts on a run until they have — or the
+recorder, pumping between packets, would glide after a moving line. Every
+run that reaches an output frame is summed, so where one
+ends and the next begins with nothing lost there is no seam. A frame is
+written once each source has delivered it or is overdue (the engine after
+1 s, the desktop after 0.25 s — an idle device sends nothing), and only then
+is the silence counted.
+
+With desktop audio the track is stereo: the voice and soundboard in the
+middle, the desktop at its volume around it, through a soft knee above
+−3 dBFS. Without it, the track is v1.52.0's to the bit — pinned by
+fingerprints taken from v1.52.0's own code.
+
+Opt-in **stems** (`stems.rs`): `.voice.wav`, and `.desktop.wav` when the take
+has desktop audio, 48 kHz float, the very frames the track is mixed from. The
+MP4 has no edit list. Over five takes (three short, two of 30 minutes), 79 of
+80 soundboard stings were measured at the same sample in its decoded audio as
+in the voice stem, and the other one sample apart (in the 30-minute take
+before the code review's fixes); on each take the stems were the same length
+as the decoded audio, to the sample. Past a WAV file's size limit (about 3.1
+hours with desktop audio, 6.2 without) they stop, `stemsError` says where, and
+the video goes on.
+
+The **doubling guard** for playback devices (`screen.rs`): what Divora plays
+on each device — `send`, `monitor`, `onlyOutput`, `nothing`, `unknown` — from
+the engine's routing (`AudioEngine::stream_info`, kept by the engine thread),
+matched by device name, the engine's own notion of identity. A device Divora
+sends your voice to when a take starts is not recorded. During the take the
+desktop feed (`EngineFeed`) reads the engine's routing each time it takes in
+desktop audio — every pump, about every 20 ms — and while the recorded device
+is one Divora sends your voice to, what it takes in goes in as silence;
+`desktopError` says why, updated with the card once a second. The engine
+publishes its routing just after its streams start, before a voice could come
+back through loopback, so none of it should get in. Measured: with Divora's
+output moved onto the recorded device mid-take and back, the device's clicks
+(one a second) were left out between the switches and kept before and after,
+and Divora's stings there were exactly 0; the switch times are known only to
+the second, and that nothing slips through in the first milliseconds is
+reasoned, not measured. On the
+others the card warns before the take, and `desktopDoubled` reports when the
+running engine's monitor switches put Divora's sound there during it.
+
 ### Tests
 
 - Pure: `FramePacer` (no drift over an hour), `ClockFit` (+80 ppm through ±5 ms
@@ -1395,6 +1497,19 @@ audio to catch up to the last frame.
   on their own time, a jittery wait that must not move a speaking voice — each
   rule mutation-checked), the NV12 converter against the BT.709 reference
   values, the recorder's phase table, filename sanitising and the wire keys.
+- Desktop audio (v1.53.0): the timeline's desktop runs (on time in stereo, no
+  channel swap, both sources on their own drifting clocks over five minutes,
+  idle stretches, a lost packet, a device's odd first stamp, untimed packets
+  with a hole, a flagged break with no seam, neither source holding back the
+  other past its own wait (the desktop 0.25 s, the engine 1 s), waited frames
+  counted once, the soft knee, gain, stems equal to the
+  track's own sources), voice-only takes pinned to v1.52.0's output, the
+  capture loop against scripted devices (`desktop_thread`), the tap measured
+  allocation-free (`tests/desktop_tap_allocations.rs`), the stems written and
+  read back, the doubling table, and the wire keys. Locally:
+  `tests/desktop_capture.rs` (real process and device loopback) and
+  `tests/desktop_self_tone.rs`, which plays an inaudible tone from the test
+  process and checks "everything except Divora" does not hear it.
 - `divora-capture/tests/encoder_smoke.rs`: the real writer, memory-input mode,
   to whatever software H.264/AAC encoder Windows has, read back box by box —
   returning early on a machine without Media Foundation or an encoder. Its

@@ -163,6 +163,21 @@ fn the_software_writer_makes_a_readable_mp4() {
         (seconds - 1.5).abs() < 0.1,
         "45 frames at 30 fps lasted {seconds:.3} s"
     );
+    // v1.53.0: whether each track starts with an edit list — what decides
+    // if players skip the AAC encoder's priming, and so whether the MP4's
+    // audio lines up with the separate WAV files. Reported, not asserted:
+    // the alignment itself is measured on the decoded file (MANUAL_TESTS).
+    for (k, (_, trak)) in children.iter().filter(|(k, _)| k == b"trak").enumerate() {
+        let edits = boxes(trak)
+            .into_iter()
+            .find(|(k, _)| k == b"edts")
+            .and_then(|(_, edts)| boxes(edts).into_iter().find(|(k, _)| k == b"elst"))
+            .map_or_else(
+                || "no edit list".to_string(),
+                |(_, elst)| format!("edit list {:02x?}", &elst[..elst.len().min(24)]),
+            );
+        say(&format!("track {k}: {edits}"));
+    }
     say(&format!(
         "encoded {} bytes: {} track(s), {seconds:.3} s{}",
         bytes.len(),

@@ -14,6 +14,11 @@ workspace = true
 [dependencies]
 thiserror = "1"
 tracing = "0.1"
+# v1.53.0: both already in the lock through divora-core (no new versions).
+# ringbuf carries desktop audio from the loopback thread without allocating;
+# hound writes the optional per-source WAV stems.
+ringbuf = "0.4"
+hound = "3"
 
 # v1.52.0: the `windows` crate at the 0.61 line Tauri already compiles
 # (tauri/tao/wry/webview2-com pin 0.61.3), so this adds no new copy — only
@@ -21,7 +26,14 @@ tracing = "0.1"
 # these bindings: windows-link emits load-time (raw-dylib) imports, which
 # would stop the app launching on Windows N editions that ship without
 # Media Foundation. They are resolved at run time in `native::mf` instead.
+#
+# v1.53.0 adds the core-audio features for desktop audio (process and
+# endpoint loopback). `ActivateAudioInterfaceAsync` is likewise resolved at
+# run time (`native::loopback`), so the exe gains no mmdevapi.dll import.
+# `windows-core` is named directly only because `#[implement]` expands to
+# `::windows_core` paths; 0.61.2 is already in the lock.
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.61"
 windows = { version = "0.61", features = [
     "Foundation",
     "Foundation_Metadata",
@@ -35,10 +47,17 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
+    "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Shell_PropertiesSystem",
 ] }

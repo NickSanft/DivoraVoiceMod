@@ -64,6 +64,13 @@ import {
   setVoiceReadingEnabled,
   unregisterAllGlobalShortcuts,
   unregisterGlobalShortcut,
+  screenCaptureStatus,
+  listCaptureMonitors,
+  listDesktopAudioSources,
+  startScreenRecording,
+  stopScreenRecording,
+  screenRecordingStatus,
+  subscribeScreenRecording,
 } from "./api";
 
 describe("audio api", () => {
@@ -808,5 +815,58 @@ describe("resamplingSummary / resamplingLegs (v1.51.2)", () => {
     expect(resamplingSummary(stale as unknown as typeof base)).toBeNull();
     expect(resamplingSummary({ ...base, outputRate: 0 })).toBeNull();
     expect(resamplingSummary({ ...base, outputRate: Number.NaN })).toBeNull();
+  });
+});
+
+describe("screen recording api (v1.52.0, v1.53.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+  });
+
+  it("each wrapper invokes its command by its frozen name", async () => {
+    invokeMock.mockResolvedValue(null);
+    await screenCaptureStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("screen_capture_status");
+    await listCaptureMonitors();
+    expect(invokeMock).toHaveBeenLastCalledWith("list_capture_monitors");
+    await listDesktopAudioSources();
+    expect(invokeMock).toHaveBeenLastCalledWith("list_desktop_audio_sources");
+    await stopScreenRecording();
+    expect(invokeMock).toHaveBeenLastCalledWith("stop_screen_recording");
+    await screenRecordingStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("screen_recording_status");
+  });
+
+  it("startScreenRecording passes every option flat, under its own key", async () => {
+    invokeMock.mockResolvedValueOnce("C:/rec/x.mp4");
+    await startScreenRecording({
+      monitorId: "m",
+      filename: "x.mp4",
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      avOffsetMs: 10,
+      desktopAudio: "everything",
+      desktopGainDb: -12,
+      stems: true,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("start_screen_recording", {
+      monitorId: "m",
+      filename: "x.mp4",
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      avOffsetMs: 10,
+      desktopAudio: "everything",
+      desktopGainDb: -12,
+      stems: true,
+    });
+  });
+
+  it("subscribeScreenRecording listens to the screen-recording event", async () => {
+    listenMock.mockResolvedValueOnce(() => {});
+    await subscribeScreenRecording(() => {});
+    expect(listenMock).toHaveBeenCalledWith("screen-recording", expect.any(Function));
   });
 });

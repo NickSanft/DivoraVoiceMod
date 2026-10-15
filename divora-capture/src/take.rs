@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::timeline::{AudioChunk, TimelineStats};
+use crate::stems::StemStats;
+use crate::timeline::{AudioChunk, DesktopChunk, TimelineStats, TrackOptions};
 
 /// A monitor that can be recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,10 @@ pub struct RecordOptions {
     pub bitrate: Option<u32>,
     /// Draw the mouse pointer into the recording.
     pub cursor: bool,
+    /// What the audio track is made of (v1.53.0): desktop audio and its
+    /// volume, and whether each source is also saved on its own. The
+    /// default is v1.52.0's track.
+    pub audio: TrackOptions,
 }
 
 impl Default for RecordOptions {
@@ -52,6 +57,7 @@ impl Default for RecordOptions {
             max_size: crate::sizing::DEFAULT_MAX,
             bitrate: None,
             cursor: true,
+            audio: TrackOptions::default(),
         }
     }
 }
@@ -62,6 +68,10 @@ pub struct AudioStats {
     pub timeline: TimelineStats,
     /// 1024-frame blocks written.
     pub blocks: u64,
+    /// The separate WAV files, once finished.
+    pub stems: Option<StemStats>,
+    /// Why the separate WAV files stopped, or were never started.
+    pub stems_error: Option<String>,
 }
 
 /// What happened during a take.
@@ -93,6 +103,10 @@ pub trait AudioFeed {
     /// [`AudioChunk::at`] measured from `start` — the instant the take's
     /// first frame is stamped 0 (see [`seconds_since`]).
     fn poll(&mut self, start: Instant, out: &mut Vec<AudioChunk>);
+
+    /// The same for desktop audio, on the same clock. A feed without any
+    /// has nothing to add.
+    fn poll_desktop(&mut self, _start: Instant, _out: &mut Vec<DesktopChunk>) {}
 }
 
 /// Told how a take is going, from the recording thread.

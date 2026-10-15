@@ -50,7 +50,11 @@ import type {
 } from "../types";
 
 import { acceleratorToKeys, keysToAccelerator } from "../data/hotkeys";
-import { MAX_AV_OFFSET_MS } from "../data/screenRecording";
+import {
+  MAX_AV_OFFSET_MS,
+  MAX_DESKTOP_GAIN_DB,
+  MIN_DESKTOP_GAIN_DB,
+} from "../data/screenRecording";
 import type { ScreenQuality } from "../audio/api";
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
@@ -757,6 +761,33 @@ function ScreenRecordingRows(): JSX.Element {
           onChange={(v) => app.setScreenSettings({ cursor: v })}
         />
       </Row>
+      <Row label={`Desktop audio volume · ${s().desktopGainDb} dB`}>
+        <div style={{ width: "220px" }} data-testid="desktop-audio-volume">
+          <Slider
+            value={s().desktopGainDb}
+            min={MIN_DESKTOP_GAIN_DB}
+            max={MAX_DESKTOP_GAIN_DB}
+            step={1}
+            ariaLabel="Desktop audio volume in decibels"
+            onChange={(v) => app.setScreenSettings({ desktopGainDb: v })}
+          />
+        </div>
+      </Row>
+      <Row label="Also save separate audio files">
+        <Toggle
+          on={s().stems}
+          ariaLabel="Also save your voice and the desktop audio as separate WAV files"
+          onChange={(v) => app.setScreenSettings({ stems: v })}
+        />
+      </Row>
+      <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
+        Desktop audio — what your other apps play — is picked on the Record screen card. Its
+        volume applies from the next recording and turns down the desktop audio in the video's
+        sound only — not your voice, and not the separate desktop file, which keeps its full
+        level; the default, −6 dB, puts it in the video at about half its level. Separate files put your
+        voice and soundboard, and any desktop audio, in 48 kHz WAV files beside the video, for
+        editing — about 35 MB a minute with desktop audio, about 12 MB without.
+      </div>
       <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
         Screens bigger than 2560×1440 are scaled down to fit, keeping their shape.
         Windows' own encoders do the work — a graphics card's when Windows offers one.

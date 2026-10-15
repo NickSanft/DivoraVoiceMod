@@ -4,6 +4,7 @@
 
 pub mod d3d;
 pub mod encoder;
+pub mod loopback;
 pub mod mf;
 pub mod probe;
 pub mod record;

@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use crate::desktop::PlaybackDevice;
 use crate::take::{
     AudioFeed, CaptureStatus, MonitorInfo, RecordOptions, RecordStats, TakeObserver,
 };
@@ -26,6 +27,15 @@ pub fn capture_status() -> CaptureStatus {
 #[must_use]
 pub fn list_monitors() -> Vec<MonitorInfo> {
     Vec::new()
+}
+
+#[must_use]
+pub fn process_loopback_available() -> bool {
+    false
+}
+
+pub fn list_playback_devices() -> Result<Vec<PlaybackDevice>, CaptureError> {
+    Ok(Vec::new())
 }
 
 /// Always fails: there is no capture API here.

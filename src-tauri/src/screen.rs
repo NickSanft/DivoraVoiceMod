@@ -1,9 +1,11 @@
-//! v1.52.0: recording the screen with your voice.
+//! v1.52.0: recording the screen with your voice. v1.53.0: and with what
+//! the PC plays.
 //!
 //! [`ScreenRecorder`] lives in `AppState` and outlives every engine session.
 //! A take runs on its own `divora-encoder` thread (`divora_capture` does the
-//! capturing and encoding); its audio comes from the engine's tap through
-//! [`EngineFeed`], and how it goes is reported as `screen-recording` events.
+//! capturing and encoding); its audio comes from the engine's tap — and,
+//! when asked, from Windows' desktop audio — through [`EngineFeed`], and how
+//! it goes is reported as `screen-recording` events.
 //!
 //! The take's phase moves Idle → Starting → Recording → Stopping → Idle, and
 //! nothing else: [`Phase::next`] is the whole table, and the tests pin it.
@@ -14,12 +16,15 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use divora_capture::desktop::{
+    DesktopCapture, DesktopDrain, DesktopSource, OpenedSource, PlaybackDevice,
+};
 use divora_capture::sizing::{default_bitrate, output_size, DEFAULT_MAX};
-use divora_capture::timeline::AudioChunk;
+use divora_capture::timeline::{AudioChunk, DesktopChunk, TrackOptions};
 use divora_capture::{
     seconds_since, AudioFeed, CaptureStatus, MonitorInfo, RecordOptions, RecordStats, TakeObserver,
 };
-use divora_core::audio::{AudioEngine, AvChunk};
+use divora_core::audio::{AudioEngine, AvChunk, StreamInfo};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -98,10 +103,34 @@ pub struct ScreenRecordingUpdate {
     /// The audio clock against the video's, in ppm (0 until measured).
     pub drift_ppm: f64,
     /// Seconds into the take at which the engine stopped, while it stays
-    /// stopped: from there the take's audio is silence.
+    /// stopped: from there the voice and soundboard are silence (desktop
+    /// audio, if any, goes on).
     pub audio_lost_at: Option<f64>,
     /// Why the take ended, when it ended badly.
     pub error: Option<String>,
+    /// v1.53.0: the desktop audio being recorded — `everything` or
+    /// `device:<id>` — and its name; `None` without desktop audio.
+    pub desktop_source_id: Option<String>,
+    pub desktop_source: Option<String>,
+    /// How long the desktop audio has had nothing to hear, in seconds.
+    pub desktop_quiet_seconds: Option<f64>,
+    /// The running engine's devices and monitor switches put Divora's own
+    /// voice or soundboard on the playback device being recorded, so it is
+    /// recorded twice whenever it plays — set whether or not anything is
+    /// playing right now; updated about once a second.
+    pub desktop_doubled: bool,
+    /// Seconds into the take at which desktop audio stopped coming, while it
+    /// stays stopped and is being reopened (a playback device that went
+    /// away, say, or Everything except Divora sending nothing for a second).
+    pub desktop_lost_at: Option<f64>,
+    /// Why the take has no desktop audio although it was asked for — from
+    /// the start, from when it stopped for good, or while the device
+    /// recorded carries your voice to the call (taken back when it no
+    /// longer does).
+    pub desktop_error: Option<String>,
+    /// Why the separate WAV files stopped (an error, or a WAV file's size
+    /// limit), never started, or couldn't be finished.
+    pub stems_error: Option<String>,
 }
 
 /// Payload of `screen_capture_status`.
@@ -221,6 +250,243 @@ pub fn screen_recording_path(dir: &Path, filename: &str) -> PathBuf {
 /// The A/V offset the user may set, in milliseconds either way.
 pub const MAX_AV_OFFSET_MS: i32 = 500;
 
+/// Desktop audio's volume in a take, in dB: −6 by default, which halves its
+/// amplitude before it is mixed with your voice; never above as captured.
+pub const DEFAULT_DESKTOP_GAIN_DB: f32 = -6.0;
+pub const MIN_DESKTOP_GAIN_DB: f32 = -30.0;
+pub const MAX_DESKTOP_GAIN_DB: f32 = 0.0;
+
+/// The desktop volume asked for, in range; anything that isn't a number is
+/// the default.
+#[must_use]
+pub fn sanitize_desktop_gain_db(db: Option<f64>) -> f32 {
+    match db {
+        #[allow(clippy::cast_possible_truncation)] // clamped to a few tens of dB
+        Some(v) if v.is_finite() => (v as f32).clamp(MIN_DESKTOP_GAIN_DB, MAX_DESKTOP_GAIN_DB),
+        _ => DEFAULT_DESKTOP_GAIN_DB,
+    }
+}
+
+/// The source id for "everything except Divora".
+pub const EVERYTHING_ID: &str = "everything";
+/// The prefix of a playback device's source id.
+pub const DEVICE_PREFIX: &str = "device:";
+
+/// The desktop audio asked for: `everything`, `device:<endpoint id>`, or —
+/// for anything else, absent and `off` included — none, as in v1.52.0.
+#[must_use]
+pub fn parse_desktop_source(s: Option<&str>) -> Option<DesktopSource> {
+    match s? {
+        EVERYTHING_ID => Some(DesktopSource::Everything),
+        other => other
+            .strip_prefix(DEVICE_PREFIX)
+            .filter(|id| !id.is_empty())
+            .map(|id| DesktopSource::Device(id.to_string())),
+    }
+}
+
+/// What Divora itself plays on a playback device — which decides whether
+/// recording that device records your voice twice. Process loopback
+/// ("everything") never has this problem: it leaves Divora out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DivoraPlays {
+    /// Nothing of Divora's plays there.
+    Nothing,
+    /// It is where Divora sends your voice, with a separate device to hear
+    /// yourself on: your voice and soundboard always play there.
+    Send,
+    /// It is the device you hear yourself on: your voice plays there while
+    /// Monitor is on, the soundboard while its own monitor is.
+    Monitor,
+    /// It is Divora's only output: your voice and soundboard play there
+    /// while Monitor is on (off silences it entirely).
+    OnlyOutput,
+    /// Can't tell: the engine is stopped, or its device names match no
+    /// device here.
+    Unknown,
+}
+
+/// What Divora plays on the playback device `id`, given the devices there
+/// are and the engine's routing. The engine knows its devices by name — the
+/// name Windows shows — so a name shared by two devices counts as both.
+#[must_use]
+pub fn divora_plays(
+    id: &str,
+    devices: &[PlaybackDevice],
+    routing: Option<&StreamInfo>,
+) -> DivoraPlays {
+    let Some(r) = routing else {
+        return DivoraPlays::Unknown;
+    };
+    let named = |name: &str| -> Vec<&str> {
+        devices
+            .iter()
+            .filter(|d| d.name == name)
+            .map(|d| d.id.as_str())
+            .collect()
+    };
+    // Each role from its own match: a monitor device that has gone away must
+    // not hide the device the voice is sent to.
+    let output = named(&r.output_name);
+    let monitor = r.monitor_name.as_deref().map(named);
+    if output.contains(&id) {
+        return if r.monitor_name.is_some() {
+            DivoraPlays::Send
+        } else {
+            DivoraPlays::OnlyOutput
+        };
+    }
+    if monitor.as_ref().is_some_and(|m| m.contains(&id)) {
+        return DivoraPlays::Monitor;
+    }
+    if output.is_empty() || monitor.as_ref().is_some_and(Vec::is_empty) {
+        return DivoraPlays::Unknown;
+    }
+    DivoraPlays::Nothing
+}
+
+/// What Divora plays on the device it is recording, named `name` — by the
+/// engine's own notion of a device, its name — or `Unknown` with no engine.
+#[must_use]
+pub fn device_role(name: &str, routing: Option<&StreamInfo>) -> DivoraPlays {
+    let Some(r) = routing else {
+        return DivoraPlays::Unknown;
+    };
+    if name == r.output_name {
+        if r.monitor_name.is_some() {
+            DivoraPlays::Send
+        } else {
+            DivoraPlays::OnlyOutput
+        }
+    } else if r.monitor_name.as_deref() == Some(name) {
+        DivoraPlays::Monitor
+    } else {
+        DivoraPlays::Nothing
+    }
+}
+
+/// Why a device Divora sends your voice to isn't recorded.
+fn sends_your_voice(label: &str) -> String {
+    format!(
+        "Divora sends your voice to {label}, so recording it would record your voice twice \u{2014} pick another device."
+    )
+}
+
+/// `0:07`, `12:34`, `1:02:03`, as the card writes times.
+#[must_use]
+pub fn clock(seconds: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a take's length
+    let total = seconds.max(0.0).floor() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Whether a device Divora plays on as `role` has Divora's sound on it right
+/// now, given whether the engine runs and its monitor switches.
+#[must_use]
+pub fn doubles_now(
+    role: DivoraPlays,
+    running: bool,
+    monitor: bool,
+    speak_monitor: bool,
+    monitor_gain: f32,
+) -> bool {
+    // A stopped engine plays nothing anywhere.
+    if !running {
+        return false;
+    }
+    match role {
+        DivoraPlays::Send => true,
+        DivoraPlays::OnlyOutput => monitor,
+        DivoraPlays::Monitor => monitor_gain > 0.0 && (monitor || speak_monitor),
+        DivoraPlays::Nothing | DivoraPlays::Unknown => false,
+    }
+}
+
+/// One entry of `list_desktop_audio_sources`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSourceDto {
+    /// `everything` or `device:<endpoint id>`: what `start_screen_recording`
+    /// takes as `desktopAudio`.
+    pub id: String,
+    pub label: String,
+    /// `everything` or `device`.
+    pub kind: &'static str,
+    /// The Windows default playback device.
+    pub is_default: bool,
+    pub divora_plays: DivoraPlays,
+}
+
+/// The desktop audio sources to offer: "everything except Divora" where
+/// Windows can do it — it already covers every device, and leaves Divora
+/// out — and otherwise each playback device, with what Divora plays there.
+#[must_use]
+pub fn desktop_source_dtos(
+    everything: bool,
+    devices: &[PlaybackDevice],
+    routing: Option<&StreamInfo>,
+) -> Vec<DesktopSourceDto> {
+    if everything {
+        return vec![DesktopSourceDto {
+            id: EVERYTHING_ID.to_string(),
+            label: EVERYTHING_LABEL.to_string(),
+            kind: "everything",
+            is_default: false,
+            divora_plays: DivoraPlays::Nothing,
+        }];
+    }
+    devices
+        .iter()
+        .map(|d| DesktopSourceDto {
+            id: format!("{DEVICE_PREFIX}{}", d.id),
+            label: d.name.clone(),
+            kind: "device",
+            is_default: d.is_default,
+            divora_plays: divora_plays(&d.id, devices, routing),
+        })
+        .collect()
+}
+
+/// Whether the recorded playback device carries your voice to the call, as
+/// the engine's routing changes. A pure step, so it is tested without an
+/// engine.
+#[derive(Debug)]
+pub struct SendGuard {
+    name: String,
+    routing: Option<(String, Option<String>)>,
+}
+
+impl SendGuard {
+    #[must_use]
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            routing: None,
+        }
+    }
+
+    /// `Some(sends)` when the routing differs from the last one seen; `None`
+    /// when it is unchanged or the engine is stopped (the last answer stands).
+    pub fn check(&mut self, routing: Option<&StreamInfo>) -> Option<bool> {
+        let r = routing?;
+        let key = (r.output_name.clone(), r.monitor_name.clone());
+        if self.routing.as_ref() == Some(&key) {
+            return None;
+        }
+        self.routing = Some(key);
+        Some(device_role(&self.name, Some(r)) == DivoraPlays::Send)
+    }
+}
+
+/// What "everything except Divora" is called on the card.
+pub const EVERYTHING_LABEL: &str = "Everything except Divora";
+
 /// What `start_screen_recording` was asked for.
 #[derive(Debug, Clone)]
 pub struct StartRequest {
@@ -231,13 +497,31 @@ pub struct StartRequest {
     pub cursor: bool,
     /// Added to every audio timestamp: positive moves the sound later.
     pub av_offset_ms: i32,
+    /// v1.53.0: desktop audio to mix in, if any, at this volume (dB).
+    pub desktop: Option<DesktopSource>,
+    pub desktop_gain_db: f32,
+    /// Also save the voice and the desktop audio as separate WAV files.
+    pub stems: bool,
 }
 
 /// The engine's tap, as the capture crate wants it: each [`AvChunk`] timed
-/// against the take's start, its voice delay worked out.
+/// against the take's start, its voice delay worked out. With desktop
+/// audio, Windows' packets too, on the same clock and with the same A/V
+/// offset — so the offset moves all the sound against the picture, never
+/// one source against another.
 pub struct EngineFeed {
     rx: Receiver<AvChunk>,
     offset: f64,
+    desktop: Option<DesktopDrain>,
+    /// For a playback device: the engine whose routing decides whether the
+    /// device carries your voice to the call.
+    guard: Option<(Arc<AudioEngine>, SendGuard)>,
+    /// Set while the recorded device carries Divora's voice to the call:
+    /// its packets go in as silence (timed as ever) until it no longer does.
+    desktop_mute: Arc<AtomicBool>,
+    /// Held so the capture runs for as long as the take; dropped (and so
+    /// stopped) with the feed.
+    capture: Option<DesktopCapture>,
 }
 
 impl EngineFeed {
@@ -247,7 +531,47 @@ impl EngineFeed {
         Self {
             rx,
             offset: f64::from(ms) / 1000.0,
+            desktop: None,
+            guard: None,
+            desktop_mute: Arc::new(AtomicBool::new(false)),
+            capture: None,
         }
+    }
+
+    /// Watch the engine's routing for the playback device named `name`:
+    /// whenever Divora sends your voice there, its packets go in as silence.
+    /// Checked every time desktop audio is taken in, so a change of devices
+    /// mid-take lets through at most what arrived before it.
+    #[must_use]
+    pub fn guard_device(mut self, engine: Arc<AudioEngine>, name: String) -> Self {
+        self.guard = Some((engine, SendGuard::new(name)));
+        self
+    }
+
+    /// The flag that silences the desktop audio, for whoever watches the
+    /// engine's routing during the take.
+    #[must_use]
+    pub fn desktop_mute(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.desktop_mute)
+    }
+
+    /// Add desktop audio from `drain`, keeping `capture` alive with it.
+    #[must_use]
+    pub fn with_desktop(mut self, drain: DesktopDrain, capture: Option<DesktopCapture>) -> Self {
+        self.desktop = Some(drain);
+        self.capture = capture;
+        self
+    }
+
+    /// What the desktop capture saw, for the log.
+    fn desktop_report(&self) -> Option<String> {
+        let d = self.desktop.as_ref()?;
+        let (packets, untimed) = d.packets();
+        Some(format!(
+            "{packets} packets ({untimed} untimed), {} frames dropped, stamp lag {:?}",
+            d.dropped_frames(),
+            d.stamp_lag()
+        ))
     }
 }
 
@@ -255,6 +579,23 @@ impl AudioFeed for EngineFeed {
     fn poll(&mut self, start: Instant, out: &mut Vec<AudioChunk>) {
         while let Ok(c) = self.rx.try_recv() {
             out.push(to_audio_chunk(c, start, self.offset));
+        }
+    }
+
+    fn poll_desktop(&mut self, start: Instant, out: &mut Vec<DesktopChunk>) {
+        if let Some((engine, guard)) = self.guard.as_mut() {
+            if let Some(send) = guard.check(engine.stream_info().as_ref()) {
+                self.desktop_mute.store(send, Ordering::Release);
+            }
+        }
+        if let Some(d) = self.desktop.as_mut() {
+            let first = out.len();
+            d.drain(start, self.offset, out);
+            if self.desktop_mute.load(Ordering::Acquire) {
+                for c in &mut out[first..] {
+                    c.frames.fill(0.0);
+                }
+            }
         }
     }
 }
@@ -368,6 +709,19 @@ impl ScreenRecorder {
             return refuse(ENGINE_STOPPED.to_string());
         }
 
+        // Desktop audio, if asked for. Opened here, before the take's own
+        // thread, so its time to open never counts against the first frame;
+        // and never a reason to fail the take — without it, the take goes on
+        // as v1.52.0 recorded it, saying why.
+        let desktop = req.desktop.as_ref().map(|s| open_desktop(s, engine));
+        if let Some(d) = &desktop {
+            let mut s = self.lock();
+            s.last.desktop_source_id.clone_from(&d.id);
+            s.last.desktop_source.clone_from(&d.label);
+            s.last.desktop_error.clone_from(&d.error);
+            emit(app, &s.last);
+        }
+        let opened = desktop.as_ref().is_some_and(|d| d.capture.is_some());
         let opts = RecordOptions {
             fps: req.fps,
             max_size: DEFAULT_MAX,
@@ -376,6 +730,10 @@ impl ScreenRecorder {
                     .bitrate((monitor.width, monitor.height), req.fps),
             ),
             cursor: req.cursor,
+            audio: TrackOptions {
+                desktop_gain_db: opened.then_some(req.desktop_gain_db),
+                stems: req.stems,
+            },
         };
         let (start_tx, start_rx) = channel::<Result<(), String>>();
         let path = req.path.clone();
@@ -386,6 +744,7 @@ impl ScreenRecorder {
             req,
             opts,
             rx,
+            desktop,
             stop,
             start_tx,
             take,
@@ -472,21 +831,82 @@ impl ScreenRecorder {
         s.phase = s.phase.next(Input::Finished).unwrap_or(Phase::Idle);
         s.stop = None;
         let error = outcome.as_ref().err().cloned();
+        let audio = stats.and_then(|st| st.audio.as_ref());
         s.last = ScreenRecordingUpdate {
             state: s.phase,
             path: s.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             elapsed_ms: s.last.elapsed_ms,
             dropped_frames: stats.map_or(s.last.dropped_frames, |st| st.frames_dropped),
-            drift_ppm: stats
-                .and_then(|st| st.audio.as_ref())
-                .map_or(s.last.drift_ppm, |a| a.timeline.drift_ppm),
+            drift_ppm: audio.map_or(s.last.drift_ppm, |a| a.timeline.drift_ppm),
             audio_lost_at: s.last.audio_lost_at,
             error,
+            desktop_source_id: s.last.desktop_source_id.take(),
+            desktop_source: s.last.desktop_source.take(),
+            desktop_quiet_seconds: audio.map_or(s.last.desktop_quiet_seconds, |a| {
+                a.timeline.desktop_quiet_seconds
+            }),
+            desktop_doubled: false,
+            desktop_lost_at: s.last.desktop_lost_at,
+            desktop_error: s.last.desktop_error.take(),
+            stems_error: audio
+                .and_then(|a| a.stems_error.clone())
+                .or_else(|| s.last.stems_error.take()),
         };
         s.outcome = Some(outcome);
         emit(app, &s.last);
         drop(s);
         self.changed.notify_all();
+    }
+}
+
+/// A take's desktop audio, as opened: the capture, what it is, what Divora
+/// plays there — or why there is none.
+struct TakeDesktop {
+    capture: Option<DesktopCapture>,
+    id: Option<String>,
+    label: Option<String>,
+    role: DivoraPlays,
+    error: Option<String>,
+}
+
+/// Open the desktop audio for a take. A playback device Divora sends your
+/// voice to is not recorded: it would carry your voice twice, whatever the
+/// monitor switches say.
+fn open_desktop(source: &DesktopSource, engine: &AudioEngine) -> TakeDesktop {
+    let none = |error: String| TakeDesktop {
+        capture: None,
+        id: None,
+        label: None,
+        role: DivoraPlays::Nothing,
+        error: Some(error),
+    };
+    let cap = match DesktopCapture::start(source) {
+        Ok(cap) => cap,
+        Err(e) => {
+            tracing::warn!(error = %e, ?source, "desktop audio didn't start");
+            return none(format!("Desktop audio couldn't start: {e}"));
+        }
+    };
+    let (id, label, role) = match cap.opened() {
+        OpenedSource::Everything => (
+            EVERYTHING_ID.to_string(),
+            EVERYTHING_LABEL.to_string(),
+            DivoraPlays::Nothing,
+        ),
+        OpenedSource::Device { id, name } => {
+            let role = device_role(name, engine.stream_info().as_ref());
+            (format!("{DEVICE_PREFIX}{id}"), name.clone(), role)
+        }
+    };
+    if role == DivoraPlays::Send {
+        return none(sends_your_voice(&label));
+    }
+    TakeDesktop {
+        capture: Some(cap),
+        id: Some(id),
+        label: Some(label),
+        role,
+        error: None,
     }
 }
 
@@ -498,6 +918,7 @@ struct TakeRun {
     req: StartRequest,
     opts: RecordOptions,
     rx: Receiver<AvChunk>,
+    desktop: Option<TakeDesktop>,
     stop: Arc<AtomicBool>,
     start_tx: Sender<Result<(), String>>,
     take: u64,
@@ -513,11 +934,33 @@ impl TakeRun {
             req,
             opts,
             rx,
+            desktop,
             stop,
             start_tx,
             take,
         } = self;
         let mut feed = EngineFeed::new(rx, req.av_offset_ms);
+        let mut desk = DesktopReport::default();
+        if let Some(d) = desktop {
+            desk.id = d.id;
+            desk.error = d.error;
+            if let Some(mut cap) = d.capture {
+                if matches!(cap.opened(), OpenedSource::Device { .. }) {
+                    desk.device_name.clone_from(&d.label);
+                }
+                desk.role = Some(d.role);
+                desk.lost = Some(cap.lost_flag());
+                desk.gave_up = Some(cap.gave_up_flag());
+                desk.mute = Some(feed.desktop_mute());
+                if let Some(name) = desk.device_name.clone() {
+                    feed = feed.guard_device(Arc::clone(&engine), name);
+                }
+                if let Some(drain) = cap.take_drain() {
+                    feed = feed.with_desktop(drain, Some(cap));
+                }
+            }
+            desk.label = d.label;
+        }
         let mut observer = AppObserver {
             app: app.clone(),
             recorder: Arc::clone(&recorder),
@@ -526,6 +969,7 @@ impl TakeRun {
             started: None,
             start_tx: Some(start_tx),
             lost_at: None,
+            desk,
         };
         let result = divora_capture::record_monitor(
             &req.monitor_id,
@@ -536,6 +980,9 @@ impl TakeRun {
             Some(&mut feed),
             &mut observer,
         );
+        let desktop_report = feed.desktop_report();
+        // Stops the desktop capture too (waiting a moment at most).
+        drop(feed);
         engine.detach_av_tap();
         let take_stats = result.as_ref().ok().cloned();
         let outcome = match result {
@@ -554,6 +1001,7 @@ impl TakeRun {
                 encoder = ?st.encoder,
                 hardware = st.hardware,
                 audio = ?st.audio,
+                desktop = ?desktop_report,
                 "screen recording finished"
             );
         }
@@ -565,6 +1013,52 @@ fn emit(app: &AppHandle, update: &ScreenRecordingUpdate) {
     let _ = app.emit(EVENT, update);
 }
 
+/// What the take reports about its desktop audio.
+#[derive(Default)]
+struct DesktopReport {
+    id: Option<String>,
+    label: Option<String>,
+    error: Option<String>,
+    /// The playback device being recorded, by name; `None` for everything
+    /// except Divora (which Divora's routing can't touch).
+    device_name: Option<String>,
+    /// What Divora plays on the device being recorded; `None` without one.
+    role: Option<DivoraPlays>,
+    /// The engine's routing the role was worked out for.
+    routing: Option<(String, Option<String>)>,
+    mute: Option<Arc<AtomicBool>>,
+    lost: Option<Arc<AtomicBool>>,
+    gave_up: Option<Arc<AtomicBool>>,
+    lost_at: Option<f64>,
+}
+
+impl DesktopReport {
+    /// Follow the engine's routing: if it changed, what Divora plays on the
+    /// recorded device is worked out again, and a device that now carries
+    /// your voice to the call says why it went silent (the feed silences it,
+    /// see [`EngineFeed::guard_device`]) until it no longer does. With the
+    /// engine stopped the last answer stands.
+    fn follow(&mut self, routing: Option<&StreamInfo>) {
+        let (Some(name), Some(r)) = (self.device_name.as_deref(), routing) else {
+            return;
+        };
+        let key = (r.output_name.clone(), r.monitor_name.clone());
+        if self.routing.as_ref() == Some(&key) {
+            return;
+        }
+        self.routing = Some(key);
+        let role = device_role(name, Some(r));
+        self.role = Some(role);
+        let said = sends_your_voice(name);
+        if role == DivoraPlays::Send {
+            self.error = Some(said);
+        } else if self.error.as_deref() == Some(said.as_str()) {
+            // Only its own message is taken back; "stopped for good" stays.
+            self.error = None;
+        }
+    }
+}
+
 /// Hears from the recording thread and tells the app.
 struct AppObserver {
     app: AppHandle,
@@ -574,6 +1068,7 @@ struct AppObserver {
     started: Option<Instant>,
     start_tx: Option<Sender<Result<(), String>>>,
     lost_at: Option<f64>,
+    desk: DesktopReport,
 }
 
 impl TakeObserver for AppObserver {
@@ -587,13 +1082,55 @@ impl TakeObserver for AppObserver {
 
     fn progress(&mut self, stats: &RecordStats) {
         let elapsed = self.started.map_or(Duration::ZERO, |t| t.elapsed());
-        // The engine stopped: the take goes on, and its audio is silence
-        // from here until the engine is started again (which re-attaches).
-        if self.engine.is_running() {
+        // The engine stopped: the take goes on, and its voice and soundboard
+        // are silence from here until the engine is started again (which
+        // re-attaches); desktop audio, if any, goes on.
+        let running = self.engine.is_running();
+        if running {
             self.lost_at = None;
         } else if self.lost_at.is_none() {
             self.lost_at = Some(elapsed.as_secs_f64());
         }
+        self.desk.follow(self.engine.stream_info().as_ref());
+        // Desktop audio that stopped coming: being reopened — or, if Windows
+        // stopped answering, gone for the rest of the take, which is said
+        // once, as an error, rather than "trying again" for ever.
+        match &self.desk.lost {
+            Some(lost) if lost.load(Ordering::Acquire) => {
+                self.desk.lost_at.get_or_insert(elapsed.as_secs_f64());
+            }
+            _ => self.desk.lost_at = None,
+        }
+        let gave_up = self
+            .desk
+            .gave_up
+            .as_ref()
+            .is_some_and(|g| g.load(Ordering::Acquire));
+        if gave_up {
+            let at = self.desk.lost_at.take().unwrap_or(elapsed.as_secs_f64());
+            if self.desk.error.is_none() {
+                self.desk.error = Some(format!(
+                    "Desktop audio stopped at {} and Windows didn't bring it back.",
+                    clock(at)
+                ));
+            }
+        }
+        let muted = self
+            .desk
+            .mute
+            .as_ref()
+            .is_some_and(|m| m.load(Ordering::Acquire));
+        let doubled = !muted
+            && self.desk.role.is_some_and(|role| {
+                doubles_now(
+                    role,
+                    running,
+                    self.engine.is_monitoring(),
+                    self.engine.is_speak_monitoring(),
+                    self.engine.monitor_gain(),
+                )
+            });
+        let audio = stats.audio.as_ref();
         self.recorder.progress(
             &self.app,
             ScreenRecordingUpdate {
@@ -601,9 +1138,16 @@ impl TakeObserver for AppObserver {
                 path: Some(self.path.to_string_lossy().into_owned()),
                 elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 dropped_frames: stats.frames_dropped,
-                drift_ppm: stats.audio.as_ref().map_or(0.0, |a| a.timeline.drift_ppm),
+                drift_ppm: audio.map_or(0.0, |a| a.timeline.drift_ppm),
                 audio_lost_at: self.lost_at,
                 error: None,
+                desktop_source_id: self.desk.id.clone(),
+                desktop_source: self.desk.label.clone(),
+                desktop_quiet_seconds: audio.and_then(|a| a.timeline.desktop_quiet_seconds),
+                desktop_doubled: doubled,
+                desktop_lost_at: self.desk.lost_at,
+                desktop_error: self.desk.error.clone(),
+                stems_error: audio.and_then(|a| a.stems_error.clone()),
             },
         );
     }
@@ -612,12 +1156,17 @@ impl TakeObserver for AppObserver {
 #[cfg(test)]
 mod tests {
     use super::{
-        monitor_dtos, sanitize_fps, screen_recording_path, to_audio_chunk, CaptureStatusDto, Input,
-        MonitorDto, Phase, Quality, ScreenRecordingUpdate,
+        clock, desktop_source_dtos, device_role, divora_plays, doubles_now, monitor_dtos,
+        parse_desktop_source, sanitize_desktop_gain_db, sanitize_fps, screen_recording_path,
+        to_audio_chunk, CaptureStatusDto, DesktopReport, DivoraPlays, EngineFeed, Input,
+        MonitorDto, Phase, Quality, ScreenRecordingUpdate, SendGuard, DEFAULT_DESKTOP_GAIN_DB,
     };
-    use divora_capture::MonitorInfo;
-    use divora_core::audio::AvChunk;
+    use divora_capture::desktop::{desktop_tap, DesktopPacket, DesktopSource, PlaybackDevice};
+    use divora_capture::{AudioFeed, MonitorInfo};
+    use divora_core::audio::{AvChunk, StreamInfo};
     use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::sync_channel;
     use std::time::{Duration, Instant};
 
     /// The whole transition table: every pair, so a new arm cannot slip in
@@ -728,12 +1277,19 @@ mod tests {
             keys,
             [
                 "audioLostAt",
+                "desktopDoubled",
+                "desktopError",
+                "desktopLostAt",
+                "desktopQuietSeconds",
+                "desktopSource",
+                "desktopSourceId",
                 "driftPpm",
                 "droppedFrames",
                 "elapsedMs",
                 "error",
                 "path",
-                "state"
+                "state",
+                "stemsError"
             ]
         );
         for (p, s) in [
@@ -770,5 +1326,376 @@ mod tests {
             ["height", "id", "number", "primary", "width", "x", "y"]
         );
         assert_eq!(monitors[0].number, 1);
+        let source = serde_json::to_value(&desktop_source_dtos(true, &[], None)[0]).unwrap();
+        let mut keys: Vec<_> = source.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["divoraPlays", "id", "isDefault", "kind", "label"]);
+        for (role, s) in [
+            (DivoraPlays::Nothing, "nothing"),
+            (DivoraPlays::Send, "send"),
+            (DivoraPlays::Monitor, "monitor"),
+            (DivoraPlays::OnlyOutput, "onlyOutput"),
+            (DivoraPlays::Unknown, "unknown"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), s);
+        }
+    }
+
+    /// `everything` and `device:<id>`; everything else — absent, `off`, a
+    /// value from a later version, an empty id — is no desktop audio, as
+    /// v1.52.0 recorded.
+    #[test]
+    fn desktop_sources_parse_strictly() {
+        assert_eq!(
+            parse_desktop_source(Some("everything")),
+            Some(DesktopSource::Everything)
+        );
+        assert_eq!(
+            parse_desktop_source(Some("device:{0.0.0.00000000}.{abc}")),
+            Some(DesktopSource::Device("{0.0.0.00000000}.{abc}".into()))
+        );
+        for none in [
+            None,
+            Some("off"),
+            Some(""),
+            Some("device:"),
+            Some("app:123"),
+            Some("Everything"),
+        ] {
+            assert_eq!(parse_desktop_source(none), None, "{none:?}");
+        }
+    }
+
+    #[test]
+    fn the_desktop_volume_is_clamped() {
+        assert!((sanitize_desktop_gain_db(None) - DEFAULT_DESKTOP_GAIN_DB).abs() < 1e-6);
+        assert!((sanitize_desktop_gain_db(Some(f64::NAN)) - DEFAULT_DESKTOP_GAIN_DB).abs() < 1e-6);
+        assert!((sanitize_desktop_gain_db(Some(12.0)) - 0.0).abs() < 1e-6);
+        assert!((sanitize_desktop_gain_db(Some(-99.0)) + 30.0).abs() < 1e-6);
+        assert!((sanitize_desktop_gain_db(Some(-12.5)) + 12.5).abs() < 1e-6);
+    }
+
+    fn device(id: &str, name: &str) -> PlaybackDevice {
+        PlaybackDevice {
+            id: id.into(),
+            name: name.into(),
+            is_default: false,
+        }
+    }
+
+    fn routing(output: &str, monitor: Option<&str>) -> StreamInfo {
+        StreamInfo {
+            input_name: "CABLE Output".into(),
+            output_name: output.into(),
+            monitor_name: monitor.map(Into::into),
+            sample_rate: 48_000,
+            output_rate: 48_000,
+            monitor_rate: monitor.map(|_| 48_000),
+            input_channels: 1,
+            output_channels: 2,
+        }
+    }
+
+    /// What Divora plays on each device, for every routing that matters —
+    /// and whether that puts your voice in the recording twice, for every
+    /// combination of the monitor switches.
+    #[test]
+    fn what_divora_plays_where() {
+        let devices = [
+            device("cable", "CABLE Input"),
+            device("phones", "Headphones"),
+            device("spk", "Speakers"),
+        ];
+        // The recommended setup: the call on the cable, you on headphones.
+        let recommended = routing("CABLE Input", Some("Headphones"));
+        assert_eq!(
+            divora_plays("cable", &devices, Some(&recommended)),
+            DivoraPlays::Send
+        );
+        assert_eq!(
+            divora_plays("phones", &devices, Some(&recommended)),
+            DivoraPlays::Monitor
+        );
+        assert_eq!(
+            divora_plays("spk", &devices, Some(&recommended)),
+            DivoraPlays::Nothing
+        );
+        // One output only.
+        let single = routing("Speakers", None);
+        assert_eq!(
+            divora_plays("spk", &devices, Some(&single)),
+            DivoraPlays::OnlyOutput
+        );
+        assert_eq!(
+            divora_plays("phones", &devices, Some(&single)),
+            DivoraPlays::Nothing
+        );
+        // Stopped, or a device name that matches nothing here: can't tell.
+        assert_eq!(divora_plays("spk", &devices, None), DivoraPlays::Unknown);
+        let renamed = routing("Old Name", None);
+        assert_eq!(
+            divora_plays("spk", &devices, Some(&renamed)),
+            DivoraPlays::Unknown
+        );
+        let renamed_monitor = routing("CABLE Input", Some("Gone"));
+        assert_eq!(
+            divora_plays("phones", &devices, Some(&renamed_monitor)),
+            DivoraPlays::Unknown
+        );
+        // Two devices with one name: both count — each by its own match,
+        // even when the output's name resolves to nothing here.
+        let twins = [device("a", "USB Audio"), device("b", "USB Audio")];
+        let r = routing("CABLE Input", Some("USB Audio"));
+        assert_eq!(divora_plays("b", &twins, Some(&r)), DivoraPlays::Monitor);
+        let twins = [
+            device("cable", "CABLE Input"),
+            device("a", "USB Audio"),
+            device("b", "USB Audio"),
+        ];
+        assert_eq!(divora_plays("a", &twins, Some(&r)), DivoraPlays::Monitor);
+        assert_eq!(divora_plays("b", &twins, Some(&r)), DivoraPlays::Monitor);
+
+        for monitor in [false, true] {
+            for speak in [false, true] {
+                for gain in [0.0, 1.0] {
+                    let case = format!("monitor {monitor}, speak {speak}, gain {gain}");
+                    assert!(
+                        doubles_now(DivoraPlays::Send, true, monitor, speak, gain),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        doubles_now(DivoraPlays::OnlyOutput, true, monitor, speak, gain),
+                        monitor,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        doubles_now(DivoraPlays::Monitor, true, monitor, speak, gain),
+                        gain > 0.0 && (monitor || speak),
+                        "{case}"
+                    );
+                    assert!(
+                        !doubles_now(DivoraPlays::Nothing, true, monitor, speak, gain),
+                        "{case}"
+                    );
+                    assert!(
+                        !doubles_now(DivoraPlays::Unknown, true, monitor, speak, gain),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A stopped engine plays nothing, so nothing is recorded twice whatever
+    /// the switches say; and a monitor device that has gone away does not
+    /// hide the device the voice is sent to.
+    #[test]
+    fn doubling_needs_a_running_engine_and_survives_a_lost_monitor() {
+        for role in [
+            DivoraPlays::Send,
+            DivoraPlays::OnlyOutput,
+            DivoraPlays::Monitor,
+        ] {
+            assert!(!doubles_now(role, false, true, true, 1.0), "{role:?}");
+        }
+        let devices = [device("cable", "CABLE Input"), device("spk", "Speakers")];
+        let gone = routing("CABLE Input", Some("Headphones"));
+        assert_eq!(
+            divora_plays("cable", &devices, Some(&gone)),
+            DivoraPlays::Send
+        );
+        assert_eq!(
+            divora_plays("spk", &devices, Some(&gone)),
+            DivoraPlays::Unknown
+        );
+        assert_eq!(
+            divora_plays("cable", &[], Some(&gone)),
+            DivoraPlays::Unknown
+        );
+    }
+
+    /// The device being recorded, by the engine's own name for it.
+    #[test]
+    fn the_recorded_device_s_role_by_name() {
+        let r = routing("CABLE Input", Some("Headphones"));
+        assert_eq!(device_role("CABLE Input", Some(&r)), DivoraPlays::Send);
+        assert_eq!(device_role("Headphones", Some(&r)), DivoraPlays::Monitor);
+        assert_eq!(device_role("Speakers", Some(&r)), DivoraPlays::Nothing);
+        let single = routing("Speakers", None);
+        assert_eq!(
+            device_role("Speakers", Some(&single)),
+            DivoraPlays::OnlyOutput
+        );
+        assert_eq!(device_role("Speakers", None), DivoraPlays::Unknown);
+    }
+
+    /// Mid-take, the engine's routing changes: the role follows it, and a
+    /// device that comes to carry the voice to the call says why it went
+    /// silent — until it no longer does. A stop keeps the answer. (The
+    /// silencing itself is the feed's: see the guard's test below.)
+    #[test]
+    fn the_role_follows_the_routing_mid_take() {
+        let mut desk = DesktopReport {
+            device_name: Some("Speakers".into()),
+            role: Some(DivoraPlays::Nothing),
+            ..DesktopReport::default()
+        };
+        desk.follow(Some(&routing("CABLE Input", Some("Headphones"))));
+        assert_eq!(desk.role, Some(DivoraPlays::Nothing));
+        // The monitor moves onto the recorded device.
+        desk.follow(Some(&routing("CABLE Input", Some("Speakers"))));
+        assert_eq!(desk.role, Some(DivoraPlays::Monitor));
+        assert!(desk.error.is_none());
+        // It becomes where the voice is sent, with a monitor elsewhere.
+        desk.follow(Some(&routing("Speakers", Some("Headphones"))));
+        assert_eq!(desk.role, Some(DivoraPlays::Send));
+        assert!(desk
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Divora sends your voice to Speakers"));
+        // The engine stops: the last answer stands.
+        desk.follow(None);
+        assert_eq!(desk.role, Some(DivoraPlays::Send));
+        // And back.
+        desk.follow(Some(&routing("CABLE Input", None)));
+        assert_eq!(desk.role, Some(DivoraPlays::Nothing));
+        assert!(desk.error.is_none());
+        // Another message (a capture that gave up) isn't taken back.
+        desk.error = Some("Desktop audio stopped at 0:05".into());
+        desk.follow(Some(&routing("CABLE Input", Some("Speakers"))));
+        assert_eq!(desk.error.as_deref(), Some("Desktop audio stopped at 0:05"));
+        // Everything except Divora is never touched by Divora's routing.
+        let mut everything = DesktopReport::default();
+        everything.follow(Some(&routing("Speakers", None)));
+        assert_eq!(everything.role, None);
+    }
+
+    /// The feed's guard: an answer whenever the routing changes, none while
+    /// it doesn't (or the engine is stopped).
+    #[test]
+    fn the_feed_s_guard_answers_on_every_routing_change() {
+        let mut g = SendGuard::new("Speakers".into());
+        assert_eq!(
+            g.check(Some(&routing("CABLE Input", Some("Headphones")))),
+            Some(false)
+        );
+        assert_eq!(
+            g.check(Some(&routing("CABLE Input", Some("Headphones")))),
+            None
+        );
+        assert_eq!(g.check(None), None);
+        assert_eq!(
+            g.check(Some(&routing("Speakers", Some("Headphones")))),
+            Some(true)
+        );
+        assert_eq!(g.check(Some(&routing("Speakers", None))), Some(false));
+    }
+
+    #[test]
+    fn times_read_like_the_card_s() {
+        assert_eq!(clock(7.9), "0:07");
+        assert_eq!(clock(754.0), "12:34");
+        assert_eq!(clock(3_723.0), "1:02:03");
+        assert_eq!(clock(-1.0), "0:00");
+    }
+
+    /// Where "everything except Divora" works it is the one source offered;
+    /// elsewhere each device is, as `device:<id>`, with its role.
+    #[test]
+    fn the_sources_offered() {
+        let everything = desktop_source_dtos(true, &[device("x", "X")], None);
+        assert_eq!(everything.len(), 1);
+        assert_eq!(
+            (everything[0].id.as_str(), everything[0].kind),
+            ("everything", "everything")
+        );
+        assert_eq!(everything[0].divora_plays, DivoraPlays::Nothing);
+        let mut spk = device("spk", "Speakers");
+        spk.is_default = true;
+        let devices = [device("cable", "CABLE Input"), spk];
+        let r = routing("CABLE Input", None);
+        let list = desktop_source_dtos(false, &devices, Some(&r));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "device:cable");
+        assert_eq!(list[0].divora_plays, DivoraPlays::OnlyOutput);
+        assert_eq!(
+            (list[1].id.as_str(), list[1].kind, list[1].is_default),
+            ("device:spk", "device", true)
+        );
+        assert_eq!(list[1].divora_plays, DivoraPlays::Nothing);
+    }
+
+    /// Desktop audio reaches the take on the same clock as the voice, with
+    /// the same A/V offset: the offset moves all the sound, never one
+    /// source against the other.
+    #[test]
+    fn desktop_audio_is_timed_like_the_voice() {
+        let (_tx, rx) = sync_channel::<AvChunk>(1);
+        let (mut tap, drain) = desktop_tap();
+        let start = Instant::now();
+        let samples = [0.5f32; 960];
+        let at = start + Duration::from_millis(250);
+        tap.ingest(&DesktopPacket {
+            samples: &samples,
+            frames: 480,
+            at,
+            arrived: at,
+            timed: true,
+            silent: false,
+            discontinuity: false,
+            resumed: false,
+        });
+        let mut feed = EngineFeed::new(rx, 40).with_desktop(drain, None);
+        let mut out = Vec::new();
+        feed.poll_desktop(start, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].at - 0.29).abs() < 1e-9, "at {}", out[0].at);
+        // The engine's buffers get the same 40 ms (to_audio_chunk, above).
+        let voice = to_audio_chunk(
+            AvChunk {
+                epoch: 1,
+                at,
+                index: 0,
+                rate: 48_000,
+                out_frames: 480,
+                out_rate: 48_000,
+                occupancy: 0,
+                chain_latency: 0,
+                input_latency: Duration::ZERO,
+                voice: vec![0.0; 480],
+                sb: vec![0.0; 480],
+            },
+            start,
+            0.04,
+        );
+        assert!((voice.at - out[0].at).abs() < 1e-9);
+        // Muted (the device came to carry the voice to the call): the same
+        // packets, on time, as silence.
+        assert!(out[0].frames.iter().all(|&s| s != 0.0));
+        let mute = feed.desktop_mute();
+        mute.store(true, Ordering::Release);
+        let (_tx2, rx2) = sync_channel::<AvChunk>(1);
+        let (mut tap2, drain2) = desktop_tap();
+        tap2.ingest(&DesktopPacket {
+            samples: &samples,
+            frames: 480,
+            at,
+            arrived: at,
+            timed: true,
+            silent: false,
+            discontinuity: false,
+            resumed: false,
+        });
+        let mut muted_feed = EngineFeed::new(rx2, 40).with_desktop(drain2, None);
+        muted_feed.desktop_mute().store(true, Ordering::Release);
+        let mut out2 = Vec::new();
+        muted_feed.poll_desktop(start, &mut out2);
+        assert_eq!(out2.len(), 1);
+        assert!((out2[0].at - 0.29).abs() < 1e-9);
+        assert!(
+            out2[0].frames.iter().all(|&s| s == 0.0),
+            "muted audio still sounds"
+        );
     }
 }

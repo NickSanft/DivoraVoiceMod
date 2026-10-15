@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_SCREEN_SETTINGS,
+  doubledHint,
   formatClock,
+  IDLE_SCREEN_RECORDING,
   monitorLabel,
+  pickDesktopSource,
   pickMonitor,
+  quietWarning,
   readScreenSettings,
   screenFilename,
+  screenRecordSubtitle,
 } from "./screenRecording";
-import type { CaptureMonitor } from "../audio/api";
+import type { CaptureMonitor, DesktopAudioSource } from "../audio/api";
 
 const main: CaptureMonitor = {
   id: "\\\\.\\DISPLAY11",
@@ -36,6 +41,7 @@ describe("readScreenSettings", () => {
   });
 
   it("keeps what is valid and defaults the rest, field by field", () => {
+    const desktopOff = { desktopAudio: "off", desktopGainDb: -6, stems: false };
     expect(
       readScreenSettings({
         monitorId: side.id,
@@ -44,9 +50,113 @@ describe("readScreenSettings", () => {
         cursor: "yes",
         avOffsetMs: 9999,
       }),
-    ).toEqual({ monitorId: side.id, fps: 30, quality: "high", cursor: true, avOffsetMs: 500 });
+    ).toEqual({
+      monitorId: side.id,
+      fps: 30,
+      quality: "high",
+      cursor: true,
+      avOffsetMs: 500,
+      ...desktopOff,
+    });
     expect(readScreenSettings({ fps: 60, quality: "ultra", cursor: false, avOffsetMs: -40.4 }))
-      .toEqual({ monitorId: null, fps: 60, quality: "balanced", cursor: false, avOffsetMs: -40 });
+      .toEqual({
+        monitorId: null,
+        fps: 60,
+        quality: "balanced",
+        cursor: false,
+        avOffsetMs: -40,
+        ...desktopOff,
+      });
+  });
+
+  it("v1.53.0: desktop audio is a first run's default, never an upgrade's", () => {
+    expect(DEFAULT_SCREEN_SETTINGS.desktopAudio).toBe("everything");
+    expect(readScreenSettings(null, true).desktopAudio).toBe("everything");
+    expect(readScreenSettings(null, false).desktopAudio).toBe("off");
+    // Settings saved before v1.53.0 have no desktopAudio at all.
+    expect(readScreenSettings({ fps: 60 }, true).desktopAudio).toBe("off");
+  });
+
+  it("v1.53.0: desktop fields are checked like the rest", () => {
+    expect(
+      readScreenSettings({ desktopAudio: "device:{abc}", desktopGainDb: 4, stems: true }),
+    ).toMatchObject({ desktopAudio: "device:{abc}", desktopGainDb: 0, stems: true });
+    expect(
+      readScreenSettings({ desktopAudio: "everything", desktopGainDb: -99.6, stems: "no" }),
+    ).toMatchObject({ desktopAudio: "everything", desktopGainDb: -30, stems: false });
+    for (const bad of ["device:", "app:12", "Everything", 3, null]) {
+      expect(readScreenSettings({ desktopAudio: bad }).desktopAudio).toBe("off");
+    }
+    expect(readScreenSettings({ desktopGainDb: Number.NaN }).desktopGainDb).toBe(-6);
+  });
+});
+
+const everything: DesktopAudioSource = {
+  id: "everything",
+  label: "Everything except Divora",
+  kind: "everything",
+  isDefault: false,
+  divoraPlays: "nothing",
+};
+const phones: DesktopAudioSource = {
+  id: "device:{phones}",
+  label: "Headphones",
+  kind: "device",
+  isDefault: true,
+  divoraPlays: "monitor",
+};
+
+describe("desktop audio", () => {
+  it("picks the saved source and never a stand-in", () => {
+    expect(pickDesktopSource([everything], "everything")).toBe(everything);
+    expect(pickDesktopSource([everything], "off")).toBeNull();
+    // Saved "everything" on a PC that can only offer devices: not swapped
+    // for a device, which might be playing Divora's own sound.
+    expect(pickDesktopSource([phones], "everything")).toBeNull();
+    expect(pickDesktopSource([phones], "device:{gone}")).toBeNull();
+    expect(pickDesktopSource([phones], "device:{phones}")).toBe(phones);
+  });
+
+  it("says what the take records", () => {
+    expect(screenRecordSubtitle(null)).toBe("Your modulated voice and soundboard");
+    expect(screenRecordSubtitle(everything)).toMatch(/plus sound from other apps/);
+    expect(screenRecordSubtitle(phones)).toMatch(/what Headphones plays/);
+    // A device Divora sends your voice to is never recorded.
+    expect(screenRecordSubtitle({ ...phones, divoraPlays: "send" })).toBe(
+      "Your modulated voice and soundboard",
+    );
+  });
+
+  it("warns about devices that carry Divora's own sound, by what plays there", () => {
+    expect(doubledHint(everything)).toBeNull();
+    expect(doubledHint(null)).toBeNull();
+    expect(doubledHint(phones)).toMatch(/hear yourself/);
+    expect(doubledHint({ ...phones, divoraPlays: "send" })).toMatch(/sends your voice/);
+    expect(doubledHint({ ...phones, divoraPlays: "onlyOutput" })).toMatch(/only output/);
+    expect(doubledHint({ ...phones, divoraPlays: "unknown" })).toBeNull();
+  });
+
+  it("warns about silence only after ten seconds, in words that fit the source", () => {
+    const base = { ...IDLE_SCREEN_RECORDING, state: "recording" as const };
+    expect(quietWarning({ ...base, desktopSourceId: "everything", desktopQuietSeconds: 9.9 })).toBeNull();
+    expect(
+      quietWarning({ ...base, desktopSourceId: "everything", desktopQuietSeconds: 12.4 }),
+    ).toMatch(/Nothing heard from other apps for 12 s/);
+    expect(
+      quietWarning({
+        ...base,
+        desktopSourceId: "device:{phones}",
+        desktopSource: "Headphones",
+        desktopQuietSeconds: 30,
+      }),
+    ).toMatch(/Nothing heard from Headphones for 30 s/);
+    // Without desktop audio there is nothing to warn about.
+    expect(quietWarning({ ...base, desktopQuietSeconds: 30 })).toBeNull();
+    // Nor while the card already says why it is silent: left out (a device
+    // that came to carry your voice), lost, or stopped for good.
+    const quiet = { ...base, desktopSourceId: "everything", desktopQuietSeconds: 30 };
+    expect(quietWarning({ ...quiet, desktopError: "Desktop audio stopped at 0:05" })).toBeNull();
+    expect(quietWarning({ ...quiet, desktopLostAt: 5 })).toBeNull();
   });
 });
 

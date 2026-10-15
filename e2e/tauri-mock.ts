@@ -209,6 +209,17 @@ export async function installTauriMock(
           { id: "\\\\.\\DISPLAY1", number: 1, x: 0, y: 0, width: 2560, height: 1440, primary: true },
           { id: "\\\\.\\DISPLAY2", number: 2, x: 2560, y: 0, width: 1920, height: 1080, primary: false },
         ],
+        // v1.53.0: desktop audio — this "PC" can record everything except
+        // Divora, so that is the one source offered.
+        list_desktop_audio_sources: () => [
+          {
+            id: "everything",
+            label: "Everything except Divora",
+            kind: "everything",
+            isDefault: false,
+            divoraPlays: "nothing",
+          },
+        ],
         start_screen_recording: () => "C:/mock/recordings/divora-screen-x.mp4",
         stop_screen_recording: () => "C:/mock/recordings/divora-screen-x.mp4",
         screen_recording_status: () => ({
@@ -219,6 +230,13 @@ export async function installTauriMock(
           driftPpm: 0,
           audioLostAt: null,
           error: null,
+          desktopSourceId: null,
+          desktopSource: null,
+          desktopQuietSeconds: null,
+          desktopDoubled: false,
+          desktopLostAt: null,
+          desktopError: null,
+          stemsError: null,
         }),
         preset_store_path: () => "C:/mock/presets",
         list_midi_inputs: () => [],

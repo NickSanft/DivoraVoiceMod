@@ -87,12 +87,14 @@ import {
   subscribeVoiceReading,
   screenCaptureStatus as screenCaptureStatusCmd,
   listCaptureMonitors as listCaptureMonitorsCmd,
+  listDesktopAudioSources as listDesktopAudioSourcesCmd,
   startScreenRecording as startScreenRecordingCmd,
   stopScreenRecording as stopScreenRecordingCmd,
   screenRecordingStatus as screenRecordingStatusCmd,
   subscribeScreenRecording,
   type CaptureMonitor,
   type CaptureStatus,
+  type DesktopAudioSource,
   type ScreenRecordingUpdate,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
@@ -129,6 +131,7 @@ import {
 import { checkForUpdate, type UpdateInfo } from "../data/updates";
 import {
   IDLE_SCREEN_RECORDING,
+  pickDesktopSource,
   pickMonitor,
   readScreenSettings,
   screenFilename,
@@ -555,8 +558,11 @@ export interface AppState {
   /** Whether this PC can record the screen (`null` until asked). */
   captureStatus: () => CaptureStatus | null;
   captureMonitors: () => CaptureMonitor[];
-  /** Ask the backend again: the status (cached there) and the screens. */
+  /** Ask the backend again: the status (cached there), the screens, and
+   *  the desktop audio sources. */
   refreshCapture: () => Promise<void>;
+  /** v1.53.0: where desktop audio can come from (`null` until asked). */
+  desktopSources: () => DesktopAudioSource[] | null;
   /** The latest `screen-recording` report. */
   screenRecording: () => ScreenRecordingUpdate;
   screenSettings: () => ScreenSettings;
@@ -1511,9 +1517,21 @@ export function createAppState(): AppState {
   const [screenRecording, setScreenRecording] =
     createSignal<ScreenRecordingUpdate>(IDLE_SCREEN_RECORDING);
   const [screenRecordingPath, setScreenRecordingPath] = createSignal<string | null>(null);
+  const storedScreenSettings = loadJson<unknown>(STORAGE_KEYS.screenRecording, null);
+  // A first run: no sign of an earlier launch. The wizard's flag alone isn't
+  // proof — "Replay setup" clears it — but every real launch since v1.49.0
+  // has recorded its version for What's new.
+  const firstRun =
+    loadRaw(WIZARD_SEEN_KEY) === null && loadRaw(STORAGE_KEYS.whatsNewSeenVersion) === null;
   const [screenSettings, setScreenSettingsRaw] = createSignal<ScreenSettings>(
-    readScreenSettings(loadJson<unknown>(STORAGE_KEYS.screenRecording, null)),
+    readScreenSettings(storedScreenSettings, firstRun),
   );
+  // v1.53.0: what desktop audio defaults to depends on whether this is a
+  // first run; settle it now, so finishing the wizard doesn't change it.
+  if (storedScreenSettings === null) {
+    saveJson(STORAGE_KEYS.screenRecording, screenSettings());
+  }
+  const [desktopSources, setDesktopSources] = createSignal<DesktopAudioSource[] | null>(null);
   const setScreenSettings = (patch: Partial<ScreenSettings>): void => {
     const next = readScreenSettings({ ...screenSettings(), ...patch });
     setScreenSettingsRaw(next);
@@ -1528,10 +1546,37 @@ export function createAppState(): AppState {
       if (!status) return; // a bridge that answered nothing (tests, previews)
       setCaptureStatus(status);
       setCaptureMonitors(status.supported ? await listCaptureMonitorsCmd() : []);
+      if (status.supported) await refreshDesktopSources();
     } catch (err) {
       console.warn("[screen] capture status unavailable", err);
     }
   };
+
+  /** Ask where desktop audio can come from — and what Divora plays on each
+   *  playback device, which follows the engine's routing. */
+  const refreshDesktopSources = async (): Promise<DesktopAudioSource[] | null> => {
+    try {
+      const sources = await listDesktopAudioSourcesCmd();
+      if (Array.isArray(sources)) {
+        setDesktopSources(sources);
+        return sources;
+      }
+    } catch (err) {
+      console.warn("[screen] desktop audio sources unavailable", err);
+    }
+    return null;
+  };
+  // What Divora plays where changes whenever the engine starts, stops or
+  // moves to other devices: ask again then, not only when the card mounts.
+  createEffect(
+    on(
+      [engineRunning, streamInfo, selectedOutput, selectedMonitorRaw],
+      () => {
+        if (captureStatus()?.supported) void refreshDesktopSources();
+      },
+      { defer: true },
+    ),
+  );
 
   let screenUnlisten: (() => void) | null = null;
   void (async () => {
@@ -1587,6 +1632,13 @@ export function createAppState(): AppState {
       setScreenRecording({ ...IDLE_SCREEN_RECORDING, error: "No screen to record." });
       return;
     }
+    // The take records what the card shows: the saved desktop audio only if
+    // it is offered right now — never some other source in its place.
+    let desktopAudio: string | undefined;
+    if (settings.desktopAudio !== "off") {
+      const sources = (await refreshDesktopSources()) ?? desktopSources() ?? [];
+      desktopAudio = pickDesktopSource(sources, settings.desktopAudio)?.id;
+    }
     setScreenRecording({ ...IDLE_SCREEN_RECORDING, state: "starting" });
     try {
       const path = await startScreenRecordingCmd({
@@ -1596,6 +1648,9 @@ export function createAppState(): AppState {
         quality: settings.quality,
         cursor: settings.cursor,
         avOffsetMs: settings.avOffsetMs,
+        ...(desktopAudio ? { desktopAudio } : {}),
+        desktopGainDb: settings.desktopGainDb,
+        stems: settings.stems,
       });
       setScreenRecordingPath(path);
     } catch (err) {
@@ -3447,6 +3502,7 @@ export function createAppState(): AppState {
     captureStatus,
     captureMonitors,
     refreshCapture,
+    desktopSources,
     screenRecording,
     screenSettings,
     setScreenSettings,

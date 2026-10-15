@@ -930,9 +930,12 @@ dependencies = [
 name = "divora-capture"
 version = "0.0.0"
 dependencies = [
+ "hound",
+ "ringbuf",
  "thiserror 1.0.69",
  "tracing",
  "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

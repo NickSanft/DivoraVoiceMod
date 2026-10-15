@@ -22,7 +22,8 @@ accidental break fails CI before it ships:
 - `ReadingSnapshot` keys — `divora-core/src/audio/engine.rs`.
 - `TtsVoiceInfo` keys + the missing-`engine` default — `divora-core/src/tts/mod.rs`.
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
-- Every command wrapper's command-name string — `src/audio/api.test.ts`.
+- `ScreenRecordingUpdate` / `CaptureStatusDto` / `MonitorDto` / `DesktopSourceDto` keys and the `DivoraPlays` strings — `src-tauri/src/screen.rs` (`wire_keys_are_frozen`; v1.52.0, v1.53.0).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -134,13 +135,30 @@ window's event loop.
 |---|---|---|
 | `screen_capture_status` | — | `CaptureStatus` (never an error: an unsupported PC is `supported: false` with a `reason`) |
 | `list_capture_monitors` | — | `CaptureMonitor[]`, the main screen first |
-| `start_screen_recording` | `monitorId: string`, `filename: string`, `fps?: 30 \| 60`, `quality?: "small" \| "balanced" \| "high"`, `cursor?: bool`, `avOffsetMs?: number` (±500) | full destination path `string`, once the first frame is in / error ("Start the engine before recording." while the engine is stopped, the same words as the WAV recorder) |
+| `list_desktop_audio_sources` | — | `DesktopAudioSource[]` — v1.53.0: just `everything` where Windows can record everything except Divora; otherwise one `device:<id>` per active playback device |
+| `start_screen_recording` | `monitorId: string`, `filename: string`, `fps?: 30 \| 60`, `quality?: "small" \| "balanced" \| "high"`, `cursor?: bool`, `avOffsetMs?: number` (±500); `desktopAudio?: string`, `desktopGainDb?: number`, `stems?: bool` — v1.53.0 | full destination path `string`, once the first frame is in / error ("Start the engine before recording." while the engine is stopped, the same words as the WAV recorder) |
 | `stop_screen_recording` | — | full path of the finished MP4 `string` / error |
 | `screen_recording_status` | — | `ScreenRecordingUpdate` (the latest report) |
 
 `filename` keeps only its last path component and is always written as `.mp4`,
 so nothing the frontend sends can leave `recordings/`. Unknown `quality`
 values read as `"balanced"`, and any `fps` but 60 as 30.
+
+**Desktop audio ids (v1.53.0).** `desktopAudio` is `everything` (process
+loopback: what every other process plays, on whichever device, except Divora
+and the processes it started — and except on a device loopback can't hear) or
+`device:<id>` (one playback device, by its Windows endpoint id — endpoint
+loopback: everything it plays, Divora included, where loopback can hear that
+device). Absent, `off`, or anything else — a value from a later
+version included — is no desktop audio: the MP4's audio track is exactly
+v1.52.0's, though with `stems` a `<take>.voice.wav` is still written beside it.
+The prefixes `everything` and `device:` are reserved. `desktopGainDb` is
+clamped to −30…0 dB; absent or `null` (what JSON makes of `NaN` and
+`Infinity`) is −6, and any other value that isn't a number fails the command.
+A source that
+can't be opened, or a device Divora sends your voice to, never fails the
+take: it records without desktop audio, and `desktopError` says why. The
+`avOffsetMs` offset moves desktop audio as it moves the voice.
 
 ### Soundboard
 
@@ -253,7 +271,28 @@ CaptureMonitor    { id, number, x, y, width, height, primary }  // v1.52.0;
 ScreenRecordingUpdate { state: "idle" | "starting" | "recording" | "stopping",
                     path (nullable), elapsedMs, droppedFrames, driftPpm,
                     audioLostAt (nullable, seconds into the take),
-                    error (nullable) }               // v1.52.0
+                    error (nullable),                // v1.52.0
+                    desktopSourceId (nullable: "everything" | "device:<id>"),
+                    desktopSource (nullable, its name),
+                    desktopQuietSeconds (nullable: seconds since desktop
+                      audio last made a sound, −60 dBFS or louder),
+                    desktopDoubled (the running engine's devices and monitor
+                      switches put Divora's voice or soundboard on the device
+                      being recorded, whether or not anything is sounding —
+                      false while that device's sound is left out because
+                      Divora sends your voice there; updated about once a
+                      second),
+                    desktopLostAt (nullable, seconds into the take; while
+                      the source is being reopened),
+                    desktopError (nullable: why the take has no desktop
+                      audio — from the start, or from when it stopped for
+                      good or came to carry your voice to the call),
+                    stemsError (nullable) }
+                                                     // the desktop* and stems* fields v1.53.0
+DesktopAudioSource { id ("everything" | "device:<id>"), label,
+                    kind: "everything" | "device", isDefault,
+                    divoraPlays: "nothing" | "send" | "monitor" |
+                      "onlyOutput" | "unknown" }     // v1.53.0
 ```
 
 **`StreamInfo` notes.**
@@ -360,7 +399,7 @@ to defaults (never throw).
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
 | `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0 (a save without them reads them as unbound). Unknown keys are ignored on load; "Win" is read as "Super" |
-| `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0. Each field falls back to its default on its own when missing or malformed |
+| `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
 | `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |
@@ -401,6 +440,15 @@ recordings/divora-screen-<date>_<time>.mp4   screen recording — v1.52.0: H.264
                          Written as `<name>.mp4.part` and renamed when finished, so a
                          take cut short by a crash is left as an obviously
                          incomplete `.part`
+recordings/divora-screen-<date>_<time>.voice.wav     — v1.53.0, opt-in (`stems`):
+recordings/divora-screen-<date>_<time>.desktop.wav   the take's voice + soundboard
+                         (mono) and, when the take has desktop audio, its
+                         desktop audio before its volume (stereo), 48 kHz 32-bit
+                         float, starting at the take's first frame; written as
+                         `.part` and renamed after the MP4. They stop at a WAV's
+                         size limit: with desktop audio, both at the same frame
+                         past about 3.1 hours; without it, the voice file alone
+                         past about 6.2 hours
 ```
 
 Installer-bundled, read-only, next to the executable's resource dir:

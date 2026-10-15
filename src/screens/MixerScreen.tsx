@@ -28,11 +28,16 @@ import {
 import { useApp } from "../stores/app";
 import { acceleratorToKeys } from "../data/hotkeys";
 import {
+  doubledHint,
   formatClock,
   monitorLabel,
+  pickDesktopSource,
   pickMonitor,
+  quietWarning,
   screenBusy,
+  screenRecordSubtitle,
 } from "../data/screenRecording";
+import type { DesktopAudioSource } from "../audio/api";
 import {
   resamplingDetail,
   resamplingSummary,
@@ -1386,7 +1391,51 @@ function RecordCard(): JSX.Element {
   );
 }
 
-/** v1.52.0: record a screen with the modulated voice and the soundboard. */
+/** The desktop audio picker's entries: off, then what can be recorded —
+ *  and the saved choice even when it can't be, so the card says so rather
+ *  than show something else. */
+function desktopOptions(
+  sources: readonly DesktopAudioSource[] | null,
+  saved: string,
+): { value: string; label: string; sub?: string }[] {
+  const options: { value: string; label: string; sub?: string }[] = [
+    { value: "off", label: "No desktop audio" },
+  ];
+  for (const s of sources ?? []) {
+    options.push({
+      value: s.id,
+      label: s.label + (s.isDefault ? " (default)" : ""),
+      sub:
+        s.kind === "everything"
+          ? "Games, videos and other apps — not Divora itself"
+          : s.divoraPlays === "send"
+            ? "Divora sends your voice here — can't be recorded"
+            : s.divoraPlays === "monitor" || s.divoraPlays === "onlyOutput"
+              ? "Divora can play here too"
+              : s.divoraPlays === "unknown"
+                ? "Everything this device plays — can't tell yet if Divora plays here"
+                : "Everything this device plays",
+    });
+  }
+  // The saved choice, even when it isn't offered (yet): the card says so
+  // rather than show something else. Before the list is in, it may well be.
+  if (saved !== "off" && !(sources ?? []).some((s) => s.id === saved)) {
+    options.push({
+      value: saved,
+      label:
+        saved === "everything"
+          ? "Everything except Divora"
+          : sources
+            ? "A playback device chosen earlier"
+            : "Your saved playback device",
+      ...(sources ? { sub: "Not offered now — takes leave desktop audio out" } : {}),
+    });
+  }
+  return options;
+}
+
+/** v1.52.0: record a screen with the modulated voice and the soundboard.
+ *  v1.53.0: and what the PC plays, as picked on the card. */
 function ScreenRecordCard(): JSX.Element {
   const app = useApp();
   const [aboutOpen, setAboutOpen] = createSignal(false);
@@ -1403,6 +1452,32 @@ function ScreenRecordCard(): JSX.Element {
   };
   const canStart = () => app.engineRunning() && !unsupported() && app.captureMonitors().length > 0;
   const chosen = () => pickMonitor(app.captureMonitors(), app.screenSettings().monitorId);
+  const desktop = () => pickDesktopSource(app.desktopSources() ?? [], app.screenSettings().desktopAudio);
+  // While a take runs, what it actually records; before, what it would.
+  const subtitle = () => {
+    const r = rec();
+    if (!busy()) {
+      if (
+        app.desktopSources() === null &&
+        app.screenSettings().desktopAudio !== "off" &&
+        !unsupported()
+      ) {
+        return "Your voice and soundboard — checking desktop audio…";
+      }
+      return screenRecordSubtitle(desktop());
+    }
+    // Left out, lost or stopped for good: the take is voice-only for now.
+    if (!r.desktopSourceId || r.desktopError || r.desktopLostAt !== null) {
+      return screenRecordSubtitle(null);
+    }
+    return screenRecordSubtitle({
+      id: r.desktopSourceId,
+      label: r.desktopSource ?? "the device",
+      kind: r.desktopSourceId === "everything" ? "everything" : "device",
+      isDefault: false,
+      divoraPlays: "nothing",
+    });
+  };
   const title = (): string => {
     switch (phase()) {
       case "starting":
@@ -1463,8 +1538,11 @@ function ScreenRecordCard(): JSX.Element {
             >
               {title()}
             </div>
-            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
-              Your modulated voice and soundboard
+            <div
+              style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}
+              data-testid="screen-record-subtitle"
+            >
+              {subtitle()}
             </div>
           </div>
         </div>
@@ -1505,6 +1583,24 @@ function ScreenRecordCard(): JSX.Element {
         />
       </Show>
 
+      <Show when={!busy() && !unsupported()}>
+        <div data-testid="screen-record-desktop">
+          <Select
+            icon="output"
+            value={app.screenSettings().desktopAudio}
+            options={desktopOptions(app.desktopSources(), app.screenSettings().desktopAudio)}
+            onChange={(id) => app.setScreenSettings({ desktopAudio: id })}
+          />
+        </div>
+        <Show when={doubledHint(desktop())}>
+          {(hint) => (
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}>
+              {hint()}
+            </div>
+          )}
+        </Show>
+      </Show>
+
       <Show when={unsupported()}>
         {(why) => (
           <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
@@ -1527,9 +1623,55 @@ function ScreenRecordCard(): JSX.Element {
           data-testid="screen-record-audio-lost"
           style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}
         >
-          Audio lost at {formatClock((rec().audioLostAt ?? 0) * 1000)} — start the engine to
-          bring it back.
+          {rec().desktopSourceId !== null && rec().desktopLostAt === null && !rec().desktopError
+            ? `Your voice and soundboard stopped at ${formatClock((rec().audioLostAt ?? 0) * 1000)} — start the engine to bring them back.`
+            : `Audio lost at ${formatClock((rec().audioLostAt ?? 0) * 1000)} — start the engine to bring it back.`}
         </div>
+      </Show>
+      <Show when={busy() && rec().desktopError}>
+        {(why) => (
+          <div
+            data-testid="screen-record-desktop-error"
+            style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}
+          >
+            Recording without desktop audio: {why()}
+          </div>
+        )}
+      </Show>
+      <Show when={busy() && rec().desktopLostAt !== null}>
+        <div
+          data-testid="screen-record-desktop-lost"
+          style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}
+        >
+          Desktop audio lost at {formatClock((rec().desktopLostAt ?? 0) * 1000)} — trying again.
+        </div>
+      </Show>
+      <Show when={busy() && rec().desktopDoubled}>
+        <div
+          data-testid="screen-record-doubled"
+          style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}
+        >
+          Divora is set to play its sound on {rec().desktopSource ?? "that device"}, so your
+          voice or soundboard is recorded twice whenever it plays there.{" "}
+          {doubledHint(desktop()) ?? ""}
+        </div>
+      </Show>
+      <Show when={recording() && quietWarning(rec())}>
+        {(warning) => (
+          <div
+            data-testid="screen-record-desktop-quiet"
+            style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}
+          >
+            {warning()}
+          </div>
+        )}
+      </Show>
+      <Show when={rec().stemsError}>
+        {(why) => (
+          <div style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}>
+            The separate WAV files weren't saved in full: {why()}
+          </div>
+        )}
       </Show>
       <Show when={recording() && rec().droppedFrames > 0}>
         <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
@@ -1567,6 +1709,19 @@ function ScreenRecordCard(): JSX.Element {
             <li>Windows draws a yellow border around the screen while it records.</li>
             <li>Recording the screen Divora is on records Divora's own window too.</li>
             <li>Recordings are SDR for now: an HDR screen may record washed-out.</li>
+            <li>
+              "Everything except Divora" leaves out Divora's own sound, so your voice isn't
+              recorded twice. It also leaves out anything Divora started, such as a browser it
+              launched to open a link.
+            </li>
+            <li>
+              Apps that play your voice back themselves, such as a mic test, can be recorded
+              too, and Windows' "Listen to this device" may be.
+            </li>
+            <li>
+              Some protected playback, and sound a device's own audio software keeps to itself,
+              can record as silence.
+            </li>
           </ul>
         </Show>
       </Show>

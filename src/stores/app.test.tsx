@@ -349,6 +349,17 @@ describe("app store — Phase 2 audio actions", () => {
       }
       if (cmd === "screen_capture_status") return status;
       if (cmd === "list_capture_monitors") return MONITORS;
+      if (cmd === "list_desktop_audio_sources") {
+        return [
+          {
+            id: "everything",
+            label: "Everything except Divora",
+            kind: "everything",
+            isDefault: false,
+            divoraPlays: "nothing",
+          },
+        ];
+      }
       if (cmd === "start_screen_recording") return "C:/rec/divora-screen-test.mp4";
       if (cmd === "stop_screen_recording") return "C:/rec/divora-screen-test.mp4";
       return null;
@@ -364,6 +375,8 @@ describe("app store — Phase 2 audio actions", () => {
   });
 
   it("toggleScreenRecording records the saved screen with the saved settings, then stops", async () => {
+    // Settings saved by v1.52.0, before desktop audio: it stays off until
+    // chosen, so a take from a hotkey records what it always did.
     window.localStorage.setItem(
       "divora.screenRecording",
       JSON.stringify({
@@ -385,12 +398,91 @@ describe("app store — Phase 2 audio actions", () => {
       quality: "high",
       cursor: false,
       avOffsetMs: -20,
+      desktopGainDb: -6,
+      stems: false,
     });
     expect(result.screenRecording().state).toBe("starting");
     expect(result.screenRecordingPath()).toBe("C:/rec/divora-screen-test.mp4");
 
     await result.toggleScreenRecording();
     expect(invokeMock).toHaveBeenCalledWith("stop_screen_recording");
+  });
+
+  it("v1.53.0: a first run records desktop audio by default, and settles that choice", async () => {
+    window.localStorage.removeItem("divora.wizardSeen");
+    window.localStorage.removeItem("divora.whatsNewSeenVersion");
+    screenBackend();
+    const { result } = setupApp();
+    expect(result.screenSettings().desktopAudio).toBe("everything");
+    const saved = JSON.parse(window.localStorage.getItem("divora.screenRecording") ?? "null");
+    expect(saved?.desktopAudio).toBe("everything");
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_screen_recording",
+      expect.objectContaining({ desktopAudio: "everything", desktopGainDb: -6, stems: false }),
+    );
+  });
+
+  it("v1.53.0: someone who has used the app before starts with desktop audio off", async () => {
+    window.localStorage.setItem("divora.wizardSeen", "true");
+    window.localStorage.removeItem("divora.screenRecording");
+    screenBackend();
+    const { result } = setupApp();
+    expect(result.screenSettings().desktopAudio).toBe("off");
+    const saved = JSON.parse(window.localStorage.getItem("divora.screenRecording") ?? "null");
+    expect(saved?.desktopAudio).toBe("off");
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    const call = invokeMock.mock.calls.find((c) => c[0] === "start_screen_recording");
+    expect(call?.[1]).not.toHaveProperty("desktopAudio");
+  });
+
+  it("v1.53.0: a profile whose wizard flag was cleared (Replay setup) is not a first run", async () => {
+    window.localStorage.removeItem("divora.wizardSeen");
+    window.localStorage.removeItem("divora.screenRecording");
+    window.localStorage.setItem("divora.whatsNewSeenVersion", "1.52.0");
+    screenBackend();
+    const { result } = setupApp();
+    expect(result.screenSettings().desktopAudio).toBe("off");
+  });
+
+  it("v1.53.0: a saved source that isn't offered now is left out of the take", async () => {
+    window.localStorage.setItem(
+      "divora.screenRecording",
+      JSON.stringify({ desktopAudio: "device:{headphones}" }),
+    );
+    screenBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.toggleScreenRecording();
+    const call = invokeMock.mock.calls.find((c) => c[0] === "start_screen_recording");
+    expect(call?.[1]).not.toHaveProperty("desktopAudio");
+  });
+
+  it("v1.53.0: the sources are asked for again when the engine starts", async () => {
+    screenBackend();
+    const { result } = setupApp();
+    await result.refreshCapture();
+    const before = invokeMock.mock.calls.filter((c) => c[0] === "list_desktop_audio_sources").length;
+    await result.startEngine();
+    await new Promise((r) => setTimeout(r, 0));
+    const after = invokeMock.mock.calls.filter((c) => c[0] === "list_desktop_audio_sources").length;
+    expect(after).toBeGreaterThan(before);
+  });
+
+  it("v1.53.0: the card's refresh asks where desktop audio can come from", async () => {
+    screenBackend();
+    const { result } = setupApp();
+    expect(result.desktopSources()).toBeNull();
+    await result.refreshCapture();
+    expect(result.desktopSources()?.map((s) => s.id)).toEqual(["everything"]);
+    // Never on a PC that can't record the screen at all.
+    invokeMock.mockClear();
+    screenBackend({ supported: false, reason: "no", h264Encoder: null, hardware: false });
+    const second = setupApp().result;
+    await second.refreshCapture();
+    expect(invokeMock).not.toHaveBeenCalledWith("list_desktop_audio_sources");
   });
 
   it("a screen that is gone falls back to the main one", async () => {

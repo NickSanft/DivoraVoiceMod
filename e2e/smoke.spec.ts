@@ -474,6 +474,13 @@ test.describe("screen recording (v1.52)", () => {
         driftPpm: 0,
         audioLostAt: null,
         error: null,
+        desktopSourceId: null,
+        desktopSource: null,
+        desktopQuietSeconds: null,
+        desktopDoubled: false,
+        desktopLostAt: null,
+        desktopError: null,
+        stemsError: null,
         ...u,
       });
     }, update);
@@ -546,6 +553,87 @@ test.describe("screen recording (v1.52)", () => {
     expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
 
+  test("v1.53: desktop audio is picked on the card, asked for, and reported on", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Mixer").click();
+    const card = page.getByTestId("screen-record-card");
+    // Someone who used the app before v1.53.0 starts with it off.
+    const picker = page.getByTestId("screen-record-desktop");
+    await expect(picker).toContainText("No desktop audio");
+    await picker.getByRole("button").click();
+    await picker.getByRole("option", { name: /Everything except Divora/ }).click();
+    await expect(page.getByTestId("screen-record-subtitle")).toHaveText(
+      "Your voice and soundboard, plus sound from other apps",
+    );
+    expect(
+      await page.evaluate(() => JSON.parse(localStorage.getItem("divora.screenRecording") ?? "{}")),
+    ).toMatchObject({ desktopAudio: "everything" });
+
+    await page.getByTestId("screen-record-toggle").click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (
+            window as unknown as {
+              __E2E_INVOKES__: Array<{ cmd: string; args: Record<string, unknown> }>;
+            }
+          ).__E2E_INVOKES__.find((i) => i.cmd === "start_screen_recording")?.args,
+        ),
+      )
+      .toMatchObject({ desktopAudio: "everything", desktopGainDb: -6, stems: false });
+
+    const running = {
+      state: "recording",
+      path: "C:/mock/recordings/divora-screen-x.mp4",
+      elapsedMs: 15_000,
+      desktopSourceId: "everything",
+      desktopSource: "Everything except Divora",
+    };
+    await emitScreen(page, { ...running, desktopQuietSeconds: 3 });
+    await expect(page.getByTestId("screen-record-desktop-quiet")).toHaveCount(0);
+    await emitScreen(page, { ...running, desktopQuietSeconds: 11.2 });
+    await expect(page.getByTestId("screen-record-desktop-quiet")).toContainText(
+      "Nothing heard from other apps for 11 s",
+    );
+    await emitScreen(page, { ...running, desktopLostAt: 14.2 });
+    await expect(page.getByTestId("screen-record-desktop-lost")).toContainText(
+      "Desktop audio lost at 0:14",
+    );
+    await emitScreen(page, {
+      ...running,
+      desktopSourceId: "device:{x}",
+      desktopSource: "Headphones",
+      desktopDoubled: true,
+    });
+    await expect(page.getByTestId("screen-record-doubled")).toContainText(
+      "set to play its sound on Headphones, so your voice or soundboard is recorded twice",
+    );
+    await expect(page.getByTestId("screen-record-subtitle")).toHaveText(
+      "Your voice and soundboard, plus what Headphones plays",
+    );
+    // The engine stops: with desktop audio still going, only the voice and
+    // soundboard are lost.
+    await emitScreen(page, { ...running, audioLostAt: 83.4 });
+    await expect(page.getByTestId("screen-record-audio-lost")).toContainText(
+      "Your voice and soundboard stopped at 1:23",
+    );
+    await emitScreen(page, {
+      state: "recording",
+      path: "C:/mock/recordings/divora-screen-x.mp4",
+      desktopError: "Desktop audio couldn't start: no answer",
+    });
+    await expect(page.getByTestId("screen-record-desktop-error")).toContainText(
+      "Recording without desktop audio: Desktop audio couldn't start",
+    );
+    await expect(page.getByTestId("screen-record-subtitle")).toHaveText(
+      "Your modulated voice and soundboard",
+    );
+    await expect(card).toBeVisible();
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
   test("the rec:screen and rec:wav hotkeys start their recorders", async ({ page }) => {
     await nav(page, "Mixer").click();
     await expect(page.getByTestId("screen-record-toggle")).toBeEnabled();
@@ -579,6 +667,12 @@ test.describe("screen recording (v1.52)", () => {
     expect(
       await page.evaluate(() => JSON.parse(localStorage.getItem("divora.screenRecording") ?? "{}")),
     ).toMatchObject({ fps: 60, quality: "high" });
+    // v1.53.0: the desktop audio volume and the separate files.
+    await expect(rows).toContainText("Desktop audio volume · -6 dB");
+    await rows.getByRole("switch", { name: /separate WAV files/ }).click();
+    expect(
+      await page.evaluate(() => JSON.parse(localStorage.getItem("divora.screenRecording") ?? "{}")),
+    ).toMatchObject({ stems: true });
     // The recorders' hotkey rows (v1.52.0).
     await expect(
       page.getByText("Start or stop recording a screen with your voice and soundboard."),
