@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.53.0] — 2026-10-15 — Your PC's sound in screen recordings
+
 ### Added
 
 - **Your PC's sound in screen recordings.** The **Record screen** card gains a **desktop audio** picker. **Everything except Divora** adds what your other apps play — a game, a video — to the same file as your voice. It leaves out Divora's own sound (your voice, soundboard and monitor), so your voice isn't recorded twice — and also anything Divora started, such as a browser it launched to open a link.
