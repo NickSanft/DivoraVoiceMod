@@ -16,6 +16,14 @@
 //!
 //! Drift only: the slope is held to ±0.5 % of nominal, far outside any real
 //! crystal, so a run of bad pairs can bend the line but never wildly.
+//!
+//! A take's line runs through every pair it has seen. A crystal's drift is
+//! not quite constant, though — it moves with the temperature — and a
+//! straight line through hours of a slowly changing drift misses the newest
+//! audio by more the longer it runs: Δ·T/12 for a drift that moves by Δ over
+//! T, 6 ms for 10 ppm over two hours. Replay's timeline lives as long as the
+//! engine runs, so its fit forgets: [`ClockFit::windowed`] fits only the
+//! newest few minutes.
 
 /// Seconds of audio the fit needs before it trusts its own slope over the
 /// nominal rate. Before then a handful of jittery pairs would swing it.
@@ -24,21 +32,73 @@ const MIN_FIT_SECONDS: f64 = 2.0;
 /// How far the measured rate may stray from nominal, either way.
 pub const MAX_DRIFT: f64 = 0.005;
 
-/// A least-squares line `time = a + b · frame` through every pair so far, with
-/// the slope clamped near nominal.
+/// A least-squares line `time = a + b · frame` through every pair so far —
+/// or, windowed, through the newest ones — with the slope clamped near
+/// nominal.
 #[derive(Debug, Clone)]
 pub struct ClockFit {
     /// Nominal frames per second.
     rate: f64,
+    /// Every pair so far; for a windowed fit, those since it last turned over.
+    pairs: Moments,
+    /// A windowed fit's previous half-window, once it has rotated.
+    older: Option<Moments>,
+    /// A windowed fit's half-window, in frames; `None` fits every pair.
+    half: Option<f64>,
+    last_n: f64,
+}
+
+/// Welford's running means and co-moments of a set of pairs: stable over
+/// the tens of millions of frames in a long take, where Σn² would not be.
+#[derive(Debug, Clone, Copy, Default)]
+struct Moments {
     count: u64,
-    // Welford's running means and co-moments: stable over the tens of
-    // millions of frames in a long take, where Σn² would not be.
     mean_n: f64,
     mean_t: f64,
     m2_n: f64,
     c_nt: f64,
+    /// The first pair's frame.
     first_n: f64,
-    last_n: f64,
+}
+
+impl Moments {
+    #[allow(clippy::cast_precision_loss)] // a count of pairs: exact far past any take
+    fn add(&mut self, n: f64, t: f64) {
+        if self.count == 0 {
+            self.first_n = n;
+        }
+        self.count += 1;
+        let k = self.count as f64;
+        let dn = n - self.mean_n;
+        self.mean_n += dn / k;
+        self.mean_t += (t - self.mean_t) / k;
+        // Welford: the co-moment uses the OLD mean for one factor and the new
+        // one for the other.
+        self.m2_n += dn * (n - self.mean_n);
+        self.c_nt += dn * (t - self.mean_t);
+    }
+
+    /// Both sets of pairs as one, by Chan's pairwise merge: the means move
+    /// toward the newer set by its share of the pairs, and each co-moment
+    /// gains the part the two means' distance explains.
+    #[allow(clippy::cast_precision_loss)] // as `add`
+    fn merged(&self, newer: &Self) -> Self {
+        if newer.count == 0 {
+            return *self;
+        }
+        let (a, b) = (self.count as f64, newer.count as f64);
+        let k = a + b;
+        let dn = newer.mean_n - self.mean_n;
+        let dt = newer.mean_t - self.mean_t;
+        Self {
+            count: self.count + newer.count,
+            mean_n: self.mean_n + dn * b / k,
+            mean_t: self.mean_t + dt * b / k,
+            m2_n: self.m2_n + newer.m2_n + dn * dn * a * b / k,
+            c_nt: self.c_nt + newer.c_nt + dn * dt * a * b / k,
+            first_n: self.first_n,
+        }
+    }
 }
 
 impl ClockFit {
@@ -47,43 +107,73 @@ impl ClockFit {
     pub fn new(rate: u32) -> Self {
         Self {
             rate: f64::from(rate.max(1)),
-            count: 0,
-            mean_n: 0.0,
-            mean_t: 0.0,
-            m2_n: 0.0,
-            c_nt: 0.0,
-            first_n: 0.0,
+            pairs: Moments::default(),
+            older: None,
+            half: None,
             last_n: 0.0,
         }
+    }
+
+    /// A fit through only the newest `window_seconds` of frames, for a clock
+    /// watched for hours.
+    ///
+    /// It keeps two halves: every `window_seconds / 2` of frames the newer
+    /// half becomes the older and the oldest is forgotten, and the line runs
+    /// through both — so through the newest half to whole window. Until the
+    /// first such turn it **is** [`ClockFit::new`], bit for bit: one set of
+    /// pairs, no merge arithmetic. A window under twice the seconds a slope
+    /// needs ([`MIN_FIT_SECONDS`]) is raised to that, so a half on its own
+    /// still has one.
+    #[must_use]
+    pub fn windowed(rate: u32, window_seconds: u32) -> Self {
+        let mut fit = Self::new(rate);
+        let window = f64::from(window_seconds).max(2.0 * MIN_FIT_SECONDS);
+        fit.half = Some(window / 2.0 * fit.rate);
+        fit
     }
 
     /// Whether any pair has been added.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.pairs.count == 0 && self.older.is_none()
     }
 
-    /// Seconds per frame: fitted once there is enough to fit, nominal before.
-    fn slope(&self) -> f64 {
+    /// The pairs the line runs through.
+    fn line(&self) -> Moments {
+        match &self.older {
+            Some(older) => older.merged(&self.pairs),
+            None => self.pairs,
+        }
+    }
+
+    /// Seconds per frame through `m`: fitted once there is enough to fit,
+    /// nominal before.
+    fn slope_of(&self, m: &Moments) -> f64 {
         let nominal = 1.0 / self.rate;
-        let span = self.last_n - self.first_n;
-        if self.count < 3 || span < MIN_FIT_SECONDS * self.rate || self.m2_n <= 0.0 {
+        let span = self.last_n - m.first_n;
+        if m.count < 3 || span < MIN_FIT_SECONDS * self.rate || m.m2_n <= 0.0 {
             return nominal;
         }
-        let fitted = self.c_nt / self.m2_n;
+        let fitted = m.c_nt / m.m2_n;
         fitted.clamp(nominal / (1.0 + MAX_DRIFT), nominal / (1.0 - MAX_DRIFT))
+    }
+
+    fn slope(&self) -> f64 {
+        self.slope_of(&self.line())
     }
 
     /// The time frame `n` sounds at, by the line. Meaningless while empty.
     #[must_use]
     pub fn time_of(&self, n: f64) -> f64 {
-        self.mean_t + self.slope() * (n - self.mean_n)
+        let m = self.line();
+        m.mean_t + self.slope_of(&m) * (n - m.mean_n)
     }
 
     /// The (fractional) frame sounding at time `t`.
     #[must_use]
     pub fn frame_at(&self, t: f64) -> f64 {
-        self.mean_n + (t - self.mean_t) / self.slope()
+        let m = self.line();
+        m.mean_n + (t - m.mean_t) / self.slope_of(&m)
     }
 
     /// Frames per second on the video's clock.
@@ -103,25 +193,20 @@ impl ClockFit {
     /// later than the line says. `None` while there is no line yet.
     #[must_use]
     pub fn residual(&self, n: f64, t: f64) -> Option<f64> {
-        (self.count > 0).then(|| t - self.time_of(n))
+        (!self.is_empty()).then(|| t - self.time_of(n))
     }
 
     /// Add a pair.
-    #[allow(clippy::cast_precision_loss)] // a count of pairs: exact far past any take
     pub fn add(&mut self, n: f64, t: f64) {
-        if self.count == 0 {
-            self.first_n = n;
+        // A windowed fit whose newer half is full turns over first, so the
+        // newest pair always lands in the newer half.
+        if let Some(half) = self.half {
+            if self.pairs.count > 0 && n - self.pairs.first_n >= half {
+                self.older = Some(std::mem::take(&mut self.pairs));
+            }
         }
-        self.count += 1;
         self.last_n = self.last_n.max(n);
-        let k = self.count as f64;
-        let dn = n - self.mean_n;
-        self.mean_n += dn / k;
-        self.mean_t += (t - self.mean_t) / k;
-        // Welford: the co-moment uses the OLD mean for one factor and the new
-        // one for the other.
-        self.m2_n += dn * (n - self.mean_n);
-        self.c_nt += dn * (t - self.mean_t);
+        self.pairs.add(n, t);
     }
 }
 
@@ -235,5 +320,95 @@ mod tests {
     #[test]
     fn an_empty_fit_has_no_residual() {
         assert!(ClockFit::new(48_000).residual(0.0, 0.0).is_none());
+        assert!(ClockFit::windowed(48_000, 600).residual(0.0, 0.0).is_none());
+    }
+
+    /// Where frame `n` of a 48 kHz clock sounds when it runs 100 ppm fast,
+    /// and 10 ppm faster still by the end of two hours: the slow change a
+    /// warming crystal makes.
+    fn ramp(n: f64) -> f64 {
+        let u = n / 48_000.0;
+        u - 1e-6 * (100.0 * u + 5.0 * u * u / 7_200.0)
+    }
+
+    /// A windowed fit is the global one until it first turns over, to the
+    /// bit — so an epoch as short as a take, every golden included, is
+    /// untouched by it — and over two hours of a drift that moves, it stays
+    /// on the clock where the global line slides 6 ms off (Δ·T/12).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn windowed_is_global_until_it_rotates() {
+        let bits = |x: Option<f64>| x.map(f64::to_bits);
+        let mut global = ClockFit::new(48_000);
+        let mut windowed = ClockFit::windowed(48_000, 600);
+        let mut rng = Lcg(5);
+        // 290 s of +80 ppm through 5 ms of jitter: short of the turn at 300 s.
+        for k in 0..29_000u32 {
+            let n = f64::from(k) * 480.0;
+            let t = n / (48_000.0 * (1.0 + 80e-6)) + 0.005 * rng.next();
+            assert_eq!(
+                bits(global.residual(n, t)),
+                bits(windowed.residual(n, t)),
+                "residual at pair {k}"
+            );
+            global.add(n, t);
+            windowed.add(n, t);
+            for probe in [0.0, n, n + 4_800.0] {
+                assert_eq!(
+                    global.time_of(probe).to_bits(),
+                    windowed.time_of(probe).to_bits(),
+                    "time_of({probe}) after pair {k}"
+                );
+            }
+            assert_eq!(
+                global.frame_at(t + 0.01).to_bits(),
+                windowed.frame_at(t + 0.01).to_bits(),
+                "frame_at after pair {k}"
+            );
+            assert_eq!(global.drift_ppm().to_bits(), windowed.drift_ppm().to_bits());
+        }
+
+        // Two hours of the ramp, a pair every 10 ms. The window turns every
+        // 30 000 pairs (300 s), so at pair p its line runs through the pairs
+        // from the start of the half before p's.
+        let pairs: Vec<(f64, f64)> = (0..720_000u32)
+            .map(|k| {
+                let n = f64::from(k) * 480.0;
+                (n, ramp(n))
+            })
+            .collect();
+        let mut global = ClockFit::new(48_000);
+        let mut windowed = ClockFit::windowed(48_000, 600);
+        for (p, &(n, t)) in pairs.iter().enumerate() {
+            global.add(n, t);
+            windowed.add(n, t);
+            if p % 60_000 != 59_999 {
+                continue;
+            }
+            let off = windowed.time_of(n) - t;
+            assert!(
+                off.abs() < 1e-4,
+                "{:.0} s in, the window is {:.3} ms off",
+                t,
+                off * 1e3
+            );
+            // The merge is exact: the same line as a fit fed only the
+            // window's pairs.
+            let from = (p / 30_000).saturating_sub(1) * 30_000;
+            let mut direct = ClockFit::new(48_000);
+            for &(n, t) in &pairs[from..=p] {
+                direct.add(n, t);
+            }
+            let apart = windowed.time_of(n) - direct.time_of(n);
+            assert!(apart.abs() < 1e-7, "the merge is {apart:e} s off at {p}");
+        }
+        // The control: the global line, through all two hours of it.
+        let (n, t) = pairs[pairs.len() - 1];
+        let off = global.time_of(n) - t;
+        assert!(
+            off.abs() > 0.005,
+            "the global fit should be ~6 ms off: {:.3} ms",
+            off * 1e3
+        );
     }
 }

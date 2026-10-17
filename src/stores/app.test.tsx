@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@solidjs/testing-library";
 import { makeTemplate } from "../data/unistroke";
 
@@ -12,7 +12,9 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+import { listen } from "@tauri-apps/api/event";
 import { AppProvider, useApp } from "./app";
+import { dispatchGlobalShortcut } from "../App";
 
 function setupApp() {
   return renderHook(() => useApp(), { wrapper: AppProvider });
@@ -558,7 +560,9 @@ describe("app store — Phase 2 audio actions", () => {
     // Settle the createEffect microtask + the inner async chain.
     await new Promise<void>((r) => setTimeout(r, 0));
     await new Promise<void>((r) => setTimeout(r, 0));
-    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    // v1.54.0: a restart, never a Stop — the start tears the old streams
+    // down itself, and a Stop is what Replay holds its ring for.
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
     expect(invokeMock).toHaveBeenCalledWith(
       "start_audio_engine",
       expect.objectContaining({ inputName: "Mic B" }),
@@ -587,7 +591,7 @@ describe("app store — Phase 2 audio actions", () => {
     result.setSelectedOutput("CABLE Input (VB-Audio Virtual Cable)");
     await new Promise<void>((r) => setTimeout(r, 0));
     await new Promise<void>((r) => setTimeout(r, 0));
-    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
     expect(invokeMock).toHaveBeenCalledWith(
       "start_audio_engine",
       expect.objectContaining({
@@ -624,7 +628,7 @@ describe("app store — Phase 2 audio actions", () => {
     result.setSelectedMonitor("Headphones"); // first device change since mount
     await new Promise<void>((r) => setTimeout(r, 0));
     await new Promise<void>((r) => setTimeout(r, 0));
-    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
     expect(invokeMock).toHaveBeenCalledWith(
       "start_audio_engine",
       expect.objectContaining({ monitorName: "Headphones" }),
@@ -690,7 +694,7 @@ describe("app store — Phase 2 audio actions", () => {
     result.setSelectedMonitor("Headphones");
     await new Promise<void>((r) => setTimeout(r, 0));
     await new Promise<void>((r) => setTimeout(r, 0));
-    expect(invokeMock).toHaveBeenCalledWith("stop_audio_engine");
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
     expect(invokeMock).toHaveBeenCalledWith(
       "start_audio_engine",
       expect.objectContaining({ monitorName: "Headphones" }),
@@ -1590,6 +1594,9 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
       // v1.52.0: the recorders' keys, saved unbound.
       "rec:screen": "",
       "rec:wav": "",
+      // v1.54.0: Replay's, likewise.
+      "replay:save": "",
+      "replay:toggle": "",
     });
     first.cleanup();
 
@@ -2911,5 +2918,601 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(result.cloneError()).toBe(
       "start the engine first, then record your voice",
     );
+  });
+});
+
+// ---- v1.54.0: Replay ---------------------------------------------------
+
+describe("app store — Replay (v1.54.0)", () => {
+  type Handler = (e: { payload: unknown }) => void;
+  const handlers = new Map<string, Handler[]>();
+  const fire = (event: string, payload: unknown) => {
+    for (const h of handlers.get(event) ?? []) h({ payload });
+  };
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  const GATE = "Turn Replay on from the Record screen card first — it explains what Replay keeps.";
+  const DISPLAY1 = "\\\\.\\DISPLAY1";
+  const DISPLAY2 = "\\\\.\\DISPLAY2";
+  const OFF = {
+    supported: true,
+    reason: null,
+    state: "off",
+    saving: false,
+    seconds: 30,
+    bufferedMs: 0,
+    bytes: 0,
+    capBytes: 0,
+    monitorId: null,
+    heldReason: null,
+    armed: null,
+  };
+  /** A ring built with settings unlike Settings' defaults, so a test can
+   *  tell which were sent. */
+  const RING = {
+    ...OFF,
+    state: "armed",
+    bufferedMs: 30_000,
+    capBytes: 80_044_800,
+    monitorId: DISPLAY2,
+    armed: {
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      desktopAudio: "everything",
+      desktopGainDb: -12,
+      avOffsetMs: 30,
+    },
+  };
+  const armCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "arm_replay_buffer");
+
+  /** A backend with the engine, the screens and Replay all working. */
+  function replayBackend(status: unknown = OFF) {
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "start_audio_engine":
+          return {
+            inputName: "Mic",
+            outputName: "CABLE Input",
+            sampleRate: 48000,
+            inputChannels: 1,
+            outputChannels: 2,
+          };
+        case "screen_capture_status":
+          return { supported: true, reason: null, h264Encoder: "X", hardware: true };
+        case "list_capture_monitors":
+          return [
+            { id: DISPLAY1, number: 1, x: 0, y: 0, width: 2560, height: 1440, primary: true },
+            { id: DISPLAY2, number: 2, x: 2560, y: 0, width: 1920, height: 1080, primary: false },
+          ];
+        case "list_desktop_audio_sources":
+          return [
+            {
+              id: "everything",
+              label: "Everything except Divora",
+              kind: "everything",
+              isDefault: false,
+              divoraPlays: "nothing",
+            },
+          ];
+        case "replay_buffer_status":
+          return status;
+        case "replay_memory":
+          return {
+            ceilingBytes: 1_073_741_824,
+            lengths: [15, 30, 60, 120].map((s) => ({
+              seconds: s,
+              bytes: s * 1_000_000,
+              capBytes: s * 1_250_000,
+              allowed: true,
+            })),
+          };
+        case "arm_replay_buffer":
+          return {
+            ...OFF,
+            state: "armed",
+            seconds: args?.seconds,
+            monitorId: args?.monitorId,
+            armed: {
+              fps: args?.fps,
+              quality: args?.quality,
+              cursor: args?.cursor,
+              desktopAudio: args?.desktopAudio ?? null,
+              desktopGainDb: args?.desktopGainDb,
+              avOffsetMs: args?.avOffsetMs,
+            },
+          };
+        case "disarm_replay_buffer":
+          return OFF;
+        case "save_replay":
+          throw "Replay is off.";
+        case "start_screen_recording":
+          return "C:/rec/divora-screen-test.mp4";
+        case "screen_recording_status":
+          return {
+            state: "idle",
+            path: null,
+            elapsedMs: 0,
+            droppedFrames: 0,
+            driftPpm: 0,
+            audioLostAt: null,
+            error: null,
+            desktopSourceId: null,
+            desktopSource: null,
+            desktopQuietSeconds: null,
+            desktopDoubled: false,
+            desktopLostAt: null,
+            desktopError: null,
+            stemsError: null,
+          };
+        default:
+          return null;
+      }
+    });
+  }
+
+  const explained = (more: Record<string, unknown> = {}) =>
+    window.localStorage.setItem(
+      "divora.replayBuffer",
+      JSON.stringify({ seconds: 30, explained: true, explainedDesktop: false, ...more }),
+    );
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    handlers.clear();
+    vi.mocked(listen).mockImplementation((async (event: string, handler: Handler) => {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+      return () => {};
+    }) as unknown as typeof listen);
+    window.localStorage.clear();
+    // Someone who has used the app before: desktop audio starts off.
+    window.localStorage.setItem("divora.wizardSeen", "true");
+  });
+  afterEach(() => {
+    vi.mocked(listen).mockImplementation((async () => () => {}) as unknown as typeof listen);
+    vi.restoreAllMocks();
+  });
+
+  it("is off at launch, whatever is stored", async () => {
+    window.localStorage.setItem(
+      "divora.replayBuffer",
+      JSON.stringify({ seconds: 60, explained: true, armed: true }),
+    );
+    replayBackend();
+    const { result } = setupApp();
+    await settle();
+    expect(result.replayStatus().state).toBe("off");
+    expect(result.replaySettings()).toEqual({
+      seconds: 60,
+      explained: true,
+      explainedDesktop: false,
+    });
+    expect(armCalls()).toEqual([]);
+  });
+
+  it("a window opened while Replay runs pulls its status", async () => {
+    replayBackend(RING);
+    const { result } = setupApp();
+    await settle();
+    expect(result.replayStatus()).toMatchObject({ state: "armed", monitorId: DISPLAY2 });
+  });
+
+  it("an arm is refused while the engine is stopped, in the recorders' words", async () => {
+    explained();
+    replayBackend();
+    const { result } = setupApp();
+    await result.armReplay();
+    expect(result.engineError()).toBe("Start the engine before recording.");
+    expect(armCalls()).toEqual([]);
+  });
+
+  it("an arm sends the screen settings and the length; an upgrader's desktop audio stays off", async () => {
+    window.localStorage.setItem(
+      "divora.screenRecording",
+      JSON.stringify({ monitorId: DISPLAY2, fps: 60, quality: "high", cursor: false, avOffsetMs: -20 }),
+    );
+    explained({ seconds: 60 });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.armReplay();
+    expect(armCalls()).toHaveLength(1);
+    expect(armCalls()[0]![1]).toEqual({
+      monitorId: DISPLAY2,
+      seconds: 60,
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      avOffsetMs: -20,
+      desktopGainDb: -6,
+    });
+    expect(result.replayStatus().state).toBe("armed");
+  });
+
+  it("with desktop audio on and its explainer read, the arm asks for it", async () => {
+    window.localStorage.setItem(
+      "divora.screenRecording",
+      JSON.stringify({ desktopAudio: "everything", desktopGainDb: -9 }),
+    );
+    explained({ explainedDesktop: true });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.armReplay();
+    expect(armCalls()[0]![1]).toMatchObject({
+      monitorId: DISPLAY1,
+      desktopAudio: "everything",
+      desktopGainDb: -9,
+    });
+  });
+
+  it("armReplay() never invokes arm_replay_buffer before the explainer — whatever the caller", async () => {
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+
+    await result.armReplay();
+    expect(result.toast()?.text).toBe(GATE);
+    await result.toggleReplay();
+    dispatchGlobalShortcut(result, { id: "replay:toggle", accelerator: "F10", state: "pressed" });
+    await settle();
+    // A running ring resized from Settings goes through the same gate.
+    fire("replay-buffer", { ...RING, cursor: true, seconds: 30 });
+    await result.setReplaySeconds(60);
+    await settle();
+
+    expect(armCalls()).toEqual([]);
+    expect(result.toast()).toMatchObject({ text: GATE, tone: "error" });
+    // Each refusal is its own toast, so each is announced.
+    expect(result.toast()!.id).toBeGreaterThanOrEqual(4);
+  });
+
+  it("read with desktop audio off, the explainer is needed again once it is on", async () => {
+    window.localStorage.setItem(
+      "divora.screenRecording",
+      JSON.stringify({ desktopAudio: "everything" }),
+    );
+    explained({ explainedDesktop: false });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.toggleReplay();
+    dispatchGlobalShortcut(result, { id: "replay:toggle", accelerator: "F10", state: "pressed" });
+    await settle();
+    expect(armCalls()).toEqual([]);
+    expect(result.toast()?.text).toBe(GATE);
+
+    // Read again from the card, with desktop audio on: now it arms.
+    result.markReplayExplained(true);
+    await result.armReplay();
+    expect(armCalls()).toHaveLength(1);
+  });
+
+  it("once explained, the replay:toggle hotkey turns it on and off", async () => {
+    explained();
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    dispatchGlobalShortcut(result, { id: "replay:toggle", accelerator: "F10", state: "pressed" });
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+    expect(result.replayStatus().state).toBe("armed");
+    dispatchGlobalShortcut(result, { id: "replay:toggle", accelerator: "F10", state: "pressed" });
+    await settle();
+    expect(invokeMock).toHaveBeenCalledWith("disarm_replay_buffer");
+    expect(result.replayStatus().state).toBe("off");
+    // A release does nothing.
+    dispatchGlobalShortcut(result, { id: "replay:toggle", accelerator: "F10", state: "released" });
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+  });
+
+  it("replay:save just asks; the replay-saved event reports, even a refusal", async () => {
+    replayBackend();
+    const { result } = setupApp();
+    await settle();
+    dispatchGlobalShortcut(result, { id: "replay:save", accelerator: "F11", state: "pressed" });
+    await settle();
+    expect(invokeMock).toHaveBeenCalledWith("save_replay");
+    // No toast from the rejected invoke itself…
+    expect(result.toast()).toBeNull();
+    // …only from the event, which every attempt ends in.
+    fire("replay-saved", { path: null, durationMs: 0, error: "Replay is off." });
+    expect(result.toast()).toMatchObject({ text: "Replay is off.", tone: "error" });
+  });
+
+  it("a length change resizes a running ring with the ring's own settings", async () => {
+    // The ring keeps desktop audio, so its explainer was read with it on.
+    explained({ explainedDesktop: true });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+    // Off: the length is only remembered.
+    await result.setReplaySeconds(15);
+    expect(armCalls()).toEqual([]);
+
+    fire("replay-buffer", { ...RING, seconds: 15 });
+    await result.setReplaySeconds(120);
+    expect(armCalls()).toHaveLength(1);
+    expect(armCalls()[0]![1]).toEqual({
+      monitorId: DISPLAY2,
+      seconds: 120,
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      avOffsetMs: 30,
+      desktopAudio: "everything",
+      desktopGainDb: -12,
+    });
+  });
+
+  it("a length picked while Replay is held applies once the ring runs again", async () => {
+    explained({ explainedDesktop: true });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+    fire("replay-buffer", { ...RING, seconds: 30 });
+    fire("replay-buffer", { ...RING, state: "held", heldReason: "screen-lost", seconds: 30 });
+    // Held: the length is only remembered…
+    await result.setReplaySeconds(120);
+    await settle();
+    expect(armCalls()).toEqual([]);
+    // …until the backend resumes the ring as it was.
+    fire("replay-buffer", { ...RING, state: "arming", seconds: 30 });
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+    expect(armCalls()[0]![1]).toMatchObject({ monitorId: DISPLAY2, seconds: 120, fps: 60 });
+    expect(result.replayStatus()).toMatchObject({ state: "armed", seconds: 120 });
+    // Once: the ring's own news after that is not another resume.
+    fire("replay-buffer", { ...RING, state: "armed", seconds: 120 });
+    fire("replay-buffer", { ...RING, state: "armed", seconds: 120, bufferedMs: 31_000 });
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+  });
+
+  it("held for an engine stop, the new length waits for the engine as well", async () => {
+    explained({ explainedDesktop: true });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+    fire("replay-buffer", { ...RING, seconds: 30 });
+    await result.stopEngine();
+    fire("replay-buffer", { ...RING, state: "held", heldReason: "engine-stopped", seconds: 30 });
+    await result.setReplaySeconds(60);
+    // The ring's news can beat the engine's: no arm yet, and no refusal.
+    fire("replay-buffer", { ...RING, state: "arming", seconds: 30 });
+    await settle();
+    expect(armCalls()).toEqual([]);
+    expect(result.engineError()).toBeNull();
+    await result.startEngine();
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+    expect(armCalls()[0]![1]).toMatchObject({ seconds: 60 });
+  });
+
+  it("a ring that resumes at the length picked is left alone", async () => {
+    explained({ explainedDesktop: true });
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+    fire("replay-buffer", { ...RING, seconds: 30 });
+    fire("replay-buffer", { ...RING, state: "held", heldReason: "screen-lost", seconds: 30 });
+    fire("replay-buffer", { ...RING, state: "arming", seconds: 30 });
+    await settle();
+    expect(armCalls()).toEqual([]);
+    // A later pick on the running ring resizes it the usual way.
+    await result.setReplaySeconds(15);
+    expect(armCalls()).toHaveLength(1);
+  });
+
+  it("a resume's re-arm that is refused is not asked again with every status", async () => {
+    explained({ explainedDesktop: true });
+    replayBackend();
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "arm_replay_buffer") throw "120 s needs more memory than this PC allows.";
+      return base(cmd, args);
+    });
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+    fire("replay-buffer", { ...RING, seconds: 30 });
+    fire("replay-buffer", { ...RING, state: "held", heldReason: "screen-lost", seconds: 30 });
+    await result.setReplaySeconds(120);
+    fire("replay-buffer", { ...RING, state: "arming", seconds: 30 });
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+    expect(result.toast()).toMatchObject({ tone: "error" });
+    // The ring runs on at the length it had; its news asks nothing more.
+    for (const ms of [1_000, 2_000, 3_000]) {
+      fire("replay-buffer", { ...RING, state: "armed", seconds: 30, bufferedMs: ms });
+    }
+    await settle();
+    expect(armCalls()).toHaveLength(1);
+  });
+
+  it("divora.replayBuffer never stores whether Replay is on", async () => {
+    explained();
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await result.armReplay();
+    await result.setReplaySeconds(60);
+    result.markReplayExplained(true);
+    const stored = JSON.parse(window.localStorage.getItem("divora.replayBuffer") ?? "null");
+    expect(Object.keys(stored).sort()).toEqual(["explained", "explainedDesktop", "seconds"]);
+    expect(stored).toEqual({ seconds: 60, explained: true, explainedDesktop: true });
+  });
+
+  it("a take while Replay is on asks for exactly what the ring runs with", async () => {
+    replayBackend();
+    const { result } = setupApp();
+    await result.startEngine();
+    await settle();
+    fire("replay-buffer", RING);
+    await result.toggleScreenRecording();
+    expect(invokeMock).toHaveBeenCalledWith("start_screen_recording", {
+      monitorId: DISPLAY2,
+      filename: expect.stringMatching(/^divora-screen-.*\.mp4$/),
+      fps: 60,
+      quality: "high",
+      cursor: false,
+      avOffsetMs: 30,
+      desktopAudio: "everything",
+      desktopGainDb: -12,
+      stems: false,
+    });
+  });
+
+  it("a device change while the engine runs restarts it without a Stop", async () => {
+    replayBackend();
+    const { result } = setupApp();
+    result.setSelectedInput("Mic A");
+    result.setSelectedOutput("Headphones");
+    await result.startEngine();
+    result.setIsRecording(true);
+    invokeMock.mockClear();
+    result.setSelectedOutput("CABLE Input (VB-Audio Virtual Cable)");
+    await settle();
+    await settle();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "start_audio_engine",
+      expect.objectContaining({ outputName: "CABLE Input (VB-Audio Virtual Cable)" }),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("stop_audio_engine");
+    // The start's own teardown finalized the WAV, as a stop does.
+    expect(result.isRecording()).toBe(false);
+  });
+
+  it("the memory figures follow the chosen screen and settings", async () => {
+    replayBackend();
+    const { result } = setupApp();
+    await result.refreshCapture();
+    await settle();
+    expect(invokeMock).toHaveBeenCalledWith("replay_memory", {
+      monitorId: DISPLAY1,
+      fps: 30,
+      quality: "balanced",
+    });
+    expect(result.replayMemory()?.lengths).toHaveLength(4);
+    invokeMock.mockClear();
+    result.setScreenSettings({ fps: 60 });
+    await settle();
+    expect(invokeMock).toHaveBeenCalledWith("replay_memory", {
+      monitorId: DISPLAY1,
+      fps: 60,
+      quality: "balanced",
+    });
+  });
+
+  describe("the save toast names the preset only when the whole clip was disguised", () => {
+    let now = 0;
+    const saved = (durationMs: number) =>
+      fire("replay-saved", { path: "C:/rec/divora-replay-x.mp4", durationMs, error: null });
+
+    beforeEach(() => {
+      now = 1_000;
+      vi.spyOn(performance, "now").mockImplementation(() => now);
+    });
+
+    it("modulated with the preset since before the clip: named", async () => {
+      replayBackend();
+      const { result } = setupApp();
+      await settle();
+      result.setUi("pressed", true);
+      expect(result.status()).toBe("modulated");
+      expect(result.modulatedSince()).toBe(1_000);
+      now = 40_000;
+      saved(30_000);
+      expect(result.toast()).toMatchObject({
+        text: `Saved a 30 s replay · ${result.preset().name}`,
+        tone: "success",
+      });
+    });
+
+    it("modulated only partway (allowing for the save's 3 s): the call's voice", async () => {
+      replayBackend();
+      const { result } = setupApp();
+      await settle();
+      result.setUi("pressed", true);
+      now = 33_999;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
+    });
+
+    it("clean or muted: the call's voice", async () => {
+      replayBackend();
+      const { result } = setupApp();
+      await settle();
+      now = 40_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
+
+      result.setUi("pressed", true);
+      result.setUi("muted", true);
+      expect(result.status()).toBe("muted");
+      expect(result.modulatedSince()).toBeNull();
+      now = 90_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
+    });
+
+    it("a preset change inside the clip: the call's voice", async () => {
+      replayBackend();
+      const { result } = setupApp();
+      await settle();
+      result.setUi("pressed", true);
+      now = 20_000;
+      result.usePreset("static-wraith");
+      expect(result.status()).toBe("modulated");
+      expect(result.modulatedSince()).toBe(20_000);
+      now = 40_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
+      // Held long enough, the new preset is named.
+      now = 60_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · Static Wraith");
+    });
+
+    it("a held ring's clip ends at the hold: a preset picked after it is not named", async () => {
+      replayBackend();
+      const { result } = setupApp();
+      await settle();
+      result.setUi("pressed", true);
+      fire("replay-buffer", { ...RING, seconds: 30 });
+      // The screen goes at 40 s; the clip ends there, under the first preset.
+      now = 40_000;
+      fire("replay-buffer", { ...RING, state: "held", heldReason: "screen-lost", seconds: 30 });
+      now = 41_000;
+      result.usePreset("static-wraith");
+      now = 120_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
+      // Back to keeping: judged from the save again.
+      fire("replay-buffer", { ...RING, state: "armed", seconds: 30 });
+      now = 125_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe("Saved a 30 s replay · Static Wraith");
+    });
+
+    it("a held ring disguised from before the clip to the hold is named", async () => {
+      replayBackend();
+      const { result } = setupApp();
+      await settle();
+      result.setUi("pressed", true);
+      now = 40_000;
+      fire("replay-buffer", { ...RING, state: "held", heldReason: "screen-lost", seconds: 30 });
+      now = 300_000;
+      saved(30_000);
+      expect(result.toast()?.text).toBe(`Saved a 30 s replay · ${result.preset().name}`);
+    });
   });
 });

@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use divora_core::audio::{
     detect_virtual_mic as detect_virtual_mic_core, list_input_devices as list_input_devices_core,
@@ -28,21 +28,28 @@ use divora_core::soundboard::{
     decode_clip, scan_folder, DecodedClip, SoundboardCommand, SoundboardTile,
 };
 use serde::Serialize;
-use tauri::menu::{Menu, MenuItem};
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 mod midi;
+pub mod replay;
 mod screen;
 use midi::{
     list_inputs as list_midi_inputs_core, open_input as open_midi_input_core, MidiInputInfo,
 };
 use midir::MidiInputConnection;
+use replay::{
+    replay_memory as replay_memory_for, sanitize_seconds, ReplayMemory, ReplaySaved, ReplayStatus,
+    TrayIconKind, TrayView, REPLAY_ICON, REPLAY_ICON_SIZE, TRAY_OFF_ID, TRAY_OFF_LABEL,
+    TRAY_SAVE_ID, TRAY_SAVE_LABEL,
+};
 use screen::{
     desktop_source_dtos, monitor_dtos, parse_desktop_source, sanitize_desktop_gain_db,
-    sanitize_fps, screen_recording_path, CaptureStatusDto, DesktopSourceDto, MonitorDto, Quality,
-    ScreenRecorder, ScreenRecordingUpdate, StartRequest,
+    sanitize_fps, screen_recording_path, ArmRequest, CaptureStatusDto, DesktopSourceDto,
+    MonitorDto, Quality, ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
 
 /// Payload of the periodic `audio-levels` event. Frontend listens with
@@ -737,6 +744,112 @@ async fn stop_screen_recording(
 #[tauri::command]
 fn screen_recording_status(state: State<'_, AppState>) -> ScreenRecordingUpdate {
     state.screen.status()
+}
+
+// ---- v1.54.0: Replay ----
+//
+// The last 15, 30, 60 or 120 seconds of one screen kept in memory, saved on
+// request. All `async` for the same reason as the screen recorder's: they
+// wait on Windows (an arm waits for the pipeline's first frame, a save for
+// its file).
+
+/// Replay now.
+#[tauri::command]
+async fn replay_buffer_status(state: State<'_, AppState>) -> Result<ReplayStatus, String> {
+    let recorder = Arc::clone(&state.screen);
+    tauri::async_runtime::spawn_blocking(move || recorder.replay_status())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What each length of Replay needs on `monitor_id` at these settings, and
+/// what this PC allows.
+#[tauri::command]
+async fn replay_memory(
+    monitor_id: String,
+    fps: Option<u32>,
+    quality: Option<String>,
+) -> Result<ReplayMemory, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let monitor = divora_capture::list_monitors()
+            .into_iter()
+            .find(|m| m.id == monitor_id)
+            .ok_or_else(|| "That screen isn't connected any more — pick another.".to_string())?;
+        Ok(replay_memory_for(
+            (monitor.width, monitor.height),
+            sanitize_fps(fps),
+            Quality::parse(quality.as_deref()),
+            divora_capture::total_physical_memory(),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Turn Replay on for `monitor_id`, keeping `seconds` (15, 30, 60 or 120),
+/// with the same settings a screen recording there would use — or change
+/// its length while it is on. Resolves once the pipeline's first frame is
+/// in; refuses in the user's words (the engine stopped, too little memory,
+/// another screen already kept, …).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // one per field of the invoke payload
+async fn arm_replay_buffer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    monitor_id: String,
+    seconds: Option<u32>,
+    fps: Option<u32>,
+    quality: Option<String>,
+    cursor: Option<bool>,
+    av_offset_ms: Option<i32>,
+    desktop_audio: Option<String>,
+    desktop_gain_db: Option<f64>,
+) -> Result<ReplayStatus, String> {
+    let req = ArmRequest {
+        screen: StartRequest {
+            monitor_id,
+            path: PathBuf::new(),
+            fps: sanitize_fps(fps),
+            quality: Quality::parse(quality.as_deref()),
+            cursor: cursor.unwrap_or(true),
+            av_offset_ms: av_offset_ms.unwrap_or(0),
+            desktop: parse_desktop_source(desktop_audio.as_deref()),
+            desktop_gain_db: sanitize_desktop_gain_db(desktop_gain_db),
+            stems: false,
+        },
+        seconds: sanitize_seconds(seconds),
+    };
+    let recorder = Arc::clone(&state.screen);
+    let engine = Arc::clone(&state.engine);
+    tauri::async_runtime::spawn_blocking(move || recorder.arm_replay(&app, &engine, req))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Turn Replay off. A Save already pressed still finishes.
+#[tauri::command]
+async fn disarm_replay_buffer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ReplayStatus, String> {
+    let recorder = Arc::clone(&state.screen);
+    tauri::async_runtime::spawn_blocking(move || recorder.disarm_replay(&app))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Save what Replay holds, ending on the frame showing now. Resolves with
+/// the clip; every outcome is also a `replay-saved` event.
+#[tauri::command]
+async fn save_replay(app: AppHandle, state: State<'_, AppState>) -> Result<ReplaySaved, String> {
+    // The press, not when the blocking pool gets to it.
+    let at = Instant::now();
+    let recorder = Arc::clone(&state.screen);
+    let dir = state.recordings_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || recorder.save_replay(&app, dir, at))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|clip| ReplaySaved::saved(&clip))
 }
 
 #[tauri::command]
@@ -2308,15 +2421,54 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+/// The tray icon's id.
+pub(crate) const TRAY_ID: &str = "divora-tray";
+
+/// The tray menu: Show and Quit, and (v1.54.0) Replay's two items while it
+/// is on. The tray never turns Replay on: that goes through the card.
+fn tray_menu<R: tauri::Runtime, M: Manager<R>>(app: &M, replay: bool) -> tauri::Result<Menu<R>> {
+    let show = MenuItem::with_id(app, "show", "Show DivoraVoice", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    if !replay {
+        return Menu::with_items(app, &[&show, &quit]);
+    }
+    let save = MenuItem::with_id(app, TRAY_SAVE_ID, TRAY_SAVE_LABEL, true, None::<&str>)?;
+    let off = MenuItem::with_id(app, TRAY_OFF_ID, TRAY_OFF_LABEL, true, None::<&str>)?;
+    let gap = PredefinedMenuItem::separator(app)?;
+    let gap2 = PredefinedMenuItem::separator(app)?;
+    Menu::with_items(app, &[&show, &gap, &save, &off, &gap2, &quit])
+}
+
+/// v1.54.0: show `view` in the tray — its tooltip, menu and icon. On the
+/// main thread and without waiting for it: the tray's setters block when
+/// called from elsewhere, and Quit holds the main thread while it waits.
+pub(crate) fn sync_tray(app: &AppHandle, view: TrayView) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(tray) = handle.tray_by_id(TRAY_ID) else {
+            return;
+        };
+        let _ = tray.set_tooltip(Some(&view.tooltip));
+        if let Ok(menu) = tray_menu(&handle, view.replay_items) {
+            let _ = tray.set_menu(Some(menu));
+        }
+        let icon = match view.icon {
+            TrayIconKind::Replay => {
+                Some(Image::new(REPLAY_ICON, REPLAY_ICON_SIZE, REPLAY_ICON_SIZE))
+            }
+            TrayIconKind::Normal => handle.default_window_icon().cloned(),
+        };
+        let _ = tray.set_icon(icon);
+    });
+}
+
 /// Phase 15: build the system-tray icon + menu so the app can run in the
 /// background (e.g. while gaming / on a Discord call). Left-click the
 /// tray icon or "Show" to restore the window; "Quit" exits for real.
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItem::with_id(app, "show", "Show DivoraVoice", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = tray_menu(app, false)?;
 
-    let mut builder = TrayIconBuilder::with_id("divora-tray")
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("DivoraVoice")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -2325,12 +2477,35 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "quit" => {
                 // v1.52.0: a screen recording in progress is finished first;
                 // exiting under it would leave an unplayable `.part`.
+                // v1.54.0: then a replay being saved, before Replay goes.
                 if let Some(state) = app.try_state::<AppState>() {
                     if state.screen.is_busy() {
                         let _ = state.screen.stop(app);
                     }
+                    state.screen.quit_replay(app);
                 }
                 app.exit(0);
+            }
+            TRAY_SAVE_ID => {
+                if let Some(state) = app.try_state::<AppState>() {
+                    let at = Instant::now();
+                    let recorder = Arc::clone(&state.screen);
+                    let dir = state.recordings_dir.clone();
+                    let app = app.clone();
+                    // The event and the tooltip say how it went.
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let _ = recorder.save_replay(&app, dir, at);
+                    });
+                }
+            }
+            TRAY_OFF_ID => {
+                if let Some(state) = app.try_state::<AppState>() {
+                    let recorder = Arc::clone(&state.screen);
+                    let app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        recorder.disarm_replay(&app);
+                    });
+                }
             }
             _ => {}
         })
@@ -2604,6 +2779,11 @@ pub fn run() {
             start_screen_recording,
             stop_screen_recording,
             screen_recording_status,
+            replay_buffer_status,
+            replay_memory,
+            arm_replay_buffer,
+            disarm_replay_buffer,
+            save_replay,
             scan_soundboard_folder,
             play_soundboard_clip,
             stop_soundboard_clip,

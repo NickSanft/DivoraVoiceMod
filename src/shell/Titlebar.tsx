@@ -4,9 +4,10 @@
 // `data-tauri-drag-region` attribute (which Tauri 2 wires up natively
 // for frameless windows).
 
-import { type JSX } from "solid-js";
+import { Show, type JSX } from "solid-js";
 import { DMark } from "../components/DMark";
 import { Sigil } from "../components/Sigil";
+import { chipLabel, chipTitle, replayOn } from "../data/replay";
 import { useApp } from "../stores/app";
 import { statusMeta } from "./statusMeta";
 
@@ -32,6 +33,9 @@ const onClose = async () => (await tauriWindow())?.close();
 export function Titlebar(): JSX.Element {
   const app = useApp();
   const meta = () => statusMeta(app.status());
+  // The kept screen's number, once the screens are known.
+  const replayScreen = (): number | null =>
+    app.captureMonitors().find((m) => m.id === app.replayStatus().monitorId)?.number ?? null;
 
   return (
     <div
@@ -64,6 +68,24 @@ export function Titlebar(): JSX.Element {
         {meta().label}
       </span>
       <div style={{ flex: 1 }} />
+      {/* v1.54.0: Replay is on. One of its indicators, with the tray icon and
+          Windows' border; the title says what is kept, calls included. No
+          animation in any state. */}
+      <Show when={replayOn(app.replayStatus())}>
+        <span
+          class={`titlebar-replay${
+            app.replayStatus().state === "arming"
+              ? " is-arming"
+              : app.replayStatus().state === "held"
+                ? " is-held"
+                : ""
+          }`}
+          data-testid="titlebar-replay"
+          title={chipTitle(app.replayStatus(), replayScreen())}
+        >
+          <Sigil name="replay" size={13} /> {chipLabel(app.replayStatus())}
+        </span>
+      </Show>
       <span class="titlebar-local">
         <Sigil name="lock" size={13} /> LOCAL · NO ACCOUNT
       </span>

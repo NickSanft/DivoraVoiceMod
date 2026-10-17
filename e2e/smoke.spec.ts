@@ -2,12 +2,44 @@
 // Covers the core UI flows that docs/MANUAL_TESTS.md otherwise carries
 // entirely by hand. See e2e/tauri-mock.ts for the backend stub.
 
-import { test, expect } from "./tauri-mock";
+import { test, expect, emitReplay, emitReplaySaved } from "./tauri-mock";
 
 const nav = (page: import("@playwright/test").Page, label: string) =>
   page.locator(".sidebar-nav", { hasText: label });
 const seg = (page: import("@playwright/test").Page, label: string) =>
   page.locator(".seg-btn", { hasText: label });
+
+/** Trace a large triangle over the Mixer's empty lower area, as a user casts
+ *  a glyph. The cast overlay captures pointer drags that start on empty
+ *  space. */
+async function traceTriangle(page: import("@playwright/test").Page): Promise<void> {
+  const box = await page.locator("#root").boundingBox();
+  if (!box) throw new Error("no root box");
+  const cx = box.x + box.width / 2;
+  const top = box.y + box.height * 0.3;
+  const bottomY = box.y + box.height * 0.72;
+  const left = cx - box.width * 0.22;
+  const right = cx + box.width * 0.22;
+
+  const path: Array<[number, number]> = [];
+  const lerp = (a: [number, number], b: [number, number], steps: number): void => {
+    for (let i = 1; i <= steps; i++) {
+      path.push([a[0] + ((b[0] - a[0]) * i) / steps, a[1] + ((b[1] - a[1]) * i) / steps]);
+    }
+  };
+  const apex: [number, number] = [cx, top];
+  const bl: [number, number] = [left, bottomY];
+  const br: [number, number] = [right, bottomY];
+  path.push(apex);
+  lerp(apex, bl, 8);
+  lerp(bl, br, 8);
+  lerp(br, apex, 8);
+
+  await page.mouse.move(path[0]![0], path[0]![1]);
+  await page.mouse.down();
+  for (const [x, y] of path) await page.mouse.move(x, y, { steps: 2 });
+  await page.mouse.up();
+}
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
@@ -100,41 +132,7 @@ test.describe("glyph casting", () => {
     // Default binding: triangle → Velvet Demon (not the active Hollow King).
     await expect(page.getByText("Hollow King").first()).toBeVisible();
 
-    // Trace a large triangle over the Mixer's empty lower area. The cast
-    // overlay captures pointer drags that start on empty space.
-    const box = await page.locator("#root").boundingBox();
-    if (!box) throw new Error("no root box");
-    const cx = box.x + box.width / 2;
-    const top = box.y + box.height * 0.3;
-    const bottomY = box.y + box.height * 0.72;
-    const left = cx - box.width * 0.22;
-    const right = cx + box.width * 0.22;
-
-    const path: Array<[number, number]> = [];
-    const lerp = (
-      a: [number, number],
-      b: [number, number],
-      steps: number,
-    ): void => {
-      for (let i = 1; i <= steps; i++) {
-        path.push([
-          a[0] + ((b[0] - a[0]) * i) / steps,
-          a[1] + ((b[1] - a[1]) * i) / steps,
-        ]);
-      }
-    };
-    const apex: [number, number] = [cx, top];
-    const bl: [number, number] = [left, bottomY];
-    const br: [number, number] = [right, bottomY];
-    path.push(apex);
-    lerp(apex, bl, 8);
-    lerp(bl, br, 8);
-    lerp(br, apex, 8);
-
-    await page.mouse.move(path[0]![0], path[0]![1]);
-    await page.mouse.down();
-    for (const [x, y] of path) await page.mouse.move(x, y, { steps: 2 });
-    await page.mouse.up();
+    await traceTriangle(page);
 
     // A recognised triangle switches the active preset to Velvet Demon.
     await expect(page.getByText("Velvet Demon").first()).toBeVisible({
@@ -181,8 +179,10 @@ test.describe("what's new (v1.49)", () => {
       dialog.getByRole("button", { name: /Full changelog/i }),
     ).toBeVisible();
 
-    // No banner off Tauri: there is no app version to compare against.
-    await expect(page.locator('[role="status"]')).toHaveCount(0);
+    // No banner off Tauri: there is no app version to compare against. (The
+    // shell's toast is a status region too, always mounted since v1.54.0.)
+    await expect(page.locator('[role="status"]:not([data-testid="toast"])')).toHaveCount(0);
+    await expect(page.getByTestId("toast")).toHaveText("");
 
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
@@ -678,6 +678,296 @@ test.describe("screen recording (v1.52)", () => {
       page.getByText("Start or stop recording a screen with your voice and soundboard."),
     ).toBeVisible();
     await expect(page.getByText("Record voice (WAV)", { exact: true })).toBeVisible();
+  });
+});
+
+// Everything here goes by test id, never /Replay/: that also matches
+// Settings → About's "Replay setup", which re-opens the first-run wizard.
+test.describe("replay (v1.54)", () => {
+  type Page = import("@playwright/test").Page;
+
+  const MAIN_SCREEN = "\\\\.\\DISPLAY1";
+  const ARMED = {
+    state: "armed",
+    seconds: 30,
+    bufferedMs: 12_000,
+    capBytes: 80_044_800,
+    monitorId: MAIN_SCREEN,
+    heldReason: null,
+    armed: {
+      fps: 30,
+      quality: "balanced",
+      cursor: true,
+      desktopAudio: null,
+      desktopGainDb: -6,
+      avOffsetMs: 0,
+    },
+  };
+  const GATE = "Turn Replay on from the Record screen card first — it explains what Replay keeps.";
+
+  const argsOf = (page: Page, cmd: string) =>
+    page.evaluate(
+      (c) =>
+        (
+          window as unknown as {
+            __E2E_INVOKES__: Array<{ cmd: string; args: Record<string, unknown> }>;
+          }
+        ).__E2E_INVOKES__
+          .filter((i) => i.cmd === c)
+          .map((i) => i.args ?? {}),
+      cmd,
+    );
+  const press = (page: Page, id: string) =>
+    page.evaluate((i) => {
+      (
+        window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void }
+      ).__E2E_EMIT__("global-shortcut", { id: i, accelerator: "F10", state: "pressed" });
+    }, id);
+  const stored = (page: Page) =>
+    page.evaluate(() => JSON.parse(localStorage.getItem("divora.replayBuffer") ?? "null"));
+  /** As if the card's explainer had been read in an earlier session. */
+  async function explainedBefore(page: Page): Promise<void> {
+    await page.evaluate(() =>
+      localStorage.setItem(
+        "divora.replayBuffer",
+        JSON.stringify({ seconds: 30, explained: true, explainedDesktop: false }),
+      ),
+    );
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+  }
+  /** The harness starts the engine; Record going live says it has. */
+  async function engineUp(page: Page): Promise<void> {
+    await nav(page, "Mixer").click();
+    await expect(page.getByTestId("screen-record-toggle")).toBeEnabled();
+  }
+
+  test("1: the card explains Replay before it can be turned on, and focus follows", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await engineUp(page);
+    const setup = page.getByTestId("replay-setup");
+    await expect(setup).toBeVisible();
+    await expect(setup).toHaveAttribute("aria-expanded", "false");
+    await expect(setup).toHaveAttribute("aria-controls", "replay-explainer");
+    // A disclosure button, not a switch that opens text.
+    await expect(page.getByTestId("replay-toggle")).toHaveCount(0);
+
+    await setup.click();
+    await expect(setup).toHaveAttribute("aria-expanded", "true");
+    const explainer = page.getByTestId("replay-explainer");
+    await expect(explainer).toBeVisible();
+    await expect(explainer).toHaveAttribute("role", "region");
+    await expect(explainer.getByRole("heading")).toBeFocused();
+    await expect(explainer).toContainText(
+      "Divora writes no picture or sound to disk until you press Save.",
+    );
+    await expect(explainer).toContainText("calls included");
+    await expect(explainer).toContainText("Desktop audio is off here.");
+    await expect(explainer).toContainText("Divora leaves it on, so you can always tell");
+
+    await explainer.getByRole("button", { name: "Not now" }).click();
+    await expect(explainer).toHaveCount(0);
+    await expect(setup).toBeFocused();
+    await expect(setup).toHaveAttribute("aria-expanded", "false");
+
+    await setup.click();
+    await page
+      .getByTestId("replay-explainer")
+      .getByRole("button", { name: "Turn Replay on" })
+      .click();
+    await expect.poll(() => argsOf(page, "arm_replay_buffer")).toHaveLength(1);
+    const [args] = await argsOf(page, "arm_replay_buffer");
+    // The card's screen and Settings' rows, plus the length. Someone who used
+    // the app before v1.53.0 has desktop audio off, so none is asked for.
+    expect(args).toEqual({
+      monitorId: MAIN_SCREEN,
+      seconds: 30,
+      fps: 30,
+      quality: "balanced",
+      cursor: true,
+      avOffsetMs: 0,
+      desktopGainDb: -6,
+    });
+    await expect(page.getByTestId("replay-setup")).toHaveCount(0);
+    await expect(page.getByTestId("replay-toggle").getByRole("switch")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(await stored(page)).toEqual({ seconds: 30, explained: true, explainedDesktop: false });
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("2: armed shows the chip, the buffered seconds and the locked line", async ({ page }) => {
+    await engineUp(page);
+    const card = page.getByTestId("screen-record-card");
+    await expect(card).toContainText("Screen 1 · 2560×1440 · main");
+    await expect(page.getByTestId("titlebar-replay")).toHaveCount(0);
+
+    await emitReplay(page, ARMED);
+    const chip = page.getByTestId("titlebar-replay");
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveText(/REPLAY · 30 s/);
+    await expect(chip).toHaveAttribute(
+      "title",
+      "Replay is keeping the last 30 s of Screen 1, your voice and soundboard in memory. Windows draws a yellow border around that screen.",
+    );
+    await expect(page.getByTestId("replay-save")).toHaveText("Save (0:12 so far)");
+    // The pickers give way to the line that says what Replay keeps.
+    await expect(card).not.toContainText("2560×1440");
+    await expect(page.getByTestId("screen-record-desktop")).toHaveCount(0);
+    await expect(page.getByTestId("replay-locked")).toHaveText(
+      "Replay is keeping Screen 1, your voice and soundboard. Turn it off to change the screen or desktop audio.",
+    );
+
+    await emitReplay(page, {
+      bufferedMs: 30_000,
+      armed: { ...ARMED.armed, desktopAudio: "everything" },
+    });
+    await expect(page.getByTestId("replay-save")).toHaveText("Save the last 30 s");
+    await expect(page.getByTestId("replay-locked")).toContainText(
+      "your voice and soundboard, and sound from other apps (calls included)",
+    );
+    await expect(chip).toHaveAttribute("title", /calls included/);
+
+    await emitReplay(page, { saving: true });
+    await expect(page.getByTestId("replay-save")).toHaveText("Saving…");
+    await expect(page.getByTestId("replay-save")).toBeDisabled();
+  });
+
+  test("3: a save hotkey while off says so", async ({ page }) => {
+    await engineUp(page);
+    await press(page, "replay:save");
+    await expect(page.getByTestId("toast")).toHaveText("Replay is off.");
+    expect(await argsOf(page, "save_replay")).toHaveLength(1);
+    // Esc dismisses it.
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("toast")).toHaveText("");
+  });
+
+  test("4: a save hotkey while armed saves", async ({ page }) => {
+    await engineUp(page);
+    await emitReplay(page, ARMED);
+    await press(page, "replay:save");
+    await expect.poll(() => argsOf(page, "save_replay")).toHaveLength(1);
+    // The clean voice (push-to-modulate up) is named as what the call heard.
+    await expect(page.getByTestId("toast")).toHaveText(
+      "Saved a 12 s replay · your voice as your call heard it",
+    );
+  });
+
+  test("5: the save toast names the preset only while the whole clip was disguised", async ({
+    page,
+  }) => {
+    // A triangle mutes, so the voice can be muted from the Mixer.
+    await page.evaluate(() =>
+      localStorage.setItem("divora.glyphBindings", JSON.stringify({ triangle: { kind: "mute" } })),
+    );
+    await page.reload();
+    await engineUp(page);
+    const saved = { path: "C:/mock/recordings/divora-replay-x.mp4", durationMs: 400 };
+
+    // Push-to-modulate off ("Hold to bypass"), Hollow King's effects on.
+    await seg(page, "Hold to bypass").click();
+    await expect(page.locator(".titlebar-status")).toContainText(/Modulated/i);
+    // The clip (and the save's own 3 s) must lie after the voice turned.
+    await page.waitForTimeout(4_000);
+    await emitReplaySaved(page, saved);
+    await expect(page.getByTestId("toast")).toHaveText("Saved a 1 s replay · Hollow King");
+
+    await traceTriangle(page);
+    await expect(page.locator(".titlebar-status")).toContainText(/Muted/i);
+    await emitReplaySaved(page, saved);
+    await expect(page.getByTestId("toast")).toHaveText(
+      "Saved a 1 s replay · your voice as your call heard it",
+    );
+  });
+
+  test("6: a held ring says why, and can still be saved", async ({ page }) => {
+    await engineUp(page);
+    const cases: Array<[string, RegExp]> = [
+      ["engine-stopped", /^The audio engine stopped, so Replay stopped keeping\./],
+      ["screen-lost", /^That screen was disconnected, so Replay stopped keeping\./],
+      ["encoder-failed", /^The video encoder stopped working, so Replay stopped keeping\./],
+    ];
+    for (const [heldReason, copy] of cases) {
+      await emitReplay(page, { ...ARMED, state: "held", heldReason });
+      await expect(page.getByTestId("replay-held")).toHaveText(copy);
+      await expect(page.getByTestId("replay-held")).toContainText("Save still saves what it kept");
+      await expect(page.getByTestId("titlebar-replay")).toHaveText(/REPLAY · HELD/);
+      await expect(page.getByTestId("replay-save")).toBeEnabled();
+    }
+    await emitReplay(page, { state: "armed", heldReason: null });
+    await expect(page.getByTestId("replay-held")).toHaveCount(0);
+  });
+
+  test("7: the on/off hotkey is refused until the explainer, then toggles", async ({ page }) => {
+    await engineUp(page);
+    await press(page, "replay:toggle");
+    await expect(page.getByTestId("toast")).toHaveText(GATE);
+    expect(await argsOf(page, "arm_replay_buffer")).toEqual([]);
+
+    await explainedBefore(page);
+    await engineUp(page);
+    await press(page, "replay:toggle");
+    await expect.poll(() => argsOf(page, "arm_replay_buffer")).toHaveLength(1);
+    await expect(page.getByTestId("titlebar-replay")).toBeVisible();
+    await press(page, "replay:toggle");
+    await expect.poll(() => argsOf(page, "disarm_replay_buffer")).toHaveLength(1);
+    await expect(page.getByTestId("titlebar-replay")).toHaveCount(0);
+  });
+
+  test("8: Settings has Replay's rows; the length persists; screen rows lock while on", async ({
+    page,
+  }) => {
+    await engineUp(page);
+    await nav(page, "Settings").click();
+    const rows = page.getByTestId("replay-settings");
+    await expect(rows).toBeVisible();
+    await expect(rows).toContainText("Replays are saved in the Recordings folder above.");
+    await expect(rows.getByRole("tab", { name: /^30 s · up to 81 MB$/ })).toBeVisible();
+    await rows.getByRole("tab", { name: /^60 s/ }).click();
+    await expect.poll(() => stored(page)).toEqual({
+      seconds: 60,
+      explained: false,
+      explainedDesktop: false,
+    });
+
+    const screen = page.getByTestId("screen-recording-settings");
+    await expect(screen.getByRole("tab", { name: "60 fps" })).toBeEnabled();
+    await emitReplay(page, ARMED);
+    await expect(screen).toContainText("Replay is on — turn it off to change these.");
+    await expect(screen.getByRole("tab", { name: "60 fps" })).toBeDisabled();
+    await expect(screen.getByRole("tab", { name: "Sharpest" })).toBeDisabled();
+    await expect(screen.getByRole("switch", { name: /mouse pointer/ })).toBeDisabled();
+    await expect(screen.getByTestId("desktop-audio-volume").getByRole("slider")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // The separate files are the take's own.
+    await expect(screen.getByRole("switch", { name: /separate WAV files/ })).toBeEnabled();
+
+    await expect(page.getByText("Save replay", { exact: true })).toBeVisible();
+    await expect(page.getByText("Turn Replay on or off", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("Works once you've turned Replay on from the Record screen card."),
+    ).toBeVisible();
+  });
+
+  test("9: lengths over this PC's memory ceiling are greyed out and say why", async ({ page }) => {
+    await engineUp(page);
+    const lengths = page.getByTestId("replay-length");
+    const over = lengths.getByRole("tab", { name: "120 s" });
+    await expect(over).toBeDisabled();
+    await expect(over).toHaveAttribute("title", /^Needs up to \d+ MB; this PC allows \d+ MB\.$/);
+    // 1440p30 Balanced at 120 s caps at 303.8 MB; a 2 GiB PC allows 268.4.
+    await expect(over).toHaveAttribute("title", "Needs up to 304 MB; this PC allows 268 MB.");
+    await expect(lengths.getByRole("tab", { name: "60 s" })).toBeEnabled();
+    await expect(lengths.getByRole("tab", { name: "60 s" })).not.toHaveAttribute("title", /.+/);
+    await expect(page.getByTestId("replay-row")).toContainText(
+      "Keeps the last 30 s · uses up to 81 MB of memory",
+    );
   });
 });
 

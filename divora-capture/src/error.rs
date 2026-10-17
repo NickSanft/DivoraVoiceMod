@@ -7,6 +7,12 @@ pub enum CaptureError {
     /// do about it (shown to the user as-is).
     #[error("{0}")]
     Unavailable(String),
+    /// v1.54.0: the directly driven encoder can't be used on this PC (it
+    /// isn't asynchronous, ignores the keyframe interval, can't force a
+    /// keyframe, …). Takes fall back to the sink writer; Replay says it
+    /// can't use this PC's encoder. The text is for the log.
+    #[error("can't use this video encoder: {0}")]
+    Encoder(String),
     /// The monitor asked for doesn't exist (any more).
     #[error("that screen isn't connected")]
     NoSuchMonitor,

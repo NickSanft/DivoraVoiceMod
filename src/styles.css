@@ -653,6 +653,11 @@
     background: var(--success);
   }
 
+  .toggle:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   /* ---------- Slider ---------- */
   .slider {
     position: relative;
@@ -1092,6 +1097,16 @@
     color: #fff;
   }
 
+  /* v1.54.0: an option that can't be picked right now (its title says why). */
+  .seg-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .seg-btn:disabled:not(.is-on):hover {
+    color: var(--text-mid);
+  }
+
   /* ---------- Window chrome ---------- */
   .titlebar-wordmark {
     font-family: var(--font-display);
@@ -1128,6 +1143,56 @@
     font-size: 10.5px;
     color: var(--text-dim);
     letter-spacing: 0.05em;
+  }
+
+  /* v1.54.0: Replay is on. Never animated, in any state — the reduced-motion
+     rule is dead once the app has mounted, so "static" has to be literal. */
+  .titlebar-replay {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--danger);
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+  }
+
+  .titlebar-replay.is-arming {
+    opacity: 0.6;
+  }
+
+  .titlebar-replay.is-held {
+    color: var(--warning);
+  }
+
+  /* v1.54.0: the shell's toast. The live region is always there; it only
+     takes up space (and clicks) while it has something to say. */
+  .toast {
+    position: absolute;
+    top: var(--s4);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 95;
+    max-width: calc(100% - 48px);
+    pointer-events: none;
+  }
+
+  .toast.is-shown {
+    padding: var(--s3) var(--s5);
+    border-radius: var(--r-pill);
+    background: var(--surface-2);
+    border: 1px solid var(--line-glow);
+    box-shadow: var(--shadow-2);
+    font-size: var(--t-sm);
+    color: var(--text-hi);
+    text-align: center;
+    pointer-events: auto;
+    cursor: pointer;
+  }
+
+  .toast.is-shown.is-error {
+    border-color: rgba(242, 86, 122, 0.5);
   }
 
   .winbtn {

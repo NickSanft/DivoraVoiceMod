@@ -3,21 +3,25 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::Gdi::HMONITOR;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoIncrementMTAUsage, CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED,
+};
 
 use super::d3d::{latest_frame_texture, Gpu, Nv12Converter, Readback};
 use super::encoder::TakeWriter;
 use super::find_monitor;
 use super::mf;
+use super::power::SleepWatch;
 use super::wgc::MonitorCapture;
 use crate::error::CaptureError;
 use crate::pacer::{FramePacer, TICKS_PER_SECOND};
 use crate::sizing::{default_bitrate, output_size};
-use crate::take::{part_path, AudioFeed, RecordOptions, RecordStats, TakeObserver};
+use crate::take::{part_path, slept_message, AudioFeed, RecordOptions, RecordStats, TakeObserver};
 use crate::track::AudioTrack;
 
 /// How long to wait for the very first frame before giving up: a monitor
@@ -36,11 +40,30 @@ pub struct ComScope(bool);
 impl ComScope {
     #[must_use]
     pub fn enter() -> Self {
+        keep_mta_alive();
         // SAFETY: initializes COM on the calling thread; balanced in Drop
         // only when this call succeeded (another mode already set is fine).
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         Self(hr.is_ok())
     }
+}
+
+/// Keep the multithreaded apartment alive for the rest of the process
+/// (v1.54.0). Every recording thread enters it and leaves it; when the last
+/// one out is the only thread in it, Windows tears it down, and objects the
+/// `windows` crate caches from it — the capture API's factories — are left
+/// pointing at nothing: the next take crashed in a test that recorded twice
+/// on one thread. `CoIncrementMTAUsage` is Windows' way to hold it open.
+/// Once per process, never released.
+fn keep_mta_alive() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: no arguments beyond the cookie it returns, which is kept
+        // (never passed to CoDecrementMTAUsage) for the process's life.
+        if let Err(e) = unsafe { CoIncrementMTAUsage() } {
+            tracing::warn!(error = %e, "couldn't hold the COM apartment open");
+        }
+    });
 }
 
 impl Drop for ComScope {
@@ -52,9 +75,7 @@ impl Drop for ComScope {
     }
 }
 
-/// Set to anything to convert on the CPU even where the GPU could: how the
-/// fallback is checked on a machine that would never take it.
-pub const FORCE_CPU_ENV: &str = "DIVORA_CAPTURE_CPU_CONVERT";
+pub use crate::take::FORCE_CPU_ENV;
 
 /// How frames get from the captured BGRA texture to the encoder as NV12.
 enum Converter {
@@ -140,7 +161,7 @@ struct Screen {
 impl Screen {
     /// Start capturing `monitor`, at an encoded size fitting `opts.max_size`.
     fn open(dev: &Gpu, monitor: HMONITOR, opts: &RecordOptions) -> Result<Self, CaptureError> {
-        let capture = MonitorCapture::start(dev, monitor, opts.cursor)?;
+        let capture = MonitorCapture::start(dev, monitor, opts.cursor, Arc::default())?;
         let in_size = capture.size();
         let out_size = output_size(in_size, opts.max_size);
         let fps = opts.fps.clamp(1, 120);
@@ -230,6 +251,7 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 ///
 /// A take stopped before its first frame arrives writes no file and
 /// returns empty stats.
+#[allow(clippy::too_many_lines)] // one take's loop, start to end; clearer inline
 pub fn record_monitor(
     monitor_id: &str,
     path: &Path,
@@ -286,9 +308,20 @@ pub fn record_monitor(
     observer.started();
     let mut last_progress = start;
     let mut last_audio = start;
+    // v1.54.0: a sleep ends the take at its last frame before it, checked
+    // before anything reads the clock (which counts the sleep).
+    let mut sleep = SleepWatch::new();
+    let mut slept_at: Option<Duration> = None;
 
     loop {
+        // The iteration's one reading of the clock, before the sleep check:
+        // a sleep in the middle of the iteration is found by the next check
+        // before a later reading (which counts the sleep) reaches the track.
         let elapsed = start.elapsed();
+        if let Some(t_jump) = sleep.jumped(elapsed) {
+            slept_at = Some(t_jump);
+            break;
+        }
         if stop.load(Ordering::Acquire) || max_duration.is_some_and(|m| elapsed >= m) {
             break;
         }
@@ -306,7 +339,7 @@ pub fn record_monitor(
             }
         }
         if let Some(t) = track.as_mut() {
-            t.pump(start, &mut write_audio)?;
+            t.pump(start, elapsed, &mut write_audio)?;
             last_audio = Instant::now();
         }
         if last_progress.elapsed() >= PROGRESS_EVERY {
@@ -339,9 +372,15 @@ pub fn record_monitor(
         capture, converter, ..
     } = screen;
     drop(capture);
+    let end = end_seconds(&pacer);
     if let Some(t) = track.as_mut() {
-        t.finish(start, end_seconds(&pacer), &mut write_audio)?;
+        match slept_at {
+            // Never pumped with the clock from after the sleep.
+            Some(t_jump) => t.finish_at(start, end, t_jump, &mut write_audio)?,
+            None => t.finish(start, end, &mut write_audio)?,
+        }
     }
+    stats.cut = slept_at.map(|_| slept_message(end));
     writer.finish()?;
     drop(converter);
     drop(session);

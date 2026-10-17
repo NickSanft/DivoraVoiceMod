@@ -94,6 +94,10 @@ pub struct RecordStats {
     pub hardware: bool,
     /// The audio track, when the take had one.
     pub audio: Option<AudioStats>,
+    /// v1.54.0: why the take ended before it was stopped — the PC slept,
+    /// the screen went away, the encoder failed — said as the card says it.
+    /// The file is kept.
+    pub cut: Option<String>,
 }
 
 /// Where a take's audio comes from. The app implements it over the audio
@@ -107,6 +111,12 @@ pub trait AudioFeed {
     /// The same for desktop audio, on the same clock. A feed without any
     /// has nothing to add.
     fn poll_desktop(&mut self, _start: Instant, _out: &mut Vec<DesktopChunk>) {}
+
+    /// Whether the engine is running (v1.54.0): a ring holds its clip while
+    /// it isn't. A feed that can't tell says it is.
+    fn engine(&mut self) -> crate::pipeline::EngineSignal {
+        crate::pipeline::EngineSignal::Running
+    }
 }
 
 /// Told how a take is going, from the recording thread.
@@ -119,6 +129,40 @@ pub trait TakeObserver {
 
 /// An observer that wants to know nothing.
 impl TakeObserver for () {}
+
+/// Set to anything to record takes through the sink writer (v1.52.0's path)
+/// even where the encoder could be driven directly (v1.54.0): for checking
+/// one against the other.
+pub const RUNG1_ENV: &str = "DIVORA_CAPTURE_RUNG1";
+
+/// Set to anything to convert on the CPU even where the GPU could: how the
+/// fallback is checked on a machine that would never take it. Only the sink
+/// writer's path has a CPU converter, so it also means that path.
+pub const FORCE_CPU_ENV: &str = "DIVORA_CAPTURE_CPU_CONVERT";
+
+/// `m:ss`, or `h:mm:ss` past an hour: a time into a take, as the card shows
+/// it (v1.54.0).
+#[must_use]
+pub fn take_clock(seconds: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a take's length
+    let total = seconds.max(0.0).floor() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// What the card says when the PC slept during a take (v1.54.0): the take
+/// ends at its last frame before the sleep.
+#[must_use]
+pub fn slept_message(seconds: f64) -> String {
+    format!(
+        "The PC went to sleep, so the recording stopped at {}. What was recorded is saved.",
+        take_clock(seconds)
+    )
+}
 
 /// Seconds from `start` to `at` on the same clock, negative when `at` is
 /// earlier.

@@ -9,7 +9,7 @@
 // (shape outline + preset name + "◆ SPELL CAST ◆"). Matches the
 // prototype's headline gesture: the Mixer *is* the casting surface.
 
-import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { createMemo, createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
 import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
@@ -37,6 +37,18 @@ import {
   screenBusy,
   screenRecordSubtitle,
 } from "../data/screenRecording";
+import {
+  desktopSettingWords,
+  explainerNeeded,
+  heldCopy,
+  lengthTitle,
+  lockedLine,
+  memoryLabel,
+  REPLAY_LENGTHS,
+  replayOn,
+  sanitizeReplaySeconds,
+  saveLabel,
+} from "../data/replay";
 import type { DesktopAudioSource } from "../audio/api";
 import {
   resamplingDetail,
@@ -1451,11 +1463,26 @@ function ScreenRecordCard(): JSX.Element {
     return s && !s.supported ? (s.reason ?? "Screen recording isn't available.") : null;
   };
   const canStart = () => app.engineRunning() && !unsupported() && app.captureMonitors().length > 0;
+  const replayRunning = () => replayOn(app.replayStatus());
   const chosen = () => pickMonitor(app.captureMonitors(), app.screenSettings().monitorId);
   const desktop = () => pickDesktopSource(app.desktopSources() ?? [], app.screenSettings().desktopAudio);
   // While a take runs, what it actually records; before, what it would.
   const subtitle = () => {
     const r = rec();
+    if (!busy() && replayRunning()) {
+      // A take now would record Replay's desktop audio, not the picker's.
+      const id = app.replayStatus().armed?.desktopAudio ?? null;
+      if (!id) return screenRecordSubtitle(null);
+      return screenRecordSubtitle(
+        app.desktopSources()?.find((s) => s.id === id) ?? {
+          id,
+          label: "the device",
+          kind: id === "everything" ? "everything" : "device",
+          isDefault: false,
+          divoraPlays: "nothing",
+        },
+      );
+    }
     if (!busy()) {
       if (
         app.desktopSources() === null &&
@@ -1574,7 +1601,12 @@ function ScreenRecordCard(): JSX.Element {
         </button>
       </div>
 
-      <Show when={!busy() && !unsupported() && app.captureMonitors().length > 1}>
+      {/* While Replay is on, a take shares its capture: the screen and the
+          desktop audio are Replay's, so the pickers give way to a line
+          saying so. */}
+      <Show
+        when={!busy() && !unsupported() && !replayRunning() && app.captureMonitors().length > 1}
+      >
         <Select
           icon="screen"
           value={chosen()?.id ?? ""}
@@ -1583,7 +1615,7 @@ function ScreenRecordCard(): JSX.Element {
         />
       </Show>
 
-      <Show when={!busy() && !unsupported()}>
+      <Show when={!busy() && !unsupported() && !replayRunning()}>
         <div data-testid="screen-record-desktop">
           <Select
             icon="output"
@@ -1599,6 +1631,23 @@ function ScreenRecordCard(): JSX.Element {
             </div>
           )}
         </Show>
+      </Show>
+
+      <Show when={!unsupported() && replayRunning()}>
+        <div
+          data-testid="replay-locked"
+          style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}
+        >
+          {lockedLine(
+            app.replayStatus(),
+            app.captureMonitors().find((m) => m.id === app.replayStatus().monitorId)?.number ??
+              null,
+          )}
+        </div>
+      </Show>
+
+      <Show when={!unsupported()}>
+        <ReplayRow desktop={desktop()} />
       </Show>
 
       <Show when={unsupported()}>
@@ -1724,6 +1773,246 @@ function ScreenRecordCard(): JSX.Element {
             </li>
           </ul>
         </Show>
+      </Show>
+    </div>
+  );
+}
+
+/** v1.54.0: Replay on the Record screen card — the last 15–120 s of the
+ *  chosen screen kept in memory, saved when something happens.
+ *
+ *  Until its explainer has been read (and read again once desktop audio is
+ *  on, since that can carry a call) the row offers "Set up Replay…" in place
+ *  of the switch: a switch that opened text instead of switching would
+ *  announce "off" again and leave a screen-reader user unaware anything had
+ *  appeared. The explainer is a disclosure, like "About screen recording":
+ *  opening it moves focus to its heading, "Not now" returns focus to the
+ *  button, and "Turn Replay on" is the one way to pass the gate. */
+function ReplayRow(props: { desktop: DesktopAudioSource | null }): JSX.Element {
+  const app = useApp();
+  const [explainerOpen, setExplainerOpen] = createSignal(false);
+  let setupButton: HTMLButtonElement | undefined;
+  let heading: HTMLHeadingElement | undefined;
+  let toggleWrap: HTMLSpanElement | undefined;
+  onMount(() => void app.refreshReplayMemory());
+
+  const ring = () => app.replayStatus();
+  const on = () => replayOn(ring());
+  const desktopOn = () => app.screenSettings().desktopAudio !== "off";
+  // While on, the ring is the authority; the gate only stands in front of
+  // turning it on.
+  const needsExplainer = () => !on() && explainerNeeded(app.replaySettings(), desktopOn());
+  const keptSeconds = () => (on() ? ring().seconds : app.replaySettings().seconds);
+  const lengthMemory = (s: number) =>
+    app.replayMemory()?.lengths.find((l) => l.seconds === s) ?? null;
+  const keptCap = () =>
+    on() && ring().capBytes > 0 ? ring().capBytes : (lengthMemory(keptSeconds())?.capBytes ?? null);
+  const unsupportedReason = () =>
+    ring().supported ? null : (ring().reason ?? "Replay isn't available on this PC.");
+  const sub = () => {
+    const cap = keptCap();
+    return `Keeps the last ${keptSeconds()} s${cap ? ` · uses ${memoryLabel(cap)} of memory` : ""}`;
+  };
+  // Only the memory figures shape the options, so the buttons aren't
+  // rebuilt (and focus lost) by the once-a-second status.
+  const lengthOptions = createMemo(() => {
+    const memory = app.replayMemory();
+    return REPLAY_LENGTHS.map((s) => {
+      const len = memory?.lengths.find((l) => l.seconds === s);
+      const why = len && memory ? lengthTitle(len, memory.ceilingBytes) : null;
+      return { value: String(s), label: `${s} s`, disabled: why !== null, title: why ?? undefined };
+    });
+  });
+
+  const openExplainer = (): void => {
+    const next = !explainerOpen();
+    setExplainerOpen(next);
+    if (next) queueMicrotask(() => heading?.focus());
+  };
+  const notNow = (): void => {
+    setExplainerOpen(false);
+    setupButton?.focus();
+  };
+  const turnOn = (): void => {
+    app.markReplayExplained(desktopOn());
+    setExplainerOpen(false);
+    // The switch has taken the button's place: keep focus in the row.
+    queueMicrotask(() => toggleWrap?.querySelector<HTMLButtonElement>("button")?.focus());
+    void app.armReplay();
+  };
+
+  const line = { "font-size": "var(--t-xs)", "line-height": 1.5 } as const;
+
+  return (
+    <div
+      data-testid="replay-row"
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+        "border-top": "1px solid var(--line)",
+        "padding-top": "var(--s3)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s3)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s3)",
+            color: on() ? "var(--danger)" : "var(--text-mid)",
+            "min-width": 0,
+          }}
+        >
+          <span aria-hidden="true" style={{ flex: "none" }}>
+            <Sigil name="replay" size={20} />
+          </span>
+          <div style={{ "min-width": 0 }}>
+            <div style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}>
+              Replay
+            </div>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>{sub()}</div>
+          </div>
+        </div>
+        <Show when={!needsExplainer()}>
+          <span data-testid="replay-toggle" ref={toggleWrap} style={{ flex: "none" }}>
+            <Toggle
+              on={on()}
+              ariaLabel="Replay"
+              disabled={!!unsupportedReason() || (!on() && !app.engineRunning())}
+              title={
+                unsupportedReason() ??
+                (on() || app.engineRunning() ? undefined : "Start the engine to turn Replay on")
+              }
+              onChange={(next) => void (next ? app.armReplay() : app.disarmReplay())}
+            />
+          </span>
+        </Show>
+      </div>
+
+      <Show when={needsExplainer()}>
+        <button
+          ref={setupButton}
+          type="button"
+          class="btn btn-secondary btn-sm"
+          data-testid="replay-setup"
+          style={{ "align-self": "flex-start" }}
+          aria-expanded={explainerOpen()}
+          aria-controls="replay-explainer"
+          onClick={openExplainer}
+        >
+          Set up Replay…
+        </button>
+        <Show when={explainerOpen()}>
+          <div
+            id="replay-explainer"
+            data-testid="replay-explainer"
+            role="region"
+            aria-labelledby="replay-explainer-heading"
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              gap: "var(--s2)",
+              padding: "var(--s3)",
+              background: "var(--surface-2)",
+              border: "1px solid var(--line)",
+              "border-radius": "var(--r-sm)",
+            }}
+          >
+            <h3
+              id="replay-explainer-heading"
+              ref={heading}
+              tabindex="-1"
+              style={{ margin: 0, "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}
+            >
+              What Replay keeps
+            </h3>
+            <ul
+              style={{
+                margin: 0,
+                "padding-left": "18px",
+                ...line,
+                color: "var(--text-mid)",
+                display: "flex",
+                "flex-direction": "column",
+                gap: "var(--s1)",
+              }}
+            >
+              <li>
+                The last {app.replaySettings().seconds} s of this screen, in memory: the picture,
+                your voice and soundboard as your call hears them, and — whenever this card records
+                desktop audio — sound from other apps, calls included.{" "}
+                {desktopSettingWords(
+                  app.screenSettings().desktopAudio,
+                  props.desktop,
+                  app.desktopSources(),
+                )}
+              </li>
+              <Show when={lengthMemory(app.replaySettings().seconds)}>
+                {(len) => <li>It uses {memoryLabel(len().capBytes)} of memory.</li>}
+              </Show>
+              <li>
+                <strong style={{ color: "var(--text-hi)" }}>
+                  Divora writes no picture or sound to disk until you press Save.
+                </strong>
+              </li>
+              <li>
+                Windows draws a yellow border around this screen while Replay is on. Divora leaves
+                it on, so you can always tell your screen is being kept. The tray icon changes too.
+              </li>
+              <li>It needs a hardware video encoder, such as a graphics card's.</li>
+            </ul>
+            <div style={{ display: "flex", gap: "var(--s2)" }}>
+              <button type="button" class="btn btn-primary btn-sm" onClick={turnOn}>
+                Turn Replay on
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm" onClick={notNow}>
+                Not now
+              </button>
+            </div>
+          </div>
+        </Show>
+      </Show>
+
+      <div data-testid="replay-length">
+        <Segmented<string>
+          options={lengthOptions()}
+          value={String(app.replaySettings().seconds)}
+          onChange={(v) => void app.setReplaySeconds(sanitizeReplaySeconds(Number(v)))}
+        />
+      </div>
+
+      <Show when={on()}>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          data-testid="replay-save"
+          disabled={ring().saving}
+          style={{ height: "34px" }}
+          onClick={() => void app.saveReplay()}
+        >
+          {saveLabel(ring())}
+        </button>
+      </Show>
+
+      <Show when={unsupportedReason()}>
+        {(why) => (
+          <div data-testid="replay-reason" style={{ ...line, color: "var(--text-lo)" }}>
+            {why()}
+          </div>
+        )}
+      </Show>
+      <Show when={ring().state === "held"}>
+        <div data-testid="replay-held" style={{ ...line, color: "var(--warning)" }}>
+          {heldCopy(ring().heldReason)}
+        </div>
       </Show>
     </div>
   );

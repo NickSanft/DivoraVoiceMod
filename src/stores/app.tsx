@@ -92,9 +92,22 @@ import {
   stopScreenRecording as stopScreenRecordingCmd,
   screenRecordingStatus as screenRecordingStatusCmd,
   subscribeScreenRecording,
+  replayBufferStatus as replayBufferStatusCmd,
+  replayMemory as replayMemoryCmd,
+  armReplayBuffer as armReplayBufferCmd,
+  disarmReplayBuffer as disarmReplayBufferCmd,
+  saveReplay as saveReplayCmd,
+  subscribeReplayBuffer,
+  subscribeReplaySaved,
   type CaptureMonitor,
   type CaptureStatus,
   type DesktopAudioSource,
+  type ReplayArmOptions,
+  type ReplayMemory,
+  type ReplayMemoryOptions,
+  type ReplaySaved,
+  type ReplaySeconds,
+  type ReplayStatus,
   type ScreenRecordingUpdate,
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
@@ -137,6 +150,17 @@ import {
   screenFilename,
   type ScreenSettings,
 } from "../data/screenRecording";
+import {
+  clipWasModulated,
+  explainerNeeded,
+  OFF_REPLAY_STATUS,
+  readReplaySettings,
+  REPLAY_GATE_TOAST,
+  replayOn,
+  savedToast,
+  type ReplaySettings,
+} from "../data/replay";
+import type { ToastMessage, ToastTone } from "../components/Toast";
 import {
   decideWhatsNew,
   notesSince,
@@ -247,8 +271,16 @@ export interface AbSnapshots {
 }
 
 /** Stable id used for the system-wide hotkeys we register. v1.52.0 adds the
- *  recorders, under the reserved `rec:` prefix. */
-export type HotkeyAction = "ptm" | "panic" | "monitor" | "rec:screen" | "rec:wav";
+ *  recorders, under the reserved `rec:` prefix; v1.54.0 adds Replay's save
+ *  and on/off, under `replay:`. */
+export type HotkeyAction =
+  | "ptm"
+  | "panic"
+  | "monitor"
+  | "rec:screen"
+  | "rec:wav"
+  | "replay:save"
+  | "replay:toggle";
 
 /** localStorage keys for Phase 8 persistence (tile metadata + recent folders). */
 /** Reactive intensity is a 0..100 percentage everywhere in the UI. */
@@ -298,6 +330,10 @@ const STORAGE_KEYS = {
   // v1.52.0: Settings → Recordings for the screen recorder, and the screen
   // last picked on its card.
   screenRecording: "divora.screenRecording",
+  // v1.54.0: Replay's length and whether its explainer has been read —
+  // `{seconds, explained, explainedDesktop}` and nothing else. Never whether
+  // it is on: Replay is off at every launch.
+  replayBuffer: "divora.replayBuffer",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -567,10 +603,46 @@ export interface AppState {
   screenRecording: () => ScreenRecordingUpdate;
   screenSettings: () => ScreenSettings;
   setScreenSettings: (patch: Partial<ScreenSettings>) => void;
-  /** Start a take of the chosen screen, or stop the running one. */
+  /** Start a take of the chosen screen, or stop the running one. While
+   *  Replay is on, the take uses Replay's settings (v1.54.0). */
   toggleScreenRecording: () => Promise<void>;
   /** The last finished (or current) take's MP4. */
   screenRecordingPath: () => string | null;
+
+  // ---- v1.54.0: Replay ----
+  /** The latest `replay-buffer` report. */
+  replayStatus: () => ReplayStatus;
+  /** The length, and whether the card's explainer has been read. */
+  replaySettings: () => ReplaySettings;
+  /** Each length's memory cap at the current settings (`null` until asked). */
+  replayMemory: () => ReplayMemory | null;
+  /** Ask again — the card and Settings do on mount; the store does when the
+   *  screen, frame rate or quality changes. */
+  refreshReplayMemory: () => Promise<void>;
+  /** Turn Replay on (or resize it while on). The ONLY caller of
+   *  `arm_replay_buffer`: it refuses, with a toast, until the card's
+   *  explainer has been read — so every arm path, now and later, is gated. */
+  armReplay: () => Promise<void>;
+  disarmReplay: () => Promise<void>;
+  /** Off if on; otherwise `armReplay()`, gate and all. */
+  toggleReplay: () => Promise<void>;
+  /** Ask for a save. The `replay-saved` event reports every outcome. */
+  saveReplay: () => Promise<void>;
+  /** Persist a length, and resize a running ring to it. */
+  setReplaySeconds: (seconds: ReplaySeconds) => Promise<void>;
+  /** The explainer was read — with desktop audio on, if `desktop`. */
+  markReplayExplained: (desktop: boolean) => void;
+  /** When the voice last became modulated with the current preset, on the
+   *  `performance.now()` clock; `null` while clean or muted. A save names the
+   *  preset only when this precedes the whole clip. */
+  modulatedSince: () => number | null;
+  /** The shell's toast (`components/Toast`). */
+  toast: () => ToastMessage | null;
+  showToast: (text: string, tone?: ToastTone) => void;
+  /** Move the running engine to the selected devices without a Stop: the
+   *  start tears the old streams down itself, so Replay sees a rebuild it
+   *  carries on through rather than a stop it must hold for. */
+  restartEngine: () => Promise<void>;
   /** Phase 16: absolute path of the recordings directory. */
   getRecordingsDir: () => Promise<string>;
   /** v1.14.0: absolute path of the logs directory (for "Open logs folder"). */
@@ -1596,6 +1668,54 @@ export function createAppState(): AppState {
     screenUnlisten = null;
   });
 
+  /** What a pipeline is asked to capture. While Replay is on, exactly what
+   *  its ring runs with: a take shares Replay's capture and encoder, and the
+   *  backend refuses any other settings as a mismatch. Otherwise the card's
+   *  screen and desktop audio, and Settings' rows. A string is why there is
+   *  nothing to ask for. */
+  const pipelineOptions = async (): Promise<Omit<ReplayArmOptions, "seconds"> | string> => {
+    const ring = replayStatus();
+    if (replayOn(ring) && ring.armed && ring.monitorId) {
+      const a = ring.armed;
+      return {
+        monitorId: ring.monitorId,
+        fps: a.fps === 60 ? 60 : 30,
+        quality: a.quality,
+        cursor: a.cursor,
+        avOffsetMs: a.avOffsetMs,
+        ...(a.desktopAudio ? { desktopAudio: a.desktopAudio } : {}),
+        desktopGainDb: a.desktopGainDb,
+      };
+    }
+    if (!captureStatus()) await refreshCapture();
+    const status = captureStatus();
+    if (!status?.supported) return status?.reason ?? "Screen recording isn't available.";
+    let monitors = captureMonitors();
+    if (monitors.length === 0) {
+      await refreshCapture();
+      monitors = captureMonitors();
+    }
+    const settings = screenSettings();
+    const monitor = pickMonitor(monitors, settings.monitorId);
+    if (!monitor) return "No screen to record.";
+    // The pipeline records what the card shows: the saved desktop audio only
+    // if it is offered right now — never some other source in its place.
+    let desktopAudio: string | undefined;
+    if (settings.desktopAudio !== "off") {
+      const sources = (await refreshDesktopSources()) ?? desktopSources() ?? [];
+      desktopAudio = pickDesktopSource(sources, settings.desktopAudio)?.id;
+    }
+    return {
+      monitorId: monitor.id,
+      fps: settings.fps,
+      quality: settings.quality,
+      cursor: settings.cursor,
+      avOffsetMs: settings.avOffsetMs,
+      ...(desktopAudio ? { desktopAudio } : {}),
+      desktopGainDb: settings.desktopGainDb,
+    };
+  };
+
   const toggleScreenRecording = async (): Promise<void> => {
     const phase = screenRecording().state;
     if (phase === "stopping") return;
@@ -1612,50 +1732,229 @@ export function createAppState(): AppState {
       setEngineError("Start the engine before recording.");
       return;
     }
-    if (!captureStatus()) await refreshCapture();
-    const status = captureStatus();
-    if (!status?.supported) {
-      setScreenRecording({
-        ...IDLE_SCREEN_RECORDING,
-        error: status?.reason ?? "Screen recording isn't available.",
-      });
+    const opts = await pipelineOptions();
+    if (typeof opts === "string") {
+      setScreenRecording({ ...IDLE_SCREEN_RECORDING, error: opts });
       return;
-    }
-    let monitors = captureMonitors();
-    if (monitors.length === 0) {
-      await refreshCapture();
-      monitors = captureMonitors();
-    }
-    const settings = screenSettings();
-    const monitor = pickMonitor(monitors, settings.monitorId);
-    if (!monitor) {
-      setScreenRecording({ ...IDLE_SCREEN_RECORDING, error: "No screen to record." });
-      return;
-    }
-    // The take records what the card shows: the saved desktop audio only if
-    // it is offered right now — never some other source in its place.
-    let desktopAudio: string | undefined;
-    if (settings.desktopAudio !== "off") {
-      const sources = (await refreshDesktopSources()) ?? desktopSources() ?? [];
-      desktopAudio = pickDesktopSource(sources, settings.desktopAudio)?.id;
     }
     setScreenRecording({ ...IDLE_SCREEN_RECORDING, state: "starting" });
     try {
       const path = await startScreenRecordingCmd({
-        monitorId: monitor.id,
+        ...opts,
         filename: screenFilename(new Date()),
-        fps: settings.fps,
-        quality: settings.quality,
-        cursor: settings.cursor,
-        avOffsetMs: settings.avOffsetMs,
-        ...(desktopAudio ? { desktopAudio } : {}),
-        desktopGainDb: settings.desktopGainDb,
-        stems: settings.stems,
+        // The separate WAV files are the take's own, not the pipeline's.
+        stems: screenSettings().stems,
       });
       setScreenRecordingPath(path);
     } catch (err) {
       setScreenRecording({ ...IDLE_SCREEN_RECORDING, error: String(err) });
     }
+  };
+
+  // ---- v1.54.0: Replay ----
+  // The backend's `replay-buffer` events are the truth about the ring; the
+  // store keeps only the length and whether the card's explainer has been
+  // read. Replay is off at every launch: nothing persisted can turn it on.
+  const [toast, setToast] = createSignal<ToastMessage | null>(null);
+  let toastSeq = 0;
+  const showToast = (text: string, tone: ToastTone = "success"): void => {
+    toastSeq += 1;
+    setToast({ id: toastSeq, text, tone });
+  };
+
+  const [replayStatus, setReplayStatus] = createSignal<ReplayStatus>(OFF_REPLAY_STATUS);
+  const [replaySettings, setReplaySettingsRaw] = createSignal<ReplaySettings>(
+    readReplaySettings(loadJson<unknown>(STORAGE_KEYS.replayBuffer, null)),
+  );
+  const [replayMemory, setReplayMemory] = createSignal<ReplayMemory | null>(null);
+  // `readReplaySettings` drops every other key, so an `armed` flag can never
+  // be written here, whoever calls this.
+  const saveReplaySettings = (patch: Partial<ReplaySettings>): void => {
+    const next = readReplaySettings({ ...replaySettings(), ...patch });
+    setReplaySettingsRaw(next);
+    saveJson(STORAGE_KEYS.replayBuffer, next);
+  };
+
+  /** The screen and settings the memory figures are for: Replay's own
+   *  while it is on, the card's and Settings' otherwise. */
+  const replayMemoryAsk = (): ReplayMemoryOptions | null => {
+    const ring = replayStatus();
+    if (replayOn(ring) && ring.armed && ring.monitorId) {
+      return {
+        monitorId: ring.monitorId,
+        fps: ring.armed.fps === 60 ? 60 : 30,
+        quality: ring.armed.quality,
+      };
+    }
+    if (!captureStatus()?.supported) return null;
+    const s = screenSettings();
+    const monitor = pickMonitor(captureMonitors(), s.monitorId);
+    return monitor ? { monitorId: monitor.id, fps: s.fps, quality: s.quality } : null;
+  };
+  let memoryAsks = 0;
+  const refreshReplayMemory = async (): Promise<void> => {
+    const opts = replayMemoryAsk();
+    if (!opts) return;
+    const ask = ++memoryAsks;
+    try {
+      const memory = await replayMemoryCmd(opts);
+      // Only the newest answer: an older one is for settings no longer shown.
+      if (ask === memoryAsks && memory && Array.isArray(memory.lengths)) {
+        setReplayMemory(memory);
+      }
+    } catch (err) {
+      console.warn("[replay] memory figures unavailable", err);
+    }
+  };
+  const replayMemoryKey = createMemo(() => {
+    const o = replayMemoryAsk();
+    return o ? `${o.monitorId}|${o.fps}|${o.quality}` : null;
+  });
+  createEffect(
+    on(replayMemoryKey, (key) => {
+      if (key) void refreshReplayMemory();
+    }),
+  );
+
+  // When the ring was last held (on this clock), while it still is: a held
+  // ring's clip ends there, not at the save, so whether the voice was
+  // disguised throughout is judged back from then.
+  let heldAt: number | null = null;
+  createEffect(
+    on(replayStatus, (s) => {
+      if (s.state !== "held") heldAt = null;
+      else heldAt ??= performance.now();
+    }),
+  );
+
+  /** Every save attempt ends in one `replay-saved`, refusals included, so
+   *  this is the only place a save's toast comes from. */
+  const onReplaySaved = (saved: ReplaySaved): void => {
+    if (saved.error) {
+      showToast(saved.error, "error");
+      return;
+    }
+    const end = heldAt ?? performance.now();
+    const named = clipWasModulated(modulatedSince(), end, saved.durationMs);
+    showToast(savedToast(saved, named ? preset().name : null), "success");
+  };
+
+  const replayUnlisten: Array<() => void> = [];
+  // An event, or an arm's or disarm's answer, is newer than the launch pull
+  // below whenever it lands first.
+  let replayHeard = false;
+  let replayDisposed = false;
+  const takeReplayStatus = (s: ReplayStatus): void => {
+    replayHeard = true;
+    setReplayStatus(s);
+  };
+  void (async () => {
+    // All three are asked for at once; the pull — so a window opened while
+    // Replay runs shows it on, and locks what it locks — counts only if
+    // nothing newer has come in meanwhile. Each failure (a browser preview
+    // without the Tauri bridge) is caught where it starts, so none goes
+    // unhandled while another is awaited.
+    const buffer = subscribeReplayBuffer(takeReplayStatus).catch(() => null);
+    const saved = subscribeReplaySaved(onReplaySaved).catch(() => null);
+    const pull = replayBufferStatusCmd().catch(() => null);
+    for (const un of [await buffer, await saved]) {
+      if (!un) continue;
+      if (replayDisposed) un();
+      else replayUnlisten.push(un);
+    }
+    const now = await pull;
+    if (now && !replayHeard) setReplayStatus(now);
+  })();
+  onCleanup(() => {
+    replayDisposed = true;
+    for (const un of replayUnlisten.splice(0)) un();
+  });
+
+  const armReplay = async (): Promise<void> => {
+    // The explainer gate. It lives here, not in any caller, so a hotkey —
+    // or any later way of turning Replay on — can't skip what the card
+    // explains: what is kept, calls included, and that nothing is written
+    // until Save.
+    const ring = replayStatus();
+    const desktopOn =
+      replayOn(ring) && ring.armed
+        ? ring.armed.desktopAudio !== null
+        : screenSettings().desktopAudio !== "off";
+    if (explainerNeeded(replaySettings(), desktopOn)) {
+      showToast(REPLAY_GATE_TOAST, "error");
+      return;
+    }
+    // Refused with the recorders' own words.
+    if (!engineRunning()) {
+      setEngineError("Start the engine before recording.");
+      return;
+    }
+    const opts = await pipelineOptions();
+    if (typeof opts === "string") {
+      showToast(opts, "error");
+      return;
+    }
+    try {
+      const next = await armReplayBufferCmd({ ...opts, seconds: replaySettings().seconds });
+      if (next) takeReplayStatus(next);
+    } catch (err) {
+      showToast(String(err), "error");
+    }
+  };
+
+  const disarmReplay = async (): Promise<void> => {
+    try {
+      const next = await disarmReplayBufferCmd();
+      if (next) takeReplayStatus(next);
+    } catch (err) {
+      showToast(String(err), "error");
+    }
+  };
+
+  const toggleReplay = (): Promise<void> =>
+    replayOn(replayStatus()) ? disarmReplay() : armReplay();
+
+  const saveReplay = async (): Promise<void> => {
+    try {
+      await saveReplayCmd();
+    } catch {
+      /* the replay-saved event says why */
+    }
+  };
+
+  const setReplaySeconds = async (seconds: ReplaySeconds): Promise<void> => {
+    saveReplaySettings({ seconds });
+    // A running ring is resized — through armReplay, like every arm. A held
+    // one keeps what it has; the new length applies when it next runs.
+    const ring = replayStatus();
+    if ((ring.state === "armed" || ring.state === "arming") && ring.seconds !== seconds) {
+      await armReplay();
+    }
+  };
+
+  // …and when it next runs, it runs at the length it kept: the backend
+  // resumes a held ring as it was. So once it runs again, and the engine with
+  // it (which comes first is a race), a length picked meanwhile is applied —
+  // once, through armReplay like every arm.
+  let resizeOnResume = false;
+  createEffect(
+    on([replayStatus, engineRunning], ([ring, running]) => {
+      if (ring.state === "held") {
+        resizeOnResume = true;
+        return;
+      }
+      if (ring.state === "off") {
+        resizeOnResume = false;
+        return;
+      }
+      if (!resizeOnResume || !running) return;
+      resizeOnResume = false;
+      if (ring.seconds !== replaySettings().seconds) void armReplay();
+    }),
+  );
+
+  const markReplayExplained = (desktop: boolean): void => {
+    saveReplaySettings({ explained: true, ...(desktop ? { explainedDesktop: true } : {}) });
   };
 
   const preset = createMemo<Preset>(
@@ -1676,6 +1975,18 @@ export function createAppState(): AppState {
   );
   const status = createMemo<VoiceStatus>(() =>
     ui.muted ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
+  );
+
+  // v1.54.0: when the voice last became modulated with the current preset,
+  // for Replay's save toast. The AV tap carries what the call hears, so a
+  // clip holds the disguised voice only while the status says "modulated":
+  // push-to-modulate up in apply mode, no effect on, or muted is the user's
+  // own voice (or nothing). A preset change restarts the clock.
+  const [modulatedSince, setModulatedSince] = createSignal<number | null>(null);
+  createEffect(
+    on([status, presetId], ([s]) => {
+      setModulatedSince(s === "modulated" ? performance.now() : null);
+    }),
   );
 
   // When the preset list changes (e.g. backend load adds user presets),
@@ -1794,6 +2105,18 @@ export function createAppState(): AppState {
     setIsRecording(false);
   };
 
+  // v1.54.0: a device switch must not be a Stop. `start_audio_engine` tears
+  // the running streams down itself, so starting again is enough — and a
+  // Stop is what Replay reads as the user stopping the engine, which holds
+  // the ring and then clears it on every device switch. A switch that
+  // starts cleanly is a rebuild Replay carries on through (silence in the
+  // gap); one that fails counts as a stop.
+  const restartEngine = async (): Promise<void> => {
+    // The teardown finalizes a WAV recording, as a stop does.
+    setIsRecording(false);
+    await startEngine();
+  };
+
   const setMonitor = async (enabled: boolean): Promise<void> => {
     await setAudioMonitorCmd(enabled);
     setEngineMonitoring(enabled);
@@ -1865,10 +2188,8 @@ export function createAppState(): AppState {
           }
         }
         if (!engineRunning()) return;
-        void (async () => {
-          await stopEngine();
-          await startEngine();
-        })();
+        // v1.54.0: a restart, never stop + start (see restartEngine).
+        void restartEngine();
       },
       { defer: true },
     ),
@@ -3508,6 +3829,21 @@ export function createAppState(): AppState {
     setScreenSettings,
     toggleScreenRecording,
     screenRecordingPath,
+
+    replayStatus,
+    replaySettings,
+    replayMemory,
+    refreshReplayMemory,
+    armReplay,
+    disarmReplay,
+    toggleReplay,
+    saveReplay,
+    setReplaySeconds,
+    markReplayExplained,
+    modulatedSince,
+    toast,
+    showToast,
+    restartEngine,
 
     setChainParam,
     setChainEnabled,

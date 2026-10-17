@@ -16,6 +16,16 @@ use std::time::Duration;
 /// 100-nanosecond units, the Media Foundation time base.
 pub const TICKS_PER_SECOND: u64 = 10_000_000;
 
+/// Presentation time of frame `index` at `fps`, in 100-ns ticks — the same
+/// for a take, a clip and the replay ring, so their times never disagree
+/// (v1.54.0; what [`FramePacer::pts_of`] computes).
+pub fn pts_at(index: u64, fps: u32) -> u64 {
+    // index * 10^7 / fps without overflow for any realistic take
+    // (u128 keeps it exact past 58 000 years at 240 fps).
+    let t = u128::from(index) * u128::from(TICKS_PER_SECOND) / u128::from(fps.max(1));
+    u64::try_from(t).unwrap_or(u64::MAX)
+}
+
 /// One frame to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Emit {
@@ -55,10 +65,7 @@ impl FramePacer {
     /// the index, never accumulated, so it cannot drift (30 fps is not a
     /// whole number of ticks: 333 333.3…).
     pub fn pts_of(&self, index: u64) -> u64 {
-        // index * 10^7 / fps without overflow for any realistic take
-        // (u128 keeps it exact past 58 000 years at 240 fps).
-        let t = u128::from(index) * u128::from(TICKS_PER_SECOND) / u128::from(self.fps);
-        u64::try_from(t).unwrap_or(u64::MAX)
+        pts_at(index, self.fps)
     }
 
     /// When the next frame is due, as time since the start of the take.
@@ -91,6 +98,12 @@ impl FramePacer {
             duration,
             dropped_before,
         })
+    }
+
+    /// The index the next frame will have (v1.54.0: a take started now
+    /// begins there).
+    pub fn next_index(&self) -> u64 {
+        self.next_index
     }
 
     /// Frames skipped so far because the writer fell behind.

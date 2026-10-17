@@ -1,5 +1,6 @@
 //! Windows Graphics Capture of one monitor.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -19,23 +20,25 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use super::d3d::Gpu;
 use crate::error::{CaptureError, Context};
 
-/// Set by the capture thread pool when a frame arrives; waited on by the
-/// recording thread. `FrameArrived` does nothing else: all Direct3D work
-/// happens on the recording thread.
+/// Set by the capture thread pool when a frame arrives, and (v1.54.0) by
+/// whoever sends the pipeline a command; waited on by the recording thread.
+/// `FrameArrived` does nothing else: all Direct3D work happens on the
+/// recording thread.
 #[derive(Default)]
-struct FrameSignal {
+pub struct Wake {
     pending: Mutex<bool>,
     cv: Condvar,
 }
 
-impl FrameSignal {
-    fn notify(&self) {
+impl Wake {
+    pub fn notify(&self) {
         *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.cv.notify_one();
     }
 
-    /// Wait up to `timeout` for a frame; true if one arrived. Clears the flag.
-    fn wait(&self, timeout: Duration) -> bool {
+    /// Wait up to `timeout` for a frame (or a command); true if one came.
+    /// Clears the flag.
+    pub fn wait(&self, timeout: Duration) -> bool {
         let guard = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut guard, _) = self
             .cv
@@ -57,18 +60,28 @@ pub struct Drained {
 
 /// A running capture of one monitor.
 pub struct MonitorCapture {
-    _item: GraphicsCaptureItem,
+    item: GraphicsCaptureItem,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     token: i64,
-    signal: Arc<FrameSignal>,
+    /// v1.54.0: the monitor went away (unplugged, or turned off and gone
+    /// from the desktop). Windows says so through `GraphicsCaptureItem::Closed`.
+    closed_token: Option<i64>,
+    lost: Arc<AtomicBool>,
+    signal: Arc<Wake>,
     size: (u32, u32),
 }
 
 impl MonitorCapture {
-    /// Start capturing `monitor`. Windows draws its yellow capture border
-    /// around the monitor until this is dropped.
-    pub fn start(dev: &Gpu, monitor: HMONITOR, cursor: bool) -> Result<Self, CaptureError> {
+    /// Start capturing `monitor`, notifying `signal` as frames arrive.
+    /// Windows draws its yellow capture border around the monitor until this
+    /// is dropped.
+    pub fn start(
+        dev: &Gpu,
+        monitor: HMONITOR,
+        cursor: bool,
+        signal: Arc<Wake>,
+    ) -> Result<Self, CaptureError> {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .context("IGraphicsCaptureItemInterop")?;
         // SAFETY: `monitor` came from EnumDisplayMonitors in this process.
@@ -83,7 +96,6 @@ impl MonitorCapture {
         )
         .context("CreateFreeThreaded")?;
 
-        let signal = Arc::new(FrameSignal::default());
         let for_handler = Arc::clone(&signal);
         let token = pool
             .FrameArrived(&TypedEventHandler::new(move |_, _| {
@@ -91,6 +103,17 @@ impl MonitorCapture {
                 Ok(())
             }))
             .context("FrameArrived")?;
+
+        let lost = Arc::new(AtomicBool::new(false));
+        let (for_closed, closed_signal) = (Arc::clone(&lost), Arc::clone(&signal));
+        // Not fatal if it can't be had: the take then simply sees no frames.
+        let closed_token = item
+            .Closed(&TypedEventHandler::new(move |_, _| {
+                for_closed.store(true, Ordering::Release);
+                closed_signal.notify();
+                Ok(())
+            }))
+            .ok();
 
         let session = pool
             .CreateCaptureSession(&item)
@@ -110,16 +133,23 @@ impl MonitorCapture {
         session.StartCapture().context("StartCapture")?;
 
         Ok(Self {
-            _item: item,
+            item,
             pool,
             session,
             token,
+            closed_token,
+            lost,
             signal,
             size: (
                 u32::try_from(size.Width).unwrap_or(0),
                 u32::try_from(size.Height).unwrap_or(0),
             ),
         })
+    }
+
+    /// Whether Windows said the monitor is gone (v1.54.0).
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
     }
 
     /// The monitor's size in pixels, as captured.
@@ -223,6 +253,9 @@ impl MonitorCapture {
 
 impl Drop for MonitorCapture {
     fn drop(&mut self) {
+        if let Some(t) = self.closed_token {
+            let _ = self.item.RemoveClosed(t);
+        }
         let _ = self.pool.RemoveFrameArrived(self.token);
         let _ = self.session.Close();
         let _ = self.pool.Close();

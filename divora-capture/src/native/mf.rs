@@ -22,7 +22,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFSinkWriter, MFSTARTUP_FULL, MFT_REGISTER_TYPE_INFO, MF_VERSION,
+    IMFSinkWriter, IMFVideoSampleAllocatorEx, MFSTARTUP_FULL, MFT_REGISTER_TYPE_INFO, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::{
@@ -53,6 +53,8 @@ type FnTEnumEx = unsafe extern "system" fn(
 ) -> HRESULT;
 type FnCreateSinkWriterFromUrl =
     unsafe extern "system" fn(PCWSTR, *mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT;
+type FnCreateVideoSampleAllocatorEx =
+    unsafe extern "system" fn(*const GUID, *mut *mut c_void) -> HRESULT;
 
 /// The Media Foundation entry points this crate uses.
 pub struct Mf {
@@ -66,6 +68,9 @@ pub struct Mf {
     create_dxgi_surface_buffer: FnCreateDxgiSurfaceBuffer,
     tenum_ex: FnTEnumEx,
     create_sink_writer_from_url: FnCreateSinkWriterFromUrl,
+    /// v1.54.0: the directly driven encoder's input pool. Optional, so a
+    /// Windows without it still records through the sink writer (rung 1).
+    create_video_sample_allocator_ex: Option<FnCreateVideoSampleAllocatorEx>,
 }
 
 static MF: OnceLock<Result<Mf, String>> = OnceLock::new();
@@ -107,6 +112,7 @@ fn load() -> Result<Mf, String> {
             create_dxgi_surface_buffer: sym(plat, s!("MFCreateDXGISurfaceBuffer"))?,
             tenum_ex: sym(plat, s!("MFTEnumEx"))?,
             create_sink_writer_from_url: sym(rw, s!("MFCreateSinkWriterFromURL"))?,
+            create_video_sample_allocator_ex: sym(plat, s!("MFCreateVideoSampleAllocatorEx")).ok(),
         })
     }
 }
@@ -231,6 +237,26 @@ impl Mf {
         .context("MFCreateDXGISurfaceBuffer")?;
         // SAFETY: as above.
         unsafe { owned(p, "MFCreateDXGISurfaceBuffer") }
+    }
+
+    /// A sample allocator handing out Direct3D 11 surfaces (v1.54.0): the
+    /// directly driven encoder's input pool.
+    pub fn create_video_sample_allocator_ex(
+        &self,
+    ) -> Result<IMFVideoSampleAllocatorEx, CaptureError> {
+        let Some(create) = self.create_video_sample_allocator_ex else {
+            return Err(CaptureError::Unavailable(
+                "This Windows has no video sample allocator.".to_string(),
+            ));
+        };
+        let mut p = std::ptr::null_mut();
+        // SAFETY: the IID matches the interface asked for; `p` is a valid
+        // out-pointer that owns the object on success.
+        unsafe { create(&IMFVideoSampleAllocatorEx::IID, &raw mut p) }
+            .ok()
+            .context("MFCreateVideoSampleAllocatorEx")?;
+        // SAFETY: as above.
+        unsafe { owned(p, "MFCreateVideoSampleAllocatorEx") }
     }
 
     /// The MFTs registered for `category` matching the given types.

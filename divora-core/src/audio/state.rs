@@ -42,6 +42,11 @@ pub struct EngineState {
     /// The UI polls this to show a "device lost — restart" banner instead of a
     /// silent, metering-but-dead "running" state.
     pub recovery_failed: AtomicBool,
+    /// v1.54.0: how many times the user's own command has left the engine
+    /// stopped — a Stop, or a Start whose devices would not open. Written by
+    /// the engine thread only, never by a callback, and never by a device-loss
+    /// rebuild. See [`AudioEngine::user_stop_count`](super::AudioEngine::user_stop_count).
+    pub user_stops: AtomicU64,
     pub input_rms_bits: AtomicU32,
     pub input_peak_bits: AtomicU32,
     pub output_rms_bits: AtomicU32,
@@ -74,6 +79,10 @@ pub struct EngineState {
     /// Gates the output callback's push into the screen recorder's tap — the
     /// one atomic load it costs a buffer while nothing records.
     pub av_recording: AtomicBool,
+    /// v1.54.0: the take the screen recorder's tap is for, while one is
+    /// attached (0 otherwise). Each attach is a new number, so the callback
+    /// starts a new run for it even when it never saw the last take let go.
+    pub av_take: AtomicU64,
     /// v1.52.0: engine-rate frames the screen recorder's tap could not keep,
     /// since the take began: full rings in the callback, or a full channel to
     /// the recorder. The recording has silence where they were.

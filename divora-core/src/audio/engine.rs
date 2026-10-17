@@ -234,6 +234,12 @@ impl AudioEngine {
     /// Spawn the audio thread.
     #[must_use]
     pub fn new() -> Self {
+        Self::spawn(start_streams)
+    }
+
+    /// Spawn the audio thread, opening each session's devices with `start`.
+    /// Always [`start_streams`] outside the tests; see [`StartFn`].
+    fn spawn<S: 'static>(start: StartFn<S>) -> Self {
         let (tx, rx) = channel();
         let state = Arc::new(EngineState::default());
         // Monitor defaults to on so first-time users hear themselves
@@ -257,7 +263,9 @@ impl AudioEngine {
         let cmd_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("divora-audio".into())
-            .spawn(move || engine_thread(rx, cmd_tx, state_clone, reading_clone, routing_clone))
+            .spawn(move || {
+                engine_thread(rx, cmd_tx, state_clone, reading_clone, routing_clone, start);
+            })
             .expect("spawning the audio thread should not fail");
         Self {
             tx,
@@ -476,6 +484,18 @@ impl AudioEngine {
         self.state.recovery_failed.load(Ordering::Acquire)
     }
 
+    /// v1.54.0: how many times the user has stopped the engine: each Stop, and
+    /// each Start whose devices would not open, since that Start has already
+    /// torn down whatever was running. A device-loss rebuild never moves it, though
+    /// [`is_running`](Self::is_running) reads false while one runs, and that
+    /// is the difference it exists to tell: Replay holds its ring on a user's
+    /// stop and carries on through a rebuild. A rebuild that gives up shows in
+    /// [`device_recovery_failed`](Self::device_recovery_failed) instead.
+    #[must_use]
+    pub fn user_stop_count(&self) -> u64 {
+        self.state.user_stops.load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn is_monitoring(&self) -> bool {
         self.state.monitor.load(Ordering::Acquire)
@@ -600,9 +620,11 @@ struct RunningStreams {
 }
 
 /// Everything `start_streams` hands back: the live streams plus the
-/// command senders + the recording writer's join handle.
-struct StartedStreams {
-    streams: RunningStreams,
+/// command senders + the recording writer's join handle. `S` is what keeps
+/// the streams alive — [`RunningStreams`], except in the tests (see
+/// [`StartFn`]).
+struct StartedStreams<S = RunningStreams> {
+    streams: S,
     info: StreamInfo,
     dsp_tx: SyncSender<DspEdit>,
     reactive_tx: SyncSender<ResolvedReactive>,
@@ -626,16 +648,32 @@ struct StartedStreams {
     av_drainer: JoinHandle<()>,
 }
 
+/// What opens a session's devices and starts its streams: [`start_streams`],
+/// with the same arguments. A parameter of the engine thread only so the tests
+/// can drive the real command loop through a Start that opens and one that
+/// doesn't. Real devices can give them neither: CI has none to open, and
+/// failing a Start by naming a missing one enumerates devices, which a test
+/// on CI must not do (see `devices.rs`).
+type StartFn<S> = fn(
+    Option<&str>,
+    Option<&str>,
+    Option<&str>,
+    Arc<EngineState>,
+    Arc<ReadingTap>,
+    Sender<Command>,
+) -> Result<StartedStreams<S>, AudioEngineError>;
+
 #[allow(clippy::needless_pass_by_value)] // owns values for the thread's lifetime
 #[allow(clippy::too_many_lines)] // one command dispatch loop; clearer inline
-fn engine_thread(
+fn engine_thread<S>(
     rx: Receiver<Command>,
     cmd_tx: Sender<Command>,
     state: Arc<EngineState>,
     reading: Arc<ReadingTap>,
     routing: Arc<Mutex<Option<StreamInfo>>>,
+    start: StartFn<S>,
 ) {
-    let mut current: Option<RunningStreams> = None;
+    let mut current: Option<S> = None;
     let mut dsp_tx: Option<SyncSender<DspEdit>> = None;
     let mut reactive_tx: Option<SyncSender<ResolvedReactive>> = None;
     let mut sb_tx: Option<SyncSender<SoundboardCommand>> = None;
@@ -659,6 +697,8 @@ fn engine_thread(
     let mut av_ctl: Option<Sender<AvControl>> = None;
     let mut av_drainer: Option<JoinHandle<()>> = None;
     let mut av_sink: Option<SyncSender<AvChunk>> = None;
+    // Attaches so far: each is a take's number for the tap.
+    let mut av_takes: u64 = 0;
     // v1.33.0: the devices of the live session, kept so a stream error can
     // rebuild on the same ones; and a counter that caps automatic recoveries
     // between manual starts so a flapping device can't loop forever.
@@ -735,7 +775,7 @@ fn engine_thread(
     // `StreamInfo` on success, the build error on failure.
     macro_rules! bring_up {
         ($in:expr, $out:expr, $mon:expr) => {{
-            match start_streams(
+            match start(
                 $in,
                 $out,
                 $mon,
@@ -758,7 +798,8 @@ fn engine_thread(
                     graveyard = Some(started.graveyard);
                     // A take in progress carries on into the new session.
                     if let Some(sink) = &av_sink {
-                        let _ = started.av_ctl.send(AvControl::Attach(sink.clone()));
+                        let take = state.av_take.load(Ordering::Acquire);
+                        let _ = started.av_ctl.send(AvControl::Attach(sink.clone(), take));
                     }
                     av_ctl = Some(started.av_ctl);
                     av_drainer = Some(started.av_drainer);
@@ -804,6 +845,13 @@ fn engine_thread(
                     state.stream_error_pending.store(false, Ordering::Release);
                     // A manual start clears any prior "recovery gave up" banner.
                     state.recovery_failed.store(false, Ordering::Release);
+                } else {
+                    // v1.54.0: the teardown above ended whatever was running
+                    // and nothing came up in its place, so this Start has left
+                    // the engine stopped by the user's own action — as a Stop
+                    // would. Counted before the reply, so a caller that sees
+                    // the error already sees the count.
+                    state.user_stops.fetch_add(1, Ordering::Release);
                 }
                 let _ = reply.send(result);
             }
@@ -822,6 +870,11 @@ fn engine_thread(
                 state.stream_error_pending.store(false, Ordering::Release);
                 // A deliberate Stop also dismisses any "recovery gave up" state.
                 state.recovery_failed.store(false, Ordering::Release);
+                // v1.54.0: counted after the teardown, so a reader that sees
+                // the new count sees the `running` it cleared (or a later
+                // Start's). A rebuild clears `running` too; only this count
+                // tells the two apart.
+                state.user_stops.fetch_add(1, Ordering::Release);
             }
             Command::StreamError => {
                 // An output stream died — most likely the device was
@@ -832,6 +885,8 @@ fn engine_thread(
                 // is re-armed only AFTER teardown, so the now-dropped stream
                 // can't re-signal; a capped budget stops a genuinely failing
                 // device from looping forever (a manual Start resets it).
+                // Never a user stop, whatever comes of it (v1.54.0): a rebuild
+                // that fails or gives up says so through `recovery_failed`.
                 teardown!();
                 state.store_input(Levels::default());
                 state.store_output(Levels::default());
@@ -943,11 +998,16 @@ fn engine_thread(
                 let attached = match &av_ctl {
                     Some(ctl) => {
                         state.av_dropped.store(0, Ordering::Relaxed);
+                        // A new take: its own number, so its buffers start a
+                        // run of their own even if the callback never saw the
+                        // last take let go (v1.54.0).
+                        av_takes += 1;
                         // The drain learns of the recorder before the callback
                         // starts tapping, so nothing is tapped with nowhere to go.
-                        let ok = ctl.send(AvControl::Attach(sink.clone())).is_ok();
+                        let ok = ctl.send(AvControl::Attach(sink.clone(), av_takes)).is_ok();
                         if ok {
                             av_sink = Some(sink);
+                            state.av_take.store(av_takes, Ordering::Release);
                             state.av_recording.store(true, Ordering::Release);
                         }
                         ok
@@ -958,6 +1018,7 @@ fn engine_thread(
             }
             Command::DetachAv => {
                 state.av_recording.store(false, Ordering::Release);
+                state.av_take.store(0, Ordering::Release);
                 av_sink = None;
                 if let Some(ctl) = &av_ctl {
                     let _ = ctl.send(AvControl::Detach);
@@ -1867,8 +1928,9 @@ fn build_output_stream(
                 // folded in, and the monitor-only previews mixed in below are
                 // not part of the call. `span`, not `block`: the recorder needs
                 // the whole timeline, and a mic gap is silence on it.
+                let av_take = state_for_callback.av_take.load(Ordering::Acquire);
                 av.tap(
-                    av_armed,
+                    (av_armed && av_take != 0).then_some(av_take),
                     AvBuffer {
                         at: info.timestamp().callback,
                         out_frames: u32::try_from(out_frames).unwrap_or(u32::MAX),
@@ -2855,9 +2917,10 @@ mod tests {
     use super::{
         drain_dsp_edits, drain_recording, drop_paired, graveyard_thread, is_octave_jump,
         is_passthrough, live_verdict_expired, main_output_plays, mix_voice_and_soundboard,
-        new_reading_analyzer, reading_snapshot, AudioEngine, LoudnessNormalizer, OctaveGuard,
-        ReadingFacts, ReadingSnapshot, ReadingTap, ReadingTaps, StreamInfo,
-        MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
+        new_reading_analyzer, reading_snapshot, AudioEngine, AudioEngineError, Command,
+        EngineState, LoudnessNormalizer, OctaveGuard, ReadingFacts, ReadingSnapshot, ReadingTap,
+        ReadingTaps, StartedStreams, StreamInfo, MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS,
+        RING_BUFFER_FRAMES,
     };
     use crate::dsp::witness::witnessed_chain;
     use crate::dsp::{
@@ -2867,9 +2930,10 @@ mod tests {
     use crate::soundboard::{SoundboardCommand, SoundboardMixer};
     use ringbuf::traits::{Observer, Producer, Split};
     use ringbuf::HeapRb;
-    use std::sync::atomic::Ordering;
-    use std::sync::mpsc::{channel, sync_channel};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, sync_channel, Sender};
     use std::sync::Arc;
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     /// The callback's reactive drain, minus the graveyard: `configure` takes
@@ -3017,6 +3081,131 @@ mod tests {
         assert!(engine.stream_info().is_none());
         engine.stop();
         assert!(engine.stream_info().is_none());
+    }
+
+    /// A session that opened no device, for driving the engine thread where
+    /// none can be opened. Each worker is a thread that runs until its sender
+    /// hangs up, as the real ones do, so `teardown!` joins it just the same.
+    fn deviceless_session() -> StartedStreams<()> {
+        fn worker<T: Send + 'static>() -> (Sender<T>, JoinHandle<()>) {
+            let (tx, rx) = channel::<T>();
+            (tx, std::thread::spawn(move || while rx.recv().is_ok() {}))
+        }
+        let (recording_tx, writer) = worker();
+        let (reference_tx, reference_writer) = worker();
+        let (reading_tx, reading_worker) = worker();
+        let (graveyard_tx, graveyard) = worker();
+        let (av_ctl, av_drainer) = worker();
+        StartedStreams {
+            streams: (),
+            info: StreamInfo {
+                input_name: "Mic".into(),
+                output_name: "Speakers".into(),
+                monitor_name: None,
+                sample_rate: 48_000,
+                output_rate: 48_000,
+                monitor_rate: None,
+                input_channels: 1,
+                output_channels: 2,
+            },
+            dsp_tx: sync_channel(1).0,
+            reactive_tx: sync_channel(1).0,
+            sb_tx: sync_channel(1).0,
+            recording_tx,
+            writer,
+            reference_tx,
+            reference_writer,
+            reading_tx,
+            reading_worker,
+            graveyard_tx,
+            graveyard,
+            av_ctl,
+            av_drainer,
+        }
+    }
+
+    /// v1.54.0 (Replay, test 42): `user_stop_count` moves when the user's own
+    /// command leaves the engine stopped — a Stop, or a Start whose devices
+    /// would not open — and for nothing else: not a Start that opens, and not
+    /// a device-loss rebuild, though `is_running` reads false while one runs.
+    /// Replay holds its ring on the first and carries on through the second,
+    /// so bumping on a rebuild would hold it on every unplug, and an uncounted
+    /// failed Start would leave it "armed" on silence.
+    ///
+    /// Driven through the real engine thread, with a stand-in for the device
+    /// bring-up (see [`super::StartFn`]): "plugged in", it opens a session
+    /// with no streams; unplugged, it fails as `start_streams` would.
+    #[test]
+    fn a_user_stop_is_counted() {
+        static PLUGGED_IN: AtomicBool = AtomicBool::new(true);
+        fn start(
+            _input: Option<&str>,
+            _output: Option<&str>,
+            _monitor: Option<&str>,
+            _state: Arc<EngineState>,
+            _reading: Arc<ReadingTap>,
+            _cmd_tx: Sender<Command>,
+        ) -> Result<StartedStreams<()>, AudioEngineError> {
+            if PLUGGED_IN.load(Ordering::Acquire) {
+                Ok(deviceless_session())
+            } else {
+                Err(AudioEngineError::NoInputDevice)
+            }
+        }
+        // The engine thread runs its commands in order and this one answers
+        // (or drops its reply), so once it returns everything sent before it
+        // has been handled. `stop` and a stream error are fire-and-forget.
+        fn settle(engine: &AudioEngine) {
+            let _ = engine.stop_reference_recording();
+        }
+        fn stream_error(engine: &AudioEngine) {
+            engine.tx.send(Command::StreamError).unwrap();
+            settle(engine);
+        }
+
+        let engine = AudioEngine::spawn(start);
+        assert_eq!(engine.user_stop_count(), 0);
+
+        // A Start that opens is not a stop.
+        engine.start(None, None, None).unwrap();
+        assert!(engine.is_running());
+        assert_eq!(engine.user_stop_count(), 0);
+
+        // Nor is a device-loss rebuild that comes back up.
+        stream_error(&engine);
+        assert!(engine.is_running());
+        assert_eq!(engine.user_stop_count(), 0);
+
+        // A Stop is.
+        engine.stop();
+        settle(&engine);
+        assert!(!engine.is_running());
+        assert_eq!(engine.user_stop_count(), 1);
+
+        // A device error queued behind that Stop rebuilds nothing and counts
+        // nothing.
+        stream_error(&engine);
+        assert!(!engine.is_running());
+        assert_eq!(engine.user_stop_count(), 1);
+
+        // A Start whose devices won't open, while a session runs — a device
+        // switch with the new device gone — is a stop: its own teardown ended
+        // the session, and the error comes back with the count already moved.
+        engine.start(None, None, None).unwrap();
+        PLUGGED_IN.store(false, Ordering::Release);
+        assert!(engine.start(None, None, None).is_err());
+        assert!(!engine.is_running());
+        assert_eq!(engine.user_stop_count(), 2);
+
+        // A rebuild that can't come back up is not a stop: that is what
+        // `device_recovery_failed` reports.
+        PLUGGED_IN.store(true, Ordering::Release);
+        engine.start(None, None, None).unwrap();
+        PLUGGED_IN.store(false, Ordering::Release);
+        stream_error(&engine);
+        assert!(!engine.is_running());
+        assert!(engine.device_recovery_failed());
+        assert_eq!(engine.user_stop_count(), 2);
     }
 
     /// v1.29.0: the Speak/soundboard monitor defaults on (TTS previews audible)

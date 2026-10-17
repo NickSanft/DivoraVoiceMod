@@ -20,7 +20,7 @@ export type SigilName =
   | "compressor" | "deesser"
   | "mixer" | "soundboard" | "presets" | "settings"
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
-  | "lock" | "panic" | "play" | "stop" | "record" | "screen"
+  | "lock" | "panic" | "play" | "stop" | "record" | "screen" | "replay"
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
   | "download" | "external" | "trash" | "copy" | "info" | "warning"
@@ -203,6 +203,15 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
       <rect x="3.5" y="4.5" width="17" height="12" rx="2" />
       <path d="M12 16.5 V19.5 M8.5 19.5 h7" />
       <circle cx="12" cy="10.5" r="2.2" fill="currentColor" stroke="none" />
+    </g>
+  ),
+  // v1.54.0: Replay — the record dot inside the refresh arrow, mirrored so
+  // it turns back: what was just kept.
+  replay: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 5.5 V9.5 H9" />
+      <path d="M5.5 9.5 A7 7 0 1 1 5 13" />
+      <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
     </g>
   ),
   // ---------- UTILITY ----------

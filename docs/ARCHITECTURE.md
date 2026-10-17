@@ -546,15 +546,22 @@ And rejects unrelated devices (`Blue Yeti X`, `HyperX Cloud II`, `Realtek HD Aud
 GlobalShortcutEvent { id, accelerator, state }  // state: "pressed" | "released"
 ```
 
-Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id:
+Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor`, the reserved prefixes `sb:`, `rec:` and `replay:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray:
 
 ```
-event.id  | event.state | action
-----------|-------------|-------------------------------
-"ptm"     | "pressed"   | setUi("pressed", true)
-"ptm"     | "released"  | setUi("pressed", false)
-"panic"   | "pressed"   | panicSoundboard()
-"monitor" | "pressed"   | toggleMonitor()
+event.id         | event.state | action
+-----------------|-------------|-------------------------------
+"ptm"            | "pressed"   | setUi("pressed", true)
+"ptm"            | "released"  | setUi("pressed", false)
+"panic"          | "pressed"   | panicSoundboard()
+"monitor"        | "pressed"   | toggleMonitor()
+"rec:screen"     | "pressed"   | toggleScreenRecording()   (v1.52.0)
+"rec:wav"        | "pressed"   | toggleRecording()         (v1.52.0)
+"replay:save"    | "pressed"   | saveReplay()              (v1.54.0)
+"replay:toggle"  | "pressed"   | toggleReplay() — refused with a toast
+                 |             | until Replay has been turned on from
+                 |             | the card once                (v1.54.0)
+"sb:<clipId>"    | "pressed"   | playTileById(clipId)
 ```
 
 `syncHotkeyBindings()` is called once after subscribe; it re-registers every persisted accelerator so a Windows restart doesn't lose the bindings (Tauri's plugin loses its registrations when the process exits).
@@ -1517,3 +1524,360 @@ running engine's monitor switches put Divora's sound there during it.
   GPU.
 - Measured end to end in the real app: see "Screen recording" in
   [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
+
+## Replay (v1.54.0)
+
+The last 15, 30, 60 or 120 seconds of one screen — the picture, the voice and
+soundboard as the call hears them, and the desktop audio the card records —
+kept in memory and saved as an MP4 on request: from the card, a hotkey or the
+tray. Off at every launch: nothing saved turns it on. The first time, only
+"Turn Replay on" in the card's explainer turns it on, and the explainer is
+needed again if desktop audio is on now but was off when it was read; after
+that, the card's switch or the `replay:toggle` hotkey does. Divora writes no
+picture or sound to disk until Save. That promise is about Divora: Windows may
+still page the ring to its page file, or write it to `hiberfil.sys` when the
+PC hibernates. The design, with its review, is in
+[`research/stream-studio.md`](research/stream-studio.md) ("As built").
+
+### One pipeline, shared
+
+A take and the ring share **one capture pipeline**: one WGC capture, one
+hardware H.264 encoder driven directly, and one audio timeline, on one
+`divora-encoder` thread (`divora_capture::spawn_pipeline`). A take started
+while Replay is on goes on Replay's pipeline (with Replay's settings, or it is
+refused); an arm during a take joins the take's pipeline (on its settings). The
+pipeline ends when neither needs it.
+
+```
+src-tauri ScreenRecorder (AppState.screen) — Shared, one lock:
+  phase/take… (v1.52.0) · slot: Slot<PipelineHandle> (None | Running | Ending)
+  · settings: SharedSettings · desktop: DesktopReport · replay: state, seconds,
+  saving, last save
+    │ PipelineCommand (mpsc + Wake)          ▲ PipelineEvents / TakeEvents
+divora-encoder thread (MTA) — Runner (native/pipeline.rs) around PipelineCore:
+  ComScope, MfSession (dropped last) · Session { encoder, pool, converter,
+  latest, capture, mf_device, gpu } (dropped in that order)
+  PipelineCore (pipeline_core.rs, pure): FramePacer · OutputRouter
+  (SubmitQueue + KeyframeWatchdog) · EncoderLiveness · AudioTimeline (stems
+  on, 600 s fit window) · BlockTail (600 ms) · TakeCore · ReplayRing +
+  PendingCut
+    ├─ divora-take-mux (one per take): Mp4Writer + StemWriter → rename
+    └─ divora-replay-save (one per save): Snapshot → Mp4Writer → rename
+```
+
+**The encoder thread writes no recording or clip** (its log lines are its only
+file writes): it hands a take's messages and each save to threads of their own
+without waiting. Once running, a turn of its loop waits at most 20 ms (2 ms
+while a frame waits for the encoder). Its longer stalls:
+
+- the first picture at the start (up to 5 s, before it reports ready);
+- a drain (up to 500 ms) when the encoder's last output is wanted — a take
+  ending, the screen gone — or a quiesce (up to 100 ms) when it isn't;
+- building again: a new encoder and pool after a stream change, new capture
+  buffers when the screen changes size, a whole session after a sleep (each
+  try a stall of its own; the loop turns between them);
+- at the very end, the desktop-audio thread's stop (up to 2 s).
+
+It logs transitions and failures only — every log line is a synchronous file
+write. Its encoder's counters go in one line when a session is let go or the
+pipeline ends, not when a sleep drops the session or a stream change replaces
+the encoder. In a 26-minute armed run (on the build before the review's fixes)
+it wrote no line after it began keeping the screen; the only later line in the
+log was the save thread's, for the save at minute 5.
+
+**`PipelineCore` makes the pipeline's decisions** about takes, the ring, saves
+and faults, and is driven in CI by a pretend encoder, engine and shell. The
+Windows shell keeps the timing and a few checks of its own: after a sleep it
+tries the rebuild every 2 s for 30 s and makes a new capture after 10 s with no
+picture; it asks the graphics device once a second whether it is still there;
+it ends a take whose writer can't keep up; and it replaces a frame still
+waiting for the encoder with the newer picture. The core's calls that act fill
+an `Out` the shell passes in: messages for the open take's writer, clips to
+save, what to do with the session — `Drain` (a take ends with nothing else
+needing the screen: the border goes, the encoder hands back what it holds),
+`Release`, `RebuildEncoder` (the encoder restarted itself), `Rebuild` (after a
+sleep) — and whether the thread should end.
+
+### The encoder, driven directly
+
+`EncoderSession` (`native/mft.rs`) drives the hardware H.264 MFT itself
+instead of the sink writer: async, D3D11-aware, fed NV12 textures from a pool
+of four (`InputPool`, an `IMFVideoSampleAllocatorEx`). It must accept the
+pipeline's bitrate (what a take with those settings uses), forced keyframes,
+and a GOP of 2 s (set before the output type, read back, refused if the encoder
+says otherwise). It asks for CBR, low latency and no B-frames; a refusal of
+any of those is logged, in "the direct encoder is ready", and is not fatal.
+NVIDIA accepts CBR and low latency and refuses the B-frame count, but makes no
+B-frames; any B-frame is caught on the output (DTS ≠ PTS).
+
+A keyframe is forced where a take or a ring segment starts, and whenever a GOP
+of input (2 s) has gone by since the frame of the last IDR that came out
+(`KeyframeWatchdog`; never while a forced one is still on its way). Outputs
+are matched to the frames submitted (`SubmitQueue`) by their timestamps — a
+later one means the encoder dropped a frame, none means it re-stamps. An
+encoder that stops answering, or stops asking for input, for more than a
+second is caught (`EncoderLiveness`).
+
+**An encoder that can't be trusted is remembered until the next launch.**
+Re-stamped outputs or B-frames end a take at its last frame and hold the ring.
+A forced keyframe more than 3 frames late, or a ring segment that goes more
+than two GOPs and 0.1 s without an IDR (`RingFault::NoKeyframe`), holds the
+ring ("This PC's encoder doesn't make regular keyframes."); a take already
+running carries on. That is said once; later late keyframes are only counted,
+and the count is logged in "the pipeline ended" only if the session lasts
+until then — not when a ring held for it lets the session go first. After any
+of these, no take or arm uses the direct encoder until the next launch. A
+stall, a lost device, a stream change or a failed rebuild is not remembered.
+
+**Rung 1 stays.** A take goes through v1.53.0's sink writer on a PC without a
+hardware encoder, on a run where the direct encoder failed to build or was
+found untrustworthy, and — only for a take started while no pipeline runs —
+with `DIVORA_CAPTURE_RUNG1` or `DIVORA_CAPTURE_CPU_CONVERT` set. A take whose
+direct encoder fails to build goes on as the same take, with the audio feed it
+already opened (`StartError::Direct` hands it back). Any failure of the parts
+only the direct path uses — the encoder, its device and input pool, the GPU
+colour converter — counts as "failed to build", even when its cause passes
+(an encoder whose sessions another app holds): the take falls back, and
+Replay is unavailable until the next launch. The capture and the GPU device,
+which the sink writer shares, still refuse the take. With Replay on, a take
+goes on Replay's pipeline whatever the switches say, or is refused. Replay needs the direct encoder: `replay_support` says why
+it can't run — screen recording unsupported, no hardware encoder, or the
+direct encoder failed on this run. The switches never stop Replay; they only
+get an arm refused (`RUNG1_TAKE`) while a take they sent to the sink writer is
+running. `DIVORA_PRETEND_NO_DIRECT` refuses the direct encoder to check that
+path.
+
+### Takes on the pipeline
+
+A take starts at the next frame, `k0`, with a keyframe forced there; its file
+opens on the first keyframe at or after `k0` (never an earlier one), with that
+keyframe's in-band SPS/PPS, or the session's header if it carries none. Its
+audio is cut from the shared timeline at
+`sample_of(k0) = k0·48000/fps` — exact at 30 and 60 fps — seeded from the last
+600 ms of blocks the timeline handed out (`BlockTail`), because with an A/V
+offset the timeline runs ahead of the picture. A stop ends the take after the
+last frame submitted and waits (≤ 1.5 s) for that frame and its audio; the
+take's writer, on its own thread, finishes the file and tells the app —
+exactly once, however the take ended. Its audio is sent only as far as its
+video has gone, give or take the one 1024-frame block that straddles it, so a
+take cut short (an encoder that stalls, a sleep) has less than a block (about
+21 ms) of sound past its last frame. A writer 4096 messages or 64 MiB of
+encoded video behind ends the take ("The disk couldn't keep up"), its file
+kept. The take reports its own counts (frames, drops, the timeline's counters
+since it began) and the pipeline's gauges as they are (drift, the voice's
+delay).
+
+### The ring
+
+`ReplayRing` (`replay.rs`, pure) keeps access units and the timeline's mixed
+track (a PCM ring of `seconds + 4` s, allocated when the ring is made and
+again, keeping the newest audio, only when the length changes while Replay is
+on):
+
+- **Whole GOPs leave the front**, never single frames, so the front is always
+  an IDR: by time while the next IDR is `N` seconds old, and by bytes over the
+  cap; the audio under them goes with them. Once full, the ring holds `N` plus
+  part of its front GOP: about `[N, N + 2 s)`, a little more when a forced
+  keyframe comes late (the test allows `N + 2 s` + 5 frames; the 26-minute run
+  at 30 s, on the build before the review's fixes, held 30.1 to 31.95 s).
+- **One segment at a time**, one header and one unbroken clock: a header
+  change, the engine coming back after a hold, a rebuilt encoder or a sleep
+  starts a new one, which clears the ring. A segment's audio is clipped to its
+  first frame's sample and seeded from the block tail.
+- **Save** cuts the window from the latest IDR at least `N` before the frame
+  showing at the press (or the front, if the ring is shorter), pins its first
+  GOP against eviction, and waits — never blocking the loop — until the ring
+  has that frame and its audio, at most 1.2 s (missing audio is silence). The
+  snapshot shares the access units and copies the audio. A save thread checks
+  the drive's free space (under 1.1 × the snapshot's size, its video plus raw
+  audio: refused, no file written), writes `.part` in time order (audio pieces
+  of 100 ms interleaved with the frames, both streams from 0, no edit list;
+  throttling off, paced on the writer's queue), renames it, and answers.
+  Every Save is answered exactly once (`SaveReply` answers "wasn't saved" if
+  dropped), so `replay-saved` goes out once per attempt.
+- **Held**: the engine stopped by the user (or its recovery gave up, or it has
+  been down 5 s), the screen gone, or the encoder failed: the ring keeps what
+  it has, takes nothing new, and a Save still cuts from it; with the engine
+  stopped, the timeline's last epoch is closed first, so the soundboard that
+  played just before the stop is in the clip. A hold with nothing kept —
+  before the first keyframe, or after a sleep emptied the ring (one held for
+  the engine waits for it) — turns Replay off, and so does a rebuild that
+  fails (the owner's decision: off, where the plan had it held).
+
+**Memory**: `estimate = (N + 2) · bitrate/8 + (N + 4) · 192 kB`, the cap 25 %
+over it (what the UI shows, "up to … MB", rounded up), refused past
+`min(1 GiB, RAM/8)` (`ullTotalPhys`; shown rounded down). The default — 30 s at
+1440p30 Balanced — is up to 81 MB.
+
+### The engine watch and the tap
+
+A device-loss rebuild leaves `is_running()` false for its length, so the ring
+can't hold on that: `AudioEngine::user_stop_count()` (divora-core) counts the
+user's stops — each Stop, and each Start whose devices won't open — and
+`EngineWatch` holds the ring on a count that moved, a recovery that gave up, or
+5 s of not running. A device switch in Settings restarts the engine without a
+Stop (`restartEngine()`): one that comes back up is a rebuild the ring carries
+on through (silence in the gap); one whose devices won't open has already torn
+the running session down, counts as a stop, and holds the ring.
+
+**The tap numbers its takes.** A take or an arm waiting for the last pipeline
+to end attaches the engine's tap the moment that pipeline lets go of it. When
+the output callback had not run in between, it never saw the tap disarmed: it
+started no new run, the drain had already dropped the old one, and every
+buffer of the new take was thrown away (found in the real app: a take started
+right after another had no voice or soundboard). Each attach is now a numbered
+take; the callback stamps each buffer with it and starts a run when the number
+changes; the drain reads its control messages first, forwards only the
+attached take's buffers, drops older ones and keeps newer ones for their
+attach. In a debug build of the shipping code, a take started right after
+another, and a ring armed right after Replay was turned off, each had 3 of 3
+soundboard stings.
+
+### Sleep
+
+`Instant` counts sleep on Windows, so no reading of it from after a sleep may
+reach the timeline. Each turn of the loop — the encoder thread's, and the sink
+writer's — reads the clock once, then checks for a sleep (`SleepWatch`:
+Windows' resume notification, plus the performance counter running ahead of
+the interrupt time), and uses that one reading for all its work; only the
+wait's length reads the clock live. On a sleep, the moment things end at is
+the reading the previous check was given (`sleep::LoopSleep`): from before the
+sleep, whether the PC went down in that turn's work or its wait.
+
+Then the feed's contents are thrown away, a take ends at its last frame before
+the sleep, its file kept (rung 1 too, through `AudioTrack::finish_at`), a
+pending Save is cut there, and the ring's session is rebuilt: at once, again
+every 2 s for 30 s, then waiting for a picture for as long as the lock screen
+takes, on a new clock. Until that picture, a take is refused ("The screen
+isn't sending a picture yet — try again in a moment."), and nothing on the
+old clock reaches the timeline: what the feed brings meanwhile is thrown away,
+and the first picture starts a new timeline on a new clock. A take's finishing
+wait on the sink writer never pumps more than 2 s past its end, so a sleep
+during that wait adds at most about a second of silence after the end, never
+the sleep.
+A ring held for a lost screen or a failed encoder has nothing to keep with
+again, so a sleep that empties it turns Replay off; one held for the engine
+stays held, empty, until the engine is back.
+
+**None of this has been through a real sleep.** It is covered by tests only:
+the pure core given the moment of a sleep, `LoopSleep`, and the bounded
+finishing wait.
+
+### The app
+
+`replay.rs` (src-tauri) is the rules, all pure and table-tested:
+
+- the `ReplayState` table: Off → Arming → Armed → Held. A rebuild sends an
+  armed ring back to Arming, and so does the engine's return to a ring held
+  for it; a ring held for a lost screen or encoder stays held until Replay
+  turns off. Whatever would hold a ring still arming turns it off, as do a
+  Disarm, Replay turning itself off (a failed rebuild, an emptied hold) and
+  the pipeline's end;
+- the `Slot` (None / Running / Ending), which tells a take's start or an arm
+  to wait while the pipeline is on its way out — up to 3 s (`SLOT_WAIT`),
+  then it is refused;
+- `SharedSettings` and the refusals in the user's words, `EngineWatch`, the
+  memory table, file names (`divora-replay-<date>_<time>.mp4`, from local time
+  — the tray saves with no window), the tray view and Quit's wait;
+- the wire shapes: `ReplayStatus` with its `ReplayArmed` and `HeldReasonDto`,
+  `ReplaySaved`, and `ReplayMemory` with its `ReplayLength`; `ReplayState`
+  goes out as its name.
+
+`screen/replay_ops.rs` applies them. `screen.rs` also holds a take's start or
+an arm for up to 8 s while a pipeline is still being started (`SPAWN_WAIT`),
+then refuses it with "Still stopping the last recording — try again." The
+`ended` event detaches the engine's tap before it frees the slot, so a new
+pipeline's tap always comes after. A Stop or a Disarm pressed while the
+pipeline is still being built is carried out the moment it is ready
+(`spawned`), and events from a pipeline that ended before then are not
+overwritten by it.
+
+The tray (`lib.rs`) is synced through `run_on_main_thread` (`sync_tray`),
+without waiting: the tray's setters block off the main thread, and Quit holds
+that thread while it waits. The one exception is Quit's "saving replay…"
+tooltip, which `quit_replay` sets directly, already on the main thread. While
+Replay is on, the tooltip says so (and with desktop audio) and how the last
+save went, the icon gains a red dot, and the menu gains Save replay and Turn
+Replay off — never a way to turn Replay on.
+
+Quit waits for a save in progress for as long as its size needs (5 to 60 s,
+plus the cut's 1.2 s, worked out again once the clip is cut), then cancels it
+and waits up to 10 s more. A save still writing stops within 16 writes, lets
+go of its file unfinished and removes the `.part` (retrying for a second while
+Windows still holds it). One already finishing its file can't be stopped: it
+has the writer's queue to flush — kept to about 4 MiB, but checked only every
+16 writes, so up to 16 more can be queued on top — and then the file's index
+to write.
+
+The frontend's `armReplay()` is the only caller of `arm_replay_buffer` and
+holds the explainer gate, for the card, the `replay:toggle` hotkey and anything
+added later: while the explainer is still needed (above), every way but its
+"Turn Replay on" is refused with a toast. A length picked while Replay is held
+is applied, through it, once the ring runs again. The save toast names the
+preset only if the voice was disguised with it from at least 3 s before the
+clip began, judged back from the save — or, for a held ring, from when it was
+held, where its clip ends. The toast is one always-mounted live region; while
+the window is hidden — and WebView2 still says `visible` for a window hidden
+to the tray, so it asks the window too — the latest toast waits until the
+window is shown.
+
+### Tests
+
+- **The pipeline, with a pretend encoder** (`pipeline_core.rs`): stems drained
+  every pump; a quiet encoder caught once it has been quiet for more than a
+  second (the test allows up to 1.1 s); a take ending within its deadline
+  however little comes after the stop; every Save answered once (Disarm,
+  Shutdown, sleep, the engine's return, a header change, an encoder failure, a
+  dead pipeline); the head of a take on an offset pipeline; gauges passed
+  through; a sleep never flooding the timeline; a stream change rebuilding; a
+  first IDR's own header; an engine stop holding with the soundboard tail
+  kept; a take's audio held to its video when an encoder fails after a Stop;
+  a failed rebuild, and a sleep emptying a held ring, turning Replay
+  off; a re-arm during a Disarm starting afresh; an ignored keyframe reported
+  once. Each was checked by taking out a rule it guards, one at a time: 21
+  mutants (10 when the core landed, 11 for the review's fixes), all caught by
+  the tests as shipped.
+- **Sleep**: `LoopSleep` hands back the reading from before a sleep, whether
+  the PC went down in a turn's wait or its work, and a reading on the new
+  clock after a restart; the sink writer's finishing wait pumps no more than
+  2 s past the end (`track.rs`). Returning the current reading fails both `LoopSleep` tests;
+  taking out the finishing wait's bound fails its test.
+- **The ring, pure** (`replay.rs`): length bounds at 30 and 60 fps, eviction
+  by bytes, audio following video, the keyframe fault, merges, resizing,
+  segments, the window, the pending cut and its pin, sample-exact audio,
+  snapshots untouched by later pushes, freezes, interleaving, the PCM clip at a
+  segment start, overflow never evicting a pinned GOP; `budget`.
+- **The bitstream, the boxes, the clock**: Annex B scanning, an MP4 box
+  reader, output matching, credits, liveness, the keyframe watchdog, sleep
+  coalescing, the windowed clock fit (bit-identical to the global fit for
+  290 s, short of its first turn at 300 s; a 2-hour armed timeline stays in
+  place, and its global-fit control fails), the take cut (a cut at 0 from a
+  timeline run to its end hashes to v1.52.0's voice-only fingerprints; one
+  from a shared timeline left running, as a take's is, comes within −80 dB of
+  them).
+- **On Windows in CI**: the inbox encoder through `EncoderSession`
+  (keyframes where asked, outputs matched, the header); a clip written from a
+  ring and read back box by box; a take cut at a keyframe; a cancelled clip's
+  writer erring and letting go of its file at once. In the save code, with no
+  encoder: a `.part` still held, removed once it is let go of.
+- **The tap**: a take attached right after another starts its own run, the
+  next take's first buffer waits for its recorder, and an earlier take's
+  leftovers are dropped.
+- **The app**: the state and slot tables, refusals, the engine watch, the
+  wire keys, the memory table, names, the tray view for every state, Quit's
+  wait. **Frontend**: the API, the store's gate, a length picked while held
+  (applied once, after the engine too; three mutants, all caught), the toast
+  (a held ring's clip judged from the hold — the rule taken out fails its
+  test), the chip, the card, the disabled controls; e2e tests 1–9.
+- **In the real app** (see "Replay (v1.54.0)" in
+  [`MANUAL_TESTS.md`](MANUAL_TESTS.md)), in a debug build of the shipping code before its last change (a fallback that only a failed encoder build reaches): turning Replay
+  on from the card's explainer, saves from the card and through `save_replay`
+  (also while hidden to the tray), a take while Replay is on, a held ring's
+  save, every save attempt answered once, the tap, the A/V offset of a clip
+  and a take (desktop audio only), 20 on/off cycles, the fallback (forced with
+  `DIVORA_PRETEND_NO_DIRECT`), a near-full disk (pretended with
+  `DIVORA_PRETEND_FREE_BYTES`), and seven files read back whole. The
+  armed run lasted 26 minutes, not the planned 2 hours (the owner chose to
+  ship on it), on the build before the review's fixes. Not tried: a real
+  sleep, a monitor unplugged, an encoder failure, a global hotkey or the tray
+  menu's items pressed, Quit during a save.

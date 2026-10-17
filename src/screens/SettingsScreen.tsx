@@ -55,6 +55,13 @@ import {
   MAX_DESKTOP_GAIN_DB,
   MIN_DESKTOP_GAIN_DB,
 } from "../data/screenRecording";
+import {
+  lengthTitle,
+  memoryLabel,
+  REPLAY_LENGTHS,
+  replayOn,
+  sanitizeReplaySeconds,
+} from "../data/replay";
 import type { ScreenQuality } from "../audio/api";
 
 const GITHUB_URL = "https://github.com/NickSanft/DivoraVoiceMod";
@@ -691,6 +698,9 @@ function RecordingsSection(): JSX.Element {
             Open folder
           </Button>
         </div>
+        {/* v1.54.0: below the folder row, which its copy points back up to —
+            replays go to the same folder; there is no second one. */}
+        <ReplayRows />
         <Show when={app.recordingPath()}>
           {(path) => (
             <div
@@ -713,11 +723,15 @@ function RecordingsSection(): JSX.Element {
   );
 }
 
-/** v1.52.0: how the screen recorder records. */
+/** v1.52.0: how the screen recorder records. v1.54.0: while Replay is on, a
+ *  take shares its capture and encoder, so the settings they were built with
+ *  are locked until it is turned off. The separate files are the take's
+ *  own and stay free. */
 function ScreenRecordingRows(): JSX.Element {
   const app = useApp();
   const [advanced, setAdvanced] = createSignal(false);
   const s = () => app.screenSettings();
+  const locked = () => replayOn(app.replayStatus());
   onMount(() => {
     if (!app.captureStatus()) void app.refreshCapture();
   });
@@ -733,6 +747,14 @@ function ScreenRecordingRows(): JSX.Element {
       }}
     >
       <div class="eyebrow">Screen recording</div>
+      <Show when={locked()}>
+        <div
+          data-testid="screen-recording-locked"
+          style={{ "font-size": "var(--t-xs)", color: "var(--warning)", "line-height": 1.5 }}
+        >
+          Replay is on — turn it off to change these.
+        </div>
+      </Show>
       <Row label="Frame rate">
         <Segmented<"30" | "60">
           options={[
@@ -740,6 +762,7 @@ function ScreenRecordingRows(): JSX.Element {
             { value: "60", label: "60 fps" },
           ]}
           value={s().fps === 60 ? "60" : "30"}
+          disabled={locked()}
           onChange={(v) => app.setScreenSettings({ fps: v === "60" ? 60 : 30 })}
         />
       </Row>
@@ -751,6 +774,7 @@ function ScreenRecordingRows(): JSX.Element {
             { value: "high", label: "Sharpest" },
           ]}
           value={s().quality}
+          disabled={locked()}
           onChange={(v) => app.setScreenSettings({ quality: v })}
         />
       </Row>
@@ -758,6 +782,7 @@ function ScreenRecordingRows(): JSX.Element {
         <Toggle
           on={s().cursor}
           ariaLabel="Show the mouse pointer in screen recordings"
+          disabled={locked()}
           onChange={(v) => app.setScreenSettings({ cursor: v })}
         />
       </Row>
@@ -769,6 +794,7 @@ function ScreenRecordingRows(): JSX.Element {
             max={MAX_DESKTOP_GAIN_DB}
             step={1}
             ariaLabel="Desktop audio volume in decibels"
+            disabled={locked()}
             onChange={(v) => app.setScreenSettings({ desktopGainDb: v })}
           />
         </div>
@@ -819,6 +845,7 @@ function ScreenRecordingRows(): JSX.Element {
               step={5}
               bipolar
               ariaLabel="A/V offset in milliseconds"
+              disabled={locked()}
               onChange={(v) => app.setScreenSettings({ avOffsetMs: v })}
             />
           </div>
@@ -828,6 +855,57 @@ function ScreenRecordingRows(): JSX.Element {
           positive moves the sound later. Leave it at 0 otherwise.
         </div>
       </Show>
+    </div>
+  );
+}
+
+/** v1.54.0: Replay's length. Turning it on — and its explainer — live on the
+ *  Record screen card; this is where the length and its memory are seen at
+ *  a glance. */
+function ReplayRows(): JSX.Element {
+  const app = useApp();
+  onMount(() => {
+    if (!app.captureStatus()) void app.refreshCapture();
+    void app.refreshReplayMemory();
+  });
+  const options = createMemo(() => {
+    const memory = app.replayMemory();
+    return REPLAY_LENGTHS.map((secs) => {
+      const len = memory?.lengths.find((l) => l.seconds === secs);
+      const why = len && memory ? lengthTitle(len, memory.ceilingBytes) : null;
+      return {
+        value: String(secs),
+        label: len ? `${secs} s · ${memoryLabel(len.capBytes)}` : `${secs} s`,
+        disabled: why !== null,
+        title: why ?? undefined,
+      };
+    });
+  });
+  return (
+    <div
+      data-testid="replay-settings"
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+        "border-top": "1px solid var(--line)",
+        "padding-top": "var(--s4)",
+      }}
+    >
+      <div class="eyebrow">Replay</div>
+      <Row label="Length">
+        <div data-testid="replay-settings-length">
+          <Segmented<string>
+            options={options()}
+            value={String(app.replaySettings().seconds)}
+            onChange={(v) => void app.setReplaySeconds(sanitizeReplaySeconds(Number(v)))}
+          />
+        </div>
+      </Row>
+      <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "line-height": 1.5 }}>
+        Save with its hotkey (Settings → Hotkeys), from the tray, or on the Record screen card.
+        Replays are saved in the Recordings folder above.
+      </div>
     </div>
   );
 }
@@ -1105,6 +1183,18 @@ const HOTKEY_ROWS: HotkeyRowDef[] = [
     label: "Record voice (WAV)",
     desc: "Start or stop recording the modulated output to a WAV.",
     icon: "record",
+  },
+  {
+    action: "replay:save",
+    label: "Save replay",
+    desc: "Save what Replay has kept as an MP4, even while Divora is hidden.",
+    icon: "replay",
+  },
+  {
+    action: "replay:toggle",
+    label: "Turn Replay on or off",
+    desc: "Works once you've turned Replay on from the Record screen card.",
+    icon: "replay",
   },
 ];
 

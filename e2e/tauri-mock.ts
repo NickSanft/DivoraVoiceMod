@@ -113,6 +113,53 @@ export async function installTauriMock(
         loudnessGainDb: 0,
       };
 
+      const emit = (event: string, payload: unknown): void => {
+        for (const id of listeners.get(event) ?? []) {
+          const cb = callbacks.get(id);
+          if (cb) cb({ event, id, payload });
+        }
+      };
+
+      // v1.54.0: Replay. The ring's status lives here so the stubs and
+      // emitReplay (test side) agree on it. Memory follows the backend's
+      // formula at 1440p30 Balanced, under the ceiling of a PC with 2 GiB
+      // (256 MiB), so 120 s is over it.
+      const replay = {
+        status: {
+          supported: true,
+          reason: null as string | null,
+          state: "off",
+          saving: false,
+          seconds: 30,
+          bufferedMs: 0,
+          bytes: 0,
+          capBytes: 0,
+          monitorId: null as string | null,
+          heldReason: null as string | null,
+          armed: null as Record<string, unknown> | null,
+        },
+      };
+      (window as unknown as { __E2E_REPLAY__: unknown }).__E2E_REPLAY__ = replay;
+      const REPLAY_CEILING = 268_435_456;
+      const replayCap = (s: number): number => {
+        const estimate = ((s + 2) * 14_376_960) / 8 + (s + 4) * 192_000;
+        return (estimate * 5) / 4;
+      };
+      const replayLengths = () =>
+        [15, 30, 60, 120].map((s) => ({
+          seconds: s,
+          bytes: (replayCap(s) * 4) / 5,
+          capBytes: replayCap(s),
+          allowed: replayCap(s) <= REPLAY_CEILING,
+        }));
+      const setReplay = (patch: Record<string, unknown>): typeof replay.status => {
+        replay.status = { ...replay.status, ...patch } as typeof replay.status;
+        emit("replay-buffer", replay.status);
+        return replay.status;
+      };
+      const replaySaved = (saved: Record<string, unknown>): void =>
+        emit("replay-saved", { path: null, durationMs: 0, error: null, ...saved });
+
       const responses: Record<string, (args: any) => unknown> = {
         list_audio_input_devices: () => data.inputs,
         list_audio_output_devices: () => data.outputs,
@@ -238,6 +285,59 @@ export async function installTauriMock(
           desktopError: null,
           stemsError: null,
         }),
+        // v1.54.0: Replay. Arming goes straight to armed; every save attempt
+        // reports itself with `replay-saved`, refusals included, as the
+        // backend does.
+        replay_buffer_status: () => replay.status,
+        replay_memory: () => ({ ceilingBytes: REPLAY_CEILING, lengths: replayLengths() }),
+        arm_replay_buffer: (a: any) => {
+          const seconds = [15, 30, 60, 120].includes(a?.seconds) ? a.seconds : 30;
+          return setReplay({
+            state: "armed",
+            seconds,
+            capBytes: replayCap(seconds),
+            monitorId: a?.monitorId ?? null,
+            heldReason: null,
+            armed: {
+              fps: a?.fps ?? 30,
+              quality: a?.quality ?? "balanced",
+              cursor: a?.cursor ?? true,
+              desktopAudio: a?.desktopAudio ?? null,
+              desktopGainDb: a?.desktopGainDb ?? -6,
+              avOffsetMs: a?.avOffsetMs ?? 0,
+            },
+          });
+        },
+        disarm_replay_buffer: () =>
+          setReplay({
+            state: "off",
+            saving: false,
+            bufferedMs: 0,
+            bytes: 0,
+            capBytes: 0,
+            monitorId: null,
+            heldReason: null,
+            armed: null,
+          }),
+        save_replay: () => {
+          const s = replay.status;
+          const refusal =
+            s.state === "off"
+              ? "Replay is off."
+              : s.state === "arming"
+                ? "Replay hasn't kept anything yet — try again in a moment."
+                : s.saving
+                  ? "Still saving the last replay."
+                  : null;
+          if (refusal) {
+            replaySaved({ error: refusal });
+            throw refusal;
+          }
+          const durationMs = Math.min(s.bufferedMs, s.seconds * 1000) || s.seconds * 1000;
+          const path = "C:/mock/recordings/divora-replay-x.mp4";
+          replaySaved({ path, durationMs });
+          return { path, durationMs };
+        },
         preset_store_path: () => "C:/mock/presets",
         list_midi_inputs: () => [],
         audio_engine_status: () => engineStatus,
@@ -293,15 +393,7 @@ export async function installTauriMock(
       (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ =
         internals;
 
-      (window as unknown as { __E2E_EMIT__: unknown }).__E2E_EMIT__ = (
-        event: string,
-        payload: unknown,
-      ) => {
-        for (const id of listeners.get(event) ?? []) {
-          const cb = callbacks.get(id);
-          if (cb) cb({ event, id, payload });
-        }
-      };
+      (window as unknown as { __E2E_EMIT__: unknown }).__E2E_EMIT__ = emit;
     },
     { inputs: MOCK_INPUTS, outputs: MOCK_OUTPUTS, presets: MOCK_PRESETS },
   );
@@ -324,6 +416,32 @@ export async function installTauriMock(
       /* localStorage always present in chromium */
     }
   }, skipWizard);
+}
+
+/** v1.54.0: move the mock's Replay ring to `patch` (over its current status)
+ *  and fire `replay-buffer`, as the backend does on every transition. The
+ *  stubs read the same status, so a save afterwards answers for it. */
+export async function emitReplay(page: Page, patch: Record<string, unknown>): Promise<void> {
+  await page.evaluate((p) => {
+    const w = window as unknown as {
+      __E2E_REPLAY__: { status: Record<string, unknown> };
+      __E2E_EMIT__: (e: string, payload: unknown) => void;
+    };
+    w.__E2E_REPLAY__.status = { ...w.__E2E_REPLAY__.status, ...p };
+    w.__E2E_EMIT__("replay-buffer", w.__E2E_REPLAY__.status);
+  }, patch);
+}
+
+/** v1.54.0: fire a `replay-saved` outcome directly. */
+export async function emitReplaySaved(
+  page: Page,
+  saved: { path?: string | null; durationMs?: number; error?: string | null },
+): Promise<void> {
+  await page.evaluate((s) => {
+    (
+      window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
+    ).__E2E_EMIT__("replay-saved", { path: null, durationMs: 0, error: null, ...s });
+  }, saved);
 }
 
 /** Playwright `test` with the Tauri mock auto-installed and a

@@ -14,6 +14,13 @@
 //! it. The recorder places each at its own time; mixed here, the sting would be
 //! dragged late with the voice or the voice left early with the sting.
 //!
+//! Every attach is a new **take** with its own number, and every buffer is
+//! stamped with the take it was tapped for (v1.54.0). A recorder can be let
+//! go of and the next one attached faster than the callback runs — a take
+//! that starts the moment the last one's pipeline has gone — so the callback
+//! may never see "not recording" in between; the number is what tells it a
+//! new run begins, and what tells the drain whose buffer each one is.
+//!
 //! Callback cost while recording: three ring pushes per buffer, plus one clock
 //! read per take (the anchor that puts cpal's timestamps on the clock the
 //! video uses). While not recording: nothing — the caller's one atomic load
@@ -90,6 +97,8 @@ struct AvMark<S> {
     /// counting frames that were dropped.
     index: u64,
     span: u32,
+    /// The take it was tapped for.
+    take: u64,
 }
 
 type FrameProducer = <HeapRb<f32> as Split>::Prod;
@@ -106,11 +115,15 @@ pub struct AvTap<S> {
     /// starts a run: index 0, and an anchor.
     running: bool,
     index: u64,
+    /// The take the run is for: a buffer for another starts a new run, even
+    /// if the callback never saw the tap disarmed in between.
+    take: u64,
 }
 
 impl<S: Copy> AvTap<S> {
-    /// Tap one buffer. `voice` and `sb` are this buffer's engine-rate frames,
-    /// the same length; `now` is read only on the first buffer of a run.
+    /// Tap one buffer for `take` (`None`: nothing records). `voice` and `sb`
+    /// are this buffer's engine-rate frames, the same length; `now` is read
+    /// only on the first buffer of a run.
     ///
     /// All or nothing: a buffer goes into all three rings or none of them, so
     /// the drain can never pair a mark with another buffer's frames. A buffer
@@ -118,21 +131,23 @@ impl<S: Copy> AvTap<S> {
     /// run's index, which the recorder fills with silence.
     pub fn tap(
         &mut self,
-        armed: bool,
+        take: Option<u64>,
         buf: AvBuffer<S>,
         voice: &[f32],
         sb: &[f32],
         dropped: &AtomicU64,
         now: impl FnOnce() -> Instant,
     ) {
-        if !armed {
+        let Some(take) = take else {
             self.running = false;
             return;
-        }
+        };
         let span = voice.len().min(sb.len());
-        let first = !self.running;
+        let first = !self.running || self.take != take;
         if first {
             self.index = 0;
+            self.take = take;
+            self.running = false;
         }
         let fits = self.marks.vacant_len() > 0
             && self.voice.vacant_len() >= span
@@ -145,6 +160,7 @@ impl<S: Copy> AvTap<S> {
                 anchor: first.then(now),
                 index: self.index,
                 span: u32::try_from(span).unwrap_or(u32::MAX),
+                take,
             });
             self.running = true;
         } else {
@@ -191,8 +207,10 @@ pub struct AvChunk {
 /// Process-wide, so two sessions' drains can never hand out the same epoch.
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-/// The run the drain is currently placing: its epoch and its anchor pair.
+/// The run the drain is currently placing: its take, its epoch and its
+/// anchor pair.
 struct Run<S> {
+    take: u64,
     epoch: u64,
     at: S,
     anchor: Instant,
@@ -209,14 +227,24 @@ pub struct AvDrain<S> {
 }
 
 impl<S: Stamp> AvDrain<S> {
-    /// Turn every buffer waiting into a chunk, oldest first.
+    /// Turn every buffer of `take` waiting into a chunk, oldest first.
     ///
-    /// Buffers from before the current run's anchor — left over from an
-    /// earlier take — are dropped rather than placed against a clock they
-    /// were never measured on.
-    pub fn drain(&mut self, input_latency: Duration, mut emit: impl FnMut(AvChunk)) {
-        while let Some(mark) = self.marks.try_pop() {
+    /// Buffers of an earlier take, and any from before the run's anchor, are
+    /// dropped rather than placed against a clock they were never measured
+    /// on. A buffer of a later take stops the drain and stays: it is the
+    /// next recorder's, whose attach is on its way.
+    pub fn drain(&mut self, input_latency: Duration, take: u64, mut emit: impl FnMut(AvChunk)) {
+        while let Some(&mark) = self.marks.try_peek() {
+            if mark.take > take {
+                return;
+            }
+            let _ = self.marks.try_pop();
             let span = mark.span as usize;
+            if mark.take < take {
+                let _ = self.voice.skip(span);
+                let _ = self.sb.skip(span);
+                continue;
+            }
             let mut voice = vec![0.0; span];
             let mut sb = vec![0.0; span];
             // The callback pushed these before the mark, so they are here.
@@ -224,12 +252,13 @@ impl<S: Stamp> AvDrain<S> {
             let _ = self.sb.pop_slice(&mut sb);
             if let Some(anchor) = mark.anchor {
                 self.run = Some(Run {
+                    take,
                     epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
                     at: mark.buf.at,
                     anchor,
                 });
             }
-            let Some(run) = &self.run else {
+            let Some(run) = self.run.as_ref().filter(|r| r.take == take) else {
                 continue;
             };
             let at = run.anchor + mark.buf.at.since(&run.at).unwrap_or_default();
@@ -249,13 +278,20 @@ impl<S: Stamp> AvDrain<S> {
         }
     }
 
-    /// Throw away everything waiting and forget the run. The next chunk
-    /// comes from the next anchored buffer.
-    pub fn discard(&mut self) {
-        while self.marks.try_pop().is_some() {}
-        self.voice.clear();
-        self.sb.clear();
-        self.run = None;
+    /// Throw away what is waiting of `take` and every earlier one, and
+    /// forget their run; a later take's buffers stay for it.
+    pub fn discard_through(&mut self, take: u64) {
+        while let Some(&mark) = self.marks.try_peek() {
+            if mark.take > take {
+                break;
+            }
+            let _ = self.marks.try_pop();
+            let _ = self.voice.skip(mark.span as usize);
+            let _ = self.sb.skip(mark.span as usize);
+        }
+        if self.run.as_ref().is_some_and(|r| r.take <= take) {
+            self.run = None;
+        }
     }
 }
 
@@ -273,6 +309,7 @@ pub fn av_tap<S: Copy>(rate: u32, out_rate: u32) -> (AvTap<S>, AvDrain<S>) {
             marks: marks_p,
             running: false,
             index: 0,
+            take: 0,
         },
         AvDrain {
             voice: voice_c,
@@ -287,9 +324,10 @@ pub fn av_tap<S: Copy>(rate: u32, out_rate: u32) -> (AvTap<S>, AvDrain<S>) {
 
 /// Engine thread → a session's drain thread.
 pub(crate) enum AvControl {
-    /// Start forwarding to this recorder.
-    Attach(SyncSender<AvChunk>),
-    /// Forward what is waiting, then stop and let go of the recorder.
+    /// Start forwarding the buffers of this take to this recorder. Sent
+    /// before the callback can tap a buffer for it.
+    Attach(SyncSender<AvChunk>, u64),
+    /// Forward what is waiting of the take, then let go of the recorder.
     Detach,
 }
 
@@ -300,45 +338,75 @@ pub(crate) enum AvControl {
 /// when the session's control sender drops at teardown; the recorder's sender
 /// lives on the engine thread, outside the session, which is how a
 /// device-loss rebuild re-attaches the same take instead of silencing it.
+///
+/// Its control messages are read before anything is forwarded: a buffer of
+/// a new take is only ever tapped after that take's attach was sent, so by
+/// the time one is here, so is its attach (v1.54.0).
 #[allow(clippy::needless_pass_by_value)] // owns its ends for the thread's lifetime
 pub(crate) fn av_drain_thread<S: Stamp>(
     mut drain: AvDrain<S>,
     ctl: Receiver<AvControl>,
     state: Arc<EngineState>,
 ) {
-    let mut sink: Option<SyncSender<AvChunk>> = None;
+    let mut sink: Option<(SyncSender<AvChunk>, u64)> = None;
+    // The newest take attached: what a detach with none attached clears.
+    let mut newest = 0;
     loop {
-        let Some(tx) = sink.as_ref() else {
+        loop {
+            match ctl.try_recv() {
+                Ok(c) => apply(c, &mut sink, &mut newest, &mut drain, &state),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if let Some((tx, take)) = &sink {
+            forward(&mut drain, tx, *take, &state);
+            std::thread::sleep(Duration::from_millis(AV_DRAIN_INTERVAL_MS));
+        } else {
             match ctl.recv() {
-                Ok(AvControl::Attach(tx)) => sink = Some(tx),
-                Ok(AvControl::Detach) => drain.discard(),
+                Ok(c) => apply(c, &mut sink, &mut newest, &mut drain, &state),
                 Err(_) => return,
             }
-            continue;
-        };
-        forward(&mut drain, tx, &state);
-        match ctl.try_recv() {
-            Ok(AvControl::Attach(tx)) => sink = Some(tx),
-            Ok(AvControl::Detach) => {
-                // `forward` above already sent what the callback had
-                // pushed; anything later belongs to no take.
-                sink = None;
-                drain.discard();
-            }
-            Err(TryRecvError::Empty) => {
-                std::thread::sleep(Duration::from_millis(AV_DRAIN_INTERVAL_MS));
-            }
-            Err(TryRecvError::Disconnected) => return,
         }
+    }
+}
+
+/// One control message: a recorder to forward to, or let go of — after
+/// what the callback has already tapped for it.
+fn apply<S: Stamp>(
+    c: AvControl,
+    sink: &mut Option<(SyncSender<AvChunk>, u64)>,
+    newest: &mut u64,
+    drain: &mut AvDrain<S>,
+    state: &EngineState,
+) {
+    match c {
+        AvControl::Attach(tx, take) => {
+            *newest = (*newest).max(take);
+            *sink = Some((tx, take));
+        }
+        AvControl::Detach => match sink.take() {
+            Some((tx, take)) => {
+                forward(drain, &tx, take, state);
+                // Anything later of it belongs to no take.
+                drain.discard_through(take);
+            }
+            None => drain.discard_through(*newest),
+        },
     }
 }
 
 /// Send everything waiting to the recorder. A full channel — a recorder that
 /// stopped reading — drops the chunk and counts its frames, rather than
 /// blocking a thread the callback depends on to keep its rings empty.
-fn forward<S: Stamp>(drain: &mut AvDrain<S>, tx: &SyncSender<AvChunk>, state: &EngineState) {
+fn forward<S: Stamp>(
+    drain: &mut AvDrain<S>,
+    tx: &SyncSender<AvChunk>,
+    take: u64,
+    state: &EngineState,
+) {
     let latency = Duration::from_micros(u64::from(state.load_input_latency_us()));
-    drain.drain(latency, |chunk| {
+    drain.drain(latency, take, |chunk| {
         let frames = chunk.voice.len() as u64;
         if tx.try_send(chunk).is_err() {
             state.av_dropped.fetch_add(frames, Ordering::Relaxed);
@@ -364,7 +432,7 @@ mod tests {
 
     fn drain_all(drain: &mut AvDrain<Duration>) -> Vec<AvChunk> {
         let mut out = Vec::new();
-        drain.drain(Duration::ZERO, |c| out.push(c));
+        drain.drain(Duration::ZERO, 1, |c| out.push(c));
         out
     }
 
@@ -380,7 +448,7 @@ mod tests {
         let sb = vec![-0.5f32; span];
         for i in 0..n {
             tap.tap(
-                true,
+                Some(1),
                 buf(first_ms + 10 * i as u64),
                 &voice,
                 &sb,
@@ -408,24 +476,29 @@ mod tests {
         assert_eq!(disarm(), (1, 1), "the allocation probe is not counting");
 
         arm();
-        tap.tap(true, buf(0), &voice, &sb, &dropped, || anchor);
-        tap.tap(true, buf(10), &voice, &sb, &dropped, || anchor);
-        tap.tap(false, buf(20), &voice, &sb, &dropped, || anchor);
+        tap.tap(Some(1), buf(0), &voice, &sb, &dropped, || anchor);
+        tap.tap(Some(1), buf(10), &voice, &sb, &dropped, || anchor);
+        tap.tap(None, buf(20), &voice, &sb, &dropped, || anchor);
         let (allocs, frees) = disarm();
         assert_eq!((allocs, frees), (0, 0), "tapping allocated or freed");
 
         // Fill the rings, then measure the dropping path too.
         for i in 0..(AV_RING_FRAMES / 480 + 2) {
-            tap.tap(true, buf(30 + 10 * i as u64), &voice, &sb, &dropped, || {
-                anchor
-            });
+            tap.tap(
+                Some(1),
+                buf(30 + 10 * i as u64),
+                &voice,
+                &sb,
+                &dropped,
+                || anchor,
+            );
         }
         assert!(
             dropped.load(Ordering::Relaxed) > 0,
             "the rings never filled"
         );
         arm();
-        tap.tap(true, buf(99_000), &voice, &sb, &dropped, || anchor);
+        tap.tap(Some(1), buf(99_000), &voice, &sb, &dropped, || anchor);
         let (allocs, frees) = disarm();
         assert_eq!((allocs, frees), (0, 0), "dropping allocated or freed");
     }
@@ -443,7 +516,7 @@ mod tests {
         for i in 0..3u64 {
             let mut b = buf(1_000 + 10 * i);
             b.chain_latency = 7;
-            tap.tap(true, b, &voice, &sb, &dropped, || anchor);
+            tap.tap(Some(1), b, &voice, &sb, &dropped, || anchor);
         }
         let chunks = drain_all(&mut drain);
         assert_eq!(chunks.len(), 3);
@@ -508,7 +581,7 @@ mod tests {
         let dropped = AtomicU64::new(0);
         let a1 = Instant::now();
         tap_n(&mut tap, 2, 480, 0, &dropped, a1);
-        tap.tap(false, buf(20), &[0.0; 480], &[0.0; 480], &dropped, || a1);
+        tap.tap(None, buf(20), &[0.0; 480], &[0.0; 480], &dropped, || a1);
         let a2 = a1 + Duration::from_secs(5);
         tap_n(&mut tap, 2, 480, 5_000, &dropped, a2);
         let chunks = drain_all(&mut drain);
@@ -527,11 +600,11 @@ mod tests {
         let dropped = AtomicU64::new(0);
         let anchor = Instant::now();
         tap_n(&mut tap, AV_RING_FRAMES / 1024, 1024, 0, &dropped, anchor);
-        tap.tap(false, buf(0), &[], &[], &dropped, || anchor);
+        tap.tap(None, buf(0), &[], &[], &dropped, || anchor);
         // Rings full of the old run: the new run's first buffer is dropped.
         let late = anchor + Duration::from_secs(1);
         tap_n(&mut tap, 1, 1024, 2_000, &dropped, late);
-        drain.discard();
+        drain.discard_through(1);
         let later = anchor + Duration::from_secs(2);
         tap_n(&mut tap, 1, 1024, 3_000, &dropped, later);
         let chunks = drain_all(&mut drain);
@@ -550,8 +623,103 @@ mod tests {
         tap_n(&mut tap, 3, 480, 0, &dropped, anchor);
         // The drain forgets the run, as a Detach does; one more buffer of the
         // old run arrives after it.
-        drain.discard();
+        drain.discard_through(1);
         tap_n(&mut tap, 1, 480, 30, &dropped, anchor);
         assert!(drain_all(&mut drain).is_empty());
+    }
+}
+
+/// v1.54.0: one recorder let go of and the next attached faster than the
+/// callback runs — the callback never sees the tap disarmed in between.
+#[cfg(test)]
+mod quick_reattach {
+    use super::{av_tap, AvBuffer, AvChunk, AvDrain};
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
+
+    fn buf(at_ms: u64) -> AvBuffer<Duration> {
+        AvBuffer {
+            at: Duration::from_millis(at_ms),
+            out_frames: 480,
+            occupancy: 96,
+            chain_latency: 0,
+        }
+    }
+
+    fn drain_take(drain: &mut AvDrain<Duration>, take: u64) -> Vec<AvChunk> {
+        let mut out = Vec::new();
+        drain.drain(Duration::ZERO, take, |c| out.push(c));
+        out
+    }
+
+    /// The next take's buffers start a run of their own — index 0, a new
+    /// epoch, its own anchor — with no disarmed buffer in between.
+    #[test]
+    fn the_next_take_starts_its_own_run() {
+        let (mut tap, mut drain) = av_tap::<Duration>(48_000, 48_000);
+        let dropped = AtomicU64::new(0);
+        let (a1, a2) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let frames = [0.5f32; 480];
+        for i in 0..3 {
+            tap.tap(Some(1), buf(10 * i), &frames, &frames, &dropped, || a1);
+        }
+        let first = drain_take(&mut drain, 1);
+        assert_eq!(first.len(), 3);
+        // Take 1 let go of, take 2 attached: the drain forgets take 1.
+        drain.discard_through(1);
+        for i in 0..3 {
+            tap.tap(
+                Some(2),
+                buf(1_000 + 10 * i),
+                &frames,
+                &frames,
+                &dropped,
+                || a2,
+            );
+        }
+        let next = drain_take(&mut drain, 2);
+        assert_eq!(next.len(), 3, "the next take hears nothing");
+        assert_ne!(next[0].epoch, first[0].epoch);
+        assert_eq!(next[0].index, 0);
+        assert_eq!(next[0].at, a2);
+    }
+
+    /// The race behind it: the next take's first buffer — its anchor — is
+    /// tapped before the drain has read the detach, while it still forwards
+    /// to the last take. It must not go to the last take, nor be thrown away
+    /// with its leftovers: it waits for its own recorder.
+    #[test]
+    fn the_next_take_s_anchor_waits_for_its_recorder() {
+        let (mut tap, mut drain) = av_tap::<Duration>(48_000, 48_000);
+        let dropped = AtomicU64::new(0);
+        let (a1, a2) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let frames = [0.5f32; 480];
+        tap.tap(Some(1), buf(0), &frames, &frames, &dropped, || a1);
+        tap.tap(Some(1), buf(10), &frames, &frames, &dropped, || a1);
+        // Take 2 already tapping; the drain still forwards take 1.
+        tap.tap(Some(2), buf(20), &frames, &frames, &dropped, || a2);
+        tap.tap(Some(2), buf(30), &frames, &frames, &dropped, || a2);
+        let last = drain_take(&mut drain, 1);
+        assert_eq!(last.len(), 2, "only take 1's buffers go to take 1");
+        drain.discard_through(1);
+        let next = drain_take(&mut drain, 2);
+        assert_eq!(next.len(), 2);
+        assert_eq!(next[0].at, a2, "anchored on its own first buffer");
+        assert_eq!(next[0].index, 0);
+    }
+
+    /// Leftovers of an earlier take still in the rings when the next take
+    /// drains are dropped, not placed.
+    #[test]
+    fn an_earlier_take_s_leftovers_are_dropped() {
+        let (mut tap, mut drain) = av_tap::<Duration>(48_000, 48_000);
+        let dropped = AtomicU64::new(0);
+        let (a1, a2) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let frames = [0.5f32; 480];
+        tap.tap(Some(1), buf(0), &frames, &frames, &dropped, || a1);
+        tap.tap(Some(2), buf(10), &frames, &frames, &dropped, || a2);
+        let next = drain_take(&mut drain, 2);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].at, a2);
     }
 }

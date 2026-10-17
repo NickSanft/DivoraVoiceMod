@@ -32,6 +32,13 @@
 //! An **epoch** is one unbroken run of the engine's timeline: a take, or the
 //! rest of one after a device-loss rebuild (new devices, maybe a new rate).
 //! Each gets its own fit and its own buffer; a new one closes the last.
+//!
+//! A timeline can outlive any one take (v1.54.0): Replay's runs for as long
+//! as its pipeline, and takes are cut out of it. Its epochs last as long as
+//! the engine runs, so it fits each clock over the newest minutes only
+//! ([`AudioTimeline::with_fit_window`]), and when the engine is stopped its
+//! epoch is closed ([`AudioTimeline::close_epoch`]) rather than the whole
+//! timeline finished.
 
 // Sample arithmetic: frame indices, positions and rates are converted between
 // integers and floats throughout. Every value involved is bounded by a take's
@@ -62,6 +69,14 @@ pub const BLOCK_FRAMES: usize = 1024;
 /// than jitter. Scheduling jitter is cancelled before this is checked (see
 /// [`AudioChunk::out_frames`]), and what is left is well under it.
 const STEP_SECONDS: f64 = 0.020;
+
+/// How far past the clock line a chunk of the same epoch may land and still
+/// be a stall. Further than that, the engine's stream survived a sleep: the
+/// chunk carries on its frame count from before it, stamped hours later. As
+/// a step, that gap would be laid out as silence in the epoch's buffer all
+/// at once — 5.5 GB for an eight-hour sleep — so it starts a new epoch
+/// instead. Real stalls are tens to hundreds of milliseconds.
+const RESET_SECONDS: f64 = 10.0;
 
 /// How long a sample may wait for its audio before it is written as silence.
 /// Longer than the slowest voice chain (≈ 256 ms) plus the drain, so a live
@@ -255,6 +270,8 @@ pub struct AudioTimeline {
     block: Vec<Frame>,
     stems: Option<Vec<StemBlock>>,
     stats: TimelineStats,
+    /// Seconds each clock fit looks back over; `None` fits a whole run.
+    fit_window: Option<u32>,
 }
 
 impl Default for AudioTimeline {
@@ -288,7 +305,21 @@ impl AudioTimeline {
             next: 0,
             block: Vec::with_capacity(BLOCK_FRAMES),
             stems: opts.stems.then(Vec::new),
+            fit_window: None,
         }
+    }
+
+    /// Fit every source's clock over only its newest `seconds`
+    /// ([`ClockFit::windowed`]) rather than its whole run: for a timeline
+    /// that outlives any one take — Replay's, whose engine epoch lasts as
+    /// long as the engine runs — where a straight line through hours of a
+    /// slowly changing drift would miss the newest audio by milliseconds.
+    /// A take's own timeline doesn't need it. It applies to the epochs and
+    /// desktop runs that start after it, so build the timeline with it.
+    #[must_use]
+    pub fn with_fit_window(mut self, seconds: u32) -> Self {
+        self.fit_window = Some(seconds);
+        self
     }
 
     #[must_use]
@@ -298,14 +329,18 @@ impl AudioTimeline {
 
     /// Take in one engine buffer.
     pub fn push(&mut self, chunk: &AudioChunk) {
+        let window = self.fit_window;
         match self.epochs.back_mut() {
             Some(back) if chunk.epoch < back.id => return, // a closed epoch's straggler
             Some(back) if chunk.epoch > back.id => {
                 back.close();
-                self.epochs.push_back(Epoch::new(chunk.epoch, chunk.rate));
+                self.epochs
+                    .push_back(Epoch::new(chunk.epoch, chunk.rate, window));
             }
             Some(_) => {}
-            None => self.epochs.push_back(Epoch::new(chunk.epoch, chunk.rate)),
+            None => self
+                .epochs
+                .push_back(Epoch::new(chunk.epoch, chunk.rate, window)),
         }
         let Some(back) = self.epochs.back_mut() else {
             return;
@@ -313,11 +348,13 @@ impl AudioTimeline {
         match back.push(chunk) {
             Pushed::Placed => {}
             Pushed::Stepped => self.stats.steps += 1,
-            Pushed::Early => {
-                // The clock went backwards, which no stall explains. Start
-                // the line again from here rather than bend it.
+            Pushed::Early | Pushed::Reset => {
+                // The clock went backwards, which no stall explains, or
+                // jumped further ahead than any stall: the PC slept with the
+                // stream open. Start the line again from here rather than
+                // bend it, or lay the whole sleep out as silence.
                 back.close();
-                let mut fresh = Epoch::new(chunk.epoch, chunk.rate);
+                let mut fresh = Epoch::new(chunk.epoch, chunk.rate, window);
                 let _ = fresh.push(chunk);
                 self.epochs.push_back(fresh);
                 self.stats.steps += 1;
@@ -339,6 +376,7 @@ impl AudioTimeline {
     /// about the device's clock and would bend its fit.
     pub fn push_desktop(&mut self, c: &DesktopChunk) {
         let next_time = frame_time(self.next);
+        let window = self.fit_window;
         let Some(d) = self.desktop.as_mut() else {
             return;
         };
@@ -375,7 +413,7 @@ impl AudioTimeline {
             if let Some(r) = d.runs.back_mut() {
                 r.lane.closed = true;
             }
-            let mut lane = Lane::with_kernel(c.rate, d.kernel(c.rate));
+            let mut lane = Lane::with_kernel(c.rate, d.kernel(c.rate), window);
             lane.started = true;
             d.runs.push_back(Run {
                 stream: c.stream,
@@ -393,7 +431,7 @@ impl AudioTimeline {
         // has; the first real timestamp replaces its guesses.
         if c.timed || r.timed_pairs == 0 {
             if r.packets < ANCHOR_PACKETS || (c.timed && r.timed_pairs == 0) {
-                r.lane.fit = ClockFit::new(c.rate);
+                r.lane.fit = clock_fit(c.rate, window);
             }
             r.lane.fit.add(r.end as f64, c.at);
             if c.timed {
@@ -473,10 +511,32 @@ impl AudioTimeline {
         out
     }
 
+    /// The engine was stopped: nothing more of its current run is coming.
+    /// The run is closed exactly as [`finish`](Self::finish) closes it, but
+    /// the timeline goes on — no padding, no end — for a timeline that
+    /// outlives the engine's run (Replay's).
+    ///
+    /// While a run is open, the soundboard ahead of the voice waits for the
+    /// voice to catch up; with the engine stopped it never would, and a
+    /// second later both are written as silence. Closed, the soundboard is
+    /// written out to its end: the last moment before the stop keeps the
+    /// sound that played in it.
+    pub fn close_epoch(&mut self) {
+        if let Some(e) = self.epochs.back_mut() {
+            e.close();
+        }
+    }
+
     /// Every block's sources as they were before the mix, since the last
     /// call; always empty unless the track was made with stems.
     pub fn take_stems(&mut self) -> Vec<StemBlock> {
         self.stems.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Stem blocks made and not yet taken.
+    #[cfg(test)]
+    pub(crate) fn stems_waiting(&self) -> usize {
+        self.stems.as_ref().map_or(0, Vec::len)
     }
 
     fn push_frame(&mut self, f: Frame) {
@@ -597,6 +657,15 @@ fn frame_time(j: u64) -> f64 {
 /// Output frame `j`'s time in 100-ns ticks, exactly.
 pub(crate) fn ticks(j: u64) -> u64 {
     u64::try_from(u128::from(j) * 10_000_000 / u128::from(OUT_RATE)).unwrap_or(u64::MAX)
+}
+
+/// A fresh clock fit for a source at `rate`: through its whole run, or
+/// through only the newest `window` seconds of it.
+fn clock_fit(rate: u32, window: Option<u32>) -> ClockFit {
+    match window {
+        Some(seconds) => ClockFit::windowed(rate, seconds),
+        None => ClockFit::new(rate),
+    }
 }
 
 /// A mixed sample to 16 bits: clamped, as v1.52.0 did.
@@ -721,6 +790,8 @@ enum Pushed {
     Placed,
     Stepped,
     Early,
+    /// Further past the line than [`RESET_SECONDS`]: not a stall.
+    Reset,
 }
 
 enum Sampled<const C: usize> {
@@ -759,14 +830,14 @@ struct Lane<const C: usize> {
 }
 
 impl<const C: usize> Lane<C> {
-    fn new(rate: u32) -> Self {
-        Self::with_kernel(rate, Arc::new(Kernel::new(rate)))
+    fn new(rate: u32, window: Option<u32>) -> Self {
+        Self::with_kernel(rate, Arc::new(Kernel::new(rate)), window)
     }
 
-    fn with_kernel(rate: u32, kernel: Arc<Kernel>) -> Self {
+    fn with_kernel(rate: u32, kernel: Arc<Kernel>, window: Option<u32>) -> Self {
         Self {
             rate: f64::from(rate.max(1)),
-            fit: ClockFit::new(rate),
+            fit: clock_fit(rate, window),
             kernel,
             base: 0,
             mix: VecDeque::new(),
@@ -888,10 +959,10 @@ struct Epoch {
 }
 
 impl Epoch {
-    fn new(id: u64, rate: u32) -> Self {
+    fn new(id: u64, rate: u32, window: Option<u32>) -> Self {
         Self {
             id,
-            lane: Lane::new(rate),
+            lane: Lane::new(rate, window),
             shift: 0,
             voice_cursor: 0,
             sb_end: 0,
@@ -930,6 +1001,9 @@ impl Epoch {
         let mut pos = c.index as i64 + self.shift;
         let mut outcome = Pushed::Placed;
         if let Some(r) = self.lane.fit.residual(pos as f64, tau) {
+            if r > RESET_SECONDS {
+                return Pushed::Reset;
+            }
             if r > STEP_SECONDS {
                 let k = (r * rate).round() as i64;
                 self.shift += k;
@@ -1076,33 +1150,35 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// The timeline's tests, and the pretend engine and v1.52.0 golden takes
+/// that [`crate::take_cut`]'s tests reuse.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         soft_clip, to_i16, AudioBlock, AudioChunk, AudioTimeline, DesktopChunk, StemBlock,
-        TrackOptions, BLOCK_FRAMES, DESKTOP_WAIT_SECONDS, OUT_RATE, SOFT_KNEE,
+        TrackOptions, BLOCK_FRAMES, DESKTOP_WAIT_SECONDS, MAX_WAIT_SECONDS, OUT_RATE, SOFT_KNEE,
     };
     use std::f64::consts::TAU;
 
     /// A pretend engine: buffers of `span` frames at `rate`, on a clock
     /// `ppm` fast, the voice `wait + chain` late.
-    struct Engine {
-        epoch: u64,
-        rate: u32,
-        ppm: f64,
-        span: usize,
+    pub(crate) struct Engine {
+        pub(crate) epoch: u64,
+        pub(crate) rate: u32,
+        pub(crate) ppm: f64,
+        pub(crate) span: usize,
         /// Take-clock time of frame 0.
-        t0: f64,
-        index: u64,
-        wait: f64,
+        pub(crate) t0: f64,
+        pub(crate) index: u64,
+        pub(crate) wait: f64,
         /// Added to the wait the engine REPORTS, alternately + and −, without
         /// moving the voice: the measurement jitters, the voice does not.
-        wait_jitter: f64,
-        chain: u32,
+        pub(crate) wait_jitter: f64,
+        pub(crate) chain: u32,
     }
 
     impl Engine {
-        fn new(rate: u32, t0: f64) -> Self {
+        pub(crate) fn new(rate: u32, t0: f64) -> Self {
             Self {
                 epoch: 1,
                 rate,
@@ -1117,13 +1193,17 @@ mod tests {
         }
 
         /// When frame `n` of this epoch sounds, on the take's clock.
-        fn time(&self, n: u64) -> f64 {
+        pub(crate) fn time(&self, n: u64) -> f64 {
             self.t0 + n as f64 / (f64::from(self.rate) * (1.0 + self.ppm * 1e-6))
         }
 
         /// The next buffer: the soundboard as `sb(t)`, the voice as `voice(t)`
         /// captured `wait + chain` before it plays.
-        fn chunk(&mut self, sb: impl Fn(f64) -> f32, voice: impl Fn(f64) -> f32) -> AudioChunk {
+        pub(crate) fn chunk(
+            &mut self,
+            sb: impl Fn(f64) -> f32,
+            voice: impl Fn(f64) -> f32,
+        ) -> AudioChunk {
             let delay = self.wait + f64::from(self.chain) / f64::from(self.rate);
             let n0 = self.index;
             let sbv = (0..self.span as u64)
@@ -1205,7 +1285,7 @@ mod tests {
         10.0 * (err / sig).log10()
     }
 
-    fn tone(freq: f64, amp: f64) -> impl Fn(f64) -> f32 {
+    pub(crate) fn tone(freq: f64, amp: f64) -> impl Fn(f64) -> f32 {
         move |t| (amp * (TAU * freq * t).sin()) as f32
     }
 
@@ -1220,7 +1300,7 @@ mod tests {
     }
 
     /// A band-limited click centred on `at`.
-    fn click(at: f64) -> impl Fn(f64) -> f32 {
+    pub(crate) fn click(at: f64) -> impl Fn(f64) -> f32 {
         move |t| {
             let d = (t - at) * 4_000.0;
             (0.8 * (-d * d).exp()) as f32
@@ -1452,7 +1532,7 @@ mod tests {
 
     /// FNV-1a over every block's timing and samples: one number for a whole
     /// track, so a test can say "exactly this track" without a fixture file.
-    fn fingerprint(blocks: &[AudioBlock]) -> u64 {
+    pub(crate) fn fingerprint(blocks: &[AudioBlock]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut eat = |bytes: &[u8]| {
             for &b in bytes {
@@ -1472,7 +1552,7 @@ mod tests {
 
     /// Run `seconds` of `engine` through a timeline as `record` does, and
     /// return the blocks themselves.
-    fn blocks_of(
+    pub(crate) fn blocks_of(
         engine: &mut Engine,
         seconds: f64,
         sb: impl Fn(f64) -> f32,
@@ -1490,62 +1570,101 @@ mod tests {
         blocks
     }
 
+    /// One of v1.52.0's voice-only takes: an engine, how long it plays, and
+    /// what it plays.
+    pub(crate) struct VoiceOnlyTake {
+        pub(crate) name: &'static str,
+        pub(crate) engine: Engine,
+        pub(crate) seconds: f64,
+        pub(crate) sb: Box<dyn Fn(f64) -> f32>,
+        pub(crate) voice: Box<dyn Fn(f64) -> f32>,
+    }
+
+    /// The takes [`VOICE_ONLY_V1_52`] fingerprints. Voice, soundboard, other
+    /// rates, drift, jitter and a clipping sum each take their own path
+    /// through the timeline.
+    pub(crate) fn voice_only_takes() -> Vec<VoiceOnlyTake> {
+        let take = |name, engine, seconds, sb, voice| VoiceOnlyTake {
+            name,
+            engine,
+            seconds,
+            sb,
+            voice,
+        };
+        let mut a = Engine::new(48_000, 0.0);
+        a.wait = 1_021.0 / 48_000.0;
+        a.chain = 2_431;
+        let mut b = Engine::new(44_100, 0.0);
+        b.wait = 0.03;
+        b.chain = 4_410;
+        let mut c = Engine::new(96_000, 0.013);
+        c.ppm = 80.0;
+        let mut d = Engine::new(48_000, 0.0);
+        d.wait = 0.020;
+        d.wait_jitter = 0.005;
+        let e = Engine::new(48_000, 0.0);
+        vec![
+            take(
+                "48k voice + soundboard",
+                a,
+                2.0,
+                Box::new(tone(300.0, 0.3)),
+                Box::new(tone(1_013.0, 0.3)),
+            ),
+            take(
+                "44.1k clicks",
+                b,
+                2.0,
+                Box::new(click(1.0)),
+                Box::new(click(1.5)),
+            ),
+            take(
+                "96k drifting",
+                c,
+                3.0,
+                Box::new(tone(440.0, 0.5)),
+                Box::new(silence),
+            ),
+            take(
+                "jittery wait",
+                d,
+                2.0,
+                Box::new(silence),
+                Box::new(tone(997.0, 0.4)),
+            ),
+            take(
+                "a sum past full scale",
+                e,
+                1.0,
+                Box::new(tone(220.0, 0.9)),
+                Box::new(tone(330.0, 0.9)),
+            ),
+        ]
+    }
+
+    /// The [`fingerprint`] of each of [`voice_only_takes`] as v1.52.0's
+    /// timeline wrote it, before it learned a second source.
+    pub(crate) const VOICE_ONLY_V1_52: [&str; 5] = [
+        "48k voice + soundboard: 0xca19a0077409ecdb",
+        "44.1k clicks: 0x1c7c3b1c10f9684b",
+        "96k drifting: 0xdc9e2855b758d128",
+        "jittery wait: 0x377b2220aea001cf",
+        "a sum past full scale: 0x3108ca4e1fc5e4c3",
+    ];
+
     /// A take with no desktop audio is exactly what v1.52.0 wrote, sample
     /// for sample: these fingerprints were taken from v1.52.0's timeline
-    /// before it learned a second source. Voice, soundboard, other rates,
-    /// drift, jitter and a clipping sum each take their own path through it.
+    /// before it learned a second source.
     #[test]
     fn voice_only_tracks_are_unchanged_since_v1_52() {
-        let mut cases: Vec<(&str, u64)> = Vec::new();
-        let mut e = Engine::new(48_000, 0.0);
-        e.wait = 1_021.0 / 48_000.0;
-        e.chain = 2_431;
-        cases.push((
-            "48k voice + soundboard",
-            fingerprint(&blocks_of(
-                &mut e,
-                2.0,
-                tone(300.0, 0.3),
-                tone(1_013.0, 0.3),
-            )),
-        ));
-        let mut e = Engine::new(44_100, 0.0);
-        e.wait = 0.03;
-        e.chain = 4_410;
-        cases.push((
-            "44.1k clicks",
-            fingerprint(&blocks_of(&mut e, 2.0, click(1.0), click(1.5))),
-        ));
-        let mut e = Engine::new(96_000, 0.013);
-        e.ppm = 80.0;
-        cases.push((
-            "96k drifting",
-            fingerprint(&blocks_of(&mut e, 3.0, tone(440.0, 0.5), |_| 0.0)),
-        ));
-        let mut e = Engine::new(48_000, 0.0);
-        e.wait = 0.020;
-        e.wait_jitter = 0.005;
-        cases.push((
-            "jittery wait",
-            fingerprint(&blocks_of(&mut e, 2.0, |_| 0.0, tone(997.0, 0.4))),
-        ));
-        let mut e = Engine::new(48_000, 0.0);
-        cases.push((
-            "a sum past full scale",
-            fingerprint(&blocks_of(&mut e, 1.0, tone(220.0, 0.9), tone(330.0, 0.9))),
-        ));
-        let got: Vec<String> = cases
-            .iter()
-            .map(|(n, h)| format!("{n}: {h:#018x}"))
+        let got: Vec<String> = voice_only_takes()
+            .into_iter()
+            .map(|mut t| {
+                let blocks = blocks_of(&mut t.engine, t.seconds, &t.sb, &t.voice);
+                format!("{}: {:#018x}", t.name, fingerprint(&blocks))
+            })
             .collect();
-        let want = [
-            "48k voice + soundboard: 0xca19a0077409ecdb",
-            "44.1k clicks: 0x1c7c3b1c10f9684b",
-            "96k drifting: 0xdc9e2855b758d128",
-            "jittery wait: 0x377b2220aea001cf",
-            "a sum past full scale: 0x3108ca4e1fc5e4c3",
-        ];
-        assert_eq!(got, want);
+        assert_eq!(got, VOICE_ONLY_V1_52);
     }
 
     /// Deterministic noise of time, with no libm in it: an LCG hash of the
@@ -1681,10 +1800,10 @@ mod tests {
     /// clock `ppm` fast, each stamped by Windows with when its first frame
     /// was captured — give or take `jitter`, alternately early and late.
     /// It sends nothing during `idle` stretches (an idle playback device).
-    struct Loopback {
+    pub(crate) struct Loopback {
         stream: u64,
         rate: u32,
-        ppm: f64,
+        pub(crate) ppm: f64,
         t0: f64,
         index: u64,
         jitter: f64,
@@ -1693,7 +1812,7 @@ mod tests {
     }
 
     impl Loopback {
-        fn new(t0: f64) -> Self {
+        pub(crate) fn new(t0: f64) -> Self {
             Self {
                 stream: 1,
                 rate: 48_000,
@@ -1741,7 +1860,11 @@ mod tests {
         }
 
         /// Every packet completed by `t`, less those the device never sent.
-        fn until(&mut self, t: f64, sound: &impl Fn(f64) -> [f32; 2]) -> Vec<DesktopChunk> {
+        pub(crate) fn until(
+            &mut self,
+            t: f64,
+            sound: &impl Fn(f64) -> [f32; 2],
+        ) -> Vec<DesktopChunk> {
             let mut out = Vec::new();
             while self.time(self.index + self.span()) <= t {
                 let at = self.time(self.index);
@@ -1756,7 +1879,7 @@ mod tests {
 
     impl Engine {
         /// Every buffer completed by `t`.
-        fn until(
+        pub(crate) fn until(
             &mut self,
             t: f64,
             sb: &impl Fn(f64) -> f32,
@@ -1810,11 +1933,14 @@ mod tests {
             .unzip()
     }
 
-    fn silence(_: f64) -> f32 {
+    pub(crate) fn silence(_: f64) -> f32 {
         0.0
     }
 
-    fn sides(l: impl Fn(f64) -> f32, r: impl Fn(f64) -> f32) -> impl Fn(f64) -> [f32; 2] {
+    pub(crate) fn sides(
+        l: impl Fn(f64) -> f32,
+        r: impl Fn(f64) -> f32,
+    ) -> impl Fn(f64) -> [f32; 2] {
         move |t| [l(t), r(t)]
     }
 
@@ -2346,6 +2472,12 @@ mod tests {
         assert!(db < -55.0, "{db:.1} dB from half the level");
     }
 
+    /// One channel of a track sample with desktop audio, from its sources as
+    /// the stems hold them: the timeline's own mix, desktop gain and all.
+    pub(crate) fn mixed(voice: f32, desktop: f32, gain_db: f32) -> i16 {
+        to_i16(soft_clip(voice + 10f32.powf(gain_db / 20.0) * desktop))
+    }
+
     /// Stems are the track's own sources before the mix: one block each per
     /// track block, contiguous from 0, and the track is exactly their mix.
     #[test]
@@ -2428,5 +2560,313 @@ mod tests {
             "ready to {ready:.3}"
         );
         assert_eq!(AudioTimeline::new().ready_until(2.0), None);
+    }
+
+    // ---- A timeline that outlives a take (v1.54.0) ----
+
+    /// The PC slept with the engine's stream open: the next chunk carries
+    /// on the frame count from before, stamped eight hours later. That is a
+    /// new epoch, not a step that would lay eight hours of silence out in
+    /// the epoch's buffer. A stall just short of the limit is still a step.
+    #[test]
+    fn a_residual_over_ten_seconds_is_a_new_epoch() {
+        let mut tl = AudioTimeline::new();
+        let mut e = Engine::new(48_000, 0.0);
+        tl.push(&e.chunk(tone(440.0, 0.5), silence));
+        e.t0 += 8.0 * 3600.0;
+        tl.push(&e.chunk(tone(440.0, 0.5), silence));
+        assert_eq!(tl.stats().steps, 1);
+        assert_eq!(tl.epochs.len(), 2, "the sleep did not start an epoch");
+        assert!(tl.epochs[0].lane.closed, "the epoch before it is open");
+        let most = tl.epochs.iter().map(|e| e.lane.mix.len()).max();
+        assert!(most < Some(48_000), "{most:?} frames buffered");
+
+        for (gap, epochs) in [(9.5, 1), (10.5, 2)] {
+            let mut tl = AudioTimeline::new();
+            let mut e = Engine::new(48_000, 0.0);
+            tl.push(&e.chunk(silence, silence));
+            e.t0 += gap;
+            tl.push(&e.chunk(silence, silence));
+            assert_eq!(tl.stats().steps, 1, "a {gap} s gap");
+            assert_eq!(tl.epochs.len(), epochs, "a {gap} s gap");
+        }
+    }
+
+    /// The engine is stopped with the soundboard still sounding in the last
+    /// 256 ms — the voice's delay, which the soundboard waits on. Closing
+    /// the epoch writes it out at once; left open, a second later it is
+    /// written as silence.
+    #[test]
+    fn close_epoch_keeps_the_soundboard_tail() {
+        for close in [true, false] {
+            let mut tl = AudioTimeline::new();
+            let mut e = Engine::new(48_000, 0.0);
+            e.chain = 12_288; // 256 ms
+            let sb = click(1.9);
+            let mut blocks = Vec::new();
+            let mut by_2_1 = 0;
+            for tick in 1..=400u32 {
+                let t = f64::from(tick) * 0.01;
+                // The engine plays until 2 s, then is stopped.
+                if t <= 2.0 {
+                    for c in e.until(t, &sb, &silence) {
+                        tl.push(&c);
+                    }
+                }
+                if tick % 2 == 0 {
+                    blocks.extend(tl.pump(t));
+                }
+                if close && tick == 200 {
+                    tl.close_epoch();
+                }
+                if tick == 210 {
+                    by_2_1 = blocks.len();
+                }
+            }
+            let track = mono(&blocks);
+            let near = &track[(1.85 * 48_000.0) as usize..(1.95 * 48_000.0) as usize];
+            let top = near.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            if close {
+                assert!(top > 0.7, "the soundboard's last click is gone: {top}");
+                let at = 1.85 + peak_time(near);
+                assert!((at - 1.9).abs() < 0.000_5, "click at {at:.4} s");
+                let early = mono(&blocks[..by_2_1]);
+                assert!(
+                    early.len() > (1.95 * 48_000.0) as usize,
+                    "not written until it was overdue"
+                );
+            } else {
+                assert!(top < 1e-3, "an open epoch wrote it after all: {top}");
+            }
+        }
+    }
+
+    /// Rung 1's sink writer throttles, and with throttling on a writer one
+    /// of whose streams leads the other by about 1.75–2 s hangs (measured).
+    /// With the engine stopped the audio trails the picture by
+    /// `MAX_WAIT_SECONDS`, so that must stay well short of it.
+    #[test]
+    fn max_wait_stays_under_the_rung1_throttle_cliff() {
+        let mut tl = AudioTimeline::new();
+        let mut written = 0usize;
+        let mut worst = 0.0f64;
+        for tick in 1..=500u32 {
+            let t = f64::from(tick) * 0.02;
+            written += tl.pump(t).len() * BLOCK_FRAMES;
+            if t > 2.0 {
+                worst = worst.max(t - written as f64 / f64::from(OUT_RATE));
+            }
+        }
+        assert!(
+            worst < 1.5,
+            "with no engine the track trails by {worst:.3} s (MAX_WAIT_SECONDS = {MAX_WAIT_SECONDS})"
+        );
+    }
+
+    /// What [`armed`] found: steps counted, the seconds of silence the
+    /// epoch at the end has inserted for them, and each checked click's
+    /// error.
+    struct Armed {
+        steps: u64,
+        kept: f64,
+        clicks: Vec<(f64, f64)>,
+    }
+
+    /// The loudest sample near each of some clicks, found block by block
+    /// as the track is written: hours of track are too much to keep.
+    struct Peaks {
+        targets: Vec<f64>,
+        found: Vec<(u64, f32)>,
+        written: u64,
+    }
+
+    impl Peaks {
+        fn new(targets: Vec<f64>) -> Self {
+            let found = vec![(0, 0.0); targets.len()];
+            Self {
+                targets,
+                found,
+                written: 0,
+            }
+        }
+
+        fn see(&mut self, b: &AudioBlock) {
+            let from = self.written;
+            self.written += BLOCK_FRAMES as u64;
+            for (target, peak) in self.targets.iter().zip(self.found.iter_mut()) {
+                let lo = ((target - 0.03) * f64::from(OUT_RATE)) as u64;
+                let hi = ((target + 0.03) * f64::from(OUT_RATE)) as u64;
+                if self.written <= lo || from >= hi {
+                    continue;
+                }
+                for (k, lr) in b.samples.as_chunks::<2>().0.iter().enumerate() {
+                    let j = from + k as u64;
+                    let v = f32::from(lr[0]).abs() / 32_767.0;
+                    if (lo..hi).contains(&j) && v > peak.1 {
+                        *peak = (j, v);
+                    }
+                }
+            }
+        }
+
+        /// Each click and how far from it its peak landed, in seconds.
+        fn errors(&self) -> Vec<(f64, f64)> {
+            self.targets
+                .iter()
+                .zip(&self.found)
+                .map(|(&target, &(j, v))| {
+                    assert!(v > 0.5, "the click at {target} s is missing: peak {v}");
+                    (target, j as f64 / f64::from(OUT_RATE) - target)
+                })
+                .collect()
+        }
+    }
+
+    /// Replay's timeline armed for `hours`, run at the live cadence — 10 ms
+    /// chunks in as each completes, a pump every 20 ms — with a 48 kHz
+    /// engine that runs 100 ppm fast and 10 ppm faster by the end, every
+    /// stamp up to 5 ms early or late, the device stalling three times (50,
+    /// 120 and 200 ms), and a soundboard click every 10 s. Each click
+    /// nearest a time in `check` is found in the track.
+    fn armed(hours: f64, window: Option<u32>, check: &[f64]) -> Armed {
+        const RATE: f64 = 48_000.0;
+        const SPAN: u64 = 480;
+        let len = hours * 3600.0;
+        let mut tl = AudioTimeline::new();
+        if let Some(w) = window {
+            tl = tl.with_fit_window(w);
+        }
+        // Clicks at 5 s, 15 s, 25 s …: clear of the stalls below.
+        let nearest = |t: f64| ((t - 5.0) / 10.0).round() * 10.0 + 5.0;
+        let mut peaks = Peaks::new(
+            check
+                .iter()
+                .map(|&t| nearest(t.min(len - 1.0) - 5.0))
+                .collect(),
+        );
+        let click_at = |t: f64| {
+            let d = (t - nearest(t)) * 4_000.0;
+            if d.abs() > 8.0 {
+                0.0
+            } else {
+                (0.8 * (-d * d).exp()) as f32
+            }
+        };
+        let stalls = [
+            (0.15 * len, 0.050),
+            (0.45 * len, 0.120),
+            (0.75 * len, 0.200),
+        ];
+        let mut stalled = 0;
+        let mut shift = 0.0;
+        // When frame `n` sounds: the ramp, plus the stalls so far.
+        let clock = |n: u64, shift: f64| {
+            let u = n as f64 / RATE;
+            shift + u - 1e-6 * (100.0 * u + 5.0 * u * u / len)
+        };
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut jitter = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((rng >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * 0.005
+        };
+        let mut index = 0u64;
+        let ticks = (len * 100.0).round() as u64;
+        for tick in 1..=ticks {
+            let now = tick as f64 * 0.01;
+            while clock(index + SPAN, shift) <= now {
+                let at = clock(index, shift);
+                if stalled < stalls.len() && at >= stalls[stalled].0 {
+                    shift += stalls[stalled].1;
+                    stalled += 1;
+                    continue;
+                }
+                let quiet = (at - nearest(at)).abs() > 0.02;
+                let sb = (0..SPAN)
+                    .map(|i| {
+                        if quiet {
+                            0.0
+                        } else {
+                            click_at(clock(index + i, shift))
+                        }
+                    })
+                    .collect();
+                tl.push(&AudioChunk {
+                    epoch: 1,
+                    at: at + jitter(),
+                    index,
+                    rate: 48_000,
+                    out_frames: 480,
+                    out_rate: 48_000,
+                    voice_wait: 0.0,
+                    chain_latency: 0,
+                    voice: vec![0.0; SPAN as usize],
+                    sb,
+                });
+                index += SPAN;
+            }
+            if tick % 2 == 0 {
+                for b in tl.pump(now) {
+                    peaks.see(&b);
+                }
+            }
+        }
+        Armed {
+            steps: tl.stats().steps,
+            kept: tl.epochs.back().map_or(0.0, |e| e.shift as f64 / RATE),
+            clicks: peaks.errors(),
+        }
+    }
+
+    /// The three stalls are the only steps — no extra ones, and no fresh
+    /// epoch from a clock that seemed to go backwards: the one epoch has
+    /// kept all 370 ms of them as silence — and every checked click lands
+    /// within 5 ms of where it played.
+    fn assert_in_place(run: &Armed) {
+        assert_eq!(run.steps, 3, "steps besides the three stalls");
+        assert!(
+            (run.kept - 0.370).abs() < 0.02,
+            "the epoch at the end kept {:.3} s of stalls, not the three",
+            run.kept
+        );
+        for &(at, off) in &run.clicks {
+            assert!(
+                off.abs() < 0.005,
+                "the click at {at} s is off by {:.2} ms",
+                off * 1e3
+            );
+        }
+    }
+
+    /// Two hours armed, with the window Replay's timeline is built with:
+    /// the clicks at 5 min, 1 h and 2 h all where they played.
+    #[test]
+    fn two_hours_armed_stay_in_place() {
+        let run = armed(2.0, Some(600), &[300.0, 3_600.0, 7_200.0]);
+        assert_in_place(&run);
+    }
+
+    /// The control: the same two hours through one line for the whole
+    /// epoch, as a take's timeline fits. The ramp bends it Δ·T/12 = 6 ms off
+    /// by the end, so the window is what keeps Replay's clips in sync.
+    #[test]
+    #[should_panic(expected = "the click at 7195 s is off by")]
+    fn two_hours_armed_slide_without_the_window() {
+        let run = armed(2.0, None, &[300.0, 3_600.0, 7_200.0]);
+        assert_in_place(&run);
+    }
+
+    /// Eight hours: the global line would be 24 ms off, past a step. Too
+    /// long for every CI run; run it by hand.
+    #[test]
+    #[ignore = "eight hours of audio; run by hand"]
+    fn eight_hours_armed_stay_in_place() {
+        let check: Vec<f64> = [300.0]
+            .into_iter()
+            .chain((1..=8).map(|h| f64::from(h) * 3_600.0))
+            .collect();
+        let run = armed(8.0, Some(600), &check);
+        assert_in_place(&run);
     }
 }

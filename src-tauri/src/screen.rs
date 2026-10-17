@@ -9,6 +9,16 @@
 //!
 //! The take's phase moves Idle → Starting → Recording → Stopping → Idle, and
 //! nothing else: [`Phase::next`] is the whole table, and the tests pin it.
+//!
+//! v1.54.0: a take runs on the capture pipeline it shares with Replay — one
+//! capture, one encoder, one timeline on one `divora-encoder` thread
+//! (`divora_capture::spawn_pipeline`) — or, where the encoder can't be driven
+//! directly, on v1.53.0's own thread through the sink writer. The pipeline
+//! is held in a [`Slot`], and Replay's side of it is in [`replay_ops`].
+
+mod replay_ops;
+
+pub use replay_ops::ArmRequest;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,12 +29,17 @@ use std::time::{Duration, Instant};
 use divora_capture::desktop::{
     DesktopCapture, DesktopDrain, DesktopSource, OpenedSource, PlaybackDevice,
 };
+use divora_capture::pipeline::STILL_STOPPING;
 use divora_capture::sizing::{default_bitrate, output_size, DEFAULT_MAX};
 use divora_capture::timeline::{AudioChunk, DesktopChunk, TrackOptions};
 use divora_capture::{
-    seconds_since, AudioFeed, CaptureStatus, MonitorInfo, RecordOptions, RecordStats, TakeObserver,
+    seconds_since, AudioFeed, CaptureStatus, EngineSignal, MonitorInfo, PipelineCommand,
+    PipelineHandle, PipelineSettings, RecordOptions, RecordStats, StartError, TakeEvents,
+    TakeObserver, TakeRequest,
 };
 use divora_core::audio::{AudioEngine, AvChunk, StreamInfo};
+
+use crate::replay::{take_check, EngineWatch, SharedSettings, Slot, SLOT_WAIT};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -47,6 +62,15 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long Stop waits for the file to be finished.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// v1.54.0: how long a request waits for a pipeline being started — its
+/// encoder built and its first frame in — before giving up on it.
+const SPAWN_WAIT: Duration = Duration::from_secs(8);
+
+/// v1.54.0: a take on a pipeline whose desktop audio had already stopped for
+/// good: not "stopped at 0:00".
+const GAVE_UP_BEFORE: &str =
+    "Desktop audio stopped before this recording started and Windows didn't bring it back.";
 
 /// Where a take is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,6 +546,16 @@ pub struct EngineFeed {
     /// Held so the capture runs for as long as the take; dropped (and so
     /// stopped) with the feed.
     capture: Option<DesktopCapture>,
+    /// v1.54.0: what the engine is doing, as Replay's ring needs to know:
+    /// a user's Stop holds it, a device rebuild doesn't.
+    watch: Option<Watch>,
+}
+
+/// The engine, watched for the ring.
+struct Watch {
+    engine: Arc<AudioEngine>,
+    stops: EngineWatch,
+    since: Instant,
 }
 
 impl EngineFeed {
@@ -535,7 +569,20 @@ impl EngineFeed {
             guard: None,
             desktop_mute: Arc::new(AtomicBool::new(false)),
             capture: None,
+            watch: None,
         }
+    }
+
+    /// v1.54.0: report the engine's stops to a pipeline (`AudioFeed::engine`).
+    #[must_use]
+    pub fn watch_engine(mut self, engine: Arc<AudioEngine>) -> Self {
+        let stops = engine.user_stop_count();
+        self.watch = Some(Watch {
+            engine,
+            stops: EngineWatch::new(stops),
+            since: Instant::now(),
+        });
+        self
     }
 
     /// Watch the engine's routing for the playback device named `name`:
@@ -582,6 +629,18 @@ impl AudioFeed for EngineFeed {
         }
     }
 
+    fn engine(&mut self) -> EngineSignal {
+        match self.watch.as_mut() {
+            Some(w) => w.stops.poll(
+                w.since.elapsed(),
+                w.engine.is_running(),
+                w.engine.user_stop_count(),
+                w.engine.device_recovery_failed(),
+            ),
+            None => EngineSignal::Running,
+        }
+    }
+
     fn poll_desktop(&mut self, start: Instant, out: &mut Vec<DesktopChunk>) {
         if let Some((engine, guard)) = self.guard.as_mut() {
             if let Some(send) = guard.check(engine.stream_info().as_ref()) {
@@ -596,6 +655,16 @@ impl AudioFeed for EngineFeed {
                     c.frames.fill(0.0);
                 }
             }
+        }
+    }
+}
+
+/// What the desktop capture saw goes in the log when the feed goes — the
+/// take's, or the pipeline's.
+impl Drop for EngineFeed {
+    fn drop(&mut self) {
+        if let Some(report) = self.desktop_report() {
+            tracing::info!(desktop = %report, "desktop audio for the recording");
         }
     }
 }
@@ -619,6 +688,48 @@ pub fn to_audio_chunk(c: AvChunk, start: Instant, offset: f64) -> AudioChunk {
     }
 }
 
+/// Which way a take is encoded (v1.54.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakePath {
+    /// The hardware encoder driven directly: Replay's path, shared with it.
+    Direct,
+    /// The sink writer, as v1.52.0 recorded, and why.
+    Rung1(&'static str),
+}
+
+/// What decides a take's path.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent facts, each a reason
+pub struct PathFacts {
+    /// `DIVORA_CAPTURE_RUNG1` is set.
+    pub rung1_env: bool,
+    /// `DIVORA_CAPTURE_CPU_CONVERT` is set.
+    pub cpu_env: bool,
+    /// The PC has a hardware H.264 encoder.
+    pub hardware: bool,
+    /// The direct encoder already failed on this run.
+    pub direct_failed: bool,
+}
+
+/// The direct path, unless a switch asks for the old one, the PC has no
+/// hardware encoder, or the direct encoder already failed on this run (a
+/// fresh launch tries it again).
+#[must_use]
+pub fn take_path(f: PathFacts) -> TakePath {
+    if f.rung1_env {
+        TakePath::Rung1("DIVORA_CAPTURE_RUNG1 is set")
+    } else if f.cpu_env {
+        // Only the sink writer's path has the CPU converter.
+        TakePath::Rung1("DIVORA_CAPTURE_CPU_CONVERT is set")
+    } else if !f.hardware {
+        TakePath::Rung1("no hardware video encoder")
+    } else if f.direct_failed {
+        TakePath::Rung1("the direct encoder failed earlier on this run")
+    } else {
+        TakePath::Direct
+    }
+}
+
 #[derive(Debug, Default)]
 struct Shared {
     phase: Phase,
@@ -630,6 +741,26 @@ struct Shared {
     outcome: Option<Result<PathBuf, String>>,
     /// The latest report, for `screen_recording_status`.
     last: ScreenRecordingUpdate,
+    /// v1.54.0: why the direct encoder couldn't be used, once it failed on
+    /// this run; later takes use the sink writer.
+    direct_failure: Option<String>,
+    /// v1.54.0: the capture pipeline, if one runs — Replay's ring, a take,
+    /// or both.
+    slot: Slot<PipelineHandle>,
+    /// A pipeline is being started (its encoder built, its first frame
+    /// awaited): nothing else may start one meanwhile.
+    spawning: bool,
+    /// What the running pipeline was built with: a take on it and the ring
+    /// share these.
+    settings: Option<SharedSettings>,
+    /// Its desktop audio, as each take on it reports it.
+    desktop: Option<DesktopReport>,
+    /// The take running is on the pipeline (not the sink writer).
+    pipeline_take: bool,
+    /// The pipeline being started ended before its start was over: its
+    /// handle is not put in the slot.
+    spawn_ended: bool,
+    replay: replay_ops::ReplayShared,
 }
 
 /// The app's screen recorder. One take at a time.
@@ -657,6 +788,7 @@ impl ScreenRecorder {
     /// Record `req.monitor_id` with the engine's voice and soundboard.
     /// Blocks until the first frame is in (or the take fails), and returns
     /// the file it is writing.
+    #[allow(clippy::too_many_lines)] // the take's three paths, in the order tried
     pub fn start(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -704,24 +836,61 @@ impl ScreenRecorder {
         else {
             return refuse("That screen isn't connected any more — pick another.".to_string());
         };
-        let (tx, rx) = sync_channel::<AvChunk>(AV_QUEUE);
-        if !engine.attach_av_tap(tx) {
-            return refuse(ENGINE_STOPPED.to_string());
+        // v1.54.0: with Replay on, the take goes on its pipeline, with its
+        // settings — or is refused.
+        let asked = SharedSettings::from(&req);
+        let route = self.route(&capture);
+        let mut s = match self.wait_slot() {
+            Ok(s) => s,
+            Err(why) => return refuse(why.to_string()),
+        };
+        // Stopped while it waited for the slot: no take, no file.
+        if s.take == take && s.phase == Phase::Stopping {
+            drop(s);
+            return refuse(divora_capture::pipeline::NO_PICTURE.to_string());
         }
+        if let Err(why) = take_check(s.replay.state, s.settings.as_ref(), &asked) {
+            drop(s);
+            return refuse(why);
+        }
+        if s.slot.running().is_some() {
+            let desk = s.desktop.clone().unwrap_or_default();
+            s.last.desktop_source_id.clone_from(&desk.id);
+            s.last.desktop_source.clone_from(&desk.label);
+            s.last.desktop_error.clone_from(&desk.error);
+            emit(app, &s.last);
+            let (events, start_rx) = self.take_events(app, engine, take, &req.path, desk);
+            s.pipeline_take = true;
+            let start = PipelineCommand::StartTake(TakeRequest {
+                take,
+                path: req.path.clone(),
+                stems: req.stems,
+                events,
+            });
+            let sent = s.slot.running().is_some_and(|h| h.send(start).is_ok());
+            drop(s);
+            if !sent {
+                return refuse(STILL_STOPPING.to_string());
+            }
+            return wait_started(&start_rx, req.path);
+        }
+        let direct = route == TakePath::Direct;
+        s.spawning = direct;
+        drop(s);
 
         // Desktop audio, if asked for. Opened here, before the take's own
         // thread, so its time to open never counts against the first frame;
         // and never a reason to fail the take — without it, the take goes on
         // as v1.52.0 recorded it, saying why.
-        let desktop = req.desktop.as_ref().map(|s| open_desktop(s, engine));
-        if let Some(d) = &desktop {
-            let mut s = self.lock();
-            s.last.desktop_source_id.clone_from(&d.id);
-            s.last.desktop_source.clone_from(&d.label);
-            s.last.desktop_error.clone_from(&d.error);
-            emit(app, &s.last);
-        }
-        let opened = desktop.as_ref().is_some_and(|d| d.capture.is_some());
+        let (feed, desk, opened) = match self.open_feed(app, engine, &req, true) {
+            Ok(f) => f,
+            Err(why) => {
+                if direct {
+                    self.spawned(None);
+                }
+                return refuse(why);
+            }
+        };
         let opts = RecordOptions {
             fps: req.fps,
             max_size: DEFAULT_MAX,
@@ -735,6 +904,48 @@ impl ScreenRecorder {
                 stems: req.stems,
             },
         };
+        let mut feed: Box<dyn AudioFeed + Send> = Box::new(feed.watch_engine(Arc::clone(engine)));
+        if direct {
+            let (events, start_rx) = self.take_events(app, engine, take, &req.path, desk.clone());
+            let first = PipelineCommand::StartTake(TakeRequest {
+                take,
+                path: req.path.clone(),
+                stems: req.stems,
+                events,
+            });
+            match divora_capture::spawn_pipeline(
+                pipeline_settings(&req.monitor_id, &opts),
+                feed,
+                self.pipeline_events(app, engine),
+                first,
+            ) {
+                Ok(h) => {
+                    self.spawned(Some((h, asked, desk.clone(), Some(take))));
+                    return wait_started(&start_rx, req.path);
+                }
+                Err(StartError::Direct { why, feed: back }) => {
+                    // Built before any audio was taken in, so the feed is
+                    // whole: the same take goes on through the sink writer.
+                    tracing::warn!(
+                        why,
+                        "the direct encoder can't be used here; using the sink writer"
+                    );
+                    self.lock().direct_failure = Some(why);
+                    self.spawned(None);
+                    // Replay can't run here now: the card says so at once.
+                    self.publish_replay(app);
+                    feed = back;
+                }
+                Err(StartError::Other(e)) => {
+                    // The tap goes before the slot frees: a request waiting
+                    // for it may attach its own the moment it does.
+                    engine.detach_av_tap();
+                    self.spawned(None);
+                    return refuse(e.to_string());
+                }
+            }
+        }
+
         let (start_tx, start_rx) = channel::<Result<(), String>>();
         let path = req.path.clone();
         let run = TakeRun {
@@ -743,8 +954,8 @@ impl ScreenRecorder {
             engine: Arc::clone(engine),
             req,
             opts,
-            rx,
-            desktop,
+            feed,
+            desk,
             stop,
             start_tx,
             take,
@@ -756,11 +967,156 @@ impl ScreenRecorder {
             engine.detach_av_tap();
             return refuse(format!("Couldn't start recording: {e}"));
         }
-        match start_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => Ok(path),
-            Ok(Err(why)) => Err(why),
-            Err(_) => Err("The screen recording didn't start.".to_string()),
+        wait_started(&start_rx, path)
+    }
+
+    /// The engine's tap and, if asked for, the desktop audio, as a feed for
+    /// a take or a pipeline; for a take (`publish`), the desktop source goes
+    /// out at once. `Err` when the engine isn't running. Returns whether the
+    /// desktop audio opened.
+    fn open_feed(
+        &self,
+        app: &AppHandle,
+        engine: &Arc<AudioEngine>,
+        req: &StartRequest,
+        publish: bool,
+    ) -> Result<(EngineFeed, DesktopReport, bool), String> {
+        let (tx, rx) = sync_channel::<AvChunk>(AV_QUEUE);
+        if !engine.attach_av_tap(tx) {
+            return Err(ENGINE_STOPPED.to_string());
         }
+        let desktop = req.desktop.as_ref().map(|s| open_desktop(s, engine));
+        if publish {
+            if let Some(d) = &desktop {
+                let mut s = self.lock();
+                s.last.desktop_source_id.clone_from(&d.id);
+                s.last.desktop_source.clone_from(&d.label);
+                s.last.desktop_error.clone_from(&d.error);
+                emit(app, &s.last);
+            }
+        }
+        let opened = desktop.as_ref().is_some_and(|d| d.capture.is_some());
+        let (feed, desk) = build_feed(rx, req.av_offset_ms, desktop, engine);
+        Ok((feed, desk, opened))
+    }
+
+    /// Wait while a pipeline is being started or is on its way out (§C.1):
+    /// the lock, once the slot can be used.
+    fn wait_slot(&self) -> Result<std::sync::MutexGuard<'_, Shared>, &'static str> {
+        let since = Instant::now();
+        let mut s = self.lock();
+        loop {
+            let ending = matches!(s.slot, Slot::Ending(_));
+            if !ending && !s.spawning {
+                return Ok(s);
+            }
+            let limit = if s.spawning { SPAWN_WAIT } else { SLOT_WAIT };
+            let Some(left) = limit.checked_sub(since.elapsed()) else {
+                return Err(STILL_STOPPING);
+            };
+            s = self
+                .changed
+                .wait_timeout(s, left.min(Duration::from_millis(100)))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// A pipeline start is over: running with these settings — for take
+    /// `take`, or for Replay — or not started. Whatever the user did while
+    /// it started is carried out on it now: a Stop of its take, Replay turned
+    /// off. A pipeline that already ended (its first moments failed) is not
+    /// put in the slot.
+    fn spawned(&self, ok: Option<(PipelineHandle, SharedSettings, DesktopReport, Option<u64>)>) {
+        let mut s = self.lock();
+        s.spawning = false;
+        let ended = std::mem::take(&mut s.spawn_ended);
+        if let Some((h, settings, desk, take)) = ok {
+            if ended {
+                tracing::info!("the pipeline ended as it started");
+            } else if let Err(h) = s.slot.spawned(h) {
+                // Never: only this start could fill the slot.
+                tracing::warn!(?h, "a second pipeline was started; it is dropped");
+            } else {
+                s.settings = Some(settings);
+                s.desktop = Some(desk);
+                match take {
+                    // Its take, unless that already finished.
+                    Some(t) if s.take == t && s.phase != Phase::Idle => {
+                        s.pipeline_take = true;
+                        if s.phase == Phase::Stopping {
+                            if let Some(h) = s.slot.handle() {
+                                let _ = h.send(PipelineCommand::StopTake { take: t });
+                            }
+                            if !s.replay.state.is_on() {
+                                s.slot.exiting();
+                            }
+                        }
+                    }
+                    // Replay's — turned off while it started.
+                    None if !s.replay.state.is_on() => {
+                        if let Some(h) = s.slot.handle() {
+                            let _ = h.send(PipelineCommand::Disarm);
+                        }
+                        if !s.pipeline_take {
+                            s.slot.exiting();
+                        }
+                    }
+                    Some(_) | None => {}
+                }
+            }
+        }
+        drop(s);
+        self.changed.notify_all();
+    }
+
+    /// What a take on the pipeline tells the app, and how Start hears that
+    /// it began (or didn't).
+    fn take_events(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        engine: &Arc<AudioEngine>,
+        take: u64,
+        path: &Path,
+        mut desk: DesktopReport,
+    ) -> (Arc<dyn TakeEvents>, Receiver<Result<(), String>>) {
+        let (tx, rx) = channel();
+        let gave_up = desk
+            .gave_up
+            .as_ref()
+            .is_some_and(|g| g.load(Ordering::Acquire));
+        if gave_up && desk.error.is_none() {
+            desk.error = Some(GAVE_UP_BEFORE.to_string());
+        }
+        let observer = AppObserver {
+            app: app.clone(),
+            recorder: Arc::clone(self),
+            engine: Arc::clone(engine),
+            path: path.to_path_buf(),
+            started: None,
+            start_tx: Some(tx),
+            lost_at: None,
+            desk,
+        };
+        let events = AppTakeEvents {
+            observer: Mutex::new(observer),
+            take,
+        };
+        (Arc::new(events), rx)
+    }
+
+    /// Which path the next take uses (v1.54.0).
+    fn route(&self, capture: &divora_capture::CaptureStatus) -> TakePath {
+        let route = take_path(PathFacts {
+            rung1_env: std::env::var_os(divora_capture::RUNG1_ENV).is_some(),
+            cpu_env: std::env::var_os(divora_capture::FORCE_CPU_ENV).is_some(),
+            hardware: capture.hardware,
+            direct_failed: self.lock().direct_failure.is_some(),
+        });
+        if let TakePath::Rung1(why) = route {
+            tracing::info!(why, "this take uses the sink writer");
+        }
+        route
     }
 
     /// Stop the take and wait for its file to be finished. Returns the file.
@@ -770,13 +1126,29 @@ impl ScreenRecorder {
         match s.phase.next(Input::Stop) {
             Some(next) => {
                 s.phase = next;
-                if let Some(stop) = &s.stop {
+                if s.pipeline_take {
+                    if let Some(h) = s.slot.handle() {
+                        let _ = h.send(PipelineCommand::StopTake { take });
+                    }
+                    // With Replay off the pipeline ends with the take: say
+                    // so in the same breath, so nothing slips in between.
+                    if !s.replay.state.is_on() {
+                        s.slot.exiting();
+                    }
+                } else if let Some(stop) = &s.stop {
                     stop.store(true, Ordering::Release);
                 }
                 s.last.state = next;
                 emit(app, &s.last);
             }
-            None if s.phase == Phase::Stopping => {}
+            None if s.phase == Phase::Stopping => {
+                // Asked again: the pipeline is told again (a take stops once).
+                if s.pipeline_take {
+                    if let Some(h) = s.slot.handle() {
+                        let _ = h.send(PipelineCommand::StopTake { take });
+                    }
+                }
+            }
             None => return Err("No screen recording is running.".to_string()),
         }
         let (s, timeout) = self
@@ -830,6 +1202,7 @@ impl ScreenRecorder {
         }
         s.phase = s.phase.next(Input::Finished).unwrap_or(Phase::Idle);
         s.stop = None;
+        s.pipeline_take = false;
         let error = outcome.as_ref().err().cloned();
         let audio = stats.and_then(|st| st.audio.as_ref());
         s.last = ScreenRecordingUpdate {
@@ -910,15 +1283,75 @@ fn open_desktop(source: &DesktopSource, engine: &AudioEngine) -> TakeDesktop {
     }
 }
 
-/// Everything one take's `divora-encoder` thread needs.
+/// The engine's tap and the desktop capture, as one feed, and what a take
+/// says about its desktop audio.
+fn build_feed(
+    rx: Receiver<AvChunk>,
+    av_offset_ms: i32,
+    desktop: Option<TakeDesktop>,
+    engine: &Arc<AudioEngine>,
+) -> (EngineFeed, DesktopReport) {
+    let mut feed = EngineFeed::new(rx, av_offset_ms);
+    let mut desk = DesktopReport::default();
+    if let Some(d) = desktop {
+        desk.id = d.id;
+        desk.error = d.error;
+        if let Some(mut cap) = d.capture {
+            if matches!(cap.opened(), OpenedSource::Device { .. }) {
+                desk.device_name.clone_from(&d.label);
+            }
+            desk.role = Some(d.role);
+            desk.lost = Some(cap.lost_flag());
+            desk.gave_up = Some(cap.gave_up_flag());
+            desk.mute = Some(feed.desktop_mute());
+            if let Some(name) = desk.device_name.clone() {
+                feed = feed.guard_device(Arc::clone(engine), name);
+            }
+            if let Some(drain) = cap.take_drain() {
+                feed = feed.with_desktop(drain, Some(cap));
+            }
+        }
+        desk.label = d.label;
+    }
+    (feed, desk)
+}
+
+/// What a pipeline for `monitor_id` is built with, from a take's options.
+fn pipeline_settings(monitor_id: &str, opts: &RecordOptions) -> PipelineSettings {
+    PipelineSettings {
+        monitor_id: monitor_id.to_string(),
+        fps: opts.fps,
+        max_size: opts.max_size,
+        bitrate: opts
+            .bitrate
+            .unwrap_or_else(|| default_bitrate(opts.max_size, opts.fps)),
+        cursor: opts.cursor,
+        track: TrackOptions {
+            desktop_gain_db: opts.audio.desktop_gain_db,
+            stems: false,
+        },
+    }
+}
+
+/// Start's answer: the take began (its first frame is in), or why not.
+fn wait_started(rx: &Receiver<Result<(), String>>, path: PathBuf) -> Result<PathBuf, String> {
+    match rx.recv_timeout(START_TIMEOUT) {
+        Ok(Ok(())) => Ok(path),
+        Ok(Err(why)) => Err(why),
+        Err(_) => Err("The screen recording didn't start.".to_string()),
+    }
+}
+
+/// Everything a v1.53.0 take's `divora-encoder` thread needs (v1.54.0: the
+/// sink writer's path, where the encoder can't be driven directly).
 struct TakeRun {
     recorder: Arc<ScreenRecorder>,
     app: AppHandle,
     engine: Arc<AudioEngine>,
     req: StartRequest,
     opts: RecordOptions,
-    rx: Receiver<AvChunk>,
-    desktop: Option<TakeDesktop>,
+    feed: Box<dyn AudioFeed + Send>,
+    desk: DesktopReport,
     stop: Arc<AtomicBool>,
     start_tx: Sender<Result<(), String>>,
     take: u64,
@@ -933,34 +1366,12 @@ impl TakeRun {
             engine,
             req,
             opts,
-            rx,
-            desktop,
+            mut feed,
+            desk,
             stop,
             start_tx,
             take,
         } = self;
-        let mut feed = EngineFeed::new(rx, req.av_offset_ms);
-        let mut desk = DesktopReport::default();
-        if let Some(d) = desktop {
-            desk.id = d.id;
-            desk.error = d.error;
-            if let Some(mut cap) = d.capture {
-                if matches!(cap.opened(), OpenedSource::Device { .. }) {
-                    desk.device_name.clone_from(&d.label);
-                }
-                desk.role = Some(d.role);
-                desk.lost = Some(cap.lost_flag());
-                desk.gave_up = Some(cap.gave_up_flag());
-                desk.mute = Some(feed.desktop_mute());
-                if let Some(name) = desk.device_name.clone() {
-                    feed = feed.guard_device(Arc::clone(&engine), name);
-                }
-                if let Some(drain) = cap.take_drain() {
-                    feed = feed.with_desktop(drain, Some(cap));
-                }
-            }
-            desk.label = d.label;
-        }
         let mut observer = AppObserver {
             app: app.clone(),
             recorder: Arc::clone(&recorder),
@@ -971,23 +1382,25 @@ impl TakeRun {
             lost_at: None,
             desk,
         };
+        let audio: &mut dyn AudioFeed = &mut *feed;
         let result = divora_capture::record_monitor(
             &req.monitor_id,
             &req.path,
             &opts,
             &stop,
             None,
-            Some(&mut feed),
+            Some(audio),
             &mut observer,
         );
-        let desktop_report = feed.desktop_report();
         // Stops the desktop capture too (waiting a moment at most).
         drop(feed);
         engine.detach_av_tap();
         let take_stats = result.as_ref().ok().cloned();
         let outcome = match result {
-            Ok(_) if req.path.exists() => Ok(req.path.clone()),
-            Ok(_) => Err("Stopped before the screen sent a picture.".to_string()),
+            // Ended by itself (a sleep): the file is kept and named, and the
+            // card says why.
+            Ok(st) if req.path.exists() => st.cut.clone().map_or_else(|| Ok(req.path.clone()), Err),
+            Ok(_) => Err(divora_capture::pipeline::NO_PICTURE.to_string()),
             Err(e) => Err(e.to_string()),
         };
         // A take that never started still owes Start its answer.
@@ -995,17 +1408,56 @@ impl TakeRun {
             let _ = tx.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
         }
         if let Some(st) = &take_stats {
-            tracing::info!(
-                frames = st.frames_written,
-                dropped = st.frames_dropped,
-                encoder = ?st.encoder,
-                hardware = st.hardware,
-                audio = ?st.audio,
-                desktop = ?desktop_report,
-                "screen recording finished"
-            );
+            log_finished(st, false);
         }
         recorder.finish(&app, take, outcome, take_stats.as_ref());
+    }
+}
+
+/// The take's numbers, once, in the log.
+fn log_finished(st: &RecordStats, direct: bool) {
+    tracing::info!(
+        direct,
+        frames = st.frames_written,
+        dropped = st.frames_dropped,
+        encoder = ?st.encoder,
+        hardware = st.hardware,
+        audio = ?st.audio,
+        "screen recording finished"
+    );
+}
+
+/// A take on the pipeline: the same observer a v1.53.0 take has, called
+/// from the pipeline's threads.
+struct AppTakeEvents {
+    observer: Mutex<AppObserver>,
+    take: u64,
+}
+
+impl AppTakeEvents {
+    fn observer(&self) -> std::sync::MutexGuard<'_, AppObserver> {
+        self.observer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl TakeEvents for AppTakeEvents {
+    fn started(&self) {
+        self.observer().started();
+    }
+
+    fn progress(&self, stats: &RecordStats) {
+        self.observer().progress(stats);
+    }
+
+    fn finished(&self, outcome: Result<PathBuf, String>, stats: RecordStats) {
+        let mut o = self.observer();
+        if let Some(tx) = o.start_tx.take() {
+            let _ = tx.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
+        }
+        let (recorder, app) = (Arc::clone(&o.recorder), o.app.clone());
+        drop(o);
+        log_finished(&stats, true);
+        recorder.finish(&app, self.take, outcome, Some(&stats));
     }
 }
 
@@ -1013,8 +1465,9 @@ fn emit(app: &AppHandle, update: &ScreenRecordingUpdate) {
     let _ = app.emit(EVENT, update);
 }
 
-/// What the take reports about its desktop audio.
-#[derive(Default)]
+/// What the take reports about its desktop audio. v1.54.0: a pipeline's is
+/// made once and copied into every take on it.
+#[derive(Debug, Clone, Default)]
 struct DesktopReport {
     id: Option<String>,
     label: Option<String>,
@@ -1171,6 +1624,39 @@ mod tests {
 
     /// The whole transition table: every pair, so a new arm cannot slip in
     /// unnoticed.
+    /// The direct encoder unless a switch, the hardware or an earlier
+    /// failure says otherwise — and never with the CPU converter forced,
+    /// which only the sink writer's path has.
+    #[test]
+    fn takes_choose_their_path() {
+        use super::{take_path, PathFacts, TakePath};
+        let ok = PathFacts {
+            hardware: true,
+            ..PathFacts::default()
+        };
+        assert_eq!(take_path(ok), TakePath::Direct);
+        for f in [
+            PathFacts {
+                rung1_env: true,
+                ..ok
+            },
+            PathFacts {
+                cpu_env: true,
+                ..ok
+            },
+            PathFacts {
+                hardware: false,
+                ..ok
+            },
+            PathFacts {
+                direct_failed: true,
+                ..ok
+            },
+        ] {
+            assert!(matches!(take_path(f), TakePath::Rung1(_)), "{f:?}");
+        }
+    }
+
     #[test]
     fn the_phase_table() {
         use Input::{Finished, Start, Started, Stop};

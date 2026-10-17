@@ -23,6 +23,7 @@ accidental break fails CI before it ships:
 - `TtsVoiceInfo` keys + the missing-`engine` default — `divora-core/src/tts/mod.rs`.
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - `ScreenRecordingUpdate` / `CaptureStatusDto` / `MonitorDto` / `DesktopSourceDto` keys and the `DivoraPlays` strings — `src-tauri/src/screen.rs` (`wire_keys_are_frozen`; v1.52.0, v1.53.0).
+- `ReplayStatus` / `ReplayArmed` / `ReplaySaved` / `ReplayMemory` / `ReplayLength` keys and the state and held-reason strings — `src-tauri/src/replay.rs` (`replay_wire_keys_are_frozen`; v1.54.0).
 - Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
@@ -140,6 +141,14 @@ window's event loop.
 | `stop_screen_recording` | — | full path of the finished MP4 `string` / error |
 | `screen_recording_status` | — | `ScreenRecordingUpdate` (the latest report) |
 
+v1.54.0: a take starts on the capture pipeline Replay uses. While Replay is on,
+`start_screen_recording` records on Replay's pipeline and must ask for the same
+screen, frame rate, quality, pointer, desktop audio, desktop volume (with
+desktop audio) and A/V offset, or it fails with "Replay is on with a different
+… — turn Replay off to record with others."; while Replay is held for a lost
+screen or a failed encoder it fails with "Replay lost its screen …" /
+"Replay lost its encoder …". `stems` and `filename` are the take's own.
+
 `filename` keeps only its last path component and is always written as `.mp4`,
 so nothing the frontend sends can leave `recordings/`. Unknown `quality`
 values read as `"balanced"`, and any `fps` but 60 as 30.
@@ -179,6 +188,23 @@ take: it records without desktop audio, and `desktopError` says why. The
 | `unregister_global_shortcut` | `id` | — / error |
 | `unregister_all_global_shortcuts` | — | — / error |
 
+### Replay (v1.54.0)
+
+All `async`: an arm waits for the pipeline's first frame, a save for its file.
+
+| Command | Args | Returns |
+|---|---|---|
+| `replay_buffer_status` | — | `ReplayStatus` |
+| `replay_memory` | `monitorId: string`, `fps?: 30 \| 60`, `quality?: "small" \| "balanced" \| "high"` | `ReplayMemory` / error (the screen isn't connected) |
+| `arm_replay_buffer` | `monitorId: string`, `seconds: 15 \| 30 \| 60 \| 120` (anything else is 30), `fps?`, `quality?`, `cursor?`, `avOffsetMs?` (±500), `desktopAudio?`, `desktopGainDb?` — as `start_screen_recording` reads them | `ReplayStatus` / error: the engine stopped ("Start the engine before recording."), unsupported (`ReplayStatus.reason`'s words), too little memory ("Replay of {N} s at these settings needs up to {cap} MB of memory; this PC allows {ceiling} MB." — the cap rounded up, the ceiling down, as the card's labels), Replay already on with other settings, a take running on the sink writer. While on with the same settings it changes the length. During a take on the pipeline it joins the take, on the take's settings |
+| `disarm_replay_buffer` | — | `ReplayStatus` (a save already pressed still finishes) |
+| `save_replay` | — | `ReplaySaved` (`path`, `durationMs`; `error` null) / error — every outcome, refusals included, is also one `replay-saved` event |
+
+**Every arm goes through the frontend's `armReplay()`**, which holds the
+explainer gate: Replay is never turned on — by the card, the `replay:toggle`
+hotkey, or any action added later (MIDI, glyphs, timers) — before its
+explainer has been seen. The tray has no item that turns Replay on.
+
 **Global-shortcut ids** (the `id` argument above, and the `id` of the `global-shortcut` event). An id is a fixed action name or a reserved prefix; new ids are added, never renamed. Accelerators use the global-hotkey grammar, so the Windows key is `Super` (written "Win" only in the UI) — v1.51.4.
 
 | Id | Meaning |
@@ -188,6 +214,7 @@ take: it records without desktop audio, and `desktopError` says why. The
 | `monitor` | toggle hearing yourself |
 | `sb:<clipId>` | play one soundboard tile (prefix reserved) |
 | `rec:<recorder>` | start / stop a recorder (prefix reserved) — v1.52.0. Defined: `rec:screen` (the screen recorder), `rec:wav` (the WAV recorder). Both unbound by default |
+| `replay:<action>` | Replay (prefix reserved) — v1.54.0. Defined: `replay:save` (save the replay), `replay:toggle` (turn Replay on / off; it works once Replay has been turned on from the Record screen card). Both unbound by default |
 
 ### MIDI control surfaces (v1.9.0)
 
@@ -212,7 +239,9 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3) |
 | `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
-| `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise |
+| `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise — also while only Replay runs |
+| `replay-buffer` | `ReplayStatus` | on every change of Replay's state or `saving`, and about once a second while armed; a held ring only on change (v1.54.0) |
+| `replay-saved` | `ReplaySaved` | the outcome of every save attempt, refusals included — exactly one per attempt (v1.54.0) |
 
 **Why `voice-reading` is its own event and not a field on `LevelUpdate`.**
 Additive-only permits either, so this is a design choice, recorded here because
@@ -293,6 +322,21 @@ DesktopAudioSource { id ("everything" | "device:<id>"), label,
                     kind: "everything" | "device", isDefault,
                     divoraPlays: "nothing" | "send" | "monitor" |
                       "onlyOutput" | "unknown" }     // v1.53.0
+ReplayStatus      { supported, reason (nullable),
+                    state: "off" | "arming" | "armed" | "held",
+                    saving, seconds, bufferedMs, bytes, capBytes,
+                    monitorId (nullable),
+                    heldReason (nullable: "engine-stopped" | "screen-lost"
+                      | "encoder-failed"),
+                    armed (nullable: ReplayArmed — what the running ring
+                      uses) }                        // v1.54.0
+ReplayArmed       { fps, quality: "small" | "balanced" | "high", cursor,
+                    desktopAudio (nullable: "everything" | "device:<id>"),
+                    desktopGainDb, avOffsetMs }      // v1.54.0
+ReplaySaved       { path (nullable), durationMs, error (nullable) }  // v1.54.0
+ReplayMemory      { ceilingBytes, lengths: ReplayLength[] }          // v1.54.0
+ReplayLength      { seconds, bytes (the estimate), capBytes (the most it
+                    may hold: the figure shown), allowed }           // v1.54.0
 ```
 
 **`StreamInfo` notes.**
@@ -398,7 +442,8 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
-| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0 (a save without them reads them as unbound). Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound). Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
@@ -449,6 +494,14 @@ recordings/divora-screen-<date>_<time>.desktop.wav   the take's voice + soundboa
                          size limit: with desktop audio, both at the same frame
                          past about 3.1 hours; without it, the voice file alone
                          past about 6.2 hours
+recordings/divora-replay-<date>_<time>.mp4   a saved replay — v1.54.0: the video as the
+                         hardware encoder made it (H.264, a keyframe every 2 s,
+                         BT.709 studio range) + AAC-LC 48 kHz stereo, both from
+                         0 with no edit list. Named by the backend from local
+                         time (`-2`, `-3`, … on a clash), written as `.part` and
+                         renamed when finished; a failed or cancelled save
+                         removes the `.part`, and one refused for disk space
+                         writes nothing
 ```
 
 Installer-bundled, read-only, next to the executable's resource dir:

@@ -28,6 +28,14 @@ describe("Sigil", () => {
     }
   });
 
+  it("includes Replay's sigil, and it draws (v1.54.0)", () => {
+    expect(SIGIL_NAMES).toContain("replay");
+    const { container } = render(() => <Sigil name="replay" size={13} />);
+    const svg = container.querySelector("svg")!;
+    expect(svg.getAttribute("width")).toBe("13");
+    expect(svg.querySelectorAll("path, circle").length).toBeGreaterThan(0);
+  });
+
   it("includes every nav name in the catalog", () => {
     for (const name of ["mixer", "soundboard", "presets", "settings"] as const) {
       expect(SIGIL_NAMES).toContain(name);

@@ -37,6 +37,9 @@ pub struct Gpu {
     pub context: ID3D11DeviceContext,
     /// The same device, as Windows Graphics Capture wants it.
     pub winrt: IDirect3DDevice,
+    /// Whether the device was made with video support — what the GPU colour
+    /// converter, and so the directly driven encoder, need (v1.54.0).
+    pub video: bool,
 }
 
 impl Gpu {
@@ -46,11 +49,11 @@ impl Gpu {
     /// converts on the CPU instead.
     pub fn new() -> Result<Self, CaptureError> {
         let with_video = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        let (device, context) = match create_device(with_video) {
-            Ok(pair) => pair,
+        let ((device, context), video) = match create_device(with_video) {
+            Ok(pair) => (pair, true),
             Err(e) => {
                 tracing::info!(error = %e, "no Direct3D video support; converting on the CPU");
-                create_device(D3D11_CREATE_DEVICE_BGRA_SUPPORT)?
+                (create_device(D3D11_CREATE_DEVICE_BGRA_SUPPORT)?, false)
             }
         };
 
@@ -72,7 +75,19 @@ impl Gpu {
             device,
             context,
             winrt,
+            video,
         })
+    }
+
+    /// The PCI vendor id of the adapter this device runs on (0x10DE NVIDIA,
+    /// 0x1002 AMD, 0x8086 Intel) — so the encoder picked is the one on the
+    /// same GPU as the frames, on a PC with two (v1.54.0).
+    pub fn vendor_id(&self) -> Result<u32, CaptureError> {
+        let dxgi: IDXGIDevice = self.device.cast().context("IDXGIDevice")?;
+        // SAFETY: plain getters on a live DXGI device and its adapter.
+        let desc = unsafe { dxgi.GetAdapter().and_then(|a| a.GetDesc()) }
+            .context("IDXGIAdapter::GetDesc")?;
+        Ok(desc.VendorId)
     }
 
     /// A GPU texture of `format`, usable as a video-processor input or
@@ -123,7 +138,15 @@ pub struct Nv12Converter {
     processor: ID3D11VideoProcessor,
     input_view: ID3D11VideoProcessorInputView,
     out_size: (u32, u32),
+    /// v1.54.0: one output view per pooled texture, by the texture's
+    /// address, so converting into the encoder's pool makes no view per
+    /// frame. A view belongs to this converter's enumerator, so the cache
+    /// goes with it when the screen changes size.
+    views: Vec<(usize, ID3D11VideoProcessorOutputView)>,
 }
+
+/// The most output views kept: the encoder's pool holds four textures.
+const VIEW_CACHE: usize = 8;
 
 impl Nv12Converter {
     /// A converter reading from `source` (a BGRA texture of `in_size`) and
@@ -246,6 +269,7 @@ impl Nv12Converter {
             processor,
             input_view,
             out_size,
+            views: Vec::new(),
         })
     }
 
@@ -254,6 +278,33 @@ impl Nv12Converter {
     /// the previous one asynchronously.
     pub fn convert(&self, dev: &Gpu) -> Result<ID3D11Texture2D, CaptureError> {
         let out = dev.texture(self.out_size, DXGI_FORMAT_NV12)?;
+        let out_view = self.output_view(&out)?;
+        self.blt(&out_view)?;
+        Ok(out)
+    }
+
+    /// Convert the current contents of the source texture into `out`, an
+    /// NV12 texture of the output size from the encoder's pool (v1.54.0).
+    pub fn convert_into(&mut self, out: &ID3D11Texture2D) -> Result<(), CaptureError> {
+        let key = out.as_raw() as usize;
+        let view = if let Some((_, v)) = self.views.iter().find(|(k, _)| *k == key) {
+            v.clone()
+        } else {
+            let v = self.output_view(out)?;
+            if self.views.len() >= VIEW_CACHE {
+                self.views.remove(0);
+            }
+            self.views.push((key, v.clone()));
+            v
+        };
+        self.blt(&view)
+    }
+
+    /// A video-processor output view of `out`.
+    fn output_view(
+        &self,
+        out: &ID3D11Texture2D,
+    ) -> Result<ID3D11VideoProcessorOutputView, CaptureError> {
         let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
@@ -264,16 +315,18 @@ impl Nv12Converter {
         // SAFETY: valid descriptor and out-pointer; `out` is alive.
         unsafe {
             self.vdevice.CreateVideoProcessorOutputView(
-                &out,
+                out,
                 &self.enumerator,
                 &raw const out_desc,
                 Some(&raw mut out_view),
             )
         }
         .context("CreateVideoProcessorOutputView")?;
-        let out_view: ID3D11VideoProcessorOutputView =
-            out_view.ok_or_else(|| unavailable("no video output view"))?;
+        out_view.ok_or_else(|| unavailable("no video output view"))
+    }
 
+    /// Run the video processor from the source texture into `out_view`.
+    fn blt(&self, out_view: &ID3D11VideoProcessorOutputView) -> Result<(), CaptureError> {
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: BOOL(1),
             pInputSurface: ManuallyDrop::new(Some(self.input_view.clone())),
@@ -283,7 +336,7 @@ impl Nv12Converter {
         let result = unsafe {
             self.vcontext.VideoProcessorBlt(
                 &self.processor,
-                &out_view,
+                out_view,
                 0,
                 std::slice::from_ref(&stream),
             )
@@ -292,8 +345,7 @@ impl Nv12Converter {
         // the reference we cloned into it.
         // SAFETY: taken exactly once, after the call that borrowed it.
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
-        result.context("VideoProcessorBlt")?;
-        Ok(out)
+        result.context("VideoProcessorBlt")
     }
 }
 

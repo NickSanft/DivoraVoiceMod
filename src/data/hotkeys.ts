@@ -17,13 +17,17 @@
 import type { HotkeyAction } from "../stores/app";
 
 /** The persisted actions, in a fixed order (also the order they register).
- *  v1.52.0 adds the two recorders, under the reserved `rec:` prefix. */
+ *  v1.52.0 adds the two recorders, under the reserved `rec:` prefix; v1.54.0
+ *  adds Replay under its own `replay:` prefix, since `rec:` means "start /
+ *  stop a recorder" and a save is neither. */
 export const HOTKEY_ACTIONS: readonly HotkeyAction[] = [
   "ptm",
   "panic",
   "monitor",
   "rec:screen",
   "rec:wav",
+  "replay:save",
+  "replay:toggle",
 ];
 
 /** Every action unbound: the default, and what a missing key reads as. */

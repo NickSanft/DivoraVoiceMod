@@ -20,9 +20,11 @@ import {
   subscribeLevels,
   subscribeMidi,
   subscribeTtsProgress,
+  type GlobalShortcutEvent,
 } from "./audio/api";
 import { overlayPayload } from "./overlay/state";
 import { syncOverlay } from "./overlay/sync";
+import { Toast } from "./components/Toast";
 import { Wizard } from "./components/Wizard";
 import { WhatsNewBanner, WhatsNewModal } from "./components/WhatsNew";
 import { Sidebar } from "./shell/Sidebar";
@@ -33,12 +35,51 @@ import { SoundboardScreen } from "./screens/SoundboardScreen";
 import { SpeakScreen } from "./screens/SpeakScreen";
 import { PresetsScreen } from "./screens/PresetsScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
-import { AppProvider, useApp } from "./stores/app";
+import { AppProvider, useApp, type AppState } from "./stores/app";
 
 function applyRootAttr(name: string, value: string | null) {
   const root = document.documentElement;
   if (value === null) root.removeAttribute(name);
   else root.setAttribute(name, value);
+}
+
+// Global hotkeys. The backend emits `global-shortcut` events with the
+// binding's id and pressed/released state; this turns them into store
+// actions. It is the path every id takes, and it runs while the window is
+// hidden to the tray too:
+//   ptm           → set ui.pressed on press, clear on release
+//   panic         → stop all soundboard clips on press
+//   monitor       → toggle sidetone on press
+//   rec:screen    → start / stop the screen recording (v1.52.0)
+//   rec:wav       → start / stop the WAV recording (v1.52.0)
+//   replay:save   → save what Replay has kept (v1.54.0)
+//   replay:toggle → turn Replay on / off (v1.54.0) — on goes through
+//                   armReplay(), which refuses until the card's explainer
+//                   has been read
+//   sb:<clip>     → play that soundboard tile
+export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent): void {
+  if (event.id === "ptm") {
+    app.setUi("pressed", event.state === "pressed");
+    return;
+  }
+  if (event.state !== "pressed") return;
+  if (event.id === "panic") {
+    void app.panicSoundboard();
+  } else if (event.id === "monitor") {
+    void app.toggleMonitor();
+  } else if (event.id === "rec:screen") {
+    void app.toggleScreenRecording();
+  } else if (event.id === "rec:wav") {
+    void app.toggleRecording();
+  } else if (event.id === "replay:save") {
+    void app.saveReplay();
+  } else if (event.id === "replay:toggle") {
+    void app.toggleReplay();
+  } else if (event.id.startsWith("sb:")) {
+    // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
+    // current scan still has it.
+    void app.playTileById(event.id.slice(3));
+  }
 }
 
 function Shell(): JSX.Element {
@@ -159,40 +200,13 @@ function Shell(): JSX.Element {
     });
   });
 
-  // Global hotkey subscription. The backend emits `global-shortcut`
-  // events with the binding's id ("ptm" | "panic" | "monitor" |
-  // "rec:screen" | "rec:wav" | "sb:<clip>") and pressed/released state.
-  // We translate those into store mutations:
-  //   ptm        → set ui.pressed on press, clear on release
-  //   panic      → stop all soundboard clips on press
-  //   monitor    → toggle sidetone on press
-  //   rec:screen → start / stop the screen recording (v1.52.0)
-  //   rec:wav    → start / stop the WAV recording (v1.52.0)
+  // Global hotkey subscription: see dispatchGlobalShortcut above.
   onMount(() => {
     let unlisten: UnlistenFn | null = null;
     let cancelled = false;
     void (async () => {
       try {
-        unlisten = await subscribeGlobalShortcut((event) => {
-          if (event.id === "ptm") {
-            app.setUi("pressed", event.state === "pressed");
-            return;
-          }
-          if (event.state !== "pressed") return;
-          if (event.id === "panic") {
-            void app.panicSoundboard();
-          } else if (event.id === "monitor") {
-            void app.toggleMonitor();
-          } else if (event.id === "rec:screen") {
-            void app.toggleScreenRecording();
-          } else if (event.id === "rec:wav") {
-            void app.toggleRecording();
-          } else if (event.id.startsWith("sb:")) {
-            // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
-            // current scan still has it.
-            void app.playTileById(event.id.slice(3));
-          }
-        });
+        unlisten = await subscribeGlobalShortcut((event) => dispatchGlobalShortcut(app, event));
       } catch (err) {
         // Browser preview without the Tauri bridge — the in-app
         // fallback above still works.
@@ -462,6 +476,9 @@ function Shell(): JSX.Element {
             </Match>
           </Switch>
           <WhatsNewBanner />
+          {/* v1.54.0: top-centre, clear of the banner's bottom slot. Always
+              mounted: it is the live region. */}
+          <Toast message={app.toast()} />
           <Wizard />
         </div>
       </div>

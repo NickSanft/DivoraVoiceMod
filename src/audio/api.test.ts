@@ -71,6 +71,13 @@ import {
   stopScreenRecording,
   screenRecordingStatus,
   subscribeScreenRecording,
+  replayBufferStatus,
+  replayMemory,
+  armReplayBuffer,
+  disarmReplayBuffer,
+  saveReplay,
+  subscribeReplayBuffer,
+  subscribeReplaySaved,
 } from "./api";
 
 describe("audio api", () => {
@@ -868,5 +875,70 @@ describe("screen recording api (v1.52.0, v1.53.0)", () => {
     listenMock.mockResolvedValueOnce(() => {});
     await subscribeScreenRecording(() => {});
     expect(listenMock).toHaveBeenCalledWith("screen-recording", expect.any(Function));
+  });
+});
+
+describe("replay api (v1.54.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+  });
+
+  it("each wrapper invokes its command by its frozen name", async () => {
+    invokeMock.mockResolvedValue(null);
+    await replayBufferStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("replay_buffer_status");
+    await disarmReplayBuffer();
+    expect(invokeMock).toHaveBeenLastCalledWith("disarm_replay_buffer");
+    await saveReplay();
+    expect(invokeMock).toHaveBeenLastCalledWith("save_replay");
+  });
+
+  it("replayMemory passes the screen and settings flat", async () => {
+    invokeMock.mockResolvedValueOnce({ ceilingBytes: 1, lengths: [] });
+    await replayMemory({ monitorId: "m", fps: 60, quality: "high" });
+    expect(invokeMock).toHaveBeenCalledWith("replay_memory", {
+      monitorId: "m",
+      fps: 60,
+      quality: "high",
+    });
+  });
+
+  it("armReplayBuffer passes every option flat, under its own key", async () => {
+    invokeMock.mockResolvedValueOnce(null);
+    await armReplayBuffer({
+      monitorId: "m",
+      seconds: 60,
+      fps: 30,
+      quality: "balanced",
+      cursor: false,
+      avOffsetMs: -15,
+      desktopAudio: "everything",
+      desktopGainDb: -9,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("arm_replay_buffer", {
+      monitorId: "m",
+      seconds: 60,
+      fps: 30,
+      quality: "balanced",
+      cursor: false,
+      avOffsetMs: -15,
+      desktopAudio: "everything",
+      desktopGainDb: -9,
+    });
+  });
+
+  it("listens to replay-buffer and replay-saved, and forwards the payloads", async () => {
+    const seen: unknown[] = [];
+    listenMock.mockImplementation(
+      async (_event: string, handler: (e: { payload: unknown }) => void) => {
+        handler({ payload: { from: _event } });
+        return () => {};
+      },
+    );
+    await subscribeReplayBuffer((s) => seen.push(s));
+    await subscribeReplaySaved((s) => seen.push(s));
+    expect(listenMock.mock.calls.map((c) => c[0])).toEqual(["replay-buffer", "replay-saved"]);
+    expect(seen).toEqual([{ from: "replay-buffer" }, { from: "replay-saved" }]);
   });
 });

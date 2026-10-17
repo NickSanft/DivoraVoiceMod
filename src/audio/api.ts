@@ -965,6 +965,131 @@ export async function subscribeScreenRecording(
   return listen<ScreenRecordingUpdate>("screen-recording", (e) => handler(e.payload));
 }
 
+// ---- Replay (v1.54.0) ----
+// The last 15–120 s of one screen, kept in memory and saved on demand. The
+// wire keys are frozen on the Rust side (`replay_wire_keys_are_frozen`):
+// every field below is always sent, and the optional ones arrive as null.
+
+export type ReplayState = "off" | "arming" | "armed" | "held";
+
+/** Why a held ring stopped keeping; it can still be saved. */
+export type ReplayHeldReason = "engine-stopped" | "screen-lost" | "encoder-failed";
+
+/** The lengths Replay can keep, in seconds (anything else is taken as 30). */
+export type ReplaySeconds = 15 | 30 | 60 | 120;
+
+/** What the running ring was built with — which a take started while it
+ *  runs has to match, and what the card's locked line describes. */
+export interface ReplayArmed {
+  fps: number;
+  quality: ScreenQuality;
+  cursor: boolean;
+  /** `everything` or `device:<id>`; null without desktop audio. */
+  desktopAudio: string | null;
+  desktopGainDb: number;
+  avOffsetMs: number;
+}
+
+/** Payload of the `replay-buffer` event (and `replay_buffer_status`). */
+export interface ReplayStatus {
+  supported: boolean;
+  /** Why Replay can't run on this PC, while `supported` is false. */
+  reason: string | null;
+  state: ReplayState;
+  saving: boolean;
+  seconds: number;
+  /** How much the ring holds now; less than `seconds` while it fills. */
+  bufferedMs: number;
+  bytes: number;
+  /** The most memory this length can use (what the UI shows). */
+  capBytes: number;
+  monitorId: string | null;
+  heldReason: ReplayHeldReason | null;
+  /** Null while off. */
+  armed: ReplayArmed | null;
+}
+
+/** Payload of `replay-saved`: the outcome of every save attempt,
+ *  refusals included. */
+export interface ReplaySaved {
+  path: string | null;
+  durationMs: number;
+  error: string | null;
+}
+
+/** One length's memory at the settings asked about. */
+export interface ReplayLength {
+  seconds: number;
+  /** The estimate; the UI never shows it. */
+  bytes: number;
+  /** The most it can use: the figure the UI shows and the refusal quotes. */
+  capBytes: number;
+  /** Whether `capBytes` fits under this PC's ceiling. */
+  allowed: boolean;
+}
+
+export interface ReplayMemory {
+  ceilingBytes: number;
+  lengths: ReplayLength[];
+}
+
+export interface ReplayMemoryOptions {
+  monitorId: string;
+  fps?: 30 | 60;
+  quality?: ScreenQuality;
+}
+
+export interface ReplayArmOptions {
+  monitorId: string;
+  seconds: ReplaySeconds;
+  fps?: 30 | 60;
+  quality?: ScreenQuality;
+  cursor?: boolean;
+  /** ±500 ms; a pipeline setting, so a take started later shares it. */
+  avOffsetMs?: number;
+  /** `everything` or `device:<id>`; absent is no desktop audio. */
+  desktopAudio?: string;
+  desktopGainDb?: number;
+}
+
+export async function replayBufferStatus(): Promise<ReplayStatus> {
+  return invoke<ReplayStatus>("replay_buffer_status");
+}
+
+/** Each length's memory cap for this screen and these settings, and this
+ *  PC's ceiling. */
+export async function replayMemory(opts: ReplayMemoryOptions): Promise<ReplayMemory> {
+  return invoke<ReplayMemory>("replay_memory", { ...opts });
+}
+
+/** Turn Replay on, or change its length while on. Only the store's
+ *  `armReplay()` calls this: it holds the explainer gate. */
+export async function armReplayBuffer(opts: ReplayArmOptions): Promise<ReplayStatus> {
+  return invoke<ReplayStatus>("arm_replay_buffer", { ...opts });
+}
+
+export async function disarmReplayBuffer(): Promise<ReplayStatus> {
+  return invoke<ReplayStatus>("disarm_replay_buffer");
+}
+
+/** Resolves with the saved clip; every outcome, a refusal included, is also
+ *  reported by a `replay-saved` event. */
+export async function saveReplay(): Promise<{ path: string; durationMs: number }> {
+  return invoke<{ path: string; durationMs: number }>("save_replay");
+}
+
+export async function subscribeReplayBuffer(
+  handler: (status: ReplayStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<ReplayStatus>("replay-buffer", (e) => handler(e.payload));
+}
+
+export async function subscribeReplaySaved(
+  handler: (saved: ReplaySaved) => void,
+): Promise<UnlistenFn> {
+  return listen<ReplaySaved>("replay-saved", (e) => handler(e.payload));
+}
+
 // ---- Soundboard ----
 
 /** Wire format for one soundboard tile (output of `scan_soundboard_folder`). */

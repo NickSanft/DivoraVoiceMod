@@ -1,5 +1,7 @@
 // Toggle — 40x23 switch with sliding knob. Gradient track when on;
 // `tone` lets you swap the on-tint to danger or success.
+//
+// v1.54.0: `disabled` (Settings' screen-recording rows while Replay is on).
 
 import type { JSX } from "solid-js";
 
@@ -8,6 +10,8 @@ export interface ToggleProps {
   onChange?: (next: boolean) => void;
   tone?: "" | "danger" | "success";
   ariaLabel?: string;
+  disabled?: boolean;
+  title?: string;
 }
 
 export function Toggle(props: ToggleProps): JSX.Element {
@@ -18,7 +22,11 @@ export function Toggle(props: ToggleProps): JSX.Element {
       role="switch"
       aria-checked={props.on}
       aria-label={props.ariaLabel}
-      onClick={() => props.onChange?.(!props.on)}
+      disabled={props.disabled}
+      title={props.title}
+      onClick={() => {
+        if (!props.disabled) props.onChange?.(!props.on);
+      }}
     >
       <span class="toggle-knob" />
     </button>

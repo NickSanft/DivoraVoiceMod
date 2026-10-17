@@ -22,7 +22,7 @@ const FLUSH_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// What the card says when the separate files reach a WAV file's limit,
 /// `frames` (48 kHz) into the take.
-fn full_at(frames: u64) -> String {
+pub(crate) fn full_at(frames: u64) -> String {
     let secs = frames / 48_000;
     format!(
         "a WAV file can only hold so much, so they stop at {}:{:02}:{:02}; the video goes on",
@@ -83,12 +83,14 @@ impl<'a> AudioTrack<'a> {
     }
 
     /// Take in everything that has arrived, then hand every block that is
-    /// ready to `write`. Desktop audio goes in before the timeline is asked
-    /// what is ready, so a recording thread that was held up has nothing
-    /// arrive "late" that was in fact waiting.
+    /// ready by `now` (the recording's clock, as its loop read it) to
+    /// `write`. Desktop audio goes in before the timeline is asked what is
+    /// ready, so a recording thread that was held up has nothing arrive
+    /// "late" that was in fact waiting.
     pub fn pump(
         &mut self,
         start: Instant,
+        now: Duration,
         write: &mut dyn FnMut(&AudioBlock) -> Result<(), CaptureError>,
     ) -> Result<(), CaptureError> {
         self.feed.poll(start, &mut self.chunks);
@@ -99,8 +101,7 @@ impl<'a> AudioTrack<'a> {
         for c in self.desktop.drain(..) {
             self.timeline.push_desktop(&c);
         }
-        let now = start.elapsed().as_secs_f64();
-        for block in self.timeline.pump(now) {
+        for block in self.timeline.pump(now.as_secs_f64()) {
             write(&block)?;
             self.blocks += 1;
         }
@@ -117,8 +118,11 @@ impl<'a> AudioTrack<'a> {
         write: &mut dyn FnMut(&AudioBlock) -> Result<(), CaptureError>,
     ) -> Result<(), CaptureError> {
         let deadline = Instant::now() + self.flush_timeout;
+        // Never past the end by more than the timeline's own wait: a sleep
+        // during this wait must not become audio.
+        let ceiling = Duration::from_secs_f64(end.max(0.0)) + Duration::from_secs(2);
         loop {
-            self.pump(start, write)?;
+            self.pump(start, start.elapsed().min(ceiling), write)?;
             let now = start.elapsed().as_secs_f64();
             if self.timeline.ready_until(now).is_none_or(|t| t >= end) || Instant::now() >= deadline
             {
@@ -128,6 +132,39 @@ impl<'a> AudioTrack<'a> {
         }
         for block in self.timeline.finish(end) {
             write(&block)?;
+            self.blocks += 1;
+        }
+        self.write_stems();
+        Ok(())
+    }
+
+    /// End the track at `end` across a jump in the clock: the PC slept, and
+    /// `start.elapsed()` now counts the sleep. `t_jump` is the take's clock
+    /// as it last read before the jump.
+    ///
+    /// [`finish`](Self::finish) would pump with the live clock first, and
+    /// the timeline writes every frame older than `now − MAX_WAIT_SECONDS`
+    /// as silence: the whole sleep, hours of it, in one call. Instead,
+    /// nothing from after the jump goes in — whatever the feed holds now is
+    /// thrown away: at most the last poll's worth from before it, and what
+    /// came after — the timeline is pumped as of `t_jump`, and finished at
+    /// `end` with whatever has not arrived written as silence. The live
+    /// clock is never read again.
+    pub fn finish_at(
+        &mut self,
+        start: Instant,
+        end: f64,
+        t_jump: Duration,
+        write: &mut dyn FnMut(&AudioBlock) -> Result<(), CaptureError>,
+    ) -> Result<(), CaptureError> {
+        self.feed.poll(start, &mut self.chunks);
+        self.chunks.clear();
+        self.feed.poll_desktop(start, &mut self.desktop);
+        self.desktop.clear();
+        let mut blocks = self.timeline.pump(t_jump.as_secs_f64());
+        blocks.extend(self.timeline.finish(end));
+        for block in &blocks {
+            write(block)?;
             self.blocks += 1;
         }
         self.write_stems();
@@ -191,12 +228,18 @@ impl<'a> AudioTrack<'a> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #![allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
 
     use super::AudioTrack;
     use crate::stems::StemWriter;
     use crate::take::AudioFeed;
     use crate::timeline::{AudioBlock, AudioChunk, DesktopChunk, TrackOptions, BLOCK_FRAMES};
+    use std::collections::VecDeque;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     /// A feed whose engine and desktop audio are whatever the test queued,
@@ -273,7 +316,7 @@ mod tests {
         let mut track =
             AudioTrack::new(&mut feed, opts, &take).with_flush_timeout(Duration::from_millis(50));
         track
-            .pump(start, &mut |b| {
+            .pump(start, start.elapsed(), &mut |b| {
                 written.push(b.clone());
                 Ok(())
             })
@@ -330,7 +373,7 @@ mod tests {
             .with_stems(w)
             .with_flush_timeout(Duration::from_millis(50));
         track
-            .pump(start, &mut |_| {
+            .pump(start, start.elapsed(), &mut |_| {
                 blocks += 1;
                 Ok(())
             })
@@ -341,6 +384,117 @@ mod tests {
         track.finish_stems();
         assert_eq!(track.stats().stems.unwrap().frames, 3 * BLOCK_FRAMES as u64);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The earliest instant at most `want` ago that this machine's clock can
+    /// say: `Instant` counts from boot on Windows, and a CI machine may not
+    /// have been up for hours.
+    fn long_ago(want: Duration) -> Instant {
+        let mut back = want;
+        loop {
+            if let Some(t) = Instant::now().checked_sub(back) {
+                return t;
+            }
+            back /= 2;
+            assert!(
+                back >= Duration::from_secs(60),
+                "the clock can't reach back"
+            );
+        }
+    }
+
+    /// A feed that hands over one queued batch of engine chunks per poll.
+    struct Batches(VecDeque<Vec<AudioChunk>>);
+
+    impl AudioFeed for Batches {
+        fn poll(&mut self, _start: Instant, out: &mut Vec<AudioChunk>) {
+            if let Some(mut batch) = self.0.pop_front() {
+                out.append(&mut batch);
+            }
+        }
+    }
+
+    /// `n` chunks of the soundboard at `level`, from frame `first`, the
+    /// first stamped `at`.
+    fn level_chunks(first: u64, at: f64, n: u64, level: f32) -> Vec<AudioChunk> {
+        (0..n)
+            .map(|k| {
+                let mut c = engine_chunk((first + k) * 480, at + k as f64 * 0.01);
+                c.sb = vec![level; 480];
+                c
+            })
+            .collect()
+    }
+
+    /// A take across a sleep: two seconds recorded, then the PC slept eight
+    /// hours with the engine's stream open. The live clock now counts the
+    /// sleep, and the feed holds chunks stamped after it. Finished as of the
+    /// jump, the track is the two seconds and no more — never the sleep as
+    /// silence — and the post-sleep audio is not in it.
+    #[test]
+    fn finish_at_ignores_the_live_clock() {
+        let mut feed = Batches(VecDeque::from([
+            level_chunks(0, 0.0, 200, 0.25),
+            // The same epoch's stream, carrying on after the sleep.
+            level_chunks(200, 8.0 * 3600.0, 50, 0.9),
+        ]));
+        // The take's start as the clock read it before the sleep, 2.4 s in,
+        // and as it reads it after: `start` is one instant, but the clock
+        // counts the sleep.
+        let before = Instant::now()
+            .checked_sub(Duration::from_millis(2_400))
+            .unwrap();
+        let after = long_ago(Duration::from_secs(8 * 3600));
+        let mut written: Vec<AudioBlock> = Vec::new();
+        let mut track = AudioTrack::new(&mut feed, TrackOptions::default(), Path::new("take.mp4"));
+        track
+            .pump(before, before.elapsed(), &mut |b| {
+                written.push(b.clone());
+                Ok(())
+            })
+            .unwrap();
+        let end = 2.0;
+        track
+            .finish_at(after, end, Duration::from_millis(2_400), &mut |b| {
+                written.push(b.clone());
+                Ok(())
+            })
+            .unwrap();
+        let most = (end * 48_000.0 / BLOCK_FRAMES as f64).ceil() as usize + 1;
+        assert!(
+            written.len() <= most,
+            "{} blocks for a {end} s take",
+            written.len()
+        );
+        assert_eq!(track.stats().blocks, written.len() as u64);
+        let level = |b: &AudioBlock| i32::from(b.samples[0]);
+        assert!((level(&written[40]) - 8_191).abs() <= 1, "the take's audio");
+        assert!(written.iter().all(|b| level(b) < 9_000), "post-sleep audio");
+    }
+
+    /// A stop, then the PC sleeps while the track waits for its last audio:
+    /// the clock counts the sleep, but the wait never pumps more than a
+    /// moment past the take's end.
+    #[test]
+    fn finish_never_pumps_a_sleep() {
+        let mut feed = Batches(VecDeque::from([level_chunks(0, 0.0, 200, 0.25)]));
+        let start = long_ago(Duration::from_secs(600));
+        let mut written: Vec<AudioBlock> = Vec::new();
+        let mut track = AudioTrack::new(&mut feed, TrackOptions::default(), Path::new("take.mp4"))
+            .with_flush_timeout(Duration::from_millis(50));
+        let end = 2.0;
+        track
+            .finish(start, end, &mut |b| {
+                written.push(b.clone());
+                Ok(())
+            })
+            .unwrap();
+        let most = ((end + 2.0) * 48_000.0 / BLOCK_FRAMES as f64).ceil() as usize + 1;
+        assert!(
+            written.len() <= most,
+            "{} blocks for a {end} s take",
+            written.len()
+        );
     }
 
     /// A take with no stems writes none, and a stem file that can't be made
@@ -365,7 +519,8 @@ mod tests {
         };
         let mut t = AudioTrack::new(&mut feed, opts, &nowhere);
         assert!(t.stats().stems_error.is_some());
-        t.pump(Instant::now(), &mut |_| Ok(())).unwrap();
+        let start = Instant::now();
+        t.pump(start, start.elapsed(), &mut |_| Ok(())).unwrap();
         drop(t);
         assert_eq!(feed.polls, 1, "the track stopped with its stems");
     }

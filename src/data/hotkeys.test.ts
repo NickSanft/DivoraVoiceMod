@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   acceleratorToKeys,
+  HOTKEY_ACTIONS,
   keysToAccelerator,
   normalizeAccelerator,
   readHotkeyBindings,
@@ -61,7 +62,15 @@ describe("normalizeAccelerator", () => {
 
 describe("readHotkeyBindings", () => {
   it("nothing stored: every action unbound", () => {
-    const none = { ptm: "", panic: "", monitor: "", "rec:screen": "", "rec:wav": "" };
+    const none = {
+      ptm: "",
+      panic: "",
+      monitor: "",
+      "rec:screen": "",
+      "rec:wav": "",
+      "replay:save": "",
+      "replay:toggle": "",
+    };
     expect(readHotkeyBindings(null)).toEqual(none);
     expect(readHotkeyBindings("junk")).toEqual(none);
     expect(readHotkeyBindings([1, 2])).toEqual(none);
@@ -76,6 +85,8 @@ describe("readHotkeyBindings", () => {
       monitor: "F8",
       "rec:screen": "",
       "rec:wav": "",
+      "replay:save": "",
+      "replay:toggle": "",
     });
   });
 
@@ -90,5 +101,39 @@ describe("readHotkeyBindings", () => {
     expect(
       readHotkeyBindings({ "rec:screen": "Ctrl+Alt+Win+F9", "rec:wav": "Ctrl+Alt+F10" }),
     ).toMatchObject({ "rec:screen": "Ctrl+Alt+Super+F9", "rec:wav": "Ctrl+Alt+F10" });
+  });
+
+  // v1.54.0: Replay's ids live under their own `replay:` prefix — `rec:`
+  // means "start / stop a recorder", and a save is neither.
+  it("reads Replay's hotkeys, turning Win into Super", () => {
+    expect(
+      readHotkeyBindings({ "replay:save": "Ctrl+Win+F11", "replay:toggle": "Ctrl+Alt+F12" }),
+    ).toMatchObject({ "replay:save": "Ctrl+Super+F11", "replay:toggle": "Ctrl+Alt+F12" });
+    // A v1.53.0 save has neither key: both read as unbound.
+    expect(readHotkeyBindings({ "rec:screen": "F9" })).toMatchObject({
+      "replay:save": "",
+      "replay:toggle": "",
+    });
+  });
+
+  it("ignores a stored rec:replay key like any unknown key (it never shipped)", () => {
+    const read = readHotkeyBindings({ "rec:replay": "F7", "rec:replay-arm": "F8" });
+    expect(read).not.toHaveProperty("rec:replay");
+    expect(read).not.toHaveProperty("rec:replay-arm");
+    expect(Object.values(read).every((v) => v === "")).toBe(true);
+  });
+});
+
+describe("HOTKEY_ACTIONS", () => {
+  it("lists Replay's two ids after the recorders (the order they register)", () => {
+    expect(HOTKEY_ACTIONS).toEqual([
+      "ptm",
+      "panic",
+      "monitor",
+      "rec:screen",
+      "rec:wav",
+      "replay:save",
+      "replay:toggle",
+    ]);
   });
 });

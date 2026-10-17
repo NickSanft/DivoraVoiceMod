@@ -6,8 +6,18 @@ pub mod d3d;
 pub mod encoder;
 pub mod loopback;
 pub mod mf;
+pub mod mft;
+pub mod mux;
+pub mod pipeline;
+pub mod pool;
+pub mod power;
 pub mod probe;
 pub mod record;
+pub mod save;
+pub mod sink;
+pub mod system;
+pub mod take_mux;
+pub mod variant;
 pub mod wgc;
 
 use windows::core::BOOL;
