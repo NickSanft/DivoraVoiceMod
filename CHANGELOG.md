@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.54.0] — 2026-10-17 — Replay: save the last moments of your screen
+
 Replay keeps the last 15 to 120 seconds of one screen in memory, with your voice and soundboard as your call hears them and, if the card records desktop audio, the sound of your other apps, and saves them as an MP4 when you press Save, its hotkey or Save replay in the tray. It is off until you turn it on, Replay writes no picture or sound to disk until you save, and Windows draws its yellow border around that screen while Replay keeps it.
 
 ### Added
