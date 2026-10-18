@@ -2,12 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
+const dialogOpenMock = vi.fn();
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (...args: unknown[]) => listenMock(...args),
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: (...args: unknown[]) => dialogOpenMock(...args),
 }));
 
 import {
@@ -78,6 +82,17 @@ import {
   saveReplay,
   subscribeReplayBuffer,
   subscribeReplaySaved,
+  openOverlayWindow,
+  closeOverlayWindow,
+  placeOverlayWindow,
+  setOverlayMode,
+  setOverlayHideFromRecordings,
+  overlayStatus,
+  importOverlayAsset,
+  deleteOverlayAsset,
+  pickImageFile,
+  subscribeOverlayStatus,
+  subscribeOverlayEdit,
 } from "./api";
 
 describe("audio api", () => {
@@ -940,5 +955,86 @@ describe("replay api (v1.54.0)", () => {
     await subscribeReplaySaved((s) => seen.push(s));
     expect(listenMock.mock.calls.map((c) => c[0])).toEqual(["replay-buffer", "replay-saved"]);
     expect(seen).toEqual([{ from: "replay-buffer" }, { from: "replay-saved" }]);
+  });
+});
+
+// v1.55.0: the names and argument shapes are the backend's (lib.rs), frozen
+// in STABLE-SURFACE §1. Literals on purpose: a renamed constant must fail
+// here too.
+describe("stream overlay api (v1.55.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+    dialogOpenMock.mockReset();
+  });
+
+  it("each window command goes by its frozen name, with flat args", async () => {
+    invokeMock.mockResolvedValue(null);
+    const rect = { x: -1920, y: 40, width: 720, height: 720 };
+    await openOverlayWindow({ rect, fit: false });
+    expect(invokeMock).toHaveBeenLastCalledWith("open_overlay", { rect, fit: false });
+    await openOverlayWindow({ rect: null, fit: false });
+    expect(invokeMock).toHaveBeenLastCalledWith("open_overlay", { rect: null, fit: false });
+    await closeOverlayWindow();
+    expect(invokeMock).toHaveBeenLastCalledWith("close_overlay");
+    await placeOverlayWindow(rect, true);
+    expect(invokeMock).toHaveBeenLastCalledWith("place_overlay", { rect, fit: true });
+    await overlayStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("overlay_status");
+  });
+
+  it("setOverlayMode sends the mode; the hide toggle goes as `enabled`", async () => {
+    invokeMock.mockResolvedValue(null);
+    for (const mode of ["locked", "arrange", "toggle"] as const) {
+      await setOverlayMode(mode);
+      expect(invokeMock).toHaveBeenLastCalledWith("set_overlay_mode", { mode });
+    }
+    await setOverlayHideFromRecordings(true);
+    expect(invokeMock).toHaveBeenLastCalledWith("set_overlay_hide_from_recordings", { enabled: true });
+  });
+
+  it("the asset commands take a path and an id", async () => {
+    invokeMock.mockResolvedValueOnce({ id: "a1b2c3d4e5f60718.gif" });
+    await importOverlayAsset("C:/pics/wave.gif");
+    expect(invokeMock).toHaveBeenLastCalledWith("import_overlay_asset", { path: "C:/pics/wave.gif" });
+    invokeMock.mockResolvedValueOnce(null);
+    await deleteOverlayAsset("a1b2c3d4e5f60718.gif");
+    expect(invokeMock).toHaveBeenLastCalledWith("delete_overlay_asset", { id: "a1b2c3d4e5f60718.gif" });
+  });
+
+  it("a rejected command rejects with the backend's words", async () => {
+    invokeMock.mockRejectedValueOnce("The overlay isn't open.");
+    await expect(placeOverlayWindow({ x: 0, y: 0, width: 1, height: 1 }, false)).rejects.toBe(
+      "The overlay isn't open.",
+    );
+  });
+
+  it("pickImageFile offers the four kinds, and answers null on a cancel or a failure", async () => {
+    dialogOpenMock.mockResolvedValueOnce("C:/pics/wave.gif");
+    expect(await pickImageFile()).toBe("C:/pics/wave.gif");
+    expect(dialogOpenMock).toHaveBeenCalledWith({
+      multiple: false,
+      title: "Pick a picture or GIF for the overlay",
+      filters: [{ name: "Pictures", extensions: ["png", "jpg", "jpeg", "jfif", "jpe", "gif", "webp", "apng"] }],
+    });
+    dialogOpenMock.mockResolvedValueOnce(null);
+    expect(await pickImageFile()).toBeNull();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    dialogOpenMock.mockRejectedValueOnce(new Error("no dialog"));
+    expect(await pickImageFile()).toBeNull();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("listens to overlay:status and overlay:edit, and forwards the payloads", async () => {
+    const seen: unknown[] = [];
+    listenMock.mockImplementation(async (event: string, handler: (e: { payload: unknown }) => void) => {
+      handler({ payload: { from: event } });
+      return () => {};
+    });
+    await subscribeOverlayStatus((s) => seen.push(s));
+    await subscribeOverlayEdit((e) => seen.push(e));
+    expect(listenMock.mock.calls.map((c) => c[0])).toEqual(["overlay:status", "overlay:edit"]);
+    expect(seen).toEqual([{ from: "overlay:status" }, { from: "overlay:edit" }]);
   });
 });

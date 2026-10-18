@@ -20,7 +20,8 @@ export type SigilName =
   | "compressor" | "deesser"
   | "mixer" | "soundboard" | "presets" | "settings"
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
-  | "lock" | "panic" | "play" | "stop" | "record" | "screen" | "replay"
+  | "lock" | "unlock" | "panic" | "play" | "stop" | "record" | "screen" | "replay"
+  | "image" | "expand"
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
   | "download" | "external" | "trash" | "copy" | "info" | "warning"
@@ -185,6 +186,14 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
       <circle cx="12" cy="15" r="1.3" fill="currentColor" stroke="none" />
     </g>
   ),
+  // v1.55.0: the lock with its shackle lifted open — the overlay's Arrange.
+  unlock: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5" y="10.5" width="14" height="9.5" rx="2.5" />
+      <path d="M8 10.5 V6.5 a4 4 0 0 1 8 0 V7.5" />
+      <circle cx="12" cy="15" r="1.3" fill="currentColor" stroke="none" />
+    </g>
+  ),
   panic: () => (
     <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
       <rect x="6" y="6" width="12" height="12" rx="2.5" />
@@ -212,6 +221,21 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
       <path d="M5 5.5 V9.5 H9" />
       <path d="M5.5 9.5 A7 7 0 1 1 5 13" />
       <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
+    </g>
+  ),
+  // v1.55.0: Charms — a picture (a frame, a sun and a mountain line), and
+  // four corners pushed outward for Fit to monitor.
+  image: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3.5" y="5" width="17" height="14" rx="2" />
+      <circle cx="9" cy="10" r="1.6" fill="currentColor" stroke="none" />
+      <path d="M4 17 L9.5 12 L13 15 L15.5 12.5 L20 16.5" />
+    </g>
+  ),
+  expand: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 9 V4 H9 M15 4 H20 V9 M20 15 V20 H15 M9 20 H4 V15" />
+      <path d="M4 4 L9.5 9.5 M20 4 L14.5 9.5 M20 20 L14.5 14.5 M4 20 L9.5 14.5" />
     </g>
   ),
   // ---------- UTILITY ----------

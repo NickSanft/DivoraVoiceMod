@@ -60,6 +60,11 @@ pub use native::{
     probe::capture_status,
     record::record_monitor,
     system::{free_bytes, local_time, total_physical_memory, PRETEND_FREE_ENV},
+    window::{
+        can_take_foreground, capture_exclusion_available, display_affinity, foreground_window,
+        make_layered_opaque, mark_non_rude, try_foreground, unmark_non_rude, MIN_CONTRACT,
+        PRETEND_NO_CAPTURE_EXCLUSION_ENV,
+    },
 };
 
 /// The real writer, for `tests/encoder_smoke.rs` to drive without a screen.
@@ -85,7 +90,9 @@ pub mod smoke {
 mod elsewhere;
 #[cfg(not(windows))]
 pub use elsewhere::{
-    capture_status, free_bytes, list_monitors, list_playback_devices, local_time,
-    process_loopback_available, record_monitor, record_monitor_direct, spawn_pipeline,
-    total_physical_memory, PRETEND_FREE_ENV,
+    can_take_foreground, capture_exclusion_available, capture_status, display_affinity,
+    foreground_window, free_bytes, list_monitors, list_playback_devices, local_time,
+    make_layered_opaque, mark_non_rude, process_loopback_available, record_monitor,
+    record_monitor_direct, spawn_pipeline, total_physical_memory, try_foreground, unmark_non_rude,
+    MIN_CONTRACT, PRETEND_FREE_ENV, PRETEND_NO_CAPTURE_EXCLUSION_ENV,
 };

@@ -9,8 +9,14 @@
 // state. Taking `emit`/`listen` as arguments lets the test drive the same
 // function App.tsx calls, rather than a copy of it.
 
-import { createEffect, createSignal, onCleanup } from "solid-js";
-import { OVERLAY_EVENT, OVERLAY_READY_EVENT, type OverlayState } from "./state";
+import { batch, createEffect, createSignal, onCleanup } from "solid-js";
+import {
+  OVERLAY_EVENT,
+  OVERLAY_READY_EVENT,
+  OVERLAY_SCENE_EVENT,
+  type OverlayState,
+  type ScenePush,
+} from "./state";
 
 export interface OverlaySyncDeps {
   /** Whether the overlay window is open. Nothing is sent while it isn't. */
@@ -52,4 +58,68 @@ export function syncOverlay(deps: OverlaySyncDeps): void {
       /* not under Tauri */
     });
   });
+}
+
+export interface SceneSyncDeps {
+  /** Whether the overlay window is open. Nothing is sent while it isn't. */
+  isOpen: () => boolean;
+  /** The push to send. Read only while open, so it is tracked only then. */
+  push: () => ScenePush;
+  emit: (event: string, payload: ScenePush) => Promise<void>;
+  listen: (event: string, handler: () => void) => Promise<() => void>;
+  /** Called on `overlay:ready`, before the re-push: a reloaded page numbers
+   *  its edits from 0 again, so main forgets its ack. */
+  onReady: () => void;
+}
+
+/** v1.55.0: keep the overlay's scene in step, as `syncOverlay` does its
+ *  state: send the push whenever it changes, and again on `overlay:ready`.
+ *
+ *  Each Tauri `emit` is its own async command, so two sent back to back can
+ *  arrive in either order and an older scene would win. Every emit here
+ *  waits for the one before it to finish; `flushed()` resolves once
+ *  everything queued so far has gone. Call inside a reactive owner; the
+ *  listener goes when that owner does, or on `dispose()`. */
+export function syncOverlayScene(deps: SceneSyncDeps): { dispose: () => void; flushed: () => Promise<void> } {
+  const [readyCount, setReadyCount] = createSignal(0);
+  let tail: Promise<void> = Promise.resolve();
+  let unlisten: (() => void) | null = null;
+  let disposed = false;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    unlisten?.();
+    unlisten = null;
+  };
+
+  void deps
+    .listen(OVERLAY_READY_EVENT, () => {
+      if (disposed) return;
+      // One re-push, with the ack already reset.
+      batch(() => {
+        deps.onReady();
+        setReadyCount((n) => n + 1);
+      });
+    })
+    .then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    })
+    .catch(() => {
+      /* not under Tauri */
+    });
+  onCleanup(dispose);
+
+  createEffect(() => {
+    readyCount();
+    if (disposed || !deps.isOpen()) return;
+    const payload = deps.push();
+    tail = tail
+      .then(() => deps.emit(OVERLAY_SCENE_EVENT, payload))
+      .catch(() => {
+        /* not under Tauri; the next push still goes */
+      });
+  });
+
+  return { dispose, flushed: () => tail };
 }

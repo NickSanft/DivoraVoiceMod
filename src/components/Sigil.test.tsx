@@ -36,6 +36,16 @@ describe("Sigil", () => {
     expect(svg.querySelectorAll("path, circle").length).toBeGreaterThan(0);
   });
 
+  it("includes the Charms sigils, and they draw (v1.55.0)", () => {
+    for (const name of ["image", "unlock", "expand"] as const) {
+      expect(SIGIL_NAMES).toContain(name);
+      const { container } = render(() => <Sigil name={name} size={16} />);
+      const svg = container.querySelector("svg")!;
+      expect(svg.getAttribute("width")).toBe("16");
+      expect(svg.querySelectorAll("path, circle, rect").length).toBeGreaterThan(0);
+    }
+  });
+
   it("includes every nav name in the catalog", () => {
     for (const name of ["mixer", "soundboard", "presets", "settings"] as const) {
       expect(SIGIL_NAMES).toContain(name);

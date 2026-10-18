@@ -19,6 +19,7 @@ pub mod system;
 pub mod take_mux;
 pub mod variant;
 pub mod wgc;
+pub mod window;
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, RECT};

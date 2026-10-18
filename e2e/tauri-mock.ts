@@ -11,9 +11,17 @@
 // are lazy-imported and also route through invoke, so this one stub
 // covers everything. Test-side helpers are exposed on `window`:
 //   __E2E_INVOKES__ : Array<{cmd, args}>  — every non-plugin invoke
+//   __E2E_PLUGIN_INVOKES__ : Array<{cmd, args}> — every other plugin call
+//                     (v1.55.0: `plugin:event|emit`, `plugin:window|…`)
 //   __E2E_EMIT__(event, payload)          — fire a backend event
+//
+// v1.55.0: each page also knows which window it is (`metadata`, as Tauri
+// injects it): `overlay` on /overlay.html, `main` everywhere else, so
+// `getCurrentWindow()` works and its calls are recorded with that label.
 
 import { test as base, expect, type Page } from "@playwright/test";
+import wire from "../src/overlay/wire.fixture.json" with { type: "json" };
+import type { OverlayStatus } from "../src/overlay/status";
 
 export const MOCK_INPUTS = [
   { name: "Mock Mic", isDefault: true, defaultSampleRate: 48000, channels: 1 },
@@ -76,6 +84,16 @@ export const MOCK_PRESETS = [
   },
 ];
 
+/** v1.55.0: the overlay's wire samples (src/overlay/wire.fixture.json), the
+ *  same file both unit suites read, so a status built here can't drift
+ *  from the backend's keys. */
+export const OVERLAY_STATUS_SAMPLES = wire.statusSamples as Record<
+  keyof typeof wire.statusSamples,
+  OverlayStatus
+>;
+export const OVERLAY_STATUS_KEYS: readonly string[] = wire.statusKeys;
+export const IMPORTED_ASSET_SAMPLE = wire.importedAssetSample;
+
 export interface MockOptions {
   /** Seed `divora.wizardSeen=true` so the app lands on the Mixer, not the
    *  first-run wizard. Default true; the wizard spec passes false. */
@@ -94,10 +112,18 @@ export async function installTauriMock(
       inputs: unknown;
       outputs: unknown;
       presets: unknown;
+      overlayClosed: object;
+      importedAsset: Record<string, unknown>;
     }) => {
       const invokes: Array<{ cmd: string; args: unknown }> = [];
       (window as unknown as { __E2E_INVOKES__: unknown }).__E2E_INVOKES__ =
         invokes;
+      const pluginInvokes: Array<{ cmd: string; args: unknown }> = [];
+      (
+        window as unknown as { __E2E_PLUGIN_INVOKES__: unknown }
+      ).__E2E_PLUGIN_INVOKES__ = pluginInvokes;
+      // The window this page is, as Tauri names it.
+      const label = location.pathname.endsWith("/overlay.html") ? "overlay" : "main";
 
       const callbacks = new Map<number, (e: unknown) => void>();
       const listeners = new Map<string, number[]>();
@@ -159,6 +185,25 @@ export async function installTauriMock(
       };
       const replaySaved = (saved: Record<string, unknown>): void =>
         emit("replay-saved", { path: null, durationMs: 0, error: null, ...saved });
+
+      // v1.55.0: the stream overlay, as the backend's core reports it. Every
+      // status starts from the fixture's closed sample. The commands answer
+      // as the backend does but never emit `overlay:status` themselves: the
+      // specs send each status with emitOverlayStatus, so every step shows
+      // the page reacting to the one they sent.
+      const overlay = {
+        status: { ...data.overlayClosed, hideAvailable: true } as Record<string, unknown>,
+        windows: 0,
+      };
+      (window as unknown as { __E2E_OVERLAY__: unknown }).__E2E_OVERLAY__ = overlay;
+      const setOverlay = (patch: Record<string, unknown>): Record<string, unknown> => {
+        overlay.status = { ...overlay.status, ...patch };
+        return overlay.status;
+      };
+      const NOT_OPEN = "The overlay isn't open.";
+      const STARTING = "The overlay is still starting. Try again in a moment.";
+      const overlayLive = (): boolean =>
+        overlay.status.open === true && overlay.status.phase !== "closing";
 
       const responses: Record<string, (args: any) => unknown> = {
         list_audio_input_devices: () => data.inputs,
@@ -355,6 +400,72 @@ export async function installTauriMock(
           JSON.stringify(a?.preset ?? {}, null, 2),
         scan_soundboard_folder: () => [],
         play_soundboard_clip: () => 1,
+        // v1.55.0: the stream overlay (STABLE-SURFACE §7). Closed, and this
+        // "PC" can leave it out of captures.
+        overlay_status: () => overlay.status,
+        set_overlay_hide_from_recordings: (a: any) => setOverlay({ hideWanted: a?.enabled === true }),
+        // A new window starts hidden; already open → the current status.
+        open_overlay: (a: any) => {
+          if (overlay.status.open === true) return overlay.status;
+          overlay.windows += 1;
+          return setOverlay({
+            open: true,
+            phase: "starting",
+            instance: overlay.windows,
+            mode: "locked",
+            canArrange: false,
+            fit: a?.rect != null && a?.fit === true,
+            error: null,
+          });
+        },
+        close_overlay: () =>
+          setOverlay({ open: false, phase: "closed", mode: "locked", canArrange: false, fit: false, error: null }),
+        // Placed where asked; the window has painted by the time anyone places it.
+        place_overlay: (a: any) => {
+          if (!overlayLive()) throw NOT_OPEN;
+          return setOverlay({ phase: "painted", canArrange: true, fit: a?.fit === true });
+        },
+        set_overlay_mode: (a: any) => {
+          const m = a?.mode;
+          if (m !== "locked" && m !== "arrange" && m !== "toggle") throw "Unknown overlay mode.";
+          const want = m === "toggle" ? (overlay.status.mode === "arrange" ? "locked" : "arrange") : m;
+          if (want === "locked") return setOverlay({ mode: "locked" });
+          if (!overlayLive()) throw NOT_OPEN;
+          if (overlay.status.canArrange !== true) throw STARTING;
+          if (overlay.status.mode === "arrange") return overlay.status;
+          return setOverlay({ mode: "arrange", arrangeGen: Number(overlay.status.arrangeGen) + 1, error: null });
+        },
+        // Only the overlay page calls these two: a status for its window.
+        overlay_handshake: (a: any) => {
+          if (a?.stage !== "ready" && a?.stage !== "painted") throw "Unknown overlay stage.";
+          return setOverlay({
+            open: true,
+            instance: a.instance,
+            phase: a.stage === "ready" ? "shown" : "painted",
+            canArrange: a.stage === "painted",
+          });
+        },
+        overlay_alive: () => null,
+        import_overlay_asset: () => ({ ...data.importedAsset }),
+        delete_overlay_asset: () => null,
+      };
+      // Plugin calls answer null, except where null would mean something:
+      // the main window's toasts wait while `isVisible()` is false. A spec
+      // can pick a file in the next dialog by setting __E2E_DIALOG_PICK__.
+      const pluginResponses: Record<string, () => unknown> = {
+        "plugin:window|is_visible": () => true,
+        "plugin:dialog|open": () =>
+          (window as unknown as { __E2E_DIALOG_PICK__?: unknown }).__E2E_DIALOG_PICK__ ?? null,
+      };
+      // v1.55.0: a broadcast also goes to the other window when a spec has
+      // linked two pages (linkWindows), as Tauri's event bus would carry it.
+      const relay = (args: unknown): void => {
+        const bridge = (window as unknown as { __E2E_BRIDGE__?: unknown }).__E2E_BRIDGE__;
+        if (typeof bridge !== "function") return;
+        const a = args as { event: string; payload: unknown };
+        Promise.resolve(bridge(a.event, a.payload)).catch(() => {
+          /* the other page is gone */
+        });
       };
 
       const internals = {
@@ -367,8 +478,15 @@ export async function installTauriMock(
             listeners.get(ev)!.push(handlerId);
             return Promise.resolve(nextId++);
           }
-          // Other plugin calls (window/dialog/shell/unlisten/emit): no-op.
-          if (cmd.indexOf("plugin:") === 0) return Promise.resolve(null);
+          // Other plugin calls (window/dialog/shell/unlisten/emit): no-op,
+          // recorded (v1.55.0) so `overlay:edit` emits and window drags can
+          // be asserted.
+          if (cmd.indexOf("plugin:") === 0) {
+            pluginInvokes.push({ cmd, args });
+            if (cmd === "plugin:event|emit") relay(args);
+            const answer = pluginResponses[cmd];
+            return Promise.resolve(answer ? answer() : null);
+          }
 
           invokes.push({ cmd, args });
           const fn = responses[cmd];
@@ -389,13 +507,23 @@ export async function installTauriMock(
         convertFileSrc(p: string) {
           return p;
         },
+        metadata: {
+          currentWindow: { label },
+          currentWebview: { windowLabel: label, label },
+        },
       };
       (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ =
         internals;
 
       (window as unknown as { __E2E_EMIT__: unknown }).__E2E_EMIT__ = emit;
     },
-    { inputs: MOCK_INPUTS, outputs: MOCK_OUTPUTS, presets: MOCK_PRESETS },
+    {
+      inputs: MOCK_INPUTS,
+      outputs: MOCK_OUTPUTS,
+      presets: MOCK_PRESETS,
+      overlayClosed: OVERLAY_STATUS_SAMPLES.closed,
+      importedAsset: IMPORTED_ASSET_SAMPLE,
+    },
   );
 
   // 2) Seed localStorage MERGE-IF-ABSENT so we don't clobber app-persisted
@@ -442,6 +570,93 @@ export async function emitReplaySaved(
       window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
     ).__E2E_EMIT__("replay-saved", { path: null, durationMs: 0, error: null, ...s });
   }, saved);
+}
+
+/** v1.55.0: move the mock's overlay status to `partial` (over its current
+ *  status, which starts as the fixture's closed sample) and fire
+ *  `overlay:status`, as the backend does on every change. The commands read
+ *  the same status, so a later call answers for it. A key the wire doesn't
+ *  have is refused, so a typo can't pass for a field. */
+export async function emitOverlayStatus(
+  page: Page,
+  partial: Partial<OverlayStatus>,
+): Promise<OverlayStatus> {
+  const unknown = Object.keys(partial).filter((k) => !OVERLAY_STATUS_KEYS.includes(k));
+  if (unknown.length > 0) throw new Error(`not OverlayStatus keys: ${unknown.join(", ")}`);
+  return page.evaluate((p) => {
+    const w = window as unknown as {
+      __E2E_OVERLAY__: { status: Record<string, unknown> };
+      __E2E_EMIT__: (e: string, payload: unknown) => void;
+    };
+    w.__E2E_OVERLAY__.status = { ...w.__E2E_OVERLAY__.status, ...p };
+    w.__E2E_EMIT__("overlay:status", w.__E2E_OVERLAY__.status);
+    return w.__E2E_OVERLAY__.status as unknown as OverlayStatus;
+  }, partial);
+}
+
+/** The app commands invoked so far, with their args (`__E2E_INVOKES__`),
+ *  optionally only `cmd`. */
+export function invokesOf(
+  page: Page,
+  cmd?: string,
+): Promise<Array<{ cmd: string; args: Record<string, unknown> }>> {
+  return page.evaluate(
+    (c) =>
+      (
+        window as unknown as {
+          __E2E_INVOKES__: Array<{ cmd: string; args: Record<string, unknown> }>;
+        }
+      ).__E2E_INVOKES__
+        .filter((i) => c === null || i.cmd === c)
+        .map((i) => ({ cmd: i.cmd, args: i.args ?? {} })),
+    cmd ?? null,
+  );
+}
+
+/** v1.55.0: the plugin calls made so far (`__E2E_PLUGIN_INVOKES__`),
+ *  optionally only `cmd`. */
+export function pluginInvokesOf(
+  page: Page,
+  cmd?: string,
+): Promise<Array<{ cmd: string; args: Record<string, unknown> }>> {
+  return page.evaluate(
+    (c) =>
+      (
+        window as unknown as {
+          __E2E_PLUGIN_INVOKES__: Array<{ cmd: string; args: Record<string, unknown> }>;
+        }
+      ).__E2E_PLUGIN_INVOKES__
+        .filter((i) => c === null || i.cmd === c)
+        .map((i) => ({ cmd: i.cmd, args: i.args ?? {} })),
+    cmd ?? null,
+  );
+}
+
+/** v1.55.0: the payloads this page emitted on `event` (`plugin:event|emit`). */
+export async function emitsOf(page: Page, event: string): Promise<unknown[]> {
+  return (await pluginInvokesOf(page, "plugin:event|emit"))
+    .filter((i) => i.args.event === event)
+    .map((i) => i.args.payload);
+}
+
+/** v1.55.0: carry each page's broadcasts (`emit`) to the other, as the event
+ *  bus carries them between the main window and the overlay. Call before
+ *  either page loads. An event sent before the other page is listening is
+ *  lost, as it would be. */
+export async function linkWindows(a: Page, b: Page): Promise<void> {
+  const relayTo = (to: Page) => async (event: string, payload: unknown) => {
+    await to
+      .evaluate(
+        ([e, p]) => {
+          const w = window as unknown as { __E2E_EMIT__?: (e: string, p: unknown) => void };
+          w.__E2E_EMIT__?.(e as string, p);
+        },
+        [event, payload] as const,
+      )
+      .catch(() => undefined);
+  };
+  await a.exposeFunction("__E2E_BRIDGE__", relayTo(b));
+  await b.exposeFunction("__E2E_BRIDGE__", relayTo(a));
 }
 
 /** Playwright `test` with the Tauri mock auto-installed and a

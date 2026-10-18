@@ -39,7 +39,8 @@ use divora_capture::{
 };
 use divora_core::audio::{AudioEngine, AvChunk, StreamInfo};
 
-use crate::replay::{take_check, EngineWatch, SharedSettings, Slot, SLOT_WAIT};
+use crate::overlay_windows::CaptureCleared;
+use crate::replay::{take_check, EngineWatch, ReplayState, SharedSettings, Slot, SLOT_WAIT};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -763,6 +764,21 @@ struct Shared {
     replay: replay_ops::ReplayShared,
 }
 
+/// v1.55.0: whether anything captures the screen — a take in any phase, or
+/// Replay in any state but Off (held included). The overlay's Hide from
+/// recordings asks Windows to leave it out only while this is true.
+#[doc(hidden)]
+#[must_use]
+pub fn capture_active(phase: Phase, replay: ReplayState) -> bool {
+    phase != Phase::Idle || replay.is_on()
+}
+
+/// v1.55.0: tell the overlay whether anything captures now. Under the lock,
+/// after every take's end and every Replay change. Private, as `Shared` is.
+fn note_capture(app: &AppHandle, s: &Shared) {
+    crate::overlay_windows::capture_changed(app, capture_active(s.phase, s.replay.state));
+}
+
 /// The app's screen recorder. One take at a time.
 #[derive(Debug, Default)]
 pub struct ScreenRecorder {
@@ -878,11 +894,15 @@ impl ScreenRecorder {
         s.spawning = direct;
         drop(s);
 
+        // v1.55.0: the overlay hides first, if it should, before either path
+        // can capture: the feed both consume needs its token. Never under
+        // the lock — it may wait for the main thread.
+        let cleared = crate::overlay_windows::before_capture(app);
         // Desktop audio, if asked for. Opened here, before the take's own
         // thread, so its time to open never counts against the first frame;
         // and never a reason to fail the take — without it, the take goes on
         // as v1.52.0 recorded it, saying why.
-        let (feed, desk, opened) = match self.open_feed(app, engine, &req, true) {
+        let (feed, desk, opened) = match self.open_feed(&cleared, app, engine, &req, true) {
             Ok(f) => f,
             Err(why) => {
                 if direct {
@@ -973,9 +993,11 @@ impl ScreenRecorder {
     /// The engine's tap and, if asked for, the desktop audio, as a feed for
     /// a take or a pipeline; for a take (`publish`), the desktop source goes
     /// out at once. `Err` when the engine isn't running. Returns whether the
-    /// desktop audio opened.
+    /// desktop audio opened. v1.55.0: only after the overlay was asked to
+    /// hide (`_cleared`).
     fn open_feed(
         &self,
+        _cleared: &CaptureCleared,
         app: &AppHandle,
         engine: &Arc<AudioEngine>,
         req: &StartRequest,
@@ -1201,6 +1223,7 @@ impl ScreenRecorder {
             return;
         }
         s.phase = s.phase.next(Input::Finished).unwrap_or(Phase::Idle);
+        note_capture(app, &s);
         s.stop = None;
         s.pipeline_take = false;
         let error = outcome.as_ref().err().cloned();
@@ -2182,6 +2205,90 @@ mod tests {
         assert!(
             out2[0].frames.iter().all(|&s| s == 0.0),
             "muted audio still sounds"
+        );
+    }
+
+    /// v1.55.0: every take phase against every Replay state, as the design's
+    /// table has it (columns Off, Arming, Armed, Held for any reason).
+    #[test]
+    fn capture_active_for_each_state() {
+        use super::capture_active;
+        use crate::replay::ReplayState::{self, Armed, Arming, Held, Off};
+        use divora_capture::HeldReason::{EncoderFailed, EngineStopped, ScreenLost};
+        use Phase::{Idle, Recording, Starting, Stopping};
+        let table = |p: Phase, r: ReplayState| -> bool {
+            let row = match p {
+                Idle => [false, true, true, true],
+                Starting | Recording | Stopping => [true, true, true, true],
+            };
+            // Exhaustive: a new Replay state or hold reason must join it.
+            row[match r {
+                Off => 0,
+                Arming => 1,
+                Armed => 2,
+                Held(EngineStopped | ScreenLost | EncoderFailed) => 3,
+            }]
+        };
+        for p in [Idle, Starting, Recording, Stopping] {
+            for r in [
+                Off,
+                Arming,
+                Armed,
+                Held(EngineStopped),
+                Held(ScreenLost),
+                Held(EncoderFailed),
+            ] {
+                assert_eq!(capture_active(p, r), table(p, r), "{p:?} with Replay {r:?}");
+            }
+        }
+        // In words: only no take and Replay off captures nothing, and a
+        // held Replay still counts, so the overlay stays hidden while held.
+        assert!(!capture_active(Idle, Off));
+        assert!(capture_active(Idle, Held(EngineStopped)));
+    }
+
+    /// v1.55.0: the two capture hooks the compiler can't see. The start side
+    /// is checked by `CaptureCleared` (`open_feed` won't build without the
+    /// token `before_capture` makes); a take's end and Replay's changes have
+    /// no such token, so this reads the source. It is a grep, the honest
+    /// limit without a display and Windows' capture in CI.
+    ///
+    /// Every needle is built with `concat!`, so this function's own text
+    /// never matches one.
+    #[test]
+    fn capture_hooks_are_in_place() {
+        // From `from` to the next `to`. The ends are found by their indent,
+        // so either line ending reads the same.
+        fn cut<'a>(src: &'a str, from: &str, to: &str) -> &'a str {
+            let rest = &src[src.find(from).unwrap_or_else(|| panic!("no {from}"))..];
+            let end = rest.find(to).unwrap_or_else(|| panic!("no {to:?}"));
+            &rest[..end]
+        }
+        let note = concat!("note_", "capture(");
+        // `finish` is the last method of its impl: it ends at the first
+        // closing brace indented by four.
+        let finish = cut(
+            include_str!("screen.rs"),
+            concat!("fn fin", "ish("),
+            "\n    }",
+        );
+        let moved = finish
+            .find(concat!("Input::", "Finished"))
+            .expect("finish moves the take's phase");
+        let noted = finish.find(note).expect("finish must tell the overlay");
+        assert!(
+            noted > moved,
+            "finish must tell the overlay after the phase moves"
+        );
+        // `publish` (not `publish_replay`), to its closing brace.
+        let publish = cut(
+            include_str!("screen/replay_ops.rs"),
+            concat!("fn pub", "lish("),
+            "\n}",
+        );
+        assert!(
+            publish.contains(note),
+            "every Replay change must tell the overlay"
         );
     }
 }

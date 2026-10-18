@@ -24,7 +24,12 @@ accidental break fails CI before it ships:
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - `ScreenRecordingUpdate` / `CaptureStatusDto` / `MonitorDto` / `DesktopSourceDto` keys and the `DivoraPlays` strings — `src-tauri/src/screen.rs` (`wire_keys_are_frozen`; v1.52.0, v1.53.0).
 - `ReplayStatus` / `ReplayArmed` / `ReplaySaved` / `ReplayMemory` / `ReplayLength` keys and the state and held-reason strings — `src-tauri/src/replay.rs` (`replay_wire_keys_are_frozen`; v1.54.0).
-- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0).
+- `OverlayStatus` keys and the phase/mode strings — `src/overlay/wire.fixture.json`, read by `src-tauri/src/overlay_machine.rs` (`wire_fixture_matches_rust`) and `src/overlay/status.test.ts`; v1.55.0.
+- `ImportedAsset` keys — the same fixture, `src-tauri/src/overlay_assets.rs` (`imported_asset_wire_keys_are_frozen`; v1.55.0).
+- The `overlay:*` event names and the overlay page's three command names — the same fixture, read by `src/overlay/state.test.ts` and `status.test.ts`; `wire_fixture_matches_rust` checks the `overlay:status` name and parses the `mode` / `stage` strings (v1.55.0).
+- The overlay window's label and title and the tray's Lock id — `src-tauri/src/overlay_machine.rs` (`title_and_label_are_the_obs_contract`); every tray menu id, label and their order — `src-tauri/src/lib.rs` (`tray_entries_for_each_combination`; v1.55.0).
+- `divora.overlayScene`'s read and write rules (unknown keys, types and `src` values kept; nothing truncated) — `src/overlay/scene.test.ts` (v1.55.0).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -215,6 +220,63 @@ explainer has been seen. The tray has no item that turns Replay on.
 | `sb:<clipId>` | play one soundboard tile (prefix reserved) |
 | `rec:<recorder>` | start / stop a recorder (prefix reserved) — v1.52.0. Defined: `rec:screen` (the screen recorder), `rec:wav` (the WAV recorder). Both unbound by default |
 | `replay:<action>` | Replay (prefix reserved) — v1.54.0. Defined: `replay:save` (save the replay), `replay:toggle` (turn Replay on / off; it works once Replay has been turned on from the Record screen card). Both unbound by default |
+| `overlay:<action>` | the stream overlay (prefix reserved) — v1.55.0. Defined: `overlay:arrange`, which switches the open overlay between Arrange and Locked. It is acted on by the backend when pressed; the frontend only shows a notice while the overlay is off or starting. Unbound by default. A different namespace from the `overlay:state` / `overlay:*` **event** names, despite the shared spelling |
+
+### Stream overlay (v1.55.0)
+
+All `async`: Tauri 2 runs a sync command on the main thread, which both
+windows share, and building a window from one deadlocks on Windows. The
+backend creates, places and shows the overlay window and owns its mode; main
+says where it goes and owns the scene (`divora.overlayScene`).
+
+| Command | Args (camelCase) | Returns | Errors (exact) |
+|---|---|---|---|
+| `open_overlay` | `rect?: {x, y, width, height} \| null` (physical px, whole numbers: `x` and `y` an i32, `width` and `height` a u32; absent, `null`, or a width or height of 0 or over 32768 → Windows' default spot), `fit?: boolean` | `OverlayStatus` | `"Couldn't open the overlay window: {e}"`; `"The overlay is still closing. Try again in a moment."` (still closing after a 2 s wait); ``"invalid args `rect` for command `open_overlay`: {e}"`` (Tauri's own, before anything else: a field of `rect` missing, fractional or out of its type's range, such as a negative width). Already open or opening → the current status, nothing moved. Opens Locked |
+| `close_overlay` | — | `OverlayStatus` | none (closed → no-op) |
+| `place_overlay` | `rect: {x, y, width, height}` (physical px, typed as for `open_overlay`; a width or height of 0 or over 32768 → nothing moves and `fit` is ignored), `fit?: boolean` | `OverlayStatus` | ``"invalid args `rect` for command `place_overlay`: {e}"`` (Tauri's own, first, as for `open_overlay`); `"The overlay isn't open."` (closed or closing); `"The overlay is still starting. Try again in a moment."` (while the window is being built). Checked before the window is touched |
+| `set_overlay_mode` | `mode: "locked" \| "arrange" \| "toggle"` | `OverlayStatus` | `"The overlay isn't open."` (arrange/toggle-to-arrange while closed or closing); `"The overlay is still starting. Try again in a moment."` (before painted); `"Unknown overlay mode."`. `"locked"` never fails |
+| `set_overlay_hide_from_recordings` | `enabled: boolean` | `OverlayStatus` | none |
+| `overlay_status` | — | `OverlayStatus` | none. Main's adoption read after a reload |
+| `overlay_handshake` | `instance: number`, `stage: "ready" \| "painted"` | `OverlayStatus` | `"Unknown overlay stage."`. Another instance's call → the status, nothing changed |
+| `overlay_alive` | `instance: number`, `gen: number` | `null` | none. A stale beat is ignored. Emits nothing |
+| `import_overlay_asset` | `path: string` | `ImportedAsset` | the refusals below |
+| `delete_overlay_asset` | `id: string` | `null` | `"That isn't a charm picture."` (not an asset id); `"Couldn't remove the picture: {e}"`. Missing file → ok |
+
+`overlay_handshake` and `overlay_alive` are called only by the overlay page.
+`fit` (default false) says main sized `rect` to a whole monitor: the window
+is then not resizable, and `OverlayStatus.fit` reports it. The
+`overlay:arrange` hotkey and the tray's **Lock the overlay** item change
+the mode without a command, as `set_overlay_mode` would with `"toggle"` and
+`"locked"`.
+
+Rules for `import_overlay_asset`. Any regular file the user can read is
+accepted, as for `import_preset`; its type comes from its first bytes, never
+its name. Each refusal, in its exact words:
+
+- not a file, or empty: "That isn't a picture file."
+- over 50 MB (50,000,000 bytes): "That picture is over 50 MB. Pick a smaller one."
+- not PNG, JPEG, GIF or WebP (APNG is PNG): "Divora can add PNG, JPEG, GIF and WebP pictures. That file isn't one."
+- a JPEG whose first SOF marker isn't SOF0, SOF1 or SOF2 with 8-bit precision (baseline, extended sequential or progressive): "Divora can't show that kind of JPEG. Save it as a regular JPEG or a PNG and try again."
+- a header that can't be read, or a zero side: "That picture looks damaged, so Divora can't add it."
+- over 8192 px a side or 16,777,216 px: "That picture is too big (over 16 megapixels or 8192 pixels on a side). Make it smaller and try again."
+- animated and over 4,194,304 px: "That animated picture is too big (over 4 megapixels). Make it smaller and try again."
+- the file can't be read, or the copy can't be written: "Couldn't read that picture: {e}" / "Couldn't save the picture: {e}"
+
+The size checked is the size as displayed: for a JPEG, after its EXIF
+orientation; for a GIF, its logical screen grown to hold its first frame. The
+destination name is derived from the content, never from the path. Same file
+twice → same id, written once; a damaged stored copy is rewritten. A picture
+over 20 MB, or an animated one over 2,097,152 px, is still added, with
+`warning` set.
+
+Capabilities don't restrict app commands (there is no app ACL manifest): the
+overlay window can call every command in this section, and every other one.
+It relies on `set_overlay_mode`, `overlay_handshake` and `overlay_alive`, and
+must be granted them if an app manifest is ever added. Its own capability,
+`src-tauri/capabilities/overlay.json`, grants only event listen / unlisten /
+emit / emit-to and dragging its window; `default.json` now covers `main`
+alone and no longer grants creating webview windows or setting a window's
+position or size, which the backend does.
 
 ### MIDI control surfaces (v1.9.0)
 
@@ -236,7 +298,10 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
 | `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0) |
-| `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3) |
+| `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3). v1.55.0: main also re-pushes the scene on it, with `ack` null, and the overlay listens for `overlay:scene` and `overlay:status` before sending it. The backend learns ready through `overlay_handshake`, not this event |
+| `overlay:status` | `OverlayStatus` | backend → all windows, on every change of any field — v1.55.0. The same shape is returned by every command in §1 "Stream overlay" except `overlay_alive` and the two asset commands |
+| `overlay:scene` | `ScenePush` | main → overlay window, while it is open: on every scene change, on each edit main acknowledges (changed or not), and on each `overlay:ready` — v1.55.0 |
+| `overlay:edit` | `SceneEdit` | overlay window → all (heard by main): on pointerup of a gesture that changed something; 300 ms after the last arrow nudge or keyboard resize (sooner when another editing key, a press, losing focus or Lock comes first); on Delete; on `[` `]` `{` `}` — v1.55.0 |
 | `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
 | `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise — also while only Replay runs |
@@ -337,6 +402,76 @@ ReplaySaved       { path (nullable), durationMs, error (nullable) }  // v1.54.0
 ReplayMemory      { ceilingBytes, lengths: ReplayLength[] }          // v1.54.0
 ReplayLength      { seconds, bytes (the estimate), capBytes (the most it
                     may hold: the figure shown), allowed }           // v1.54.0
+OverlayState      { chain, status, motion, mystical, mood, accent, theme,
+                    bg: "transparent" | "green" | "magenta" }        // v1.16.0
+OverlayStatus     { open (any phase but closed),
+                    phase: "closed" | "starting" | "shown" | "painted"
+                      | "closing",           // a window being built reads as starting
+                    instance (the current or last window's number; 0 before
+                      any),
+                    mode: "locked" | "arrange",
+                    arrangeGen (bumped on every entry to Arrange; the page
+                      echoes it in overlay_alive),
+                    canArrange (phase is painted),
+                    fit (the window was placed fitted to its monitor),
+                    hideWanted (the Hide from recordings switch, as the
+                      backend holds it),
+                    hideAvailable (Windows can leave a window out of
+                      captures on this PC),
+                    capturing (a take in any phase, or Replay in any state
+                      but off),
+                    error (nullable: why the watchdog closed this window,
+                      or why the lease ended Arrange; null again once the
+                      window is gone, and the lease's at the next
+                      Arrange) }                                     // v1.55.0
+ScenePush         { session (new at each main-window load), revision
+                      (bumped on every scene change),
+                    scene: OverlayScene,
+                    ack (nullable: { instance, seq } — the overlay's latest
+                      edit this push includes),
+                    expectViewport (nullable: { w, h } — set only by a Fit
+                      change: keep drawing the previous scene until the
+                      viewport is this size, for at most 1 s) }      // v1.55.0
+SceneEdit         { instance (OverlayStatus.instance), seq (this window's
+                      edits numbered from 0, in the order sent),
+                    op: SceneOp }                                    // v1.55.0
+SceneOp           { kind: "add", element (a "spellcircle" or "image"
+                      element, as in OverlayScene) }
+                  | { kind: "remove", id }
+                  | { kind: "place", id, rect: { x, y, w, h }, viewport: { w, h } }
+                  | { kind: "order", id, to: "front" | "back" | "forward" | "backward" }
+                  | { kind: "reframe", from: { x, y, w, h }, to: { x, y, w, h },
+                      frame: "window" | "monitor" }                  // v1.55.0
+                  // CSS px. The overlay may send only remove, place and order;
+                  // main ignores any other edit, and one it can't read
+ImportedAsset     { id (the stored file's name: the first 16 hex digits of
+                      the content's SHA-256, a dot, and png | jpg | gif |
+                      webp by the content),
+                    width, height (as displayed, in the picture's own
+                      pixels), bytes (the file's size),
+                    animated (a GIF with a second frame, an APNG, or a WebP
+                      with its animation flag; a GIF or PNG that can't be
+                      read far enough to tell counts as animated),
+                    warning (nullable: words for a picture over 20 MB, or an
+                      animated one over 2,097,152 px) }              // v1.55.0
+OverlayRect       { x, y, width, height }   // physical px; an argument only; v1.55.0
+OverlayScene      { version, designSize: { w, h }, frame,
+                    elements: SceneElement[] }                       // v1.55.0
+// version: an integer ≥ 1 (else read as 1), written as max(stored, 1); a larger value is read with the v1 rules
+// designSize: CSS px, each side finite and 1..16384, else { 480, 480 }
+// frame: "window" | "monitor"; missing or unknown reads as "window" and is kept until a reframe
+// elements: never truncated; not an array → the default elements (the circle, centred, at most 440 px)
+// SceneElement: { id, type, x, y, w, h, z }, plus { src, nw, nh, anim, bytes, name } for "image"
+// id: an entry that isn't an object, or has no non-empty string id, is dropped; a later duplicate is dropped; nothing else is
+// type: "spellcircle" (the first usable one is shown), "image", or anything else (kept verbatim, not shown)
+// shown: an id of 1..64 characters and usable x/y/w/h, and for "image" a valid src; everything else is kept, not shown
+// x/y/w/h: fractions of designSize, never clamped on read; usable when all four are finite and w, h > 0
+// z: finite, else its array index (computed, not written)
+// src: an asset id matching ^[0-9a-f]{16}\.(png|jpg|gif|webp)$, never a path or URL; anything else keeps the image, unshown
+// nw/nh: the picture's own pixels; integers ≥ 1, else the aspect comes from the stored w·designSize.w / h·designSize.h
+// anim: boolean (anything else → src ends in .gif); bytes: the file's size (missing or not positive → 0); both only for the scene budget
+// name: shown cut to 120 characters, "Picture" when missing or blank (computed, not written)
+// any other key, at any level: kept and written back unchanged
 ```
 
 **`StreamInfo` notes.**
@@ -380,6 +515,26 @@ ReplayLength      { seconds, bytes (the estimate), capBytes (the most it
 - Every metric field is always a finite number. A silent window is −∞ dBFS
   internally, which JSON cannot carry, so the bridge floors it (−120 dBFS)
   rather than emitting `null`.
+
+**`OverlayStatus` notes (v1.55.0).**
+
+- Every change goes out as `overlay:status`, and a command's answer can
+  arrive after events that followed it (a close answers "closing" after
+  "closed" has arrived). Main applies a command's answer only when no
+  `overlay:status` event arrived while the call was in flight.
+- The overlay page ignores a status whose `instance` isn't its own.
+- The frontend reads a status with every key checked, and ignores keys a
+  later version adds.
+- Main toasts each new `error` as given. It is "The overlay window didn't
+  start, so Divora closed it. Try turning it on again." (the watchdog: no
+  ready handshake 10 s after the window was built); "The overlay didn't
+  respond, so it stayed locked." (the Arrange lease: three 1 s ticks without
+  the page's first beat); or "The overlay stopped responding, so Divora
+  locked it. Turn it off and on again if it looks wrong." (three ticks
+  without a beat after one).
+- No key says whether Hide from recordings is in effect: Windows doesn't say
+  whether a capture honours it, so `hideWanted` is the request and nothing
+  more.
 
 `EffectKindWire` (frozen set; new kinds may be **added** after v1.0):
 
@@ -442,7 +597,7 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
-| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound). Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super" |
 | `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
 | `divora.tileGains` | per-tile soundboard gain |
@@ -453,7 +608,8 @@ to defaults (never throw).
 | `divora.updateCheckEnabled` | opt-out for the in-app update check (default true) — v1.12.0 |
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
-| `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0; plus the window's last place, all optional (`x`, `y`, `w`, `h` in physical pixels, `monitor` name, `scale` factor) — v1.51.3. A `{ bg }`-only blob still loads, and unknown keys are kept on save |
+| `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0; plus the window's last place, all optional (`x`, `y`, `w`, `h` in physical pixels, `monitor` name, `scale` factor) — v1.51.3. A `{ bg }`-only blob still loads, and unknown keys are kept on save; plus `fit` and `hideFromRecordings` (booleans, off unless stored as `true`; `fit` counts only with the Transparent background, so a stored `fit` with Green or Magenta reads as off) — v1.55.0. While the window is fitted, the place keys keep its last unfitted place. `hideFromRecordings` is sent to the backend each time the main window loads; the backend doesn't save it |
+| `divora.overlayScene` | `{version, designSize, frame, elements[]}` — v1.55.0, the first versioned key. Each field falls back on its own (see `OverlayScene` in §3). Absent or unreadable, the scene is made from `divora.overlay`'s last window size (the circle centred, at most 440 CSS px) and first written when the overlay is next seen open (opened, or adopted after a main-window reload) or a charm is first added or removed, whichever comes first. Every stored element is kept and written back, including ones this version can't show (an unknown `type`, an unrecognised `src`, a second circle, unusable geometry); only an entry without an id and a later duplicate id are dropped. Caps apply when adding, never when reading: 64 elements, 16 shown pictures, one circle, and a budget over the distinct pictures of 200 MB of files, 16,777,216 animated px and 67,108,864 px in all. A picture file is kept while any string anywhere in the scene names it. `src` holds an asset id, never a path or URL; `version` is never lowered on write. **Never the mode**: the overlay opens Locked at every launch |
 | `divora.ttsVoice` | selected "Speak" voice id (or null) — v1.17.0: a preset id, a cloned id (v1.20.0), or a Critter Chatter `babble:*` id (v1.50.0) |
 | `divora.ttsVolume` | "Speak" playback volume (linear 0..2) — v1.18.0 |
 | `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
@@ -502,6 +658,19 @@ recordings/divora-replay-<date>_<time>.mp4   a saved replay — v1.54.0: the vid
                          renamed when finished; a failed or cancelled save
                          removes the `.part`, and one refused for disk space
                          writes nothing
+overlay/assets/<16 hex>.<png|jpg|gif|webp>   charm pictures — v1.55.0: copied in by
+                         `import_overlay_asset`, named by the first 16 hex digits
+                         of their content's SHA-256 and the type their first bytes
+                         name, written as a temp file, synced and renamed; removed
+                         when no string in `divora.overlayScene` names them. Files
+                         left behind (e.g. after clearing app storage, or a delete
+                         that failed) are harmless. Only the overlay window can
+                         load them. `tauri dev` builds use `overlay/assets-dev/`
+                         (a `tauri build --debug` build uses `overlay/assets/`)
+overlay/.import-<pid>-<nanos>.part   temporary file written while a picture is
+                         imported — v1.55.0; renamed into the pictures' folder when
+                         complete and removed if the import fails. One left behind
+                         by a crash is incomplete and safe to delete
 ```
 
 Installer-bundled, read-only, next to the executable's resource dir:
@@ -510,3 +679,32 @@ Installer-bundled, read-only, next to the executable's resource dir:
 onnxruntime.dll          ONNX runtime (also locatable via ORT_DYLIB_PATH)
 voices/<id>.onnx         shipped voice models (shadowed by a same-id user file)
 ```
+
+---
+
+## 7. Windows and tray
+
+Other programs, and the app's own code, find a window or a tray item by
+these names. Labels, titles and ids are added, never renamed.
+
+**Windows** (v1.55.0):
+
+| Label | Title | Why frozen |
+|---|---|---|
+| `overlay` | `DivoraVoice Overlay` | OBS Window Capture sources match the title. `getByLabel("overlay")` and the capability use the label |
+
+The backend builds the `overlay` window (`open_overlay`), one at a time.
+
+**Tray menu ids** (v1.55.0; the Replay ones backfilled from v1.54.0), in
+menu order:
+
+| Id | Label | Shown |
+|---|---|---|
+| `show` | Show DivoraVoice | always |
+| `replay-save` | Save replay | while Replay is on (arming or armed) or held (v1.54.0) |
+| `replay-off` | Turn Replay off | while Replay is on (arming or armed) or held (v1.54.0) |
+| `overlay-lock` | Lock the overlay | while the overlay is in Arrange (v1.55.0) |
+| `quit` | Quit | always |
+
+Each optional group is set off by separators. The tray has no item that
+turns Replay on or starts Arrange.

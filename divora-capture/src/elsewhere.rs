@@ -19,6 +19,12 @@ use std::sync::Arc;
 /// See the Windows build's.
 pub const PRETEND_FREE_ENV: &str = "DIVORA_PRETEND_FREE_BYTES";
 
+/// See the Windows build's.
+pub const PRETEND_NO_CAPTURE_EXCLUSION_ENV: &str = "DIVORA_PRETEND_NO_CAPTURE_EXCLUSION";
+
+/// See the Windows build's.
+pub const MIN_CONTRACT: u16 = 10;
+
 const WINDOWS_ONLY: &str = "Screen recording is only available on Windows.";
 
 #[must_use]
@@ -104,4 +110,52 @@ pub fn local_time() -> LocalTime {
         day: 1,
         ..LocalTime::default()
     }
+}
+
+// v1.55.0: the stream overlay's window calls. There is no overlay window
+// here to mark, protect or focus.
+
+/// Nothing to mark.
+#[must_use]
+pub fn mark_non_rude(_window: isize) -> bool {
+    false
+}
+
+/// Nothing to unmark.
+pub fn unmark_non_rude(_window: isize) {}
+
+/// Nothing can be left out of a capture here.
+#[must_use]
+pub fn capture_exclusion_available() -> bool {
+    false
+}
+
+/// Unknown here.
+#[must_use]
+pub fn display_affinity(_window: isize) -> Option<u32> {
+    None
+}
+
+/// No window.
+#[must_use]
+pub fn foreground_window() -> isize {
+    0
+}
+
+/// Never.
+#[must_use]
+pub fn try_foreground(_window: isize) -> bool {
+    false
+}
+
+/// Never.
+#[must_use]
+pub fn can_take_foreground(_window: isize) -> bool {
+    false
+}
+
+/// Never.
+#[must_use]
+pub fn make_layered_opaque(_window: isize) -> bool {
+    false
 }

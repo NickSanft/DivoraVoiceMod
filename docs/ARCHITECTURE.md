@@ -546,7 +546,7 @@ And rejects unrelated devices (`Blue Yeti X`, `HyperX Cloud II`, `Realtek HD Aud
 GlobalShortcutEvent { id, accelerator, state }  // state: "pressed" | "released"
 ```
 
-Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor`, the reserved prefixes `sb:`, `rec:` and `replay:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray:
+Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor`, the reserved prefixes `sb:`, `rec:`, `replay:` and `overlay:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. One id is acted on before it gets there (v1.55.0): `global_shortcut_handler` hands every event to `overlay_windows::hotkey` before it emits it, and a press of `overlay:arrange` switches the open overlay between Arrange and Locked in Rust, inside `WM_HOTKEY` (see "Stream overlay window"). Its JavaScript branch never calls `set_overlay_mode`, which would toggle the press twice. The routes:
 
 ```
 event.id         | event.state | action
@@ -561,6 +561,11 @@ event.id         | event.state | action
 "replay:toggle"  | "pressed"   | toggleReplay() — refused with a toast
                  |             | until Replay has been turned on from
                  |             | the card once                (v1.54.0)
+"overlay:arrange"| "pressed"   | noteOverlayHotkey() — a toast only, while
+                 |             | the overlay is off or starting; the
+                 |             | backend already toggled the mode
+                 |             | (global_shortcut_handler →
+                 |             | overlay_windows::hotkey)     (v1.55.0)
 "sb:<clipId>"    | "pressed"   | playTileById(clipId)
 ```
 
@@ -568,7 +573,7 @@ event.id         | event.state | action
 
 **Persistence (v1.51.4).**
 
-- **What is saved:** the `ptm` / `panic` / `monitor` bindings, in `divora.hotkeyBindings`. They are read back through `readHotkeyBindings` (`src/data/hotkeys.ts`), which keeps only the known actions and only string values. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
+- **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), and `overlay:arrange` (v1.55.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
 - **The Windows key:** the capture component labels it "Win", but the parser behind `register_global_shortcut` (global-hotkey 0.8.0) accepts only `Super` / `Cmd` / `Command`. `keysToAccelerator` and `normalizeAccelerator` turn "Win" into "Super" for every accelerator handed to the backend: the three actions, and soundboard tiles, including ones saved before the fix. `acceleratorToKeys` shows "Super" as "Win" again.
 
 ### Why two PTM listeners?
@@ -1174,81 +1179,572 @@ see the [CHANGELOG](../CHANGELOG.md) for the blow-by-blow:
   Commands `set_loudness_enabled` / `set_loudness_target`; a
   `loudnessGainDb` field on the `audio-levels` event drives the readout.
 
-## Stream overlay window (v1.16.0; window fixes v1.51.3)
+## Stream overlay window (v1.16.0; window fixes v1.51.3; Charms v1.55.0)
 
-The overlay is a second `WebviewWindow` labelled `overlay`, created on demand
-by the store (`openOverlay` in `src/stores/app.tsx`) and loaded from a second
-Vite entry (`overlay.html` → `src/overlay.tsx`, `rollupOptions.input` in
-`vite.config.ts`). It renders only the `SpellCircle`. It has no store and no
-engine of its own.
+The overlay is a second `WebviewWindow` labelled `overlay` and titled
+"DivoraVoice Overlay", the title OBS Window Capture sources match
+(`title_and_label_are_the_obs_contract`). Since v1.55.0 the backend makes it:
+`open_overlay` builds it, shows it once its page says it is listening, and
+owns its mode. Main still decides where it goes and owns what it shows. The
+page is a second Vite entry (`overlay.html` → `src/overlay.tsx`,
+`rollupOptions.input` in `vite.config.ts`), loaded as
+`overlay.html?instance=<n>`. It draws the **scene** — the spell circle and the
+pictures and GIFs the user adds, together the **charms** — through `Stage`
+(`src/overlay/Stage.tsx`). It has no store and no engine of its own. The plan,
+and what changed from it, are in
+[`research/stream-studio.md`](research/stream-studio.md) (v1.55.0, "As
+built").
+
+Three Rust modules split the backend's part:
+
+- **`overlay_machine.rs`** (pure): `OverlayCore`, the lifecycle and mode
+  machine. Every input — the commands, the page's handshake and beats, the
+  watchdog, the lease, the hotkey, the recorder — goes through
+  `OverlayCore::step` and comes back as `Effect`s. It also holds the
+  protection rule, the setter order and the small focus and affinity tables.
+  Nothing in it touches a window, so all of it is tested on any machine.
+- **`overlay_windows.rs`** (the shell): runs the effects on the real window —
+  build, place, show, close, click-through, protection, focus — and runs the
+  watchdog, the lease and the recorder's hooks.
+- **`overlay_assets.rs`**: picture import and delete, and the `charm` scheme
+  that serves the pictures.
+
+Main's side is `src/overlay/controller.ts`, which replaced the overlay block
+`src/stores/app.tsx` carried since v1.16.0. Its dependencies are injected, so
+the tests drive the real controller. The pure maths is in `scene.ts`,
+`frame.ts`, `mirror.ts` and `editor.ts`.
 
 ### Window
 
-Created with:
+`build_window` (`overlay_windows.rs`) builds it with:
 
-- **Frameless and transparent:** `transparent`, `decorations: false`, and
-  `shadow: false`. An undecorated transparent window keeps a 1 px border while
-  its shadow is on (tauri #8308).
-- **On top, not on the taskbar:** `alwaysOnTop`, `skipTaskbar`.
-- **Resizable but not maximisable:** `resizable`, `maximizable: false`.
-- **Hidden and unfocused:** `visible: false`, `focus: false`.
+- **Frameless and transparent:** `transparent(true)`, `decorations(false)`
+  and `shadow(false)`. An undecorated transparent window keeps a 1 px border
+  while its shadow is on (tauri #8308).
+- **On top, not on the taskbar:** `always_on_top(true)`, `skip_taskbar(true)`.
+- **Resizable unless fitted; not maximisable or minimisable:**
+  `resizable(!fit)`, `maximizable(false)`, `minimizable(false)`.
+- **Size:** `inner_size(480, 480)` until it is placed, and
+  `min_inner_size(64, 48)` (logical). At that minimum the chrome's Lock button
+  still fits, and it stays under `placeOverlay`'s 120 px floor.
+- **Hidden and unfocused:** `visible(false)`, `focused(false)`.
 
-It is created hidden, placed, then shown. `focus: false` makes tao mark the
-window `MARKER_DONT_FOCUS`, so its first show uses `SW_SHOWNOACTIVATE`
-(tao `window_state.rs`). Opening the overlay therefore never takes focus from
-a game.
+`focused(false)` makes tao mark the window `MARKER_DONT_FOCUS`, so its first
+show uses `SW_SHOWNOACTIVATE` (tao `window_state.rs`). Opening the overlay
+therefore never takes focus from a game.
 
-### State
+Before the window can show, on the same tokio worker:
 
-- **Main → overlay:** `overlay:state` (`OverlayState`), a broadcast `emit` from
-  `syncOverlay` (`src/overlay/sync.ts`) whenever the chain, the status, the
-  tweaks or the background mode change while the overlay is open. The overlay
-  animates on its own between pushes.
-- **Overlay → main:** `overlay:ready` (no payload), emitted once the overlay's
-  `overlay:state` listener is registered. Main answers with the current state.
-  `tauri://created` fires when the native window exists, which is before the
-  overlay's page is listening, so the push sent on open could reach nobody.
-  The ready signal is sent right after the listener is registered, not after
-  a paint: the window is still hidden while main places it, and a hidden page
-  may not run animation frames.
-- **The overlay draws nothing until the first state arrives.** Main shows the
-  window as soon as it is placed, which can be before the state reaches it,
-  and a first frame of the default circle would be captured by OBS.
+1. click-through goes on: `set_ignore_cursor_events(true)`, which tao does by
+   adding `WS_EX_TRANSPARENT | WS_EX_LAYERED`. `R1_RUNG` is 0: the layered
+   window is left as tao makes it, with no `SetLayeredWindowAttributes` of
+   Divora's;
+2. its HWND is stored, and the `NonRudeHWND` property is set on the main
+   thread (`mark_non_rude`, `divora_capture::native::window`; Raymond Chen,
+   2025-05-22). The shell reads it when a window is shown, and a window that
+   has it is never taken for a fullscreen app, which would hide the taskbar
+   and hold back notifications under a fitted, topmost overlay;
+3. it is placed (see Geometry);
+4. the core steps `Built`.
+
+It is shown once, when the page's ready handshake arrives, and never hidden:
+the backend makes no `hide()` or `minimize()` call on it, and closing destroys
+it. `minimizable(false)` only takes away the minimise button; what Win+D and
+Win+M do to the window hasn't been checked.
 
 ### Lifecycle
 
-`on_window_event` in `src-tauri/src/lib.rs` turns `CloseRequested` into "hide
-to tray" only for `main`, through `hides_on_close(label)`. Until v1.51.3 it did
-this for every window. The overlay's `close()` then only hid it, so
-`tauri://destroyed` never fired, and the next open found the hidden window and
-left it hidden. Now `close()` destroys the overlay, and `tauri://destroyed`
-clears `overlayOpen`.
+`OverlayCore`'s phases. Each window has a number, its `instance`, and an input
+carrying another window's number changes nothing.
 
-Every path that leaves a visible overlay registers that `tauri://destroyed`
-listener and the geometry tracking:
+- **Creating(i):** `open_overlay` is building it. A close now is remembered
+  and carried out once it is built. A ready handshake that arrives first shows
+  it as soon as it is built.
+- **Starting(i):** built, hidden, click-through and placed. The watchdog
+  (`divora-overlay-watchdog`) gives the page 10 s to say it is ready, then
+  destroys the window; the closing statuses carry "The overlay window didn't
+  start, so Divora closed it. Try turning it on again.", which main toasts
+  once.
+- **Shown(i):** the ready handshake arrived and the window was shown.
+- **Painted(i):** the page has drawn since it was shown; Arrange is allowed
+  (`canArrange`).
+- **Closing(i):** after `close_overlay` (`close()`, the path Alt+F4 takes),
+  Alt+F4, or the watchdog (`destroy()`). Locked again; no more window state
+  is applied to it (`reconcile_plan` is `None`) while it closes.
+- **Closed:** after `Destroyed`. Mode, fit and error are reset and the tray
+  is refreshed.
 
-- a new window;
-- an existing one being shown again;
-- one found still on screen when the store starts.
+Every change goes out as `overlay:status`, the whole `OverlayStatus`, emitted
+while the core's lock is held, so statuses leave in the order the state
+changed. Every overlay window command returns the same struct, except
+`overlay_alive`, which returns nothing.
 
-The last case is a reload of the main page: F5 / Ctrl+R reload a WebView2
-page, and the overlay window survives it.
+**The handshake is two app commands, not events.** Right after it broadcasts
+`overlay:ready`, the page calls `overlay_handshake {instance, stage: "ready"}`.
+Two animation frames after the first status that says its own window is
+`shown`, it calls `overlay_handshake {instance, stage: "painted"}`. tauri runs
+Rust event listeners under a `try_lock` and parks an event when the lock is
+taken (`event/listener.rs`), flushing it only when a later emit runs a Rust
+handler. The 30 Hz `audio-levels` emit contends for that lock, and the app has
+no other Rust listener, so a parked ready would leave the window hidden until
+the watchdog killed it. Commands never take that lock. Ready gates the show;
+painted gates Arrange, because a frame can only be seen drawn after the show.
+An unpainted Locked window is click-through, so it can't catch clicks. A failed
+handshake is logged and retried once.
+
+**Opening again.** `open_overlay` on an open overlay returns its status and
+moves nothing. While the last window is still closing it waits up to 2 s for
+Closed, then tries once more, else answers "The overlay is still closing. Try
+again in a moment."
+
+**Main follows the status.** The controller sets `overlayOpen` from `open`. On
+the way to open it attaches geometry tracking (or the fit keeper, when
+fitted), and on the way to closed it detaches it. A command's answer can land
+after the events that followed it: `close_overlay`'s "closing" arrived about
+10 ms after the "closed" event. So main applies a command's answer only if no
+`overlay:status` event arrived while the call was on its way (a `heard`
+counter); the events carry every change anyway. Found in the real app: without
+this rule the Show overlay window toggle stayed on after 6 of 12 quick
+open/close cycles. A status with a new `error` is toasted once. The toast
+has two tones: success for the plain "Picture added." and the hotkey's two
+notices; error for everything else, the large-picture warning included. The
+controller's public actions never reject: a failure they don't expect is
+logged with `console.warn`.
+
+**A main-window reload** (F5 / Ctrl+R reload a WebView2 page, and the overlay
+window survives it). At start the controller subscribes to `overlay:status`
+and `overlay:edit`, reads `overlay_status` and pushes the stored Hide flag,
+all at once. It adopts an open overlay from that read unless a status event
+arrived first. Adoption treats the status's `error` as already seen, unless
+the phase is `closing` (a reload racing the watchdog). Once `overlayOpen` is
+true, the state and the scene are pushed again.
+
+**An overlay-page reload:** a ready handshake in Shown or Painted sends the
+window back to Shown, so it must paint again before it may arrange, and an
+Arrange in progress is locked.
+
+**Closing.** `on_window_event` in `src-tauri/src/lib.rs` still turns
+`CloseRequested` into "hide to tray" only for `main`, through
+`hides_on_close(label)`. Until v1.51.3 it did this for every window, so the
+overlay's `close()` only hid it. The overlay's `CloseRequested` and
+`Destroyed` now go to `overlay_windows::on_window_event`. On `CloseRequested`
+the `charm` scheme stops serving it and `NonRudeHWND` comes off, then the core
+goes to Closing. On `Destroyed` the shell forgets the HWND and its cells, and
+the core goes to Closed. The tray's Quit takes `NonRudeHWND` off too
+(`before_exit`), because the window then gets no `CloseRequested`.
+
+### Arrange and Locked
+
+The overlay opens **Locked** at every launch: click-through, so clicks reach
+whatever is under it. The mode is never saved. **Arrange** takes clicks and
+keys so the charms can be moved.
+
+- **Ways in:** Settings' Arrange button, the `overlay:arrange` hotkey, and
+  `set_overlay_mode {mode: "arrange" | "toggle"}`. The core accepts only in
+  Painted. Otherwise it answers "The overlay is still starting. Try again in a
+  moment." or "The overlay isn't open."
+- **Ways out:** Esc in the overlay, its Lock button, Settings' Lock button,
+  the tray's Lock the overlay (there only while arranging), the hotkey, and
+  the lease. `set_overlay_mode {mode: "locked"}` never fails.
+
+**The Arrange lease.** Entering Arrange bumps `arrangeGen`, clears `arranged`,
+takes the foreground (below), adds the tray item and starts the lease. The
+window stays click-through, and protection stays as it was. Two frames after
+the chrome mounts, the page calls `overlay_alive {instance, gen}`, then again
+every 500 ms until the chrome unmounts. The first beat of the current
+generation sets `arranged` and applies the window: protection off, then
+click-through off. Later beats only reset the miss count. No beat sends a
+status.
+The lease thread (`divora-overlay-lease`) ticks once a second. Three ticks
+without a beat lock the overlay as Lock does, with an error main toasts:
+
+- "The overlay didn't respond, so it stayed locked." (it never beat);
+- "The overlay stopped responding, so Divora locked it. Turn it off and on
+  again if it looks wrong." (it beat, then stopped).
+
+Nothing else would notice a hung or crashed page behind a window that takes
+clicks: neither wry nor tauri-runtime-wry handles WebView2's `ProcessFailed`.
+Beats are a command on a tokio worker, so a busy main thread doesn't stop
+them. Beats and ticks from another instance or generation do nothing.
+
+**Locking** (`lock_edge`): the mode goes back to Locked and the status goes
+out at once, while `core` is held. Then, in order, the window is applied
+(click-through on, protection last if due), the keyboard is handed back, and
+the tray is refreshed. Closing while arranging leaves Arrange too, but only
+refreshes the tray: the closing window gets no window state, and the keyboard
+isn't handed back.
+
+### Focus
+
+The shell never calls tauri's or tao's `set_focus` on the overlay. When
+`SetForegroundWindow` fails, tao's `force_window_active` sends a Left-Alt
+press and release with `SendInput` and tries again; in a game that is an
+injected Alt key. `the_overlay_never_calls_set_focus` scans
+`overlay_windows.rs` for the call.
+
+`divora_capture::native::window` has `foreground_window()`,
+`try_foreground(hwnd)` (`SetForegroundWindow`, nothing injected) and
+`can_take_foreground(hwnd)` (`IsWindow`, `IsWindowVisible` and not
+`IsIconic`). Windows are passed as integers, so `src-tauri` needs neither
+`unsafe` nor the `windows` crate.
+
+- **Focus** (entering Arrange): remember the foreground window in
+  `return_to`, unless it is the overlay or none; `try_foreground` the overlay;
+  log whether it worked.
+- **ReturnFocus** (every Arrange → Locked edge): if the overlay still has the
+  foreground and the saved window can take it (`should_return_focus`), give it
+  back. Settings' Lock and the tray's leave the keyboard where it is: Divora's
+  main window, or the tray's hidden window, has it then.
+- **Refused.** Windows may refuse the overlay the foreground. Nothing else
+  happens then. The chrome's hint follows the overlay's own focus
+  (`document.hasFocus()` and focus/blur): "Esc locks the overlay" while it has
+  the keyboard, "Click Lock to lock the overlay" otherwise. A click on the
+  overlay focuses it.
+
+**The hotkey acts in Rust.** `global_shortcut_handler` (`lib.rs`) calls
+`overlay_windows::hotkey` before it emits `global-shortcut`. A press of
+`overlay:arrange` is a toggle (`hotkey_overlay_request`); releases, which come
+from global-hotkey's polling thread, and other ids do nothing. The mode changes
+inline, on the main thread inside `WM_HOTKEY`, so the overlay asks for the
+foreground while the press is fresh; a JavaScript round trip would ask later,
+when Windows is less likely to allow it. It also works while main's
+JavaScript is busy. The JavaScript branch (`noteOverlayHotkey`) never calls
+`set_overlay_mode`, which would toggle the press twice. It only toasts "The
+overlay is off. Turn it on in Settings first." or "The overlay is still
+starting. Try again in a moment." While the overlay is closed, the hotkey does
+nothing else.
+
+### State
+
+- **Main → overlay:** `overlay:state` (`OverlayState`, still 8 keys), a
+  broadcast `emit` from `syncOverlay` (`src/overlay/sync.ts`) whenever the
+  chain, the status, the tweaks or the background mode change while the
+  overlay is open. The overlay animates on its own between pushes.
+- **Overlay → main:** `overlay:ready` (no payload), emitted once the
+  overlay's listeners are registered. Main answers with the current state and
+  scene. The backend doesn't listen to it: it learns ready from
+  `overlay_handshake`.
+- **Backend → both windows:** `overlay:status` (`OverlayStatus`): `open`,
+  `phase` (`closed` / `starting` / `shown` / `painted` / `closing`; a window
+  being built reads as `starting`), `instance`, `mode`, `arrangeGen`,
+  `canArrange`, `fit`, `hideWanted`, `hideAvailable`, `capturing` and
+  `error`. No key says whether protection is applied: Windows doesn't confirm
+  it. The overlay ignores a status for another instance.
+- **Main → overlay:** `overlay:scene` (`ScenePush {session, revision, scene,
+  ack, expectViewport}`), from `syncOverlayScene`: on every scene change while
+  the overlay is open, and on each `overlay:ready` with `ack: null` (a reloaded
+  page numbers its edits from 0 again). It is not part of `overlay:state`:
+  `syncOverlay` re-sends the whole state on every status flip, which would snap
+  a dragged picture back.
+- **Overlay → main:** `overlay:edit` (`SceneEdit {instance, seq, op}`), one
+  per finished gesture.
+
+Each tauri `emit` is its own async command, so two sent back to back can
+arrive in either order. Main's scene pushes and the overlay's edits each go
+through one promise chain: an emit starts only once the one before it has
+gone.
+
+The ready signal is sent right after the listeners are registered, not after a
+paint: the window is still hidden then, and stays hidden until the backend
+hears the handshake, and a hidden page may not run animation frames. Painted
+is its own signal, after the show.
+
+**The overlay draws nothing until it has the state (for the circle) and a
+scene (for the pictures).** The window can be shown before they arrive, and a
+first frame of defaults would be captured by OBS.
+
+The event names, the `OverlayStatus` and `ImportedAsset` keys, and sample
+statuses are held once in `src/overlay/wire.fixture.json`. Rust
+(`wire_fixture_matches_rust`, `imported_asset_wire_keys_are_frozen`) and
+TypeScript (`status.test.ts`, `state.test.ts`) both read it, so a change on
+one side fails the other's tests.
+
+### The scene
+
+`divora.overlayScene`, `{version, designSize, frame, elements[]}`, is the
+first versioned localStorage key. Only main reads, migrates, writes and pushes
+it.
+
+- **Units.** An element stores `x, y, w, h` as fractions of `designSize`, in
+  CSS px of the overlay's client area. A picture also stores `src` (an asset
+  id, never a path or URL), `nw`/`nh` (its own pixels, as displayed), `anim`,
+  `bytes` and `name`.
+- **Layout** (`layoutElement`, pure). In viewport `V`, an element keeps its
+  designed size in CSS px and shrinks, keeping its shape, only when it is
+  larger than `V`. Its centre stays at the same fraction of `V`, clamped so it
+  stays inside. The circle is laid out as the largest square in its rectangle,
+  and Stage scales the circle's 440 px box (`SPELL_CIRCLE_PX`) by
+  `min(w, h) / 440`. Elements stack by `z`, then by array order.
+- **`designSize` only grows.** A `place` edit grows it to cover the viewport
+  and stores the edited element as it is on screen. Every other element keeps
+  its designed size and centre, and is left byte-for-byte unchanged when
+  nothing grew. So shrinking the window and growing it back changes nothing.
+  A drag or a nudge keeps a shrunk element's designed size and takes only its
+  new centre; a resize takes the new size.
+- **The shape is always kept:** `nw/nh` for a picture, square for the circle.
+- **Frame.** `frame` says what `designSize` was measured against: the window,
+  or the whole monitor (Fit to monitor). Changing Fit commits a `reframe` that
+  keeps every element where it is on screen.
+- **Live and inert.** An element this version can show is live: the first
+  usable `spellcircle`, and each `image` with usable geometry and an asset-id
+  `src`. Anything else — an unknown type, a picture it can't recognise, a
+  second circle, unusable geometry — is inert: kept exactly as stored, written
+  back unchanged, neither drawn nor listed. Reading drops only entries without
+  a string id and later duplicate ids. The caps (16 pictures, 64 stored
+  elements, one live circle, and the budget under Charm pictures) apply when
+  adding, never when reading.
+- **Migration.** With no stored scene, `migrateScene` puts the circle where
+  v1.51.3 drew it: at most 440 px, centred in the saved window (its size in
+  `divora.overlay`, divided by its scale). That scene is saved the first time
+  the overlay is seen open, before a geometry save can change what it was
+  migrated from. A window under 440 CSS px now shrinks the circle; v1.51.3 cut
+  it off.
+- **The reducer** (`applyOp`: `add`, `remove`, `place`, `order`, `reframe`)
+  is pure, rounds what it writes to 6 decimals, and returns the same object
+  when nothing changes. Main and the overlay run the same function. The
+  overlay may send only `remove`, `place` and `order` (`readOp`); main ignores
+  anything else with a `console.warn`, and still acks it.
+- The circle can be removed like a picture. Settings' Charms list then offers
+  **Add the spell circle**, which adds it at the back.
+
+**The mirror** (`mirror.ts`). The overlay draws the last scene main pushed
+with its own unacknowledged edits applied on top, so a dropped picture stays
+where it was dropped while its edit travels, and a push that crosses it
+doesn't snap it back. An ack for its instance drops the edits it covers. A
+new `session` (main reloaded) is adopted whatever its revision, and drops
+every pending edit. Within a session a push is adopted only if its `revision`
+is at least the one held. `expectViewport`, set only by a Fit change, keeps the
+previous scene on screen until the window has that size, for at most 1 s
+(`HOLD_MS`).
+
+### Editing
+
+Stage's rows are keyed by element id (the `ids`, `byId` and `rank` memos), so
+a drag, an ack, a Settings change or a resize restyles a charm and never
+remounts it: the circle keeps animating, a picture never reloads, and a
+focused charm keeps focus. Rows stay in scene-array order and stack with
+`z-index`, so restacking moves no node.
+
+- **Pointer.** A press on a charm's hit layer (`[data-hit]`, at least 24×24
+  CSS px, round for the circle) or on a corner handle (12×12, centred on the
+  hit layer's corners) selects it and captures the pointer on its row.
+  `pointermove`, `pointerup`, `pointercancel` and `lostpointercapture` are
+  heard on `window`. A move only updates a preview; the `place` edit is sent
+  once, on `pointerup`. A cancel or a lost capture drops the gesture and sends
+  nothing, and a move with no button down ends it as a release. A corner
+  resizes from the opposite corner, keeping the shape.
+- **Keys.** The arrows nudge 1 px (Shift: 10 px). `=` and `-` (and the
+  numpad's + and −) resize about the centre by 2 px on the long side; `+` and
+  `_` by 10 %. A run of these is sent as one `place`, 300 ms after the last
+  key (`NUDGE_FLUSH_MS`). Delete removes (Backspace doesn't); `[`, `]`, `{` and
+  `}` restack. A pending nudge is sent before any other edit, a gesture, a
+  lock or a change of selection, and when the window loses the keyboard.
+- **Blocked.** In both modes every `keydown` is `preventDefault`ed except Tab,
+  Alt+F4, and Enter or Space on a button (`shouldPreventKey`). That is meant
+  to keep F5, Ctrl+R, Ctrl+P, Ctrl+F, F12, Ctrl+zoom, Alt+arrows and Alt+Space
+  from WebView2: a reload would run the handshake again. The page has no
+  `title`, no `<select>` and no context menu (`contextmenu` is prevented),
+  because WebView2's popups escape capture exclusion (WebView2Feedback #4544).
+  The circle is `SpellCircle` with `decorative`: its nodes have no `title` and
+  take no pointer or focus.
+- **Entering Arrange** gives the stage the keyboard. `arrange` is a memo of
+  the mode, so a status that keeps the mode (a take starting mid-arrange)
+  doesn't move it. **Locking** sends a pending nudge, ends any drag and clears
+  the selection.
+- **The chrome** (Arrange only): a dashed frame; the **Lock** button top
+  right, the toolbar's first control, an icon alone below 160 px wide; the
+  **Move window** grip top left, not while fitted, its text from 320 px wide;
+  and the hints, from 320×120: "Esc locks the overlay" or "Click Lock to lock
+  the overlay", and "Recordings can see the overlay while you arrange." while
+  a capture runs with Hide on. A picture that won't load shows "Picture
+  missing" while arranging. Locked shows no frame, outline or handle.
+
+### Charm pictures
+
+**Import** (`import_overlay_asset {path}`, on a blocking thread). The source
+may be any regular file the user can read. It is refused when it:
+
+- isn't a file, or is empty;
+- is over 50 MB (counted in 10⁶ bytes, as Replay counts MB);
+- isn't PNG, JPEG, GIF or WebP by its first bytes (an APNG is a PNG);
+- is a JPEG that isn't baseline or progressive 8-bit (SOF0, SOF1 or SOF2 at
+  precision 8): Chromium's libjpeg-turbo build has no arithmetic decoder, and
+  Blink uses only the 8-bit API;
+- has a zero side, or is over 8192 px a side or 16,777,216 px;
+- is animated and over 4,194,304 px.
+
+The size is as displayed: a GIF's logical screen grown to hold its first frame
+(Wuffs' default, which Chromium uses), and a JPEG's width and height swapped
+for EXIF orientations 5 to 8. Every header read is bounds-checked, so a
+truncated file never panics. Only the headers are read: a file cut off before
+its size is refused, and one cut off after it is still added. A PNG cut before
+its first `IDAT`, or a GIF before its trailer, counts as animated, so the
+animated cap applies.
+
+The file is copied to `overlay/assets/<id>`. The id is the first 16 hex digits
+of its SHA-256, a dot, and the sniffed type's extension (`png`, `jpg`, `gif` or
+`webp`): nothing comes from the path. It is written as
+`overlay/.import-<pid>-<nanos>.part`, beside the folder, synced (`sync_all`)
+and renamed. The same picture added twice gets the same id and is written
+once; a damaged or truncated file under that id is replaced. The answer is
+`{id, width, height, bytes, animated, warning}`. `warning` is "Picture added.
+It's a large picture, so the overlay may use more memory and CPU." over 20 MB,
+or for an animated picture over 2 megapixels, else null. The file picker offers
+`.png`, `.jpg`, `.jpeg`, `.jfif`, `.jpe`, `.gif`, `.webp` and `.apng`; the
+content decides, so the `.jfif` JPEGs browsers save are accepted.
+
+**Budgets** (`addRefusal`, main, when adding only): 16 live pictures, 64 stored
+elements, and, over the distinct pictures (a shared file counts once),
+200,000,000 bytes of files, 16,777,216 animated pixels and 67,108,864 pixels
+in all.
+
+**The `charm` scheme.** `register_asynchronous_uri_scheme_protocol("charm",
+…)`, so the overlay loads `http://charm.localhost/<id>` (`charmUrl`). The
+handler runs on WebView2's UI thread and only hands the request to a blocking
+thread. That thread takes one of two `ServeGate` places before it reads and
+holds it until the response is handed back, so at most two pictures are held
+in memory at once. `serve` answers:
+
+| Condition | Answer |
+|---|---|
+| the app's state doesn't exist yet | 503 |
+| any webview but `overlay` (Settings shows no thumbnails) | 403 |
+| a method other than GET | 405, `Allow: GET` |
+| a path that isn't an id; a missing file; a file over 50 MB; bytes that don't match the extension | 404 |
+| a read error | 500 |
+| the overlay stopped being live while the file was read (checked last) | 503 |
+| otherwise | 200, the type from the extension, `Cache-Control: public, max-age=31536000, immutable`, `X-Content-Type-Options: nosniff` |
+
+The overlay is live from just before its window is built until
+`CloseRequested`, or until the watchdog destroys it. tauri's `protocol-asset`
+is not used: the dialog plugin widens the asset scope at run time for every
+path it picks, and tauri's asset handler reads whole files on WebView2's UI
+thread. The scheme adds no crate, Cargo feature or `tauri.conf.json` change,
+and no absolute path reaches the DOM or localStorage.
+
+**Removing.** After each change main counts every string anywhere in the scene
+that is an asset id (`assetRefs`; inert elements and unknown keys included).
+Each id whose count fell to 0 is queued for `delete_overlay_asset {id}`. The
+queue checks the count again before deleting, and imports run on the same
+queue, so a picture added again meanwhile keeps its file. A delete that fails
+is logged. Files left behind (a failed delete, cleared app storage) are
+harmless.
+
+**Two folders.** `pnpm tauri dev` has its own localStorage, and so its own
+scene; it keeps its pictures in `overlay/assets-dev`, so one build can't delete
+the other's. The choice is `tauri::is_dev()`, not `debug_assertions`, which
+`tauri build --debug` shares with the installed app. Both are under
+`%APPDATA%\com.divora.voicemod\`, with a temp-folder fallback; the folder is
+created and logged at startup.
+
+### Hiding from recordings
+
+**Hide from recordings** in Settings (off by default; shown only when
+`hideAvailable`) asks Windows to leave the overlay out of captures
+(`set_content_protected(true)`, `WDA_EXCLUDEFROMCAPTURE`) while Divora
+records. It is a request: Windows doesn't confirm it, so no wire key claims
+it. Only decoding a recording shows whether it worked.
+
+- **When.** `protected()` is true when the toggle is on (`hideWanted`), it is
+  available, the overlay is effectively Locked (Locked, or Arrange before its
+  first beat), something captures (`capturing`), and the window has been shown
+  (Shown, Painted or Closing: a closing window's request stands while it is on
+  screen). `capturing` is `capture_active(phase, replay)` in `screen.rs`: a
+  take in any phase, or Replay in any state but Off, held included.
+- **Only on a shown window, only on change.** The shell sets the affinity
+  only once the window has been shown, and only when the wanted value differs
+  from what it last set (`affinity_call`). So `WDA_NONE` never reaches a
+  window that was never protected, and nothing reaches a hidden one (Chromium
+  skips the call on a hidden window too, because it can leave the window
+  blank). The Show effect applies the window state, protection included, then
+  shows the window, with no message pump between.
+- **Order.** Towards Locked: click-through, the layered attributes (rung 1
+  only; `R1_RUNG` is 0), resizable, then the affinity last, on that apply's
+  final styles. Towards Arrange: the affinity off first, while the window is
+  still layered. The order is an unmeasured hedge, based on reports of a
+  `WS_EX_TRANSPARENT|WS_EX_LAYERED` window being captured anyway (Electron
+  #29085, #47856).
+- **Before a capture starts.** `ScreenRecorder::start` and `arm_replay` call
+  `before_capture` after releasing the recorder's lock, before `open_feed`. It
+  sets `capturing`; when protection is now due, it runs the apply on the main
+  thread and waits for it, at most 300 ms, logging a warning if it isn't
+  confirmed. It returns a `CaptureCleared` token, and `open_feed` takes one,
+  so deleting either call, or moving it after `open_feed`, no longer
+  compiles. A take's end (`finish`) and every Replay change (`publish`) call
+  `note_capture` under the recorder's lock; `capture_hooks_are_in_place` is a
+  source scan for those two, which the compiler can't check.
+- **Arranging mid-take.** Protection goes off at the first beat, before
+  click-through does, and the chrome says "Recordings can see the overlay
+  while you arrange."
+- **Windows 10.** The toggle is offered from `UniversalApiContract` 10
+  (Windows 10 2004, `MIN_CONTRACT`), the first release with
+  `WDA_EXCLUDEFROMCAPTURE`. Electron #47834 reports a click-through protected
+  window still captured on Windows 10 (19045) and on Windows 11 21H2 (22000)
+  when the affinity is set after the show, which is the usual order here. If
+  a check on Windows 10 shows the same, `MIN_CONTRACT` rises to 15 (Windows 11
+  22H2). `DIVORA_PRETEND_NO_CAPTURE_EXCLUSION` makes the toggle unavailable.
+- **Other apps.** While it is protected, apps that capture your screen or the
+  overlay window, OBS and Discord included, may not show it either — with
+  Replay on, for as long as Replay is on. It applies whatever monitor Divora
+  records; hiding only when the overlay is on the recorded monitor is a
+  follow-up.
+
+### Fit to monitor
+
+- **Transparent only.** `effectiveFit(flags, bg)`: Fit counts only with the
+  Transparent background. A stored Fit with Green or Magenta (written by mixing
+  builds) reads as off, and nothing is written at boot. Settings disables Fit
+  on a colour background, and Green and Magenta while fitted. Choosing a colour
+  while fitted turns Fit off first; if that fails, the colour isn't applied.
+  The overlay's background is transparent whenever `status.fit`, whatever the
+  stored colour, so a fitted topmost window can't paint the screen.
+- **`planFrame`** (`frame.ts`, pure) plans every open and Fit change. The
+  window gets its monitor's whole rectangle (`fitRect`, through the same
+  `pickMonitor` as `placeOverlay`) when Fit counts and the monitors could be
+  read; else `placeOverlay(saved)`; else nothing, and Windows places it.
+  `fit: true` goes to the backend only with a fitted rectangle. When the
+  scene's `frame` differs from the target's, the plan adds a `reframe` between
+  the two rectangles in the monitor's CSS px (`canvasRects`), so nothing moves
+  on screen. A Fit change made while the overlay was closed is reconciled at
+  the next open, and saved before `open_overlay`.
+- **While open,** main pushes the reframed scene, unsaved, with
+  `expectViewport`, waits for that push to go, then calls `place_overlay`. On
+  success it saves the scene and the flag and swaps geometry tracking for the
+  fit keeper, or back. On failure it re-pushes the old scene and toasts the
+  backend's words. Fitted since a fresh install (no saved place), Fit off puts
+  the window where the reframe stood it in: a 480-logical square at the
+  monitor's top-left.
+- **One placement queue** runs open, close, Fit changes, the colour path and
+  the keeper's re-fits one at a time, so a second click plans from a settled
+  window. Imports and deletes have a queue of their own.
+- **The fit keeper** (`keepFit`): the overlay's scale-change, resize and move
+  events, settled for 400 ms, plus a check every 5 s, since a resolution
+  change sends no event the overlay hears. If the window no longer equals its
+  monitor's rectangle, the keeper places it again. tao keeps an undecorated
+  window's logical size on `WM_DPICHANGED`, so after a scale change a fitted
+  window would spill onto the next monitor.
+- **While fitted** the window is not resizable and has no drag and no grip,
+  and geometry saves stop, so `divora.overlay` keeps the user's own place for
+  Fit off.
 
 ### Geometry
 
 Everything is in **physical pixels**, because Tauri reports monitors,
 `outerPosition`, `innerSize`, `onMoved` and `onResized` in physical pixels,
-while the `x`/`y`/`width`/`height` a window is created with are logical.
+while the size a window is built with is logical. Main computes the rectangle;
+since v1.55.0 the backend applies it.
 
 **Saving.** After a move or resize settles (400 ms), main reads the overlay's
 `outerPosition` and `innerSize`. It also reads the monitor under the overlay's
 centre (`monitorFromPoint`). `currentMonitor()` would not do: it answers for
 the window calling it, which is main. All of this is stored in
-`divora.overlay` as `{ bg, x, y, w, h, monitor?, scale? }`. Keys the build
-doesn't know are carried through. The minimised parking spot (−32000) is
-never saved.
+`divora.overlay` as `{ bg, x, y, w, h, monitor?, scale? }`, plus `fit` and
+`hideFromRecordings` (v1.55.0; false when missing). Keys the build doesn't
+know are carried through. The minimised parking spot (−32000) is never saved.
+The place isn't updated while fitted.
 
-**Restoring.** `placeOverlay` (`src/overlay/geometry.ts`) picks the monitor:
+**Restoring.** `placeOverlay` (`src/overlay/geometry.ts`) picks the monitor,
+since v1.55.0 through the exported `pickMonitor`, which `fitRect` shares:
 
 1. the monitor saved by name;
 2. else the monitor the old rectangle overlaps most;
@@ -1259,49 +1755,248 @@ It then scales the size by the ratio of scale factors, so the window keeps its
 apparent size if that display's scaling changed. Finally it clamps the
 rectangle fully onto the monitor, with a minimum of 120 px.
 
-Main applies the result by setting the size, then the position, then reading
-both back, repeating until they match, at most three times. Windows rescales
-a window (`WM_DPICHANGED`) when most of it crosses onto a monitor with a
-different scale, and that can happen during the resize as well as during the
-move. The target rectangle lies wholly on one monitor, so a second pass has
-nothing left to rescale.
+**Applying.** `place_window` (`overlay_windows.rs`, on a tokio worker) sets the
+size, then the position, then reads both back, repeating until they match, at
+most three times. Windows rescales a window (`WM_DPICHANGED`) when most of it
+crosses onto a monitor with a different scale, and that can happen during the
+resize as well as during the move. The target rectangle lies wholly on one
+monitor, so a second pass has nothing left to rescale. `open_overlay` places
+the window before `Built`, so it never appears at Windows' spot and then
+jumps. `place_overlay` checks the phase before it touches anything: "The
+overlay is still starting. Try again in a moment." while the window is being
+built, "The overlay isn't open." while closing or closed. Open's build-to-
+`Built` and `place_overlay`'s placement hold one async lock, so two placements
+never interleave. A rectangle with a side outside 1..32768 is ignored. When
+Fit doesn't count and there is no saved place, or when no monitors could be
+read, the rectangle is null and the window opens at 480×480 (logical) where
+Windows puts it.
 
 ### Moving it
 
-A plain left press anywhere that isn't a button starts `startDragging()`
-(`src/overlay/drag.ts`). It doesn't use `data-tauri-drag-region`, because
-Tauri's drag script toggles maximise on a double-click for any resizable
-window (`internal_toggle_maximize` checks `is_resizable` only). That would
-blow a transparent, always-on-top window up to the whole screen.
+Only in Arrange, and only when not fitted: Locked is click-through, so no
+press reaches the window. A plain left press (`isPlainLeftPress`: button 0,
+`detail` 1) on the **Move window** grip (`[data-grip]`), or on empty stage
+(`startsWindowDrag`, `src/overlay/drag.ts`), calls `startDragging()`. Charms,
+handles and the chrome are not empty stage. The circle's hit layer is round,
+so the empty corners of its square move the window. A press on a charm calls
+`preventDefault()`, which also stops the compatibility `mousedown`, so it never
+drags the window.
+
+It doesn't use `data-tauri-drag-region`, because Tauri's drag script toggles
+maximise on a double-click for any resizable window
+(`internal_toggle_maximize` checks `is_resizable` only). That would blow a
+transparent, always-on-top window up to the whole screen. A drag may leave
+part of the window off screen; the next open clamps it.
 
 ### Permissions
 
-`capabilities/default.json` applies to both windows. v1.51.3 adds
-`core:window:allow-set-position` and `core:window:allow-set-size`, so main can
-place the overlay. The rest comes from `core:default` or was already granted:
-monitor queries, positions and sizes, `is-minimized`, `start-dragging`,
-`show`, `close`, and event emit/listen. A separate, narrower capability for
-the overlay is planned with the scene editor (see
-[`research/stream-studio.md`](research/stream-studio.md)).
+`capabilities/overlay.json` (v1.55.0) applies to the overlay alone:
+`core:event:allow-listen`, `core:event:allow-unlisten`,
+`core:event:allow-emit`, `core:event:allow-emit-to` and
+`core:window:allow-start-dragging`. `allow-emit` is for `overlay:ready`, a
+broadcast, and `overlay:edit`. `capabilities/default.json` now applies to
+`main` only, and drops `core:webview:allow-create-webview-window`,
+`core:window:allow-set-position` and `core:window:allow-set-size`: their only
+users were main's creation and placement of the overlay. Main's tracking and
+fit keeper read the overlay and listen to it through `core:default`.
+
+Capabilities don't restrict app commands. There is no app ACL manifest
+(`build.rs` is the plain `tauri_build::build()`), and tauri checks app commands
+only when one exists, so the overlay can invoke every `#[tauri::command]`. It
+relies on three: `set_overlay_mode` (Esc and Lock), `overlay_handshake` and
+`overlay_alive`. `overlay.json`'s description says they must be granted if an
+app manifest is ever added. The overlay logs failed calls with `console.warn`
+(a failing beat once per Arrange), so a refusal would show in its console.
+
+### Threads and locks
+
+All ten overlay commands are `async`: Tauri 2 runs a sync command on the main
+thread, which both windows share, and building a window from a sync command
+deadlocks.
+
+| Caller | Thread | Locks | Window calls |
+|---|---|---|---|
+| `open_overlay`, `place_overlay` | tokio worker | the placement lock (`tauri::async_runtime::Mutex`) from build or placing to `Built` / `Placed`; `core` briefly | build, setters and getters (`hwnd`, `outer_position`, `inner_size`, round trips to the main thread), never under `core` |
+| `close_overlay`, `set_overlay_mode`, `set_overlay_hide_from_recordings`, `overlay_status`, `overlay_handshake`, `overlay_alive` | tokio worker | `core` | posted |
+| the hotkey (`global_shortcut_handler`) | main, inside `WM_HOTKEY` | `core`, released before the window work | inline |
+| the tray's Lock the overlay | main | `core`, released first | inline |
+| `on_window_event` (`CloseRequested`, `Destroyed`) | main | `core`, released first | `RemovePropW` inline |
+| watchdog, lease | `divora-overlay-watchdog`, `divora-overlay-lease` | `core` | posted |
+| `capture_changed` (`note_capture`) | whichever thread ended a take or changed Replay, **under the recorder's lock** | `core` | posted, or inline on main after `core` is released |
+| `before_capture` | the thread starting a take or arming Replay, **after** the recorder's lock is released | `core` | posts and waits ≤ 300 ms; inline on main |
+| the `charm` scheme | WebView2's UI thread, then a blocking thread | a `ServeGate` place | none |
+| import, delete | tokio blocking | none | none |
+
+`step` takes `core`, steps, and emits the status while still holding it. Off
+the main thread it posts the window work as one closure, still holding `core`
+(posting doesn't wait, and keeps the order across threads). On the main thread
+it releases `core` first and runs the work inline: an inline setter can send a
+window event straight back into `on_window_event`, which takes `core`.
+
+**Lock order:** the recorder's lock → `core`; the hotkey plugin's own lock, if
+it holds one around the handler → `core`. `core` is a leaf: under it, code
+only computes, emits and (off the main thread) posts. The overlay never calls into
+the recorder. There are no Rust event listeners, so tauri's listener lock is
+not in the order.
+
+**Main-thread hazards** (each a review item):
+
+1. `WebviewWindowBuilder::build` only in async commands: from a sync command
+   or an event handler it deadlocks.
+2. Never hold `core` across a window call.
+3. Never block the main thread on a channel: `before_capture` runs inline
+   there.
+4. Getters (`hwnd`, `outer_position`, `inner_size`) only on worker threads,
+   never under `core` or the recorder's lock. `open` and `place_overlay` call
+   them under the placement lock, which the main thread never takes.
+   Main-thread code reads the stored HWND.
+5. The tray menu is rebuilt only on the main thread.
+6. The scheme handler never reads a file on the UI thread.
+7. Never `set_focus` the overlay (a test scans for it).
+8. Never register or unregister a shortcut from the hotkey path.
+9. The reconcile setters never reach a window that isn't live
+   (`reconcile_plan` is `None` in Closed, Creating and Closing), and the
+   affinity reaches only a shown window. Outside that, `open`'s build sets
+   click-through on the window it is creating, reads its HWND and places it,
+   and `close_overlay` and the watchdog close or destroy the window as the
+   core steps to Closing.
+10. `before_capture` only after the recorder's lock is released; the token
+    can't check that.
 
 ### What the overlay never shows
 
-It never shows the voice reading. `src/overlay/state.test.ts` scans every
-non-test source file in `src/overlay/` for reading identifiers.
+It never shows the voice reading. `src/overlay/state.test.ts` scans
+`src/overlay.tsx` and the source files in `src/overlay/` for reading
+identifiers; `controller.ts`, main's side, is among them. The scan doesn't
+look into subfolders, so `src/overlay has no subfolders` keeps the folder flat.
+`OverlayState` keeps its 8 keys: the scene and the mode travel on their own
+events.
 
 ### Tests
 
-- `geometry.test.ts`: placement across monitors, including mixed
-  100 %/150 % scaling, unplugged and renamed monitors, and negative
-  coordinates; persistence back-compat.
-- `sync.test.ts`: drives the real `syncOverlay`, including the ready
-  re-push. Removing that re-push fails the test.
-- `drag.test.ts`: the press rule.
-- `state.test.ts`: event names.
-- Rust: `only_the_main_window_hides_on_close`.
+- **Rust, `overlay_machine.rs`:** `machine_table_is_exhaustive` (every phase
+  against every input); `invariants_hold_on_random_walks` (50 seeds × 10,000
+  inputs: Arrange only in Painted, click-through off only after a beat,
+  protection only on a shown window, `Show` once per window and after
+  click-through, no input from another instance or generation changing
+  anything); `cannot_arrange_before_painted`; the instance checks on ready and
+  painted; ready before `Built`; a page reload while arranging; the watchdog
+  and its error; close while creating and while arranging; the first beat;
+  the lease's three ticks and its two errors; stale beats and ticks; focus
+  only on the edges; `protected_partition_all_192`;
+  `reconcile_plan_only_while_live`; `setter_plan_orders`; the `affinity_call`,
+  `should_return_focus` and `hotkey_overlay_request` tables;
+  `placement_settled_cases`; `wire_fixture_matches_rust`;
+  `title_and_label_are_the_obs_contract`.
+- **Rust, `overlay_windows.rs`**, through a fake of its window calls: the
+  setters in the plan's order, protection through `affinity_call`, Show only
+  while live and protecting before it shows, focus remembering and handing
+  back, destroy taking the mark off first, the per-window cells, `place`'s
+  phase check, `open`'s wait for a closing window, the page URL and the debug
+  switch, and `the_overlay_never_calls_set_focus`.
+- **Rust, `overlay_assets.rs`:** sniffing; sizes for each format, including
+  GIF canvases, zero sides and EXIF orientations in both byte orders; the JPEG
+  SOF table; animation; every prefix and corrupted pictures never panicking;
+  the caps and the warning; ids against a known SHA-256 vector and the
+  fixture's 13 id strings; import writing once, repairing a damaged copy,
+  refusing a folder, an empty file and a 50,000,001-byte file, leaving no
+  temp file; delete; `serve_statuses_and_headers` (every row of the table
+  above); `serve_gate_admits_two`.
+- **Rust, elsewhere:** `tray_entries_for_each_combination` (the first two
+  equal v1.53.0's and v1.54.0's menus); `only_the_main_window_hides_on_close`;
+  `capture_active_for_each_state` and `capture_hooks_are_in_place`
+  (`screen.rs`); `divora-capture`'s window calls on a real window, on Windows
+  in CI.
+- **Vitest:** `scene.test.ts` (reading, inert elements kept through every op,
+  migration, layout, every op, the budget, the rect and hit helpers,
+  `CIRCLE_PX === SPELL_CIRCLE_PX`); `frame.test.ts`; `mirror.test.ts`;
+  `editor.test.ts` (`resizeRect` from every corner, `keyAction`,
+  `shouldPreventKey`); `status.test.ts`; `sync.test.ts` (ordered scene emits,
+  the ready re-push); `geometry.test.ts` and `drag.test.ts` (the new helpers
+  and rules); `controller.test.ts` (placement and Fit, status and adoption —
+  including a close or open whose answer lands after a newer event, which fail
+  without the rule above — the migrated scene, pictures and deletes, and one
+  test through the seam from a drag's edit to main's ack); `Stage.test.tsx`
+  (drawing, the chrome, the beats, dragging, moving the window, keys);
+  `overlay.test.tsx` (the handshake, the scene, the look); the Settings rows,
+  the api freeze, the hotkey branch, `SpellCircle`'s `decorative` and the new
+  sigils.
+- **E2E** (mocked Tauri): `overlay.spec.ts` drives the overlay page — the
+  handshake invokes, the chrome and beats, one edit per drag, real
+  hit-testing, Lock inside the window at 136×39, 200×200 and 480×480, Esc —
+  and a picture added in Settings reaching the overlay; `smoke.spec.ts`
+  renders the Settings rows with monitors unreadable.
+- **In the real app** (Windows 11 26200; a 3440×1440 and a 1920×1080 monitor,
+  both at 100 %; NVIDIA; two debug builds, driven over WebView2 remote
+  debugging, with Settings clicks and the overlay's keys and mouse sent that
+  way rather than as OS input): see "Charms (v1.55.0)" in
+  [`MANUAL_TESTS.md`](MANUAL_TESTS.md). The first build was `34f1b0b`, before
+  the late-answer and review fixes. It ran opening, Arrange, Esc and Lock, Fit,
+  the ACL check in both consoles, focus with its own console window in front,
+  the GIF and PNG (with the scheme, drag and delete checks), the lease, the
+  watchdog, the decoded Hide takes and the first opens under Replay. The
+  second was the shipping code, and ran the rest: the 20 cycles, focus against
+  another program, the APNG, WebP and JPEG, GPU use, memory, the restart and
+  the later Replay rounds.
+  - Opening: hidden at first, click-through set before it was first visible,
+    shown about 138 ms after the click, opened Locked; the foreground window
+    didn't change; `NonRudeHWND` was set. Locked, `WindowFromPoint` at the
+    centre, the edges and an inner point always found the window underneath
+    (6 of 6). Arrange from Settings turned click-through off about 60 ms later;
+    Esc locked it in 64 ms and the chrome's Lock in 81 ms. 20 quick open/close
+    cycles all opened (141–205 ms to `canArrange`) and all ended with the
+    toggle off. Neither window's console showed an ACL refusal.
+  - The lease: with the overlay's page hung while arranging, it locked again
+    2998 ms after the hang began, `WindowFromPoint` passed through the hung
+    window, the toast showed and Settings still worked. The watchdog, with
+    `DIVORA_PRETEND_OVERLAY_NO_READY` (debug builds only): never visible,
+    closed at 10.2 s, one toast, the toggle off.
+  - Focus: with another program's window in front, Windows refused the
+    overlay the foreground 3 times of 3 and that window kept the keyboard;
+    with the debug build's own console window in front, Arrange took it.
+  - Pictures, through Add picture…: a GIF, an APNG and an animated WebP drawn
+    and animating, in their stored shape; a JPEG with EXIF orientation 6 stored
+    and drawn upright; the scheme's headers as above, refusals as 404, the main
+    window's request a 403; a 10-step drag in Arrange moving a charm by exactly
+    the pointer's travel, saved by main; each file deleted once nothing used it.
+  - Hide from recordings (Green background, toggle on, Locked, a 480×360
+    window; every frame decoded from frame 0): the overlay in 0 of 302 frames
+    of a 10 s take; with the toggle off, in 152 of 152; arranging mid-take,
+    only while arranging (92 of 276); a Replay clip saved 4.3 s after arming,
+    0 of 130. Opened 6 times while Replay was armed, on the build before the
+    late-answer fix, the clip had it in 0 of 641 frames. The affinity read
+    back as `WDA_EXCLUDEFROMCAPTURE` during a take, while Replay was armed and
+    after relocking mid-take, and as none while nothing captured, while
+    arranging, with the toggle off, and after the take or Replay ended. Once
+    in 27 rounds of opens under armed Replay, Replay held ("the video encoder
+    stopped returning frames") about 1 s after an overlay opened; not seen
+    again, cause unknown.
+  - Fit to monitor: the window became exactly its monitor (3440×1440), still
+    click-through; off, it went back to its 480×480 place. Idle 3D-engine use
+    (dwm and Divora's processes, 15 s each) was 1.79 % with a GIF in the
+    480 window and 1.89 % fitted (0.17 % with the overlay off).
+  - Memory, with the worst scene the budgets allow (four 2048×2048 GIFs of
+    20 frames and three 4096×4096 PNGs): divora-app grew by at most 8 MB.
+    WebView2's private bytes went from 334 to 880 MB with every picture drawn
+    1080×1080 on a fitted 1920×1080 monitor, flat over 30 s. 20 open/close
+    cycles, each closed 300 ms after opening, added 1 MB to divora-app.
+  - A restart (the process stopped with the overlay open) kept the scene,
+    Fit and Hide; the overlay came back off, and opened Locked and fitted with
+    the picture on the same pixels. A main-window reload adopted the open
+    overlay.
+  - Not tried: real keys in a focused overlay (F5, Ctrl+P, Alt+Space, Alt+F4
+    and the rest); the hotkey in a game, and the keyboard's return to it; Win+D
+    and Win+M during a protected take; what OBS shows of the overlay, protected
+    or not; the taskbar and notifications while fitted; a display scale or
+    resolution change while fitted; mixed DPI; a game's present mode with the
+    overlay fitted; Windows 10 and Windows 11 21H2; a 12-bit or arithmetic
+    JPEG, or a GIF frame larger than its screen, in the real app; Discord,
+    Teams and the Snipping Tool while protected; a 4K display; a long Replay
+    with the toggle on.
 
-Drag, border, taskbar, focus and reopen behaviour can only be checked on a
-desktop: see "Stream overlay" in [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
+Drag, border, taskbar, focus and reopen behaviour from v1.51.3 is checked on a
+desktop too: see "Stream overlay (v1.16.0)" in
+[`MANUAL_TESTS.md`](MANUAL_TESTS.md).
 
 ## Screen recording (v1.52.0)
 
@@ -1799,6 +2494,16 @@ tooltip, which `quit_replay` sets directly, already on the main thread. While
 Replay is on, the tooltip says so (and with desktop audio) and how the last
 save went, the icon gains a red dot, and the menu gains Save replay and Turn
 Replay off — never a way to turn Replay on.
+
+From v1.55.0 the menu is built from `TrayItems {replay, lock_overlay}` through
+`tray_entries`: Show · Save replay · Turn Replay off · Lock the overlay ·
+Quit, each optional group set off by separators and shown only while it
+applies. `sync_tray` keeps Replay's half in `TRAY_REPLAY`, so the overlay can
+rebuild the menu without asking the recorder. `refresh_tray_menu` rebuilds
+only the menu (not the tooltip or icon), also on the main thread, when the
+overlay enters or leaves Arrange and when its window goes. The menu gains
+Lock the overlay (`overlay-lock`) only while arranging; it never starts
+Arrange.
 
 Quit waits for a save in progress for as long as its size needs (5 to 60 s,
 plus the cut's 1.2 s, worked out again once the clip is cut), then cancels it

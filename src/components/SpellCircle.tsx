@@ -13,7 +13,12 @@ import { EFFECTS } from "../data/effects";
 import type { ChainEntry, EffectId, VoiceStatus } from "../types";
 import { Sigil, type SigilName } from "./Sigil";
 
-const S = 440;
+/** The circle's own size in CSS px. v1.55.0: the overlay scales a box of
+ *  this size to fit the circle's place on the stage (scene.ts keeps an equal
+ *  `CIRCLE_PX`, and a test pins the two). */
+export const SPELL_CIRCLE_PX = 440;
+
+const S = SPELL_CIRCLE_PX;
 const C = S / 2;
 const NODE_R = 158;
 const CORE_R = 66;
@@ -28,6 +33,10 @@ export interface SpellCircleProps {
   selected: EffectId | null;
   onSelect: (id: EffectId) => void;
   onToggle: (id: EffectId) => void;
+  /** v1.55.0: drawing only, for the stream overlay. The nodes take no
+   *  pointer, focus or tooltip there: the overlay has no title tooltips, and
+   *  inspecting or toggling an effect does nothing in it. */
+  decorative?: boolean;
 }
 
 interface Node extends ChainEntry {
@@ -88,7 +97,15 @@ export function SpellCircle(props: SpellCircleProps): JSX.Element {
     `${(base / Math.max(props.motion, 0.001)).toFixed(1)}s`;
 
   return (
-    <div style={{ position: "relative", width: `${S}px`, height: `${S}px`, flex: "none" }}>
+    <div
+      style={{
+        position: "relative",
+        width: `${S}px`,
+        height: `${S}px`,
+        flex: "none",
+        "pointer-events": props.decorative ? "none" : undefined,
+      }}
+    >
       <svg
         width={S}
         height={S}
@@ -419,9 +436,15 @@ export function SpellCircle(props: SpellCircleProps): JSX.Element {
               type="button"
               onClick={() => props.onSelect(n.id)}
               onDblClick={() => props.onToggle(n.id)}
-              title={`${eff.name} — click to inspect, double-click to ${
-                n.enabled ? "disable" : "enable"
-              }`}
+              title={
+                props.decorative
+                  ? undefined
+                  : `${eff.name} — click to inspect, double-click to ${
+                      n.enabled ? "disable" : "enable"
+                    }`
+              }
+              tabIndex={props.decorative ? -1 : undefined}
+              aria-hidden={props.decorative ? "true" : undefined}
               style={{
                 position: "absolute",
                 left: `${n.x}px`,
@@ -435,6 +458,7 @@ export function SpellCircle(props: SpellCircleProps): JSX.Element {
                 background: "none",
                 padding: 0,
                 border: "none",
+                "pointer-events": props.decorative ? "none" : undefined,
               }}
             >
               <span

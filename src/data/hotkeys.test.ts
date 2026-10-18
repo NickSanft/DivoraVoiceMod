@@ -70,6 +70,7 @@ describe("readHotkeyBindings", () => {
       "rec:wav": "",
       "replay:save": "",
       "replay:toggle": "",
+      "overlay:arrange": "",
     };
     expect(readHotkeyBindings(null)).toEqual(none);
     expect(readHotkeyBindings("junk")).toEqual(none);
@@ -87,6 +88,7 @@ describe("readHotkeyBindings", () => {
       "rec:wav": "",
       "replay:save": "",
       "replay:toggle": "",
+      "overlay:arrange": "",
     });
   });
 
@@ -116,6 +118,15 @@ describe("readHotkeyBindings", () => {
     });
   });
 
+  // v1.55.0: a v1.54.0 save has no overlay key; it reads as unbound, and a
+  // binding round-trips like any other.
+  it("older save reads overlay:arrange as unbound", () => {
+    const read = readHotkeyBindings({ ptm: "F9", "replay:save": "F11" });
+    expect(read["overlay:arrange"]).toBe("");
+    expect(read).toMatchObject({ ptm: "F9", "replay:save": "F11" });
+    expect(readHotkeyBindings({ "overlay:arrange": "Ctrl+Win+O" })["overlay:arrange"]).toBe("Ctrl+Super+O");
+  });
+
   it("ignores a stored rec:replay key like any unknown key (it never shipped)", () => {
     const read = readHotkeyBindings({ "rec:replay": "F7", "rec:replay-arm": "F8" });
     expect(read).not.toHaveProperty("rec:replay");
@@ -125,7 +136,7 @@ describe("readHotkeyBindings", () => {
 });
 
 describe("HOTKEY_ACTIONS", () => {
-  it("lists Replay's two ids after the recorders (the order they register)", () => {
+  it("lists Replay's two ids after the recorders, and the overlay's last (the order they register)", () => {
     expect(HOTKEY_ACTIONS).toEqual([
       "ptm",
       "panic",
@@ -134,6 +145,7 @@ describe("HOTKEY_ACTIONS", () => {
       "rec:wav",
       "replay:save",
       "replay:toggle",
+      "overlay:arrange",
     ]);
   });
 });

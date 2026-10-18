@@ -7,8 +7,10 @@
 // double-click on the circle would blow a transparent always-on-top window
 // up to the whole screen. This handler only ever starts a drag.
 
-/** Elements that keep their own click; pressing them never moves the window. */
-const INTERACTIVE = "button, a, input, select, textarea, [role='button']";
+/** Elements that keep their own click; pressing them never moves the window.
+ *  v1.55.0: charms, their handles and the Arrange chrome too (the chrome's
+ *  Move window grip starts its own drag). */
+const INTERACTIVE = "button, a, input, select, textarea, [role='button'], [data-charm], [data-handle], [data-chrome]";
 
 export interface PressLike {
   button: number;
@@ -17,9 +19,15 @@ export interface PressLike {
   target: EventTarget | null;
 }
 
+/** v1.55.0: a single press of the left button — the only press that moves
+ *  the window (the second press of a double-click never does). */
+export function isPlainLeftPress(e: { button: number; detail: number }): boolean {
+  return e.button === 0 && e.detail === 1;
+}
+
 /** True for a plain left press on anything that isn't interactive. */
 export function startsWindowDrag(e: PressLike): boolean {
-  if (e.button !== 0 || e.detail !== 1) return false;
+  if (!isPlainLeftPress(e)) return false;
   const t = e.target;
   if (typeof Element === "undefined" || !(t instanceof Element)) return false;
   return t.closest(INTERACTIVE) === null;

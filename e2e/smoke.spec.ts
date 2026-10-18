@@ -2,7 +2,15 @@
 // Covers the core UI flows that docs/MANUAL_TESTS.md otherwise carries
 // entirely by hand. See e2e/tauri-mock.ts for the backend stub.
 
-import { test, expect, emitReplay, emitReplaySaved } from "./tauri-mock";
+import {
+  test,
+  expect,
+  emitOverlayStatus,
+  emitReplay,
+  emitReplaySaved,
+  emitsOf,
+  invokesOf,
+} from "./tauri-mock";
 
 const nav = (page: import("@playwright/test").Page, label: string) =>
   page.locator(".sidebar-nav", { hasText: label });
@@ -231,6 +239,84 @@ test.describe("stream overlay (v1.16)", () => {
     await expect(page.getByText("Stream overlay")).toBeVisible();
     await expect(page.getByText(/Show overlay window/i)).toBeVisible();
     await expect(page.getByText(/capture it in OBS/i)).toBeVisible();
+  });
+
+  // v1.55.0: the main window's side of Charms, against the mock backend. The
+  // mock can't read monitors (availableMonitors answers null), so the
+  // overlay opens unplaced (rect null) and Fit can't turn on.
+  test("Stream overlay controls render with monitors → null", async ({ page, consoleErrors }) => {
+    await nav(page, "Settings").click();
+
+    // Boot: main read the backend's status and pushed the stored Hide flag.
+    await expect.poll(() => invokesOf(page, "overlay_status")).toHaveLength(1);
+    expect((await invokesOf(page, "set_overlay_hide_from_recordings")).map((i) => i.args)).toEqual([
+      { enabled: false },
+    ]);
+
+    // The rows. Closed, Arrange is disabled; the backend says Hide works here.
+    const arrange = page.getByTestId("overlay-arrange");
+    await expect(arrange).toBeVisible();
+    await expect(arrange).toBeDisabled();
+    await expect(arrange).toHaveAttribute("aria-label", "Arrange the overlay");
+    const fit = page.getByRole("switch", { name: "Fit the overlay to its monitor" });
+    await expect(fit).toBeVisible();
+    await expect(fit).toHaveAttribute("aria-checked", "false");
+    await expect(page.getByRole("switch", { name: "Hide the overlay from recordings" })).toBeVisible();
+    const charms = page.getByTestId("overlay-charms");
+    await expect(charms).toBeVisible();
+    await expect(charms.locator('[data-charm-row="circle"]')).toContainText("Spell circle");
+    await expect(page.getByTestId("overlay-add-picture")).toBeEnabled();
+
+    // Fit with no readable monitors: it says so and stays off, and nothing
+    // breaks on the way.
+    await fit.click();
+    await expect(page.getByTestId("toast")).toHaveText("Couldn't read your monitors.");
+    await expect(fit).toHaveAttribute("aria-checked", "false");
+    expect(await invokesOf(page, "place_overlay")).toEqual([]);
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+
+    // Show the overlay: no saved place and no monitors → Windows' default
+    // spot, unfitted. The window starts hidden, so Arrange waits.
+    const show = page.getByRole("switch", { name: "Show stream overlay window" });
+    await show.click();
+    await expect.poll(() => invokesOf(page, "open_overlay")).toEqual([
+      { cmd: "open_overlay", args: { rect: null, fit: false } },
+    ]);
+    await expect(show).toHaveAttribute("aria-checked", "true");
+    await expect(arrange).toHaveText("Starting…");
+    await expect(arrange).toBeDisabled();
+    // The migrated scene is saved the first time the overlay is seen open,
+    // and pushed to it.
+    expect(
+      await page.evaluate(() => JSON.parse(localStorage.getItem("divora.overlayScene") ?? "null")),
+    ).toMatchObject({ version: 1, frame: "window", elements: [{ id: "circle", type: "spellcircle" }] });
+    await expect
+      .poll(async () => (await emitsOf(page, "overlay:scene")).length)
+      .toBeGreaterThanOrEqual(1);
+
+    // Still starting while nothing else is heard; the shown status alone
+    // doesn't allow Arrange either.
+    await page.waitForTimeout(300);
+    await expect(arrange).toHaveText("Starting…");
+    await emitOverlayStatus(page, { phase: "shown" });
+    await expect(arrange).toHaveText("Starting…");
+    await expect(arrange).toBeDisabled();
+
+    // Painted: Arrange is offered.
+    await emitOverlayStatus(page, { phase: "painted", canArrange: true });
+    await expect(arrange).toHaveText("Arrange");
+    await expect(arrange).toBeEnabled();
+    await expect(arrange).toHaveAttribute("aria-label", "Arrange the overlay");
+
+    await arrange.click();
+    await expect.poll(() => invokesOf(page, "set_overlay_mode")).toEqual([
+      { cmd: "set_overlay_mode", args: { mode: "arrange" } },
+    ]);
+    // The backend's answer puts the button on Lock.
+    await expect(arrange).toHaveText("Lock");
+    await expect(arrange).toHaveAttribute("aria-label", "Lock the overlay");
+
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
 });
 

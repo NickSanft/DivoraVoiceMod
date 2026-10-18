@@ -67,9 +67,14 @@ describe("decideWhatsNew", () => {
 
 describe("notesSince", () => {
   it("returns just the running version when there's no marker", () => {
-    const got = notesSince(null, "1.48.0");
-    expect(got.notes.map((n) => n.version)).toEqual(["1.48.0"]);
+    // v1.55.0: read from what is bundled, not pinned (a pinned "1.48.0" ages
+    // out of the window). Not the newest, so returning RELEASE_NOTES[0]
+    // can't pass by accident.
+    const current = RELEASE_NOTES[1]!.version;
+    const got = notesSince(null, current);
+    expect(got.notes.map((n) => n.version)).toEqual([current]);
     expect(got.moreCount).toBe(0);
+    expect(got.moreUnknown).toBe(false);
   });
 
   it("returns the range, newest first", () => {

@@ -151,41 +151,44 @@ impl ScreenRecorder {
         s.spawning = true;
         drop(s);
 
+        // v1.55.0: the overlay hides first, if it should, before the ring
+        // captures; never under the lock (it may wait for the main thread).
+        let cleared = crate::overlay_windows::before_capture(app);
         let mut screen = req.screen;
         screen.stems = false;
-        let started =
-            self.open_feed(app, engine, &screen, false)
-                .and_then(|(feed, desk, opened)| {
-                    let opts = RecordOptions {
-                        fps: screen.fps,
-                        max_size: DEFAULT_MAX,
-                        bitrate: Some(bitrate),
-                        cursor: screen.cursor,
-                        audio: TrackOptions {
-                            desktop_gain_db: opened.then_some(screen.desktop_gain_db),
-                            stems: false,
-                        },
-                    };
-                    let feed = Box::new(feed.watch_engine(Arc::clone(engine)));
-                    divora_capture::spawn_pipeline(
-                        pipeline_settings(&screen.monitor_id, &opts),
-                        feed,
-                        self.pipeline_events(app, engine),
-                        PipelineCommand::Arm { seconds, cap_bytes },
-                    )
-                    .map(|h| (h, desk))
-                    .map_err(|e| {
-                        engine.detach_av_tap();
-                        match e {
-                            StartError::Direct { why, .. } => {
-                                tracing::warn!(why, "replay can't use the direct encoder");
-                                self.lock().direct_failure = Some(why);
-                                NO_DIRECT.to_string()
-                            }
-                            StartError::Other(e) => e.to_string(),
+        let started = self
+            .open_feed(&cleared, app, engine, &screen, false)
+            .and_then(|(feed, desk, opened)| {
+                let opts = RecordOptions {
+                    fps: screen.fps,
+                    max_size: DEFAULT_MAX,
+                    bitrate: Some(bitrate),
+                    cursor: screen.cursor,
+                    audio: TrackOptions {
+                        desktop_gain_db: opened.then_some(screen.desktop_gain_db),
+                        stems: false,
+                    },
+                };
+                let feed = Box::new(feed.watch_engine(Arc::clone(engine)));
+                divora_capture::spawn_pipeline(
+                    pipeline_settings(&screen.monitor_id, &opts),
+                    feed,
+                    self.pipeline_events(app, engine),
+                    PipelineCommand::Arm { seconds, cap_bytes },
+                )
+                .map(|h| (h, desk))
+                .map_err(|e| {
+                    engine.detach_av_tap();
+                    match e {
+                        StartError::Direct { why, .. } => {
+                            tracing::warn!(why, "replay can't use the direct encoder");
+                            self.lock().direct_failure = Some(why);
+                            NO_DIRECT.to_string()
                         }
-                    })
-                });
+                        StartError::Other(e) => e.to_string(),
+                    }
+                })
+            });
         match started {
             Ok((h, desk)) => {
                 self.spawned(Some((h, settings, desk, None)));
@@ -421,11 +424,14 @@ impl ScreenRecorder {
 
 /// Replay's status out as an event, and the tray to match — under the
 /// recorder's lock, so they go out in the order the state changed. Neither
-/// waits: the event is queued, the tray posted to the main thread.
+/// waits: the event is queued, the tray posted to the main thread. v1.55.0:
+/// the overlay hears whether anything still captures, and doesn't wait
+/// either.
 fn publish(app: &AppHandle, s: &Shared) -> ReplayStatus {
     let st = status(s);
     let _ = app.emit(EVENT_BUFFER, &st);
     crate::sync_tray(app, tray(s));
+    super::note_capture(app, s);
     st
 }
 

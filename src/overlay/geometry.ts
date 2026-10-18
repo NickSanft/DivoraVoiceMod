@@ -9,6 +9,7 @@
 // `setSize(PhysicalSize)` once the window exists. Pure, so the arithmetic is
 // tested without a window.
 
+import type { PxRect } from "./scene";
 import { OVERLAY_BG_COLOR, type OverlayBg } from "./state";
 
 /** A rectangle in physical pixels. */
@@ -84,11 +85,13 @@ export function isSavablePosition(x: number, y: number): boolean {
 /** The blob to write: what was stored, with `bg` and the geometry replaced.
  *  Keys this build doesn't know are kept (the surface is additive-only, so a
  *  newer build's fields must survive an older one saving). Null geometry
- *  removes the geometry keys rather than leaving stale ones behind. */
+ *  removes the geometry keys rather than leaving stale ones behind. v1.55.0:
+ *  `flags` sets the switches it names and keeps the others as stored. */
 export function mergeOverlayPrefs(
   stored: unknown,
   bg: OverlayBg,
   geometry: OverlayGeometry | null,
+  flags: Partial<OverlayFlags> = {},
 ): Record<string, unknown> {
   const base: Record<string, unknown> =
     typeof stored === "object" && stored !== null && !Array.isArray(stored)
@@ -104,6 +107,8 @@ export function mergeOverlayPrefs(
     if (geometry.monitor !== undefined) base.monitor = geometry.monitor;
     if (geometry.scale !== undefined) base.scale = geometry.scale;
   }
+  if (flags.fit !== undefined) base.fit = flags.fit;
+  if (flags.hideFromRecordings !== undefined) base.hideFromRecordings = flags.hideFromRecordings;
   return base;
 }
 
@@ -117,12 +122,95 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(Math.max(n, lo), Math.max(lo, hi));
 }
 
-/** Where to put the overlay, given where it was and the monitors that exist
- *  now; null when there are no monitors to place it on.
+/** v1.55.0: the monitor the overlay belongs on; null when there are none.
  *
- *  1. Back on the monitor it was on, if that monitor still exists.
- *  2. Otherwise on whichever monitor the old rectangle overlaps most.
- *  3. Otherwise on the primary monitor (an unplugged second screen).
+ *  1. The monitor it was on, if that monitor still exists.
+ *  2. Otherwise whichever monitor the old rectangle overlaps most.
+ *  3. Otherwise the primary monitor (an unplugged second screen), or the
+ *     first one listed.
+ *
+ *  With nothing saved (a window that was never moved), the primary. */
+export function pickMonitor(
+  saved: OverlayGeometry | null,
+  monitors: MonitorInfo[],
+  primaryName: string | null = null,
+): MonitorInfo | null {
+  if (monitors.length === 0) return null;
+  let target: MonitorInfo | undefined;
+  if (saved) {
+    if (saved.monitor !== undefined) {
+      target = monitors.find((m) => m.name === saved.monitor);
+    }
+    if (!target) {
+      const was: Rect = { x: saved.x, y: saved.y, width: saved.w, height: saved.h };
+      let best = 0;
+      for (const m of monitors) {
+        const a = overlap(was, m);
+        if (a > best) {
+          best = a;
+          target = m;
+        }
+      }
+    }
+  }
+  if (!target && primaryName !== null) {
+    target = monitors.find((m) => m.name === primaryName);
+  }
+  return target ?? monitors[0]!;
+}
+
+/** v1.55.0: Fit to monitor's window — the whole of the monitor
+ *  `pickMonitor` chooses (not its work area); null with no monitors. */
+export function fitRect(
+  saved: OverlayGeometry | null,
+  monitors: MonitorInfo[],
+  primaryName: string | null = null,
+): Rect | null {
+  const m = pickMonitor(saved, monitors, primaryName);
+  return m ? { x: m.x, y: m.y, width: m.width, height: m.height } : null;
+}
+
+/** v1.55.0: a window rectangle and its monitor in the overlay's CSS px,
+ *  relative to the monitor's top-left: what a scene `reframe` maps
+ *  between. */
+export function canvasRects(windowRect: Rect, monitor: MonitorInfo): { window: PxRect; monitor: PxRect } {
+  const s = Number.isFinite(monitor.scaleFactor) && monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
+  return {
+    window: {
+      x: (windowRect.x - monitor.x) / s,
+      y: (windowRect.y - monitor.y) / s,
+      w: windowRect.width / s,
+      h: windowRect.height / s,
+    },
+    monitor: { x: 0, y: 0, w: monitor.width / s, h: monitor.height / s },
+  };
+}
+
+/** v1.55.0: the overlay's switches in `divora.overlay`. */
+export interface OverlayFlags {
+  /** Fit to monitor, as the user set it. It counts only with the
+   *  Transparent background (`effectiveFit`). */
+  fit: boolean;
+  hideFromRecordings: boolean;
+}
+
+/** The switches from a stored blob; off unless stored as `true`. */
+export function readOverlayFlags(raw: unknown): OverlayFlags {
+  const o = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+  return { fit: o.fit === true, hideFromRecordings: o.hideFromRecordings === true };
+}
+
+/** Whether Fit to monitor applies. A colour background on a window the
+ *  size of the monitor would paint the whole screen, so Fit needs
+ *  Transparent; a `{bg: "green", fit: true}` written by mixing builds reads
+ *  as off. */
+export function effectiveFit(flags: OverlayFlags, bg: OverlayBg): boolean {
+  return flags.fit && bg === "transparent";
+}
+
+/** Where to put the overlay, given where it was and the monitors that exist
+ *  now; null when there are no monitors to place it on. The monitor is
+ *  `pickMonitor`'s.
  *
  *  If that monitor's scale factor differs from the one saved, the size is
  *  scaled by the ratio so the window keeps its apparent size. The result is
@@ -132,27 +220,8 @@ export function placeOverlay(
   monitors: MonitorInfo[],
   primaryName: string | null = null,
 ): Rect | null {
-  if (monitors.length === 0) return null;
-  const was: Rect = { x: saved.x, y: saved.y, width: saved.w, height: saved.h };
-
-  let target: MonitorInfo | undefined;
-  if (saved.monitor !== undefined) {
-    target = monitors.find((m) => m.name === saved.monitor);
-  }
-  if (!target) {
-    let best = 0;
-    for (const m of monitors) {
-      const a = overlap(was, m);
-      if (a > best) {
-        best = a;
-        target = m;
-      }
-    }
-  }
-  if (!target && primaryName !== null) {
-    target = monitors.find((m) => m.name === primaryName);
-  }
-  target ??= monitors[0]!;
+  const target = pickMonitor(saved, monitors, primaryName);
+  if (!target) return null;
 
   let width = saved.w;
   let height = saved.h;

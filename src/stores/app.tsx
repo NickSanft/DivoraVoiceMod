@@ -99,6 +99,17 @@ import {
   saveReplay as saveReplayCmd,
   subscribeReplayBuffer,
   subscribeReplaySaved,
+  openOverlayWindow,
+  closeOverlayWindow,
+  placeOverlayWindow,
+  setOverlayMode as setOverlayModeCmd,
+  setOverlayHideFromRecordings,
+  overlayStatus as overlayStatusCmd,
+  importOverlayAsset,
+  deleteOverlayAsset,
+  pickImageFile,
+  subscribeOverlayStatus,
+  subscribeOverlayEdit,
   type CaptureMonitor,
   type CaptureStatus,
   type DesktopAudioSource,
@@ -177,21 +188,21 @@ import {
 } from "../data/unistroke";
 import type { ReactiveConfig, ReactiveRouteSpec } from "../audio/api";
 import type { Point } from "../data/glyphs";
-import type { OverlayBg } from "../overlay/state";
+import type { OverlayBg, ScenePush } from "../overlay/state";
+import type { OverlayScene } from "../overlay/scene";
+import type { OverlayStatus } from "../overlay/status";
+import {
+  createOverlayController,
+  OVERLAY_PREFS_KEY,
+  OVERLAY_SCENE_KEY,
+  tauriOverlayWindows,
+} from "../overlay/controller";
 import {
   keysToAccelerator,
   normalizeAccelerator,
   readHotkeyBindings,
   unboundHotkeys,
 } from "../data/hotkeys";
-import {
-  isSavablePosition,
-  mergeOverlayPrefs,
-  placeOverlay,
-  readGeometry,
-  readOverlayBg,
-  type OverlayGeometry,
-} from "../overlay/geometry";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
@@ -272,7 +283,8 @@ export interface AbSnapshots {
 
 /** Stable id used for the system-wide hotkeys we register. v1.52.0 adds the
  *  recorders, under the reserved `rec:` prefix; v1.54.0 adds Replay's save
- *  and on/off, under `replay:`. */
+ *  and on/off, under `replay:`; v1.55.0 the stream overlay's Arrange / Lock
+ *  switch, under `overlay:`. */
 export type HotkeyAction =
   | "ptm"
   | "panic"
@@ -280,7 +292,8 @@ export type HotkeyAction =
   | "rec:screen"
   | "rec:wav"
   | "replay:save"
-  | "replay:toggle";
+  | "replay:toggle"
+  | "overlay:arrange";
 
 /** localStorage keys for Phase 8 persistence (tile metadata + recent folders). */
 /** Reactive intensity is a 0..100 percentage everywhere in the UI. */
@@ -311,7 +324,10 @@ const STORAGE_KEYS = {
   updateCheckEnabled: "divora.updateCheckEnabled",
   glyphBindings: "divora.glyphBindings",
   customGlyphs: "divora.customGlyphs",
-  overlay: "divora.overlay",
+  overlay: OVERLAY_PREFS_KEY,
+  // v1.55.0: the overlay's charms and where they sit. Written only by main
+  // (overlay/controller.ts).
+  overlayScene: OVERLAY_SCENE_KEY,
   reactive: "divora.reactive",
   ttsVoice: "divora.ttsVoice",
   ttsVolume: "divora.ttsVolume",
@@ -352,6 +368,18 @@ function loadJson<T>(key: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+/** `bytes` random bytes as lowercase hex (overlay element ids, and the page
+ *  load's session). */
+function randomHex(bytes: number): string {
+  const b = new Uint8Array(bytes);
+  try {
+    crypto.getRandomValues(b);
+  } catch {
+    for (let i = 0; i < bytes; i += 1) b[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 function saveJson(key: string, value: unknown): void {
@@ -485,15 +513,35 @@ export interface AppState {
     path: Point[],
   ) => { id: string; template: Point[] } | null;
 
-  // Stream overlay (v1.16.0)
-  /** Whether the transparent spell-circle overlay window is open. */
+  // Stream overlay (v1.16.0; charms v1.55.0 — overlay/controller.ts)
+  /** Whether the overlay window exists, as the backend reports it. */
   overlayOpen: () => boolean;
-  /** Overlay background mode (persisted): alpha, or a chroma colour. */
+  /** The backend's whole overlay status (phase, mode, fit, hide…). */
+  overlayStatus: () => OverlayStatus;
+  overlayMode: () => "locked" | "arrange";
+  /** Overlay background mode (persisted): alpha, or a chroma colour. A
+   *  colour turns Fit to monitor off first, and isn't applied if that
+   *  fails. */
   overlayBg: () => OverlayBg;
-  setOverlayBg: (bg: OverlayBg) => void;
-  /** Open / close the overlay window (a second transparent Tauri window). */
+  setOverlayBg: (bg: OverlayBg) => Promise<void>;
+  /** Fit to monitor (persisted); it needs the Transparent background. */
+  overlayFit: () => boolean;
+  setOverlayFit: (on: boolean) => Promise<void>;
+  /** Hide from recordings (persisted), pushed to the backend. */
+  overlayHide: () => boolean;
+  setOverlayHide: (on: boolean) => Promise<void>;
+  /** The charms (`divora.overlayScene`), and what was last pushed. */
+  overlayScene: () => OverlayScene;
+  overlayScenePush: () => ScenePush;
+  /** Open / close the overlay window; the backend creates and shows it. */
   openOverlay: () => Promise<void>;
   closeOverlay: () => Promise<void>;
+  setOverlayMode: (mode: "locked" | "arrange") => Promise<void>;
+  /** The `overlay:arrange` hotkey's notice; the backend acts on the key. */
+  noteOverlayHotkey: () => void;
+  addOverlayPicture: () => Promise<void>;
+  removeOverlayElement: (id: string) => Promise<void>;
+  addSpellCircle: () => void;
 
   // Audio engine
   audioInputs: () => DeviceInfo[];
@@ -1084,236 +1132,43 @@ export function createAppState(): AppState {
   // the spell circle for OBS; the main window pushes state to it (App.tsx,
   // via overlay/sync.ts).
   //
-  // v1.51.3: the window remembers where it was (in physical pixels, see
-  // overlay/geometry.ts), opens there without taking focus, and really
-  // closes when switched off (lib.rs `hides_on_close`).
-  const storedOverlay = loadJson<unknown>(STORAGE_KEYS.overlay, null);
-  const [overlayOpen, setOverlayOpen] = createSignal(false);
-  const [overlayBg, setOverlayBgRaw] = createSignal<OverlayBg>(
-    readOverlayBg(
-      typeof storedOverlay === "object" && storedOverlay !== null
-        ? (storedOverlay as { bg?: unknown }).bg
-        : undefined,
-    ),
-  );
-  let overlayGeometry: OverlayGeometry | null = readGeometry(storedOverlay);
-  const saveOverlayPrefs = (): void => {
-    saveJson(
-      STORAGE_KEYS.overlay,
-      mergeOverlayPrefs(loadJson<unknown>(STORAGE_KEYS.overlay, null), overlayBg(), overlayGeometry),
-    );
-  };
-  const setOverlayBg = (bg: OverlayBg): void => {
-    setOverlayBgRaw(bg);
-    saveOverlayPrefs();
-  };
-
-  type OverlayWindow = import("@tauri-apps/api/webviewWindow").WebviewWindow;
-  let overlayUnlisten: Array<() => void> = [];
-  let overlaySaveTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** Read where the overlay is now and remember it. */
-  const saveOverlayGeometry = async (w: OverlayWindow): Promise<void> => {
-    try {
-      if (await w.isMinimized()) return;
-      const [pos, size] = await Promise.all([w.outerPosition(), w.innerSize()]);
-      if (!isSavablePosition(pos.x, pos.y) || size.width <= 0 || size.height <= 0) return;
-      // The monitor under the overlay's centre. (`currentMonitor()` would be
-      // the monitor of the window *calling* it, which is main.) Both are in
-      // physical pixels, as `MonitorFromPoint` expects.
-      const { monitorFromPoint } = await import("@tauri-apps/api/window");
-      const monitor = await monitorFromPoint(
-        pos.x + size.width / 2,
-        pos.y + size.height / 2,
-      );
-      overlayGeometry = {
-        x: pos.x,
-        y: pos.y,
-        w: size.width,
-        h: size.height,
-        ...(monitor?.name ? { monitor: monitor.name } : {}),
-        ...(monitor ? { scale: monitor.scaleFactor } : {}),
-      };
-      saveOverlayPrefs();
-    } catch {
-      /* the window went away mid-read: keep the last good geometry */
-    }
-  };
-  const stopTrackingOverlay = (): void => {
-    if (overlaySaveTimer !== null) clearTimeout(overlaySaveTimer);
-    overlaySaveTimer = null;
-    for (const un of overlayUnlisten) un();
-    overlayUnlisten = [];
-  };
-  /** Save after a move or resize settles; a drag fires dozens of events. */
-  const trackOverlay = async (w: OverlayWindow): Promise<void> => {
-    stopTrackingOverlay();
-    const schedule = (): void => {
-      if (overlaySaveTimer !== null) clearTimeout(overlaySaveTimer);
-      overlaySaveTimer = setTimeout(() => {
-        overlaySaveTimer = null;
-        void saveOverlayGeometry(w);
-      }, 400);
-    };
-    try {
-      overlayUnlisten.push(await w.onMoved(schedule), await w.onResized(schedule));
-    } catch {
-      /* tracking is a convenience; the window still works without it */
-    }
-  };
-
-  let overlayCloseUnlisten: (() => void) | null = null;
-  /** Notice when this overlay window goes away (its own close, Alt+F4, the
-   *  app's toggle), so `overlayOpen` never claims a window that isn't there.
-   *  Every path that leaves a visible overlay goes through here, including a
-   *  main-window reload (F5) that finds one still on screen. */
-  const watchOverlayClose = async (w: OverlayWindow): Promise<void> => {
-    overlayCloseUnlisten?.();
-    overlayCloseUnlisten = null;
-    try {
-      overlayCloseUnlisten = await w.once("tauri://destroyed", () => {
-        overlayCloseUnlisten = null;
-        stopTrackingOverlay();
-        setOverlayOpen(false);
-      });
-    } catch {
-      /* not under Tauri */
-    }
-  };
-
-  /** Put a new overlay where it was last time, then show it. */
-  const placeAndShowOverlay = async (w: OverlayWindow): Promise<void> => {
-    const saved = overlayGeometry;
-    if (saved) {
-      try {
-        const win = await import("@tauri-apps/api/window");
-        const [monitors, primary] = await Promise.all([
-          win.availableMonitors(),
-          win.primaryMonitor(),
-        ]);
-        const rect = placeOverlay(
-          saved,
-          monitors.map((m) => ({
-            name: m.name,
-            x: m.position.x,
-            y: m.position.y,
-            width: m.size.width,
-            height: m.size.height,
-            scaleFactor: m.scaleFactor,
-          })),
-          primary?.name ?? null,
-        );
-        if (rect) {
-          const { PhysicalPosition, PhysicalSize } = await import("@tauri-apps/api/dpi");
-          const pos = new PhysicalPosition(rect.x, rect.y);
-          const size = new PhysicalSize(rect.width, rect.height);
-          // Windows rescales a window (WM_DPICHANGED) whenever most of it
-          // crosses onto a monitor with a different scale, and that can
-          // happen on the resize as well as on the move. So size it, move
-          // it, then read back and repeat until it is exactly where and as
-          // big as it should be (bounded: the rect lies wholly on one
-          // monitor, so a second pass has nothing left to rescale).
-          for (let attempt = 0; attempt < 3; attempt++) {
-            await w.setSize(size);
-            await w.setPosition(pos);
-            const [p, s] = await Promise.all([w.outerPosition(), w.innerSize()]);
-            if (p.x === rect.x && p.y === rect.y && s.width === rect.width && s.height === rect.height) {
-              break;
-            }
-          }
-        }
-      } catch {
-        /* keep the default position rather than not showing it */
-      }
-    }
-    try {
-      // Created with `focus: false`, so this first show doesn't take focus
-      // from whatever the user is in (tao shows it SW_SHOWNOACTIVATE).
-      await w.show();
-    } catch {
-      /* ignore */
-    }
-    await trackOverlay(w);
-  };
-
-  const openOverlay = async (): Promise<void> => {
-    try {
-      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      const existing = await WebviewWindow.getByLabel("overlay");
-      if (existing) {
-        // It exists but may be hidden: show it, or the toggle reads "on"
-        // over a window nobody can see. Then take charge of it as if we had
-        // just created it, or its close and its moves would go unnoticed.
-        await existing.show();
-        setOverlayOpen(true);
-        await watchOverlayClose(existing);
-        await trackOverlay(existing);
-        return;
-      }
-      const w = new WebviewWindow("overlay", {
-        url: "overlay.html",
-        title: "DivoraVoice Overlay",
-        width: 480,
-        height: 480,
-        transparent: true,
-        decorations: false,
-        // An undecorated transparent window keeps a 1 px border unless the
-        // shadow is off (tauri #8308).
-        shadow: false,
-        alwaysOnTop: true,
-        skipTaskbar: true,
-        resizable: true,
-        maximizable: false,
-        // Hidden until it is in place, and it never takes focus on open.
-        visible: false,
-        focus: false,
-      });
-      void watchOverlayClose(w);
-      void w.once("tauri://created", () => {
-        setOverlayOpen(true);
-        void placeAndShowOverlay(w);
-      });
-      void w.once("tauri://error", () => setOverlayOpen(false));
-    } catch {
-      /* not under Tauri (browser / E2E): overlay is desktop-only */
-    }
-  };
-  // A reload of the main window (F5 / Ctrl+R) restarts this store while
-  // the overlay stays on screen. Adopt it, so the toggle reads "on" and its
-  // close and moves are noticed. No-op when there is none, or off Tauri.
-  void (async () => {
-    try {
-      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      const existing = await WebviewWindow.getByLabel("overlay");
-      if (existing && (await existing.isVisible())) {
-        setOverlayOpen(true);
-        await watchOverlayClose(existing);
-        await trackOverlay(existing);
-      }
-    } catch {
-      /* not under Tauri */
-    }
-  })();
-
-  const closeOverlay = async (): Promise<void> => {
-    try {
-      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      const w = await WebviewWindow.getByLabel("overlay");
-      if (w) {
-        // A move that hasn't settled yet would otherwise be lost.
-        if (overlaySaveTimer !== null) {
-          stopTrackingOverlay();
-          await saveOverlayGeometry(w);
-        }
-        // Destroys it since v1.51.3: only `main` hides on close.
-        await w.close();
-      }
-    } catch {
-      /* ignore */
-    }
-    stopTrackingOverlay();
-    setOverlayOpen(false);
-  };
+  // v1.55.0: the backend creates, places and shows the window and owns its
+  // mode; main says where it goes and owns the charms. All of that lives in
+  // overlay/controller.ts, which also pushes the scene. Its toasts call
+  // `showToast` (below) only after an await, once this store is built.
+  const overlay = createOverlayController({
+    api: {
+      open: (rect, fit) => openOverlayWindow({ rect, fit }),
+      close: closeOverlayWindow,
+      place: placeOverlayWindow,
+      setMode: setOverlayModeCmd,
+      setHide: setOverlayHideFromRecordings,
+      status: overlayStatusCmd,
+      importAsset: importOverlayAsset,
+      deleteAsset: deleteOverlayAsset,
+      pickImage: pickImageFile,
+      subscribeStatus: subscribeOverlayStatus,
+      subscribeEdit: subscribeOverlayEdit,
+    },
+    events: {
+      emit: async (event, payload) => {
+        const { emit } = await import("@tauri-apps/api/event");
+        await emit(event, payload);
+      },
+      listen: async (event, handler) => {
+        const { listen } = await import("@tauri-apps/api/event");
+        return listen(event, (e) => handler(e.payload));
+      },
+    },
+    windows: tauriOverlayWindows(),
+    storage: {
+      load: (key) => loadJson<unknown>(key, null),
+      save: saveJson,
+    },
+    toast: (text, tone) => showToast(text, tone),
+    newId: () => `c-${randomHex(4)}`,
+    session: randomHex(8),
+  });
 
   // Audio engine signals.
   const [audioInputs, setAudioInputs] = createSignal<DeviceInfo[]>([]);
@@ -3752,11 +3607,24 @@ export function createAppState(): AppState {
     dispatchGlyphAction,
     recognizeCustomGlyph,
 
-    overlayOpen,
-    overlayBg,
-    setOverlayBg,
-    openOverlay,
-    closeOverlay,
+    overlayOpen: overlay.overlayOpen,
+    overlayStatus: overlay.overlayStatus,
+    overlayMode: overlay.overlayMode,
+    overlayBg: overlay.overlayBg,
+    setOverlayBg: overlay.setOverlayBg,
+    overlayFit: overlay.overlayFit,
+    setOverlayFit: overlay.setOverlayFit,
+    overlayHide: overlay.overlayHide,
+    setOverlayHide: overlay.setOverlayHide,
+    overlayScene: overlay.overlayScene,
+    overlayScenePush: overlay.overlayScenePush,
+    openOverlay: overlay.openOverlay,
+    closeOverlay: overlay.closeOverlay,
+    setOverlayMode: overlay.setOverlayMode,
+    noteOverlayHotkey: overlay.noteOverlayHotkey,
+    addOverlayPicture: overlay.addOverlayPicture,
+    removeOverlayElement: overlay.removeOverlayElement,
+    addSpellCircle: overlay.addSpellCircle,
 
     audioInputs,
     setAudioInputs,

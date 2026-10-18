@@ -31,6 +31,7 @@ import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
+import { charmLabels, layoutScene, MAX_PICTURES, pictureCount } from "../overlay/scene";
 import { openExternal } from "../lib/openExternal";
 import { EFFECTS } from "../data/effects";
 import {
@@ -1196,6 +1197,13 @@ const HOTKEY_ROWS: HotkeyRowDef[] = [
     desc: "Works once you've turned Replay on from the Record screen card.",
     icon: "replay",
   },
+  // v1.55.0. Not "Stream overlay": e2e finds that section by the phrase.
+  {
+    action: "overlay:arrange",
+    label: "Arrange or lock the overlay",
+    desc: "Switches the overlay between Arrange and Locked while it's open.",
+    icon: "unlock",
+  },
 ];
 
 function HotkeysSection(): JSX.Element {
@@ -2151,10 +2159,148 @@ function DiagnosticsSection(): JSX.Element {
   );
 }
 
-// ---------- Stream overlay (v1.16.0) ----------
+// ---------- Stream overlay (v1.16.0; charms v1.55.0) ----------
+
+const helpStyle: JSX.CSSProperties = {
+  "font-size": "var(--t-xs)",
+  color: "var(--text-lo)",
+  "line-height": 1.5,
+};
+const reasonStyle: JSX.CSSProperties = {
+  "font-size": "var(--t-xs)",
+  color: "var(--warning)",
+  "line-height": 1.5,
+};
+
+/** v1.55.0: the overlay opens Locked; Arrange makes its charms movable. The
+ *  backend says when Arrange is possible (`canArrange`, once the overlay has
+ *  drawn), and the button follows its mode. */
+function OverlayArrangeButton(): JSX.Element {
+  const app = useApp();
+  const s = () => app.overlayStatus();
+  const arranging = () => s().mode === "arrange";
+  // Starting, the visible text is the reason, and the name.
+  const starting = () => s().open && s().phase !== "closing" && !s().canArrange;
+  return (
+    <Button
+      size="sm"
+      data-testid="overlay-arrange"
+      icon={arranging() ? "lock" : "unlock"}
+      aria-label={starting() ? undefined : arranging() ? "Lock the overlay" : "Arrange the overlay"}
+      disabled={!s().canArrange}
+      onClick={() => void app.setOverlayMode(arranging() ? "locked" : "arrange")}
+    >
+      {starting() ? "Starting…" : arranging() ? "Lock" : "Arrange"}
+    </Button>
+  );
+}
+
+/** v1.55.0: what the overlay shows, front-most first. No thumbnails:
+ *  Settings never loads a picture. */
+function OverlayCharmRows(): JSX.Element {
+  const app = useApp();
+  const scene = () => app.overlayScene();
+  const labels = createMemo(() => charmLabels(scene()));
+  // `layoutScene` draws back to front; the list reads front to back.
+  const charms = createMemo(() =>
+    layoutScene(scene(), scene().designSize)
+      .map((r) => r.el)
+      .reverse(),
+  );
+  const full = () => pictureCount(scene()) >= MAX_PICTURES;
+  const hasCircle = () => charms().some((e) => e.type === "spellcircle");
+  return (
+    <div
+      data-testid="overlay-charms"
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+        "border-top": "1px solid var(--line)",
+        "padding-top": "var(--s4)",
+      }}
+    >
+      <div class="eyebrow">Charms</div>
+      <For each={charms()}>
+        {(el) => {
+          const label = () => labels().get(el.id) ?? "Picture";
+          return (
+            <div
+              data-charm-row={el.id}
+              style={{
+                display: "flex",
+                "align-items": "center",
+                "justify-content": "space-between",
+                gap: "var(--s4)",
+              }}
+            >
+              <span
+                style={{
+                  display: "inline-flex",
+                  "align-items": "center",
+                  gap: "var(--s2)",
+                  "min-width": 0,
+                  "font-size": "var(--t-sm)",
+                  color: "var(--text-mid)",
+                }}
+              >
+                <Sigil name={el.type === "spellcircle" ? "modulated" : "image"} size={16} />
+                <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                  {el.type === "image"
+                    ? `${label()} · ${el.nw}×${el.nh}${el.anim === true ? " · animated" : ""}`
+                    : label()}
+                </span>
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Remove ${label()}`}
+                onClick={() => void app.removeOverlayElement(el.id)}
+              >
+                Remove
+              </Button>
+            </div>
+          );
+        }}
+      </For>
+      <div style={{ display: "flex", gap: "var(--s3)", "flex-wrap": "wrap" }}>
+        <Button
+          size="sm"
+          icon="image"
+          data-testid="overlay-add-picture"
+          disabled={full()}
+          onClick={() => void app.addOverlayPicture()}
+        >
+          Add picture…
+        </Button>
+        <Show when={!hasCircle()}>
+          <Button size="sm" icon="modulated" onClick={() => app.addSpellCircle()}>
+            Add the spell circle
+          </Button>
+        </Show>
+      </div>
+      <Show when={full()}>
+        <div style={reasonStyle}>The overlay holds up to 16 pictures.</div>
+      </Show>
+      <div style={helpStyle}>
+        If you use OBS, add images in OBS. Charms are for the window OBS captures and for
+        recordings without OBS.
+      </div>
+    </div>
+  );
+}
 
 function StreamOverlaySection(): JSX.Element {
   const app = useApp();
+  // A colour background on a window the size of the monitor would paint the
+  // whole screen, so the two exclude each other.
+  const fitted = () => app.overlayFit() || app.overlayStatus().fit;
+  const chroma = (value: OverlayBg, label: string) => ({
+    value,
+    label,
+    disabled: fitted(),
+    title: fitted() ? "Turn off Fit to monitor to use a colour background." : undefined,
+  });
   return (
     <section>
       <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
@@ -2180,28 +2326,62 @@ function StreamOverlaySection(): JSX.Element {
           <Segmented<OverlayBg>
             options={[
               { value: "transparent", label: "Transparent" },
-              { value: "green", label: "Green" },
-              { value: "magenta", label: "Magenta" },
+              chroma("green", "Green"),
+              chroma("magenta", "Magenta"),
             ]}
             value={app.overlayBg()}
-            onChange={(v) => app.setOverlayBg(v)}
+            onChange={(v) => void app.setOverlayBg(v)}
           />
         </Row>
-        <div
-          style={{
-            "font-size": "var(--t-xs)",
-            color: "var(--text-lo)",
-            "line-height": 1.5,
-          }}
-        >
+        <Row label="Move and resize" icon="unlock">
+          <OverlayArrangeButton />
+        </Row>
+        <div style={helpStyle}>
+          Locked, clicks go through the overlay to whatever is under it. Choose Arrange to move
+          and resize what's on it and, unless it's fitted to the monitor, drag Move window to
+          move the window. Press Esc or Lock when you're done.
+        </div>
+        <Row label="Fit to monitor" icon="expand">
+          <Toggle
+            on={app.overlayFit()}
+            disabled={app.overlayBg() !== "transparent"}
+            onChange={(v) => void app.setOverlayFit(v)}
+            ariaLabel="Fit the overlay to its monitor"
+          />
+        </Row>
+        <Show when={app.overlayBg() !== "transparent"}>
+          <div data-testid="overlay-fit-reason" style={reasonStyle}>
+            Fit to monitor needs the Transparent background.
+          </div>
+        </Show>
+        <div style={helpStyle}>
+          The overlay covers the whole monitor it's on, so pictures can go anywhere on it.
+        </div>
+        <Show when={app.overlayStatus().hideAvailable}>
+          <Row label="Hide from recordings">
+            <Toggle
+              on={app.overlayHide()}
+              onChange={(v) => void app.setOverlayHide(v)}
+              ariaLabel="Hide the overlay from recordings"
+            />
+          </Row>
+          <div style={helpStyle}>
+            While Divora records any screen or Replay is on, Windows is asked to leave the
+            locked overlay out. On Windows 10 and the first Windows 11 release it may still
+            show. While it's hidden, apps that capture your screen or the overlay window, OBS
+            and Discord included, may not show it either. With Replay on, that lasts as long as
+            Replay does. It shows while you arrange.
+          </div>
+        </Show>
+        <OverlayCharmRows />
+        <div style={helpStyle}>
           A frameless, always-on-top window shows your spell circle reacting
           to your voice — capture it in OBS. Use{" "}
           <strong style={{ color: "var(--text-mid)" }}>Transparent</strong> with
           a Window Capture that supports alpha, or pick{" "}
           <strong style={{ color: "var(--text-mid)" }}>Green</strong> /{" "}
           <strong style={{ color: "var(--text-mid)" }}>Magenta</strong> and add
-          a Chroma Key filter. Drag the circle to move the window; it
-          reopens where you left it.
+          a Chroma Key filter. It reopens where you left it.
         </div>
       </div>
     </section>
@@ -2572,6 +2752,8 @@ function EmptyHint(props: { children: JSX.Element }): JSX.Element {
 
 interface RowProps {
   label: string;
+  /** v1.55.0: a sigil before the label. */
+  icon?: SigilName;
   children: JSX.Element;
 }
 
@@ -2585,7 +2767,16 @@ function Row(props: RowProps): JSX.Element {
         gap: "var(--s4)",
       }}
     >
-      <span style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)" }}>
+      <span
+        style={{
+          display: "inline-flex",
+          "align-items": "center",
+          gap: "var(--s2)",
+          "font-size": "var(--t-sm)",
+          color: "var(--text-mid)",
+        }}
+      >
+        <Show when={props.icon}>{(name) => <Sigil name={name()} size={16} />}</Show>
         {props.label}
       </span>
       {props.children}

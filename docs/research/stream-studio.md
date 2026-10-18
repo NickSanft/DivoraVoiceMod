@@ -131,10 +131,10 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
 **Windows.**
 - **`main`** is unchanged except that the close handler becomes label-scoped.
 - **`overlay`** keeps its label and Vite entry.
-  - **Creation:** from v1.55.0 it is created by a Rust `open_overlay` command (`WebviewWindowBuilder`, `visible:false`, click-through set *before* the first show).
+  - **Creation:** from v1.55.0 it is created by a Rust `open_overlay` command (`WebviewWindowBuilder`, `visible:false`, click-through set *before* the first show). The backend places it at the rectangle main computes (`placeOverlay`), and shows it once its page says it is listening.
   - **Locked mode** (default): whole-window click-through, no hover.
-  - **Arrange mode:** entered only after the overlay reports it has painted. It has visible chrome and four exits: Esc, the Settings toggle, a tray item and a hotkey.
-- **Permissions:** a dedicated `capabilities/overlay.json` grants the overlay only listen/emit-to/start-dragging, and `"overlay"` leaves `default.json`'s window list. Capabilities union per window, so leaving it there would make the restriction a no-op. Every `set-*` window call happens in Rust.
+  - **Arrange mode:** entered only after the overlay reports it has painted; click-through goes off only at the page's first beat, and three 1 s ticks without a beat lock it again (the lease). It has visible chrome and six ways out: Esc, the chrome's Lock button, the Settings button, a tray item (shown only while arranging), a hotkey and the lease.
+- **Permissions:** a dedicated `capabilities/overlay.json` grants the overlay event listen, unlisten, emit and emit-to, and start-dragging, and `"overlay"` leaves `default.json`'s window list. Capabilities union per window, so leaving it there would make the restriction a no-op. Capabilities don't cover app commands (there is no app ACL manifest): the overlay relies on `set_overlay_mode`, `overlay_handshake` and `overlay_alive`. Every `set-*` window call happens in Rust, at the rectangle main computes.
 
 **Crates.**
 - **`divora-core`** keeps its contract and gains:
@@ -652,9 +652,10 @@ The same holds after two hours armed.
 **Tests.**
 - **Vitest:**
   - the reducer, exhaustively: clamp, aspect, re-anchoring, z-order and migration;
-  - the mode machine: it cannot leave Locked before ready;
   - the existing reading-free source scan, which now covers scene.ts automatically.
-- **Rust:** the asset allowlist, id derivation and traversal rejection.
+- **Rust:**
+  - the asset allowlist, id derivation and traversal rejection;
+  - the mode machine: it cannot leave Locked before the page has painted (in Rust, not Vitest: the machine lives in the backend).
 - **E2E:** controls render with monitors → null.
 - **Manual:**
   - click-through over a game and over OBS;
@@ -664,6 +665,54 @@ The same holds after two hours armed.
 **Kill switch.** If click-through over WebView2's child window fails on the current runtime, Locked degrades to "hide while not arranging". OBS users are unaffected.
 
 **Not.** No text or video charms, rotation, snapping, per-monitor windows or timer face yet.
+
+**As built (2026-10-18).**
+- **No separate spike: S0 was folded into the real-app run (S2),** on this machine (Windows 11 Pro 26200; 3440×1440 and 1920×1080 screens, both at 100 %; an NVIDIA GPU), in a debug build of the `charms` branch driven over WebView2's DevTools protocol and read through Win32 — no game, and no real mouse or keyboard input. What it settled:
+  - **R1, click-through:** rung 0 held — tao as is (`R1_RUNG = 0`). Locked, the window was `WS_EX_TRANSPARENT|WS_EX_LAYERED` before it was first seen, `WindowFromPoint` passed through it at 6 of 6 points (centre, edges, corners, an inner point); the circle drew Locked, and a GIF drew and animated, Locked and arranging. Not tried over a game.
+  - **R2, hiding:** it works on this machine, by decoding: a 10 s take with Hide on had the overlay in 0 of 302 frames, a 5 s take with it off in 152 of 152, and a Replay clip saved 4.3 s after arming in 0 of 130 from frame 0. The toggle ships.
+  - **R4, the fitted window's cost:** the idle-GPU half of the gate passed — fitted added about 0.1 percentage point of 3D-engine time over 480×480 (the gate was 2) — so the bounding-box fallback was not built. The present-mode half (PresentMon over a borderless game) was not measured.
+  - **R3, Windows 10 / Windows 11 21H2:** pending, on the owner's two-order check on the other machine. Until then the toggle is offered from `UniversalApiContract` 10 (Windows 10 2004, `MIN_CONTRACT`), and the CHANGELOG says the outcome there is unknown and the gate decision pending.
+  - **R7, memory:** the three thresholds set beforehand passed with the largest scene the limits allow (drawn large for 30 s, not 5 minutes, and not over a game), so the designed limits stay (the figures are in the CHANGELOG).
+  - **Not settled:** whether the browser keys stay blocked and Alt+F4 closes the overlay under real keys (S0 f, R16); the hotkey's foreground success in a game (S0 e); a GIF or WebP whose frames are larger than its canvas, served to WebView2 (S0 d's fixtures; the sizes are unit-tested).
+- **Differences from the deliverables above** (the design's D1–D22):
+  - **D1:** pictures are served by Divora's own `charm` scheme (`http://charm.localhost/<id>`), not `protocol-asset`: to the overlay only, at most two at a time, 503 once it is closing; Settings shows no thumbnails. The log names the assets folder at startup; development builds use `overlay/assets-dev`.
+  - **D2:** the backend builds, places and shows the window, but main still computes the rectangle (`placeOverlay`, through `planFrame`). The window also gets `minimizable(false)` and a 64×48 minimum size.
+  - **D3:** the page's ready and painted signals are one app command (`overlay_handshake {instance, stage}`), not Rust event listeners, which tauri parks on lock contention. The window shows at ready, Arrange waits for painted, and the watchdog closes a window that never readied within 10 s, not one that never painted.
+  - **D4:** the backend owns the mode in a pure machine and reports it on a new event, `overlay:status` (and a new command, `overlay_status`). Two more ways out of Arrange: the chrome's Lock button and the lease. The test that the machine can't leave Locked early is Rust (`cannot_arrange_before_painted`, `machine_table_is_exhaustive`), not Vitest.
+  - **D5:** main owns the scene and pushes it on `overlay:scene` with a session, a revision and an ack; edits come back on `overlay:edit` as `{instance, seq, op}` (the plan named the event, not its payload).
+  - **D6:** positions are fractions of a design size that only grows, centre-anchored; an element keeps its size and only shrinks to fit. Images store `nw`, `nh`, `anim`, `bytes` and `name`, and the scene its `frame`; the plan's per-image `fit?` is dropped, and the reducer gains `reframe`.
+  - **D7:** aspect is always locked, with no control to unlock it; **+** and **−** resize from the keyboard.
+  - **D8:** Hide is a request, with no status key claiming it. The affinity is set only on a shown window, only when it changes, never on a closing one, and last on the way to Locked (an unmeasured hedge); the recorder asks before a capture starts (`before_capture`, whose `CaptureCleared` token `open_feed` takes). The plan's "Locked makes the window layered, which Windows 10 needs" (deliverable 7; the Decisions row says the same) doesn't hold: on 19045/22000 the click-through Locked adds is the suspected trigger of Electron #47834. The copy says "may still show", not a black box.
+  - **D9:** Fit counts only with the Transparent background; the fitted window isn't resizable; the scene records its frame and is reframed at the next open if Fit changed while closed; geometry isn't saved while fitted; the fit keeper re-fits after a scale change and checks every 5 s for a resolution change.
+  - **D10:** caps of 8192 px a side, 16,777,216 px and 4,194,304 px animated, besides 50 MB (10⁶ bytes); only 8-bit Huffman-coded JPEGs, sequential or progressive (SOF0/1/2); sizes as displayed (a GIF's canvas grown to hold its first frame, EXIF orientation). "Path confinement" is restated: any regular file the user can read is accepted, and the stored name never comes from the path.
+  - **D11:** `overlay.json` grants five permissions (event listen, unlisten, emit and emit-to; start-dragging). It doesn't cover app commands, as the Architecture section now says.
+  - **D12:** the window moves only in Arrange, unfitted, from the **Move window** grip or an empty spot, which reverses v1.51.3's "press anywhere".
+  - **D13:** the overlay's circle is decorative (no tooltips, focus or pointer on its nodes), laid out square from `SPELL_CIRCLE_PX` (440), with a round hit target; at most one is shown, and it can be removed.
+  - **D14:** 16 pictures, 64 stored elements, a 24 px minimum side and hit box, and a budget over distinct pictures (200 MB of files, 16,777,216 animated and 67,108,864 total pixels), all applied when adding, never when reading.
+  - **D15:** the tray's **Lock the overlay** (`overlay-lock`) is shown only while arranging, in the plan's order: Show · Save replay · Turn Replay off · Lock the overlay · Quit.
+  - **D16:** the hotkey `overlay:arrange` toggles Arrange and Locked, acted on in Rust inside `WM_HOTKEY`; JS only shows a toast while the overlay is off or starting.
+  - **D17:** the overlay blocks every key but Tab, Alt+F4, and Enter or Space on a button (`shouldPreventKey`), and its context menu; it has no `<select>` and no `title`.
+  - **D18:** the kill switch is a ladder — rung 0 tao as is, rung 1 an opaque layered window, rung 2 hidden while Locked — and rung 0 shipped. The plan's "OBS users are unaffected" is corrected: under rung 2, OBS Window Capture would have nothing to show.
+  - **D19:** the boot reveal finds the main window by its label.
+  - **D20:** the main window's overlay code moved to `src/overlay/controller.ts`, tested with its dependencies injected.
+  - **D21:** the Arrange lease: click-through goes off only at the page's first beat (`overlay_alive`, every 500 ms), and three silent 1 s ticks lock the overlay again, with a toast.
+  - **D22:** focus is taken with plain `SetForegroundWindow`, never tao's `set_focus` (which presses Alt when Windows refuses), and handed back on Lock to the window that had it before Arrange, if the overlay still has the foreground.
+- **Smaller changes while building:** the picker also offers `.jfif` and `.jpe` (the import goes by the content); a status that keeps the mode doesn't move the keyboard in the overlay; main's overlay actions never reject, and log their failures.
+- **Owner decisions:**
+  - the `overlay:arrange` hotkey does nothing but show a toast while the overlay is off;
+  - the spell circle can be removed, and added back (**Add the spell circle**);
+  - the caps: 16 pictures, 50 MB, 16 megapixels and 8192 px a side;
+  - Hide keeps the overlay hidden while Replay is held, not only while it keeps;
+  - at the design's defaults: the 4-megapixel cap on animated pictures, the scene budget, the tray item only while arranging, hiding whatever screen Divora records (R15), no refusal of long, thin pictures, and no single-pointer Smaller/Bigger buttons (the keyboard resizes).
+- **Found in the real app and fixed:** after a quick close the Settings toggle could stay on with the window gone (6 of 12 quick cycles): `close_overlay`'s answer ("closing", open) arrived about 10 ms after the "closed" event and was applied last. Main now applies a command's answer only if no `overlay:status` arrived while it was in flight (the backend emits one on every change); 20 of 20 cycles after.
+- **Seen once, not reproduced:** Replay held with "the video encoder stopped returning frames" about 1 s after an overlay opened, 2.5 s after arming; not seen in 26 further rounds (156 opens and closes with Replay on, 4 of the rounds right after a fresh launch). Cause unknown; Replay behaved as designed.
+- **Not measured** (owner checks, or not possible here): Windows 10 and 21H2 (R3); what OBS shows, of the overlay's alpha and of a hidden overlay; Discord, Teams and the Snipping Tool while hidden; real keys; the hotkey (none was pressed, in a game or anywhere) and the keyboard going back to the window that had it; the tray item; Win+D and Win+M during a protected take; the taskbar and notifications while fitted; a scale or resolution change while fitted; mixed DPI; PresentMon; a 4K screen; a long Replay with Hide on; memory drawn large for 5 minutes, over a game; a 12-bit or arithmetic-coded JPEG refused in the app (unit-tested only).
+- **Follow-ups:**
+  - **Monitor-aware hiding (R15).** Hide applies whatever screen Divora records, so with the overlay on a second monitor that OBS captures and Replay on the first, OBS loses the overlay for the session although Divora's recording never contained it. Protect only while the overlay is on the recorded monitor: a pure factor fed by the recorded monitor id (`StartRequest.monitor_id`, `SharedSettings.monitor_id`) and the overlay's cached rectangle, protecting whenever either is unknown.
+  - **R3's outcome:** if the common path shows the overlay on Windows 10, raise `MIN_CONTRACT` to 15 (Windows 11 22H2), so the row is hidden below it.
+  - **R4's present-mode half,** over a borderless game; the bounding-box fallback if fitting changes the present mode.
+  - **R16,** if real keys get through: turning WebView2's browser accelerator keys off, which needs `webview2-com` and an owner decision.
+  - **The encoder stall above,** if it is seen again.
 
 ### v1.56.0 — Mute that mutes (2–3 days)
 

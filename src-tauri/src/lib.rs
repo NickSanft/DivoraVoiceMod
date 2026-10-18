@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use divora_core::audio::{
@@ -35,12 +35,19 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 mod midi;
+pub mod overlay_assets;
+pub mod overlay_machine;
+mod overlay_windows;
 pub mod replay;
 mod screen;
 use midi::{
     list_inputs as list_midi_inputs_core, open_input as open_midi_input_core, MidiInputInfo,
 };
 use midir::MidiInputConnection;
+use overlay_assets::{ImportedAsset, ServeGate, CHARM_SCHEME, SERVE_SLOTS};
+use overlay_machine::{
+    HandshakeStage, ModeRequest, OverlayRect, OverlayStatus, BAD_MODE, BAD_STAGE,
+};
 use replay::{
     replay_memory as replay_memory_for, sanitize_seconds, ReplayMemory, ReplaySaved, ReplayStatus,
     TrayIconKind, TrayView, REPLAY_ICON, REPLAY_ICON_SIZE, TRAY_OFF_ID, TRAY_OFF_LABEL,
@@ -257,6 +264,10 @@ struct AppState {
     /// v1.52.0: the screen recorder. Outlives engine sessions — a take
     /// carries on through a device-loss rebuild and a Stop/Start.
     screen: Arc<ScreenRecorder>,
+    /// v1.55.0: where the stream overlay's charm pictures are kept
+    /// (`%APPDATA%/com.divora.voicemod/overlay/assets/`; `assets-dev/` for
+    /// development builds). Created at startup.
+    overlay_assets_dir: PathBuf,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -850,6 +861,101 @@ async fn save_replay(app: AppHandle, state: State<'_, AppState>) -> Result<Repla
         .await
         .map_err(|e| e.to_string())?
         .map(|clip| ReplaySaved::saved(&clip))
+}
+
+// ---- v1.55.0: the stream overlay ----
+//
+// All `async`: Tauri 2 runs a sync command on the main thread, which both
+// windows share, and building a window from a sync command deadlocks on
+// Windows. The rules are in `overlay_machine`, the window work in
+// `overlay_windows`; these only read their arguments.
+
+/// Open the stream overlay at `rect` (physical px; Windows' default spot
+/// when absent), fitted to its monitor when `fit`. Already open: its status.
+#[tauri::command]
+async fn open_overlay(
+    app: AppHandle,
+    rect: Option<OverlayRect>,
+    fit: Option<bool>,
+) -> Result<OverlayStatus, String> {
+    overlay_windows::open(app, rect, fit.unwrap_or(false)).await
+}
+
+/// Close the stream overlay. Closed already: nothing happens.
+#[tauri::command]
+async fn close_overlay(app: AppHandle) -> OverlayStatus {
+    overlay_windows::close(&app)
+}
+
+/// Move and size the open overlay to `rect` (physical px).
+#[tauri::command]
+async fn place_overlay(
+    app: AppHandle,
+    rect: OverlayRect,
+    fit: Option<bool>,
+) -> Result<OverlayStatus, String> {
+    overlay_windows::place(app, rect, fit.unwrap_or(false)).await
+}
+
+/// `"locked"`, `"arrange"` or `"toggle"`. Locking never fails.
+#[tauri::command]
+async fn set_overlay_mode(app: AppHandle, mode: String) -> Result<OverlayStatus, String> {
+    let req = ModeRequest::parse(&mode).ok_or_else(|| BAD_MODE.to_owned())?;
+    overlay_windows::set_mode(&app, req)
+}
+
+/// The Settings toggle: ask Windows to leave the locked overlay out of
+/// Divora's captures.
+#[tauri::command]
+async fn set_overlay_hide_from_recordings(app: AppHandle, enabled: bool) -> OverlayStatus {
+    overlay_windows::set_hide(&app, enabled)
+}
+
+/// The overlay now, for a main window that reloaded.
+#[tauri::command]
+async fn overlay_status(app: AppHandle) -> OverlayStatus {
+    overlay_windows::status(&app)
+}
+
+/// The overlay page is listening (`"ready"`) or has drawn since it was shown
+/// (`"painted"`). Only the overlay page calls it.
+#[tauri::command]
+async fn overlay_handshake(
+    app: AppHandle,
+    instance: u32,
+    stage: String,
+) -> Result<OverlayStatus, String> {
+    let stage = HandshakeStage::parse(&stage).ok_or_else(|| BAD_STAGE.to_owned())?;
+    Ok(overlay_windows::handshake(&app, instance, stage))
+}
+
+/// The overlay page's beat while arranging. Only the overlay page calls it.
+#[tauri::command]
+async fn overlay_alive(app: AppHandle, instance: u32, gen: u32) {
+    overlay_windows::alive(&app, instance, gen);
+}
+
+/// Copy the picture at `path` into the overlay's pictures.
+#[tauri::command]
+async fn import_overlay_asset(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ImportedAsset, String> {
+    let dir = state.overlay_assets_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        overlay_assets::import(&dir, Path::new(&path)).map_err(|e| e.message())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Remove the overlay picture `id`. Already gone: fine.
+#[tauri::command]
+async fn delete_overlay_asset(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let dir = state.overlay_assets_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || overlay_assets::delete(&dir, &id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2330,6 +2436,10 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
             .map(|(id, _)| id.clone())
     };
     if let Some(id) = hit {
+        // v1.55.0: the overlay acts on its own hotkey here, inside
+        // `WM_HOTKEY`, while the press's right to the foreground is fresh.
+        // The event still goes out (the frontend only shows a notice).
+        overlay_windows::hotkey(app, &id, event.state == ShortcutState::Pressed);
         let state_str = match event.state {
             ShortcutState::Pressed => "pressed",
             ShortcutState::Released => "released",
@@ -2424,32 +2534,110 @@ fn show_main_window(app: &AppHandle) {
 /// The tray icon's id.
 pub(crate) const TRAY_ID: &str = "divora-tray";
 
-/// The tray menu: Show and Quit, and (v1.54.0) Replay's two items while it
-/// is on. The tray never turns Replay on: that goes through the card.
-fn tray_menu<R: tauri::Runtime, M: Manager<R>>(app: &M, replay: bool) -> tauri::Result<Menu<R>> {
-    let show = MenuItem::with_id(app, "show", "Show DivoraVoice", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    if !replay {
-        return Menu::with_items(app, &[&show, &quit]);
+/// What the tray menu holds besides Show and Quit.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrayItems {
+    /// Replay is on: Save replay and Turn Replay off (v1.54.0).
+    pub replay: bool,
+    /// The overlay is in Arrange: Lock the overlay (v1.55.0).
+    pub lock_overlay: bool,
+}
+
+/// One line of the tray menu: an item's id and label, or a separator.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayEntry {
+    Item(&'static str, &'static str),
+    Separator,
+}
+
+/// The tray menu's lines: Show · Save replay · Turn Replay off · Lock the
+/// overlay · Quit, each group set off by separators, the optional ones only
+/// while they apply. The tray never turns Replay on (that goes through the
+/// card) and never starts Arrange.
+#[doc(hidden)]
+pub fn tray_entries(items: TrayItems) -> Vec<TrayEntry> {
+    let mut out = vec![TrayEntry::Item("show", "Show DivoraVoice")];
+    if items.replay {
+        out.extend([
+            TrayEntry::Separator,
+            TrayEntry::Item(TRAY_SAVE_ID, TRAY_SAVE_LABEL),
+            TrayEntry::Item(TRAY_OFF_ID, TRAY_OFF_LABEL),
+        ]);
     }
-    let save = MenuItem::with_id(app, TRAY_SAVE_ID, TRAY_SAVE_LABEL, true, None::<&str>)?;
-    let off = MenuItem::with_id(app, TRAY_OFF_ID, TRAY_OFF_LABEL, true, None::<&str>)?;
-    let gap = PredefinedMenuItem::separator(app)?;
-    let gap2 = PredefinedMenuItem::separator(app)?;
-    Menu::with_items(app, &[&show, &gap, &save, &off, &gap2, &quit])
+    if items.lock_overlay {
+        out.extend([
+            TrayEntry::Separator,
+            TrayEntry::Item(
+                overlay_machine::TRAY_LOCK_ID,
+                overlay_machine::TRAY_LOCK_LABEL,
+            ),
+        ]);
+    }
+    if items.replay || items.lock_overlay {
+        out.push(TrayEntry::Separator);
+    }
+    out.push(TrayEntry::Item("quit", "Quit"));
+    out
+}
+
+/// The tray menu for `items`.
+fn tray_menu<R: tauri::Runtime, M: Manager<R>>(
+    app: &M,
+    items: TrayItems,
+) -> tauri::Result<Menu<R>> {
+    let menu = Menu::new(app)?;
+    for entry in tray_entries(items) {
+        match entry {
+            TrayEntry::Item(id, label) => {
+                menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
+            }
+            TrayEntry::Separator => menu.append(&PredefinedMenuItem::separator(app)?)?,
+        }
+    }
+    Ok(menu)
+}
+
+/// v1.55.0: Replay's half of the tray menu, as `sync_tray` last set it, so
+/// the overlay can rebuild the menu without asking the recorder.
+static TRAY_REPLAY: AtomicBool = AtomicBool::new(false);
+
+/// v1.55.0: rebuild only the tray menu (not its tooltip or icon) from the
+/// latest Replay and overlay state: the overlay's Lock item comes and goes
+/// with Arrange. On the main thread, as `sync_tray`.
+pub(crate) fn refresh_tray_menu(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(tray) = handle.tray_by_id(TRAY_ID) else {
+            return;
+        };
+        let items = TrayItems {
+            replay: TRAY_REPLAY.load(Ordering::SeqCst),
+            lock_overlay: overlay_windows::arranging(&handle),
+        };
+        if let Ok(menu) = tray_menu(&handle, items) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    });
 }
 
 /// v1.54.0: show `view` in the tray — its tooltip, menu and icon. On the
 /// main thread and without waiting for it: the tray's setters block when
 /// called from elsewhere, and Quit holds the main thread while it waits.
 pub(crate) fn sync_tray(app: &AppHandle, view: TrayView) {
+    TRAY_REPLAY.store(view.replay_items, Ordering::SeqCst);
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let Some(tray) = handle.tray_by_id(TRAY_ID) else {
             return;
         };
         let _ = tray.set_tooltip(Some(&view.tooltip));
-        if let Ok(menu) = tray_menu(&handle, view.replay_items) {
+        let items = TrayItems {
+            replay: view.replay_items,
+            lock_overlay: overlay_windows::arranging(&handle),
+        };
+        if let Ok(menu) = tray_menu(&handle, items) {
             let _ = tray.set_menu(Some(menu));
         }
         let icon = match view.icon {
@@ -2466,7 +2654,7 @@ pub(crate) fn sync_tray(app: &AppHandle, view: TrayView) {
 /// background (e.g. while gaming / on a Discord call). Left-click the
 /// tray icon or "Show" to restore the window; "Quit" exits for real.
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let menu = tray_menu(app, false)?;
+    let menu = tray_menu(app, TrayItems::default())?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("DivoraVoice")
@@ -2484,6 +2672,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     state.screen.quit_replay(app);
                 }
+                // v1.55.0: the overlay's `NonRudeHWND` comes off first; its
+                // window isn't closed through `CloseRequested` on the way out.
+                overlay_windows::before_exit(app);
                 app.exit(0);
             }
             TRAY_SAVE_ID => {
@@ -2507,6 +2698,11 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
             }
+            // v1.55.0: present only while the overlay is in Arrange. The
+            // keyboard stays put: the tray's window has it now.
+            overlay_machine::TRAY_LOCK_ID => {
+                let _ = overlay_windows::set_mode(app, ModeRequest::Locked);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -2526,6 +2722,41 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// v1.55.0: bounds how many charm pictures the `charm` scheme holds at once.
+static SERVE_GATE: OnceLock<ServeGate> = OnceLock::new();
+
+/// v1.55.0: answer one `charm` request (`http://charm.localhost/<id>`).
+///
+/// This runs on `WebView2`'s UI thread, so it only hands the request to a
+/// blocking thread, which holds a [`SERVE_GATE`] place from before the read
+/// until the response is handed back.
+fn charm_request(
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    req: tauri::http::Request<Vec<u8>>,
+    responder: tauri::UriSchemeResponder,
+) {
+    let app = ctx.app_handle().clone();
+    let webview = ctx.webview_label().to_owned();
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _slot = SERVE_GATE
+            .get_or_init(|| ServeGate::new(SERVE_SLOTS))
+            .acquire();
+        // No state yet (the app is still starting): `serve` answers 503.
+        let dir = app
+            .try_state::<AppState>()
+            .map(|s| s.overlay_assets_dir.clone());
+        responder.respond(overlay_assets::serve(
+            dir.as_deref(),
+            &webview,
+            &method,
+            &path,
+            || overlay_windows::overlay_live(&app),
+        ));
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[allow(clippy::too_many_lines)] // builder chain + setup closure; clearer inline
 pub fn run() {
@@ -2537,6 +2768,8 @@ pub fn run() {
                 .with_handler(global_shortcut_handler)
                 .build(),
         )
+        // v1.55.0: the stream overlay's charm pictures.
+        .register_asynchronous_uri_scheme_protocol(CHARM_SCHEME, charm_request)
         // Phase 15: closing the main window hides it to the tray instead of
         // quitting, so audio (and Discord routing) keep running in the
         // background. "Quit" in the tray menu exits for real. Only `main`:
@@ -2548,6 +2781,11 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
+            }
+            // v1.55.0: the overlay's close (Alt+F4, `close_overlay`, the
+            // watchdog) and its end reach the shell.
+            if window.label() == overlay_machine::OVERLAY_LABEL {
+                overlay_windows::on_window_event(window.app_handle(), event);
             }
         })
         .setup(|app| {
@@ -2620,6 +2858,26 @@ pub fn run() {
                 tracing::warn!(?e, path = %recordings_dir.display(), "could not create recordings dir");
             }
             tracing::info!(path = %recordings_dir.display(), "recordings dir ready");
+
+            // v1.55.0: the stream overlay's charm pictures. `tauri dev`
+            // builds keep their own scene, so they keep their own pictures:
+            // one build can't delete the other's. Not `debug_assertions`,
+            // which `tauri build --debug` shares with the installed app.
+            let assets_name = overlay_assets::assets_dir_name(tauri::is_dev());
+            let overlay_assets_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join("overlay").join(assets_name),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; falling back to temp for overlay assets");
+                    std::env::temp_dir()
+                        .join("DivoraVoice")
+                        .join("overlay")
+                        .join(assets_name)
+                }
+            };
+            if let Err(e) = std::fs::create_dir_all(&overlay_assets_dir) {
+                tracing::warn!(?e, path = %overlay_assets_dir.display(), "could not create overlay assets dir");
+            }
+            tracing::info!(path = %overlay_assets_dir.display(), "overlay assets dir ready");
 
             // Phase 12.4: discover bundled voice assets shipped in the
             // installer's resource dir (onnxruntime.dll + voices/*.onnx).
@@ -2722,7 +2980,9 @@ pub fn run() {
                 voice_recording_path: Mutex::new(None),
                 voxcpm_engine: Mutex::new(None),
                 screen: Arc::new(ScreenRecorder::default()),
+                overlay_assets_dir,
             });
+            overlay_windows::init(app);
 
             // The window is created hidden (`visible: false`) so the user never
             // sees an empty black frame while WebView2 initializes. The frontend
@@ -2731,8 +2991,9 @@ pub fn run() {
             // timer is just a safety net: if that frontend reveal never runs
             // (JS error, non-web target), show the window anyway so it can't get
             // stuck hidden. `show()` is idempotent, so the earlier of the two
-            // wins.
-            if let Some(win) = app.webview_windows().values().next().cloned() {
+            // wins. By label (v1.55.0): the overlay is a backend-made window
+            // too, so "the first window" isn't necessarily the main one.
+            if let Some(win) = app.get_webview_window("main") {
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(10));
                     let _ = win.show();
@@ -2784,6 +3045,16 @@ pub fn run() {
             arm_replay_buffer,
             disarm_replay_buffer,
             save_replay,
+            open_overlay,
+            close_overlay,
+            place_overlay,
+            set_overlay_mode,
+            set_overlay_hide_from_recordings,
+            overlay_status,
+            overlay_handshake,
+            overlay_alive,
+            import_overlay_asset,
+            delete_overlay_asset,
             scan_soundboard_folder,
             play_soundboard_clip,
             stop_soundboard_clip,
@@ -2839,6 +3110,38 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    /// Every combination, in the order the menu shows it. The first two are
+    /// v1.53.0's and v1.54.0's menus exactly: the overlay's item must never
+    /// cost Replay its two.
+    #[test]
+    fn tray_entries_for_each_combination() {
+        use super::{tray_entries, TrayEntry, TrayItems};
+        use TrayEntry::{Item, Separator};
+        let show = Item("show", "Show DivoraVoice");
+        let save = Item("replay-save", "Save replay");
+        let off = Item("replay-off", "Turn Replay off");
+        let lock = Item("overlay-lock", "Lock the overlay");
+        let quit = Item("quit", "Quit");
+        let items = |replay, lock_overlay| TrayItems {
+            replay,
+            lock_overlay,
+        };
+        assert_eq!(tray_entries(items(false, false)), [show, quit]);
+        assert_eq!(
+            tray_entries(items(true, false)),
+            [show, Separator, save, off, Separator, quit]
+        );
+        assert_eq!(
+            tray_entries(items(false, true)),
+            [show, Separator, lock, Separator, quit]
+        );
+        assert_eq!(
+            tray_entries(items(true, true)),
+            [show, Separator, save, off, Separator, lock, Separator, quit]
+        );
+        assert_eq!(TrayItems::default(), items(false, false));
+    }
 
     #[test]
     fn only_the_main_window_hides_on_close() {

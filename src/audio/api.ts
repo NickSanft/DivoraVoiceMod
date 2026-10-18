@@ -6,6 +6,9 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Rect } from "../overlay/geometry";
+import { OVERLAY_EDIT_EVENT, OVERLAY_STATUS_EVENT } from "../overlay/state";
+import { SET_OVERLAY_MODE_CMD, type OverlayModeRequest } from "../overlay/status";
 
 /** A single audio device, as enumerated by cpal on the backend. */
 export interface DeviceInfo {
@@ -1088,6 +1091,94 @@ export async function subscribeReplaySaved(
   handler: (saved: ReplaySaved) => void,
 ): Promise<UnlistenFn> {
   return listen<ReplaySaved>("replay-saved", (e) => handler(e.payload));
+}
+
+// ---- Stream overlay (v1.55.0) ----
+// The backend creates, places and shows the overlay window and owns its
+// mode; main says where it goes and owns the scene (overlay/controller.ts).
+// Every window command answers the whole `OverlayStatus`, read with
+// `readOverlayStatus` (overlay/status.ts). `overlay_handshake` and
+// `overlay_alive` have no wrapper here: only the overlay page calls them.
+
+/** Where the overlay window goes, in physical px (geometry.ts `Rect`). */
+export type OverlayRectArg = Rect;
+
+/** `import_overlay_asset`'s answer. Its keys are frozen in
+ *  overlay/wire.fixture.json. */
+export interface ImportedAsset {
+  /** The stored file's name: 16 hex digits of its SHA-256 and its type. */
+  id: string;
+  /** The picture's size as displayed, in its own pixels. */
+  width: number;
+  height: number;
+  bytes: number;
+  animated: boolean;
+  /** Words for the user when the picture is large, else null. */
+  warning: string | null;
+}
+
+/** Already open → the current status, nothing moved. */
+export async function openOverlayWindow(o: { rect: OverlayRectArg | null; fit: boolean }): Promise<unknown> {
+  return invoke<unknown>("open_overlay", { rect: o.rect, fit: o.fit });
+}
+
+export async function closeOverlayWindow(): Promise<unknown> {
+  return invoke<unknown>("close_overlay");
+}
+
+export async function placeOverlayWindow(rect: OverlayRectArg, fit: boolean): Promise<unknown> {
+  return invoke<unknown>("place_overlay", { rect, fit });
+}
+
+/** Locking never fails; Arrange is refused until the overlay has painted. */
+export async function setOverlayMode(mode: OverlayModeRequest): Promise<unknown> {
+  return invoke<unknown>(SET_OVERLAY_MODE_CMD, { mode });
+}
+
+export async function setOverlayHideFromRecordings(on: boolean): Promise<unknown> {
+  return invoke<unknown>("set_overlay_hide_from_recordings", { enabled: on });
+}
+
+/** Read after a main-window reload, to adopt an overlay still open. */
+export async function overlayStatus(): Promise<unknown> {
+  return invoke<unknown>("overlay_status");
+}
+
+/** Copy a picture into Divora's charm pictures. Rejects with the words to
+ *  show. */
+export async function importOverlayAsset(path: string): Promise<ImportedAsset> {
+  return invoke<ImportedAsset>("import_overlay_asset", { path });
+}
+
+export async function deleteOverlayAsset(id: string): Promise<void> {
+  await invoke("delete_overlay_asset", { id });
+}
+
+/** Open the native file picker for a charm picture; null when cancelled or
+ *  unavailable. Lazy-imports the dialog plugin, as `pickAudioFile` does. */
+export async function pickImageFile(): Promise<string | null> {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const result = await open({
+      multiple: false,
+      title: "Pick a picture or GIF for the overlay",
+      // The content decides the type (import sniffs it), so every name a
+      // JPEG is saved under is offered: browsers save web JPEGs as .jfif.
+      filters: [{ name: "Pictures", extensions: ["png", "jpg", "jpeg", "jfif", "jpe", "gif", "webp", "apng"] }],
+    });
+    return typeof result === "string" ? result : null;
+  } catch (err) {
+    console.warn("[overlay] file picker unavailable", err);
+    return null;
+  }
+}
+
+export async function subscribeOverlayStatus(handler: (raw: unknown) => void): Promise<UnlistenFn> {
+  return listen<unknown>(OVERLAY_STATUS_EVENT, (e) => handler(e.payload));
+}
+
+export async function subscribeOverlayEdit(handler: (raw: unknown) => void): Promise<UnlistenFn> {
+  return listen<unknown>(OVERLAY_EDIT_EVENT, (e) => handler(e.payload));
 }
 
 // ---- Soundboard ----

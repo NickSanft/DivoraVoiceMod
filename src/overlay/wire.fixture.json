@@ -1,0 +1,100 @@
+{
+  "about": "v1.55.0: the stream overlay's wire contract, read by both test suites (src-tauri/src/overlay_machine.rs and overlay_assets.rs; src/overlay/*.test.ts). Production code never imports it.",
+  "events": {
+    "state": "overlay:state",
+    "ready": "overlay:ready",
+    "status": "overlay:status",
+    "scene": "overlay:scene",
+    "edit": "overlay:edit"
+  },
+  "commands": {
+    "setMode": "set_overlay_mode",
+    "handshake": "overlay_handshake",
+    "alive": "overlay_alive"
+  },
+  "handshakeStages": ["ready", "painted"],
+  "modeRequests": ["locked", "arrange", "toggle"],
+  "statusKeys": [
+    "arrangeGen",
+    "canArrange",
+    "capturing",
+    "error",
+    "fit",
+    "hideAvailable",
+    "hideWanted",
+    "instance",
+    "mode",
+    "open",
+    "phase"
+  ],
+  "importedAssetKeys": ["animated", "bytes", "height", "id", "warning", "width"],
+  "statusSamples": {
+    "closed": {
+      "open": false,
+      "phase": "closed",
+      "instance": 0,
+      "mode": "locked",
+      "arrangeGen": 0,
+      "canArrange": false,
+      "fit": false,
+      "hideWanted": false,
+      "hideAvailable": false,
+      "capturing": false,
+      "error": null
+    },
+    "arranging": {
+      "open": true,
+      "phase": "painted",
+      "instance": 1,
+      "mode": "arrange",
+      "arrangeGen": 1,
+      "canArrange": true,
+      "fit": false,
+      "hideWanted": true,
+      "hideAvailable": false,
+      "capturing": true,
+      "error": null
+    },
+    "watchdog": {
+      "open": true,
+      "phase": "closing",
+      "instance": 1,
+      "mode": "locked",
+      "arrangeGen": 0,
+      "canArrange": false,
+      "fit": false,
+      "hideWanted": false,
+      "hideAvailable": false,
+      "capturing": false,
+      "error": "The overlay window didn't start, so Divora closed it. Try turning it on again."
+    }
+  },
+  "importedAssetSample": {
+    "id": "a1b2c3d4e5f60718.gif",
+    "width": 498,
+    "height": 280,
+    "bytes": 1834221,
+    "animated": true,
+    "warning": null
+  },
+  "assetIds": [
+    { "id": "ba7816bf8f01cfea.png", "valid": true },
+    { "id": "a1b2c3d4e5f60718.gif", "valid": true },
+    { "id": "0123456789abcdef.jpg", "valid": true },
+    { "id": "ffffffffffffffff.webp", "valid": true },
+    { "id": "BA7816BF8F01CFEA.png", "valid": false },
+    { "id": "ba7816bf8f01cfe.png", "valid": false },
+    { "id": "ba7816bf8f01cfea0.png", "valid": false },
+    { "id": "ba7816bf8f01cfea.jpeg", "valid": false },
+    { "id": "ba7816bf8f01cfea.svg", "valid": false },
+    { "id": "../x.png", "valid": false },
+    { "id": "a/b.png", "valid": false },
+    { "id": "", "valid": false },
+    { "id": "ba7816bf8f01cfea.png ", "valid": false }
+  ],
+  "charmOrigin": "http://charm.localhost/",
+  "debug": {
+    "noReadyEnv": "DIVORA_PRETEND_OVERLAY_NO_READY",
+    "noReadyGlobal": "__DIVORA_OVERLAY_NO_READY__"
+  }
+}

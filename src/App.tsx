@@ -45,18 +45,24 @@ function applyRootAttr(name: string, value: string | null) {
 
 // Global hotkeys. The backend emits `global-shortcut` events with the
 // binding's id and pressed/released state; this turns them into store
-// actions. It is the path every id takes, and it runs while the window is
-// hidden to the tray too:
-//   ptm           → set ui.pressed on press, clear on release
-//   panic         → stop all soundboard clips on press
-//   monitor       → toggle sidetone on press
-//   rec:screen    → start / stop the screen recording (v1.52.0)
-//   rec:wav       → start / stop the WAV recording (v1.52.0)
-//   replay:save   → save what Replay has kept (v1.54.0)
-//   replay:toggle → turn Replay on / off (v1.54.0) — on goes through
-//                   armReplay(), which refuses until the card's explainer
-//                   has been read
-//   sb:<clip>     → play that soundboard tile
+// actions. It is the path every id takes, except that `overlay:arrange` is
+// acted on by the backend (v1.55.0); here it only shows a notice while the
+// overlay is off or starting. It runs while the window is hidden to the
+// tray too:
+//   ptm             → set ui.pressed on press, clear on release
+//   panic           → stop all soundboard clips on press
+//   monitor         → toggle sidetone on press
+//   rec:screen      → start / stop the screen recording (v1.52.0)
+//   rec:wav         → start / stop the WAV recording (v1.52.0)
+//   replay:save     → save what Replay has kept (v1.54.0)
+//   replay:toggle   → turn Replay on / off (v1.54.0) — on goes through
+//                     armReplay(), which refuses until the card's explainer
+//                     has been read
+//   overlay:arrange → the backend already switched Arrange / Locked, inside
+//                     the hotkey's own message, while Windows still lets it
+//                     take the foreground; never set_overlay_mode from here,
+//                     or the press would toggle twice (v1.55.0)
+//   sb:<clip>       → play that soundboard tile
 export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent): void {
   if (event.id === "ptm") {
     app.setUi("pressed", event.state === "pressed");
@@ -75,6 +81,8 @@ export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent
     void app.saveReplay();
   } else if (event.id === "replay:toggle") {
     void app.toggleReplay();
+  } else if (event.id === "overlay:arrange") {
+    app.noteOverlayHotkey();
   } else if (event.id.startsWith("sb:")) {
     // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
     // current scan still has it.
@@ -137,7 +145,8 @@ function Shell(): JSX.Element {
   // / bg mode). The overlay animates on its own from there — no per-frame
   // traffic. v1.51.3: and again whenever the overlay says it is listening
   // (`overlay:ready`), so the push made as it opens is never lost. No-op off
-  // Tauri.
+  // Tauri. v1.55.0: the charms travel on their own event, `overlay:scene`,
+  // which the store's overlay controller pushes.
   syncOverlay({
     isOpen: app.overlayOpen,
     payload: () =>

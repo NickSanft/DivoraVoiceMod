@@ -1,26 +1,60 @@
 import { describe, expect, it } from "vitest";
-import { startsWindowDrag } from "./drag";
+import { isPlainLeftPress, startsWindowDrag } from "./drag";
 
 function tree() {
   const root = document.createElement("div");
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-  svg.appendChild(line);
+  root.setAttribute("data-stage", "");
   const button = document.createElement("button");
   const inside = document.createElement("span");
   button.appendChild(inside);
   const roleButton = document.createElement("div");
   roleButton.setAttribute("role", "button");
-  root.append(svg, button, roleButton);
-  return { root, line, button, inside, roleButton };
+  // v1.55.0: the circle is a charm; its drawing sits inside the row.
+  const charm = document.createElement("div");
+  charm.setAttribute("data-charm", "");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  svg.appendChild(line);
+  const hit = document.createElement("div");
+  hit.setAttribute("data-hit", "");
+  const handle = document.createElement("div");
+  handle.setAttribute("data-handle", "");
+  charm.append(svg, hit, handle);
+  const chrome = document.createElement("div");
+  chrome.setAttribute("data-chrome", "");
+  const grip = document.createElement("div");
+  grip.setAttribute("data-grip", "");
+  chrome.appendChild(grip);
+  root.append(button, roleButton, charm, chrome);
+  return { root, line, button, inside, roleButton, charm, hit, handle, chrome, grip };
 }
 
+describe("isPlainLeftPress (v1.55.0)", () => {
+  it.each([
+    [0, 1, true],
+    [0, 2, false],
+    [0, 3, false],
+    [0, 0, false],
+    [1, 1, false],
+    [2, 1, false],
+  ])("button %i, detail %i → %s", (button, detail, want) => {
+    expect(isPlainLeftPress({ button, detail })).toBe(want);
+  });
+});
+
 describe("startsWindowDrag", () => {
-  it("a plain left press on the background or the circle's drawing drags", () => {
+  it("a plain left press on the empty stage drags", () => {
     const t = tree();
     expect(startsWindowDrag({ button: 0, detail: 1, target: t.root })).toBe(true);
-    // SVG elements are not HTMLElements; Tauri's own script skips them.
-    expect(startsWindowDrag({ button: 0, detail: 1, target: t.line })).toBe(true);
+  });
+
+  it("v1.55.0: charms, their handles and the Arrange chrome never drag the window", () => {
+    // v1.51.3 let the circle's drawing drag; now pressing a charm moves the
+    // charm, and the window moves from the grip or an empty spot.
+    const t = tree();
+    for (const target of [t.charm, t.line, t.hit, t.handle, t.chrome, t.grip]) {
+      expect(startsWindowDrag({ button: 0, detail: 1, target })).toBe(false);
+    }
   });
 
   it("buttons keep their click, including whatever is inside them", () => {

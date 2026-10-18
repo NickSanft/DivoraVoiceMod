@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
   OVERLAY_MIN_SIZE,
+  canvasRects,
+  effectiveFit,
+  fitRect,
   isSavablePosition,
   mergeOverlayPrefs,
+  pickMonitor,
   placeOverlay,
   readGeometry,
   readOverlayBg,
+  readOverlayFlags,
   type MonitorInfo,
+  type OverlayGeometry,
 } from "./geometry";
+import type { OverlayBg } from "./state";
 
 // A common desk: a 1920×1080 laptop panel at 100 % as the primary, and a
 // 4K screen at 150 % to its right. All values physical, as Tauri reports them.
@@ -218,5 +225,101 @@ describe("placeOverlay", () => {
     const saved = { x: 100.4, y: 100.6, w: 333, h: 333, monitor: LAPTOP.name!, scale: 1.25 };
     const r = placeOverlay(saved, [LAPTOP], LAPTOP.name)!;
     for (const v of [r.x, r.y, r.width, r.height]) expect(Number.isInteger(v)).toBe(true);
+  });
+});
+
+describe("pickMonitor (v1.55.0)", () => {
+  // placeOverlay's cases above guard the extraction; these pin the choice.
+  it.each([
+    ["by name", { x: 0, y: 0, w: 480, h: 480, monitor: FOUR_K.name! }, [LAPTOP, FOUR_K], LAPTOP.name, FOUR_K],
+    ["by overlap when the name is gone", { x: 3000, y: 900, w: 720, h: 720, monitor: "gone" }, [LAPTOP, FOUR_K], LAPTOP.name, FOUR_K],
+    ["the primary when nothing overlaps", { x: 99999, y: 0, w: 480, h: 480 }, [FOUR_K, LAPTOP], LAPTOP.name, LAPTOP],
+    ["the first with no primary", { x: 99999, y: 0, w: 480, h: 480 }, [FOUR_K, LAPTOP], null, FOUR_K],
+    ["nothing saved: the primary", null, [FOUR_K, LEFT, LAPTOP], LAPTOP.name, LAPTOP],
+    ["nothing saved, no primary: the first", null, [LEFT, LAPTOP], null, LEFT],
+  ] as Array<[string, OverlayGeometry | null, MonitorInfo[], string | null, MonitorInfo]>)("%s", (_n, saved, mons, primary, want) => {
+    expect(pickMonitor(saved, mons, primary)).toBe(want);
+  });
+
+  it("no monitors: none", () => {
+    expect(pickMonitor(null, [])).toBeNull();
+    expect(pickMonitor({ x: 0, y: 0, w: 1, h: 1 }, [])).toBeNull();
+  });
+});
+
+describe("fitRect (v1.55.0)", () => {
+  it("is the whole of pickMonitor's monitor", () => {
+    const saved = { x: 2100, y: 300, w: 720, h: 720, monitor: FOUR_K.name!, scale: 1.5 };
+    expect(fitRect(saved, [LAPTOP, FOUR_K], LAPTOP.name)).toEqual({ x: 1920, y: 0, width: 3840, height: 2160 });
+    expect(fitRect(null, [LEFT, LAPTOP], LAPTOP.name)).toEqual({ x: 0, y: 0, width: 1920, height: 1080 });
+    expect(fitRect(null, [LEFT], null)).toEqual({ x: -2560, y: -200, width: 2560, height: 1440 });
+    expect(fitRect(saved, [])).toBeNull();
+  });
+});
+
+describe("canvasRects (v1.55.0)", () => {
+  it("100 %: CSS px equal physical, relative to the monitor", () => {
+    expect(canvasRects({ x: 100, y: 50, width: 480, height: 480 }, LAPTOP)).toEqual({
+      window: { x: 100, y: 50, w: 480, h: 480 },
+      monitor: { x: 0, y: 0, w: 1920, h: 1080 },
+    });
+  });
+
+  it("150 %: divided by the scale", () => {
+    expect(canvasRects({ x: 2100, y: 300, width: 720, height: 720 }, FOUR_K)).toEqual({
+      window: { x: 120, y: 200, w: 480, h: 480 },
+      monitor: { x: 0, y: 0, w: 2560, h: 1440 },
+    });
+  });
+
+  it("a screen with a negative origin, at 125 %", () => {
+    expect(canvasRects({ x: -2400, y: -100, width: 600, height: 600 }, LEFT)).toEqual({
+      window: { x: 128, y: 80, w: 480, h: 480 },
+      monitor: { x: 0, y: 0, w: 2048, h: 1152 },
+    });
+  });
+
+  it("an unreadable scale counts as 100 %", () => {
+    const odd = { ...LAPTOP, scaleFactor: 0 };
+    expect(canvasRects({ x: 10, y: 10, width: 100, height: 100 }, odd).window).toEqual({ x: 10, y: 10, w: 100, h: 100 });
+  });
+});
+
+describe("overlay flags (v1.55.0)", () => {
+  it("readOverlayFlags: off unless stored as true", () => {
+    expect(readOverlayFlags(undefined)).toEqual({ fit: false, hideFromRecordings: false });
+    expect(readOverlayFlags(null)).toEqual({ fit: false, hideFromRecordings: false });
+    expect(readOverlayFlags("x")).toEqual({ fit: false, hideFromRecordings: false });
+    expect(readOverlayFlags({ bg: "green" })).toEqual({ fit: false, hideFromRecordings: false });
+    expect(readOverlayFlags({ fit: true })).toEqual({ fit: true, hideFromRecordings: false });
+    expect(readOverlayFlags({ hideFromRecordings: true })).toEqual({ fit: false, hideFromRecordings: true });
+    expect(readOverlayFlags({ fit: "true", hideFromRecordings: 1 })).toEqual({ fit: false, hideFromRecordings: false });
+  });
+
+  it.each([
+    [true, "transparent", true],
+    [true, "green", false],
+    [true, "magenta", false],
+    [false, "transparent", false],
+    [false, "green", false],
+  ] as Array<[boolean, OverlayBg, boolean]>)("effectiveFit(fit %s, %s) = %s", (fit, bg, want) => {
+    expect(effectiveFit({ fit, hideFromRecordings: false }, bg)).toBe(want);
+  });
+
+  it("a {bg: green, fit: true} written by mixing builds reads as Fit off", () => {
+    const stored = { bg: "green", fit: true };
+    expect(effectiveFit(readOverlayFlags(stored), readOverlayBg(stored.bg))).toBe(false);
+  });
+
+  it("mergeOverlayPrefs sets the flags it is given and keeps everything else", () => {
+    const stored = { bg: "green", x: 1, y: 2, w: 3, h: 4, fit: true, hideFromRecordings: true, future: { a: 1 } };
+    const g = { x: 1, y: 2, w: 3, h: 4 };
+    // No flags: as stored (the 28 geometry cases above call it this way).
+    expect(mergeOverlayPrefs(stored, "transparent", g)).toEqual({ ...stored, bg: "transparent" });
+    expect(mergeOverlayPrefs(stored, "green", g, { fit: false })).toEqual({ ...stored, fit: false });
+    expect(mergeOverlayPrefs(stored, "green", g, { hideFromRecordings: false })).toEqual({ ...stored, hideFromRecordings: false });
+    const fresh = mergeOverlayPrefs({ bg: "green" }, "transparent", null, { fit: true, hideFromRecordings: true });
+    expect(fresh).toEqual({ bg: "transparent", fit: true, hideFromRecordings: true });
+    expect(readOverlayFlags(fresh)).toEqual({ fit: true, hideFromRecordings: true });
   });
 });

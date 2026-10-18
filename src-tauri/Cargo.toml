@@ -44,6 +44,9 @@ tracing = "0.1"
 # %APPDATA%/com.divora.voicemod/logs/ (surfaced via "Open logs folder").
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
+# v1.55.0: charm pictures are named by their content's SHA-256. Already in
+# Cargo.lock through tauri-codegen; =0.10.9 adds no package.
+sha2 = "=0.10.9"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

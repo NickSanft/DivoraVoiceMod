@@ -1597,6 +1597,8 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
       // v1.54.0: Replay's, likewise.
       "replay:save": "",
       "replay:toggle": "",
+      // v1.55.0: the overlay's Arrange / Lock switch.
+      "overlay:arrange": "",
     });
     first.cleanup();
 
@@ -3514,5 +3516,83 @@ describe("app store — Replay (v1.54.0)", () => {
       saved(30_000);
       expect(result.toast()?.text).toBe(`Saved a 30 s replay · ${result.preset().name}`);
     });
+  });
+});
+
+// v1.55.0: the `overlay:arrange` hotkey is acted on by the backend, inside
+// the hotkey's own message. The JS path only explains why nothing happened;
+// it must never ask for the mode too, or one press would toggle twice.
+describe("app store — stream overlay hotkey (v1.55.0)", () => {
+  type Handler = (e: { payload: unknown }) => void;
+  const handlers = new Map<string, Handler[]>();
+  const fire = (event: string, payload: unknown) => {
+    for (const h of handlers.get(event) ?? []) h({ payload });
+  };
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  const status = (more: Record<string, unknown>) => ({
+    open: false,
+    phase: "closed",
+    instance: 0,
+    mode: "locked",
+    arrangeGen: 0,
+    canArrange: false,
+    fit: false,
+    hideWanted: false,
+    hideAvailable: true,
+    capturing: false,
+    error: null,
+    ...more,
+  });
+  const press = (result: ReturnType<typeof useApp>) =>
+    dispatchGlobalShortcut(result, { id: "overlay:arrange", accelerator: "F8", state: "pressed" });
+  const modeCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "set_overlay_mode");
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "overlay_status" || cmd === "set_overlay_hide_from_recordings" ? status({}) : null,
+    );
+    handlers.clear();
+    vi.mocked(listen).mockImplementation((async (event: string, handler: Handler) => {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+      return () => {};
+    }) as unknown as typeof listen);
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    vi.mocked(listen).mockImplementation((async () => () => {}) as unknown as typeof listen);
+  });
+
+  it("closed: a notice, and never set_overlay_mode", async () => {
+    const { result } = setupApp();
+    await settle();
+    press(result);
+    expect(result.toast()).toMatchObject({
+      text: "The overlay is off. Turn it on in Settings first.",
+      tone: "success",
+    });
+    expect(modeCalls()).toEqual([]);
+  });
+
+  it("starting: says so; painted: nothing — the backend already switched it", async () => {
+    const { result } = setupApp();
+    await settle();
+    fire("overlay:status", status({ open: true, phase: "starting", instance: 1 }));
+    press(result);
+    expect(result.toast()?.text).toBe("The overlay is still starting. Try again in a moment.");
+    const shown = result.toast()!.id;
+
+    fire("overlay:status", status({ open: true, phase: "painted", instance: 1, canArrange: true }));
+    press(result);
+    fire("overlay:status", status({ open: true, phase: "painted", instance: 1, canArrange: true, mode: "arrange", arrangeGen: 1 }));
+    press(result);
+    // A release does nothing either.
+    dispatchGlobalShortcut(result, { id: "overlay:arrange", accelerator: "F8", state: "released" });
+    await settle();
+    expect(result.toast()!.id).toBe(shown);
+    expect(modeCalls()).toEqual([]);
   });
 });
