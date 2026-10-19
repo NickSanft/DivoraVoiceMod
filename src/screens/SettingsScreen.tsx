@@ -2375,8 +2375,8 @@ function StreamOverlaySection(): JSX.Element {
         </Show>
         <OverlayCharmRows />
         <div style={helpStyle}>
-          A frameless, always-on-top window shows your spell circle reacting
-          to your voice — capture it in OBS. Use{" "}
+          A frameless, always-on-top window shows your charms — capture it in
+          OBS. Use{" "}
           <strong style={{ color: "var(--text-mid)" }}>Transparent</strong> with
           a Window Capture that supports alpha, or pick{" "}
           <strong style={{ color: "var(--text-mid)" }}>Green</strong> /{" "}

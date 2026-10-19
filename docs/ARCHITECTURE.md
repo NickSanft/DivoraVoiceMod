@@ -1241,9 +1241,9 @@ Before the window can show, on the same tokio worker:
    Divora's;
 2. its HWND is stored, and the `NonRudeHWND` property is set on the main
    thread (`mark_non_rude`, `divora_capture::native::window`; Raymond Chen,
-   2025-05-22). The shell reads it when a window is shown, and a window that
-   has it is never taken for a fullscreen app, which would hide the taskbar
-   and hold back notifications under a fitted, topmost overlay;
+   2025-05-22). Windows' shell reads it when a window is shown, and a window
+   that has it is never taken for a fullscreen app, which would hide the
+   taskbar and hold back notifications under a fitted, topmost overlay;
 3. it is placed (see Geometry);
 4. the core steps `Built`.
 
@@ -1364,8 +1364,10 @@ without a beat lock the overlay as Lock does, with an error main toasts:
 
 Nothing else would notice a hung or crashed page behind a window that takes
 clicks: neither wry nor tauri-runtime-wry handles WebView2's `ProcessFailed`.
-Beats are a command on a tokio worker, so a busy main thread doesn't stop
-them. Beats and ticks from another instance or generation do nothing.
+A beat's command body runs on a tokio worker, but tauri receives every
+command on WebView2's UI thread, which is the main thread, so a main thread
+blocked for three ticks ends Arrange just as a silent page does. Beats and
+ticks from another instance or generation do nothing.
 
 **Locking** (`lock_edge`): the mode goes back to Locked and the status goes
 out at once, while `core` is held. Then, in order, the window is applied
@@ -1485,16 +1487,18 @@ it.
 - **The shape is always kept:** `nw/nh` for a picture, square for the circle.
 - **Frame.** `frame` says what `designSize` was measured against: the window,
   or the whole monitor (Fit to monitor). Changing Fit commits a `reframe` that
-  keeps every element where it is on screen and sets `designSize` to the new
-  frame's size, so turning Fit off shrinks it to the window's.
+  keeps every element that lies wholly inside the new frame where it is on
+  screen (one that doesn't is pulled inside it, shrunk if it is larger) and
+  sets `designSize` to the new frame's size, so turning Fit off shrinks it to
+  the window's.
 - **Live and inert.** An element this version can show is live: the first
   usable `spellcircle`, and each `image` with usable geometry and an asset-id
   `src`. Anything else — an unknown type, a picture it can't recognise, a
   second circle, unusable geometry — is inert: kept exactly as stored, written
-  back unchanged, neither drawn nor listed. Reading drops only entries without
-  a string id and later duplicate ids. The caps (16 pictures, 64 stored
-  elements, one live circle, and the budget under Charm pictures) apply when
-  adding, never when reading.
+  back unchanged, neither drawn nor listed. Reading drops only entries that
+  aren't objects or have no non-empty string id, and later duplicate ids. The
+  caps (16 pictures, 64 stored elements, one live circle, and the budget
+  under Charm pictures) apply when adding, never when reading.
 - **Migration.** With no stored scene, `migrateScene` puts the circle where
   v1.51.3 drew it: at most 440 px, centred in the saved window (its size in
   `divora.overlay`, divided by its scale). That scene is saved the first time
@@ -1545,8 +1549,9 @@ focused charm keeps focus. Rows stay in scene-array order and stack with
   Alt+F4, and Enter or Space on a button (`shouldPreventKey`). That is meant
   to keep F5, Ctrl+R, Ctrl+P, Ctrl+F, F12, Ctrl+zoom, Alt+arrows and Alt+Space
   from WebView2: a reload would run the handshake again. The page has no
-  `title`, no `<select>` and no context menu (`contextmenu` is prevented),
-  because WebView2's popups escape capture exclusion (WebView2Feedback #4544).
+  `title` attribute (no tooltip), no `<select>` and no context menu
+  (`contextmenu` is prevented), because WebView2's popups escape capture
+  exclusion (WebView2Feedback #4544).
   The circle is `SpellCircle` with `decorative`: its nodes have no `title` and
   take no pointer or focus.
 - **Entering Arrange** gives the stage the keyboard. `arrange` is a memo of
@@ -1558,8 +1563,9 @@ focused charm keeps focus. Rows stay in scene-array order and stack with
   **Move window** grip top left, not while fitted, its text from 320 px wide;
   and the hints, from 320×120: "Esc locks the overlay" or "Click Lock to lock
   the overlay", and "Recordings can see the overlay while you arrange." while
-  a capture runs with Hide on. A picture that won't load shows "Picture
-  missing" while arranging. Locked shows no frame, outline or handle.
+  a capture runs with Hide on and available (`capturing`, `hideWanted` and
+  `hideAvailable`). A picture that won't load shows "Picture missing" while
+  arranging. Locked shows no frame, outline or handle.
 
 ### Charm pictures
 
@@ -1637,8 +1643,10 @@ harmless.
 
 **Two folders.** `pnpm tauri dev` has its own localStorage, and so its own
 scene; it keeps its pictures in `overlay/assets-dev`, so one build can't delete
-the other's. The choice is `tauri::is_dev()`, not `debug_assertions`, which
-`tauri build --debug` shares with the installed app. Both are under
+the other's. The choice is `tauri::is_dev()`, not `debug_assertions`: a
+`tauri build --debug` build has debug assertions on, but it shares the
+installed app's localStorage and scene, so it keeps its pictures in
+`overlay/assets` too. Both folders are under
 `%APPDATA%\com.divora.voicemod\`, with a temp-folder fallback; the folder is
 created and logged at startup.
 
@@ -1652,17 +1660,19 @@ it. Only decoding a recording shows whether it worked.
 
 - **When.** `protected()` is true when the toggle is on (`hideWanted`), it is
   available, the overlay is effectively Locked (Locked, or Arrange before its
-  first beat), something captures (`capturing`), and the window has been shown
-  (Shown, Painted or Closing: a closing window's request stands while it is on
+  first beat), something captures (`capturing`), and the overlay's phase is
+  Shown, Painted or Closing (a closing window's request stands while it is on
   screen). `capturing` is `capture_active(phase, replay)` in `screen.rs`: a
   take in any phase, or Replay in any state but Off, held included.
-- **Only on a shown window, only on change.** The shell sets the affinity
-  only once the window has been shown, and only when the wanted value differs
-  from what it last set (`affinity_call`). So `WDA_NONE` never reaches a
-  window that was never protected, and nothing reaches a hidden one (Chromium
-  skips the call on a hidden window too, because it can leave the window
-  blank). The Show effect applies the window state, protection included, then
-  shows the window, with no message pump between.
+- **From the Show on, only on change.** The shell sets the affinity only
+  once the window's Show effect has begun (the first time on the still-hidden
+  window, just before it shows), and only when the wanted value differs from
+  what it last set (`affinity_call`). So `WDA_NONE` never reaches a window
+  that was never protected, and nothing reaches the window before its Show
+  (Chromium skips the call on any hidden window, because it can leave the
+  window blank). The Show effect marks the window shown, applies the window
+  state, protection included, then shows the window, with no message pump
+  between.
 - **Order.** Towards Locked: click-through, the layered attributes (rung 1
   only; `R1_RUNG` is 0), resizable, then the affinity last, on that apply's
   final styles. Towards Arrange: the affinity off first, while the window is
@@ -1709,9 +1719,11 @@ it. Only decoding a recording shows whether it worked.
   read; else `placeOverlay(saved)`; else nothing, and Windows places it.
   `fit: true` goes to the backend only with a fitted rectangle. When the
   scene's `frame` differs from the target's, the plan adds a `reframe` between
-  the two rectangles in the monitor's CSS px (`canvasRects`), so nothing moves
-  on screen. A Fit change made while the overlay was closed is reconciled at
-  the next open, and saved before `open_overlay`.
+  the two rectangles in the monitor's CSS px (`canvasRects`). An element
+  wholly inside the new rectangle stays where it is on screen; one that isn't
+  is pulled inside it, shrunk if it is larger. A Fit change made while the
+  overlay was closed is reconciled at the next open, and saved before
+  `open_overlay`.
 - **While open,** main pushes the reframed scene, unsaved, with
   `expectViewport`, waits for that push to go, then calls `place_overlay`. On
   success it saves the scene and the flag and swaps geometry tracking for the
@@ -1865,10 +1877,11 @@ not in the order.
 8. Never register or unregister a shortcut from the hotkey path.
 9. The reconcile setters never reach a window that isn't live
    (`reconcile_plan` is `None` in Closed, Creating and Closing), and the
-   affinity reaches only a shown window. Outside that, `open`'s build sets
-   click-through on the window it is creating, reads its HWND and places it,
-   and `close_overlay` and the watchdog close or destroy the window as the
-   core steps to Closing.
+   affinity reaches a window only from its Show effect on (the first time
+   just before it shows). Outside that, `open`'s build sets click-through on
+   the window it is creating, reads its HWND and places it, and
+   `close_overlay` and the watchdog close or destroy the window as the core
+   steps to Closing.
 10. `before_capture` only after the recorder's lock is released; the token
     can't check that.
 
@@ -1944,9 +1957,10 @@ events.
   the ACL check in both consoles, focus with its own console window in front,
   the GIF and PNG (with the scheme, drag and delete checks), the lease, the
   watchdog, the decoded Hide takes and the first opens under Replay. The
-  second was the shipping code, and ran the rest: the 20 cycles, focus against
-  another program, the APNG, WebP and JPEG, GPU use, memory, the restart and
-  the later Replay rounds.
+  second had those fixes; the code has changed since only in Settings' text,
+  the recordings hint's `hideAvailable` gate and comments. It ran the rest:
+  the 20 cycles, focus against another program, the APNG, WebP and JPEG, GPU
+  use, memory, the restart and the later Replay rounds.
   - Opening: hidden at first, click-through set before it was first visible,
     shown about 138 ms after the click, opened Locked; the foreground window
     didn't change; `NonRudeHWND` was set. Locked, `WindowFromPoint` at the
@@ -1963,11 +1977,13 @@ events.
   - Focus: with another program's window in front, Windows refused the
     overlay the foreground 3 times of 3 and that window kept the keyboard;
     with the debug build's own console window in front, Arrange took it.
-  - Pictures, through Add picture…: a GIF, an APNG and an animated WebP drawn
-    and animating, in their stored shape; a JPEG with EXIF orientation 6 stored
-    and drawn upright; the scheme's headers as above, refusals as 404, the main
-    window's request a 403; a 10-step drag in Arrange moving a charm by exactly
-    the pointer's travel, saved by main; each file deleted once nothing used it.
+  - Pictures, through Add picture… (the file picker's answer was supplied
+    inside the page, so the native dialog never opened): a GIF, an APNG and
+    an animated WebP drawn and animating, in their stored shape; a JPEG with
+    EXIF orientation 6 stored and drawn upright; the scheme's headers as
+    above, refusals as 404, the main window's request a 403; a 10-step drag
+    in Arrange moving a charm by exactly the pointer's travel, saved by main;
+    each file deleted once nothing used it.
   - Hide from recordings (Green background, toggle on, Locked, a 480×360
     window; every frame decoded from frame 0): the overlay in 0 of 302 frames
     of a 10 s take; with the toggle off, in 152 of 152; arranging mid-take,
@@ -1995,17 +2011,23 @@ events.
     the picture on the same pixels. A main-window reload adopted the open
     overlay.
   - Not tried: real keys in a focused overlay (F5, Ctrl+P, Alt+Space, Alt+F4
-    and the rest); the hotkey in a game, and the keyboard's return to it; Win+D
-    and Win+M during a protected take; what OBS shows of the overlay, protected
-    or not; the taskbar and notifications while fitted; a display scale or
-    resolution change while fitted; mixed DPI; a game's present mode with the
-    overlay fitted; Windows 10 and Windows 11 21H2; a 12-bit or arithmetic
-    JPEG, or a GIF or WebP frame larger than its canvas, in the real app;
-    Discord, Teams and the Snipping Tool while protected; a 4K display; a long
-    Replay with the toggle on.
+    and the rest); the `overlay:arrange` hotkey, in a game or anywhere else
+    (it needs real input), and the keyboard's return to a game; the tray's
+    Lock the overlay; the arrange keys (arrows, resizes, Delete, restacking)
+    and the corner handles; moving the window by Move window or an empty
+    spot; memory drawn large for 5 minutes, or over a game; Win+D and Win+M
+    during a protected take; what OBS shows of the overlay, protected or not;
+    the taskbar and notifications while fitted; a display scale or resolution
+    change while fitted; mixed DPI; a game's present mode with the overlay
+    fitted; Windows 10 and Windows 11 21H2; in the real app, a 12-bit or
+    arithmetic JPEG, a GIF whose frames are larger than its logical screen
+    (or whose screen is 0×0), or a WebP whose frames are larger than its
+    canvas (that one isn't unit-tested either); Discord, Teams and the
+    Snipping Tool while protected; a 4K display; a long Replay with the toggle
+    on.
 
-Drag, border, taskbar, focus and reopen behaviour from v1.51.3 is checked on a
-desktop too: see "Stream overlay (v1.16.0)" in
+Drag, border, taskbar, focus and reopen behaviour from v1.51.3 can only be
+checked on a desktop: see "Stream overlay (v1.16.0)" in
 [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
 
 ## Screen recording (v1.52.0)

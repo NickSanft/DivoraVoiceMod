@@ -601,7 +601,9 @@ impl OverlayCore {
         )
     }
 
-    /// The shell may touch the window: Starting, Shown or Painted.
+    /// The window is given its window state (`reconcile_plan`) and `Placed`
+    /// is accepted: Starting, Shown or Painted. A closing window still has
+    /// its `NonRudeHWND` mark taken off and is closed or destroyed.
     pub fn live(&self) -> bool {
         matches!(
             self.phase,
@@ -718,8 +720,9 @@ pub fn setter_plan(w: WindowState, rung: u8) -> Vec<Setter> {
     }
 }
 
-/// Whether to set the display affinity, and to what: only on a shown
-/// window, and only when it changes.
+/// Whether to set the display affinity, and to what: only once the window's
+/// Show has begun (`shown` is the shell's cell, set just before the window
+/// shows), and only when it changes.
 #[doc(hidden)]
 pub fn affinity_call(want: bool, shown: bool, applied: bool) -> Option<bool> {
     // A window never protected never gets WDA_NONE either.
@@ -1667,8 +1670,9 @@ mod tests {
                     })
                     .unwrap();
                 }
-                // Nothing touches a closing window, and the keyboard goes
-                // wherever Windows puts it.
+                // A closing window gets no window state and no ReturnFocus
+                // (`Close` only closes it), so the keyboard goes wherever
+                // Windows puts it.
                 assert_eq!(core.step(input), Ok(want.clone()), "{input:?}");
                 assert_eq!(
                     (core.status().phase, core.mode),

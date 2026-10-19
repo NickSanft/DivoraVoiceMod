@@ -52,7 +52,9 @@ pub struct OverlayShared {
     arranging: AtomicBool,
     /// The foreground window before Arrange took it; 0 when none.
     return_to: AtomicIsize,
-    /// The live window has been shown. Main thread only while there is a
+    /// The live window's Show has begun: set just before the window is
+    /// shown, so the Show's own apply can protect it, and cleared again if
+    /// the window is no longer live. Main thread only while there is a
     /// window; `open` clears it on its worker when there is none (`adopt`
     /// before the build, `forget` if the build fails).
     shown: AtomicBool,
@@ -587,9 +589,10 @@ fn reconcile_on(shared: &OverlayShared, n: &impl Native) -> bool {
     true
 }
 
-/// Run `plan` in its order. The affinity reaches only a shown window, and
-/// only when it changes (`affinity_call`); tao skips the flags that didn't
-/// change, so a repeat apply makes no Win32 call.
+/// Run `plan` in its order. The affinity reaches a window only once its Show
+/// has begun (just before it shows), and only when it changes
+/// (`affinity_call`); tao skips the flags that didn't change, so a repeat
+/// apply makes no Win32 call.
 fn apply_setters(shared: &OverlayShared, plan: &[Setter], n: &impl Native) {
     let hwnd = shared.hwnd.load(Ordering::SeqCst);
     for setter in plan {

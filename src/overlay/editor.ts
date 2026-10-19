@@ -85,7 +85,7 @@ const ORDER_KEYS = new Map<string, "front" | "back" | "forward" | "backward">([
  *  pointer gesture: Esc cancels it and nothing else acts. Otherwise Esc
  *  locks, and with an element selected: arrows nudge 1 px (Shift: 10),
  *  Delete removes (Backspace doesn't), = and numpad + grow a step, + grows
- *  10 %, − and numpad − shrink a step, _ shrinks 10 %, and [ ] { } restack. */
+ *  10 %, - and numpad − shrink a step, _ shrinks 10 %, and [ ] { } restack. */
 export function keyAction(
   e: { key: string; code: string; shiftKey: boolean },
   ctx: { arrange: boolean; gesture: boolean; selected: boolean },
