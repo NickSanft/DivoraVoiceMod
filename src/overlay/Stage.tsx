@@ -655,7 +655,8 @@ export function Stage(props: StageProps): JSX.Element {
               }}
             >
               <span>{hasFocus() ? "Esc locks the overlay" : "Click Lock to lock the overlay"}</span>
-              <Show when={props.status.capturing && props.status.hideWanted}>
+              {/* Only where Locked would hide it: Hide on, and Windows able to. */}
+              <Show when={props.status.capturing && props.status.hideWanted && props.status.hideAvailable}>
                 <span>Recordings can see the overlay while you arrange.</span>
               </Show>
             </div>

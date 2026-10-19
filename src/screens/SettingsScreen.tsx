@@ -2338,8 +2338,8 @@ function StreamOverlaySection(): JSX.Element {
         </Row>
         <div style={helpStyle}>
           Locked, clicks go through the overlay to whatever is under it. Choose Arrange to move
-          and resize what's on it and, unless it's fitted to the monitor, drag Move window to
-          move the window. Press Esc or Lock when you're done.
+          and resize what's on it and, unless it's fitted to the monitor, drag Move window at
+          the overlay's top left to move the window. Press Esc or Lock when you're done.
         </div>
         <Row label="Fit to monitor" icon="expand">
           <Toggle

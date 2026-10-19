@@ -1306,10 +1306,10 @@ after the events that followed it: `close_overlay`'s "closing" arrived about
 counter); the events carry every change anyway. Found in the real app: without
 this rule the Show overlay window toggle stayed on after 6 of 12 quick
 open/close cycles. A status with a new `error` is toasted once. The toast
-has two tones: success for the plain "Picture added." and the hotkey's two
-notices; error for everything else, the large-picture warning included. The
-controller's public actions never reject: a failure they don't expect is
-logged with `console.warn`.
+has two tones: success for "Picture added. Use Arrange to place it." and the
+hotkey's two notices; error for everything else, the large-picture warning
+included. The controller's public actions never reject: a failure they don't
+expect is logged with `console.warn`.
 
 **A main-window reload** (F5 / Ctrl+R reload a WebView2 page, and the overlay
 window survives it). At start the controller subscribes to `overlay:status`
@@ -1475,16 +1475,18 @@ it.
   stays inside. The circle is laid out as the largest square in its rectangle,
   and Stage scales the circle's 440 px box (`SPELL_CIRCLE_PX`) by
   `min(w, h) / 440`. Elements stack by `z`, then by array order.
-- **`designSize` only grows.** A `place` edit grows it to cover the viewport
-  and stores the edited element as it is on screen. Every other element keeps
-  its designed size and centre, and is left byte-for-byte unchanged when
-  nothing grew. So shrinking the window and growing it back changes nothing.
+- **A `place` only grows `designSize`.** A `place` edit grows it to cover the
+  viewport and stores the edited element as it is on screen. Every other
+  element keeps its designed size and centre, and is left byte-for-byte
+  unchanged when nothing grew. So shrinking the window and growing it back
+  changes nothing.
   A drag or a nudge keeps a shrunk element's designed size and takes only its
   new centre; a resize takes the new size.
 - **The shape is always kept:** `nw/nh` for a picture, square for the circle.
 - **Frame.** `frame` says what `designSize` was measured against: the window,
   or the whole monitor (Fit to monitor). Changing Fit commits a `reframe` that
-  keeps every element where it is on screen.
+  keeps every element where it is on screen and sets `designSize` to the new
+  frame's size, so turning Fit off shrinks it to the window's.
 - **Live and inert.** An element this version can show is live: the first
   usable `spellcircle`, and each `image` with usable geometry and an asset-id
   `src`. Anything else — an unknown type, a picture it can't recognise, a
@@ -1589,7 +1591,7 @@ and renamed. The same picture added twice gets the same id and is written
 once; a damaged or truncated file under that id is replaced. The answer is
 `{id, width, height, bytes, animated, warning}`. `warning` is "Picture added.
 It's a large picture, so the overlay may use more memory and CPU." over 20 MB,
-or for an animated picture over 2 megapixels, else null. The file picker offers
+or for an animated picture over 2,097,152 px, else null. The file picker offers
 `.png`, `.jpg`, `.jpeg`, `.jfif`, `.jpe`, `.gif`, `.webp` and `.apng`; the
 content decides, so the `.jfif` JPEGs browsers save are accepted.
 
@@ -1602,8 +1604,11 @@ in all.
 …)`, so the overlay loads `http://charm.localhost/<id>` (`charmUrl`). The
 handler runs on WebView2's UI thread and only hands the request to a blocking
 thread. That thread takes one of two `ServeGate` places before it reads and
-holds it until the response is handed back, so at most two pictures are held
-in memory at once. `serve` answers:
+holds it until the response is handed back, so at most two pictures are read
+into memory at once. That doesn't cap how many are held: a response handed
+back waits, outside the gate, for WebView2's UI thread to copy it into a
+stream, so while that thread is busy more than two can be held. `serve`
+answers:
 
 | Condition | Answer |
 |---|---|
@@ -1766,10 +1771,13 @@ jumps. `place_overlay` checks the phase before it touches anything: "The
 overlay is still starting. Try again in a moment." while the window is being
 built, "The overlay isn't open." while closing or closed. Open's build-to-
 `Built` and `place_overlay`'s placement hold one async lock, so two placements
-never interleave. A rectangle with a side outside 1..32768 is ignored. When
-Fit doesn't count and there is no saved place, or when no monitors could be
-read, the rectangle is null and the window opens at 480×480 (logical) where
-Windows puts it.
+never interleave. A rectangle whose width or height is 0 or over 32768 is
+ignored: `open_overlay` leaves the window where Windows puts it, and
+`place_overlay` moves nothing and leaves `fit` as it was. A negative,
+fractional or missing field fails the call first, with Tauri's "invalid args"
+error. When Fit doesn't count and there is no saved place, or when no monitors
+could be read, the rectangle is null and the window opens at 480×480 (logical)
+where Windows puts it.
 
 ### Moving it
 
@@ -1835,8 +1843,9 @@ window event straight back into `on_window_event`, which takes `core`.
 
 **Lock order:** the recorder's lock → `core`; the hotkey plugin's own lock, if
 it holds one around the handler → `core`. `core` is a leaf: under it, code
-only computes, emits and (off the main thread) posts. The overlay never calls into
-the recorder. There are no Rust event listeners, so tauri's listener lock is
+only computes, emits and, off the main thread, posts the window work and
+starts the watchdog and lease threads. The overlay never calls into the
+recorder. There are no Rust event listeners, so tauri's listener lock is
 not in the order.
 
 **Main-thread hazards** (each a review item):
@@ -1975,8 +1984,9 @@ events.
     click-through; off, it went back to its 480×480 place. Idle 3D-engine use
     (dwm and Divora's processes, 15 s each) was 1.79 % with a GIF in the
     480 window and 1.89 % fitted (0.17 % with the overlay off).
-  - Memory, with the worst scene the budgets allow (four 2048×2048 GIFs of
-    20 frames and three 4096×4096 PNGs): divora-app grew by at most 8 MB.
+  - Memory, with a scene filling both pixel budgets (four 2048×2048 GIFs of
+    20 frames and three 4096×4096 PNGs; copies of a picture, which the budget
+    counts once, weren't added): divora-app grew by at most 8 MB.
     WebView2's private bytes went from 334 to 880 MB with every picture drawn
     1080×1080 on a fitted 1920×1080 monitor, flat over 30 s. 20 open/close
     cycles, each closed 300 ms after opening, added 1 MB to divora-app.
@@ -1990,9 +2000,9 @@ events.
     or not; the taskbar and notifications while fitted; a display scale or
     resolution change while fitted; mixed DPI; a game's present mode with the
     overlay fitted; Windows 10 and Windows 11 21H2; a 12-bit or arithmetic
-    JPEG, or a GIF frame larger than its screen, in the real app; Discord,
-    Teams and the Snipping Tool while protected; a 4K display; a long Replay
-    with the toggle on.
+    JPEG, or a GIF or WebP frame larger than its canvas, in the real app;
+    Discord, Teams and the Snipping Tool while protected; a 4K display; a long
+    Replay with the toggle on.
 
 Drag, border, taskbar, focus and reopen behaviour from v1.51.3 is checked on a
 desktop too: see "Stream overlay (v1.16.0)" in

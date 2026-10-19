@@ -330,13 +330,23 @@ describe("Stage: the Arrange chrome", () => {
   });
 
   it("warns that recordings see the overlay only while capturing with Hide on", () => {
-    const { q, setStatus } = mount({ status: arranging({ capturing: true, hideWanted: false }) });
+    const { q, setStatus } = mount({
+      status: arranging({ capturing: true, hideWanted: false, hideAvailable: true }),
+    });
     const warning = "Recordings can see the overlay while you arrange.";
     expect(q("[data-hints]")!.textContent).not.toContain(warning);
-    setStatus(arranging({ capturing: true, hideWanted: true }));
+    setStatus(arranging({ capturing: true, hideWanted: true, hideAvailable: true }));
     expect(q("[data-hints]")!.textContent).toContain(warning);
-    setStatus(arranging({ capturing: false, hideWanted: true }));
+    setStatus(arranging({ capturing: false, hideWanted: true, hideAvailable: true }));
     expect(q("[data-hints]")!.textContent).not.toContain(warning);
+  });
+
+  it("no recordings warning where Windows can't hide the overlay, even with Hide on", () => {
+    // The stored flag reaches the backend even where the Settings row is
+    // hidden, so hideWanted can be true here; Locked doesn't hide it either.
+    const { q } = mount({ status: arranging({ capturing: true, hideWanted: true, hideAvailable: false }) });
+    expect(q("[data-hints]")).not.toBeNull();
+    expect(q("[data-hints]")!.textContent).not.toContain("Recordings can see the overlay");
   });
 
   it("entering Arrange gives the stage the keyboard", () => {

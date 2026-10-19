@@ -10,9 +10,11 @@
 //! `core` released first, because an inline setter can send a window event
 //! straight back into [`on_window_event`], which takes `core`. Getters
 //! (`hwnd`, `outer_position`, `inner_size`) run only on worker threads,
-//! outside every lock; main-thread code reads the stored HWND. The page's
-//! handshake and beats are commands, never event listeners: tauri parks Rust
-//! event listeners on lock contention (event/listener.rs:137-143, 196-213).
+//! never under `core` or the recorder's lock: `open` and `place` call them
+//! under the placement lock, which the main thread never takes. Main-thread
+//! code reads the stored HWND. The page's handshake and beats are commands,
+//! never event listeners: tauri parks Rust event listeners on lock
+//! contention (event/listener.rs:137-143, 196-213).
 //!
 //! Focus is taken with plain `SetForegroundWindow`, never tauri's or tao's
 //! focus call, which injects an Alt key press when Windows refuses
@@ -50,9 +52,12 @@ pub struct OverlayShared {
     arranging: AtomicBool,
     /// The foreground window before Arrange took it; 0 when none.
     return_to: AtomicIsize,
-    /// Main thread only: the live window has been shown.
+    /// The live window has been shown. Main thread only while there is a
+    /// window; `open` clears it on its worker when there is none (`adopt`
+    /// before the build, `forget` if the build fails).
     shown: AtomicBool,
-    /// Main thread only: the display affinity last set on the live window.
+    /// The display affinity last set on the live window. The same threads
+    /// as `shown`.
     applied_protect: AtomicBool,
     /// True from just before the window is built until `CloseRequested` or
     /// `DestroyWindow`; the `charm` scheme answers 503 otherwise.
@@ -218,7 +223,8 @@ fn no_ready_script(pretend: bool) -> Option<String> {
 }
 
 /// The window's HWND as an integer. A main-thread round trip: worker
-/// threads only, outside every lock.
+/// threads only, never under `core` (`build_window` calls it under the
+/// placement lock, which the main thread never takes).
 fn window_id(window: &WebviewWindow) -> isize {
     #[cfg(windows)]
     {

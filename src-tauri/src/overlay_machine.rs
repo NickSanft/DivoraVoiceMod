@@ -546,8 +546,9 @@ impl OverlayCore {
         ]
     }
 
-    /// Into Closing, Locked. A closing window is never touched, so leaving
-    /// Arrange here only takes the tray item away.
+    /// Into Closing, Locked. A closing window gets no window state
+    /// (`reconcile_plan` is `None`) and the keyboard isn't handed back, so
+    /// leaving Arrange here only takes the tray item away.
     fn closing(&mut self, instance: u32) -> Option<Effect> {
         let was_arranging = self.mode == Mode::Arrange;
         self.phase = Phase::Closing { instance };

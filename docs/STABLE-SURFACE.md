@@ -24,7 +24,7 @@ accidental break fails CI before it ships:
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - `ScreenRecordingUpdate` / `CaptureStatusDto` / `MonitorDto` / `DesktopSourceDto` keys and the `DivoraPlays` strings — `src-tauri/src/screen.rs` (`wire_keys_are_frozen`; v1.52.0, v1.53.0).
 - `ReplayStatus` / `ReplayArmed` / `ReplaySaved` / `ReplayMemory` / `ReplayLength` keys and the state and held-reason strings — `src-tauri/src/replay.rs` (`replay_wire_keys_are_frozen`; v1.54.0).
-- `OverlayStatus` keys and the phase/mode strings — `src/overlay/wire.fixture.json`, read by `src-tauri/src/overlay_machine.rs` (`wire_fixture_matches_rust`) and `src/overlay/status.test.ts`; v1.55.0.
+- `OverlayStatus` keys, the mode strings and the `closed` / `painted` / `closing` phase strings (the phases in the fixture's three status samples; `starting` and `shown` aren't in it) — `src/overlay/wire.fixture.json`, read by `src-tauri/src/overlay_machine.rs` (`wire_fixture_matches_rust`) and `src/overlay/status.test.ts`; v1.55.0.
 - `ImportedAsset` keys — the same fixture, `src-tauri/src/overlay_assets.rs` (`imported_asset_wire_keys_are_frozen`; v1.55.0).
 - The `overlay:*` event names and the overlay page's three command names — the same fixture, read by `src/overlay/state.test.ts` and `status.test.ts`; `wire_fixture_matches_rust` checks the `overlay:status` name and parses the `mode` / `stage` strings (v1.55.0).
 - The overlay window's label and title and the tray's Lock id — `src-tauri/src/overlay_machine.rs` (`title_and_label_are_the_obs_contract`); every tray menu id, label and their order — `src-tauri/src/lib.rs` (`tray_entries_for_each_combination`; v1.55.0).

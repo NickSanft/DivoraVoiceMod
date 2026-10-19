@@ -62,7 +62,9 @@ const PICTURE = {
   name: "wave.png",
 };
 
-const ARRANGING = { ...OVERLAY_STATUS_SAMPLES.arranging, instance: INSTANCE };
+// The fixture's sample is a PC that can't hide the overlay; this one can, so
+// the recordings warning is due.
+const ARRANGING = { ...OVERLAY_STATUS_SAMPLES.arranging, instance: INSTANCE, hideAvailable: true };
 
 test.use({ viewport: { width: 480, height: 480 } });
 
@@ -322,7 +324,7 @@ test.describe("stream overlay page (v1.55)", () => {
     await shown(page, [CIRCLE, PICTURE]);
     // Recording with Hide on: the longest hint is due.
     await arranging(page);
-    expect(ARRANGING).toMatchObject({ capturing: true, hideWanted: true });
+    expect(ARRANGING).toMatchObject({ capturing: true, hideWanted: true, hideAvailable: true });
 
     const sizes = [
       { width: 136, height: 39, text: false, hints: false },
