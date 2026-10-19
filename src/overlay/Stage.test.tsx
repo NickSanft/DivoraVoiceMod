@@ -282,7 +282,7 @@ describe("Stage: the Arrange chrome", () => {
     expect(first.getAttribute("aria-label")).toBe("Lock the overlay");
     expect(first.textContent).toBe("Lock");
     const grip = q("[data-grip]")!;
-    expect(grip.getAttribute("aria-label")).toBe("Move the window");
+    expect(grip.getAttribute("aria-label")).toBe("Move window");
     expect(grip.textContent).toBe("Move window");
     expect(grip.hasAttribute("tabindex")).toBe(false);
     expect(q("[data-hints]")).not.toBeNull();

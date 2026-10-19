@@ -623,7 +623,7 @@ export function Stage(props: StageProps): JSX.Element {
           <Show when={!props.status.fit}>
             <div
               data-grip
-              aria-label="Move the window"
+              aria-label="Move window"
               onMouseDown={pressGrip}
               style={{ ...PILL, left: "6px", cursor: "move" }}
             >
