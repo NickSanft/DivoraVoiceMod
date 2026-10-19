@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.55.0] — 2026-10-19 — Charms: pictures and GIFs on your overlay
+
 Charms put your own pictures and GIFs on the stream overlay beside the spell circle. Arrange them, then lock the overlay so clicks go through it to your game; the arrangement is kept for next time. Fit to monitor lets them go anywhere on that screen, and Hide from recordings asks Windows to leave the locked overlay out of the picture while Divora records any screen or Replay is on, so OBS and other apps capturing then may not show it either.
 
 ### Added
