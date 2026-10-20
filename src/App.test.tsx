@@ -1,13 +1,19 @@
-import { describe, expect, it, vi } from "vitest";
-import { render } from "@solidjs/testing-library";
-import App from "./App";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { render, renderHook } from "@solidjs/testing-library";
+import App, { applyLevelUpdate, dispatchGlobalShortcut } from "./App";
+import { AppProvider, useApp } from "./stores/app";
 
 const invokeCalls: Array<{ cmd: string; args?: unknown }> = [];
 const onFocusChangedListeners: Array<(event: { payload: boolean }) => void> = [];
+// v1.56.0: per-test answers for a command, and the events the page emits.
+const invokeOverrides = new Map<string, (args?: unknown) => unknown>();
+const emitted: Array<{ event: string; payload: unknown }> = [];
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
     invokeCalls.push({ cmd, args });
+    const override = invokeOverrides.get(cmd);
+    if (override) return override(args);
     switch (cmd) {
       case "list_audio_input_devices":
         return [];
@@ -30,6 +36,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => {
     /* unlisten no-op */
+  }),
+  emit: vi.fn(async (event: string, payload: unknown) => {
+    emitted.push({ event, payload });
   }),
 }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -168,5 +177,121 @@ describe("App shell — focus device refresh (v0.11.4)", () => {
     );
     expect(inputsCalled).toBe(true);
     expect(outputsCalled).toBe(true);
+  });
+});
+
+// v1.56.0: the mute's seams in the shell — the boot read's order, the
+// hotkey the backend owns, the level tick, and the overlay push held until
+// the mute is known.
+describe("App shell — the mute (v1.56.0)", () => {
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  afterEach(() => {
+    invokeOverrides.clear();
+    emitted.length = 0;
+  });
+
+  it("reads the mute before the boot enumerates devices", async () => {
+    invokeCalls.length = 0;
+    render(() => <App />);
+    await settle();
+    const cmds = invokeCalls.map((c) => c.cmd);
+    const read = cmds.indexOf("input_mute");
+    const enumerate = cmds.indexOf("list_audio_input_devices");
+    expect(read).toBeGreaterThanOrEqual(0);
+    expect(enumerate).toBeGreaterThanOrEqual(0);
+    expect(read).toBeLessThan(enumerate);
+    // The boot only reads: it never sends a mute.
+    expect(cmds.filter((c) => c === "set_input_muted" || c === "toggle_input_muted")).toEqual([]);
+  });
+
+  it("a mute hotkey press or release invokes nothing (the backend already flipped it)", async () => {
+    const { result } = renderHook(() => useApp(), { wrapper: AppProvider });
+    await settle();
+    invokeCalls.length = 0;
+    dispatchGlobalShortcut(result, { id: "mute", accelerator: "F20", state: "pressed" });
+    dispatchGlobalShortcut(result, { id: "mute", accelerator: "F20", state: "released" });
+    await settle();
+    expect(invokeCalls).toEqual([]);
+    expect(result.muted()).toBe(false);
+  });
+
+  it("applyLevelUpdate takes a tick's levels and its mute; a tick without the mute leaves it", async () => {
+    const { result } = renderHook(() => useApp(), { wrapper: AppProvider });
+    await settle();
+    const tick = {
+      input: { rms: 0.1, peak: 0.2 },
+      output: { rms: 0.3, peak: 0.4 },
+      running: true,
+      monitoring: false,
+      dspLatencyMs: 12,
+      recording: true,
+      loudnessGainDb: 3,
+      deviceLost: false,
+      modEnv: 0.5,
+    };
+    applyLevelUpdate(result, tick);
+    expect(result.inputLevels()).toEqual({ rms: 0.1, peak: 0.2 });
+    expect(result.outputLevels()).toEqual({ rms: 0.3, peak: 0.4 });
+    expect(result.engineRunning()).toBe(true);
+    expect(result.engineMonitoring()).toBe(false);
+    expect(result.dspLatencyMs()).toBe(12);
+    expect(result.isRecording()).toBe(true);
+    expect(result.loudnessGainDb()).toBe(3);
+    expect(result.modEnv()).toBe(0.5);
+    // No mute fields: no information, never "unmuted".
+    expect(result.muteState()).toBeNull();
+
+    applyLevelUpdate(result, { ...tick, inputMuted: true, inputMuteSeq: 1 });
+    expect(result.muted()).toBe(true);
+    expect(result.status()).toBe("muted");
+    applyLevelUpdate(result, tick);
+    expect(result.muted()).toBe(true);
+    // An older tick is stale; a newer one is taken.
+    applyLevelUpdate(result, { ...tick, inputMuted: false, inputMuteSeq: 0 });
+    expect(result.muted()).toBe(true);
+    applyLevelUpdate(result, { ...tick, inputMuted: false, inputMuteSeq: 2 });
+    expect(result.muted()).toBe(false);
+  });
+
+  it("the overlay hears nothing until the mute is read, then Muted", async () => {
+    // A reload while the overlay is open and the voice is muted.
+    const open = {
+      open: true,
+      phase: "painted",
+      instance: 1,
+      mode: "locked",
+      arrangeGen: 0,
+      canArrange: true,
+      fit: false,
+      hideWanted: false,
+      hideAvailable: true,
+      capturing: false,
+      error: null,
+    };
+    invokeOverrides.set("overlay_status", () => open);
+    invokeOverrides.set("set_overlay_hide_from_recordings", () => open);
+    let answer!: (v: unknown) => void;
+    invokeOverrides.set("input_mute", () => new Promise((r) => (answer = r)));
+    const states = () =>
+      emitted
+        .filter((e) => e.event === "overlay:state")
+        .map((e) => (e.payload as { status: string }).status);
+
+    render(() => <App />);
+    await settle();
+    await settle();
+    // The overlay is open, but the mute isn't known: nothing goes (it would
+    // say Clean).
+    expect(invokeCalls.some((c) => c.cmd === "overlay_status")).toBe(true);
+    expect(states()).toEqual([]);
+
+    answer({ muted: true, seq: 3 });
+    await settle();
+    await settle();
+    expect(states().length).toBeGreaterThan(0);
+    expect(states().every((s) => s === "muted")).toBe(true);
   });
 });

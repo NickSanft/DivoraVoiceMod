@@ -28,6 +28,8 @@ function mkHandlers() {
     setPtm: vi.fn(),
     toggleMonitor: vi.fn(),
     setParam: vi.fn(),
+    toggleMuted: vi.fn(),
+    muteCc: vi.fn(),
   };
 }
 
@@ -104,6 +106,54 @@ describe("midi router", () => {
     routeMidi(cc(20, 127), mappings, h);
     routeMidi(cc(20, 0), mappings, h);
     expect(h.toggleMonitor).toHaveBeenCalledTimes(1);
+  });
+
+  // v1.56.0: the mute. A pad toggles; a CC hands every value to the store,
+  // which acts only on crossings (see muteCcStep).
+  it("mute: a note-on toggles, a note-off does nothing", () => {
+    const h = mkHandlers();
+    const mappings: MidiMapping[] = [
+      { id: "mu", action: "mute", trigger: { kind: "note", data1: 48, channel: 0 } },
+    ];
+    routeMidi(noteOn(48), mappings, h);
+    routeMidi(noteOff(48), mappings, h);
+    routeMidi(noteOn(48, 1, 5), mappings, h);
+    expect(h.toggleMuted).toHaveBeenCalledTimes(2);
+    expect(h.muteCc).not.toHaveBeenCalled();
+  });
+
+  it("mute: a CC passes the mapping's id and every value, never toggles", () => {
+    const h = mkHandlers();
+    const mappings: MidiMapping[] = [
+      { id: "mu-cc", action: "mute", trigger: { kind: "cc", data1: 21, channel: 0 } },
+    ];
+    for (const v of [0, 59, 62, 64, 127, 10]) routeMidi(cc(21, v), mappings, h);
+    expect(h.muteCc.mock.calls).toEqual([
+      ["mu-cc", 0],
+      ["mu-cc", 59],
+      ["mu-cc", 62],
+      ["mu-cc", 64],
+      ["mu-cc", 127],
+      ["mu-cc", 10],
+    ]);
+    expect(h.toggleMuted).not.toHaveBeenCalled();
+    // Nothing else is driven by a mute mapping.
+    expect(h.setPtm).not.toHaveBeenCalled();
+    expect(h.toggleMonitor).not.toHaveBeenCalled();
+  });
+
+  it("mute: no trigger, or a trigger that doesn't match, does nothing", () => {
+    const h = mkHandlers();
+    const mappings: MidiMapping[] = [
+      { id: "a", action: "mute", trigger: null },
+      { id: "b", action: "mute", trigger: { kind: "note", data1: 48, channel: 0 } },
+      { id: "c", action: "mute", trigger: { kind: "cc", data1: 21, channel: 0 } },
+    ];
+    routeMidi(noteOn(49), mappings, h);
+    routeMidi(cc(48, 127), mappings, h); // CC 48 is not note 48
+    routeMidi(noteOn(21), mappings, h); // note 21 is not CC 21
+    expect(h.toggleMuted).not.toHaveBeenCalled();
+    expect(h.muteCc).not.toHaveBeenCalled();
   });
 
   it("ignores unmapped messages and mappings without a learned trigger", () => {

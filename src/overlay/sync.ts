@@ -8,6 +8,11 @@
 // emits `overlay:ready` once it is listening, and that re-sends the current
 // state. Taking `emit`/`listen` as arguments lets the test drive the same
 // function App.tsx calls, rather than a copy of it.
+//
+// v1.56.0: the status says Muted to an audience that relies on it, so the
+// pushes go out in order (one emit at a time, as `syncOverlayScene` does),
+// and none goes out until the main window knows the mute or stops waiting
+// for it (`held`; at worst 500 ms).
 
 import { batch, createEffect, createSignal, onCleanup } from "solid-js";
 import {
@@ -23,6 +28,11 @@ export interface OverlaySyncDeps {
   isOpen: () => boolean;
   /** The state to send. Read only while open, so it is tracked only then. */
   payload: () => OverlayState;
+  /** v1.56.0: while true nothing is sent; when it turns false, the current
+   *  state goes once. App.tsx holds until the store knows the mute, or its
+   *  read of it fails, or 500 ms pass, so the hold always ends; after a
+   *  failure or the 500 ms, what goes may say not muted. Absent = never held. */
+  held?: () => boolean;
   emit: (event: string, payload: OverlayState) => Promise<void>;
   listen: (event: string, handler: () => void) => Promise<() => void>;
 }
@@ -30,9 +40,14 @@ export interface OverlaySyncDeps {
 /** Keep the overlay in step with the main window: send the state whenever it
  *  changes, and again whenever the overlay says it is ready to hear it. Call
  *  inside a reactive owner (a component, or `createRoot` in tests); the
- *  listener is removed when that owner is disposed. */
+ *  listener is removed when that owner is disposed.
+ *
+ *  Each Tauri `emit` is its own async command, so two sent back to back can
+ *  arrive in either order, and the overlay shows whichever lands last. Every
+ *  emit here waits for the one before it to finish. */
 export function syncOverlay(deps: OverlaySyncDeps): void {
   const [readyCount, setReadyCount] = createSignal(0);
+  let tail: Promise<void> = Promise.resolve();
 
   let unlisten: (() => void) | null = null;
   let disposed = false;
@@ -52,11 +67,13 @@ export function syncOverlay(deps: OverlaySyncDeps): void {
 
   createEffect(() => {
     readyCount();
-    if (!deps.isOpen()) return;
+    if (deps.held?.() === true || !deps.isOpen()) return;
     const payload = deps.payload();
-    void deps.emit(OVERLAY_EVENT, payload).catch(() => {
-      /* not under Tauri */
-    });
+    tail = tail
+      .then(() => deps.emit(OVERLAY_EVENT, payload))
+      .catch(() => {
+        /* not under Tauri; the next push still goes */
+      });
   });
 }
 

@@ -21,7 +21,9 @@ import {
   subscribeMidi,
   subscribeTtsProgress,
   type GlobalShortcutEvent,
+  type LevelUpdate,
 } from "./audio/api";
+import { levelMute } from "./data/mute";
 import { overlayPayload } from "./overlay/state";
 import { syncOverlay } from "./overlay/sync";
 import { Toast } from "./components/Toast";
@@ -45,10 +47,10 @@ function applyRootAttr(name: string, value: string | null) {
 
 // Global hotkeys. The backend emits `global-shortcut` events with the
 // binding's id and pressed/released state; this turns them into store
-// actions. It is the path every id takes, except that `overlay:arrange` is
-// acted on by the backend (v1.55.0); here it only shows a notice while the
-// overlay is off or starting. It runs while the window is hidden to the
-// tray too:
+// actions. It is the path every id takes, except that `overlay:arrange`
+// (v1.55.0) and `mute` (v1.56.0) are acted on by the backend; here the
+// first only shows a notice while the overlay is off or starting, and the
+// second does nothing. It runs while the window is hidden to the tray too:
 //   ptm             → set ui.pressed on press, clear on release
 //   panic           → stop all soundboard clips on press
 //   monitor         → toggle sidetone on press
@@ -62,6 +64,8 @@ function applyRootAttr(name: string, value: string | null) {
 //                     the hotkey's own message, while Windows still lets it
 //                     take the foreground; never set_overlay_mode from here,
 //                     or the press would toggle twice (v1.55.0)
+//   mute            → nothing: the backend already flipped the mute on the
+//                     press; acting here would flip it twice (v1.56.0)
 //   sb:<clip>       → play that soundboard tile
 export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent): void {
   if (event.id === "ptm") {
@@ -83,11 +87,30 @@ export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent
     void app.toggleReplay();
   } else if (event.id === "overlay:arrange") {
     app.noteOverlayHotkey();
+  } else if (event.id === "mute") {
+    // The backend already flipped it (v1.56.0); acting here would flip it
+    // twice. The next level tick brings the new state.
   } else if (event.id.startsWith("sb:")) {
     // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
     // current scan still has it.
     void app.playTileById(event.id.slice(3));
   }
+}
+
+/** One `audio-levels` tick into the store. v1.56.0 adds the mute: the tick's
+ *  pair is adopted only when it is newer than what the mirror holds, and a
+ *  tick without it changes nothing. */
+export function applyLevelUpdate(app: AppState, update: LevelUpdate): void {
+  app.setInputLevels(update.input);
+  app.setOutputLevels(update.output);
+  app.setEngineRunning(update.running);
+  app.setEngineMonitoring(update.monitoring);
+  app.setDspLatencyMs(update.dspLatencyMs);
+  app.setIsRecording(update.recording);
+  app.setLoudnessGainDb(update.loudnessGainDb);
+  app.setDeviceLost(update.deviceLost);
+  app.setModEnv(update.modEnv);
+  app.applyMuteState(levelMute(update));
 }
 
 function Shell(): JSX.Element {
@@ -146,9 +169,13 @@ function Shell(): JSX.Element {
   // traffic. v1.51.3: and again whenever the overlay says it is listening
   // (`overlay:ready`), so the push made as it opens is never lost. No-op off
   // Tauri. v1.55.0: the charms travel on their own event, `overlay:scene`,
-  // which the store's overlay controller pushes.
+  // which the store's overlay controller pushes. v1.56.0: held until the
+  // store knows the mute or 500 ms pass (`muteKnown`), so a reload during a
+  // mute shows the stream unmuted only if the boot read takes longer than
+  // that, and then only until the read or a level tick lands.
   syncOverlay({
     isOpen: app.overlayOpen,
+    held: () => !app.muteKnown(),
     payload: () =>
       overlayPayload({
         chain: app.chain(),
@@ -274,6 +301,12 @@ function Shell(): JSX.Element {
   // 4) Attempt to auto-start with the selected (default) devices.
   // Each step is wrapped to fail gracefully — we may be running in a
   // browser preview without the Tauri bridge.
+  // The levels subscription stays after enumeration: subscribed first, a
+  // reload's early `running: true` tick would set engineRunning, and a
+  // default pick in refreshDevices (a saved device gone) would then fire
+  // the device effect's restart beside the boot's own start. The mute
+  // doesn't wait for ticks: the store read it at creation, before this
+  // (v1.56.0).
   onMount(() => {
     let unlisten: UnlistenFn | null = null;
     let cancelled = false;
@@ -286,17 +319,7 @@ function Shell(): JSX.Element {
       }
 
       try {
-        unlisten = await subscribeLevels((update) => {
-          app.setInputLevels(update.input);
-          app.setOutputLevels(update.output);
-          app.setEngineRunning(update.running);
-          app.setEngineMonitoring(update.monitoring);
-          app.setDspLatencyMs(update.dspLatencyMs);
-          app.setIsRecording(update.recording);
-          app.setLoudnessGainDb(update.loudnessGainDb);
-          app.setDeviceLost(update.deviceLost);
-          app.setModEnv(update.modEnv);
-        });
+        unlisten = await subscribeLevels((update) => applyLevelUpdate(app, update));
       } catch (err) {
         app.setEngineError(`level subscription failed: ${String(err)}`);
       }

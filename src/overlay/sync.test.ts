@@ -73,10 +73,12 @@ describe("syncOverlay", () => {
     expect(b.sent.map((s) => s.payload.status)).toEqual(["clean"]);
 
     setStatus("modulated");
+    await flush();
     expect(b.sent.map((s) => s.payload.status)).toEqual(["clean", "modulated"]);
 
     // The overlay's page finished loading: it gets the state as it is NOW.
     b.fire(OVERLAY_READY_EVENT);
+    await flush();
     expect(b.sent.map((s) => s.payload.status)).toEqual(["clean", "modulated", "modulated"]);
     expect(b.sent.every((s) => s.event === OVERLAY_EVENT)).toBe(true);
     dispose();
@@ -91,9 +93,11 @@ describe("syncOverlay", () => {
     });
     await flush();
     b.fire(OVERLAY_READY_EVENT);
+    await flush();
     expect(b.sent).toEqual([]);
 
     setOpen(true);
+    await flush();
     expect(b.sent).toHaveLength(1);
     dispose();
   });
@@ -121,6 +125,92 @@ describe("syncOverlay", () => {
     dispose();
     await flush();
     expect(b.unlistened).toBe(1);
+  });
+
+  // v1.56.0: the status is a fact the audience relies on (Muted), so an
+  // older push must never land after a newer one.
+  it("delivers in push order even when the bus would finish them backwards", async () => {
+    // A bus that finishes the newest emit first: unchained, the first push
+    // would land last and the overlay would keep the older state.
+    const delivered: Array<OverlayState["status"]> = [];
+    const pending: Array<() => void> = [];
+    const emit = (_event: string, payload: OverlayState): Promise<void> =>
+      new Promise<void>((resolve) =>
+        pending.push(() => {
+          delivered.push(payload.status);
+          resolve();
+        }),
+      );
+    const [status, setStatus] = createSignal<OverlayState["status"]>("clean");
+    const dispose = createRoot((d) => {
+      syncOverlay({ isOpen: () => true, payload: () => state(status()), emit, listen: bus().listen });
+      return d;
+    });
+    setStatus("muted");
+    setStatus("modulated");
+    setStatus("muted");
+    await flush();
+    for (let i = 0; i < 10 && pending.length > 0; i++) {
+      pending.pop()?.(); // newest first
+      await flush();
+    }
+    expect(pending).toEqual([]);
+    expect(delivered).toEqual(["clean", "muted", "modulated", "muted"]);
+    dispose();
+  });
+
+  it("a failed emit doesn't stop the ones after it", async () => {
+    const sent: Array<OverlayState["status"]> = [];
+    let fail = true;
+    const [status, setStatus] = createSignal<OverlayState["status"]>("clean");
+    const dispose = createRoot((d) => {
+      syncOverlay({
+        isOpen: () => true,
+        payload: () => state(status()),
+        emit: async (_e, p) => {
+          if (fail) {
+            fail = false;
+            throw new Error("no tauri");
+          }
+          sent.push(p.status);
+        },
+        listen: () => Promise.reject(new Error("no tauri")),
+      });
+      return d;
+    });
+    setStatus("muted");
+    await flush();
+    expect(sent).toEqual(["muted"]);
+    dispose();
+  });
+
+  // v1.56.0: on a reload the overlay can be open before the store has read
+  // the mute; a push then would show the stream Clean during a mute.
+  it("sends nothing while held, then the current state once", async () => {
+    const b = bus();
+    const [held, setHeld] = createSignal(true);
+    const [status, setStatus] = createSignal<OverlayState["status"]>("clean");
+    const dispose = createRoot((d) => {
+      syncOverlay({ isOpen: () => true, held, payload: () => state(status()), emit: b.emit, listen: b.listen });
+      return d;
+    });
+    await flush();
+    // Changes and a ready while held: nothing goes.
+    setStatus("modulated");
+    b.fire(OVERLAY_READY_EVENT);
+    setStatus("muted");
+    await flush();
+    expect(b.sent).toEqual([]);
+
+    setHeld(false);
+    await flush();
+    expect(b.sent.map((s) => s.payload.status)).toEqual(["muted"]);
+
+    // Then it follows changes as before.
+    setStatus("clean");
+    await flush();
+    expect(b.sent.map((s) => s.payload.status)).toEqual(["muted", "clean"]);
+    dispose();
   });
 
   it("a failing bus (off Tauri) never throws", async () => {

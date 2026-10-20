@@ -74,7 +74,7 @@ async function setup() {
   const emit = (patch: Record<string, unknown>) => {
     for (const h of handlers.get("replay-buffer") ?? []) h({ payload: { ...ARMED, ...patch } });
   };
-  return { ...utils, emit };
+  return { ...utils, emit, app: () => app! };
 }
 
 describe("Titlebar — Replay chip (v1.54.0)", () => {
@@ -134,5 +134,85 @@ describe("Titlebar — Replay chip (v1.54.0)", () => {
     const rules = css.match(/\.titlebar-replay[^{]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThanOrEqual(3);
     for (const rule of rules) expect(rule).not.toMatch(/animation|transition/);
+  });
+});
+
+// v1.56.0: the pill is loud while the engine's mute is on, and a separate
+// live region speaks the mute's edges. Driven through the store's real
+// mirror (`applyMuteState`), as answers and ticks drive it.
+describe("Titlebar — the mute (v1.56.0)", () => {
+  beforeEach(() => handlers.clear());
+
+  const TITLE =
+    "Your voice is muted for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.";
+
+  it("is loud only while muted, and its title names the call, headphones, recordings and Replay", async () => {
+    const { getByTestId, app } = await setup();
+    const pill = () => getByTestId("titlebar-status");
+    expect(pill()).not.toHaveClass("is-muted");
+    expect(pill()).not.toHaveAttribute("title");
+    expect(pill()).toHaveTextContent("Clean");
+
+    app().applyMuteState({ muted: true, seq: 1 });
+    expect(pill()).toHaveClass("is-muted");
+    expect(pill()).toHaveTextContent("Muted");
+    expect(pill().title).toBe(TITLE);
+    expect(pill().title).toContain("headphones");
+    expect(pill().title).toContain("recordings");
+
+    // Push-to-modulate can't take it over.
+    app().setUi("pressed", true);
+    expect(pill()).toHaveClass("is-muted");
+
+    app().applyMuteState({ muted: false, seq: 2 });
+    expect(pill()).not.toHaveClass("is-muted");
+    expect(pill()).not.toHaveAttribute("title");
+  });
+
+  it("never animates while muted", async () => {
+    const { getByTestId, app } = await setup();
+    app().applyMuteState({ muted: true, seq: 1 });
+    const pill = getByTestId("titlebar-status");
+    const dot = pill.querySelector<HTMLElement>(".titlebar-status-dot");
+    expect(dot).not.toBeNull();
+    expect(dot!.style.animation).toBe("none");
+    for (const el of [pill, ...pill.querySelectorAll<HTMLElement>("*")]) {
+      expect(el.style.animation === "" || el.style.animation === "none").toBe(true);
+      expect(el.style.transition ?? "").toBe("");
+    }
+    // Nor in the stylesheet: the reduced-motion rule is dead after mount.
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../styles.css"), "utf8");
+    const rules = css.match(/\.titlebar-status[^{]*\{[^}]*\}/g) ?? [];
+    expect(rules.some((r) => r.startsWith(".titlebar-status.is-muted"))).toBe(true);
+    for (const rule of rules) expect(rule).not.toMatch(/animation|transition/);
+  });
+
+  it("the announcer is always there and speaks only the mute's edges", async () => {
+    const { getByTestId, app } = await setup();
+    const announcer = getByTestId("mute-announcer");
+    // Mounted before it has anything to say, and not the pill itself.
+    expect(announcer).toHaveAttribute("role", "status");
+    expect(announcer).toHaveAttribute("aria-live", "polite");
+    expect(getByTestId("titlebar-status").contains(announcer)).toBe(false);
+    expect(announcer.textContent).toBe("");
+
+    // A push-to-modulate press changes the pill, never the announcer.
+    app().setUi("pressed", true);
+    expect(getByTestId("titlebar-status")).toHaveTextContent("Modulated");
+    expect(announcer.textContent).toBe("");
+    app().setUi("pressed", false);
+    expect(announcer.textContent).toBe("");
+
+    app().applyMuteState({ muted: true, seq: 1 });
+    expect(announcer.textContent).toBe("Your voice is muted.");
+    app().setUi("pressed", true);
+    expect(announcer.textContent).toBe("Your voice is muted.");
+
+    app().applyMuteState({ muted: false, seq: 2 });
+    expect(announcer.textContent).toBe("Your voice is unmuted.");
+    app().setUi("pressed", false);
+    expect(announcer.textContent).toBe("Your voice is unmuted.");
+    // Still the same element: the region was never remounted.
+    expect(getByTestId("mute-announcer")).toBe(announcer);
   });
 });

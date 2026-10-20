@@ -11,6 +11,7 @@
 
 import { createMemo, createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { Badge } from "../components/Badge";
+import { Button } from "../components/Button";
 import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
 import { VMeter } from "../components/Meters";
@@ -410,6 +411,31 @@ function VoiceStatusCard(): JSX.Element {
           {meta().sub}
         </div>
       </div>
+      {/* v1.56.0: sends the state its label names, never a toggle: a stale
+          label (the mirror lags a hotkey mute by a tick) is then a no-op whose
+          answer corrects it, not the opposite of what it says. Never
+          disabled, and works with the engine stopped.
+          A mouse or touch click (detail > 0) hands focus back to the page: a
+          focused button takes Space, which is the in-app push-to-modulate
+          key, so the next PTM press would unmute. Tab, then Space or Enter
+          (detail 0), keeps focus on it. */}
+      <Button
+        variant={app.muted() ? "danger" : "secondary"}
+        size="sm"
+        data-testid="mute-button"
+        title={
+          app.muted()
+            ? "Unmute your voice"
+            : "Mute your voice for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play."
+        }
+        style={{ "margin-left": "auto", "flex-shrink": 0 }}
+        onClick={(e) => {
+          if (e.detail > 0) e.currentTarget.blur();
+          void app.setMuted(!app.muted());
+        }}
+      >
+        {app.muted() ? "Unmute" : "Mute"}
+      </Button>
     </div>
   );
 }
@@ -748,8 +774,9 @@ function ReactiveCard(): JSX.Element {
 
 /** What the card is showing, and why. */
 export interface ReadingView {
-  /** The headline. Also what (coarsely) gets announced. */
-  kind: "stopped" | "muted" | "quiet" | "listening" | "held" | "live";
+  /** The headline. Also what (coarsely) gets announced. `divoraMuted`
+   *  (v1.56.0): muted by Divora's own mute, not the device. */
+  kind: "stopped" | "muted" | "divoraMuted" | "quiet" | "listening" | "held" | "live";
   /** Whether there are numbers worth rendering at all. */
   hasNumbers: boolean;
   /** Those numbers were measured earlier and are being held, not measured now. */
@@ -784,7 +811,10 @@ export function readingView(
   if (reading.state === "stopped") {
     kind = "stopped";
   } else if (reading.state === "muted") {
-    kind = "muted";
+    // v1.56.0: the cause rides on the same snapshot as the state, so the two
+    // can't disagree. Never joined with the store's mirror: that travels at
+    // a different rate and flashed "Input silent" after every unmute.
+    kind = reading.mutedInDivora === true ? "divoraMuted" : "muted";
   } else if (reading.state === "speaking") {
     // Raw measurements are valid immediately; only the descriptors need a
     // baseline to be relative to, so say which one is missing.
@@ -811,6 +841,9 @@ export function readingAnnouncement(view: ReadingView): string {
       return "Engine stopped. Nothing to read.";
     case "muted":
       return "Input is silent.";
+    // Not the titlebar's sentence again: that one already said it.
+    case "divoraMuted":
+      return "Reading paused while your voice is muted.";
     case "listening":
       return "Still listening. Not enough speech yet to compare against.";
     default:
@@ -825,6 +858,8 @@ function readingHeadline(view: ReadingView): string {
       return "Engine stopped";
     case "muted":
       return "Input silent";
+    case "divoraMuted":
+      return "Muted in Divora";
     case "quiet":
       return "Too quiet to measure";
     case "listening":

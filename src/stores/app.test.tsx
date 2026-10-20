@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { listen } from "@tauri-apps/api/event";
 import { AppProvider, useApp } from "./app";
-import { dispatchGlobalShortcut } from "../App";
+import { applyLevelUpdate, dispatchGlobalShortcut } from "../App";
 
 function setupApp() {
   return renderHook(() => useApp(), { wrapper: AppProvider });
@@ -53,10 +53,10 @@ describe("app store — Phase 1", () => {
     expect(result.status()).toBe("modulated");
   });
 
-  it("becomes muted when muted flag is set, overriding PTM", () => {
+  it("becomes muted when the engine's mute is adopted, overriding PTM", () => {
     const { result } = setupApp();
     result.setUi("pressed", true);
-    result.setUi("muted", true);
+    result.applyMuteState({ muted: true, seq: 1 });
     expect(result.status()).toBe("muted");
   });
 
@@ -1599,6 +1599,8 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
       "replay:toggle": "",
       // v1.55.0: the overlay's Arrange / Lock switch.
       "overlay:arrange": "",
+      // v1.56.0: the mute.
+      mute: "",
     });
     first.cleanup();
 
@@ -1698,6 +1700,7 @@ describe("app store — Phase 6 virtual mic + hotkeys", () => {
     expect(result.hotkeyBindings.ptm).toBe("");
     expect(result.hotkeyBindings.panic).toBe("");
     expect(result.hotkeyBindings.monitor).toBe("");
+    expect(result.hotkeyBindings.mute).toBe("");
   });
 
   it("ui.ptmKey defaults to Space so the in-app focused-window PTM still works", () => {
@@ -3458,7 +3461,7 @@ describe("app store — Replay (v1.54.0)", () => {
       expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
 
       result.setUi("pressed", true);
-      result.setUi("muted", true);
+      result.applyMuteState({ muted: true, seq: 1 });
       expect(result.status()).toBe("muted");
       expect(result.modulatedSince()).toBeNull();
       now = 90_000;
@@ -3594,5 +3597,370 @@ describe("app store — stream overlay hotkey (v1.55.0)", () => {
     await settle();
     expect(result.toast()!.id).toBe(shown);
     expect(modeCalls()).toEqual([]);
+  });
+});
+
+describe("app store — the mute (v1.56.0)", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+
+  /** The engine's word, as the backend keeps it: a change bumps `seq`, a set
+   *  to the value it already has moves nothing. */
+  function engineWord(start = { muted: false, seq: 0 }) {
+    let word = { ...start };
+    const set = (muted: boolean) => {
+      if (word.muted !== muted) word = { muted, seq: word.seq + 1 };
+      return { ...word };
+    };
+    invokeMock.mockImplementation(async (cmd: string, args?: { muted?: boolean }) => {
+      if (cmd === "input_mute") return { ...word };
+      if (cmd === "set_input_muted") return set(args!.muted!);
+      if (cmd === "toggle_input_muted") return set(!word.muted);
+      return undefined;
+    });
+    return {
+      get: () => ({ ...word }),
+      /** A change made elsewhere (the hotkey, in Rust): the store hears of it
+       *  only through a tick. */
+      elsewhere: (muted: boolean) => set(muted),
+    };
+  }
+
+  const muteCalls = () =>
+    invokeMock.mock.calls
+      .filter((c) => c[0] === "set_input_muted" || c[0] === "toggle_input_muted")
+      .map((c) => (c[0] === "set_input_muted" ? c[1] : c[0]));
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    window.localStorage.clear();
+  });
+
+  it("defaults to unmuted and clean; muteKnown waits for the read", async () => {
+    let answer!: (v: unknown) => void;
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "input_mute" ? new Promise((r) => (answer = r)) : Promise.resolve(undefined),
+    );
+    const { result } = setupApp();
+    expect(result.muted()).toBe(false);
+    expect(result.muteState()).toBeNull();
+    expect(result.status()).toBe("clean");
+    await settle();
+    expect(result.muteKnown()).toBe(false);
+
+    answer({ muted: false, seq: 0 });
+    await settle();
+    expect(result.muteKnown()).toBe(true);
+    expect(result.muteState()).toEqual({ muted: false, seq: 0 });
+    expect(result.status()).toBe("clean");
+  });
+
+  it("the boot read adopts a mute before any tick (a reload during a hotkey mute)", async () => {
+    engineWord({ muted: true, seq: 4 });
+    const { result } = setupApp();
+    await settle();
+    expect(result.muted()).toBe(true);
+    expect(result.muteState()).toEqual({ muted: true, seq: 4 });
+    expect(result.status()).toBe("muted");
+    expect(result.muteKnown()).toBe(true);
+  });
+
+  it("muteKnown comes true when the read fails (off Tauri)", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "input_mute") throw new Error("no tauri");
+      return undefined;
+    });
+    const { result } = setupApp();
+    await settle();
+    expect(result.muteKnown()).toBe(true);
+    expect(result.muted()).toBe(false);
+    expect(result.muteState()).toBeNull();
+  });
+
+  it("muteKnown comes true after 500 ms when the read never answers", () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockImplementation((cmd: string) =>
+        cmd === "input_mute" ? new Promise(() => {}) : Promise.resolve(undefined),
+      );
+      const { result } = setupApp();
+      vi.advanceTimersByTime(499);
+      expect(result.muteKnown()).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(result.muteKnown()).toBe(true);
+      expect(result.muted()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("setMuted sends the value every time and adopts the answer", async () => {
+    const word = engineWord();
+    const { result } = setupApp();
+    await settle();
+    await result.setMuted(true);
+    await result.setMuted(true);
+    expect(muteCalls()).toEqual([{ muted: true }, { muted: true }]);
+    expect(result.muteState()).toEqual({ muted: true, seq: 1 });
+    expect(word.get()).toEqual({ muted: true, seq: 1 });
+    expect(result.status()).toBe("muted");
+  });
+
+  it("toggleMuted sends one toggle and adopts the answer", async () => {
+    engineWord();
+    const { result } = setupApp();
+    await settle();
+    await result.toggleMuted();
+    expect(muteCalls()).toEqual(["toggle_input_muted"]);
+    expect(result.muteState()).toEqual({ muted: true, seq: 1 });
+  });
+
+  it("a stale tick after an answer is ignored; a newer one is taken", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "set_input_muted" ? { muted: true, seq: 3 } : undefined,
+    );
+    const { result } = setupApp();
+    await settle();
+    await result.setMuted(true);
+    // A tick built just before the command landed arrives after its answer.
+    result.applyMuteState({ muted: false, seq: 2 });
+    expect(result.muted()).toBe(true);
+    result.applyMuteState({ muted: false, seq: 4 });
+    expect(result.muted()).toBe(false);
+  });
+
+  it("a tick without the mute fields changes nothing", async () => {
+    const { result } = setupApp();
+    await settle();
+    const tick = {
+      input: { rms: 0.1, peak: 0.2 },
+      output: { rms: 0, peak: 0 },
+      running: true,
+      monitoring: true,
+      dspLatencyMs: 0,
+      recording: false,
+      loudnessGainDb: 0,
+      deviceLost: false,
+      modEnv: 0,
+    };
+    applyLevelUpdate(result, tick);
+    expect(result.muteState()).toBeNull();
+    applyLevelUpdate(result, { ...tick, inputMuted: true, inputMuteSeq: 1 });
+    expect(result.muted()).toBe(true);
+    applyLevelUpdate(result, tick);
+    expect(result.muteState()).toEqual({ muted: true, seq: 1 });
+  });
+
+  it("the store sends no mute of its own: only the read, at creation; nothing on start", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "input_mute") return { muted: true, seq: 2 };
+      if (cmd === "start_audio_engine") {
+        return { inputName: "Mic", outputName: "Speakers", monitorName: null, sampleRate: 48000, inputChannels: 1, outputChannels: 2 };
+      }
+      return undefined;
+    });
+    const { result } = setupApp();
+    result.setSelectedInput("Mic");
+    result.setSelectedOutput("Speakers");
+    await result.startEngine();
+    await result.stopEngine();
+    await result.startEngine();
+    await settle();
+    expect(result.engineRunning()).toBe(true);
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "input_mute")).toHaveLength(1);
+    expect(muteCalls()).toEqual([]);
+    expect(result.muted()).toBe(true);
+  });
+
+  describe("the glyph sends what its omen says", () => {
+    it("Mute while unmuted, Unmute while muted", async () => {
+      const word = engineWord();
+      const { result } = setupApp();
+      await settle();
+      result.setGlyphBinding("circle", { kind: "mute" });
+
+      expect(result.glyphOutcome("circle")?.label).toBe("Mute");
+      result.dispatchGlyphAction({ kind: "mute" });
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      expect(result.muted()).toBe(true);
+
+      expect(result.glyphOutcome("circle")?.label).toBe("Unmute");
+      result.dispatchGlyphAction({ kind: "mute" });
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }, { muted: false }]);
+      expect(word.get()).toEqual({ muted: false, seq: 2 });
+      expect(result.glyphOutcome("circle")?.label).toBe("Mute");
+    });
+
+    it("a stale omen is a no-op, never the opposite", async () => {
+      // The hotkey muted in Rust and the mirror hasn't heard yet. The omen
+      // says Mute, and the cast sends exactly that: the engine stays muted.
+      const word = engineWord();
+      const { result } = setupApp();
+      await settle();
+      word.elsewhere(true);
+      result.setGlyphBinding("circle", { kind: "mute" });
+      expect(result.glyphOutcome("circle")?.label).toBe("Mute");
+      result.dispatchGlyphAction({ kind: "mute" });
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      expect(word.get()).toEqual({ muted: true, seq: 1 });
+      expect(result.muteState()).toEqual({ muted: true, seq: 1 });
+    });
+  });
+
+  describe("MIDI, through the real handlers", () => {
+    const noteOn = (n: number) => ({ channel: 0, kind: "note-on" as const, data1: n, data2: 100 });
+    const noteOff = (n: number) => ({ channel: 0, kind: "note-off" as const, data1: n, data2: 0 });
+    const cc = (controller: number, value: number) => ({
+      channel: 0,
+      kind: "control-change" as const,
+      data1: controller,
+      data2: value,
+    });
+    type Msg = ReturnType<typeof noteOn> | ReturnType<typeof noteOff> | ReturnType<typeof cc>;
+
+    /** A store with one learned `mute` mapping per trigger given. */
+    async function withMappings(...triggers: Array<{ kind: "note" | "cc"; data1: number }>) {
+      const word = engineWord();
+      const { result } = setupApp();
+      await settle();
+      for (const t of triggers) {
+        result.addMidiMapping({ action: "mute", trigger: { ...t, channel: 0 } });
+      }
+      const send = async (...msgs: Msg[]) => {
+        for (const m of msgs) {
+          result.handleMidiMessage(m);
+          await settle();
+        }
+      };
+      return { result, word, send };
+    }
+
+    it("a pad toggles on note-on; note-off does nothing", async () => {
+      const { result, send } = await withMappings({ kind: "note", data1: 48 });
+      await send(noteOn(48), noteOff(48));
+      expect(muteCalls()).toEqual(["toggle_input_muted"]);
+      expect(result.muted()).toBe(true);
+      await send(noteOn(48), noteOff(48));
+      expect(muteCalls()).toEqual(["toggle_input_muted", "toggle_input_muted"]);
+      expect(result.muted()).toBe(false);
+    });
+
+    it("a CC resting low as the first message does nothing", async () => {
+      const { send } = await withMappings({ kind: "cc", data1: 21 });
+      await send(cc(21, 0), cc(21, 3), cc(21, 62));
+      expect(muteCalls()).toEqual([]);
+    });
+
+    it("a fader swept up then down mutes, then unmutes", async () => {
+      const { result, send } = await withMappings({ kind: "cc", data1: 21 });
+      await send(cc(21, 10), cc(21, 70));
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      expect(result.muted()).toBe(true);
+      await send(cc(21, 10));
+      expect(muteCalls()).toEqual([{ muted: true }, { muted: false }]);
+      expect(result.muted()).toBe(false);
+    });
+
+    it("a fader resting low doesn't undo a hotkey mute when touched", async () => {
+      const { result, word, send } = await withMappings({ kind: "cc", data1: 21 });
+      // Fresh: touching it low does nothing.
+      await send(cc(21, 10), cc(21, 11), cc(21, 12));
+      expect(muteCalls()).toEqual([]);
+      // Used once (up, then back down): it is known to be down.
+      await send(cc(21, 70), cc(21, 10));
+      expect(muteCalls()).toHaveLength(2);
+      // The hotkey mutes in Rust; a tick brings it.
+      result.applyMuteState(word.elsewhere(true));
+      expect(result.muted()).toBe(true);
+      await send(cc(21, 10), cc(21, 11), cc(21, 12));
+      expect(muteCalls()).toHaveLength(2);
+      expect(word.get().muted).toBe(true);
+      expect(result.muted()).toBe(true);
+    });
+
+    it("jitter at halfway doesn't flap: one set, not one per message", async () => {
+      const { send } = await withMappings({ kind: "cc", data1: 21 });
+      await send(cc(21, 64), cc(21, 63), cc(21, 64), cc(21, 62), cc(21, 64));
+      expect(muteCalls()).toEqual([{ muted: true }]);
+    });
+
+    it("each mapping keeps its own side", async () => {
+      const { send } = await withMappings({ kind: "cc", data1: 21 }, { kind: "cc", data1: 22 });
+      await send(cc(21, 70));
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      // The second control was never up, so its low first message doesn't
+      // unmute.
+      await send(cc(22, 10));
+      expect(muteCalls()).toEqual([{ muted: true }]);
+    });
+
+    it("a mapping that changes forgets its side", async () => {
+      const { result, send } = await withMappings({ kind: "cc", data1: 21 });
+      await send(cc(21, 70));
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      const id = result.midiMappings()[0]!.id;
+      // Re-learned onto another control: its first message acts only when up.
+      result.updateMidiMapping(id, { trigger: { kind: "cc", data1: 23, channel: 0 } });
+      await send(cc(23, 10));
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      await send(cc(23, 90));
+      expect(muteCalls()).toEqual([{ muted: true }, { muted: true }]);
+    });
+
+    it.each([
+      ["another device", ["Deck B"]],
+      ["None, then the same device", [null, "Deck A"]],
+    ] as const)(
+      "picking the MIDI input (%s) forgets every side, so a fader resting low there can't undo a hotkey mute",
+      async (_, picks) => {
+        const { result, word, send } = await withMappings({ kind: "cc", data1: 7 });
+        await result.selectMidiInput("Deck A");
+        // Pushed up: mute. Unmuted from the Mixer; the fader stays up.
+        await send(cc(7, 10), cc(7, 70));
+        await result.setMuted(false);
+        await settle();
+        expect(muteCalls()).toEqual([{ muted: true }, { muted: false }]);
+
+        // The input changes, and CC 7 there rests low.
+        for (const name of picks) await result.selectMidiInput(name);
+        // The hotkey mutes in Rust; a tick brings it.
+        result.applyMuteState(word.elsewhere(true));
+        await send(cc(7, 5), cc(7, 6));
+        expect(muteCalls()).toEqual([{ muted: true }, { muted: false }]);
+        expect(word.get().muted).toBe(true);
+        expect(result.muted()).toBe(true);
+      },
+    );
+  });
+
+  it("Test my setup names the mute when it is why no voice reached the output", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "input_mute") return { muted: true, seq: 1 };
+      if (cmd === "list_audio_input_devices")
+        return [{ name: "Mic", isDefault: true, defaultSampleRate: 48000, channels: 1 }];
+      if (cmd === "list_audio_output_devices")
+        return [{ name: "Speakers", isDefault: true, defaultSampleRate: 48000, channels: 2 }];
+      if (cmd === "detect_virtual_mic")
+        return { detected: false, cableInputDevice: null, cableOutputDevice: null, downloadUrl: "x" };
+      if (cmd === "start_audio_engine")
+        return { inputName: "Mic", outputName: "Speakers", monitorName: null, sampleRate: 48000, inputChannels: 1, outputChannels: 2 };
+      return undefined;
+    });
+    const { result } = setupApp();
+    await settle();
+    expect(result.muted()).toBe(true);
+    result.setSelectedInput("Mic");
+    result.setSelectedOutput("Speakers");
+    // The OUT meter stays at zero, so the 700 ms signal poll runs out.
+    const checks = await result.runDiagnostics();
+    const signal = checks.find((c) => c.id === "signal");
+    expect(signal?.status).toBe("warn");
+    expect(signal?.detail).toBe("Your voice is muted in Divora. Unmute it, then run the test again.");
   });
 });

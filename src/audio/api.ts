@@ -152,6 +152,12 @@ export interface LevelUpdate {
   /** v1.46.0: current reactive-modulation depth, 0..1 (0 when the feature is
    *  off or the engine is stopped). Drives the live envelope meter. */
   modEnv: number;
+  /** v1.56.0: Divora's mute of the voice, engine running or not. Optional:
+   *  absent means "no information", never "unmuted". */
+  inputMuted?: boolean;
+  /** v1.56.0: the mute's change count, read with `inputMuted` in one load.
+   *  Orders ticks against command answers (see {@link InputMute}). */
+  inputMuteSeq?: number;
 }
 
 /** Why the panel is or isn't showing a live reading.
@@ -159,6 +165,9 @@ export interface LevelUpdate {
  *  Four states, not one low-level catch-all: stopped, muted and
  *  quiet-but-present all look identical at the meter, and a panel that
  *  couldn't tell them apart would go on describing a signal it no longer has.
+ *
+ *  v1.56.0: "muted" also covers Divora's own mute, when the microphone may
+ *  be live (the IN meter moves). `mutedInDivora` tells the two apart.
  */
 export type VoiceReadingState = "stopped" | "muted" | "quiet" | "speaking";
 
@@ -211,6 +220,9 @@ export interface VoiceReadingUpdate {
   stale: boolean;
   /** How long ago that window was measured, ms. 0 while live. */
   ageMs: number;
+  /** v1.56.0: `state` is "muted" because of Divora's own mute. Set in the
+   *  same snapshot as `state`, so the two can't disagree. Absent = false. */
+  mutedInDivora?: boolean;
 }
 
 const SILENT_METRICS: ReadingMetrics = {
@@ -292,6 +304,29 @@ export async function setAudioMonitor(enabled: boolean): Promise<void> {
  *  from the Mixer's mic monitor ({@link setAudioMonitor}). */
 export async function setSpeakMonitor(enabled: boolean): Promise<void> {
   await invoke("set_speak_monitor", { enabled });
+}
+
+/** v1.56.0: Divora's own mute of the voice. `seq` counts changes since the
+ *  app started; of two states, the larger `seq` is newer. */
+export interface InputMute {
+  muted: boolean;
+  seq: number;
+}
+
+/** v1.56.0: mute or unmute the voice; answers the state after. Idempotent:
+ *  the same value twice moves nothing, `seq` included. */
+export async function setInputMuted(muted: boolean): Promise<InputMute> {
+  return invoke<InputMute>("set_input_muted", { muted });
+}
+
+/** v1.56.0: flip the mute; answers the state after. */
+export async function toggleInputMuted(): Promise<InputMute> {
+  return invoke<InputMute>("toggle_input_muted");
+}
+
+/** v1.56.0: the current mute. The store reads it once, at creation. */
+export async function inputMute(): Promise<InputMute> {
+  return invoke<InputMute>("input_mute");
 }
 
 /** v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 = unity). */

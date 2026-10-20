@@ -130,13 +130,17 @@ src/
 | `preset` | memo | Active preset object (from PRESETS) |
 | `chains` / `setChains` | store | Per-preset editable copies of the chain (mutated when sliders move) |
 | `chain` | memo | Active preset's current chain |
-| `ui` / `setUi` | store | `{ muted, monitor, ab, ptmMode, ptmKey, pressed }` |
+| `ui` / `setUi` | store | `{ monitor, ab, ptmMode, ptmKey, pressed }` (`muted` left it in v1.56.0) |
 | `wizardOpen` / `setWizardOpen` | signal | First-run overlay visibility |
 | `tweaks` / `setTweaks` | store | Mystical / motion / mood / accent / grain / vignette |
-| `glyphs` / `setGlyphs` | store | Triangle / invtriangle / square / circle → preset id |
+| `glyphBindings` / `setGlyphBinding` | store | Glyph id → the action it casts (v1.15.0; persisted to `divora.glyphBindings`) |
+| `muted` | memo | Divora's mute of the voice (v1.56.0): a read-only mirror of the engine's state, false until known |
+| `muteState` / `applyMuteState` | signal / action | The newest `InputMute` seen; `applyMuteState` is the mirror's only writer and keeps the larger `seq` |
+| `muteKnown` | signal | True once the boot read of the mute settles, a state is adopted, or 500 ms pass; holds the overlay push |
+| `setMuted` / `toggleMuted` | action | `set_input_muted` (controls with a label) / `toggle_input_muted` (a MIDI pad); each adopts the answer |
 | `hasEnabled` | memo | Any effect on the active chain enabled |
 | `effectiveModulated` | memo | PTM apply/bypass logic |
-| `status` | memo | "muted" / "modulated" / "clean" |
+| `status` | memo | "muted" (from `muted()`) / "modulated" / "clean" |
 
 Components access this via `useApp()`; tests use `renderHook(() => useApp(), { wrapper: AppProvider })`.
 
@@ -546,7 +550,12 @@ And rejects unrelated devices (`Blue Yeti X`, `HyperX Cloud II`, `Realtek HD Aud
 GlobalShortcutEvent { id, accelerator, state }  // state: "pressed" | "released"
 ```
 
-Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor`, the reserved prefixes `sb:`, `rec:`, `replay:` and `overlay:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. One id is acted on before it gets there (v1.55.0): `global_shortcut_handler` hands every event to `overlay_windows::hotkey` before it emits it, and a press of `overlay:arrange` switches the open overlay between Arrange and Locked in Rust, inside `WM_HOTKEY` (see "Stream overlay window"). Its JavaScript branch never calls `set_overlay_mode`, which would toggle the press twice. The routes:
+Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor` / `mute`, the reserved prefixes `sb:`, `rec:`, `replay:`, `overlay:` and `mute:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. Two ids are acted on in Rust before they get there, when the press arrives inside `WM_HOTKEY`; `global_shortcut_handler` still emits both events afterwards:
+
+- **`overlay:arrange`** (v1.55.0): the handler hands every event to `overlay_windows::hotkey`, and a press switches the open overlay between Arrange and Locked (see "Stream overlay window"). Its JavaScript branch never calls `set_overlay_mode`, which would toggle the press twice.
+- **`mute`** (v1.56.0): the handler then hands every event to `mute_on_hotkey`, and a press — never a release (`hotkey_mute_request`) — calls `engine.toggle_input_muted()`, one atomic operation on the engine's mute (see "Mute (v1.56.0)"). The page plays no part, so it doesn't matter whether it is hidden, reloading or busy, and two quick presses are two flips. global-hotkey 0.8.0 registers every key with `MOD_NOREPEAT`, so a held key doesn't repeat. Its JavaScript branch does nothing: acting there would flip it twice. The page learns the new state from the next `audio-levels` tick.
+
+The routes:
 
 ```
 event.id         | event.state | action
@@ -566,6 +575,9 @@ event.id         | event.state | action
                  |             | backend already toggled the mode
                  |             | (global_shortcut_handler →
                  |             | overlay_windows::hotkey)     (v1.55.0)
+"mute"           | "pressed"   | nothing — the backend already flipped
+                 |             | the mute (global_shortcut_handler →
+                 |             | mute_on_hotkey)              (v1.56.0)
 "sb:<clipId>"    | "pressed"   | playTileById(clipId)
 ```
 
@@ -573,7 +585,7 @@ event.id         | event.state | action
 
 **Persistence (v1.51.4).**
 
-- **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), and `overlay:arrange` (v1.55.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
+- **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), `overlay:arrange` (v1.55.0) and `mute` (v1.56.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
 - **The Windows key:** the capture component labels it "Win", but the parser behind `register_global_shortcut` (global-hotkey 0.8.0) accepts only `Super` / `Cmd` / `Command`. `keysToAccelerator` and `normalizeAccelerator` turn "Win" into "Super" for every accelerator handed to the backend: the three actions, and soundboard tiles, including ones saved before the fix. `acceleratorToKeys` shows "Super" as "Win" again.
 
 ### Why two PTM listeners?
@@ -1022,26 +1034,45 @@ The preset name, the glyph chip, and the "◆ SPELL CAST ◆" eyebrow all share 
 
 ### Soundboard → mic invariant
 
-The output callback's audio path:
+The output callback's audio path (as of v1.56.0; the soundboard has had its
+own buffer since v1.29.0):
 
 ```
-mic ring → mono buffer ───┐
-                          ▼
-            mix_voice_and_soundboard(mono, chain, soundboard, sr):
-              chain.process(mono, sr);       // mic, modulated
-              soundboard.mix_into(mono, sr); // clips added on top
-                          │
-                          ▼
-                  (optional resampler)
-                          │
-                          ▼
-                fan-out to output channels
-                          │
-                          ▼
-            output device (e.g. CABLE Input → Discord)
+mic ring → mono ──┐
+                  ▼
+   mix_voice_and_soundboard(mono, sb, chain, modulator, loudness,
+                            soundboard, gate, muted, rate):
+     run = gate.run(muted, mono.len()) // v1.56.0: this buffer's mute fade
+     run.feed(mono)                   // v1.56.0: the chain's input (zero while muted)
+     modulator.apply(mono, chain, …)  // v1.46.0: reads the input's level
+     chain.process(mono, rate)        // the voice, modulated
+     loudness.process(mono, rate)     // v1.7.0
+     run.mute(mono)                   // v1.56.0: the voice (exact zero while muted)
+     soundboard.mix_into(sb, rate)    // clips, Speak, Critter Chatter: own buffer
+                  │
+                  ▼
+   reading WET tap, AV tap (mono and sb still apart), monitor ring
+   (the mic copy and sb gated apart); with no monitor device, the
+   monitor-only previews are mixed into mono here
+                  │
+                  ▼
+   mono += sb                         // the fold: voice + clips
+                  │
+                  ▼
+   WAV tap → (optional resampler) → fan-out to output channels
+                  │
+                  ▼
+   output device (e.g. CABLE Input → Discord)
 ```
 
-The two helper tests directly assert this: `mix_voice_and_soundboard` over a constant-0.10 mic buffer and a constant-0.25 playing clip yields constant-0.35 output; without the clip it yields constant-0.10. The chip on the Soundboard header surfaces this to the user.
+The two helper tests assert the split directly:
+`soundboard_clips_render_into_their_own_buffer_then_sum_with_mic` runs
+`mix_voice_and_soundboard` over a constant-0.10 mic buffer and a constant-0.25
+playing clip — the mic stays in `mono`, the clip lands in `sb`, their sum is
+0.35 — and `mic_only_passes_through_when_no_clip_is_playing` leaves the mic at
+0.10 with `sb` empty. Muted, `muted_voice_is_exactly_zero_while_a_clip_passes`
+holds the voice at exactly `+0.0` from the fade's end while the clip goes on at
+0.25. The chip on the Soundboard header surfaces this to the user.
 
 ## Phase 12 — AI voice conversion (ONNX / LLVC)
 
@@ -1079,9 +1110,11 @@ audible on the monitor for free — it's mixed in before the tap).
 
 Gating (`main_output_plays`): with a separate monitor device active, the
 **main output always plays** (Discord must keep hearing you) and the
-Monitor toggle mutes only the headphone stream. With no separate monitor
-device, the toggle gates the main output as in Phase 2 — fully
-backward-compatible. The monitor device persists to
+Monitor toggle silences only the headphone stream. With no separate monitor
+device, the toggle gates the main output as in Phase 2 — the whole output,
+the call included; fully backward-compatible. (Divora's own mute, v1.56.0,
+is another thing: it silences your voice on every stream and leaves the
+clips playing — see "Mute (v1.56.0)".) The monitor device persists to
 `localStorage["divora.monitorDevice"]` and is wired into the live
 device-switch effect. `StreamInfo` gains `monitorName`;
 `start_audio_engine` + `AudioEngine::start` take a monitor argument.
@@ -1130,7 +1163,8 @@ thread** drains a lock-free ring to disk — **no file I/O ever runs on the
 real-time callback**. Hot samples clamp to the i16 range (no wrap). Files
 land in `%APPDATA%/com.divora.voicemod/recordings/`. Commands:
 `start_recording` / `stop_recording` / `recordings_dir`; a `recording`
-flag rides the `audio-levels` event.
+flag rides the `audio-levels` event. Since v1.56.0, while you're muted the
+file has the clips and no voice, as the call does.
 
 ## v1.0 — surface freeze
 
@@ -1444,7 +1478,9 @@ nothing else.
 Each tauri `emit` is its own async command, so two sent back to back can
 arrive in either order. Main's scene pushes and the overlay's edits each go
 through one promise chain: an emit starts only once the one before it has
-gone.
+gone. Since v1.56.0 `syncOverlay`'s `overlay:state` pushes do too, because the
+status can say Muted to an audience that relies on it; and none goes out
+until main knows the mute or 500 ms have passed (see "Mute (v1.56.0)").
 
 The ready signal is sent right after the listeners are registered, not after a
 paint: the window is still hidden then, and stays hidden until the backend
@@ -2085,7 +2121,8 @@ divora-encoder thread (MTA COM, one per take)
 ### The sound
 
 The output callback taps two signals where the soundboard is still separate
-from the voice — after the chain and loudness, before the fold and before the
+from the voice — after the chain, loudness and the mute (v1.56.0: a muted
+voice goes in as zeros, never skipped), before the fold and before the
 monitor-only previews — into preallocated rings, plus one mark per buffer:
 cpal's callback instant, the buffer's index, the device frames it wrote, the
 input ring's depth before the pop, and the chain's latency. Idle, each
@@ -2618,3 +2655,438 @@ window is shown.
   ship on it), on the build before the review's fixes. Not tried: a real
   sleep, a monitor unplugged, an encoder failure, a global hotkey or the tray
   menu's items pressed, Quit during a save.
+
+## Mute (v1.56.0)
+
+Mute silences your voice everywhere Divora sends it — the call, the headphone
+monitor and Divora's own recordings (the WAV recorder, screen takes and their
+voice stem, Replay) — while the soundboard, Speak and Critter Chatter keep
+playing. Both edges fade over a few milliseconds, so neither is a hard cut.
+Every way in drives one state the engine owns: the `mute` hotkey (acted on in
+Rust; a key a Stream Deck **Hotkey** action can send), a MIDI pad or CC, a
+glyph bound to Mute / unmute, and the Mute button on the Mixer's Voice status
+card.
+Until v1.56.0 the glyph's mute changed only the status label (`ui.muted`), and
+the voice kept reaching the call. It mutes Divora's voice, not the microphone:
+an app that reads the microphone itself still hears you. The plan, and what
+changed from it, are in [`research/stream-studio.md`](research/stream-studio.md)
+(v1.56.0, "As built").
+
+### The state
+
+`EngineState.input_mute` is one `AtomicU64` holding `seq << 1 | muted`
+(`audio/mute.rs` packs and unpacks it). `seq` counts changes since launch:
+every change bumps it by one, and of two states the larger `seq` is newer. A
+set to the value it already has changes nothing, `seq` included.
+
+`AudioEngine` changes it with atomic operations on that shared state, never
+through the engine's command channel, so a mute lands on the next buffer from
+any thread, while the engine is stopped, and while the engine thread is
+blocked inside a Start (`a_mute_lands_while_the_engine_thread_is_busy`):
+
+- `set_input_muted(bool)` and `toggle_input_muted()` run one compare-and-swap
+  loop (`EngineState::apply_input_mute`: `fetch_update`'s loop written out,
+  since that name is deprecated on current stable and `try_update` is newer
+  than the workspace's `rust-version`) and return `MuteChange { before, after }`
+  from it; `before == after` means the call changed nothing.
+- `input_mute()` loads the word once and returns `InputMute { muted, seq }`.
+
+The commands `set_input_muted {muted}`, `toggle_input_muted` and `input_mute`
+are sync, each makes one of those calls, and each answers an `InputMute`: the
+state after. They never fail, apart from Tauri's own error for a `muted` that
+isn't a boolean.
+
+**Lifetime.** The word lives in `EngineState`, one `Arc` for the engine's
+life, and teardown never touches it. Stop, Start, a device switch and a
+device-loss rebuild keep the user muted, and a mute made while stopped holds
+for the next Start (`input_mute_survives_stop_start_and_a_rebuild`). It is
+never stored: every launch starts unmuted, at `seq` 0.
+
+### The gate
+
+`MuteGate` is built once per session in `build_output_stream`, beside the
+cushion, where the word stands:
+`MuteGate::new(mute_ramp_len(input_rate), state.input_muted())`. So a session
+started or rebuilt while muted sends no voice from its first buffer, and a
+take or Replay running through the rebuild gets no blip. The gate is the
+closure's state, on the audio thread; the word is the engine's.
+
+It holds one position, `pos`, in `0..=2L`, on a two-segment linear path. Each
+sample moves `pos` one step toward its target — 0 muted, `2L` unmuted — before
+that sample is scaled. The chain's input gets `min(pos, L)/L`, and the voice
+after loudness gets `max(pos − L, 0)/L`:
+
+```
+pos (L = 4 shown)          0   1   2   3   4   5   6   7   8
+the chain's input (feed)   0   ¼   ½   ¾   1   1   1   1   1
+the voice (mute)           0   0   0   0   0   ¼   ½   ¾   1
+```
+
+- **Mute** fades the voice out over L samples, then the chain's input over L
+  more. **Unmute** opens the chain's input first, then the voice.
+- A toggle mid-fade turns round from where it is. Both gains are continuous in
+  `pos`, so turning round never steps.
+- The voice's gain is the outer one, so it reaches exactly zero L samples after
+  the callback first sees the mute, whatever the chain still holds. At unmute
+  a tail the chain still holds fades in rather than stepping in, and since the
+  chain's input fades in too, an echo can't bring the unmute back as a step
+  (`the_chain_input_fades_in_at_unmute`).
+- With a passthrough chain the send is an exact linear ramp, with no step
+  larger than the fade's slope (`no_step_larger_than_the_slope`,
+  `the_send_is_a_pure_linear_ramp`).
+
+**L** is `mute_ramp_len(rate)` at the engine (input) rate: the power of two at
+or above 5 ms (`rate.div_ceil(200)`), clamped to 64..=2048. That is 256 at
+44.1 and 48 kHz (5.8 and 5.3 ms), 512 at 88.2 and 96 kHz, 1024 at 176.4 and
+192 kHz and 128 at 16 to 24 kHz; between 5 and 10 ms for every rate from 12.8
+to 409.6 kHz, and 64 below that (8 ms at 8 kHz). A power of two makes every
+gain `k/L` exact in `f32`, so both ends of a fade land exactly and the tests
+compare without an epsilon.
+
+`gate.run(muted, frames)` plans one buffer — where `pos` starts and where it
+ends — and both passes, `feed` and `mute`, walk that plan, so neither their
+order nor the buffer sizes change what they compute
+(`feed_and_mute_share_one_plan`, `buffers_of_any_size_give_one_result`).
+
+### Where it sits
+
+Inside `mix_voice_and_soundboard`, the voice stage the callback already had:
+
+```
+output callback, per buffer:
+  denormals::flush_to_zero()                 FTZ | DAZ (below)
+  drains → chain latency → resample_pop → loudness params
+  reading DRY tap                            the raw mic
+  let muted = state_for_callback.input_muted();   one Acquire load
+  mix_voice_and_soundboard(…, &mut mute_gate, muted, input_rate):
+      run.feed(mono) → modulator → chain → loudness → run.mute(mono)
+      soundboard.mix_into(sb)                untouched
+  reading WET tap                            zeros while muted
+  AV tap (takes, Replay)                     voice zeros, sb intact
+  monitor ring                               the mic copy (zeros), sb, previews
+  no monitor device: previews into mono      still audible
+  fold: mono += sb                           the send = the clips (+ previews)
+  WAV tap → resample_render → fan-out → OUT meter
+```
+
+"After loudness, before the soundboard fold", as the plan put it, is not one
+point: between the two sit the reading's WET tap, the AV tap, the monitor's
+mic copy and, with no monitor device, the previews mixed into `mono`. Muting
+before all of them makes every recording match the send and leaves the
+soundboard and the previews alone. A chain swap replaces the chain only; the
+gate sits outside it, beside loudness. No test can run the callback's closure
+without a device, so `the_output_callback_mutes_the_voice_stage` reads the
+source, as the soundboard drain's test does: the gate built once, outside the
+closure, at the word; the word read once and passed to the stage; the order of
+the stage, the taps and the monitor; and the flush as the closure's first
+statement.
+
+### Starving the chain
+
+`feed` closes the chain's input too, so while muted the chain hears only
+silence. Zeroing the voice after the chain alone would keep the chain running
+on the live microphone, and at unmute it would let out what it still held of
+words said while muted: up to about a quarter-second through Voice Convert's
+downsampler, seconds through an Echo with high feedback. Starved, what is said
+once you're muted never enters the chain
+(`what_is_said_while_muted_never_reaches_the_send`). What is said right around
+the press can still enter: up to a buffer before the callback reads the word,
+then 2L samples while the voice and then the input close — about 10 to 21 ms
+at 48 kHz with 480-frame buffers. `STARVE_CHAIN` in `mute.rs` is the kill
+switch; `false` makes `feed` a no-op.
+
+**What the press cuts.** The voice closes first, so what the chain still holds
+at the press — speech from just before it — is cut with it: about the last
+quarter-second with Voice Convert (its downsampler's 4096-sample chunk at
+16 kHz; see "DSP architecture"), and otherwise the delays of the chain's
+effects added up: 10 ms for a denoiser and 21 ms for each pitch or formant
+effect, so 43 ms or more in the 10 of the 24 bundled presets that run both
+pitch and formant; nothing with a passthrough chain. That is worked out from
+the code, not measured: no voice model was loaded in the real-app run. Keeping
+those words would mean holding the send open for the chain's real delay, and
+`VoiceConverter::latency_samples` reports about 13 ms for a chain whose real
+delay is about 256 ms; that is a follow-up. After an unmute the voice enters a
+chain that held silence, as after any pause, and the reactive envelope
+(`modEnv`) falls to rest while muted.
+
+### Exact zero
+
+Where a gain is 0 the stage writes `+0.0` (`fill`, or an assignment), never
+`x · 0`, which keeps a NaN — and loudness passes a NaN through while it is
+off. So once the fade is over the voice is `+0.0` whatever reaches it
+(`nan_is_zero_once_silent`), and the fold's `0.0 + s` leaves the send equal to
+the soundboard exactly. `feed` writes exact zeros too, from 2L samples after
+the callback first sees the mute until the unmute. Where both gains are 1 the
+gate leaves the buffer untouched; `an_open_gate_is_bit_exact` checks that with
+a signalling NaN, which an x86 multiply by 1.0 would quiet.
+
+### FTZ and DAZ on the output callback
+
+A long mute — minutes, on a break — feeds the chain exact zeros the whole time,
+and its recursive states (reverb combs, echo feedback, the biquads, the
+loudness EMA, the STFT magnitudes) decay into subnormal floats. On x86 an
+operation on a subnormal can cost a microcode assist. The bench
+`a_long_mute_costs_at_most_twice_speech_or_a_pause` (ignored in CI; run with `--release`)
+puts every bundled preset, loudness on, through the real stage on a thread
+that flushes every buffer as the callback does: 10 s of a tone, then 180 s
+muted, against a second run that sits 180 s on −70 dBFS room tone after the
+tone. The bar: the last 10 s muted costs at most twice the larger of the tone
+and the pause's last 10 s. Without the flush, 21 of the 24 presets failed it,
+their last 10 s muted costing 2 to 16 times the larger of the two, on the
+development PC's i7-14700K (The Oracle 429 µs and Zombie about 1.1 ms per
+480-frame buffer).
+
+So the output callback's first statement is `denormals::flush_to_zero()`
+(`audio/denormals.rs`), which sets MXCSR's flush-to-zero and
+denormals-are-zero bits on the calling thread: it reads MXCSR, ORs in the two
+bits and writes it back. cpal owns the output stream's thread, so it is set
+every buffer. It applies to everything that thread computes, muted or not.
+cpal gives each stream its own thread, so the input and monitor callbacks, like
+every other thread, keep gradual underflow
+(`flush_to_zero_flushes_this_thread_only`). Off x86-64 it does nothing. With
+it all 24 presets passed: per 480-frame buffer, Zombie took 243.3 µs muted
+against 277.5 on the tone and 294.8 on the pause, The Oracle 34.1 against 39.0
+and 50.2, Clean 11.6 against 3.8 and 11.8 — the last 10 s muted costing 0.68
+to 0.99 times the larger of the two. That is one CPU, in a release build;
+others weren't measured.
+
+It is `divora-core`'s one production `unsafe`: the workspace sets
+`unsafe_code = "warn"`, and this function alone allows it, with a SAFETY note.
+The `asm!` block touches only a local and MXCSR, writes MXCSR's other bits back
+as it read them, uses no stack and can't unwind. Formally it is undefined
+behaviour all the same: Rust assumes gradual underflow (std's `_mm_setcsr`
+docs say so of changing DAZ), so a float operation the compiler folds at build
+time can still give a subnormal that the same operation at run time would
+flush. Nothing on the audio thread gets memory safety from a float, so in
+practice that is a difference below 1.2e-38 in a sample.
+
+A first fix fed the starved chain a normal-float floor (±1e-18) instead of
+zeros. It didn't help: the noise gate that 23 of the 24 bundled presets start
+with took it down 60 dB, to about 1e-21, and loudness's `x * x` average and
+the STFT magnitudes squared that below the normal range. It was taken out,
+and `feed` writes exact zeros again.
+
+### Who hears what
+
+| Consumer | While muted | Why |
+|---|---|---|
+| **The send** (the main output: CABLE Input → Discord, OBS, …) | the soundboard, Speak, Critter Chatter and saved Speak clips only. Your voice is exactly zero in `mono` from L samples after the callback first sees the mute. When the output device runs at another rate than the input, the device gets the send through rubato's sinc resampler (`sinc_len` 128), whose history carries the voice about 64 engine-rate samples past that point (worked out from the code: the real-app runs measured the WAV, which is before the resampler) | the gate is before the fold |
+| **Monitor** (a separate headphone device) | your voice silent; clips, Speak and previews as the Speak-monitor toggle says | the mic copy is taken after the gate |
+| **Single output** (no monitor device) | as the send, plus the monitor-only previews; still gated by Monitor as before | the previews are mixed into `mono` after the gate |
+| **WAV recorder** | as the send | its tap is after the fold |
+| **Screen takes, their voice stem, Replay** | the voice as zeros, pushed like any buffer; the soundboard as it plays. `.voice.wav` holds voice **and** soundboard | the AV tap is after the gate |
+| **Desktop audio** in takes and Replay | unchanged | other apps' sound, not Divora's voice |
+| **Voice reading** | Muted, with `mutedInDivora`; the last reading held, nothing analysed | see "The reading" |
+| **IN meter** | keeps moving: the raw microphone, so it shows you talking while muted | before everything |
+| **OUT meter** | the send: the clips, else zero | after the fold |
+| **Reactive envelope** (`modEnv`) | falls to rest | the modulator hears the starved input |
+| **Loudness readout** | holds its last gain | below the noise floor the gain is held |
+| **Voice-clone reference recording** | still records the raw microphone | a deliberate local recording, tapped in the input callback |
+| **Titlebar, Mixer card, spell circle, overlay** | Muted | the store's mirror |
+| **Apps that read the microphone** (an OBS mic source, a game's voice chat) | still hear you | Divora can't mute the device |
+
+### The mirror in the store
+
+`UiState.muted` is gone. The store keeps a read-only mirror (`muteState`, and
+`muted()` from it) whose only writer is `applyMuteState`. Three things reach
+it, in any order: command answers, the boot read, and every `audio-levels`
+tick, which carries `inputMuted` and `inputMuteSeq` from one load of the word
+(about 30 Hz, engine running or not; `level_update`). `adoptMute` keeps
+whichever state has the larger `seq` and drops older ones, so a tick built
+just before a command landed, arriving after its answer, changes nothing. (The
+overlay controller, v1.55.0, settles the same answer-or-event question by
+watching for events while a command is in flight; with a tick always on its
+way, the mute needs the number.) A tick without the two fields is no
+information, never "unmuted".
+
+**The boot read.** The store sends `input_mute` once, when it is created:
+before `App`'s `onMount` enumerates devices with two sync commands that hold
+the main thread, so a reload during a hotkey mute shows Muted after one round
+trip rather than after the enumeration. Ticks still start after it (the boot
+comment in `App.tsx` says why). The boot sends no mute of its own, so a reload
+never unmutes the call. `muteKnown` comes true when the read settles (an
+answer or a failure), when any state is adopted, or after 500 ms; until the
+read lands, the pill shows the push-to-modulate status.
+
+**Labels set, triggers toggle.** A control with a label sends the state its
+label names (`setMuted`): the Mixer's Mute / Unmute button, a glyph (its omen,
+Mute or Unmute, is read from the same mirror the cast reads) and a MIDI CC.
+When the label is stale — the mirror lags a hotkey mute by a tick — a click is
+an idempotent no-op whose answer corrects the label, never the opposite of
+what it says. A trigger with no label toggles in Rust, so a quick double press
+is two flips: the hotkey, and a MIDI pad (`toggle_input_muted`). After a
+pointer click (`detail > 0`) the Mixer button gives focus back to the page,
+because a focused button takes Space, the in-app push-to-modulate key; from
+the keyboard it keeps focus.
+
+**MIDI.** Kind `mute`. The router stays stateless: a note-on calls
+`toggleMuted`, a note-off nothing, and every CC goes to the store's `muteCc`
+with the mapping's id. The store keeps the side each mapping is on
+(`muteCcSides`) and acts only when a CC crosses (`muteCcStep`): rising to 64
+or more mutes, falling to 59 or less unmutes, and 60 to 63 keeps the side.
+While a mapping's side is unknown — after launch, after the mapping changes,
+or after a MIDI input is picked, which forgets every side — a message acts
+only if it is 64 or more, and then it mutes. So a fader resting low can't undo
+a hotkey mute when touched, and a knob jittering at halfway acts once. The cost: after another surface changed the
+mute, a latching CC button's next press does nothing.
+
+**The overlay.** `syncOverlay` sends `overlay:state` through one promise
+chain, and sends nothing while `held()` is true; `App.tsx` passes
+`() => !app.muteKnown()`. A reload during a mute therefore shows the stream
+unmuted (Clean or Modulated) only if the boot read takes more than 500 ms or
+fails, and then only until the read or a tick lands. The hold can't freeze the
+overlay, because `muteKnown` always comes true. The mute rides
+`status: "muted"` as before; `OverlayState` is unchanged.
+
+**On screen.** While muted the titlebar pill is loud and still (`.is-muted`:
+the danger colours, a border, bold; nothing animates), and its `title` names
+the call, your headphones and recordings. An always-mounted polite live region
+beside it says "Your voice is muted." and "Your voice is unmuted." on the
+mute's edges only, and nothing until the page has seen a mute. Whether a
+screen reader voices it while another app has focus, or while the window is
+hidden to the tray, hasn't been checked. With the main window hidden to the
+tray, the overlay, when it is open, is the only thing that shows the mute:
+there is no tray item or tooltip for it.
+
+### The reading
+
+The reading worker loads the word once a pass (every 20 ms, in
+`reading_facts`): `facts.muted` is the device's fact or Divora's mute, and
+every store goes through `publish`, which sets `mutedInDivora` when the state
+is Muted and Divora's mute is a reason. The state and its cause come from one
+load, so they can't disagree. While muted the worker drops what both taps
+hold, paired, and holds the last reading as Muted; on each mute edge it drops
+the wet window, as it does for a chain change. The panel keys "Muted in
+Divora" off `reading.mutedInDivora`, never the mirror: the two travel at
+different rates, and joining them flashed "Input silent" after every unmute.
+`set_reading_muted` stays the device's fact (still with no caller).
+
+### Threads
+
+- **The output callback:** the flush, one `Acquire` load per buffer, and
+  `run`, which moves a `u16`. No allocation, lock or system call.
+  `the_voice_stage_allocates_nothing_while_mute_toggles` measures the voice
+  stage — an echo, loudness and a clip, with flips that turn a fade round
+  mid-way — not the whole callback, where Voice Convert's inference still
+  allocates.
+- **The main thread:** the three commands and the hotkey's flip, each one
+  atomic operation, with no lock. It is a shared queue, though: Tauri runs
+  sync commands on the main thread, and global-hotkey handles `WM_HOTKEY`
+  there too. A mute pressed or invoked while another sync command holds it —
+  a `start_audio_engine` blocked on opening a device — lands when that command
+  returns. `Command::Start` tears the old session down first, so no stream
+  runs while it waits.
+- **The level emitter:** one load per tick, so `inputMuted` and
+  `inputMuteSeq` always agree.
+- **The reading worker:** one load per pass.
+- `AudioEngine::set_input_muted` takes `&self` and no lock, so any thread can
+  call it; that is the way in planned for v1.58.0's break timer.
+
+**Latency**, from the press: the main-thread queue (normally empty), then up
+to one buffer before the callback reads the word (about 10 ms at 480 frames),
+then the fade (5.3 to 8 ms). A Voice Convert overrun adds to it. In the real
+app, silence began 0 to 11 ms after each command was sent, at 48 kHz.
+
+### Tests
+
+- **Pure** (`mute.rs`): `ramp_len_table` (the table, and every rate from 12.8
+  to 409.6 kHz giving 5 ms ≤ L < 10 ms); `transition_table`;
+  `an_open_gate_is_bit_exact`;
+  `a_gate_built_muted_is_silent_from_its_first_sample`;
+  `the_send_is_exactly_zero_l_samples_after_mute` and
+  `no_step_larger_than_the_slope` at every rate in the table;
+  `the_send_is_a_pure_linear_ramp`; `a_toggle_mid_ramp_turns_round` at every
+  offset in both directions; `buffers_of_any_size_give_one_result`;
+  `open_again_two_ramps_after_unmute`; `nan_is_zero_once_silent`;
+  `feed_and_mute_share_one_plan`; and `seeded_toggle_walk` (10,000 buffers of
+  1 to 4096 frames, random flips, at three fade lengths).
+- **The voice stage** (the real `mix_voice_and_soundboard`):
+  `muted_voice_is_exactly_zero_while_a_clip_passes` (an echo, loudness on, a
+  clip; 100- and 480-frame buffers), `what_is_said_while_muted_never_reaches_the_send`,
+  `a_tail_fades_in_at_unmute`, `the_chain_input_fades_in_at_unmute`,
+  `the_voice_stage_allocates_nothing_while_mute_toggles` (with a live-probe
+  control, and a count showing some flips turned a fade round), and the source
+  test `the_output_callback_mutes_the_voice_stage`.
+- **The state:** `input_mute_is_idempotent_and_counted`;
+  `concurrent_toggles_are_all_counted` (four threads × 10,000 toggles from a
+  barrier: all 40,000 counted, each a change of one);
+  `input_mute_survives_stop_start_and_a_rebuild`;
+  `a_mute_lands_while_the_engine_thread_is_busy`;
+  `input_mute_json_keys_are_frozen`.
+- **The reading:** `the_reading_hears_the_mute` (`reading_facts` and
+  `publish`) and `the_reading_worker_holds_while_muted` (the real worker on its
+  own thread, fed paired blocks every 10 ms as the callback feeds it).
+- **Subnormals:** `flush_to_zero_flushes_this_thread_only`, and the bench
+  above: a `cargo test --release` of the voice stage on a thread of its own,
+  not the app, run on the development PC with and without the flush.
+- **The shell** (`lib.rs`): `the_level_tick_carries_the_mute` (the emitter's
+  own builder), `the_reading_update_carries_muted_in_divora`,
+  `hotkey_mute_request_table`, `the_mute_hotkey_flips_the_engine_on_press_only`
+  (the handler's mute step against a real engine) and
+  `the_shortcut_handler_runs_the_mute_hotkey` (the handler needs an
+  `AppHandle`, so a source test pins that it runs that step once with the
+  press state); the frozen key lists gain `inputMuted`, `inputMuteSeq` and
+  `mutedInDivora`.
+- **Vitest:** `data/mute.test.ts` (`adoptMute`, `readInputMute`, `levelMute`,
+  `muteAnnouncement`, `muteCcStep`); the store (the boot read, `muteKnown`
+  after an answer, a failure and 500 ms, stale ticks, no mute sent at creation
+  or on start, the glyph's omen, MIDI through the real handlers — a fader
+  resting low after a hotkey mute, jitter at halfway, a changed mapping and a
+  picked input forgetting their sides); `App.test.tsx` (`input_mute` sent
+  before the device enumeration, the hotkey branch invoking nothing,
+  `applyLevelUpdate`, the overlay held until the read); `sync.test.ts` (push
+  order, a failed emit, the hold); the router; the Titlebar; the Mixer button
+  (a stale label, focus after a click and from the keyboard); the reading
+  panel; diagnostics.
+- **E2E** (mocked Tauri, whose word lives in `sessionStorage` so it survives
+  a reload): the Mixer button, the hotkey left to the backend, a stale label,
+  stale ticks, a reload that reads and never sends, a glyph, the Settings
+  hotkey row and MIDI mapping, and a MIDI pad and CC.
+- **In the real app** (see "Mute (v1.56.0)" in
+  [`MANUAL_TESTS.md`](MANUAL_TESTS.md)): one debug build of `72ee4e3`, on
+  Windows 11 26200 with an i7-14700K, driven over WebView2's DevTools
+  protocol, with the mute commands sent from the page over the real IPC — the
+  hotkey through real `WM_HOTKEY` from `SendInput`, the Mixer button by clicks
+  sent over the same protocol. The engine ran at 48 kHz on a silent route (the
+  Focusrite in, the Realtek speakers out with Monitor off, no monitor device;
+  nothing to the VB-Audio cable). The voice was a 440 Hz tone (660 Hz for the
+  echo check) at −30 dBFS played on the SMSL DAC and picked up by the
+  microphone at only about −73 to −80 dBFS.
+  - The send's WAV with a −20 dBFS clip playing, 10 toggles: the tone 88 dB or
+    more down in every muted stretch, the clip at −20.0 dBFS in every stretch.
+    With no clip, every muted stretch was all exact-zero samples (5 of 5), and
+    silence began 0 to 11 ms after each command was sent.
+  - A screen take with stems, muted across two engine restarts: the voice
+    stem exactly 0.0 from the mute to the unmute, straight through both, and
+    the take kept recording. (It reported audio lost during the second
+    restart and cleared it by the end: the recorder's existing restart
+    behaviour.) A Replay clip: the tone 68.8 dB down in the muted stretch of
+    its AAC, where the tone reached the clip at only −82 dBFS.
+  - The hotkey (Ctrl+Alt+Shift+F24, four presses about 480 ms apart, the
+    overlay open, the main window visible): `seq` +1 per press, never +2, each
+    in its own tick 12 to 25 ms later; the pill and the overlay's circle
+    alternated Muted and Clean.
+  - A main-window reload while muted: the engine stayed muted with the same
+    `seq`, the overlay received only Muted, and the pill, sampled every 20 ms,
+    read Clean at
+    51 ms and Muted at 174 ms after the reload.
+  - 40 clicks on the Mixer button 0 to 32 ms apart: one `set_input_muted` per
+    click, each sending what its label said, and every animation frame showed
+    the newest state the page had received before the previous frame. The real
+    commands with real arguments: `set_input_muted` with `true` twice answered
+    the same `seq` both times, `false` moved it by one, `input_mute` agreed,
+    and the ticks agreed within 6 to 23 ms.
+  - Supporting only: the room noise's level over the 256 samples before
+    silence was 0.38 to 0.94 times its steady level (mean about 0.63), near a
+    linear fade's 0.58 and below a hard cut's 1.0. The no-step bound itself is
+    the unit tests'. The echo check couldn't run: its positive control's burst
+    reached the microphone too weakly to make a measurable echo, so that is
+    the unit test's alone.
+  - Not tried here: real speech, or a voice as loud as speech at the
+    microphone; the hotkey while hidden to the tray (the run's hide step
+    didn't take); a Stream Deck **Hotkey** action sending the key; Discord's
+    far end, a game, OBS's own mic source; a Bluetooth or high-rate device;
+    Voice Convert and the cut at the press; a screen reader; the headphone
+    monitor's output; a real device loss (the rebuilds were direct restarts);
+    a mute held for minutes in the app (the bench covers its CPU only). Several
+    of these are the owner's checks in `MANUAL_TESTS.md`.

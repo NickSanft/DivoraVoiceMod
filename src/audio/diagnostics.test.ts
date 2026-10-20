@@ -75,6 +75,27 @@ describe("evaluateDiagnostics", () => {
     expect(overallStatus(checks)).toBe("warn");
   });
 
+  // v1.56.0: when Divora's own mute is why nothing reached the output, the
+  // signal row says so instead of asking the user to speak up.
+  it("names Divora's mute when no signal moved while muted", () => {
+    const muted = by(evaluateDiagnostics({ ...GOOD, signalFlowing: false, muted: true }), "signal");
+    expect(muted?.status).toBe("warn");
+    expect(muted?.detail).toBe("Your voice is muted in Divora. Unmute it, then run the test again.");
+
+    const today = by(evaluateDiagnostics({ ...GOOD, signalFlowing: false, muted: false }), "signal");
+    expect(today?.status).toBe("warn");
+    expect(today?.detail).toBe(
+      "No output level detected — speak into the mic and run it again (with no separate monitor device, also check the Monitor toggle is on).",
+    );
+    // An older snapshot without the field reads as not muted.
+    expect(by(evaluateDiagnostics({ ...GOOD, signalFlowing: false }), "signal")?.detail).toBe(today?.detail);
+
+    // A clip can still move the meter while muted: then it passes, as today.
+    const flowing = by(evaluateDiagnostics({ ...GOOD, signalFlowing: true, muted: true }), "signal");
+    expect(flowing?.status).toBe("pass");
+    expect(flowing?.detail).toBe("Output level moved during the test.");
+  });
+
   it("warns + omits routing when VB-Cable isn't detected", () => {
     const checks = evaluateDiagnostics({
       ...GOOD,

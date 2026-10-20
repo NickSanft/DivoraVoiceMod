@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::mute::{mute_transition, unpack, InputMute, MuteChange, MuteOp};
+
 /// RMS and peak for one audio path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Levels {
@@ -91,6 +93,10 @@ pub struct EngineState {
     /// input callback hands it to the ring, in microseconds. Written by the
     /// input callback only while a screen recording runs.
     pub input_latency_us: AtomicU32,
+    /// v1.56.0: Divora's mute of the voice: `seq << 1 | muted` (see
+    /// `audio::mute`). Engine-lifetime: teardown never touches it. `Default`
+    /// 0 = unmuted, seq 0.
+    pub input_mute: AtomicU64,
 }
 
 impl EngineState {
@@ -188,6 +194,46 @@ impl EngineState {
     #[must_use]
     pub fn load_input_latency_us(&self) -> u32 {
         self.input_latency_us.load(Ordering::Relaxed)
+    }
+
+    /// v1.56.0: the callback's read of the mute: bit 0, `Acquire`.
+    #[must_use]
+    pub fn input_muted(&self) -> bool {
+        self.input_mute.load(Ordering::Acquire) & 1 == 1
+    }
+
+    /// v1.56.0: the mute and its change count, from one load.
+    #[must_use]
+    pub fn load_input_mute(&self) -> InputMute {
+        unpack(self.input_mute.load(Ordering::Acquire))
+    }
+
+    /// v1.56.0: apply `op` in one atomic op. `before` is the word it found;
+    /// `after` is the word it left, which is `before` when nothing changed.
+    ///
+    /// The compare-and-swap loop `fetch_update` runs, written out: that name
+    /// is deprecated on current stable, and its replacement `try_update` is
+    /// newer than the workspace's `rust-version`.
+    pub(crate) fn apply_input_mute(&self, op: MuteOp) -> MuteChange {
+        let mut prev = self.input_mute.load(Ordering::Acquire);
+        let next = loop {
+            let Some(next) = mute_transition(prev, op) else {
+                break prev;
+            };
+            match self.input_mute.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break next,
+                Err(actual) => prev = actual,
+            }
+        };
+        MuteChange {
+            before: unpack(prev),
+            after: unpack(next),
+        }
     }
 }
 

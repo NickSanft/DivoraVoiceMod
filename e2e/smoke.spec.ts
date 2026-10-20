@@ -5,11 +5,14 @@
 import {
   test,
   expect,
+  emitLevels,
   emitOverlayStatus,
   emitReplay,
   emitReplaySaved,
   emitsOf,
   invokesOf,
+  mockMute,
+  pressMuteHotkey,
 } from "./tauri-mock";
 
 const nav = (page: import("@playwright/test").Page, label: string) =>
@@ -188,9 +191,15 @@ test.describe("what's new (v1.49)", () => {
     ).toBeVisible();
 
     // No banner off Tauri: there is no app version to compare against. (The
-    // shell's toast is a status region too, always mounted since v1.54.0.)
-    await expect(page.locator('[role="status"]:not([data-testid="toast"])')).toHaveCount(0);
+    // shell's toast is a status region too, always mounted since v1.54.0, and
+    // so is the titlebar's mute announcer since v1.56.0; both are empty.)
+    await expect(
+      page.locator(
+        '[role="status"]:not([data-testid="toast"]):not([data-testid="mute-announcer"])',
+      ),
+    ).toHaveCount(0);
     await expect(page.getByTestId("toast")).toHaveText("");
+    await expect(page.getByTestId("mute-announcer")).toHaveText("");
 
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
@@ -964,6 +973,10 @@ test.describe("replay (v1.54)", () => {
 
     await traceTriangle(page);
     await expect(page.locator(".titlebar-status")).toContainText(/Muted/i);
+    // v1.56.0: the glyph really mutes, through the engine.
+    expect(await invokesOf(page, "set_input_muted")).toEqual([
+      { cmd: "set_input_muted", args: { muted: true } },
+    ]);
     await emitReplaySaved(page, saved);
     await expect(page.getByTestId("toast")).toHaveText(
       "Saved a 1 s replay · your voice as your call heard it",
@@ -1054,6 +1067,348 @@ test.describe("replay (v1.54)", () => {
     await expect(page.getByTestId("replay-row")).toContainText(
       "Keeps the last 30 s · uses up to 81 MB of memory",
     );
+  });
+});
+
+// v1.56.0: the mute (design §10.5). The mock keeps the engine's word in
+// sessionStorage, so it outlives a reload as the engine's does, and answers
+// the three commands by its rules. It never sends a tick: what the backend
+// changes on its own (the hotkey) is played with pressMuteHotkey, and the
+// tick that carries it with emitLevels. Every list of mute commands below is
+// compared whole, so a command sent where none should be shows up in it.
+test.describe("mute (v1.56)", () => {
+  type Page = import("@playwright/test").Page;
+
+  const pill = (page: Page) => page.getByTestId("titlebar-status");
+  const announcer = (page: Page) => page.getByTestId("mute-announcer");
+  const muteButton = (page: Page) => page.getByTestId("mute-button");
+  const SET_TRUE = { cmd: "set_input_muted", args: { muted: true } };
+  const SET_FALSE = { cmd: "set_input_muted", args: { muted: false } };
+  const TOGGLE = { cmd: "toggle_input_muted", args: {} };
+  const READ = { cmd: "input_mute", args: {} };
+
+  /** The mute commands this page has sent, in order, the boot's read included. */
+  const muteCalls = async (page: Page) =>
+    (await invokesOf(page)).filter((i) =>
+      ["input_mute", "set_input_muted", "toggle_input_muted"].includes(i.cmd),
+    );
+  /** Only the ones that change it. */
+  const muteWrites = async (page: Page) =>
+    (await muteCalls(page)).filter((i) => i.cmd !== "input_mute");
+  /** A section of Settings, by its heading. */
+  const settingsSection = (page: Page, heading: string) =>
+    page.locator("section", {
+      has: page.locator(".eyebrow", { hasText: new RegExp(`^${heading}$`) }),
+    });
+  /** Fire a `midi-message`, as the backend does for each note or CC. */
+  const midi = (page: Page, kind: string, data1: number, data2: number) =>
+    page.evaluate(
+      (m) => {
+        (
+          window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void }
+        ).__E2E_EMIT__("midi-message", m);
+      },
+      { channel: 0, kind, data1, data2 },
+    );
+
+  async function expectMuted(page: Page): Promise<void> {
+    await expect(pill(page)).toHaveClass(/\bis-muted\b/);
+    await expect(pill(page)).toHaveText("Muted");
+    await expect(muteButton(page)).toHaveText("Unmute");
+  }
+  async function expectUnmuted(page: Page): Promise<void> {
+    await expect(pill(page)).not.toHaveClass(/\bis-muted\b/);
+    await expect(pill(page)).toHaveText(/^(Clean|Modulated)$/);
+    await expect(muteButton(page)).toHaveText("Mute");
+  }
+  /** The Mixer, once the boot has read the mute (and sent nothing else for
+   *  it) and started the engine, so the levels listener is up. */
+  async function mixerReady(page: Page): Promise<void> {
+    await nav(page, "Mixer").click();
+    await expect(page.getByTestId("screen-record-toggle")).toBeEnabled();
+    await expect.poll(() => muteCalls(page)).toEqual([READ]);
+  }
+
+  test("the Mixer button sends what its label says; the pill and the announcer follow", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await mixerReady(page);
+    await expectUnmuted(page);
+    // Silent until this page has seen a mute: a launch never says "unmuted".
+    await expect(announcer(page)).toHaveText("");
+    await expect(pill(page)).not.toHaveAttribute("title");
+    await expect(muteButton(page)).toHaveAttribute(
+      "title",
+      "Mute your voice for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.",
+    );
+
+    await muteButton(page).click();
+    await expectMuted(page);
+    expect(await muteWrites(page)).toEqual([SET_TRUE]);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+    await expect(announcer(page)).toHaveText("Your voice is muted.");
+    await expect(pill(page)).toHaveAttribute(
+      "title",
+      "Your voice is muted for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.",
+    );
+    await expect(page.getByText("Your voice is off · clips and Speak still play")).toBeVisible();
+    await expect(muteButton(page)).toHaveAttribute("title", "Unmute your voice");
+
+    await muteButton(page).click();
+    await expectUnmuted(page);
+    expect(await muteWrites(page)).toEqual([SET_TRUE, SET_FALSE]);
+    expect(await mockMute(page)).toEqual({ muted: false, seq: 2 });
+    await expect(announcer(page)).toHaveText("Your voice is unmuted.");
+    await expect(pill(page)).not.toHaveAttribute("title");
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("the mute hotkey is the backend's: the page sends nothing, and the tick brings it", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await mixerReady(page);
+
+    // The backend flips its word on the press and still sends the event.
+    expect(await pressMuteHotkey(page)).toEqual({ muted: true, seq: 1 });
+    // The page must not act on it as well: that would flip it twice.
+    await page.waitForTimeout(300);
+    expect(await muteWrites(page)).toEqual([]);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+    // The next tick brings it.
+    await emitLevels(page, { inputMuted: true, inputMuteSeq: 1 });
+    await expectMuted(page);
+    await expect(announcer(page)).toHaveText("Your voice is muted.");
+
+    // And back.
+    expect(await pressMuteHotkey(page)).toEqual({ muted: false, seq: 2 });
+    await page.waitForTimeout(300);
+    expect(await muteWrites(page)).toEqual([]);
+    await emitLevels(page, { inputMuted: false, inputMuteSeq: 2 });
+    await expectUnmuted(page);
+    await expect(announcer(page)).toHaveText("Your voice is unmuted.");
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("a stale Mute label sends Mute, never the opposite", async ({ page }) => {
+    await mixerReady(page);
+    // A hotkey muted the voice and its tick isn't in yet: the button still
+    // says Mute.
+    await pressMuteHotkey(page);
+    await expect(muteButton(page)).toHaveText("Mute");
+
+    await muteButton(page).click();
+    // Mute again moves nothing in the engine, and the answer corrects the
+    // label. A toggle here would have unmuted the call.
+    await expectMuted(page);
+    expect(await muteWrites(page)).toEqual([SET_TRUE]);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+    // The late tick says the same.
+    await emitLevels(page, { inputMuted: true, inputMuteSeq: 1 });
+    await expectMuted(page);
+  });
+
+  test("a stale tick doesn't undo a mute; a tick without the mute says nothing; a newer one is taken", async ({
+    page,
+  }) => {
+    await mixerReady(page);
+    await muteButton(page).click();
+    await expectMuted(page);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+
+    // A tick built before the mute landed, arriving after its answer. Its
+    // latency readout shows the page took the tick.
+    await emitLevels(page, { inputMuted: false, inputMuteSeq: 0, dspLatencyMs: 12 });
+    await expect(page.getByText(/\+12 ms latency/)).toBeVisible();
+    await expectMuted(page);
+    await expect(announcer(page)).toHaveText("Your voice is muted.");
+
+    // No pair on the tick (an older backend): no information, never unmuted.
+    await emitLevels(page, { dspLatencyMs: 13 });
+    await expect(page.getByText(/\+13 ms latency/)).toBeVisible();
+    await expectMuted(page);
+
+    // Unmuted elsewhere (a newer seq): taken.
+    await emitLevels(page, { inputMuted: false, inputMuteSeq: 2 });
+    await expectUnmuted(page);
+    await expect(announcer(page)).toHaveText("Your voice is unmuted.");
+    expect(await muteWrites(page)).toEqual([SET_TRUE]);
+  });
+
+  test("a reload reads the mute and shows it, and never sends one", async ({ page }) => {
+    await mixerReady(page);
+    await muteButton(page).click();
+    await expectMuted(page);
+
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+    // Muted from the read alone: the mock sends no tick.
+    await expect(pill(page)).toHaveClass(/\bis-muted\b/);
+    await expect(pill(page)).toHaveText("Muted");
+    // Through the rest of the boot (enumeration, the auto-start, the hotkey
+    // sync) it only ever read.
+    await mixerReady(page);
+    await expect(muteButton(page)).toHaveText("Unmute");
+    await page.waitForTimeout(300);
+    expect(await muteCalls(page)).toEqual([READ]);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+    // Sent before the boot's device enumeration, which holds the main thread.
+    const cmds = (await invokesOf(page)).map((i) => i.cmd);
+    expect(cmds.indexOf("input_mute")).toBeLessThan(cmds.indexOf("list_audio_input_devices"));
+  });
+
+  test("a Mute / unmute glyph sends what its omen says", async ({ page, consoleErrors }) => {
+    // Bound in Settings, as a user would.
+    await nav(page, "Settings").click();
+    const triangle = settingsSection(page, "Glyph casting")
+      .locator(".panel > div")
+      .filter({ has: page.getByText("Triangle", { exact: true }) });
+    const kind = triangle.locator("button.select").first();
+    await kind.click();
+    await triangle.getByRole("option").filter({ hasText: "Mute / unmute" }).click();
+    await expect(kind).toContainText("Mute / unmute");
+    expect(
+      await page.evaluate(
+        () => JSON.parse(localStorage.getItem("divora.glyphBindings") ?? "{}").triangle,
+      ),
+    ).toEqual({ kind: "mute" });
+
+    // The omen says Mute, and the cast sends Mute; then Unmute.
+    await mixerReady(page);
+    await traceTriangle(page);
+    await expectMuted(page);
+    expect(await muteWrites(page)).toEqual([SET_TRUE]);
+    await traceTriangle(page);
+    await expectUnmuted(page);
+    expect(await muteWrites(page)).toEqual([SET_TRUE, SET_FALSE]);
+    expect(await mockMute(page)).toEqual({ muted: false, seq: 2 });
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("Settings: Mute your voice binds a hotkey, which the boot registers again", async ({
+    page,
+  }) => {
+    await nav(page, "Settings").click();
+    const rows = settingsSection(page, "Hotkeys").locator(".panel > div");
+    const row = rows.filter({ has: page.getByText("Mute your voice", { exact: true }) });
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText(
+      "Mutes or unmutes your voice for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.",
+    );
+    // Right after Toggle monitor, whose row no longer says "mute".
+    const labels = (await rows.allInnerTexts()).map((t) => t.split("\n")[0]);
+    expect(labels).toContain("Toggle monitor");
+    expect(labels.indexOf("Mute your voice")).toBe(labels.indexOf("Toggle monitor") + 1);
+    const monitor = rows.filter({ has: page.getByText("Toggle monitor", { exact: true }) });
+    await expect(monitor).toContainText("the call included");
+    await expect(monitor).not.toContainText(/mute/i);
+
+    // Unbound until set.
+    await row.getByRole("button", { name: "Click to set" }).click();
+    await page.keyboard.press("F8");
+    const bound = { cmd: "register_global_shortcut", args: { id: "mute", accelerator: "F8" } };
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    expect(
+      await page.evaluate(
+        () => JSON.parse(localStorage.getItem("divora.hotkeyBindings") ?? "{}").mute,
+      ),
+    ).toBe("F8");
+    await expect(row.getByRole("button", { name: "Clear Mute your voice hotkey" })).toBeVisible();
+
+    // A restart registers it again from what was saved.
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    // Binding it sends no mute.
+    expect(await muteWrites(page)).toEqual([]);
+  });
+
+  test("Settings: a MIDI mapping can be Mute your voice; a learned pad toggles it", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Settings").click();
+    // The MIDI listener is up once the boot has listed the ports.
+    await expect.poll(async () => (await invokesOf(page, "list_midi_inputs")).length).toBeGreaterThan(0);
+    const surfaces = settingsSection(page, "Control surfaces");
+    await expect(surfaces).toContainText(
+      "Mute your voice toggles on a pad. On a knob, fader or CC button it mutes when the control goes past halfway and unmutes when it comes back a little below halfway (59 or less); a control that stays on one side never changes it, except that its first move after launch (or after you pick the device or change its mapping) mutes if it is past halfway.",
+    );
+
+    await surfaces.getByRole("button", { name: "Add mapping" }).click();
+    const action = surfaces.locator("button.select", { hasText: "Summon preset" });
+    await action.click();
+    await surfaces.getByRole("option").filter({ hasText: "Mute your voice" }).click();
+    await expect(surfaces.locator("button.select", { hasText: "Mute your voice" })).toBeVisible();
+
+    // Learn a pad: the message that teaches it isn't routed.
+    await surfaces.getByRole("button", { name: "Learn" }).click();
+    await midi(page, "note-on", 36, 100);
+    await expect(surfaces.getByRole("button", { name: "Learn" })).toBeVisible();
+    expect(
+      await page.evaluate(() => JSON.parse(localStorage.getItem("divora.midiMappings") ?? "[]")),
+    ).toMatchObject([{ action: "mute", trigger: { kind: "note", data1: 36, channel: 0 } }]);
+    expect(await muteWrites(page)).toEqual([]);
+
+    // The pad toggles in the backend, on note-on only.
+    await midi(page, "note-on", 36, 100);
+    await expect(pill(page)).toHaveText("Muted");
+    await midi(page, "note-off", 36, 0);
+    expect(await muteWrites(page)).toEqual([TOGGLE]);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("MIDI: a pad toggles; a CC mutes and unmutes only when it crosses", async ({ page }) => {
+    await page.evaluate(() =>
+      localStorage.setItem(
+        "divora.midiMappings",
+        JSON.stringify([
+          { id: "pad", action: "mute", trigger: { kind: "note", data1: 36, channel: 0 } },
+          { id: "fader", action: "mute", trigger: { kind: "cc", data1: 7, channel: 0 } },
+        ]),
+      ),
+    );
+    await page.reload();
+    await mixerReady(page);
+    await expect.poll(async () => (await invokesOf(page, "list_midi_inputs")).length).toBeGreaterThan(0);
+
+    await midi(page, "note-on", 36, 100);
+    await expectMuted(page);
+    await midi(page, "note-off", 36, 0);
+    expect(await muteWrites(page)).toEqual([TOGGLE]);
+
+    // The fader's first message after load, resting low: nothing.
+    await midi(page, "control-change", 7, 0);
+    expect(await muteWrites(page)).toEqual([TOGGLE]);
+    // Pushed past halfway: Mute (already muted, so the engine keeps its seq).
+    await midi(page, "control-change", 7, 127);
+    await expect.poll(() => muteWrites(page)).toEqual([TOGGLE, SET_TRUE]);
+    expect(await mockMute(page)).toEqual({ muted: true, seq: 1 });
+    // Into the dead band (60-63): nothing; still muted. Routing is
+    // synchronous, so the command list is final when the emit returns.
+    await midi(page, "control-change", 7, 62);
+    expect(await muteWrites(page)).toEqual([TOGGLE, SET_TRUE]);
+    // Below it: Unmute.
+    await midi(page, "control-change", 7, 0);
+    await expect.poll(() => muteWrites(page)).toEqual([TOGGLE, SET_TRUE, SET_FALSE]);
+    await expectUnmuted(page);
+
+    // A hotkey mutes; the fader, resting low, is touched: it doesn't undo it.
+    await pressMuteHotkey(page);
+    await emitLevels(page, { inputMuted: true, inputMuteSeq: 3 });
+    await expectMuted(page);
+    await midi(page, "control-change", 7, 10);
+    await midi(page, "control-change", 7, 11);
+    expect(await muteWrites(page)).toEqual([TOGGLE, SET_TRUE, SET_FALSE]);
+    await expectMuted(page);
+
+    // The pad flips it back.
+    await midi(page, "note-on", 36, 100);
+    await expectUnmuted(page);
+    expect(await muteWrites(page)).toEqual([TOGGLE, SET_TRUE, SET_FALSE, TOGGLE]);
+    expect(await mockMute(page)).toEqual({ muted: false, seq: 4 });
   });
 });
 

@@ -28,6 +28,9 @@ export interface DiagSnapshot {
   cableDetected: boolean;
   /** The VB-Cable input device name (what other apps listen to), if known. */
   cableInputName: string | null;
+  /** v1.56.0: Divora's own mute was on, so no voice reached the output.
+   *  Optional: absent reads as not muted. */
+  muted?: boolean;
 }
 
 /**
@@ -73,7 +76,9 @@ export function evaluateDiagnostics(s: DiagSnapshot): DiagCheck[] {
       status: s.signalFlowing ? "pass" : "warn",
       detail: s.signalFlowing
         ? "Output level moved during the test."
-        : "No output level detected — speak into the mic and run it again (and check the chain isn't muted).",
+        : s.muted
+          ? "Your voice is muted in Divora. Unmute it, then run the test again."
+          : "No output level detected — speak into the mic and run it again (with no separate monitor device, also check the Monitor toggle is on).",
     });
   }
 

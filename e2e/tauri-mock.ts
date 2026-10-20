@@ -200,6 +200,35 @@ export async function installTauriMock(
         overlay.status = { ...overlay.status, ...patch };
         return overlay.status;
       };
+      // v1.56.0: the voice mute, as the engine's word: a change bumps `seq`,
+      // and a set to the value it already has moves nothing. Kept in
+      // sessionStorage so it survives a reload, as the engine's word does.
+      // Read only inside the handlers, once the page has an origin.
+      const MUTE_KEY = "__E2E_MUTE__";
+      const readMute = (): { muted: boolean; seq: number } => {
+        try {
+          const m = JSON.parse(sessionStorage.getItem(MUTE_KEY) ?? "null") as unknown;
+          if (
+            typeof m === "object" &&
+            m !== null &&
+            typeof (m as { muted?: unknown }).muted === "boolean" &&
+            typeof (m as { seq?: unknown }).seq === "number"
+          ) {
+            return m as { muted: boolean; seq: number };
+          }
+        } catch {
+          /* no storage: start unmuted */
+        }
+        return { muted: false, seq: 0 };
+      };
+      const setMute = (muted: boolean): { muted: boolean; seq: number } => {
+        const now = readMute();
+        if (now.muted === muted) return now;
+        const next = { muted, seq: now.seq + 1 };
+        sessionStorage.setItem(MUTE_KEY, JSON.stringify(next));
+        return next;
+      };
+
       const NOT_OPEN = "The overlay isn't open.";
       const STARTING = "The overlay is still starting. Try again in a moment.";
       const overlayLive = (): boolean =>
@@ -386,6 +415,15 @@ export async function installTauriMock(
         preset_store_path: () => "C:/mock/presets",
         list_midi_inputs: () => [],
         audio_engine_status: () => engineStatus,
+        // v1.56.0: the mute's three commands, each answering the state.
+        input_mute: () => readMute(),
+        set_input_muted: (a: any) => {
+          if (typeof a?.muted !== "boolean") {
+            throw "invalid args `muted` for command `set_input_muted`";
+          }
+          return setMute(a.muted);
+        },
+        toggle_input_muted: () => setMute(!readMute().muted),
         start_audio_engine: (a: any) => ({
           inputName: a?.inputName ?? "Mock Mic",
           outputName: a?.outputName ?? "Mock Speakers",
@@ -592,6 +630,68 @@ export async function emitOverlayStatus(
     w.__E2E_EMIT__("overlay:status", w.__E2E_OVERLAY__.status);
     return w.__E2E_OVERLAY__.status as unknown as OverlayStatus;
   }, partial);
+}
+
+/** v1.56.0: the mute as the mock engine holds it (sessionStorage
+ *  `__E2E_MUTE__`, which `input_mute`, `set_input_muted` and
+ *  `toggle_input_muted` read and write). Unset means unmuted, seq 0, as at
+ *  launch. */
+export interface MockMute {
+  muted: boolean;
+  seq: number;
+}
+
+export function mockMute(page: Page): Promise<MockMute> {
+  return page.evaluate(() => {
+    const m = JSON.parse(sessionStorage.getItem("__E2E_MUTE__") ?? "null") as {
+      muted?: unknown;
+      seq?: unknown;
+    } | null;
+    return typeof m?.muted === "boolean" && typeof m.seq === "number"
+      ? { muted: m.muted, seq: m.seq }
+      : { muted: false, seq: 0 };
+  });
+}
+
+/** v1.56.0: what the backend does on a press of the `mute` hotkey: flips the
+ *  engine's word (here, the mock's) and bumps its seq, then sends
+ *  `global-shortcut` — with no command from the page. The page hears of the
+ *  new state only from the next `audio-levels` tick (emitLevels). Returns the
+ *  word after the flip. */
+export async function pressMuteHotkey(page: Page): Promise<MockMute> {
+  const now = await mockMute(page);
+  const next = { muted: !now.muted, seq: now.seq + 1 };
+  await page.evaluate((n) => {
+    sessionStorage.setItem("__E2E_MUTE__", JSON.stringify(n));
+    const emit = (window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void })
+      .__E2E_EMIT__;
+    emit("global-shortcut", { id: "mute", accelerator: "F20", state: "pressed" });
+    emit("global-shortcut", { id: "mute", accelerator: "F20", state: "released" });
+  }, next);
+  return next;
+}
+
+/** v1.56.0: fire one `audio-levels` tick, as the backend's level emitter
+ *  does ~30 times a second: a running engine at rest, under `patch` (the
+ *  mute's pair, `inputMuted` + `inputMuteSeq`, goes here). The page only
+ *  hears it once it listens, which it does before the boot's auto-start. */
+export async function emitLevels(page: Page, patch: Record<string, unknown> = {}): Promise<void> {
+  await page.evaluate((p) => {
+    (
+      window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
+    ).__E2E_EMIT__("audio-levels", {
+      input: { rms: 0, peak: 0 },
+      output: { rms: 0, peak: 0 },
+      running: true,
+      monitoring: true,
+      dspLatencyMs: 0,
+      recording: false,
+      loudnessGainDb: 0,
+      deviceLost: false,
+      modEnv: 0,
+      ...p,
+    });
+  }, patch);
 }
 
 /** The app commands invoked so far, with their args (`__E2E_INVOKES__`),

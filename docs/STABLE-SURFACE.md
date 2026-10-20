@@ -20,6 +20,7 @@ accidental break fails CI before it ships:
 - `StreamInfo` keys — `divora-core/src/audio/engine.rs`.
 - `EngineStatus` / `LevelUpdate` / `VoiceInfo` / `OnnxRuntimeStatus` / `VoiceReadingUpdate` keys — `src-tauri/src/lib.rs`.
 - `ReadingSnapshot` keys — `divora-core/src/audio/engine.rs`.
+- `InputMute` keys — `divora-core/src/audio/engine.rs` (`input_mute_json_keys_are_frozen`; v1.56.0).
 - `TtsVoiceInfo` keys + the missing-`engine` default — `divora-core/src/tts/mod.rs`.
 - `MidiMessage` keys — `src-tauri/src/midi.rs`.
 - `ScreenRecordingUpdate` / `CaptureStatusDto` / `MonitorDto` / `DesktopSourceDto` keys and the `DivoraPlays` strings — `src-tauri/src/screen.rs` (`wire_keys_are_frozen`; v1.52.0, v1.53.0).
@@ -29,7 +30,8 @@ accidental break fails CI before it ships:
 - The `overlay:*` event names and the overlay page's three command names — the same fixture, read by `src/overlay/state.test.ts` and `status.test.ts`; `wire_fixture_matches_rust` checks the `overlay:status` name and parses the `mode` / `stage` strings (v1.55.0).
 - The overlay window's label and title and the tray's Lock id — `src-tauri/src/overlay_machine.rs` (`title_and_label_are_the_obs_contract`); every tray menu id, label and their order — `src-tauri/src/lib.rs` (`tray_entries_for_each_combination`; v1.55.0).
 - `divora.overlayScene`'s read and write rules (unknown keys, types and `src` values kept; nothing truncated) — `src/overlay/scene.test.ts` (v1.55.0).
-- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0).
+- The `mute` hotkey id: a press flips the mute; its release, `Mute` and `mute:` ids don't — `src-tauri/src/lib.rs` (`hotkey_mute_request_table`; v1.56.0).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -56,6 +58,18 @@ resolved `T` or a thrown string on the JS side.
 | `set_loudness_enabled` | `enabled: bool` | — |
 | `set_loudness_target` | `dbfs: number` | — |
 | `audio_engine_status` | — | `EngineStatus` |
+| `set_input_muted` | `muted: bool` | `InputMute`, the state after — v1.56.0. Idempotent: the same value twice moves nothing, `seq` included. Never fails, apart from ``"invalid args `muted` for command `set_input_muted`: {e}"`` (Tauri's own, for a missing or non-boolean `muted`) |
+| `toggle_input_muted` | — | `InputMute`, the state after — v1.56.0. Every call flips it, so two quick calls are two flips. Never fails |
+| `input_mute` | — | `InputMute`, the current state — v1.56.0. Only reads: the main window calls it once each time the page loads, so a reload never changes the mute |
+
+Divora's own mute of the voice (v1.56.0) — on the call, the headphone monitor
+and Divora's recordings (WAV, screen recordings and their stems, Replay).
+Soundboard clips, Speak and Critter Chatter still play. Engine-wide: it can be
+set with the engine stopped, it outlives Stop, Start and device-loss rebuilds,
+and it is never stored; every launch starts unmuted. Every change adds 1 to
+`seq`. The three commands are sync (they run on the main thread, in turn with
+each other and with the hotkey), and each is one atomic operation;
+`LevelUpdate` carries the same state on every tick.
 
 ### DSP chain
 
@@ -221,6 +235,7 @@ explainer has been seen. The tray has no item that turns Replay on.
 | `rec:<recorder>` | start / stop a recorder (prefix reserved) — v1.52.0. Defined: `rec:screen` (the screen recorder), `rec:wav` (the WAV recorder). Both unbound by default |
 | `replay:<action>` | Replay (prefix reserved) — v1.54.0. Defined: `replay:save` (save the replay), `replay:toggle` (turn Replay on / off; it works once Replay has been turned on from the Record screen card). Both unbound by default |
 | `overlay:<action>` | the stream overlay (prefix reserved) — v1.55.0. Defined: `overlay:arrange`, which switches the open overlay between Arrange and Locked. It is acted on by the backend when pressed; the frontend only shows a notice while the overlay is off or starting. Unbound by default. A different namespace from the `overlay:state` / `overlay:*` **event** names, despite the shared spelling |
+| `mute` | mute or unmute your voice (a toggle) — v1.56.0. Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. Unbound by default. The prefix `mute:` is reserved for later variants |
 
 ### Stream overlay (v1.55.0)
 
@@ -297,7 +312,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `audio-levels` | `LevelUpdate` | ~30 Hz while the app runs |
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
-| `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0) |
+| `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0). v1.56.0: each emit waits for the one before it, and after the main window loads nothing goes until it knows the mute (its `input_mute` read settles or a state arrives; at most 500 ms). The payload is unchanged: while muted, `status` is `"muted"` |
 | `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3). v1.55.0: main also re-pushes the scene on it, with `ack` null, and the overlay listens for `overlay:scene` and `overlay:status` before sending it. The backend learns ready through `overlay_handshake`, not this event |
 | `overlay:status` | `OverlayStatus` | backend → all windows, on every change of any field — v1.55.0. The same shape is returned by every command in §1 "Stream overlay" except `overlay_alive` and the two asset commands |
 | `overlay:scene` | `ScenePush` | main → overlay window, while it is open: on every scene change, on each edit main acknowledges (changed or not), and on each `overlay:ready` — v1.55.0 |
@@ -317,6 +332,9 @@ the always-on payload would carry an empty reading to every user who never
 opens the panel. And the panel's accessible summary is text: a value updating
 30 times a second is exactly what must never go near an `aria-live` region.
 `LevelUpdate` keeps meaning "meter tick" and gains no reading fields.
+v1.56.0 adds the mute to it (`inputMuted`, `inputMuteSeq`), like `monitoring`
+and `recording`: a state every window may need, cheap, and the only always-on
+channel that reaches a hidden page whoever changed it.
 
 ---
 
@@ -334,7 +352,10 @@ EngineStatus      { running, monitoring, input: Levels, output: Levels,
                     dspLatencyMs, recording, loudnessGainDb }
 LevelUpdate       { input: Levels, output: Levels, running, monitoring,
                     dspLatencyMs, recording, loudnessGainDb,
-                    deviceLost, modEnv }        // modEnv v1.46.0, 0..1
+                    deviceLost, modEnv,         // modEnv v1.46.0, 0..1
+                    inputMuted, inputMuteSeq }  // v1.56.0: the InputMute pair
+InputMute         { muted, seq }    // v1.56.0: seq counts changes since launch;
+                                    // of two states, the larger is newer
 EffectSpec        { kind: EffectKindWire, enabled, params: {string: number} }
 ReactiveConfig    { enabled, intensity, floorDb, ceilDb,           // v1.46.0
                     attackMs, holdMs, releaseMs,
@@ -357,7 +378,8 @@ ReadingMetrics    { energyDbfs, energyRangeDb, f0Hz, f0RangeSt,
                     voicedRatio, paceOps, brightnessHz }
 VoiceReadingUpdate { state, dry: ReadingMetrics, wet: ReadingMetrics,
                     words: string[], calibrated, wetBypassed,
-                    stale, ageMs }                   // wetBypassed v1.51.0
+                    stale, ageMs,                    // wetBypassed v1.51.0
+                    mutedInDivora }                  // v1.56.0
 CaptureStatus     { supported, reason (nullable), h264Encoder (nullable),
                     hardware }                       // v1.52.0
 CaptureMonitor    { id, number, x, y, width, height, primary }  // v1.52.0;
@@ -491,6 +513,13 @@ OverlayScene      { version, designSize: { w, h }, frame,
   the four are distinct on purpose: stopped, muted and quiet-but-present look
   identical at the meter, and collapsing them would let the panel go on
   describing a signal it no longer has.
+- v1.56.0: `"muted"` is also reported while Divora's own mute is on
+  (`"stopped"` still comes first); the microphone may be live then (the IN
+  meter moves). `mutedInDivora` (additive, set in the same snapshot as
+  `state`) tells the two apart; the state set stays closed.
+- The wet tap is taken after the chain, loudness and the mute (v1.56.0). While
+  muted nothing is analysed: both taps are dropped and the last reading is
+  held, as through a pause.
 - `dry` is the microphone **before any effect**; `wet` is the same voice
   **after the chain**. Soundboard / Speak / Critter Chatter audio is mixed in
   downstream of the wet tap, so it appears on neither half.
@@ -597,17 +626,17 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
-| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super" |
 | `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
 | `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |
-| `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0 |
+| `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0. Each `action` is one of `preset`, `tile`, `ptm`, `monitor`, `param` (v1.9.0), `mute` (v1.56.0: a note-on toggles. A CC acts only when it changes side: it mutes on rising to 64 or more and unmutes on falling to 59 or less; 60-63 keeps the side it was on. The side is kept per mapping, in memory only, and forgotten at launch (or a reload), when a MIDI input is picked and when that mapping changes; until it is known again, 64 or more mutes and 59 or less only records it. So a control that stays on one side never changes the mute, except that a move while its side is unknown mutes if it lands at 64 or more). An older build keeps a mapping whose kind it doesn't know and ignores it |
 | `divora.calibrated` | mic calibration completed flag (suppresses the wizard step) — v1.10.0 |
 | `divora.updateCheckEnabled` | opt-out for the in-app update check (default true) — v1.12.0 |
-| `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0 |
-| `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0 |
+| `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0. The action's `kind` is one of `preset`, `tile`, `monitor`, `mute`, `panic` |
+| `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0. The action's `kind` as in `divora.glyphBindings` |
 | `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0; plus the window's last place, all optional (`x`, `y`, `w`, `h` in physical pixels, `monitor` name, `scale` factor) — v1.51.3. A `{ bg }`-only blob still loads, and unknown keys are kept on save; plus `fit` and `hideFromRecordings` (booleans, off unless stored as `true`; `fit` counts only with the Transparent background, so a stored `fit` with Green or Magenta reads as off) — v1.55.0. While the window is fitted, the place keys keep its last unfitted place. `hideFromRecordings` is sent to the backend each time the main window loads; the backend doesn't save it |
 | `divora.overlayScene` | `{version, designSize, frame, elements[]}` — v1.55.0, the first versioned key. Each field falls back on its own (see `OverlayScene` in §3). Absent or unreadable, the scene is made from `divora.overlay`'s last window size (the circle centred, at most 440 CSS px) and first written when the overlay is next seen open (opened, or adopted after a main-window reload) or a charm is first added or removed, whichever comes first. Every stored element is kept and written back, including ones this version can't show (an unknown `type`, an unrecognised `src`, a second circle, unusable geometry); only an entry without an id and a later duplicate id are dropped. Caps apply when adding, never when reading: 64 elements, 16 shown pictures, one circle, and a budget over the distinct pictures of 200 MB of files, 16,777,216 animated px and 67,108,864 px in all. A picture file is kept while any string anywhere in the scene names it. `src` holds an asset id, never a path or URL; `version` is never lowered on write. **Never the mode**: the overlay opens Locked at every launch |
 | `divora.ttsVoice` | selected "Speak" voice id (or null) — v1.17.0: a preset id, a cloned id (v1.20.0), or a Critter Chatter `babble:*` id (v1.50.0) |
@@ -623,6 +652,19 @@ is built in the engine, lives for the length of one session, and is never
 written to disk. It is invalidated by: switching the panel on, an engine
 start/stop, a device change, and device-loss recovery — each of those rebuilds
 the session, and the baseline dies with the worker thread that held it.
+
+**The mute itself is never stored (v1.56.0)**, and neither is the side a
+mute CC was last on. Every launch starts unmuted; only the bindings above
+(`divora.hotkeyBindings`, `divora.midiMappings`, the glyph keys) are kept.
+
+> **Ruling (v1.56.0): `{kind: "mute"}` keeps its name and now mutes.** Until
+> v1.56.0 the `mute` glyph action toggled a status label only. It was
+> documented as a mute from the start (CHANGELOG v1.15.0; the Mixer's
+> "Muted · Nothing is being sent", its words until v1.56.0), so making it
+> silence the voice fulfils that meaning rather than repurposing the value. A
+> cast no longer toggles: it sends `set_input_muted` with the state its omen
+> names (Mute or Unmute, the opposite of what Divora shows). Settings now
+> calls it "Mute / unmute". No kind is renamed or removed.
 
 ---
 

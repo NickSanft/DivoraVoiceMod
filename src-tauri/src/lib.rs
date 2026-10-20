@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use divora_core::audio::{
     detect_virtual_mic as detect_virtual_mic_core, list_input_devices as list_input_devices_core,
-    list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, Levels,
+    list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, InputMute, Levels,
     ReadingSnapshot, StreamInfo, VirtualMicStatus,
 };
 use divora_core::dsp::{
@@ -82,6 +82,11 @@ struct LevelUpdate {
     /// v1.46.0: current reactive-modulation depth, 0..=1 (0 when the feature
     /// is off). Drives the live envelope meter.
     mod_env: f32,
+    /// v1.56.0: Divora's mute of the voice, engine running or not.
+    input_muted: bool,
+    /// v1.56.0: the mute's change count, read with `input_muted` in one load.
+    /// Orders ticks against command answers: the larger is newer.
+    input_mute_seq: u64,
 }
 
 /// Level shown when a window measured nothing.
@@ -134,6 +139,7 @@ impl ReadingMetrics {
 /// renders what it is handed and owns no list of its own.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // flat facts about one reading on one wire event
 struct VoiceReadingUpdate {
     /// "stopped" | "muted" | "quiet" | "speaking".
     state: ReadingState,
@@ -157,6 +163,9 @@ struct VoiceReadingUpdate {
     /// The numbers come from an earlier window, held rather than decayed.
     stale: bool,
     age_ms: u32,
+    /// v1.56.0: `state` is "muted" because of Divora's own mute (the
+    /// microphone may be live). Set in the same snapshot as `state`.
+    muted_in_divora: bool,
 }
 
 impl VoiceReadingUpdate {
@@ -179,6 +188,7 @@ impl VoiceReadingUpdate {
             calibrated: snap.reading.calibrated,
             stale: snap.stale,
             age_ms: snap.age_ms,
+            muted_in_divora: snap.muted_in_divora,
         }
     }
 }
@@ -343,6 +353,28 @@ fn set_audio_monitor(state: State<'_, AppState>, enabled: bool) {
 #[tauri::command]
 fn set_speak_monitor(state: State<'_, AppState>, enabled: bool) {
     state.engine.set_speak_monitor(enabled);
+}
+
+/// v1.56.0: mute or unmute the voice; answers the state after. Takes effect
+/// on the next buffer once the command runs (sync commands share the main
+/// thread with each other and with `WM_HOTKEY`). Idempotent.
+#[tauri::command]
+fn set_input_muted(state: State<'_, AppState>, muted: bool) -> InputMute {
+    state.engine.set_input_muted(muted).after
+}
+
+/// v1.56.0: flip the mute; answers the state after. The `mute` hotkey does
+/// this in Rust (see `global_shortcut_handler`); the frontend calls it for
+/// MIDI pads.
+#[tauri::command]
+fn toggle_input_muted(state: State<'_, AppState>) -> InputMute {
+    state.engine.toggle_input_muted().after
+}
+
+/// v1.56.0: the current mute, for the store's first read after a (re)load.
+#[tauri::command]
+fn input_mute(state: State<'_, AppState>) -> InputMute {
+    state.engine.input_mute()
 }
 
 /// v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 =
@@ -2421,6 +2453,25 @@ fn decode_or_cache(
     Ok(clip)
 }
 
+/// v1.56.0: the hotkey id the backend mutes on. The `mute:` prefix is
+/// reserved for later variants (hold-to-mute, on, off).
+const HOTKEY_MUTE: &str = "mute";
+
+/// v1.56.0: whether this shortcut event flips the mute: a press of `mute`
+/// only. Release does nothing.
+fn hotkey_mute_request(id: &str, pressed: bool) -> bool {
+    pressed && id == HOTKEY_MUTE
+}
+
+/// v1.56.0: what a shortcut event does to the mute: a press of `mute` flips
+/// it, anything else leaves it. The handler's whole mute step, so a test can
+/// run it against a real engine (the handler itself needs an `AppHandle`).
+fn mute_on_hotkey(engine: &AudioEngine, id: &str, pressed: bool) {
+    if hotkey_mute_request(id, pressed) {
+        engine.toggle_input_muted();
+    }
+}
+
 /// Handle a global-shortcut event by looking up the registration id
 /// from the shared state and emitting a `global-shortcut` Tauri event
 /// the frontend can react to.
@@ -2440,6 +2491,10 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
         // `WM_HOTKEY`, while the press's right to the foreground is fresh.
         // The event still goes out (the frontend only shows a notice).
         overlay_windows::hotkey(app, &id, event.state == ShortcutState::Pressed);
+        // v1.56.0: the mute hotkey is acted on here too, so it works while
+        // the page is hidden, reloading or busy. The frontend ignores the
+        // event (acting there would flip it twice).
+        mute_on_hotkey(&state.engine, &id, event.state == ShortcutState::Pressed);
         let state_str = match event.state {
             ShortcutState::Pressed => "pressed",
             ShortcutState::Released => "released",
@@ -2453,6 +2508,25 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
     }
 }
 
+/// One `audio-levels` tick's payload. Extracted so a test runs the emitter's
+/// real builder. The mute is one load, so its two fields always agree.
+fn level_update(engine: &AudioEngine) -> LevelUpdate {
+    let mute = engine.input_mute();
+    LevelUpdate {
+        input: engine.input_levels(),
+        output: engine.output_levels(),
+        running: engine.is_running(),
+        monitoring: engine.is_monitoring(),
+        dsp_latency_ms: engine.dsp_latency_ms(),
+        recording: engine.is_recording(),
+        loudness_gain_db: engine.loudness_gain_db(),
+        device_lost: engine.device_recovery_failed(),
+        mod_env: engine.reactive_depth(),
+        input_muted: mute.muted,
+        input_mute_seq: mute.seq,
+    }
+}
+
 /// Spawn a background thread that emits `audio-levels` events to the
 /// frontend at ~30 Hz. The frontend uses these to drive live meters
 /// and the status pill without polling commands.
@@ -2461,17 +2535,7 @@ fn spawn_level_emitter(app: AppHandle, engine: Arc<AudioEngine>) {
         .name("divora-level-emitter".into())
         .spawn(move || loop {
             std::thread::sleep(Duration::from_millis(33));
-            let payload = LevelUpdate {
-                input: engine.input_levels(),
-                output: engine.output_levels(),
-                running: engine.is_running(),
-                monitoring: engine.is_monitoring(),
-                dsp_latency_ms: engine.dsp_latency_ms(),
-                recording: engine.is_recording(),
-                loudness_gain_db: engine.loudness_gain_db(),
-                device_lost: engine.device_recovery_failed(),
-                mod_env: engine.reactive_depth(),
-            };
+            let payload = level_update(&engine);
             if app.emit("audio-levels", &payload).is_err() {
                 // App is shutting down (no receivers / window gone).
                 break;
@@ -3009,6 +3073,9 @@ pub fn run() {
             stop_audio_engine,
             set_audio_monitor,
             set_speak_monitor,
+            set_input_muted,
+            toggle_input_muted,
+            input_mute,
             set_monitor_gain,
             set_loudness_enabled,
             set_loudness_target,
@@ -3096,14 +3163,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloned_voices_dir, default_clone_base, emit_speak, hides_on_close, is_safe_voice_id,
-        list_cloned_voice_infos, load_cloned_voice, preview_path_in, read_preview,
-        rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
-        unique_preset_id, write_preview, ClonedMeta, EngineStatus, LevelUpdate, Levels,
-        OnnxRuntimeStatus, SpeakClip, VoiceInfo, VoiceReadingUpdate, MAX_CLONE_NAME_LEN,
-        PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
+        cloned_voices_dir, default_clone_base, emit_speak, hides_on_close, hotkey_mute_request,
+        is_safe_voice_id, level_update, list_cloned_voice_infos, load_cloned_voice, mute_on_hotkey,
+        preview_path_in, read_preview, rename_cloned_voice_in, save_tts_clip, scan_voice_dir,
+        slugify_preset_id, speak_commands, unique_preset_id, write_preview, ClonedMeta,
+        EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
+        VoiceReadingUpdate, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
+        PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
     };
-    use divora_core::audio::ReadingSnapshot;
+    use divora_core::audio::{AudioEngine, InputMute, ReadingSnapshot};
     use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
     use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
     use divora_core::tts::babble;
@@ -3302,6 +3370,8 @@ mod tests {
             loudness_gain_db: 0.0,
             device_lost: false,
             mod_env: 0.0,
+            input_muted: false,
+            input_mute_seq: 0,
         };
         assert_eq!(
             sorted_keys(&serde_json::to_value(&u).unwrap()),
@@ -3309,6 +3379,9 @@ mod tests {
                 "deviceLost",
                 "dspLatencyMs",
                 "input",
+                // v1.56.0: the mute and its change count.
+                "inputMuteSeq",
+                "inputMuted",
                 "loudnessGainDb",
                 "modEnv",
                 "monitoring",
@@ -3356,6 +3429,7 @@ mod tests {
                             },
                             stale,
                             age_ms: 0,
+                            muted_in_divora: false,
                         };
                         let u = VoiceReadingUpdate::from_snapshot(&snap);
                         assert!(
@@ -3384,6 +3458,8 @@ mod tests {
                 "ageMs",
                 "calibrated",
                 "dry",
+                // v1.56.0: "muted" because of Divora's own mute.
+                "mutedInDivora",
                 "stale",
                 "state",
                 "wet",
@@ -3407,6 +3483,115 @@ mod tests {
                 "paceOps",
                 "voicedRatio"
             ]
+        );
+    }
+
+    /// v1.56.0: the tick is built by the emitter's own builder, and carries
+    /// the engine's mute with its change count, engine running or not.
+    #[test]
+    fn the_level_tick_carries_the_mute() {
+        let engine = AudioEngine::new();
+        let tick = level_update(&engine);
+        assert!(!tick.input_muted && tick.input_mute_seq == 0);
+        engine.set_input_muted(true);
+        let tick = level_update(&engine);
+        assert!(tick.input_muted && tick.input_mute_seq == 1);
+        engine.toggle_input_muted();
+        let tick = level_update(&engine);
+        assert!(!tick.input_muted && tick.input_mute_seq == 2);
+        // Under the names the frontend reads.
+        let v = serde_json::to_value(&tick).unwrap();
+        assert_eq!(v["inputMuted"], false);
+        assert_eq!(v["inputMuteSeq"], 2);
+    }
+
+    /// v1.56.0: "Muted in Divora" crosses the bridge on the same snapshot as
+    /// the state it explains, both ways.
+    #[test]
+    fn the_reading_update_carries_muted_in_divora() {
+        for muted_in_divora in [false, true] {
+            let mut snap = ReadingSnapshot::idle(ReadingState::Muted);
+            snap.muted_in_divora = muted_in_divora;
+            let u = VoiceReadingUpdate::from_snapshot(&snap);
+            assert_eq!(u.muted_in_divora, muted_in_divora);
+            let v = serde_json::to_value(&u).unwrap();
+            assert_eq!(v["mutedInDivora"], muted_in_divora);
+            assert_eq!(v["state"], "muted");
+        }
+    }
+
+    /// v1.56.0: only a press of `mute` flips the mute. Its release, other
+    /// ids and the reserved `mute:` prefix do nothing.
+    #[test]
+    fn hotkey_mute_request_table() {
+        assert!(hotkey_mute_request("mute", true));
+        assert!(!hotkey_mute_request("mute", false));
+        for id in ["Mute", "mute:hold", "monitor", "sb:mute", ""] {
+            assert!(!hotkey_mute_request(id, true), "{id:?} pressed");
+            assert!(!hotkey_mute_request(id, false), "{id:?} released");
+        }
+    }
+
+    /// v1.56.0: the handler's mute step, against a real engine: a press of
+    /// `mute` flips the mute and counts, its release and other ids don't.
+    #[test]
+    fn the_mute_hotkey_flips_the_engine_on_press_only() {
+        let engine = AudioEngine::new();
+        let st = |muted, seq| InputMute { muted, seq };
+        mute_on_hotkey(&engine, "mute", true);
+        assert_eq!(engine.input_mute(), st(true, 1));
+        mute_on_hotkey(&engine, "mute", false);
+        assert_eq!(engine.input_mute(), st(true, 1), "a release flipped it");
+        for id in ["Mute", "mute:hold", "monitor", "sb:mute", ""] {
+            mute_on_hotkey(&engine, id, true);
+            mute_on_hotkey(&engine, id, false);
+        }
+        assert_eq!(engine.input_mute(), st(true, 1), "another id flipped it");
+        mute_on_hotkey(&engine, "mute", true);
+        assert_eq!(engine.input_mute(), st(false, 2));
+    }
+
+    /// v1.56.0: the shortcut handler needs an `AppHandle`, so no test can run
+    /// it; this reads the source instead, like engine.rs's callback needles.
+    /// The handler passes the event's real press state to the mute step, and
+    /// doesn't touch the mute any other way. Needles are split by `concat!`
+    /// so they can't match themselves.
+    #[test]
+    fn the_shortcut_handler_runs_the_mute_hotkey() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let head = prod
+            .find(concat!("fn global_shortcut", "_handler("))
+            .expect("the handler");
+        let open = head + prod[head..].find('{').expect("its body");
+        let mut depth = 0_usize;
+        let close = prod[open..]
+            .char_indices()
+            .find_map(|(i, c)| {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(open + i)
+            })
+            .expect("its body closes");
+        let handler = &prod[open..=close];
+        let call = concat!(
+            "mute_on_hotkey(&state.engine, &id, ",
+            "event.state == ShortcutState::Pressed);"
+        );
+        assert_eq!(
+            handler.matches(call).count(),
+            1,
+            "the handler must run the mute step once, with the press state"
+        );
+        assert!(
+            !handler.contains(concat!("_input", "_muted(")),
+            "the handler must not touch the mute any other way"
         );
     }
 
@@ -3464,6 +3649,7 @@ mod tests {
             },
             stale: false,
             age_ms: 0,
+            muted_in_divora: false,
         };
         let u = VoiceReadingUpdate::from_snapshot(&snap);
         assert_eq!(u.words.len(), MAX_DESCRIPTORS);

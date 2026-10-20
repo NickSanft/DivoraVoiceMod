@@ -192,6 +192,14 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
   const [refreshing, setRefreshing] = createSignal(false);
   const inputCount = () => app.audioInputs().length;
   const outputCount = () => app.audioOutputs().length;
+  // v1.56.0: the engine's rule (engine.rs, Phase 13): a monitor device only
+  // counts when it isn't the main output. With none, the Monitor toggle
+  // gates the main output itself (`main_output_plays`), so the note below
+  // must not say it never touches the send.
+  const separateMonitor = (): boolean => {
+    const monitor = app.selectedMonitor();
+    return !!monitor && monitor !== app.selectedOutput();
+  };
   const statusLabel = () => {
     if (app.engineError()) return `Error: ${app.engineError()}`;
     if (app.engineRunning()) {
@@ -374,9 +382,11 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
           >
             Pick a second device (e.g. your headphones) to hear yourself
             while the main output routes elsewhere — set Output to CABLE
-            Input for Discord/games and Monitor to your headphones. The
-            Monitor toggle below mutes only this device, never the main
-            send. Soundboard clips play here too.
+            Input for Discord/games and Monitor to your headphones.
+            Soundboard clips play here too.{" "}
+            {separateMonitor()
+              ? "The Monitor toggle below turns your voice on or off on this device only, never on the main send. Clips and Speak here follow the Monitor checkbox on Speak."
+              : "With no separate monitor device, the Monitor toggle below turns Divora's whole output on or off, the call included."}
           </div>
         </FieldRow>
 
@@ -431,7 +441,9 @@ function AudioDevicesSection(props: AudioDevicesProps): JSX.Element {
               Monitor (hear yourself in headphones)
             </div>
             <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "margin-top": "2px" }}>
-              When off, the engine still meters but the output device is silent.
+              When off, you stop hearing yourself; the engine keeps metering
+              your mic. With no separate monitor device, Divora's whole output
+              is silent, the call included.
             </div>
           </div>
           <Toggle
@@ -1170,8 +1182,18 @@ const HOTKEY_ROWS: HotkeyRowDef[] = [
   {
     action: "monitor",
     label: "Toggle monitor",
-    desc: "Mute / unmute the headphone sidetone without stopping the engine.",
+    // v1.56.0: never "mute" here, beside the real mute. With no monitor
+    // device the toggle gates the whole output, so it says so.
+    desc: "Turns hearing yourself on or off. With no separate monitor device, it turns Divora's whole output on or off, the call included.",
     icon: "monitor",
+  },
+  // v1.56.0. The backend acts on this key itself (a toggle on press), so it
+  // works while Divora is hidden.
+  {
+    action: "mute",
+    label: "Mute your voice",
+    desc: "Mutes or unmutes your voice for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.",
+    icon: "muted",
   },
   {
     action: "rec:screen",
@@ -1325,6 +1347,8 @@ const MIDI_ACTIONS: { value: MidiActionKind; label: string }[] = [
   { value: "ptm", label: "Hold push-to-modulate" },
   { value: "monitor", label: "Toggle monitor" },
   { value: "param", label: "Sweep effect param" },
+  // v1.56.0: a pad toggles; a CC acts when it crosses (see the intro).
+  { value: "mute", label: "Mute your voice" },
 ];
 
 interface ParamOption {
@@ -1438,7 +1462,12 @@ function ControlSurfacesSection(): JSX.Element {
           Bind a MIDI controller's pads and knobs to DivoraVoice. Pick your
           device, add a mapping, then click <strong>Learn</strong> and move a
           pad or knob to capture it. Mappings are saved locally and restored on
-          the next launch.
+          the next launch. <strong>Mute your voice</strong> toggles on a pad.
+          On a knob, fader or CC button it mutes when the control goes past
+          halfway and unmutes when it comes back a little below halfway (59
+          or less); a control that stays on one side never changes it,
+          except that its first move after launch (or after you pick the
+          device or change its mapping) mutes if it is past halfway.
         </p>
 
         <FieldRow label="MIDI input">
@@ -1601,10 +1630,11 @@ function ControlSurfacesSection(): JSX.Element {
             <p style={{ "font-size": "var(--t-xs)", color: "var(--text-mid)", margin: 0 }}>
               No plugin needed. In the Stream Deck app, add a <strong>Hotkey</strong>{" "}
               action to a button and set it to the same key you bound under{" "}
-              <strong>Settings → Hotkeys</strong> (push-to-modulate, panic, or
-              toggle monitor) or to a per-tile soundboard hotkey. The button then
-              fires DivoraVoice's existing global shortcut — even while a game or
-              Discord is focused.
+              <strong>Settings → Hotkeys</strong> (for example{" "}
+              <strong>Mute your voice</strong>, panic or a recorder) or to a
+              per-tile soundboard hotkey. The button then fires DivoraVoice's
+              existing global shortcut — even while a game or Discord is
+              focused.
             </p>
           </div>
         </Card>
@@ -1692,7 +1722,8 @@ const GLYPH_ACTION_KINDS: SelectOption[] = [
   { value: "preset", label: "Preset" },
   { value: "tile", label: "Clip" },
   { value: "monitor", label: "Monitor" },
-  { value: "mute", label: "Mute" },
+  // v1.56.0: really mutes now, and still flips it.
+  { value: "mute", label: "Mute / unmute" },
   { value: "panic", label: "Panic" },
 ];
 

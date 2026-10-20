@@ -10,7 +10,7 @@
 // We exercise the latter two paths directly. Focus refresh is covered
 // in `App.test.tsx`.
 
-import { fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { fireEvent, render, waitFor, within } from "@solidjs/testing-library";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeCalls: Array<{ cmd: string; args?: unknown }> = [];
@@ -18,6 +18,8 @@ const invokeCalls: Array<{ cmd: string; args?: unknown }> = [];
 // store registered, so a test can send it a status.
 let overlayReply: unknown = null;
 const eventHandlers = new Map<string, Array<(e: { payload: unknown }) => void>>();
+// v1.56.0: the output devices the backend lists (none unless a test says).
+let outputDevices: unknown[] = [];
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
@@ -26,7 +28,7 @@ vi.mock("@tauri-apps/api/core", () => ({
       case "list_audio_input_devices":
         return [];
       case "list_audio_output_devices":
-        return [];
+        return outputDevices;
       case "audio_engine_status":
         return {
           running: false,
@@ -70,6 +72,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   })),
 }));
 
+import { muteCcStep } from "../data/mute";
 import { AppProvider } from "../stores/app";
 import { SettingsScreen } from "./SettingsScreen";
 
@@ -83,6 +86,10 @@ function mount() {
 }
 
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+beforeEach(() => {
+  outputDevices = [];
+});
 
 describe("SettingsScreen — audio device refresh (v0.11.4)", () => {
   it("re-enumerates audio devices on mount", async () => {
@@ -346,5 +353,158 @@ describe("SettingsScreen — Stream overlay (v1.55.0)", () => {
     expect(view.getByText("Arrange or lock the overlay")).toBeInTheDocument();
     expect(view.getByText("Switches the overlay between Arrange and Locked while it's open.")).toBeInTheDocument();
     expect(view.getAllByText(/Stream overlay/i)).toHaveLength(1);
+  });
+});
+
+// v1.56.0: the mute's rows and the words around it. Mute is your voice
+// everywhere Divora sends it; Monitor is whether your headphones get a copy
+// (with no monitor device, Divora's whole output).
+describe("SettingsScreen — the mute (v1.56.0)", () => {
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  const squash = (s: string | null | undefined): string => (s ?? "").replace(/\s+/g, " ").trim();
+  const MUTE_DESC =
+    "Mutes or unmutes your voice for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.";
+  const MONITOR_DESC =
+    "Turns hearing yourself on or off. With no separate monitor device, it turns Divora's whole output on or off, the call included.";
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    overlayReply = null;
+    invokeCalls.length = 0;
+  });
+
+  it("the Mute your voice hotkey row follows Toggle monitor and names headphones and recordings", async () => {
+    const view = mount();
+    await flush();
+    const desc = view.getByText(MUTE_DESC);
+    expect(desc.textContent).toContain("headphones");
+    expect(desc.textContent).toContain("recordings");
+    expect(desc.previousElementSibling?.textContent).toBe("Mute your voice");
+    // Right after Toggle monitor, before the recorders.
+    const rows = desc.closest("section")!.textContent ?? "";
+    const at = rows.indexOf(MUTE_DESC);
+    expect(rows.indexOf(MONITOR_DESC)).toBeGreaterThan(-1);
+    expect(rows.indexOf(MONITOR_DESC)).toBeLessThan(at);
+    expect(rows.indexOf("Record screen")).toBeGreaterThan(at);
+  });
+
+  it("the row is bound to the mute hotkey", async () => {
+    window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ mute: "F20" }));
+    const view = mount();
+    await flush();
+    fireEvent.click(view.getByRole("button", { name: "Clear Mute your voice hotkey" }));
+    await flush();
+    expect(invokeCalls.filter((c) => c.cmd === "unregister_global_shortcut").map((c) => c.args)).toEqual([
+      { id: "mute" },
+    ]);
+  });
+
+  it("the Monitor row says what Monitor does, and never 'mute'", async () => {
+    const view = mount();
+    await flush();
+    const desc = view.getByText(MONITOR_DESC);
+    expect(desc.textContent).toContain("the call included");
+    expect(desc.textContent).not.toMatch(/mute/i);
+    expect(view.queryByText(/headphone sidetone/i)).toBeNull();
+    expect(squash(document.body.textContent)).not.toContain("mutes only this device");
+  });
+
+  it("the monitor-device note says what the Monitor toggle does with the device picked", async () => {
+    const SEPARATE =
+      "The Monitor toggle below turns your voice on or off on this device only, never on the main send. Clips and Speak here follow the Monitor checkbox on Speak.";
+    const NONE =
+      "With no separate monitor device, the Monitor toggle below turns Divora's whole output on or off, the call included.";
+    outputDevices = [
+      { name: "CABLE Input", isDefault: true, defaultSampleRate: 48000, channels: 2 },
+      { name: "Headphones", isDefault: false, defaultSampleRate: 48000, channels: 2 },
+    ];
+    const view = mount();
+    await flush();
+    const note = view.getByText(/Pick a second device/);
+    const field = note.parentElement!;
+    const pickMonitor = async (name: RegExp) => {
+      fireEvent.click(field.querySelector("button.select")!);
+      fireEvent.click(within(field).getByRole("option", { name }));
+      await flush();
+    };
+
+    // None (the default): the toggle gates the main output, the call included.
+    expect(squash(note.textContent)).toContain(NONE);
+    expect(squash(note.textContent)).not.toContain(SEPARATE);
+
+    // A second device: the toggle gates only your voice on it.
+    await pickMonitor(/Headphones/);
+    expect(squash(note.textContent)).toContain(SEPARATE);
+    expect(squash(note.textContent)).not.toContain(NONE);
+
+    // The main output picked again as the monitor: the engine skips it, so
+    // there is no separate monitor device.
+    await pickMonitor(/CABLE Input/);
+    expect(squash(note.textContent)).toContain(NONE);
+
+    await pickMonitor(/None/);
+    expect(squash(note.textContent)).toContain(NONE);
+  });
+
+  it("MIDI: a Mute your voice mapping, and the intro says how a pad and a CC act", async () => {
+    window.localStorage.setItem(
+      "divora.midiMappings",
+      JSON.stringify([{ id: "m1", action: "preset", trigger: { kind: "cc", data1: 7, channel: 0 } }]),
+    );
+    const view = mount();
+    await flush();
+    const section = view.getByText("Control surfaces").closest("section")!;
+    expect(squash(section.textContent)).toContain(
+      "Mute your voice toggles on a pad. On a knob, fader or CC button it mutes when the control goes past halfway and unmutes when it comes back a little below halfway (59 or less); a control that stays on one side never changes it, except that its first move after launch (or after you pick the device or change its mapping) mutes if it is past halfway.",
+    );
+    // The sentence against the rule it describes (data/mute.ts). Its first
+    // move mutes past halfway and does nothing below it...
+    expect(muteCcStep(undefined, 100).act).toBe(true);
+    expect(muteCcStep(undefined, 10).act).toBeNull();
+    // ...then staying on a side never acts, and crossing does.
+    expect(muteCcStep(true, 100).act).toBeNull();
+    expect(muteCcStep(false, 10).act).toBeNull();
+    expect(muteCcStep(false, 100).act).toBe(true);
+    expect(muteCcStep(true, 10).act).toBe(false);
+    // "A little below halfway (59 or less)": 60..63 is below halfway and
+    // still keeps it muted.
+    expect(muteCcStep(true, 63).act).toBeNull();
+    expect(muteCcStep(true, 60).act).toBeNull();
+    expect(muteCcStep(true, 59).act).toBe(false);
+
+    // Pick it from the action list: the mapping is saved as kind "mute".
+    fireEvent.click(view.getByText("Summon preset"));
+    fireEvent.click(view.getByRole("option", { name: /Mute your voice/ }));
+    await flush();
+    const saved = JSON.parse(window.localStorage.getItem("divora.midiMappings") ?? "[]") as Array<{
+      action: string;
+    }>;
+    expect(saved.map((m) => m.action)).toEqual(["mute"]);
+    const shown = Array.from(section.querySelectorAll(".select-main")).map((e) => e.textContent);
+    expect(shown).toContain("Mute your voice");
+  });
+
+  it("the glyph option reads Mute / unmute", async () => {
+    window.localStorage.setItem("divora.glyphBindings", JSON.stringify({ triangle: { kind: "mute" } }));
+    const view = mount();
+    await flush();
+    const section = view.getByText("Glyph casting").closest("section")!;
+    const shown = Array.from(section.querySelectorAll(".select-main")).map((e) => e.textContent);
+    expect(shown).toContain("Mute / unmute");
+  });
+
+  it("the Stream Deck card names Mute your voice", async () => {
+    const view = mount();
+    await flush();
+    const card = view.getByText("Using a Stream Deck").closest(".card");
+    expect(card).not.toBeNull();
+    const text = squash(card!.textContent);
+    expect(text).toContain(
+      "the same key you bound under Settings → Hotkeys (for example Mute your voice, panic or a recorder) or to a per-tile soundboard hotkey.",
+    );
+    expect(text).not.toMatch(/push-to-modulate/i);
   });
 });

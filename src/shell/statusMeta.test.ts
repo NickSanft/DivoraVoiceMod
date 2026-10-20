@@ -22,4 +22,10 @@ describe("statusMeta", () => {
     expect(m.sigil).toBe("muted");
     expect(m.color).toContain("danger");
   });
+
+  // v1.56.0: Mute silences the voice only; "Nothing is being sent" was false
+  // while a clip played.
+  it("says the voice is off and clips still play while muted", () => {
+    expect(statusMeta("muted").sub).toBe("Your voice is off · clips and Speak still play");
+  });
 });

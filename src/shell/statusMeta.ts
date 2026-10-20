@@ -19,7 +19,8 @@ export interface StatusMeta {
 const META: Record<VoiceStatus, StatusMeta> = {
   muted: {
     label: "Muted",
-    sub: "Nothing is being sent",
+    // v1.56.0: the voice really is off; clips and Speak still reach the call.
+    sub: "Your voice is off · clips and Speak still play",
     sigil: "muted",
     color: "var(--danger)",
     line: "rgba(242, 86, 122, 0.3)",

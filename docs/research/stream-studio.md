@@ -29,7 +29,7 @@ The owner asked whether DivoraVoice can:
 - **Recording.** A new workspace crate, `divora-capture`, drives Windows Graphics Capture (WGC) and Media Foundation through the `windows` 0.61 crate Tauri already compiles. That means no new crate versions, no sidecar, no GPL, and H.264/AAC from Windows' own codecs. The voice comes from new rings beside the WAV tap. Game and Discord audio follow in the very next release.
 - **Replay.** It reuses the same capture and the same encoder. The encoded video and the mixed audio sit in a ring in memory, and nothing is written to disk until you press Save.
 - **Pictures and GIFs.** These extend the existing overlay window with an **Arrange / Locked** mode pair, designed around Tauri's whole-window-only click-through.
-- **Timers.** They get a Rust-owned clock: the main window hides to the tray, where WebView2 throttles JS timers. Once a *real* mic mute exists, timers also get end-of-timer voice actions, which no OBS plugin, Stream Deck timer or Streamer.bot action offers. Examples: "Villager voice for five minutes", "BRB mutes the mic".
+- **Timers.** They get a Rust-owned clock: the main window hides to the tray, where WebView2 throttles JS timers. Once a *real* voice mute exists (v1.56.0), timers also get end-of-timer voice actions, which no OBS plugin, Stream Deck timer or Streamer.bot action offers. Examples: "Villager voice for five minutes", "BRB mutes your voice".
 - **OBS control.** It is opt-in and off by default, through a small client Divora owns. Timer text goes straight into an OBS text source, a break switches OBS to a BRB scene and back, and an uptime clock follows OBS going live. Divora never starts or stops your stream.
 
 **The honest cost:**
@@ -97,7 +97,7 @@ Every correction is folded in below. The refuted claims and what replaced them a
 docs/ARCHITECTURE.md has no overlay section.
 
 **The WAV recorder (Phase 16).** How the tap works:
-- **Where and what:** the output callback pushes `&mono[..span]` into an 8192-frame SPSC ring while `state.recording` is set (divora-core/src/audio/engine.rs:1769-1771). That signal is post-chain, post-loudness mono at the **input** device's rate. Soundboard voices are folded in just before (engine.rs:1759-1762).
+- **Where and what:** the output callback pushes `&mono[..span]` into an 8192-frame SPSC ring while `state.recording` is set (divora-core/src/audio/engine.rs:2038-2040 in v1.56.0). That signal is post-chain, post-loudness mono at the **input** device's rate. Soundboard voices are folded in just before (engine.rs:2029-2031 in v1.56.0).
 - **Silent drops:** `push_slice`'s return value is discarded with `let _ =`, so a full ring drops audio silently.
 - **Writer:** a per-session thread writes 16-bit mono WAV.
 - **Session end:** rings and writers die with the engine session, and nothing restores a take after a device-loss rebuild.
@@ -106,9 +106,9 @@ docs/ARCHITECTURE.md has no overlay section.
 Nothing in the app captures video, encodes, or opens a loopback stream.
 
 **Actions and mute.**
-- **Hotkey ids** are flat strings: `ptm | panic | monitor` (app.tsx:217), plus the dynamic `sb:<clipId>` prefix.
-- **MIDI kinds** are `preset | tile | ptm | monitor | param` (src/types.ts:183).
-- **The glyph `mute` action** toggles a **cosmetic** flag (`setUi("muted", !ui.muted)`, app.tsx:906) that only changes the status pill. **No code path silences the microphone.**
+- **Hotkey ids** are flat strings: `ptm | panic | monitor` (the `HotkeyAction` type, app.tsx:293-302 in v1.56.0, which has since gained more), plus the dynamic `sb:<clipId>` prefix.
+- **MIDI kinds** are `preset | tile | ptm | monitor | param` (src/types.ts:185 in v1.56.0, which adds `mute`).
+- **The glyph `mute` action** toggles a **cosmetic** flag (`setUi("muted", !ui.muted)`) that only changes the status pill. **No code path silences the microphone.** (v1.56.0 makes it a real mute of Divora's voice: app.tsx:1103-1107.)
 - **Lost bindings:** PTM/panic/monitor bindings are not persisted, although App.tsx and ARCHITECTURE.md say they are.
 - **Windows key:** HotkeyCapture emits `"Win"`, which global-hotkey 0.8.0 rejects; it accepts `Super`.
 - **No hotkey-id section:** STABLE-SURFACE.md has none, not even for `sb:`.
@@ -140,10 +140,10 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
 - **`divora-core`** keeps its contract and gains:
   - **two new rings** at the tap site. **Voice** carries `mono` *before* the soundboard fold; **soundboard** carries `sb`. Each gets its own latency correction;
   - a preallocated **side ring** of `(StreamInstant, span, cushion occupancy)` per callback;
-  - an `AtomicU64` **drop counter** and an `input_muted` flag;
+  - an `AtomicU64` **drop counter**, and the mute: one `AtomicU64` word, `input_mute` (`seq << 1 | muted`, v1.56.0);
   - a **drain thread** whose sender lives *outside* the engine session, so a device-loss rebuild re-attaches it rather than silencing the rest of the take.
 - **`divora-capture`** is a new workspace member with no tauri or cpal dependency.
-  - **Unsafe scope:** its FFI modules are the only production `#[allow(unsafe_code)]` scope in the tree, each with a justification and `// SAFETY:` comments.
+  - **Unsafe scope:** its FFI modules are the tree's only production FFI `unsafe`, each with a justification and `// SAFETY:` comments. The one other production `#[allow(unsafe_code)]` is `divora-core`'s `audio::denormals` (v1.56.0), an `asm!` block that sets FTZ and DAZ on the audio thread.
   - **Modules:** `probe`, `monitors`, `wgc`, `encoder`, `mux`, `replay`, `loopback` and `ffi::dpapi`. The pure, CI-tested pieces are `FramePacer`, `ClockFit`, `AudioTimeline` and `ReplayRing`.
   - **`CapturePipeline`:** fans encoded packets out to `PacketSink` consumers. These are the take's muxer and the replay ring.
   - **Runtime-only Media Foundation:** `mfplat.dll`/`mfreadwrite.dll` are loaded with `LoadLibraryExW(…SYSTEM32)` + `GetProcAddress` for every MF free function used. COM methods are vtable calls and import nothing. A static import would stop `divora-app.exe` from launching at all on Windows N editions, where it launches today.
@@ -154,7 +154,7 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
 
   Recorder, replay and OBS commands are `async`. Tauri 2 runs sync commands on the main thread, which every window shares.
 
-**Threads.** The cpal callbacks keep their rules. Per buffer, the new work is two ring pushes, one side-ring push, one `fetch_add` and one atomic load, all lock-free and allocation-free.
+**Threads.** The cpal callbacks keep their rules. Per buffer, the new work is two ring pushes, one side-ring push, one `fetch_add`, one atomic load and (v1.56.0) setting FTZ and DAZ in MXCSR, all lock-free and allocation-free.
 - **`divora-av-tap` (5 ms):** forwards chunks over a bounded channel.
 - **`divora-encoder` (MTA COM):** owns the D3D11 device, frame pool, video processor, H.264 MFT and fan-out. It lives one per take in v1.52.0 and becomes one per pipeline in v1.54.0. WGC's FrameArrived only signals it.
 - **`divora-replay-save`:** short-lived, one per save. It muxes a snapshot so capture never waits on disk.
@@ -182,7 +182,7 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
         │                                           │
         ▼                                           ▼
  divora-capture (NEW; windows 0.61;            divora-core (callback contract unchanged)
- the only production unsafe scope)             ├─ output callback: + voice ring, + sb ring,
+ the tree's only FFI unsafe scope)             ├─ output callback: + voice ring, + sb ring,
  ├─ probe   (LoadLibrary mfplat → MFStartup    │    + (StreamInstant, span, cushion) side ring,
  │           → MFTEnumEx; build ≥ 18362)       │    + dropped fetch_add, + input_muted load
  ├─ wgc     (CreateForMonitor, 2-buffer pool)  ├─ thread divora-av-tap (5 ms) ──AvChunk──┐
@@ -733,6 +733,53 @@ The same holds after two hours armed.
 
 **Done when.** A Stream Deck key mutes the call while a clip stays audible, and unmuting does not click.
 
+**As built (2026-10-20).**
+- **The real-app run (S2),** on this machine (Windows 11 Pro 26200, i7-14700K), in one debug build of the `mute` branch (`72ee4e3`), driven over WebView2's DevTools protocol, the mute commands sent from the page through the real IPC except R7 (real `WM_HOTKEY`, from `SendInput`) and R9 (CDP clicks on the real button). The engine was silent: the Focusrite in at 48 kHz, the Realtek speakers out with Monitor off and no monitor device, nothing played into the cable. The voice was a 440 Hz tone (660 Hz for R4) at −30 dBFS on the SMSL (owner-approved, ≤ 30 s a phase), which the Focusrite heard at only about −73 to −80 dBFS: the analyser's automatic edge finding failed in R1–R4, and the lead measured those recordings directly. What it settled:
+  - **R1, the call's audio** (the send's WAV, a 1 kHz −20 dBFS clip playing, 10 toggles 2.5 s apart): mute works and the clip is untouched — the tone at −79.8 to −81.0 dBFS unmuted and −168.9 to −269.3 dBFS muted (≥ 88 dB down; the line was 70 dB), the clip at −20.0 dBFS in every stretch.
+  - **R3, the voice alone:** every muted stretch 100 % exact-zero samples (5 of 5); silence began 0–11 ms after each command was sent.
+  - **R2, the click:** supporting evidence only. With room noise as the signal, the 256 samples before silence were 0.38–0.94× (mean ≈ 0.63) the steady RMS, near a 256-sample linear fade's 0.58 and well below a hard cut's 1.0; at unmute 0.38–0.81×. The planned second-difference measure couldn't run on so weak a tone; the strict bound is the unit tests' (`no_step_larger_than_the_slope`, `the_send_is_a_pure_linear_ramp`).
+  - **R4, speech said while muted, through an echo:** not measurable here. The trial passed, but its positive control failed (the burst reached the mic too weakly to make a measurable echo), so it proves nothing. Covered by `what_is_said_while_muted_never_reaches_the_send`, which fails with the starve switched off.
+  - **R5, a take across two restarts:** the voice stem exactly 0.0 from 2.05 s (mute at 2.006 s) to 6.80 s (unmute at 6.79 s), straight through both restarts, from the lead's 50 ms map of the stem (the analyser's window was misaligned). The take kept recording; its `audioLostAt` at 5.03 s, cleared by the end, is the recorder's restart behaviour, not the mute.
+  - **R6, Replay:** the tone 68.8 dB down in the saved clip's muted stretch (the line was 50 dB).
+  - **R7, the real hotkey** (Ctrl+Alt+Shift+F24 four times by `SendInput`, about 480 ms apart, the overlay open): seq 72 → 76, +1 per press, never +2; each press in its own tick 12–25 ms later; the pill and the overlay's circle Muted, Clean, Muted, Clean. The hide-to-tray step left main visible, so "while hidden to the tray" is not shown.
+  - **R8, a reload while muted:** the engine kept its seq, so the boot neither unmuted nor toggled it; the overlay received only "muted"; the pill read Clean at 51 ms and Muted at 174 ms. "`input_mute` before device enumeration" rests on the e2e and unit tests: the harness's IPC log didn't survive the reload.
+  - **R9, 40 clicks 0–32 ms apart:** one `set_input_muted` per click, each sending what its label said; every animation frame showed the newest state received before the previous frame.
+  - **R10, the real commands:** `{muted:true}` twice → `{true, 67}` both times (seq unchanged the second time), `{muted:false}` → `{false, 68}`, `input_mute` → `{false, 68}`; ticks agreed within 6–23 ms.
+  - **B1, a long mute's CPU** (not in the app: the release-mode bench `a_long_mute_costs_at_most_twice_speech_or_a_pause`, the voice stage alone on a test thread that flushes as the callback does; every bundled preset, loudness on, 180 s muted against 10 s of a 220 Hz tone standing in for speech and 180 s of −70 dBFS room tone): all 24 pass with the flush below, the last 10 s muted at 0.68–0.99× max(speech, pause), against a bar of 2×; without it 21 of 24 fail, at up to 15.9× max(speech, pause).
+- **Differences from the deliverables above** (the design's D1–D23):
+  - **D1:** the plan's "after loudness, before the soundboard fold" is not one point: four consumers sit between them — the reading's wet tap, the screen recorder's tap, the monitor's copy of the voice and, with no monitor device, the previews mixed into it. The mute sits at the earliest, inside `mix_voice_and_soundboard` right after `loudness.process` and before the soundboard renders, so every recorder matches the send and the soundboard and the previews are untouched.
+  - **D2:** the chain's input is starved too (`feed`, before the modulator). Zeroing after loudness alone keeps the effects on the live mic, and at unmute they release what they held of words said while muted: up to about 256 ms from Voice Convert, seconds from an echo.
+  - **D3, D4:** one position on a two-segment linear path. Muting closes the send over L, then the chain's input over L; unmuting opens them in the other order; a toggle mid-fade turns round. L is the power of two at or above 5 ms, 64 to 2048: 256 at 44.1 and 48 kHz, as planned, but 512 at 88.2 and 96 kHz, 1024 at 176.4 and 192 kHz, 128 at 16 to 24 kHz and 64 at 8 to 12 kHz. A gain of 0 writes `+0.0`, a gain of 1 leaves the sample alone. The cost, stated in the CHANGELOG (owner Q10): what the chain still holds at the press is cut with the send — about a quarter-second with Voice Convert, 10–21 ms with a denoiser, pitch or formant effect.
+  - **D6–D9:** the state is one engine-lifetime `AtomicU64`, `seq << 1 | muted`, not an `AtomicBool`; every change bumps `seq`, a set to the value it has doesn't. The setters are direct atomic ops, never the command channel, so a mute isn't queued behind a Start or a device-loss rebuild on the engine thread. The commands and the hotkey's `WM_HOTKEY` run on the main thread, though, so they wait while `start_audio_engine`, a sync command, holds it opening a device. Never stored; every launch starts unmuted; each session's gate starts at the word.
+  - **D10:** `toggle_input_muted` and an `input_mute` read beside the plan's `set_input_muted`. Labelled controls (the Mixer button, the glyph by its omen, a MIDI CC) set the state they name; unlabelled triggers (the hotkey, a pad) toggle. The store keeps a read-only mirror, the largest `seq` from answers, ticks and one read at creation; `UiState.muted` is gone.
+  - **D11:** the hotkey is acted on in Rust (`mute_on_hotkey`, inside `global_shortcut_handler`), on press only; JS ignores the event. `mute:` is reserved.
+  - **D12:** a MIDI CC acts on crossings — 64 or more mutes, 59 or less unmutes, 60–63 keeps the side — so a fader resting low can't undo a hotkey mute and a knob near halfway doesn't flap. The first message after load acts only when up; a mapping's side is forgotten when it changes and, for every mapping, when the MIDI input is picked. A pad toggles.
+  - **D17:** `set_input_muted` doesn't drive the reading's mute: the reading worker reads the word once per pass and stamps `mutedInDivora` on the snapshot it publishes, and the panel keys **Muted in Divora** off that, not the store's mirror. `set_reading_muted` stays the device fact, with no caller.
+  - **D18:** `LevelUpdate` carries `inputMuteSeq` beside `inputMuted`, on every tick.
+  - **D19–D21:** the pill loud and static, with a polite live region for the mute's edges only; a **Mute** / **Unmute** button on the Mixer that sends what its label says (D20); copy that names the call, your headphones and recordings, never "microphone", and Monitor's copy corrected for a single output.
+  - **D22:** the allocation test covers the voice stage, not the callback (Voice Convert's inference still allocates).
+  - **D23:** the overlay's `overlay:state` pushes are chained one at a time, and held until the store knows the mute (500 ms at most).
+  - **The tray left out** (D14, owner): no item or tooltip.
+  - **K16, not in the plan: subnormals.** A long mute feeds the chain exact zeros, and its recursive states decay into subnormal floats; B1 found 21 of 24 presets at 2–16× the CPU of speech or a pause. The design's contingency, feeding the starved chain an alternating ±1e-18, was tried and reverted: the noise gate 23 of the 24 presets start with took it down 60 dB, and loudness's `x * x` average and the STFT magnitudes squared that under the normal range. Instead the output callback sets FTZ|DAZ in MXCSR first thing, every buffer (`divora-core/src/audio/denormals.rs`, x86-64 only, a no-op elsewhere): `divora-core`'s first production `unsafe`, an `asm!` block of `stmxcsr`, `or` and `ldmxcsr`. Rust formally treats a changed float environment as undefined behaviour; the expected effect is that a float the compiler folded at build time can keep a subnormal that the thread would flush. `feed` writes exact `+0.0` again.
+- **Owner decisions** (2026-10-20):
+  - your voice goes silent in the headphone monitor too; clips and Speak still play there (Q1, D16);
+  - push-to-modulate, which is cosmetic as well, gets its own small release right after this one, before Hourglass; v1.56.0 claims nothing about it (Q6);
+  - nothing new shows the mute while Divora is hidden: no tray item or tooltip (Q2);
+  - S2's 440/660 Hz tone at −30 dBFS on the SMSL (never the cable, up to 30 s a phase) and Ctrl+Alt+Shift+F24 sent four times by `SendInput` (Q8, Q9);
+  - at the design's defaults: CCs act on crossings (Q3); hold-to-mute and separate on and off keys later (Q4); the mute never remembered (Q5); the Voice Convert cut accepted and stated (Q10). Q7's default, a toast when Windows refuses a hotkey, was not built (follow-ups).
+- **Found by the code review and the bench, and fixed before S2:** the subnormals (above); the Mixer's button kept focus after a mouse click, so Space, the in-app push-to-modulate key, pressed it again (a pointer click now blurs it; a keyboard click keeps focus); a mute CC kept its side across a change of MIDI input, so a fader resting low could undo a hotkey mute; the monitor-device note was wrong with no monitor device (it now says what Monitor does with and without a separate one), and the MIDI intro overclaimed what a CC does on its first move (it now says its first move after launch, a device pick or a mapping change mutes if it is past halfway). Two tests were tightened: the needle pins the gate's construction outside the callback's closure, and the hotkey's mute step (`mute_on_hotkey`) runs against a real engine, with a needle that the handler passes it the real press state.
+- **Done when** rests on M1 (a Stream Deck key in a real Discord call, a clip heard while muted, no click at unmute), not run yet; R1 and R7 stand in for parts of it.
+- **Not measured** (S2's gaps; the owner checks M1–M9 in MANUAL_TESTS → Mute haven't been run yet): real speech, and a voice as loud as speech at the mic — the click (R2's room-noise evidence only) and the echo leak (R4) rest on unit tests; the hotkey while hidden to the tray (R7's hide step didn't take) and a Stream Deck **Hotkey** action (M1); the headphone monitor (M2); MIDI (M3); a glyph (M4); a real unplug (M5; R5's rebuilds were direct restarts); Voice Convert (no model loaded) and its end-of-word cut (M6, M6b); Voice reading in the app (M7); Test my setup's muted message in the app; screen readers (M8); the light theme (M9); a game; OBS's own mic source; the far end of a Discord call (no call was live); a Bluetooth or high-rate device (only 48 kHz ran) and the device signal after the resampler when the rates differ (the WAV is taken before it); the overlay's Muted on the stream with main hidden; a mute held for minutes in the real app (B1 covers the CPU only); a take's MP4 audio (R5 measured its voice stem); Space after a mouse click on the Mixer's button, and the button from the keyboard; B1 on other CPUs; Windows 10.
+- **Follow-ups:**
+  - **Push-to-modulate's own release, next.** The release order changes: it comes before Hourglass (v1.57.0 below). Push-to-modulate is cosmetic too: its key changes the status, not the sound, so the pill can say Clean while the call hears the preset. What still claims a bypass: the app's own copy (Settings → Hotkeys: "Hold to apply the chain. Lifts back to clean."; the Mixer's Push to modulate card: Hold to apply / Hold to bypass, APPLYING / BYPASSED), README.md's feature list, MANUAL_TESTS' Voice reading check "Push-to-modulate with the key up" and its Hotkeys survive a restart check ("the voice modulates"), and comments in `dsp/reading.rs`, `dsp/reading/analyzer.rs` and `examples/voice_reading.rs` (this release corrected engine.rs's).
+  - **Keep the last words at the press** (K17): needs `VoiceConverter::latency_samples` to report its downsampler's chunk (about 256 ms, not the 13 ms it reports for the shipped streaming model), which also moves the latency readout and the take timeline's compensation; then the send's close can wait for the chain's real delay.
+  - **Hotkey conflicts and refusals** (K4, Q7): a hotkey Windows refuses looks bound but does nothing (it is only logged); a toast for the row being set when its register fails.
+  - **`mute:hold` / `mute:on` / `mute:off`** (Q4), under the reserved prefix.
+  - **A tray mute,** a tooltip (about 2 hours, no menu change) or an item (about half a day, a frozen-menu change), if the owner wants one (Q2); it fits v1.58.0's BRB.
+  - **v1.58.0's "restore what it was"** needs a compare-and-set on the word inside `AudioEngine` (no wire change); the setters already return `MuteChange {before, after}`.
+  - **A latching MIDI button out of step** after another surface changed the mute (one dead press): a "pickup" mode if owners ask.
+  - **The flush is x86-64 only,** and B1 has run on this machine's CPU only.
+
 ### v1.57.0 — Hourglass: countdowns and stream clocks on a hotkey (5–7 days)
 
 **Goal.** A countdown *and* a count-up (stream uptime is the most common stream timer), each on hotkeys so Stream Deck works unchanged. Both are visible on the overlay and in an OBS text source while the main window is hidden to the tray.
@@ -768,7 +815,7 @@ The same holds after two hours armed.
    - `revertPreset` and `randomPreset`;
    - `speak {text, voiceId}`;
    - **`saveReplay`**, from v1.54.0;
-   - an **idempotent `setMuted {muted}`**. The glyph mute toggles, which would *unmute* an already-muted mic on BRB.
+   - an **idempotent `setMuted {muted}`**. The glyph mute toggles, which would *unmute* an already-muted voice on BRB.
 2. **Hooks and dispatch:** timers gain `onStart`/`onFire`, all dispatched by one generalised `dispatchAction`.
 3. **Where actions run.**
    - **Rust timer thread:** mute, unmute, panic and saveReplay. Rust-side panic emits `soundboard:stopped` so the store clears its playing clips.
@@ -825,7 +872,7 @@ The protocol Divora needs is small and frozen: rpcVersion 1, unchanged since 202
    - **While disconnected:** operations are dropped, never replayed.
    - **Engine:** the audio engine and `divora-core` are untouched.
 5. **The password.**
-   - **Storage:** `obs_set_password` encrypts it with DPAPI `CryptProtectData` (current user, `CRYPTPROTECT_UI_FORBIDDEN`, a fixed app entropy) into `app_data_dir()/obs/password.bin`, via temp file + rename. The FFI lives in `divora-capture::ffi::dpapi` (`Win32_Security_Cryptography`), so the tree keeps one production unsafe scope.
+   - **Storage:** `obs_set_password` encrypts it with DPAPI `CryptProtectData` (current user, `CRYPTPROTECT_UI_FORBIDDEN`, a fixed app entropy) into `app_data_dir()/obs/password.bin`, via temp file + rename. The FFI lives in `divora-capture::ffi::dpapi` (`Win32_Security_Cryptography`), so the tree keeps its FFI in one unsafe scope.
    - **Use:** it is decrypted only inside a handshake, and wiped with `zeroize` as soon as the auth string exists.
    - **Where it never appears:** localStorage, a log line, an event payload, a command result or a store signal. The password field is cleared after Save or Forget.
    - **A blob that will not decrypt** (after a profile reset) shows *"Re-enter your OBS password."*
@@ -902,8 +949,8 @@ The protocol Divora needs is small and frozen: rpcVersion 1, unchanged since 202
 
 **Done when.** A screen recording against OBS 32.2.2 on this machine shows:
 1. Settings → OBS switched on and the password pasted; the status reads Connected.
-2. A 1:00 Break: OBS switches to the BRB scene, the mic is muted, and the mapped text source tracks the overlay within ±0.5 s.
-3. End now: the mic unmutes and OBS returns to the previous scene.
+2. A 1:00 Break: OBS switches to the BRB scene, your voice is muted, and the mapped text source tracks the overlay within ±0.5 s.
+3. End now: your voice unmutes and OBS returns to the previous scene.
 4. Recording started in OBS: the uptime Hourglass starts within 1 s, and stops when recording stops.
 5. OBS quit and reopened: Divora reconnects within 40 s, untouched.
 6. A wrong password: the status reads "OBS rejected the password", after one attempt, not a storm.

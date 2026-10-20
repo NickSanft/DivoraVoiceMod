@@ -2,13 +2,13 @@
 //
 // Pure mapping layer: given an incoming MIDI message and the user's
 // mappings, dispatch to the existing store actions. Deliberately free of
-// any Tauri / SolidJS coupling so it unit-tests in isolation — App.tsx
-// binds the handlers to the live store (usePreset / playTileById / PTM /
-// monitor / setChainParam).
+// any Tauri / SolidJS coupling so it unit-tests in isolation — the store
+// binds the handlers to its live actions (usePreset / playTileById / PTM /
+// monitor / setChainParam / the mute).
 
 import type { MidiMapping, MidiMessage, MidiTrigger } from "../types";
 
-/** The existing store actions a mapping can drive. App.tsx supplies the
+/** The existing store actions a mapping can drive. The store supplies the
  *  live implementations; tests supply spies. */
 export interface MidiHandlers {
   usePreset: (presetId: string) => void;
@@ -16,6 +16,11 @@ export interface MidiHandlers {
   setPtm: (pressed: boolean) => void;
   toggleMonitor: () => void;
   setParam: (effectIndex: number, key: string, value: number) => void;
+  /** v1.56.0: a note on a `mute` mapping flips the mute. */
+  toggleMuted: () => void;
+  /** v1.56.0: every CC on a `mute` mapping, with the mapping's id. The store
+   *  keeps the side each mapping is on and acts only when it crosses. */
+  muteCc: (mappingId: string, value: number) => void;
 }
 
 /** The trigger a `midi-message` would match (kind + data1), or null when
@@ -87,6 +92,13 @@ export function routeMidi(
         ) {
           h.setParam(m.effectIndex, m.paramKey, scaleCc(msg.data2, m.min, m.max));
         }
+        break;
+      case "mute":
+        // v1.56.0: a pad toggles on note-on (note-off does nothing). A CC
+        // goes to the store with every value: whether it crossed needs the
+        // side it was on, and the router keeps no state.
+        if (msg.kind === "note-on") h.toggleMuted();
+        else if (msg.kind === "control-change") h.muteCc(m.id, msg.data2);
         break;
     }
   }

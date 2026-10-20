@@ -4,9 +4,10 @@
 // `data-tauri-drag-region` attribute (which Tauri 2 wires up natively
 // for frameless windows).
 
-import { Show, type JSX } from "solid-js";
+import { createEffect, createSignal, Show, type JSX } from "solid-js";
 import { DMark } from "../components/DMark";
 import { Sigil } from "../components/Sigil";
+import { muteAnnouncement } from "../data/mute";
 import { chipLabel, chipTitle, replayOn } from "../data/replay";
 import { useApp } from "../stores/app";
 import { statusMeta } from "./statusMeta";
@@ -36,6 +37,13 @@ export function Titlebar(): JSX.Element {
   // The kept screen's number, once the screens are known.
   const replayScreen = (): number | null =>
     app.captureMonitors().find((m) => m.id === app.replayStatus().monitorId)?.number ?? null;
+  // v1.56.0: the announcer stays silent until this page has seen a mute, so
+  // a launch never says "unmuted".
+  const [everMuted, setEverMuted] = createSignal(false);
+  createEffect(() => {
+    if (app.muted()) setEverMuted(true);
+  });
+  const isMuted = (): boolean => app.status() === "muted";
 
   return (
     <div
@@ -56,7 +64,18 @@ export function Titlebar(): JSX.Element {
       <DMark size={20} radius={6} />
       <span class="titlebar-wordmark">DivoraVoice</span>
       <span class="titlebar-divider" />
-      <span class="titlebar-status">
+      {/* v1.56.0: loud while muted, and static: no state animates but
+          "modulated"'s dot. Not clickable — the bar is a drag region; the
+          Mixer's button mutes. */}
+      <span
+        class={`titlebar-status${isMuted() ? " is-muted" : ""}`}
+        data-testid="titlebar-status"
+        title={
+          isMuted()
+            ? "Your voice is muted for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play."
+            : undefined
+        }
+      >
         <span
           class="titlebar-status-dot"
           style={{
@@ -131,6 +150,12 @@ export function Titlebar(): JSX.Element {
           <Sigil name="x" size={13} />
         </button>
       </div>
+      {/* v1.56.0: speaks the mute's edges only, never the pill (that would
+          speak every push-to-modulate press). Always mounted: a region
+          inserted together with its text is commonly missed. */}
+      <span class="sr-only" role="status" aria-live="polite" data-testid="mute-announcer">
+        {muteAnnouncement(app.muted(), everMuted())}
+      </span>
     </div>
   );
 }

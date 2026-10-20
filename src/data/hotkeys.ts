@@ -20,7 +20,9 @@ import type { HotkeyAction } from "../stores/app";
  *  v1.52.0 adds the two recorders, under the reserved `rec:` prefix; v1.54.0
  *  adds Replay under its own `replay:` prefix, since `rec:` means "start /
  *  stop a recorder" and a save is neither. v1.55.0 adds the stream overlay's
- *  Arrange / Lock switch under `overlay:`, which the backend acts on itself. */
+ *  Arrange / Lock switch under `overlay:`, which the backend acts on itself.
+ *  v1.56.0 adds `mute`, which the backend also acts on itself; the `mute:`
+ *  prefix is reserved for later variants. */
 export const HOTKEY_ACTIONS: readonly HotkeyAction[] = [
   "ptm",
   "panic",
@@ -30,6 +32,7 @@ export const HOTKEY_ACTIONS: readonly HotkeyAction[] = [
   "replay:save",
   "replay:toggle",
   "overlay:arrange",
+  "mute",
 ];
 
 /** Every action unbound: the default, and what a missing key reads as. */

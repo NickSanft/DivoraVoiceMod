@@ -37,6 +37,9 @@ import {
   saveUserPreset,
   scanSoundboardFolder,
   setAudioMonitor,
+  setInputMuted,
+  toggleInputMuted,
+  inputMute,
   setEffectChain,
   setEffectEnabled,
   setEffectParam,
@@ -158,6 +161,28 @@ describe("audio api", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await setAudioMonitor(true);
     expect(invokeMock).toHaveBeenCalledWith("set_audio_monitor", { enabled: true });
+  });
+
+  // v1.56.0: the mute's three commands, each answering the state.
+  it("setInputMuted invokes set_input_muted with the value and returns the answer", async () => {
+    invokeMock.mockResolvedValueOnce({ muted: true, seq: 1 });
+    const answer = await setInputMuted(true);
+    expect(invokeMock).toHaveBeenCalledWith("set_input_muted", { muted: true });
+    expect(answer).toEqual({ muted: true, seq: 1 });
+  });
+
+  it("toggleInputMuted invokes toggle_input_muted and returns the answer", async () => {
+    invokeMock.mockResolvedValueOnce({ muted: false, seq: 2 });
+    const answer = await toggleInputMuted();
+    expect(invokeMock).toHaveBeenCalledWith("toggle_input_muted");
+    expect(answer).toEqual({ muted: false, seq: 2 });
+  });
+
+  it("inputMute invokes input_mute and returns the answer", async () => {
+    invokeMock.mockResolvedValueOnce({ muted: true, seq: 4 });
+    const answer = await inputMute();
+    expect(invokeMock).toHaveBeenCalledWith("input_mute");
+    expect(answer).toEqual({ muted: true, seq: 4 });
   });
 
   it("getEngineStatus invokes audio_engine_status", async () => {

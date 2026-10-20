@@ -85,6 +85,9 @@ import {
   setVoiceReadingEnabled as setVoiceReadingEnabledCmd,
   getVoiceReading as getVoiceReadingCmd,
   subscribeVoiceReading,
+  setInputMuted as setInputMutedCmd,
+  toggleInputMuted as toggleInputMutedCmd,
+  inputMute as inputMuteCmd,
   screenCaptureStatus as screenCaptureStatusCmd,
   listCaptureMonitors as listCaptureMonitorsCmd,
   listDesktopAudioSources as listDesktopAudioSourcesCmd,
@@ -123,6 +126,7 @@ import {
   unregisterGlobalShortcut as unregisterGlobalShortcutCmd,
   type DeviceInfo,
   type EffectSpec,
+  type InputMute,
   type Levels,
   type MidiInputInfo,
   type MidiMessage,
@@ -204,6 +208,7 @@ import {
   unboundHotkeys,
 } from "../data/hotkeys";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
+import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
   AbSlot,
@@ -267,7 +272,6 @@ export const BUILTIN_GLYPHS: GlyphId[] = [
 ];
 
 const defaultUi = (): UiState => ({
-  muted: false,
   monitor: true,
   ab: "A",
   ptmMode: "apply",
@@ -284,7 +288,8 @@ export interface AbSnapshots {
 /** Stable id used for the system-wide hotkeys we register. v1.52.0 adds the
  *  recorders, under the reserved `rec:` prefix; v1.54.0 adds Replay's save
  *  and on/off, under `replay:`; v1.55.0 the stream overlay's Arrange / Lock
- *  switch, under `overlay:`. */
+ *  switch, under `overlay:`. v1.56.0 adds `mute`, which the backend acts on
+ *  itself (a toggle on press); the `mute:` prefix is reserved. */
 export type HotkeyAction =
   | "ptm"
   | "panic"
@@ -293,7 +298,8 @@ export type HotkeyAction =
   | "rec:wav"
   | "replay:save"
   | "replay:toggle"
-  | "overlay:arrange";
+  | "overlay:arrange"
+  | "mute";
 
 /** localStorage keys for Phase 8 persistence (tile metadata + recent folders). */
 /** Reactive intensity is a 0..100 percentage everywhere in the UI. */
@@ -975,6 +981,24 @@ export interface AppState {
   selectedEffect: () => EffectId | null;
   setSelectedEffect: Setter<EffectId | null>;
 
+  // Divora's mute of the voice (v1.56.0). The engine owns it; the store
+  // keeps a read-only mirror, ordered by `seq`.
+  /** The mirror: true while muted. False until the state is known. */
+  muted: () => boolean;
+  /** The newest state seen (largest `seq`), or null before any. */
+  muteState: () => InputMute | null;
+  /** True once the boot read settled, any state was adopted, or 500 ms
+   *  passed, so nothing that waits on it can wait for ever. */
+  muteKnown: () => boolean;
+  /** The mirror's only writer: takes `incoming` only if it is newer. */
+  applyMuteState: (incoming: InputMute | null) => void;
+  /** Sends `set_input_muted` and adopts the answer. For controls with a
+   *  label: they send what the label says. */
+  setMuted: (on: boolean) => Promise<void>;
+  /** Sends `toggle_input_muted` and adopts the answer. For triggers with no
+   *  label (a MIDI pad). */
+  toggleMuted: () => Promise<void>;
+
   // Derived
   hasEnabled: () => boolean;
   effectiveModulated: () => boolean;
@@ -1077,7 +1101,9 @@ export function createAppState(): AppState {
         void toggleMonitor();
         break;
       case "mute":
-        setUi("muted", !ui.muted);
+        // v1.56.0: really mutes. Sends the opposite of the mirror, so the
+        // cast does what its omen said.
+        void setMuted(!muted());
         break;
       case "panic":
         void panicSoundboard();
@@ -1107,7 +1133,10 @@ export function createAppState(): AppState {
       case "monitor":
         return { color: GLYPH_ACCENT, label: "Monitor", action };
       case "mute":
-        return { color: GLYPH_ACCENT, label: "Mute", action };
+        // v1.56.0: the omen names what the cast will send, read from the
+        // same mirror `dispatchGlyphAction` reads (SparkLayer resolves and
+        // runs in one go), so the two can't disagree.
+        return { color: GLYPH_ACCENT, label: muted() ? "Unmute" : "Mute", action };
       case "panic":
         return { color: GLYPH_ACCENT, label: "Panic", action };
     }
@@ -1824,12 +1853,57 @@ export function createAppState(): AppState {
   );
   const viewedChain = createMemo<ChainEntry[]>(() => chains[viewedId()] ?? []);
 
+  // v1.56.0: Divora's mute of the voice. The engine's word is the only
+  // truth; this is a read-only mirror of it. Command answers, the boot read
+  // and level ticks can land in any order, so the mirror keeps the state with
+  // the largest `seq` and ignores older ones.
+  const [muteState, setMuteState] = createSignal<InputMute | null>(null);
+  const [muteKnown, setMuteKnown] = createSignal(false);
+  const muted = createMemo(() => muteState()?.muted === true);
+  const applyMuteState = (incoming: InputMute | null): void => {
+    const next = adoptMute(muteState(), incoming);
+    if (next !== muteState()) setMuteState(next);
+    if (next !== null) setMuteKnown(true);
+  };
+  // Neither command can fail in the app; outside Tauri (or a mock without
+  // them) the click changes nothing.
+  const setMuted = async (on: boolean): Promise<void> => {
+    try {
+      applyMuteState(readInputMute(await setInputMutedCmd(on)));
+    } catch (e) {
+      console.warn("[mute] set_input_muted failed:", e);
+    }
+  };
+  const toggleMuted = async (): Promise<void> => {
+    try {
+      applyMuteState(readInputMute(await toggleInputMutedCmd()));
+    } catch (e) {
+      console.warn("[mute] toggle_input_muted failed:", e);
+    }
+  };
+  // The boot read. Sent here, at creation, so it goes out before App's
+  // onMount enumerates devices (sync commands that hold the main thread),
+  // and a reload during a mute shows it in one round trip. It only reads:
+  // a reload must never unmute the call. `muteKnown` comes true when it
+  // settles, or after 500 ms if it never does.
+  const muteKnownTimer = setTimeout(() => setMuteKnown(true), 500);
+  void (async () => {
+    try {
+      applyMuteState(readInputMute(await inputMuteCmd()));
+    } catch {
+      /* browser preview without the Tauri bridge */
+    } finally {
+      setMuteKnown(true);
+    }
+  })();
+  onCleanup(() => clearTimeout(muteKnownTimer));
+
   const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
   const effectiveModulated = createMemo(() =>
     ui.ptmMode === "apply" ? ui.pressed : !ui.pressed,
   );
   const status = createMemo<VoiceStatus>(() =>
-    ui.muted ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
+    muted() ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
   );
 
   // v1.54.0: when the voice last became modulated with the current preset,
@@ -2800,7 +2874,16 @@ export function createAppState(): AppState {
     }
   };
 
+  // v1.56.0: the side (up or down) each `mute` CC mapping was last on, by
+  // mapping id, so a CC acts only when it crosses. Not persisted: the first
+  // message after load acts only when it is up. A mapping that changes or
+  // goes forgets its side, and every mapping forgets it when the input is
+  // picked: the same CC number on another device (or on this one, moved
+  // while closed) is a control we haven't heard yet.
+  const muteCcSides = new Map<string, boolean>();
+
   const selectMidiInput = async (name: string | null): Promise<void> => {
+    muteCcSides.clear();
     setSelectedMidiInput(name);
     saveJson(STORAGE_KEYS.midiInput, name);
     try {
@@ -2823,6 +2906,7 @@ export function createAppState(): AppState {
   };
 
   const updateMidiMapping = (id: string, patch: Partial<MidiMapping>): void => {
+    muteCcSides.delete(id);
     persistMidiMappings(
       midiMappings().map((m) => (m.id === id ? { ...m, ...patch } : m)),
     );
@@ -2830,6 +2914,7 @@ export function createAppState(): AppState {
 
   const removeMidiMapping = (id: string): void => {
     if (midiLearnId() === id) setMidiLearnIdRaw(null);
+    muteCcSides.delete(id);
     persistMidiMappings(midiMappings().filter((m) => m.id !== id));
   };
 
@@ -2844,6 +2929,15 @@ export function createAppState(): AppState {
     setPtm: (pressed) => setUi("pressed", pressed),
     toggleMonitor: () => void toggleMonitor(),
     setParam: (idx, key, value) => setChainParam(idx, key, value),
+    // v1.56.0: a pad has no label, so it toggles in the backend. A CC sets
+    // the side it crossed to; no dedupe against the mirror (it can lag a
+    // tick, and the backend's set is idempotent).
+    toggleMuted: () => void toggleMuted(),
+    muteCc: (id, value) => {
+      const step = muteCcStep(muteCcSides.get(id), value);
+      if (step.up !== undefined) muteCcSides.set(id, step.up);
+      if (step.act !== null) void setMuted(step.act);
+    },
   };
 
   const handleMidiMessage = (msg: MidiMessage): void => {
@@ -3050,6 +3144,7 @@ export function createAppState(): AppState {
         signalFlowing,
         cableDetected: cable?.detected ?? false,
         cableInputName: cable?.cableInputDevice?.name ?? null,
+        muted: muted(),
       });
       setDiagnostics(result);
       return result;
@@ -3877,6 +3972,13 @@ export function createAppState(): AppState {
 
     selectedEffect,
     setSelectedEffect,
+
+    muted,
+    muteState,
+    muteKnown,
+    applyMuteState,
+    setMuted,
+    toggleMuted,
 
     hasEnabled,
     effectiveModulated,

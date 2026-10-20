@@ -23,8 +23,10 @@ use ringbuf::HeapRb;
 use serde::{Deserialize, Serialize};
 
 use super::av_tap::{av_drain_thread, av_tap, AvBuffer, AvChunk, AvControl, AvTap};
+use super::denormals;
 use super::level::LevelMeter;
 use super::loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS};
+use super::mute::{mute_ramp_len, InputMute, MuteChange, MuteGate, MuteOp};
 use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
@@ -324,6 +326,25 @@ impl AudioEngine {
         self.state.monitor_soundboard.load(Ordering::Acquire)
     }
 
+    /// v1.56.0: mute or unmute the voice everywhere Divora sends it. A direct
+    /// atomic op: takes effect on the next buffer, also mid-start, also while
+    /// stopped, from any thread. Idempotent: setting the value it has moves
+    /// nothing, `seq` included (`before == after`).
+    pub fn set_input_muted(&self, muted: bool) -> MuteChange {
+        self.state.apply_input_mute(MuteOp::Set(muted))
+    }
+
+    /// v1.56.0: flip the mute, atomically. Two quick presses are two flips.
+    pub fn toggle_input_muted(&self) -> MuteChange {
+        self.state.apply_input_mute(MuteOp::Toggle)
+    }
+
+    /// v1.56.0: the mute and its change count.
+    #[must_use]
+    pub fn input_mute(&self) -> InputMute {
+        self.state.load_input_mute()
+    }
+
     /// v1.6.0: set the gain applied to the separate monitor ("hear
     /// yourself") stream. 1.0 = unity. Clamped to a safe range. Stored in
     /// shared state and picked up by the monitor callback next buffer; no
@@ -578,12 +599,11 @@ impl AudioEngine {
         self.reading.is_enabled()
     }
 
-    /// Tell the reading the input is muted.
+    /// Tell the reading the input is muted at the device or by the OS.
     ///
-    /// A fact handed in, not a level guess — see [`ReadingFacts`]. Deliberately
-    /// NOT wired to push-to-modulate: with the key up the mic is still open
-    /// and only the chain is bypassed, so the dry reading stays valid and only
-    /// the after-effects half changes.
+    /// A fact handed in, not a level guess — see [`ReadingFacts`]. Divora's
+    /// own mute needs no call here: the reading worker reads it from
+    /// [`EngineState`] itself (v1.56.0).
     pub fn set_reading_muted(&self, muted: bool) {
         self.reading.muted.store(muted, Ordering::Release);
     }
@@ -1769,11 +1789,18 @@ fn build_output_stream(
         )?)
     };
     let mut cushion = RingCushion::default();
+    // v1.56.0: per session, but it starts where the engine-wide word is, so
+    // a Start or a rebuild while muted sends no voice at all.
+    let mut mute_gate = MuteGate::new(mute_ramp_len(input_rate), state.input_muted());
 
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                // v1.56.0: subnormals count as zero on this thread, so a
+                // chain starved by a long mute costs what a pause does (K16).
+                // cpal owns the thread, so it's set every buffer.
+                denormals::flush_to_zero();
                 if data.is_empty() || channels == 0 {
                     return;
                 }
@@ -1874,7 +1901,9 @@ fn build_output_stream(
                 // Run the DSP chain over the mic mono buffer first, so
                 // effects apply only to the user's voice; normalize the
                 // voice's loudness post-chain (steady level across presets,
-                // never clipping); then mix soundboard voices in alongside
+                // never clipping); fade the voice by the mute (v1.56.0: the
+                // chain's input too, so nothing said while muted reaches an
+                // effect); then mix soundboard voices in alongside
                 // the already-effected voice. Clips play "as-is" (no DSP,
                 // no normalization). All write into the same `mono` buffer
                 // that the resampler / fan-out consume below, so the mix
@@ -1901,6 +1930,8 @@ fn build_output_stream(
                     reading_taps.push_dry(&mono[..block]);
                 }
 
+                // v1.56.0: the mute, read once per buffer.
+                let muted = state_for_callback.input_muted();
                 mix_voice_and_soundboard(
                     &mut mono[..span],
                     &mut sb[..span],
@@ -1908,14 +1939,17 @@ fn build_output_stream(
                     &mut modulator,
                     &mut loudness,
                     &mut soundboard,
+                    &mut mute_gate,
+                    muted,
                     input_rate,
                 );
                 // Publish the makeup gain for the UI "it's working" readout.
                 state_for_callback.store_loudness_gain_db(loudness.gain_db());
                 state_for_callback.store_reactive_depth(modulator.depth());
 
-                // Voice reading, WET half — the chain's output, which is what
-                // the call hears from the mic. Taken HERE, before the
+                // Voice reading, WET half — the chain's output after loudness
+                // and the mute, which is what the call hears from the mic
+                // (zeros while muted). Taken HERE, before the
                 // soundboard is folded in below, so Speak / Critter Chatter /
                 // clip audio is on neither tap: those are mixed in after the
                 // chain and are not the user's voice.
@@ -1923,7 +1957,8 @@ fn build_output_stream(
                     reading_taps.push_wet(&mono[..block]);
                 }
 
-                // v1.52.0: the screen recorder's tap, at the same point and for
+                // v1.52.0: the screen recorder's tap, at the same point (after
+                // the mute, so a muted voice is recorded as zeros) and for
                 // the same reason — the soundboard is still in `sb`, not yet
                 // folded in, and the monitor-only previews mixed in below are
                 // not part of the call. `span`, not `block`: the recorder needs
@@ -2180,6 +2215,11 @@ fn main_output_plays(has_monitor: bool, monitoring: bool) -> bool {
 /// the caller folds `soundboard_out` back into `mono` afterwards for the main
 /// send. Effects + loudness apply only to the user's voice; clips play as-is.
 /// Extracted so the order is unit-testable in isolation.
+///
+/// v1.56.0: the mute's gate wraps the voice. `feed` fades the chain's input
+/// and `mute` fades the voice after loudness, before anything taps or sends
+/// it; the soundboard is never touched.
+#[allow(clippy::too_many_arguments)] // the voice stage's parts, in order
 fn mix_voice_and_soundboard(
     mono: &mut [f32],
     soundboard_out: &mut [f32],
@@ -2187,17 +2227,25 @@ fn mix_voice_and_soundboard(
     modulator: &mut ReactiveModulator,
     loudness: &mut LoudnessNormalizer,
     soundboard: &mut SoundboardMixer,
+    gate: &mut MuteGate,
+    muted: bool,
     sample_rate: u32,
 ) {
+    // v1.56.0: plan the mute's fade for this buffer, then fade the chain's
+    // input. While muted the chain hears only silence, so nothing said then
+    // can come out of an effect's tail after the unmute.
+    let run = gate.run(muted, mono.len());
+    run.feed(mono);
     // v1.46.0: `mono` is the DRY, pre-effects mic signal at exactly this point
-    // — the only place on this thread where that is true. Measuring here is
-    // what makes the modulation feedback-free: following the chain's own
-    // output would mean louder -> more drive -> louder. It must also run
-    // before `loudness`, whose entire job is removing the level variation the
-    // follower needs.
+    // (faded by the mute since v1.56.0) — the only place on this thread where
+    // that is true. Measuring here is what makes the modulation feedback-free:
+    // following the chain's own output would mean louder -> more drive ->
+    // louder. It must also run before `loudness`, whose entire job is
+    // removing the level variation the follower needs.
     modulator.apply(mono, chain, sample_rate);
     chain.process(mono, sample_rate);
     loudness.process(mono, sample_rate);
+    run.mute(mono);
     soundboard.mix_into(soundboard_out, sample_rate);
 }
 
@@ -2223,8 +2271,7 @@ pub struct ReadingFacts {
     /// quiet one.
     pub running: bool,
     /// Something outside the analysis knows the input is muted — an OS or
-    /// device mute. Push-to-modulate is deliberately not this: with the key
-    /// up the mic is still open and only the chain is bypassed.
+    /// device mute, or Divora's own mute (read from [`EngineState`], v1.56.0).
     pub muted: bool,
     /// Every sample of a whole analysis window was exactly zero. A device or
     /// OS mute produces that; a quiet room never does, which is what makes it
@@ -2292,10 +2339,10 @@ pub trait ReadingAnalyzer: Send {
 ///   seam passes it per block — so the analyzer is built on the first block
 ///   and rebuilt if the device rate ever changes under it;
 /// * whether the chain was a passthrough over the window. Nothing in the
-///   engine holds a "bypassed" flag: push-to-modulate toggles effects one at
-///   a time, and a Clean preset is bypass by another name. So this measures
-///   it instead of trusting plumbing — see [`is_passthrough`] — which is
-///   right for every cause rather than the one we remembered to wire.
+///   engine holds a "bypassed" flag, and a Clean preset is bypass by another
+///   name. So this measures it instead of trusting plumbing — see
+///   [`is_passthrough`] — which is right for every cause rather than the one
+///   we remembered to wire.
 struct LiveAnalyzer {
     /// The rate it was built for, and the analyzer itself.
     inner: Option<(u32, Analyzer)>,
@@ -2435,6 +2482,9 @@ pub struct ReadingSnapshot {
     pub stale: bool,
     /// How long ago that window was measured, in ms. 0 while live.
     pub age_ms: u32,
+    /// v1.56.0: the state is Muted and Divora's own mute is a reason.
+    #[serde(default)]
+    pub muted_in_divora: bool,
 }
 
 impl ReadingSnapshot {
@@ -2445,6 +2495,7 @@ impl ReadingSnapshot {
             reading: VoiceReading::idle(state),
             stale: false,
             age_ms: 0,
+            muted_in_divora: false,
         }
     }
 }
@@ -2666,6 +2717,7 @@ fn reading_snapshot(
         } else {
             0
         },
+        muted_in_divora: false,
     }
 }
 
@@ -2679,6 +2731,29 @@ fn reading_snapshot(
 fn live_verdict_expired(measured: ReadingState, since_last_window: Duration) -> bool {
     matches!(measured, ReadingState::Speaking)
         && since_last_window >= Duration::from_millis(READING_LIVE_TIMEOUT_MS)
+}
+
+/// v1.56.0: one pass's facts, and whether Divora's own mute is among them.
+///
+/// One load of the mute word serves both, so the state a pass publishes and
+/// its `muted_in_divora` can't disagree. `muted` is the device fact or
+/// Divora's mute.
+fn reading_facts(state: &EngineState, tap: &ReadingTap) -> (ReadingFacts, bool) {
+    let divora_muted = state.input_muted();
+    let facts = ReadingFacts {
+        running: state.running.load(Ordering::Acquire),
+        muted: tap.is_muted() || divora_muted,
+        digital_silence: false,
+    };
+    (facts, divora_muted)
+}
+
+/// v1.56.0: store a snapshot, stamped with whether it is Muted because of
+/// Divora's own mute. Every store in the worker goes through here.
+fn publish(tap: &ReadingTap, mut snapshot: ReadingSnapshot, divora_muted: bool) {
+    snapshot.muted_in_divora =
+        divora_muted && matches!(snapshot.reading.state, ReadingState::Muted);
+    tap.store(snapshot);
 }
 
 /// The voice-reading worker thread.
@@ -2703,6 +2778,8 @@ fn reading_worker(
     let mut measured = ReadingState::Quiet;
     let mut last_window = Instant::now();
     let mut was_enabled = false;
+    // v1.56.0: Divora's mute, as the last pass saw it.
+    let mut was_muted = false;
     let mut all_zero = true;
     let mut dry_buf = [0f32; MAX_FRAMES_PER_CALLBACK];
     let mut wet_buf = [0f32; MAX_FRAMES_PER_CALLBACK];
@@ -2724,11 +2801,17 @@ fn reading_worker(
             all_zero = true;
         }
 
-        let mut facts = ReadingFacts {
-            running: state.running.load(Ordering::Acquire),
-            muted: tap.is_muted(),
-            digital_silence: false,
-        };
+        let (mut facts, divora_muted) = reading_facts(&state, &tap);
+        if divora_muted != was_muted {
+            was_muted = divora_muted;
+            // v1.56.0: the mute's edge, either way. The wet window would
+            // straddle the fade, so drop it as for a chain change, and let
+            // the state come from audio after the edge, not before it.
+            analyzer.note_chain_changed();
+            measured = ReadingState::Quiet;
+            last_window = Instant::now();
+            all_zero = true;
+        }
 
         // Drop the wet window whenever the chain changed under it: those
         // samples describe a chain that no longer exists, and holding them
@@ -2752,7 +2835,25 @@ fn reading_worker(
             // skips keep the halves paired whatever the callback does in
             // between.
             drop_paired(&mut dry, &mut wet, &mut dry_buf, &mut wet_buf);
-            tap.store(ReadingSnapshot::idle(facts.resolve(ReadingState::Quiet)));
+            publish(
+                &tap,
+                ReadingSnapshot::idle(facts.resolve(ReadingState::Quiet)),
+                divora_muted,
+            );
+            std::thread::sleep(Duration::from_millis(READING_DRAIN_INTERVAL_MS));
+            continue;
+        }
+
+        if facts.muted {
+            // v1.56.0: nothing to read. The wet tap carries zeros and the dry
+            // tap a voice that isn't sent; drop both, paired, so neither
+            // window fills with them, and hold the last reading as Muted.
+            drop_paired(&mut dry, &mut wet, &mut dry_buf, &mut wet_buf);
+            publish(
+                &tap,
+                reading_snapshot(held.as_ref(), facts.resolve(ReadingState::Quiet)),
+                divora_muted,
+            );
             std::thread::sleep(Duration::from_millis(READING_DRAIN_INTERVAL_MS));
             continue;
         }
@@ -2783,7 +2884,11 @@ fn reading_worker(
                     reading.state = resolved;
                     held = Some((reading, Instant::now()));
                 }
-                tap.store(reading_snapshot(held.as_ref(), resolved));
+                publish(
+                    &tap,
+                    reading_snapshot(held.as_ref(), resolved),
+                    divora_muted,
+                );
                 last_window = Instant::now();
                 published = true;
             }
@@ -2798,7 +2903,11 @@ fn reading_worker(
                 measured = ReadingState::Quiet;
             }
             facts.digital_silence = false;
-            tap.store(reading_snapshot(held.as_ref(), facts.resolve(measured)));
+            publish(
+                &tap,
+                reading_snapshot(held.as_ref(), facts.resolve(measured)),
+                divora_muted,
+            );
         }
 
         std::thread::sleep(Duration::from_millis(READING_DRAIN_INTERVAL_MS));
@@ -2917,11 +3026,12 @@ mod tests {
     use super::{
         drain_dsp_edits, drain_recording, drop_paired, graveyard_thread, is_octave_jump,
         is_passthrough, live_verdict_expired, main_output_plays, mix_voice_and_soundboard,
-        new_reading_analyzer, reading_snapshot, AudioEngine, AudioEngineError, Command,
-        EngineState, LoudnessNormalizer, OctaveGuard, ReadingFacts, ReadingSnapshot, ReadingTap,
-        ReadingTaps, StartedStreams, StreamInfo, MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS,
-        RING_BUFFER_FRAMES,
+        new_reading_analyzer, publish, reading_facts, reading_snapshot, reading_worker,
+        AudioEngine, AudioEngineError, Command, EngineState, LoudnessNormalizer, OctaveGuard,
+        ReadingFacts, ReadingSnapshot, ReadingTap, ReadingTaps, StartedStreams, StreamInfo,
+        MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
     };
+    use crate::audio::mute::{mute_ramp_len, InputMute, MuteChange, MuteGate, MuteOp};
     use crate::dsp::witness::witnessed_chain;
     use crate::dsp::{
         Descriptor, Displaced, DspEdit, EffectChain, Metrics, ReactiveModulator, ReadingState,
@@ -3296,6 +3406,8 @@ mod tests {
             &mut modulator,
             &mut loudness,
             &mut sb,
+            &mut MuteGate::new(mute_ramp_len(48_000), false),
+            false,
             48_000,
         );
         for (i, (&m, &s)) in mono.iter().zip(&sb_out).enumerate() {
@@ -3333,6 +3445,8 @@ mod tests {
             &mut modulator,
             &mut loudness,
             &mut sb,
+            &mut MuteGate::new(mute_ramp_len(48_000), false),
+            false,
             48_000,
         );
         for (&m, &s) in mono.iter().zip(&sb_out) {
@@ -3447,6 +3561,8 @@ mod tests {
                 &mut m_dry,
                 &mut loud1,
                 &mut sb1,
+                &mut MuteGate::new(mute_ramp_len(48_000), false),
+                false,
                 48_000,
             );
             mix_voice_and_soundboard(
@@ -3456,6 +3572,8 @@ mod tests {
                 &mut m_hot,
                 &mut loud2,
                 &mut sb2,
+                &mut MuteGate::new(mute_ramp_len(48_000), false),
+                false,
                 48_000,
             );
         }
@@ -3997,7 +4115,7 @@ mod tests {
         let v = serde_json::to_value(&snap).unwrap();
         let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["ageMs", "reading", "stale"]);
+        assert_eq!(keys, ["ageMs", "mutedInDivora", "reading", "stale"]);
         // The state serializes as the lowercase word the UI switches on.
         assert_eq!(v["reading"]["state"], "quiet");
     }
@@ -4367,5 +4485,925 @@ mod tests {
             None,
             "silence must abstain"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // v1.56.0: the mute
+    // -----------------------------------------------------------------
+
+    /// The engine rate the mute tests run at.
+    const RATE: u32 = 48_000;
+
+    /// The fade length at [`RATE`].
+    fn fade() -> usize {
+        usize::from(mute_ramp_len(RATE))
+    }
+
+    /// One Echo, as a preset builds it: `time` in ms, `fb` in percent.
+    fn echo_chain(time: f32, fb: f32) -> EffectChain {
+        use crate::dsp::{EffectKind, EffectSpec};
+        let params = [("time".to_string(), time), ("fb".to_string(), fb)];
+        EffectChain::from_specs(&[EffectSpec {
+            kind: EffectKind::Echo,
+            enabled: true,
+            params: params.into_iter().collect(),
+        }])
+    }
+
+    /// `n` samples of a sine at `freq` Hz, from phase 0.
+    fn sine(freq: f32, amp: f32, n: usize) -> Vec<f32> {
+        let inc = std::f32::consts::TAU * freq / 48_000.0;
+        let mut phase = 0.0_f32;
+        (0..n)
+            .map(|_| {
+                let s = amp * phase.sin();
+                phase = (phase + inc) % std::f32::consts::TAU;
+                s
+            })
+            .collect()
+    }
+
+    /// The voice stage's parts, run a buffer at a time through the real
+    /// `mix_voice_and_soundboard`, as the output callback runs them.
+    struct VoiceStage {
+        chain: EffectChain,
+        modulator: ReactiveModulator,
+        loudness: LoudnessNormalizer,
+        soundboard: SoundboardMixer,
+        gate: MuteGate,
+    }
+
+    impl VoiceStage {
+        /// `muted`: the session starts muted, as one built while muted does.
+        fn new(chain: EffectChain, loudness_on: bool, muted: bool) -> Self {
+            let mut loudness = LoudnessNormalizer::new();
+            loudness.set_enabled(loudness_on);
+            Self {
+                chain,
+                modulator: ReactiveModulator::new(),
+                loudness,
+                soundboard: SoundboardMixer::new(),
+                gate: MuteGate::new(mute_ramp_len(RATE), muted),
+            }
+        }
+
+        /// A clip of constant `level`, `len` samples long, at the engine rate.
+        fn play(&mut self, level: f32, len: usize) {
+            drop(self.soundboard.apply(SoundboardCommand::Play {
+                clip_id: "clip".to_string(),
+                samples: Arc::new(vec![level; len]),
+                sample_rate: RATE,
+                gain: 1.0,
+            }));
+        }
+
+        fn run(&mut self, mono: &mut [f32], sb: &mut [f32], muted: bool) {
+            mix_voice_and_soundboard(
+                mono,
+                sb,
+                &mut self.chain,
+                &mut self.modulator,
+                &mut self.loudness,
+                &mut self.soundboard,
+                &mut self.gate,
+                muted,
+                RATE,
+            );
+        }
+    }
+
+    /// The largest step in `y`, counting the one from `prev` into it.
+    fn max_step(prev: f32, y: &[f32]) -> f32 {
+        let mut last = prev;
+        y.iter().fold(0.0_f32, |max, &s| {
+            let step = (s - last).abs();
+            last = s;
+            max.max(step)
+        })
+    }
+
+    /// The send while muted carries the clip and nothing of the voice: from
+    /// L after the edge the voice is `+0.0` exactly, whatever the echo and
+    /// loudness still hold, and the clip is untouched.
+    ///
+    /// The mute comes once the echo has returned (its delay is 100 ms), so
+    /// the chain holds a tail at the edge: with the send's fade inside the
+    /// input's, that tail would still be on the send at L.
+    #[test]
+    #[allow(clippy::float_cmp)] // the fold is `0.0 + s`, exact
+    fn muted_voice_is_exactly_zero_while_a_clip_passes() {
+        let l = fade();
+        for frames in [100, 480] {
+            let mut stage = VoiceStage::new(echo_chain(100.0, 90.0), true, false);
+            stage.play(0.25, 48_000);
+            let edge = 7_200_usize.div_ceil(frames); // the first buffer after 0.15 s
+            for i in 0..edge + 12 {
+                let muted = i >= edge;
+                let mut mono = vec![0.10_f32; frames];
+                let mut sb = vec![0.0_f32; frames];
+                stage.run(&mut mono, &mut sb, muted);
+                if !muted {
+                    assert!(mono.iter().all(|&m| m > 0.0), "no voice before the mute");
+                    continue;
+                }
+                for (j, (&m, &s)) in mono.iter().zip(&sb).enumerate() {
+                    let n = (i - edge) * frames + j;
+                    assert_eq!(s, 0.25, "{frames}-frame buffers: the clip moved at {n}");
+                    if n + 1 >= l {
+                        assert_eq!(m.to_bits(), 0, "{frames}-frame buffers: voice at {n}");
+                        assert_eq!(m + s, s);
+                    }
+                }
+            }
+        }
+    }
+
+    /// D2: the chain's input is starved while muted, so a sentence said then
+    /// can't ring out of an echo after the unmute. Fails with `feed` a no-op
+    /// (only the send zeroed), the plan's original design.
+    #[test]
+    fn what_is_said_while_muted_never_reaches_the_send() {
+        const FRAMES: usize = 480;
+        let l = fade();
+        let mute_at = 9_600; // 0.2 s of silence first
+        let tone_at = mute_at + 2 * l; // once the chain's input has closed
+        let unmute_at = 72_000; // 1.5 s
+        let end = unmute_at + 48_000;
+        let mut mic = vec![0.0_f32; end];
+        mic[tone_at..tone_at + 24_000].copy_from_slice(&sine(660.0, 0.3, 24_000));
+
+        let mut stage = VoiceStage::new(echo_chain(100.0, 90.0), false, false);
+        let mut sb = [0.0_f32; FRAMES];
+        for (i, block) in mic.chunks(FRAMES).enumerate() {
+            let at = i * FRAMES;
+            let mut mono = block.to_vec();
+            stage.run(&mut mono, &mut sb, (mute_at..unmute_at).contains(&at));
+            if at >= mute_at + FRAMES && at < unmute_at {
+                assert!(
+                    mono.iter().all(|&s| s == 0.0),
+                    "the send spoke while muted at {at}"
+                );
+            }
+            if at >= unmute_at {
+                assert!(
+                    mono.iter().all(|&s| s == 0.0),
+                    "what was said while muted came out after the unmute, at {at}"
+                );
+            }
+        }
+    }
+
+    /// At unmute the send fades in over what the chain still holds — an echo
+    /// tail of words said before the mute — rather than stepping into it.
+    /// The muted run's chain hears exactly what the reference's does (the mic
+    /// is silent by then), so the send is the tail times the fade, and no step
+    /// can exceed the tail's own steepest plus `tail_peak / L`.
+    #[test]
+    fn a_tail_fades_in_at_unmute() {
+        const FRAMES: usize = 100;
+        let l = fade();
+        let mute_at = 14_400;
+        // Several unmute points, so the fade meets the tail at several phases.
+        for unmute_at in (24_000..24_500).step_by(FRAMES) {
+            let end = unmute_at + 2 * l + 480;
+            let mut mic = vec![0.0_f32; end];
+            mic[..9_600].copy_from_slice(&sine(660.0, 0.3, 9_600));
+            let mut reference = VoiceStage::new(echo_chain(100.0, 90.0), false, false);
+            let mut stage = VoiceStage::new(echo_chain(100.0, 90.0), false, false);
+            let (mut tail, mut sent) = (Vec::new(), Vec::new());
+            let mut sb = [0.0_f32; FRAMES];
+            for (i, block) in mic.chunks(FRAMES).enumerate() {
+                let at = i * FRAMES;
+                let (mut a, mut b) = (block.to_vec(), block.to_vec());
+                reference.run(&mut a, &mut sb, false);
+                stage.run(&mut b, &mut sb, (mute_at..unmute_at).contains(&at));
+                if at + FRAMES >= unmute_at {
+                    tail.extend(a);
+                    sent.extend(b);
+                }
+            }
+            // From the last muted sample (+0.0) through the fade and past it.
+            let skip = tail.len() - (end - unmute_at) - 1;
+            let (tail, sent) = (&tail[skip..], &sent[skip..]);
+            assert_eq!(sent[0].to_bits(), 0, "still muted just before {unmute_at}");
+            let peak = tail.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(peak > 0.05, "the echo isn't ringing at {unmute_at}: {peak}");
+            let bound = max_step(tail[0], &tail[1..]) + peak / f32::from(mute_ramp_len(RATE));
+            let step = max_step(sent[0], &sent[1..]);
+            assert!(
+                step <= bound,
+                "unmute at {unmute_at}: a step of {step} over {bound}"
+            );
+        }
+    }
+
+    /// PLAN-10: at unmute the chain's input fades in too. An Echo of 20 ms
+    /// (960 samples, longer than 2L) returns its copy of the input after the
+    /// send is open; with the input ramped, the copy comes back ramped. A
+    /// `feed` that opened in one step would bring it back as a 0.25 step.
+    #[test]
+    fn the_chain_input_fades_in_at_unmute() {
+        const A: f32 = 0.5;
+        const FRAMES: usize = 480;
+        let l = fade();
+        let mut stage = VoiceStage::new(echo_chain(20.0, 0.0), false, true);
+        let mut sb = [0.0_f32; FRAMES];
+        // A second muted with the mic running, so the echo holds only silence.
+        for _ in 0..100 {
+            let mut mono = [A; FRAMES];
+            stage.run(&mut mono, &mut sb, true);
+            assert!(mono.iter().all(|s| s.to_bits() == 0));
+        }
+        let bound = 1.5 * A / f32::from(mute_ramp_len(RATE));
+        let (mut prev, mut seen) = (0.0_f32, 0);
+        while seen < 2 * l + 960 + 2400 {
+            let mut mono = [A; FRAMES];
+            stage.run(&mut mono, &mut sb, false);
+            let step = max_step(prev, &mono);
+            assert!(
+                step <= bound,
+                "a step of {step} by sample {seen} after the unmute"
+            );
+            prev = mono[FRAMES - 1];
+            seen += FRAMES;
+        }
+        // The echo did come back inside the window: A plus half of A.
+        assert!((prev - 1.5 * A).abs() < 1e-6, "the send ended at {prev}");
+    }
+
+    /// RT-5 / D22: the voice stage — an echo, loudness, a clip playing —
+    /// allocates and frees nothing while the mute toggles, including flips
+    /// that turn a fade round mid-way. The claim is this stage, not the whole
+    /// callback (Voice Convert's inference still allocates).
+    #[test]
+    fn the_voice_stage_allocates_nothing_while_mute_toggles() {
+        use crate::alloc_probe::{arm, disarm};
+        let mut stage = VoiceStage::new(echo_chain(100.0, 90.0), true, false);
+        stage.play(0.25, 48_000 * 5);
+        let mut mono = [0.1_f32; 480];
+        let mut sb = [0.0_f32; 480];
+
+        // The counter is live: the same window around a real allocation is
+        // not zero, so the zeros below are a measurement, not a dead hook.
+        arm();
+        drop(std::hint::black_box(vec![0u8; 16]));
+        assert_eq!(disarm(), (1, 1), "the allocation probe is not counting");
+
+        // Warm: the first buffer is not the steady state.
+        stage.run(&mut mono, &mut sb, false);
+
+        // 100-frame buffers flip every 300 samples, between L and 2L at
+        // 48 kHz, so every other flip lands mid-fade; 480-frame ones never do.
+        for frames in [100, 480] {
+            let (mut muted, mut turned) = (false, 0_usize);
+            arm();
+            for i in 0..300 {
+                if i % 3 == 0 {
+                    turned += usize::from(!stage.gate.settled());
+                    muted = !muted;
+                }
+                mono[..frames].fill(0.1);
+                sb[..frames].fill(0.0);
+                stage.run(&mut mono[..frames], &mut sb[..frames], muted);
+            }
+            let counts = disarm();
+            assert_eq!(counts, (0, 0), "{frames}-frame buffers allocated or freed");
+            if frames == 100 {
+                assert!(
+                    turned > 0,
+                    "no flip turned a fade round, so none was measured"
+                );
+            }
+        }
+    }
+
+    /// The block that follows the first `head` in `src`: from the first `{`
+    /// at or after it to the brace that closes it.
+    fn block_after<'a>(src: &'a str, head: &str) -> &'a str {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("`{head}` is not in engine.rs"));
+        let open = start + src[start..].find('{').expect("a block after it");
+        let mut depth = 0_usize;
+        for (i, c) in src[open..].char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..=open + i];
+                }
+            }
+        }
+        panic!("`{head}`'s block never closes");
+    }
+
+    /// The seams no behaviour test can reach: the output callback's closure,
+    /// which needs a device, and the parts of the reading worker that mask
+    /// each other in what it publishes. So this reads the source, like
+    /// `the_soundboard_drain_routes_what_it_retires_to_the_graveyard`, with
+    /// every needle split by `concat!` so it can't match itself.
+    #[test]
+    fn the_output_callback_mutes_the_voice_stage() {
+        let file = include_str!("engine.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let count = |needle: &str| prod.matches(needle).count();
+
+        // The gate starts at the word, the word is read once per buffer, and
+        // what was read is what the stage gets (`false` there fails this).
+        let built = concat!(
+            "let mut mute_gate = MuteGate::new(mute_ramp_len(input_rate), ",
+            "state.input_muted());"
+        );
+        assert_eq!(
+            count(built),
+            1,
+            "the gate must be built at the engine's word"
+        );
+        let read = concat!("let muted = state_for_callback", ".input_muted();");
+        assert_eq!(count(read), 1, "the callback must read the word once");
+        let passed = concat!("&mut mute_gate,\n", "                    muted,");
+        assert_eq!(count(passed), 1, "the callback must pass what it read");
+
+        // The gate is built once a session, before the per-buffer closure: one
+        // built inside it starts settled every buffer, so no fade ever runs.
+        let callback = block_after(prod, concat!("fn build_output", "_stream("));
+        let closure_at = callback
+            .find(concat!("move |data: &mut [f32], ", "info"))
+            .expect("the output callback's closure");
+        let closure = block_after(&callback[closure_at..], "move |");
+        assert!(
+            callback.find(built).expect("the gate's construction") < closure_at,
+            "the gate must be built before the callback's closure"
+        );
+        assert!(
+            !closure.contains(concat!("MuteGate", "::new(")),
+            "the gate must not be rebuilt every buffer"
+        );
+
+        // K16: the closure's first statement sets FTZ/DAZ, before anything
+        // can return or touch a float.
+        let first = closure[1..]
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("a statement in the closure");
+        assert_eq!(
+            first,
+            concat!("denormals::flush", "_to_zero();"),
+            "the callback must flush subnormals first"
+        );
+
+        // In the callback: the read, the stage, then the reading's wet tap, the
+        // screen recorder's tap and the monitor's mix (the dry tap comes before
+        // the stage; the WAV tap isn't pinned here).
+        let mut at = 0;
+        for needle in [
+            concat!("state_for_callback", ".input_muted();"),
+            concat!("&mut mute", "_gate,"),
+            concat!("reading_taps.push", "_wet("),
+            concat!("av.", "tap("),
+            concat!("mix_monitor", "_into("),
+        ] {
+            let found = callback[at..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is missing or out of order"));
+            at += found + needle.len();
+        }
+
+        // In the stage: the input fades before the modulator hears it, the
+        // voice after loudness and before the soundboard renders.
+        let stage = block_after(prod, concat!("fn mix_voice_and", "_soundboard("));
+        let pos = |needle: &str| {
+            stage
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is not in the voice stage"))
+        };
+        assert!(pos(concat!("run.feed", "(mono)")) < pos("modulator.apply("));
+        assert!(pos("loudness.process(") < pos(concat!("run.mute", "(mono)")));
+        assert!(pos(concat!("run.mute", "(mono)")) < pos("soundboard.mix_into("));
+
+        // In the reading worker: one read of the word per pass, every store
+        // stamped through `publish`, the muted branch drops what the taps
+        // hold, and each edge drops the wet window.
+        let worker = block_after(prod, concat!("fn reading", "_worker("));
+        assert!(worker.contains(concat!("reading_facts", "(")));
+        assert!(!worker.contains(concat!("muted: tap", ".is_muted()")));
+        assert!(!worker.contains(concat!("tap.", "store(")));
+        let muted = block_after(worker, concat!("if facts", ".muted {"));
+        let dropped = muted
+            .find(concat!("drop_", "paired("))
+            .expect("the muted branch drops");
+        assert!(dropped < muted.find("continue;").expect("and holds"));
+        let edge = block_after(worker, concat!("if divora_muted != ", "was_muted {"));
+        assert!(edge.contains(concat!("analyzer.note_chain", "_changed()")));
+    }
+
+    #[test]
+    fn input_mute_is_idempotent_and_counted() {
+        let engine = AudioEngine::new();
+        let st = |muted, seq| InputMute { muted, seq };
+        let change = |before, after| MuteChange { before, after };
+        assert_eq!(engine.input_mute(), st(false, 0));
+        assert_eq!(
+            engine.set_input_muted(true),
+            change(st(false, 0), st(true, 1))
+        );
+        // The same value again moves nothing, `seq` included.
+        assert_eq!(
+            engine.set_input_muted(true),
+            change(st(true, 1), st(true, 1))
+        );
+        assert_eq!(
+            engine.toggle_input_muted(),
+            change(st(true, 1), st(false, 2))
+        );
+        assert_eq!(
+            engine.set_input_muted(false),
+            change(st(false, 2), st(false, 2))
+        );
+        engine.toggle_input_muted();
+        engine.toggle_input_muted();
+        assert_eq!(engine.input_mute(), st(false, 4));
+    }
+
+    /// PLAN-14: a toggle is one atomic op. Four threads toggling at once lose
+    /// none, and each sees a change of exactly one. The barrier makes "at
+    /// once" true: spawned one by one, each thread could finish its 10,000
+    /// before the next began.
+    #[test]
+    fn concurrent_toggles_are_all_counted() {
+        let engine = AudioEngine::new();
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    start.wait();
+                    for _ in 0..10_000 {
+                        let c = engine.toggle_input_muted();
+                        assert_eq!(c.after.seq, c.before.seq + 1);
+                        assert_ne!(c.after.muted, c.before.muted);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            engine.input_mute(),
+            InputMute {
+                muted: false,
+                seq: 40_000
+            }
+        );
+    }
+
+    /// The word is the engine's, not a session's: Stop, Start and a
+    /// device-loss rebuild keep it, and a mute made while stopped holds for
+    /// the next Start.
+    #[test]
+    fn input_mute_survives_stop_start_and_a_rebuild() {
+        #[allow(clippy::unnecessary_wraps)] // a `StartFn`, whose sessions may fail
+        fn start(
+            _input: Option<&str>,
+            _output: Option<&str>,
+            _monitor: Option<&str>,
+            _state: Arc<EngineState>,
+            _reading: Arc<ReadingTap>,
+            _cmd_tx: Sender<Command>,
+        ) -> Result<StartedStreams<()>, AudioEngineError> {
+            Ok(deviceless_session())
+        }
+        // Answered in order, so everything sent before it has been handled.
+        fn settle(engine: &AudioEngine) {
+            let _ = engine.stop_reference_recording();
+        }
+        let st = |muted, seq| InputMute { muted, seq };
+
+        let engine = AudioEngine::spawn(start);
+        engine.set_input_muted(true);
+        engine.start(None, None, None).unwrap();
+        assert_eq!(engine.input_mute(), st(true, 1));
+
+        engine.tx.send(Command::StreamError).unwrap();
+        settle(&engine);
+        assert!(engine.is_running(), "the rebuild came back up");
+        assert_eq!(engine.input_mute(), st(true, 1));
+
+        engine.stop();
+        settle(&engine);
+        assert!(!engine.is_running());
+        assert_eq!(engine.input_mute(), st(true, 1));
+
+        engine.start(None, None, None).unwrap();
+        assert_eq!(engine.input_mute(), st(true, 1));
+        assert_eq!(engine.set_input_muted(false).after, st(false, 2));
+        assert_eq!(engine.input_mute(), st(false, 2));
+    }
+
+    /// RT-4 / PLAN-11 / D8: a mute lands while the engine thread is stuck in
+    /// a Start (a device open), because the setter never goes through the
+    /// engine's command channel.
+    #[test]
+    fn a_mute_lands_while_the_engine_thread_is_busy() {
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        #[allow(clippy::unnecessary_wraps)] // a `StartFn`, whose sessions may fail
+        fn start(
+            _input: Option<&str>,
+            _output: Option<&str>,
+            _monitor: Option<&str>,
+            _state: Arc<EngineState>,
+            _reading: Arc<ReadingTap>,
+            _cmd_tx: Sender<Command>,
+        ) -> Result<StartedStreams<()>, AudioEngineError> {
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(deviceless_session())
+        }
+
+        let engine = AudioEngine::spawn(start);
+        std::thread::scope(|s| {
+            let starter = s.spawn(|| engine.start(None, None, None));
+            let since = Instant::now();
+            while !ENTERED.load(Ordering::Acquire) && since.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (tx, rx) = channel();
+            let setter = &engine;
+            s.spawn(move || tx.send(setter.set_input_muted(true)).unwrap());
+            let answer = rx.recv_timeout(Duration::from_millis(200));
+            let (running, word) = (engine.is_running(), engine.input_mute());
+            // Let the Start finish before asserting, so a failure can't hang
+            // the scope on a thread that never returns.
+            RELEASE.store(true, Ordering::Release);
+            assert!(ENTERED.load(Ordering::Acquire), "the Start never began");
+            let answer = answer.expect("the mute waited behind the Start");
+            assert_eq!(
+                answer.after,
+                InputMute {
+                    muted: true,
+                    seq: 1
+                }
+            );
+            assert!(!running, "the engine thread was still inside the Start");
+            assert!(word.muted);
+            starter.join().unwrap().unwrap();
+        });
+        assert!(engine.is_running());
+        assert!(engine.input_mute().muted);
+    }
+
+    #[test]
+    fn input_mute_json_keys_are_frozen() {
+        let v = serde_json::to_value(InputMute {
+            muted: true,
+            seq: 3,
+        })
+        .unwrap();
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["muted", "seq"]);
+        assert_eq!(v["muted"], true);
+        assert_eq!(v["seq"], 3);
+    }
+
+    /// D17: the worker's facts carry Divora's mute beside the device fact,
+    /// and `publish` names Divora's mute only when it is why the state is
+    /// Muted.
+    #[test]
+    fn the_reading_hears_the_mute() {
+        let state = EngineState::default();
+        let tap = ReadingTap::default();
+        state.running.store(true, Ordering::Release);
+
+        let (facts, divora) = reading_facts(&state, &tap);
+        assert!(!facts.muted && !divora && facts.running && !facts.digital_silence);
+        assert_eq!(
+            facts.resolve(ReadingState::Speaking),
+            ReadingState::Speaking
+        );
+
+        // Divora's mute alone.
+        state.apply_input_mute(MuteOp::Set(true));
+        let (facts, divora) = reading_facts(&state, &tap);
+        assert!(facts.muted && divora);
+        assert_eq!(facts.resolve(ReadingState::Speaking), ReadingState::Muted);
+
+        // The device fact alone.
+        state.apply_input_mute(MuteOp::Set(false));
+        tap.muted.store(true, Ordering::Release);
+        let (facts, divora) = reading_facts(&state, &tap);
+        assert!(facts.muted && !divora);
+        tap.muted.store(false, Ordering::Release);
+
+        // Stopped beats muted.
+        state.apply_input_mute(MuteOp::Set(true));
+        state.running.store(false, Ordering::Release);
+        let (facts, divora) = reading_facts(&state, &tap);
+        assert!(divora);
+        assert_eq!(facts.resolve(ReadingState::Quiet), ReadingState::Stopped);
+
+        let held = (speaking_window(), Instant::now());
+        let stamped = |snapshot: ReadingSnapshot, divora: bool| {
+            publish(&tap, snapshot, divora);
+            tap.load().muted_in_divora
+        };
+        assert!(stamped(ReadingSnapshot::idle(ReadingState::Muted), true));
+        assert!(stamped(
+            reading_snapshot(Some(&held), ReadingState::Muted),
+            true
+        ));
+        assert!(!stamped(ReadingSnapshot::idle(ReadingState::Muted), false));
+        for other in [
+            ReadingState::Stopped,
+            ReadingState::Quiet,
+            ReadingState::Speaking,
+        ] {
+            assert!(!stamped(ReadingSnapshot::idle(other), true), "{other:?}");
+        }
+    }
+
+    /// Stops the worker test's threads however the test ends, so a failed
+    /// assertion leaves no feeder or worker running.
+    struct StopOnDrop {
+        stop: Arc<AtomicBool>,
+        alive: Option<Sender<()>>,
+    }
+
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            drop(self.alive.take());
+        }
+    }
+
+    /// The callback's half of the reading, on its own thread: a paired block
+    /// every 10 ms. DRY is a 220 Hz tone; WET is the same tone, or zeros
+    /// while muted, the word read once per block as the callback reads it.
+    /// Returns the fullest either ring got while muted, in frames.
+    fn feed_the_taps(
+        mut taps: ReadingTaps,
+        state: Arc<EngineState>,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<usize> {
+        const BLOCK: usize = 480;
+        std::thread::spawn(move || {
+            let inc = std::f32::consts::TAU * 220.0 / 48_000.0;
+            let (mut phase, mut fullest) = (0.0_f32, 0);
+            let mut block = [0.0_f32; BLOCK];
+            while !stop.load(Ordering::Acquire) {
+                for s in &mut block {
+                    *s = 0.3 * phase.sin();
+                    phase = (phase + inc) % std::f32::consts::TAU;
+                }
+                let muted = state.input_muted();
+                if muted {
+                    fullest = fullest
+                        .max(taps.dry.occupied_len())
+                        .max(taps.wet.occupied_len());
+                }
+                if taps.armed(true, BLOCK) {
+                    taps.push_dry(&block);
+                    taps.push_wet(if muted { &[0.0; BLOCK] } else { &block });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fullest
+        })
+    }
+
+    /// Polls the reading until `ok` holds or `limit` passes.
+    fn reading_within(
+        tap: &ReadingTap,
+        limit: Duration,
+        ok: impl Fn(&ReadingSnapshot) -> bool,
+    ) -> bool {
+        let since = Instant::now();
+        while since.elapsed() < limit {
+            if ok(&tap.load()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Every reading published over `span`, polled, through `check`.
+    fn readings_for(tap: &ReadingTap, span: Duration, mut check: impl FnMut(&ReadingSnapshot)) {
+        let since = Instant::now();
+        while since.elapsed() < span {
+            check(&tap.load());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// PLAN-3 / D17: the real worker on its own thread, fed as the callback
+    /// feeds it. Muted, it publishes Muted in Divora, holds the last reading
+    /// and keeps the taps drained; unmuted, it reads again at once, with no
+    /// zeros from the mute left in the after-effects window.
+    #[test]
+    fn the_reading_worker_holds_while_muted() {
+        let (taps, dry, wet) = taps();
+        let tap = Arc::new(ReadingTap::default());
+        tap.enabled.store(true, Ordering::Release);
+        let state = Arc::new(EngineState::default());
+        state.running.store(true, Ordering::Release);
+        let (alive_tx, alive_rx) = channel::<()>();
+        let worker = {
+            let (tap, state) = (Arc::clone(&tap), Arc::clone(&state));
+            std::thread::spawn(move || reading_worker(dry, wet, tap, state, alive_rx, RATE))
+        };
+        let guard = StopOnDrop {
+            stop: Arc::new(AtomicBool::new(false)),
+            alive: Some(alive_tx),
+        };
+        let feeder = feed_the_taps(taps, Arc::clone(&state), Arc::clone(&guard.stop));
+        let speaking = |s: &ReadingSnapshot| {
+            s.reading.state == ReadingState::Speaking && s.reading.wet.energy_dbfs.is_finite()
+        };
+        let muted_in_divora =
+            |s: &ReadingSnapshot| s.reading.state == ReadingState::Muted && s.muted_in_divora;
+        let unmuted =
+            |s: &ReadingSnapshot| s.reading.state != ReadingState::Muted && !s.muted_in_divora;
+
+        // (1) Speech, read with an after-effects half, for at least a second.
+        let since = Instant::now();
+        assert!(
+            reading_within(&tap, Duration::from_secs(5), speaking),
+            "the tone never read as speech"
+        );
+        std::thread::sleep(Duration::from_secs(1).saturating_sub(since.elapsed()));
+
+        // (2) Muted in Divora, promptly, and held so.
+        state.apply_input_mute(MuteOp::Set(true));
+        assert!(
+            reading_within(&tap, Duration::from_millis(500), muted_in_divora),
+            "the reading never said Muted in Divora"
+        );
+        readings_for(&tap, Duration::from_secs(1), |s| {
+            assert!(muted_in_divora(s), "{s:?}");
+        });
+
+        // (3) Unmuted: reading again, and nothing measured from the mute.
+        // The wet tap carried the same tone as the dry one whenever it was
+        // open, so after effects that read quieter, or less voiced, are
+        // reading the mute's silence: a level kept from a window of zeros,
+        // or zeros left in the window (unvoiced frames; the level skips
+        // digital silence, so it can't see those).
+        state.apply_input_mute(MuteOp::Set(false));
+        assert!(
+            reading_within(&tap, Duration::from_millis(500), unmuted),
+            "the reading stayed Muted after the unmute"
+        );
+        let mut spoke = 0;
+        readings_for(&tap, Duration::from_secs(2), |s| {
+            assert!(unmuted(s), "{s:?}");
+            if s.reading.state == ReadingState::Speaking {
+                spoke += 1;
+                let (dry, wet) = (&s.reading.dry, &s.reading.wet);
+                assert!(
+                    wet.energy_dbfs >= dry.energy_dbfs - 6.0,
+                    "after effects read {} dB against {}",
+                    wet.energy_dbfs,
+                    dry.energy_dbfs
+                );
+                assert!(
+                    wet.voiced_ratio >= dry.voiced_ratio - 0.2,
+                    "after effects read {} voiced against {}",
+                    wet.voiced_ratio,
+                    dry.voiced_ratio
+                );
+            }
+        });
+        assert!(spoke > 0, "no speech was read after the unmute");
+
+        drop(guard);
+        let fullest = feeder.join().unwrap();
+        worker.join().unwrap();
+        // A tap left undrained fills its ring in 170 ms.
+        assert!(
+            fullest <= 8 * 480,
+            "the taps filled while muted: {fullest} frames"
+        );
+    }
+
+    /// RT-2 / K16: while muted the chain hears exact zeros for as long as the
+    /// mute lasts, and its recursive states decay toward subnormal floats,
+    /// each operation on one a possible microcode assist on x86. The output
+    /// callback flushes them to zero (`denormals`); this checks that holds
+    /// for every bundled preset, loudness on, through the real stage on a
+    /// thread that flushes every buffer as the callback does. Per preset: 10 s
+    /// of speech then 180 s muted (the mic keeps the tone), against a second
+    /// run that sits 180 s unmuted on −70 dBFS room tone, which is what the
+    /// chain heard before v1.56.0 while you said nothing. The bar: the last
+    /// 10 s muted costs at most twice the larger of speech and the pause's
+    /// last 10 s. Prints all three per preset. Run:
+    /// `cargo test --release -p divora-core -- --ignored --nocapture a_long_mute_costs_at_most_twice_speech_or_a_pause`
+    #[test]
+    #[ignore = "bench: run with --release in S2"]
+    fn a_long_mute_costs_at_most_twice_speech_or_a_pause() {
+        use super::denormals;
+        use crate::dsp::EffectSpec;
+        use crate::presets::bundled_presets;
+        const FRAMES: usize = 480;
+        const SPEECH: usize = 10 * 48_000 / FRAMES;
+        const LONG: usize = 180 * 48_000 / FRAMES;
+        const LAST: usize = 10 * 48_000 / FRAMES;
+
+        /// One buffer of `mic` through `stage`, timed from the flush.
+        fn time(stage: &mut VoiceStage, mic: &mut impl FnMut() -> f32, muted: bool) -> Duration {
+            let mut mono = [0.0_f32; FRAMES];
+            mono.fill_with(&mut *mic);
+            let mut sb = [0.0_f32; FRAMES];
+            let since = Instant::now();
+            denormals::flush_to_zero();
+            stage.run(&mut mono, &mut sb, muted);
+            let took = since.elapsed();
+            assert!(mono.iter().all(|s| s.is_finite()), "a sample went bad");
+            took
+        }
+        fn median(mut d: Vec<Duration>) -> Duration {
+            d.sort_unstable();
+            d[d.len() / 2]
+        }
+        fn tone() -> impl FnMut() -> f32 {
+            let inc = std::f32::consts::TAU * 220.0 / 48_000.0;
+            let mut phase = 0.0_f32;
+            move || {
+                let s = 0.3 * phase.sin();
+                phase = (phase + inc) % std::f32::consts::TAU;
+                s
+            }
+        }
+        /// White noise at −70 dBFS RMS: uniform in ±a has RMS a/√3.
+        fn room_tone() -> impl FnMut() -> f32 {
+            let a = 10.0_f32.powf(-70.0 / 20.0) * 3.0_f32.sqrt();
+            let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+            move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let unit = f32::from(u16::try_from(x >> 48).unwrap()) / 32_768.0 - 1.0;
+                a * unit
+            }
+        }
+
+        // Its own thread, so the flush can't reach another test.
+        std::thread::spawn(|| {
+            let mut over = Vec::new();
+            for preset in bundled_presets() {
+                let specs: Vec<EffectSpec> = preset
+                    .chain
+                    .iter()
+                    .map(|e| EffectSpec {
+                        kind: serde_json::from_value(serde_json::Value::String(e.id.clone()))
+                            .unwrap_or_else(|err| panic!("{}: {}: {err}", preset.id, e.id)),
+                        enabled: e.enabled,
+                        params: e.vals.clone(),
+                    })
+                    .collect();
+
+                // Speech, then a long mute, then speech again.
+                let mut stage = VoiceStage::new(EffectChain::from_specs(&specs), true, false);
+                let mut mic = tone();
+                let speech = (0..SPEECH).map(|_| time(&mut stage, &mut mic, false));
+                let speech = median(speech.collect());
+                let muted: Vec<_> = (0..LONG).map(|_| time(&mut stage, &mut mic, true)).collect();
+                let muted = median(muted[LONG - LAST..].to_vec());
+                for _ in 0..SPEECH / 10 {
+                    time(&mut stage, &mut mic, false);
+                }
+
+                // Speech, then a long pause on room tone.
+                let mut stage = VoiceStage::new(EffectChain::from_specs(&specs), true, false);
+                let mut mic = tone();
+                for _ in 0..SPEECH {
+                    time(&mut stage, &mut mic, false);
+                }
+                let mut mic = room_tone();
+                let pause: Vec<_> = (0..LONG).map(|_| time(&mut stage, &mut mic, false)).collect();
+                let pause = median(pause[LONG - LAST..].to_vec());
+
+                let base = speech.max(pause);
+                println!(
+                    "{:<20} speech {speech:>9.1?}  pause {pause:>9.1?}  muted {muted:>9.1?}  {:.2}x",
+                    preset.id,
+                    muted.as_secs_f64() / base.as_secs_f64()
+                );
+                if muted > base * 2 {
+                    over.push(preset.id);
+                }
+            }
+            assert!(
+                over.is_empty(),
+                "a long mute costs more than twice speech or a pause: {over:?}"
+            );
+        })
+        .join()
+        .unwrap();
     }
 }

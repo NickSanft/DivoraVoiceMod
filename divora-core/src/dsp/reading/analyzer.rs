@@ -38,7 +38,8 @@
 //! Speak and Critter Chatter audio never reaches either tap. `engine.rs`
 //! renders those voices into their own `soundboard_out` buffer inside
 //! `mix_voice_and_soundboard` and folds them into the send *after* the chain
-//! has run; the wet tap is the chain's output on the mic buffer alone. That is
+//! has run; the wet tap is the chain's output on the mic buffer alone, after
+//! loudness and the mute (v1.56.0; while muted nothing is read). That is
 //! correct and is not worth "fixing" — a panel that read the send instead of
 //! the chain would start reading a sound effect the moment one played.
 

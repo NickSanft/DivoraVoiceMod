@@ -44,7 +44,12 @@
 //! * `VoiceConvert`'s resampling phases and the soundboard drain, in their own
 //!   modules' unit tests — both reach `pub(crate)` internals, so they are
 //!   measured from inside the crate using `crate::alloc_probe` rather than from
-//!   more test binaries.
+//!   more test binaries;
+//! * the voice stage while the mute toggles (v1.56.0) — the real
+//!   `mix_voice_and_soundboard` with an echo, loudness and a clip playing,
+//!   including flips that turn a fade round mid-way — in `audio/engine.rs`'s
+//!   `the_voice_stage_allocates_nothing_while_mute_toggles`, also through
+//!   `crate::alloc_probe`, since the stage and its gate are private.
 //!
 //! Do not read any of those zeros as covering the others.
 //! * the counter is live — proved in the same run by measuring what the code

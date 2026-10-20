@@ -163,9 +163,9 @@ export interface TweaksState {
   vignette: boolean;
 }
 
-/** UI-side ephemeral state. */
+/** UI-side ephemeral state. v1.56.0: the mute left for the store's
+ *  read-only `muted()`, a mirror of the engine's state. */
 export interface UiState {
-  muted: boolean;
   monitor: boolean;
   ab: AbSlot;
   ptmMode: PtmMode;
@@ -179,8 +179,10 @@ export interface UiState {
  *  non-API call sites (the router, the store) import it tidily. */
 export type { MidiMessage } from "./audio/api";
 
-/** Which existing action a MIDI mapping drives. */
-export type MidiActionKind = "preset" | "tile" | "ptm" | "monitor" | "param";
+/** Which existing action a MIDI mapping drives. v1.56.0 adds `mute`: a note
+ *  toggles; a CC mutes when it rises to 64 or more and unmutes when it falls
+ *  to 59 or less. */
+export type MidiActionKind = "preset" | "tile" | "ptm" | "monitor" | "param" | "mute";
 
 /** The MIDI signal a mapping listens for, captured via MIDI-learn.
  *  Matching is channel-agnostic (hardware varies); `channel` is kept

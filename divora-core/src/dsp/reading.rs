@@ -59,7 +59,8 @@ use serde::{Deserialize, Serialize};
 pub enum ReadingState {
     /// The audio engine isn't running.
     Stopped,
-    /// Input is digital silence — muted at the device or by push-to-modulate.
+    /// Input is muted — digital silence at the device, or Divora's own mute
+    /// (v1.56.0), when the microphone may still be live.
     Muted,
     /// Signal present but below the speech floor: room tone, breathing.
     Quiet,

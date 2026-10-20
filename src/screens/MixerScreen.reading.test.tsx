@@ -193,6 +193,31 @@ describe("voice reading — view resolution (pure)", () => {
     expect(
       readingAnnouncement({ kind: "muted", hasNumbers: false, stale: false }),
     ).not.toBe(spoken("live"));
+    expect(
+      readingAnnouncement({ kind: "divoraMuted", hasNumbers: false, stale: false }),
+    ).not.toBe(spoken("live"));
+  });
+
+  // v1.56.0: Divora's own mute is told apart by the reading itself.
+  it("says Muted in Divora from the reading's own flag", () => {
+    const divora = readingView(
+      update({ state: "muted", mutedInDivora: true, words: [], calibrated: false }),
+      true,
+    );
+    expect(divora.kind).toBe("divoraMuted");
+    expect(divora.hasNumbers).toBe(false);
+    expect(readingAnnouncement(divora)).toBe("Reading paused while your voice is muted.");
+    // A device mute, flagged or not: today's words.
+    for (const flag of [false, undefined]) {
+      const device = readingView(
+        update({ state: "muted", mutedInDivora: flag, words: [], calibrated: false }),
+        true,
+      );
+      expect(device.kind).toBe("muted");
+      expect(readingAnnouncement(device)).toBe("Input is silent.");
+    }
+    // The flag means nothing on any other state.
+    expect(readingView(update({ mutedInDivora: true }), true).kind).toBe("live");
   });
 
   it("takes the passing-through answer from the engine, not from the numbers", () => {
@@ -275,6 +300,34 @@ describe("voice reading — the card", () => {
 
     push(update());
     expect(getByTestId("reading-state")).toHaveTextContent(/live/i);
+  });
+
+  // v1.56.0: the store's mirror and the reading travel at different rates
+  // (an answer at once, a reading every 200 ms). Right after an unmute the
+  // mirror is already unmuted while the last reading still says Divora's
+  // mute; keyed off the mirror, the card flashed "Input silent" and
+  // announced it.
+  it("says Muted in Divora from the reading, whatever the mirror says", async () => {
+    const { app, getByLabelText, getByTestId } = setup();
+    const toggle = getByLabelText("Voice reading");
+    fireEvent.click(toggle);
+    await Promise.resolve();
+    const region = toggle.closest(".card")!.querySelector("[aria-live]")!;
+    expect(region).not.toBeNull();
+
+    app().applyMuteState({ muted: true, seq: 1 });
+    app().applyMuteState({ muted: false, seq: 2 });
+    readingHandler!(update({ state: "muted", mutedInDivora: true, words: [], calibrated: false }));
+    expect(getByTestId("reading-state")).toHaveTextContent("Muted in Divora");
+    expect(getByTestId("reading-state")).not.toHaveTextContent(/input silent/i);
+    expect(region.textContent).toBe("Reading paused while your voice is muted.");
+    expect(region.textContent).not.toContain("Input is silent.");
+
+    // And a device mute stays a device mute while Divora's mirror is muted.
+    app().applyMuteState({ muted: true, seq: 3 });
+    readingHandler!(update({ state: "muted", mutedInDivora: false, words: [], calibrated: false }));
+    expect(getByTestId("reading-state")).toHaveTextContent(/input silent/i);
+    expect(region.textContent).toBe("Input is silent.");
   });
 
   it("a pause shows the held window as visibly stale, with its age", async () => {
@@ -435,6 +488,7 @@ describe("voice reading — accessibility structure", () => {
       update(),
       update({ state: "quiet", stale: true, ageMs: 9000 }),
       update({ state: "muted", words: [], calibrated: false }),
+      update({ state: "muted", mutedInDivora: true, words: [], calibrated: false }),
       update({ state: "stopped", words: [], calibrated: false }),
       update({ state: "quiet", words: [], calibrated: false }),
       update({ wet: VOICED }),
