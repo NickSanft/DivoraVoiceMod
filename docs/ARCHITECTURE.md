@@ -586,6 +586,7 @@ event.id         | event.state | action
 **Persistence (v1.51.4).**
 
 - **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), `overlay:arrange` (v1.55.0) and `mute` (v1.56.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
+- **A refused key leaves the action unbound (v1.56.0).** `register_global_shortcut` takes the action's old shortcut out of the map, and unregisters it, before it parses the new accelerator (`rebind`, tested by `a_refused_key_never_leaves_the_old_one_bound`). Until v1.56.0 the parse came first, so an accelerator the parser refuses — Shift with a digit, captured as "!", the number pad's + ("Ctrl++") or *, a letter outside A to Z — returned early and left the old key live under a binding Settings no longer showed, until a restart or a Clear. The refusal itself is still only logged to the console.
 - **The Windows key:** the capture component labels it "Win", but the parser behind `register_global_shortcut` (global-hotkey 0.8.0) accepts only `Super` / `Cmd` / `Command`. `keysToAccelerator` and `normalizeAccelerator` turn "Win" into "Super" for every accelerator handed to the backend: the three actions, and soundboard tiles, including ones saved before the fix. `acceleratorToKeys` shows "Super" as "Win" again.
 
 ### Why two PTM listeners?
@@ -2796,13 +2797,16 @@ at 48 kHz with 480-frame buffers. `STARVE_CHAIN` in `mute.rs` is the kill
 switch; `false` makes `feed` a no-op.
 
 **What the press cuts.** The voice closes first, so what the chain still holds
-at the press — speech from just before it — is cut with it: about the last
-quarter-second with Voice Convert (its downsampler's 4096-sample chunk at
-16 kHz; see "DSP architecture"), and otherwise the delays of the chain's
-effects added up: 10 ms for a denoiser and 21 ms for each pitch or formant
-effect, so 43 ms or more in the 10 of the 24 bundled presets that run both
-pitch and formant; nothing with a passthrough chain. That is worked out from
-the code, not measured: no voice model was loaded in the real-app run. Keeping
+at the press — speech from just before it — is cut with it: the delays of the
+chain's effects added up, 10 ms for a denoiser and 21 ms for each pitch or
+formant effect, so 43 ms or more in the 10 of the 24 bundled presets that run
+both pitch and formant; nothing with a passthrough chain. A voice model loaded
+in Voice Convert adds about a quarter-second, streaming or not: its downsampler
+works in whole 4096-sample rounds at 16 kHz and puts out nothing until a round
+is in (a probe fed 480-frame buffers saw the first output after the 26th; see
+"DSP architecture"), so Deep Narrator with a model cuts about 0.31 s. That is
+worked out from the code and that probe, not measured in the app: no voice
+model was loaded in the real-app run. Keeping
 those words would mean holding the send open for the chain's real delay, and
 `VoiceConverter::latency_samples` reports about 13 ms for a chain whose real
 delay is about 256 ms; that is a follow-up. After an unmute the voice enters a

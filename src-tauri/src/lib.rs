@@ -2333,6 +2333,27 @@ fn detect_virtual_mic() -> VirtualMicStatus {
     detect_virtual_mic_core()
 }
 
+/// Gives `id` the key `accelerator` names in `map`, returning the shortcut
+/// it had (to unregister) and the parsed new one (to register). The old one
+/// comes out before the parse: until v1.56.0 a key the parser refuses (Shift
+/// with a digit arrives as "!") returned early and left the old key live
+/// under a binding Settings no longer showed — a mute hotkey still muting
+/// from a key the user thought was free.
+fn rebind(
+    map: &mut HashMap<String, Shortcut>,
+    id: &str,
+    accelerator: &str,
+) -> (Option<Shortcut>, Result<Shortcut, String>) {
+    let old = map.remove(id);
+    let new = accelerator
+        .parse::<Shortcut>()
+        .map_err(|e| format!("{e:?}"));
+    if let Ok(shortcut) = new {
+        map.insert(id.to_owned(), shortcut);
+    }
+    (old, new)
+}
+
 #[tauri::command]
 fn register_global_shortcut(
     app: AppHandle,
@@ -2340,14 +2361,14 @@ fn register_global_shortcut(
     id: String,
     accelerator: String,
 ) -> Result<(), String> {
-    let shortcut: Shortcut = accelerator.parse().map_err(|e| format!("{e:?}"))?;
-    {
+    let shortcut = {
         let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
-        if let Some(old) = map.remove(&id) {
+        let (old, new) = rebind(&mut map, &id, &accelerator);
+        if let Some(old) = old {
             let _ = app.global_shortcut().unregister(old);
         }
-        map.insert(id.clone(), shortcut);
-    }
+        new?
+    };
     app.global_shortcut()
         .register(shortcut)
         .map_err(|e| e.to_string())?;
@@ -3165,9 +3186,9 @@ mod tests {
     use super::{
         cloned_voices_dir, default_clone_base, emit_speak, hides_on_close, hotkey_mute_request,
         is_safe_voice_id, level_update, list_cloned_voice_infos, load_cloned_voice, mute_on_hotkey,
-        preview_path_in, read_preview, rename_cloned_voice_in, save_tts_clip, scan_voice_dir,
-        slugify_preset_id, speak_commands, unique_preset_id, write_preview, ClonedMeta,
-        EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
+        preview_path_in, read_preview, rebind, rename_cloned_voice_in, save_tts_clip,
+        scan_voice_dir, slugify_preset_id, speak_commands, unique_preset_id, write_preview,
+        ClonedMeta, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
         VoiceReadingUpdate, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
         PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
     };
@@ -3175,9 +3196,11 @@ mod tests {
     use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
     use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
     use divora_core::tts::babble;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use tauri_plugin_global_shortcut::Shortcut;
 
     /// Every combination, in the order the menu shows it. The first two are
     /// v1.53.0's and v1.54.0's menus exactly: the overlay's item must never
@@ -3549,6 +3572,28 @@ mod tests {
         assert_eq!(engine.input_mute(), st(true, 1), "another id flipped it");
         mute_on_hotkey(&engine, "mute", true);
         assert_eq!(engine.input_mute(), st(false, 2));
+    }
+
+    /// v1.56.0: a rebind takes the old key out first, so a key the parser
+    /// refuses leaves the action unbound instead of still on its old key.
+    #[test]
+    fn a_refused_key_never_leaves_the_old_one_bound() {
+        let f9: Shortcut = "F9".parse().unwrap();
+        let mut map = HashMap::from([("mute".to_owned(), f9)]);
+        for refused in ["Ctrl+Shift+!", "Ctrl++", "Ctrl+*", "Ctrl+É", "ZZZ", ""] {
+            map.insert("mute".to_owned(), f9);
+            let (old, new) = rebind(&mut map, "mute", refused);
+            assert_eq!(old, Some(f9), "{refused:?}: the old key to unregister");
+            assert!(new.is_err(), "{refused:?} parsed");
+            assert!(!map.contains_key("mute"), "{refused:?} left mute bound");
+        }
+        let (old, new) = rebind(&mut map, "mute", "Ctrl+Shift+1");
+        assert_eq!(old, None);
+        let digit = new.expect("Ctrl+Shift+1 parses");
+        assert_eq!(map.get("mute"), Some(&digit));
+        let (old, new) = rebind(&mut map, "mute", "F9");
+        assert_eq!((old, new), (Some(digit), Ok(f9)));
+        assert_eq!(map.get("mute"), Some(&f9));
     }
 
     /// v1.56.0: the shortcut handler needs an `AppHandle`, so no test can run
