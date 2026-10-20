@@ -458,7 +458,7 @@ describe("SettingsScreen — the mute (v1.56.0)", () => {
     await flush();
     const section = view.getByText("Control surfaces").closest("section")!;
     expect(squash(section.textContent)).toContain(
-      "Mute your voice toggles on a pad that sends a note (its mapping shows Note). On a knob, fader or CC button it mutes when the control goes past halfway and unmutes when it comes back a little below halfway (59 or less); a control that stays on one side never changes it, except that its first move after launch (or after you pick the device or change its mapping) mutes if it is past halfway.",
+      "Mute your voice toggles with each press of a pad that sends a note (its mapping shows Note), unless the pad is set to latch: then every second press just ends the note and does nothing. On a knob, fader or CC button it mutes when the control goes past halfway and unmutes when it comes back a little below halfway (59 or less); a control that stays on one side never changes it, except that its first move after launch (or after you pick the device or change its mapping) mutes if it is past halfway.",
     );
     // The sentence against the rule it describes (data/mute.ts). Its first
     // move mutes past halfway and does nothing below it...

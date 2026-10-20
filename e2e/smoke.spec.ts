@@ -1333,7 +1333,7 @@ test.describe("mute (v1.56)", () => {
     await expect.poll(async () => (await invokesOf(page, "list_midi_inputs")).length).toBeGreaterThan(0);
     const surfaces = settingsSection(page, "Control surfaces");
     await expect(surfaces).toContainText(
-      "Mute your voice toggles on a pad that sends a note (its mapping shows Note). On a knob, fader or CC button it mutes when the control goes past halfway and unmutes when it comes back a little below halfway (59 or less); a control that stays on one side never changes it, except that its first move after launch (or after you pick the device or change its mapping) mutes if it is past halfway.",
+      "Mute your voice toggles with each press of a pad that sends a note (its mapping shows Note), unless the pad is set to latch: then every second press just ends the note and does nothing. On a knob, fader or CC button it mutes when the control goes past halfway and unmutes when it comes back a little below halfway (59 or less); a control that stays on one side never changes it, except that its first move after launch (or after you pick the device or change its mapping) mutes if it is past halfway.",
     );
 
     await surfaces.getByRole("button", { name: "Add mapping" }).click();

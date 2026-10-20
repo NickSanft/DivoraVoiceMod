@@ -1462,8 +1462,10 @@ function ControlSurfacesSection(): JSX.Element {
           Bind a MIDI controller's pads and knobs to DivoraVoice. Pick your
           device, add a mapping, then click <strong>Learn</strong> and move a
           pad or knob to capture it. Mappings are saved locally and restored on
-          the next launch. <strong>Mute your voice</strong> toggles on a pad
-          that sends a note (its mapping shows <strong>Note</strong>). On a knob, fader or CC button it mutes when the control goes past
+          the next launch. <strong>Mute your voice</strong> toggles with each
+          press of a pad that sends a note (its mapping shows{" "}
+          <strong>Note</strong>), unless the pad is set to latch: then every
+          second press just ends the note and does nothing. On a knob, fader or CC button it mutes when the control goes past
           halfway and unmutes when it comes back a little below halfway (59
           or less); a control that stays on one side never changes it,
           except that its first move after launch (or after you pick the
