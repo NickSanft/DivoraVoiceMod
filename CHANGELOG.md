@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.56.0] — 2026-10-20 — Mute that mutes
+
 Mute now silences your voice — on the call, in your headphones, and in Divora's WAV recordings, screen recordings and Replay — while your soundboard, Speak and Critter Chatter keep playing. It fades out and back in over a few milliseconds instead of switching off and on in one step. Put it on a hotkey (one a Stream Deck **Hotkey** action can send), a MIDI pad, knob or fader, a glyph, or the new **Mute** button on the Mixer.
 
 ### Added
