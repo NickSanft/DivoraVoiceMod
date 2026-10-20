@@ -23,7 +23,7 @@ Mute now silences your voice — on the call, in your headphones, and in Divora'
 ### Fixed
 
 - **Settings said the Monitor toggle never touches the call.** With no separate monitor device, it turns Divora's whole output on or off, the call included. The note under **Monitor output (hear yourself)** now says so unless a separate monitor device is picked, and the **Toggle monitor** hotkey's description no longer calls it "the headphone sidetone".
-- **Changing a hotkey could leave the wrong key working, or stop the wrong one.** Changing it to a key Divora can't register left the old key working, though Settings no longer showed it, until you set another key, cleared it or restarted Divora; now the old key stops as soon as you change it. And when two hotkeys shared a key, changing or clearing one stopped the other's too, though Settings still showed it; now the other keeps it.
+- **Changing a hotkey could leave the wrong key working, or stop the wrong one.** Changing it to a key Divora can't read, such as Ctrl+Shift+1 (Settings shows **!** for the 1), left the old key working, though Settings no longer showed it, until you set another key, cleared it or restarted Divora; now the old key stops as soon as you change it. And when two hotkeys shared a key, changing or clearing one stopped the other's too, though Settings still showed it; now the other keeps it.
 
 ### Tests
 
