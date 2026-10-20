@@ -2333,18 +2333,28 @@ fn detect_virtual_mic() -> VirtualMicStatus {
     detect_virtual_mic_core()
 }
 
+/// Takes `id`'s shortcut out of `map`, returning it to unregister only when
+/// no other action still holds the same key. Windows keeps one registration
+/// per key, so two actions bound to one key share it: until v1.56.0,
+/// changing or clearing one of them unregistered it and silenced the other,
+/// whose key Settings still showed.
+fn release(map: &mut HashMap<String, Shortcut>, id: &str) -> Option<Shortcut> {
+    let old = map.remove(id)?;
+    (!map.values().any(|held| *held == old)).then_some(old)
+}
+
 /// Gives `id` the key `accelerator` names in `map`, returning the shortcut
-/// it had (to unregister) and the parsed new one (to register). The old one
-/// comes out before the parse: until v1.56.0 a key the parser refuses (Shift
-/// with a digit arrives as "!") returned early and left the old key live
-/// under a binding Settings no longer showed — a mute hotkey still muting
-/// from a key the user thought was free.
+/// to unregister (see [`release`]) and the parsed new one (to register). The
+/// old one comes out before the parse: until v1.56.0 a key the parser refuses
+/// (Shift with a digit arrives as "!") returned early and left the old key
+/// live under a binding Settings no longer showed — a mute hotkey still
+/// muting from a key the user thought was free.
 fn rebind(
     map: &mut HashMap<String, Shortcut>,
     id: &str,
     accelerator: &str,
 ) -> (Option<Shortcut>, Result<Shortcut, String>) {
-    let old = map.remove(id);
+    let old = release(map, id);
     let new = accelerator
         .parse::<Shortcut>()
         .map_err(|e| format!("{e:?}"));
@@ -2382,7 +2392,7 @@ fn unregister_global_shortcut(
     id: String,
 ) -> Result<(), String> {
     let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
-    if let Some(shortcut) = map.remove(&id) {
+    if let Some(shortcut) = release(&mut map, &id) {
         app.global_shortcut()
             .unregister(shortcut)
             .map_err(|e| e.to_string())?;
@@ -3186,7 +3196,7 @@ mod tests {
     use super::{
         cloned_voices_dir, default_clone_base, emit_speak, hides_on_close, hotkey_mute_request,
         is_safe_voice_id, level_update, list_cloned_voice_infos, load_cloned_voice, mute_on_hotkey,
-        preview_path_in, read_preview, rebind, rename_cloned_voice_in, save_tts_clip,
+        preview_path_in, read_preview, rebind, release, rename_cloned_voice_in, save_tts_clip,
         scan_voice_dir, slugify_preset_id, speak_commands, unique_preset_id, write_preview,
         ClonedMeta, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
         VoiceReadingUpdate, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
@@ -3594,6 +3604,44 @@ mod tests {
         let (old, new) = rebind(&mut map, "mute", "F9");
         assert_eq!((old, new), (Some(digit), Ok(f9)));
         assert_eq!(map.get("mute"), Some(&f9));
+    }
+
+    /// v1.56.0: two actions on one key share Windows' one registration, so
+    /// changing or clearing one leaves the key registered for the other; the
+    /// key is unregistered once the last action lets it go.
+    #[test]
+    fn a_shared_key_stays_registered_for_the_other_action() {
+        let f9: Shortcut = "F9".parse().unwrap();
+        let mut map = HashMap::from([("mute".to_owned(), f9), ("panic".to_owned(), f9)]);
+        let (old, new) = rebind(&mut map, "mute", "F10");
+        assert_eq!(old, None, "moving mute off F9 unregistered panic's key");
+        assert!(new.is_ok());
+        assert_eq!(map.get("panic"), Some(&f9));
+        map.insert("mute".to_owned(), f9);
+        assert_eq!(release(&mut map, "mute"), None, "clearing mute did");
+        assert_eq!(map.get("panic"), Some(&f9));
+        assert_eq!(release(&mut map, "panic"), Some(f9), "the last holder");
+        assert!(map.is_empty());
+        assert_eq!(release(&mut map, "panic"), None, "an unbound action");
+    }
+
+    /// v1.56.0: the two shortcut commands need an `AppHandle`, so this reads
+    /// the source: they take an action's key out only through `rebind` and
+    /// `release`, and nothing else takes one out of the map.
+    #[test]
+    fn the_shortcut_commands_let_keys_go_through_release() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        for (call, n) in [
+            ("rebind(&mut map, &id, &accelerator)", 1),
+            ("release(&mut map, &id)", 1),
+            ("map.remove(", 1),
+        ] {
+            assert_eq!(prod.matches(call).count(), n, "{call}");
+        }
     }
 
     /// v1.56.0: the shortcut handler needs an `AppHandle`, so no test can run
