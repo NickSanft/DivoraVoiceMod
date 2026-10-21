@@ -282,7 +282,7 @@ src/
 - The reactive-modulation queue beside it works the same way and for the same reason — with the reactive panel on it is on the preset-switch path too, since a config goes out on every preset switch and every input event of a targeted slider (with the panel off the config is constant and the frontend dedupes it away). It is bounded, and `ReactiveModulator::configure` **swaps** the route tables rather than copying, so the config leaves through the graveyard carrying the table it displaced.
 - One free remains **in the drain**: `SetParam` drops the owned key string it was sent, once per slider tick. `divora-core/tests/rt_chain_swap_allocations.rs` asserts it at exactly one — that test drives the real drain functions, not copies of them, and pins the zeros for everything else.
 - The soundboard drain takes the same route now: `SoundboardMixer::apply` returns what it retired — a displaced voice's name and decoded clip, or a `Stop`'s own owned name — and the callback pushes it to the graveyard. `play` uses `mem::replace` rather than `*v = Voice { .. }`, which is where the free was: an idle slot still owns an `Arc`, a stopped slot still owns its clip, and when the callback holds a clip's last reference, stealing that slot freed the whole buffer there (measured 3 frees for a 1.9 MB clip, one of them the 1.9 MB). `apply` is `#[must_use]`, and because that only catches an *accidental* discard, a source-level test also pins that the callback routes the value rather than dropping it.
-- **`VoiceConvert` inference is the remaining architectural violation, and it is not an allocation problem.** With a model loaded, inference blocks the audio callback well past its deadline: measured on the production path with the bundled model, 23 of 600 callbacks took **83–106 ms** against a 10 ms budget, one every ~260 ms, and the first ~240 ms after a voice lands is silence. The bundled model is the *streaming* export (208-sample chunks), but the downsampler feeding it is built with a 4096-sample output chunk, so a single round hands it ~20 inferences to run back to back. `ort` also allocates tensors per call. (v1.51.1's note said 14–16 ms; that measured `run_inference`, the non-streaming fallback that no longer ships.) Nothing short of moving inference to its own thread behind a latency-compensating queue fixes that, so it is deliberately unfixed and deliberately stated. v1.51.2 moved the *resampling* half off the thread and pinned it; the inference half is untouched, and no test reaches it because CI has no ONNX runtime.
+- **`VoiceConvert` inference is the remaining architectural violation.** It runs in the audio callback, and `ort` allocates tensors on every call. Through v1.56.0 it was a deadline problem too: the downsampler ran whole 4096-sample rounds, so each round handed the bundled *streaming* model (208-sample chunks) about twenty inferences to run back to back in one callback — with `the_bundled_model_in_the_callback`, 78 of 2 000 callbacks at 480 frames took **101–115 ms** against a 10 ms budget, one a round (an earlier production-path run saw 23 of 600 at 83–106 ms). Both resamplers now convert all the input each callback brings (`resample_rounds`), so inferences come one at a time as the audio arrives: at 480 frames about three callbacks in four run one, of about 5 ms, and none of 2 000 went over budget in three runs (worst 7.8–9.4 ms, mean 4.0–4.3 ms; the converter alone, nothing else in the chain, test profile). At 256 frames (a 5.33 ms budget) one inference does not fit: 500–696 of 3 750 went over, by up to 3.5 ms. A non-streaming model still makes its one 4096-sample call in a single callback (v1.51.1 measured `run_inference` at 14–16 ms). Taking inference off the callback still means its own thread behind a latency-compensating queue; that is deliberately unfixed and deliberately stated, and no CI test reaches inference because CI has no ONNX runtime. v1.51.2 moved the resamplers' construction off the thread and pinned it; the phases around inference, priming included, allocate nothing (`the_phases_around_inference_allocate_nothing`).
 - Engine restarts (Stop → Start) clear the chain; the frontend re-sends `SetChain` via a `createEffect` on `(presetId, engineRunning)`.
 
 ### Frontend chain sync
@@ -1100,6 +1100,40 @@ model, and the installer-bundling pipeline are documented in detail in
 (threaded cache tensors, ~13 ms chunks) lands in v1.3.0; see the
 [CHANGELOG](../CHANGELOG.md).
 
+**The hold.** `VoiceConverter` delays the voice by a fixed `hold_frames`: a
+whole inference chunk, both resamplers' lookahead (`MonoResampler::LOOKAHEAD`,
+64 frames — at 48 kHz for the downsampler, at 16 kHz, so 192 of ours, for the
+upsampler), and one 16 kHz sample more, because rubato sums a round's input
+need in f32 and rounds it up, and at a chunk's end that one sample is the next
+chunk's. That is 883 frames (18.4 ms) for a streaming model and 12 547
+(261.4 ms) for a non-streaming one. Both resamplers size every round to what is
+queued, so a callback converts all its input bar the lookahead. On engaging,
+`run_phases` primes the wet and the dry output queues with the hold's silence,
+so every converted sample is ready before its slot comes round at any buffer
+size, the delay never moves, and the wet/dry mix lines up. `latency_samples`
+reports the same `hold()`, behind the same `engaged` test `process` bypasses
+on, so it is 0 whenever the effect passes through — at any rate but 48 kHz too.
+Pinned through the real phase order with a copy standing in for inference, at
+every buffer size from 1 to 64 and a spread up to 4 096 frames
+(`the_voice_comes_out_exactly_the_hold_late_at_any_buffer_size`): the first
+sound comes out exactly the hold late, no output sample goes without a
+converted one, and over that sweep a hold two frames shorter still never ran
+dry while three shorter did. Not counted: the model's own delay — about 5 ms
+for the bundled narrator, by an envelope measure that reads the identity
+pipeline's hold to within its quarter-millisecond
+(`the_bundled_model_in_the_callback`, ignored in CI).
+
+Through v1.56.0 there was no hold and the downsampler ran whole 4096-sample
+rounds: fed 480-frame buffers it put out nothing until the 26th, then 4096
+samples at once (the 49th at 256 frames). Through the phase order with a
+streaming model's chunk, the first converted sample came out 12 000 samples in,
+the output then ran dry for about 1 000 more as each round's last partial chunk
+waited a further round, and the delay settled at 13 056 samples (272 ms; 277 ms
+at 256 frames) while `latency_samples` reported one chunk, 624 (13 ms). With a
+non-streaming model it settled at 12 544 against a reported 12 288. The dry
+copy was never delayed: until the wet queue first filled, phase 5 popped it and
+wrote silence.
+
 ## Phase 13 — monitor output routing
 
 A **second, independent cpal output stream** so the main send can go to
@@ -1129,7 +1163,7 @@ serial). Implemented for the effects that buffer:
 
 | Effect | Added latency |
 |---|---|
-| Voice Convert | the inference chunk — and only when a model is loaded (passthrough adds 0) |
+| Voice Convert | its hold (`hold_frames`): 883 samples (18.4 ms) with a streaming model, 12 547 (261.4 ms) with a non-streaming one — only while it converts (passthrough, or any rate but 48 kHz, adds 0); the model's own delay is not counted |
 | Denoiser | one 480-sample RNNoise frame (10 ms) — and only at 48 kHz |
 | Pitch / Formant | the phase-vocoder STFT window (1024 samples ≈ 21 ms each) |
 | Gate / EQ / Robot / Distortion | 0 (sample-by-sample) |
@@ -1199,6 +1233,9 @@ see the [CHANGELOG](../CHANGELOG.md) for the blow-by-blow:
 - **Streaming LLVC** (v1.3.0) — re-exported in cache-tensor streaming mode;
   Voice Convert latency drops ~256 ms → ~13 ms. Auto-detects the model
   contract (streaming vs stateless), both still degrading to passthrough.
+  (13 ms was the chunk alone: through v1.56.0 the downsampler's 4096-sample
+  rounds held every model's voice about a quarter-second — see Phase 12, "The
+  hold".)
 - **Voice pack** (v1.5.0) — five DSP presets (Leviathan, The Imp, Dispatch,
   Corrupted, Whisper Wraith) over existing effects → 16 bundled presets.
 - **Preview-then-Use presets** (v1.6.0) — the Presets screen splits a
@@ -2151,8 +2188,10 @@ is no engine, and the event's `audioLostAt` says when that began.
 3. **Placement.** The soundboard at its buffer's time. The voice earlier, by
    input latency + the input ring's depth (smoothed; moved only in a pause, or
    mid-word past 20 ms) + the chain's latency (exact; moves with the chain) —
-   so a non-streaming voice model's 256 ms doesn't put the voice a quarter of a
-   second behind the picture.
+   so Voice Convert's hold (18.4 ms with the bundled voice, 261.4 ms with a
+   non-streaming model) doesn't put the voice behind the picture. Through
+   v1.56.0 the chain reported 13 ms for the bundled voice while holding it about
+   272 ms, so by the code the voice was placed about a quarter-second late.
 4. **Clock.** `ClockFit` fits engine frames against the video's clock (drift
    held to ±0.5 %), and a Kaiser-windowed sinc reads the mix at the fitted
    positions straight into 48 kHz, so the track neither slides over a long take
@@ -2787,8 +2826,9 @@ statement.
 `feed` closes the chain's input too, so while muted the chain hears only
 silence. Zeroing the voice after the chain alone would keep the chain running
 on the live microphone, and at unmute it would let out what it still held of
-words said while muted: up to about a quarter-second through Voice Convert's
-downsampler, seconds through an Echo with high feedback. Starved, what is said
+words said while muted: about 18 ms through Voice Convert with the bundled
+voice (a quarter-second through v1.56.0), seconds through an Echo with high
+feedback. Starved, what is said
 once you're muted never enters the chain
 (`what_is_said_while_muted_never_reaches_the_send`). What is said right around
 the press can still enter: up to a buffer before the callback reads the word,
@@ -2801,15 +2841,16 @@ at the press — speech from just before it — is cut with it: the delays of th
 chain's effects added up, 10 ms for a denoiser and 21 ms for each pitch or
 formant effect, so 43 ms or more in the 10 of the 24 bundled presets that run
 both pitch and formant; nothing with a passthrough chain. A voice model loaded
-in Voice Convert adds about a quarter-second, streaming or not: its downsampler
-works in whole 4096-sample rounds at 16 kHz and puts out nothing until a round
-is in (a probe fed 480-frame buffers saw the first output after the 26th; see
-"DSP architecture"), so Deep Narrator with a model cuts about 0.31 s. That is
-worked out from the code and that probe, not measured in the app: no voice
-model was loaded in the real-app run. Keeping
-those words would mean holding the send open for the chain's real delay, and
-`VoiceConverter::latency_samples` reports about 13 ms for a chain whose real
-delay is about 256 ms; that is a follow-up. After an unmute the voice enters a
+in Voice Convert adds its hold (Phase 12, "The hold"): 18.4 ms with the bundled
+streaming voice, plus about 5 ms inside the model, or 261.4 ms with a
+non-streaming one, so Deep Narrator with the bundled model cuts about 75 ms.
+Through v1.56.0 it added about a quarter-second whatever the model — the
+downsampler's whole 4096-sample rounds — and Deep Narrator cut about 0.31 s.
+Both are worked out from the code and the tests' probes, not measured in the
+app: no voice model was loaded in the real-app run. Keeping those words would
+mean holding the send open for the chain's delay, which
+`EffectChain::latency_samples` now reports (bar the model's own few
+milliseconds). After an unmute the voice enters a
 chain that held silence, as after any pause, and the reactive envelope
 (`modEnv`) falls to rest while muted.
 

@@ -32,9 +32,9 @@
 //! measures the command and config drains, with no resampler, no voice model
 //! session, no soundboard and no inference in the context it builds. One thing
 //! in the callback is still outside every one of these files —
-//! `VoiceConverter`'s INFERENCE, which allocates and blocks for 14–16 ms with
-//! the bundled model. That is architectural, documented at its site, and
-//! deliberately unfixed.
+//! `VoiceConverter`'s INFERENCE, which allocates, and blocks for about 5 ms a
+//! chunk with the bundled model — one chunk most callbacks at 480 frames. That
+//! is architectural, documented at its site, and deliberately unfixed.
 //!
 //! Everything else that used to be on this list has its own coverage now, and
 //! these are pointers rather than silence so the files cannot drift:

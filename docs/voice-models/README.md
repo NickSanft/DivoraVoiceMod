@@ -13,7 +13,7 @@ public-domain audiobook narrator.
 picks per loaded model (a model is "streaming" if it has an `enc_buf`
 input).
 
-### Streaming (v1.3.0+, the bundled narrator) — ~13 ms latency
+### Streaming (v1.3.0+, the bundled narrator) — ~18 ms latency
 
 Threads four cache tensors + a 2·L front-context between 208-sample
 chunks. Fixed shapes (batch 1, f32):
@@ -30,9 +30,14 @@ chunks. Fixed shapes (batch 1, f32):
 
 All caches are zero-initialized (verified equivalent to the model's
 `None`-init). The engine streams 208-sample chunks (`dec_chunk_size 13 ·
-L 16`) ≈ 13 ms, threading the four `*_out` caches back in next call.
+L 16`) ≈ 13 ms, threading the four `*_out` caches back in next call. With
+the resamplers' lookahead on top, Divora holds the voice 883 samples at
+48 kHz (18.4 ms; `hold_frames` in `voice_convert.rs`), and the bundled
+model adds about 5 ms of its own. Through v1.56.0 the downsampler worked
+in whole 4096-sample rounds, so every model's voice was held about a
+quarter-second whatever its chunk.
 
-### Non-streaming (fallback) — ~256 ms latency
+### Non-streaming (fallback) — ~261 ms latency
 
 | dir | name | shape |
 |---|---|---|
@@ -137,10 +142,11 @@ export, then `gh release upload voice-assets-v2 <files> --clobber`.
 
 ## Notes
 
-- v1.3.0 ships the **streaming** export (208-sample chunks, ~13 ms),
-  threading the model's four cache tensors between chunks. The
-  non-streaming path (4096-sample independent chunks, ~256 ms) remains as
-  the fallback for models that only expose the single `audio` → `output`
-  contract.
+- v1.3.0 ships the **streaming** export (208-sample chunks, ~13 ms each;
+  about 18 ms through Divora's resamplers once they stopped working in
+  whole 4096-sample rounds, after v1.56.0), threading the model's four
+  cache tensors between chunks. The non-streaming path (4096-sample
+  independent chunks, ~261 ms through Divora) remains as the fallback for
+  models that only expose the single `audio` → `output` contract.
 - Bundling the DLL + a model into the installer (so it works without
   this manual step) is tracked as future packaging work.

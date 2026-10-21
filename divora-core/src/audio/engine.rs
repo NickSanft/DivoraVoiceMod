@@ -1826,10 +1826,11 @@ fn build_output_stream(
                 // device-rate resampler no longer allocates per buffer, and
                 // `VoiceConverter` no longer builds its sinc pair here; v1.51.2
                 // fixed all three. What is left in this callback is
-                // `VoiceConvert` INFERENCE, which allocates and overruns the
-                // deadline badly (~83–106 ms on one callback in twenty-six with
-                // the bundled model). Still do not read the line above as
-                // covering the whole callback.
+                // `VoiceConvert` INFERENCE, which allocates, and runs one ~5 ms
+                // inference about three callbacks in four at 480 frames with
+                // the bundled model — inside a 10 ms buffer, not inside a
+                // 256-frame one (`the_bundled_model_in_the_callback`). Still do
+                // not read the line above as covering the whole callback.
                 drain_dsp_edits(&dsp_rx, &mut chain, &mut graveyard, &reading);
                 while let Ok(cmd) = sb_rx.try_recv() {
                     // A Play displaces whatever held the slot and a Stop

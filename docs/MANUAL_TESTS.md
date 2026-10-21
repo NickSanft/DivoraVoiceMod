@@ -340,7 +340,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Add `voice_convert` to a chain and select a model → after a brief background load, your voice converts to the target voice; there is **no** UI hang while the model loads.
 - [ ] Select a model file that doesn't exist / is invalid → the effect degrades to passthrough and never hangs (no 60 s freeze).
 - [ ] Disable Voice Convert → voice returns to the pre-conversion signal immediately.
-- [ ] **Streaming (v1.3.0):** with the bundled narrator, the converted voice has *conversational* latency — talking over a call feels responsive, not the old ~quarter-second lag. The Mixer latency readout shows ~13 ms (vs ~256 ms for a non-streaming model). No clicks/seams between chunks during continuous speech.
+- [ ] **Streaming (v1.3.0):** with the bundled narrator, the converted voice has *conversational* latency — talking over a call feels responsive, not the old ~quarter-second lag. The Mixer latency readout shows ~18 ms (vs ~261 ms for a non-streaming model). No clicks/seams between chunks during continuous speech.
 - [ ] Confirm the converted audio reaches a Discord call when output = CABLE Input.
 
 ## Monitor output routing (Phase 13)
@@ -356,7 +356,7 @@ Run this checklist before tagging any release that touches audio capture, output
 ## Latency readout (Phase 14)
 
 - [ ] With the engine running and an empty/sample-by-sample chain, the Mixer header shows no latency suffix (or `+0 ms`).
-- [ ] Enable **Voice Convert** with the bundled **streaming** narrator (v1.3.0) → header shows roughly `+13 ms` (not the old ~256 ms), and the converted voice is usable in live conversation. A non-streaming BYO model still shows ~256 ms.
+- [ ] Enable **Voice Convert** with the bundled **streaming** narrator (v1.3.0) → header shows roughly `+18 ms` (not ~261 ms), and the converted voice is usable in live conversation. A non-streaming BYO model shows ~261 ms.
 - [ ] Enable the **denoiser** at 48 kHz → adds ~10 ms; enable **pitch** or **formant** → ~21 ms each. The number updates the instant you toggle an effect.
 - [ ] Disable all latency-adding effects → the readout returns to ~0.
 - [ ] Hover the readout → tooltip explains the contributors.
@@ -533,7 +533,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] **M4 — A glyph** (owner check — not run): Settings → Glyph casting: set a glyph's action to **Mute / unmute**. On the Mixer, cast it → the omen says **Mute**, and you're muted; cast it again → the omen says **Unmute**, and you're unmuted. Each cast does what its omen said.
 - [ ] **M5 — A real unplug** (owner check — not run): mute, then unplug the headset → after Divora recovers it's still muted, and no burst of your voice reaches the call or a recording.
 - [ ] **M6 — Voice Convert** (owner check — not run): a preset with Voice Convert and its model installed (e.g. **Deep Narrator**). Mute, say a word, unmute at once → the word is never heard.
-- [ ] **M6b — The end-of-word cut** (owner check — not run): the same preset; say a word that ends right as you press **Mute**, with a WAV recording running (or a listener on the call), and note how much of the word is missing. Expected: about its last third of a second with Deep Narrator (about 0.31 s, worked out from the code: Voice Convert's downsampler holds about 256 ms whatever the model, and the preset's denoiser, pitch and formant about 52 ms more). Record the length under Measured below.
+- [ ] **M6b — The end-of-word cut** (owner check — not run): the same preset; say a word that ends right as you press **Mute**, with a WAV recording running (or a listener on the call), and note how much of the word is missing. Expected: about its last 75 ms with Deep Narrator, worked out from the code: Voice Convert holds the voice 18 ms with the bundled model plus about 5 ms inside the model, and the preset's denoiser, pitch and formant about 52 ms more. (Through v1.56.0 it was about 0.31 s: the downsampler held about 256 ms whatever the model.) Record the length under Measured below.
 - [ ] **M7 — Voice reading** (owner check — not run): the reading on, talking: mute → the card reads **Muted in Divora** with the last reading held, and a screen reader says "Reading paused while your voice is muted."; unmute and keep talking → the panel recovers within a few seconds, with no reading that shows the after-effects half as silent. **At unmute the panel never shows "Input silent", and the screen reader never says "Input is silent."**
 - [ ] **M8 — Screen readers** (owner check — not run), with Narrator on; record each case under Measured or Not measured below: **(a)** Divora focused — mute and unmute with the Mixer's button, then with the hotkey: each time "Your voice is muted.", then "Your voice is unmuted."; **(b)** another app focused (Discord) — the hotkey; **(c)** Divora hidden to the tray — the hotkey. Nothing is said at launch: the announcer stays quiet until the first mute. The CHANGELOG's screen-reader sentence covers only the cases that pass.
 - [ ] **M9 — Light theme** (owner check — not run): Settings → Appearance → Theme → **Light**, then mute → the titlebar's red **Muted** pill reads clearly.
