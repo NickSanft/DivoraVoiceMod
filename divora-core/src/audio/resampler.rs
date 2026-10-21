@@ -59,6 +59,9 @@ use super::AudioEngineError;
 /// expensive operation here and must not happen on the audio thread.
 const MAX_RATIO_TRIM: f64 = 1.05;
 
+/// Taps in the windowed sinc every round interpolates with.
+const SINC_LEN: usize = 128;
+
 /// Streaming mono resampler.
 ///
 /// Allocates at construction and never again. One `process` round per call,
@@ -87,6 +90,13 @@ pub struct MonoResampler {
 }
 
 impl MonoResampler {
+    /// Input frames past an output frame's own position that a round must
+    /// already have to write it: half the sinc. rubato starts its read position
+    /// that far back, so the output is not delayed by it — but nothing can come
+    /// out until it has arrived. The first round asks for it on top of its
+    /// share of the input, and every later round is that far behind.
+    pub const LOOKAHEAD: usize = SINC_LEN / 2;
+
     /// Create a resampler that converts `input_rate` → `output_rate` and can
     /// produce up to `max_out_frames` output frames per round.
     ///
@@ -106,7 +116,7 @@ impl MonoResampler {
         let max_out_frames = max_out_frames.max(1);
         let ratio = f64::from(output_rate) / f64::from(input_rate);
         let params = SincInterpolationParameters {
-            sinc_len: 128,
+            sinc_len: SINC_LEN,
             f_cutoff: 0.95,
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,

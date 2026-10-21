@@ -9,14 +9,16 @@
 //!
 //! 1. **Steps.** A chunk that arrives well after the line [`ClockFit`] has
 //!    drawn through the earlier ones means the audio really did stop — the
-//!    device starved, as one voice-conversion buffer in twenty-six makes it
-//!    — and the gap is kept, as silence, rather than averaged into the clock.
+//!    device starved, as one voice-conversion buffer in twenty-six did
+//!    through v1.56.0 — and the gap is kept, as silence, rather than averaged
+//!    into the clock.
 //! 2. **Drops.** A jump in the frame index is buffers the engine could not
 //!    keep; they become silence of exactly their length.
 //! 3. **Placement.** The soundboard goes where its buffer's timestamp says.
 //!    The voice goes earlier, by how long it had already been on its way:
-//!    input latency, the input ring, and the effect chain's own delay — a
-//!    non-streaming voice model's 256 ms included. The jittery part is
+//!    input latency, the input ring, and the effect chain's own delay — Voice
+//!    Convert's 18 ms with the bundled voice, 261 ms with a non-streaming
+//!    model. The jittery part is
 //!    smoothed, and the voice is only moved to follow it in a pause — or
 //!    mid-word if it is 20 ms out; the chain's part is exact and moves when
 //!    the chain does.

@@ -273,7 +273,7 @@ function PresetHeader(props: PresetHeaderProps): JSX.Element {
             )}
           </Show>
           <Show when={app.engineRunning() && app.dspLatencyMs() >= 0.5}>
-            <span title="Latency added by the active effects (e.g. Voice Convert ≈ 256 ms, Denoiser ≈ 10 ms)">
+            <span title="Latency added by the active effects (e.g. Voice Convert ≈ 18 ms with the bundled voice, Denoiser ≈ 10 ms)">
               {" "}
               · +{Math.round(app.dspLatencyMs())} ms latency
             </span>
