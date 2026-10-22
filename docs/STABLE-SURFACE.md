@@ -320,7 +320,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `overlay:status` | `OverlayStatus` | backend → all windows, on every change of any field — v1.55.0. The same shape is returned by every command in §1 "Stream overlay" except `overlay_alive` and the two asset commands |
 | `overlay:scene` | `ScenePush` | main → overlay window, while it is open: on every scene change, on each edit main acknowledges (changed or not), and on each `overlay:ready` — v1.55.0 |
 | `overlay:edit` | `SceneEdit` | overlay window → all (heard by main): on pointerup of a gesture that changed something; 300 ms after the last arrow nudge or keyboard resize (sooner when another editing key, a press, losing focus or Lock comes first); on Delete; on `[` `]` `{` `}` — v1.55.0 |
-| `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0); v1.57.0: any of the three model downloads, about every MiB and at each file's end, with `kind` |
+| `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0); VoxCPM's (v1.24.0) and the GPU model's (v1.30.0) too, about every MiB and at each file's end; v1.57.0: with `kind` |
 | `clone-model-download-done` | `{ kind, error: string \| null }` | once when a model download ends, after the next one can start and before the command answers; `error` is the string the command rejects with. None for a set already on disk — v1.57.0 |
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
 | `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise — also while only Replay runs |

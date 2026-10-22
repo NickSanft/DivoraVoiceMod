@@ -3149,20 +3149,22 @@ gets `WM_HOTKEY` (so every hotkey press, the backend-handled **Mute your
 voice** included), where the tray and window events run, where events
 emitted from other threads are delivered, and where async commands' answers
 are handed to the page. A sync command that takes minutes freezes all of it:
-the window can't close to the tray, hotkeys do nothing, and every other
-command waits. `async fn` commands, and `#[tauri::command(async)]`, run on
+the window can't close to the tray, hotkey presses wait in the queue and
+all land, in a burst, when the command returns, and every other command
+waits. `async fn` commands, and `#[tauri::command(async)]`, run on
 tauri's tokio workers (`async_runtime::spawn`), not the blocking pool, so
 blocking work inside them ties up a worker; the shape for long work is
 `async fn` + `tauri::async_runtime::spawn_blocking`, as `speak` (v1.27.0)
 and the screen-recording commands already were.
 
 **What moved.** The Speak screen's three model downloads
-(`download_clone_models` ~157 MB, `download_voxcpm_models` ~1.7 GB,
+(`download_clone_models` ~157 MB, `download_voxcpm_models` ~1.6 GB,
 `download_voxcpm_gpu_model` ~1.2 GB) and voice cloning (`clone_voice`,
 `stop_voice_recording`: a whole-file decode and a fresh ONNX session, and
 stop's wait for the engine to finalize the WAV). Each is an `async fn` that
-claims what it needs, then runs in `spawn_blocking`. Their answers and error
-strings are unchanged (`downloading {name}: {e}`).
+claims what it needs, then runs in `spawn_blocking`. Their answers are
+unchanged, and a download that fails still rejects with
+`downloading {name}: {e}`; the one-at-a-time refusals below are new.
 
 **Measured** (debug builds, a local server through `DIVORA_MODELS_BASE_URL`
 trickling 64 KiB every 100 ms and cutting the connection at 6 of 8 MiB, so
@@ -3180,7 +3182,7 @@ refuses a second with `MODEL_DOWNLOAD_BUSY` ("A model download is already
 running."); the slot updates the snapshot as bytes arrive and frees it on
 drop, so an error, or a panic in a debug build, can't leave it claimed. A
 set already on disk answers `Ok` before claiming, with no events. The end of
-a download, in order: the blocking task finishes, the slot is freed,
+a download, in order: the slot is freed as the blocking task ends,
 `clone-model-download-done` `{kind, error}` goes out, the command answers —
 so a page reacting to the done event can start the next download at once.
 `model_download_status` (sync, instant) answers the snapshot, for a page
@@ -3195,7 +3197,9 @@ forever, and with it, before this change, the whole app — and no pooled
 connections (`max_idle_connections(0)`): ureq 2 clears a pooled connection's
 timeouts and sets the read timeout again only for the body, so from a set's
 second file on, the wait for GitHub's redirect and the file's headers had no
-timeout at all. The temp file stays `<name>.part`, opened with
+timeout at all. The temp file is still the file's name with its extension
+swapped for `.part` (`openvoice-extractor.part`, `voxcpm-tokenizer.part`),
+opened with
 `share_mode(0)` on Windows so a second Divora process gets an error instead
 of writing into it; any error once it exists removes it, and a body that
 doesn't match its `Content-Length` is an error. A process that ends
@@ -3237,11 +3241,15 @@ commands must stay sync: global-hotkey registers on its window's thread, and
 the plugin holds its own lock while it runs our handler. Mute, chain edits
 and other atomic or channel-send commands stay sync: they are fast and rely
 on arriving in order. Deferred, each needing more than a move:
-`start_audio_engine` (roughly 150–450 ms; an async Start loses its place in
-IPC order, so it needs a two-step split); device enumeration
+`start_audio_engine` (roughly 150–450 ms here, added up from parts timed
+separately rather than end to end; likely seconds with a Bluetooth headset
+mic and unbounded if a driver hangs, neither tested; an async Start loses its
+place in IPC order, so it needs a two-step split); device enumeration
 (`list_audio_*`, `detect_virtual_mic`; about 0.1–0.2 s here, more with many
 endpoints; cpal leaves its thread in an STA and owns a process-wide
 enumerator, so it needs one long-lived thread); `play_soundboard_clip` on a
 cache miss (150–500 ms for a ten-minute file; a later Stop must still win);
-`scan_soundboard_folder` (only a network folder is slow); `import_preset`
-(only a cloud or network file); `list_speak_clips`.
+`scan_soundboard_folder` (only a network folder is slow; a slow scan of the
+old folder could land after the new one). Also left, though a plain move
+would do: `import_preset` (slow only for a cloud or network file) and
+`list_speak_clips` (grows with the number of saved clips).
