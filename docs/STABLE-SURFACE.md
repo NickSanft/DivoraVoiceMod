@@ -117,16 +117,19 @@ each other and with the hotkey), and each is one atomic operation;
 | `stop_speak` | — | — |
 | `preview_voice` | `voiceId: string`, `useGpu?: bool` | duration seconds `f32` / error — v1.47.0 (fixed phrase, monitor-only, one take, disk-cached; Critter Chatter voices are never disk-cached, v1.50.0) |
 | `stop_preview_voice` | — | — / v1.47.0 |
-| `clone_voice` | `name: string`, `referencePath: string` | `ClonedVoiceInfo` / error — v1.20.0 |
-| `start_voice_recording` | — | — / error ("start the engine first") — v1.23.0 |
-| `stop_voice_recording` | `name: string` | `ClonedVoiceInfo` / error — v1.23.0 |
+| `clone_voice` | `name: string`, `referencePath: string` | `ClonedVoiceInfo` / error — v1.20.0. v1.57.0: runs off the main thread; one voice at a time, a second refused with "Divora is still making a voice. Try again when it's done." |
+| `start_voice_recording` | — | v1.57.0: `string \| null` — the sentence to read when the take will become a VoxCPM voice, decided here and kept for the take, or null to speak freely (was `—`) / error ("start the engine first"; v1.57.0: "Divora is still making a voice…" while a clone is being made) — v1.23.0 |
+| `stop_voice_recording` | `name: string` | `ClonedVoiceInfo` / error — v1.23.0. v1.57.0: off the main thread, the wait for the WAV included; makes the engine the start chose; refused like `clone_voice` while another voice is being made |
 | `list_cloned_voices` | — | `ClonedVoiceInfo[]` — v1.20.0 |
 | `rename_cloned_voice` | `id: string`, `name: string` | — / error — v1.43.0 (display name only; the `id` is stable) |
 | `delete_cloned_voice` | `id: string` | — / error — v1.20.0 |
 | `clone_models_status` | — | `{ ready: bool }` — v1.21.0 |
-| `download_clone_models` | — | — / error (downloads ~157 MB on-demand) — v1.21.0 |
+| `download_clone_models` | — | — / error (downloads ~157 MB on-demand) — v1.21.0. v1.57.0: off the main thread; answers when the set is down (at once if already on disk). One model download at a time: another while one runs rejects with "A model download is already running."; a connection silent for 60 s fails it |
 | `voxcpm_status` | — | `{ available: bool, readPrompt: string }` — v1.24.0 |
-| `download_voxcpm_models` | — | — / error (downloads ~1.6 GB on-demand) — v1.24.0 |
+| `download_voxcpm_models` | — | — / error (downloads ~1.6 GB on-demand) — v1.24.0. v1.57.0: as `download_clone_models` |
+| `voxcpm_gpu_status` | — | `{ supported: bool, modelPresent: bool }` — v1.30.0 |
+| `download_voxcpm_gpu_model` | — | — / error (downloads ~1.2 GB on-demand) — v1.30.0. v1.57.0: as `download_clone_models` |
+| `model_download_status` | — | `CloneDownloadProgress \| null` — the running model download's latest progress, or null; for a page loaded mid-download — v1.57.0 |
 
 **Voice ids (v1.50.0).** An id containing `:` is **engine-namespaced** and is
 never a cloned-voice id — cloned ids are a single safe path component
@@ -317,7 +320,8 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `overlay:status` | `OverlayStatus` | backend → all windows, on every change of any field — v1.55.0. The same shape is returned by every command in §1 "Stream overlay" except `overlay_alive` and the two asset commands |
 | `overlay:scene` | `ScenePush` | main → overlay window, while it is open: on every scene change, on each edit main acknowledges (changed or not), and on each `overlay:ready` — v1.55.0 |
 | `overlay:edit` | `SceneEdit` | overlay window → all (heard by main): on pointerup of a gesture that changed something; 300 ms after the last arrow nudge or keyboard resize (sooner when another editing key, a press, losing focus or Lock comes first); on Delete; on `[` `]` `{` `}` — v1.55.0 |
-| `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0) |
+| `clone-model-download` | `CloneDownloadProgress` | during the on-demand voice-cloning model download (v1.21.0); v1.57.0: any of the three model downloads, about every MiB and at each file's end, with `kind` |
+| `clone-model-download-done` | `{ kind, error: string \| null }` | once when a model download ends, after the next one can start and before the command answers; `error` is the string the command rejects with. None for a set already on disk — v1.57.0 |
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
 | `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise — also while only Replay runs |
 | `replay-buffer` | `ReplayStatus` | on every change of Replay's state or `saving`, and about once a second while armed; a held ring only on change (v1.54.0) |
@@ -366,7 +370,8 @@ OnnxRuntimeStatus { runtimeAvailable, voicesDir }
 TtsVoiceInfo      { id, name, lang, installed, engine }  // v1.17.0; engine v1.50.0:
                   // "kokoro" | "babble" — absent reads as "kokoro"
 ClonedVoiceInfo   { id, name, baseName }             // v1.20.0; baseName v1.22.0
-CloneDownloadProgress { file, fileCount, received, total }  // v1.21.0
+CloneDownloadProgress { kind, file, fileCount, received, total }  // v1.21.0;
+                  // kind v1.57.0: "clone" | "voxcpm" | "voxcpmGpu"
 SoundboardTile    { id, path, label, extension, sizeBytes, modifiedSecs? }
 VirtualMicStatus  { detected, cableInputDevice: DeviceInfo|null,
                     cableOutputDevice: DeviceInfo|null, downloadUrl }

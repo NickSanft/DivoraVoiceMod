@@ -14,6 +14,11 @@
 //   __E2E_PLUGIN_INVOKES__ : Array<{cmd, args}> — every other plugin call
 //                     (v1.55.0: `plugin:event|emit`, `plugin:window|…`)
 //   __E2E_EMIT__(event, payload)          — fire a backend event
+//   __E2E_DOWNLOAD__ : { answer }         — the open download command's answer
+//
+// v1.57.0: a model download stays open until the spec ends it
+// (emitDownloadProgress, endDownload), and the backend's download slot lives
+// in sessionStorage, so a reload mid-download finds it.
 //
 // v1.55.0: each page also knows which window it is (`metadata`, as Tauri
 // injects it): `overlay` on /overlay.html, `main` everywhere else, so
@@ -98,13 +103,21 @@ export interface MockOptions {
   /** Seed `divora.wizardSeen=true` so the app lands on the Mixer, not the
    *  first-run wizard. Default true; the wizard spec passes false. */
   skipWizard?: boolean;
+  /** v1.57.0: one Kokoro voice (Aria) installed, so Speak shows the cloning
+   *  block and its model downloads. Default false: no Kokoro, as in a build
+   *  without its assets. */
+  kokoroInstalled?: boolean;
 }
+
+/** v1.57.0: the backend's refusal while a model download runs. */
+export const MODEL_DOWNLOAD_BUSY = "A model download is already running.";
 
 export async function installTauriMock(
   page: Page,
   opts: MockOptions = {},
 ): Promise<void> {
   const skipWizard = opts.skipWizard !== false;
+  const kokoroInstalled = opts.kokoroInstalled === true;
 
   // 1) The Tauri internals stub. Runs before any page script.
   await page.addInitScript(
@@ -114,6 +127,8 @@ export async function installTauriMock(
       presets: unknown;
       overlayClosed: object;
       importedAsset: Record<string, unknown>;
+      kokoroInstalled: boolean;
+      downloadBusy: string;
     }) => {
       const invokes: Array<{ cmd: string; args: unknown }> = [];
       (window as unknown as { __E2E_INVOKES__: unknown }).__E2E_INVOKES__ =
@@ -229,6 +244,36 @@ export async function installTauriMock(
         return next;
       };
 
+      // v1.57.0: the model downloads. The slot (the running download's last
+      // progress, or null) and which sets are present are kept in
+      // sessionStorage, so a reload mid-download finds them, as the backend
+      // keeps them across one. A download command stays open until the spec
+      // ends it with endDownload, as the real one stays open for minutes; a
+      // page that reloaded meanwhile has no answer waiting, as in the app.
+      const DOWNLOAD_KEY = "__E2E_DOWNLOAD__";
+      const MODELS_KEY = "__E2E_MODELS__";
+      const readSession = (key: string): unknown => {
+        try {
+          return JSON.parse(sessionStorage.getItem(key) ?? "null") as unknown;
+        } catch {
+          return null;
+        }
+      };
+      const modelsPresent = (): Record<string, boolean> =>
+        (readSession(MODELS_KEY) as Record<string, boolean> | null) ?? {};
+      const download = { answer: null as null | ((error: string | null) => void) };
+      (window as unknown as { __E2E_DOWNLOAD__: unknown }).__E2E_DOWNLOAD__ = download;
+      const startDownload = (kind: string, fileCount: number): Promise<null> => {
+        if (readSession(DOWNLOAD_KEY) !== null) throw data.downloadBusy;
+        sessionStorage.setItem(
+          DOWNLOAD_KEY,
+          JSON.stringify({ kind, file: 1, fileCount, received: 0, total: 0 }),
+        );
+        return new Promise((resolve, reject) => {
+          download.answer = (error) => (error === null ? resolve(null) : reject(error));
+        });
+      };
+
       const NOT_OPEN = "The overlay isn't open.";
       const STARTING = "The overlay is still starting. Try again in a moment.";
       const overlayLive = (): boolean =>
@@ -257,7 +302,7 @@ export async function installTauriMock(
         // they are the only ids speak renders (as the real backend would in a
         // build without Kokoro).
         list_tts_voices: () => [
-          { id: "af_heart", name: "Aria — warm (US)", lang: "en-us", installed: false, engine: "kokoro" },
+          { id: "af_heart", name: "Aria — warm (US)", lang: "en-us", installed: data.kokoroInstalled, engine: "kokoro" },
           { id: "bm_george", name: "George — crisp (UK)", lang: "en-gb", installed: false, engine: "kokoro" },
           { id: "babble:bright", name: "Bright", lang: "en-us", installed: true, engine: "babble" },
           { id: "babble:mellow", name: "Mellow", lang: "en-us", installed: true, engine: "babble" },
@@ -313,10 +358,17 @@ export async function installTauriMock(
         },
         rename_cloned_voice: () => null,
         delete_cloned_voice: () => null,
-        clone_models_status: () => ({ ready: false }),
-        voxcpm_status: () => ({ available: false, readPrompt: "" }),
-        download_voxcpm_models: () => null,
-        download_clone_models: () => null,
+        clone_models_status: () => ({ ready: modelsPresent().clone === true }),
+        voxcpm_status: () => ({ available: modelsPresent().voxcpm === true, readPrompt: "" }),
+        // This "PC" can't run the GPU build, so the GPU button stays hidden.
+        voxcpm_gpu_status: () => ({
+          supported: false,
+          modelPresent: modelsPresent().voxcpmGpu === true,
+        }),
+        download_clone_models: () => startDownload("clone", 2),
+        download_voxcpm_models: () => startDownload("voxcpm", 6),
+        download_voxcpm_gpu_model: () => startDownload("voxcpmGpu", 1),
+        model_download_status: () => readSession(DOWNLOAD_KEY),
         recordings_dir: () => "C:/mock/recordings",
         // v1.52.0: screen recording. Supported, two screens, nothing running;
         // takes are driven by firing `screen-recording` with __E2E_EMIT__.
@@ -561,6 +613,8 @@ export async function installTauriMock(
       presets: MOCK_PRESETS,
       overlayClosed: OVERLAY_STATUS_SAMPLES.closed,
       importedAsset: IMPORTED_ASSET_SAMPLE,
+      kokoroInstalled,
+      downloadBusy: MODEL_DOWNLOAD_BUSY,
     },
   );
 
@@ -694,6 +748,72 @@ export async function emitLevels(page: Page, patch: Record<string, unknown> = {}
   }, patch);
 }
 
+/** v1.57.0: the mock's download slot: the running download's last progress,
+ *  or null. */
+export interface MockDownload {
+  kind: "clone" | "voxcpm" | "voxcpmGpu";
+  file: number;
+  fileCount: number;
+  received: number;
+  total: number;
+}
+
+export function mockDownload(page: Page): Promise<MockDownload | null> {
+  return page.evaluate(
+    () => JSON.parse(sessionStorage.getItem("__E2E_DOWNLOAD__") ?? "null") as MockDownload | null,
+  );
+}
+
+/** v1.57.0: one progress event for the running download, as the backend
+ *  sends one every MiB: `patch` over the slot, which `model_download_status`
+ *  then answers too. Throws when no download runs. */
+export async function emitDownloadProgress(
+  page: Page,
+  patch: Partial<Omit<MockDownload, "kind">>,
+): Promise<MockDownload> {
+  return page.evaluate((p) => {
+    const slot = JSON.parse(sessionStorage.getItem("__E2E_DOWNLOAD__") ?? "null") as Record<
+      string,
+      unknown
+    > | null;
+    if (slot === null) throw new Error("no download is running");
+    const next = { ...slot, ...p };
+    sessionStorage.setItem("__E2E_DOWNLOAD__", JSON.stringify(next));
+    (
+      window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
+    ).__E2E_EMIT__("clone-model-download", next);
+    return next as unknown as MockDownload;
+  }, patch);
+}
+
+/** v1.57.0: end the running download in the backend's order: the slot frees
+ *  (and on success the set is there), `clone-model-download-done` goes out,
+ *  then the command answers, if this page is the one that started it. */
+export async function endDownload(page: Page, error: string | null = null): Promise<void> {
+  await page.evaluate((err) => {
+    const slot = JSON.parse(sessionStorage.getItem("__E2E_DOWNLOAD__") ?? "null") as {
+      kind: string;
+    } | null;
+    if (slot === null) throw new Error("no download is running");
+    sessionStorage.setItem("__E2E_DOWNLOAD__", "null");
+    if (err === null) {
+      const present = JSON.parse(sessionStorage.getItem("__E2E_MODELS__") ?? "{}") as Record<
+        string,
+        boolean
+      >;
+      sessionStorage.setItem("__E2E_MODELS__", JSON.stringify({ ...present, [slot.kind]: true }));
+    }
+    const w = window as unknown as {
+      __E2E_EMIT__: (e: string, payload: unknown) => void;
+      __E2E_DOWNLOAD__: { answer: null | ((error: string | null) => void) };
+    };
+    w.__E2E_EMIT__("clone-model-download-done", { kind: slot.kind, error: err });
+    const answer = w.__E2E_DOWNLOAD__.answer;
+    w.__E2E_DOWNLOAD__.answer = null;
+    answer?.(err);
+  }, error);
+}
+
 /** The app commands invoked so far, with their args (`__E2E_INVOKES__`),
  *  optionally only `cmd`. */
 export function invokesOf(
@@ -765,9 +885,11 @@ export async function linkWindows(a: Page, b: Page): Promise<void> {
  *  spec does `test.use({ skipWizard: false })` to see the first run. */
 export const test = base.extend<{
   skipWizard: boolean;
+  kokoroInstalled: boolean;
   consoleErrors: string[];
 }>({
   skipWizard: [true, { option: true }],
+  kokoroInstalled: [false, { option: true }],
   consoleErrors: async ({ page }, use) => {
     const errors: string[] = [];
     page.on("console", (m) => {
@@ -776,8 +898,8 @@ export const test = base.extend<{
     page.on("pageerror", (e) => errors.push(String(e)));
     await use(errors);
   },
-  page: async ({ page, skipWizard }, use) => {
-    await installTauriMock(page, { skipWizard });
+  page: async ({ page, skipWizard, kokoroInstalled }, use) => {
+    await installTauriMock(page, { skipWizard, kokoroInstalled });
     await use(page);
   },
 });

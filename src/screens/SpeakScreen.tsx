@@ -853,8 +853,11 @@ export function SpeakScreen(): JSX.Element {
                 </Button>
               </div>
               <Show when={app.recordingVoice()}>
+                {/* v1.57.0: the prompt fixed when the take started, as the
+                    backend's engine is, not VoxCPM's status now (a download
+                    can finish mid-take). */}
                 <Show
-                  when={app.voxcpmAvailable() && app.voxcpmReadPrompt()}
+                  when={app.recordingReadPrompt()}
                   fallback={
                     <span
                       role="status"
@@ -879,7 +882,7 @@ export function SpeakScreen(): JSX.Element {
                         "font-style": "italic",
                       }}
                     >
-                      “{app.voxcpmReadPrompt()}”
+                      “{app.recordingReadPrompt()}”
                     </span>
                   </span>
                 </Show>

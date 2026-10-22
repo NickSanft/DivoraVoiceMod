@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use divora_core::audio::{
@@ -263,7 +263,16 @@ struct AppState {
     /// v1.23.0: temp WAV path of an in-progress in-app voice recording (dry
     /// mic), set by `start_voice_recording` and consumed by
     /// `stop_voice_recording`. `None` when no capture is active.
-    voice_recording_path: Mutex<Option<PathBuf>>,
+    ///
+    /// v1.57.0: the `bool` is whether the recording becomes a `VoxCPM` voice,
+    /// decided when it starts (see [`start_voice_recording`]).
+    voice_recording_path: Mutex<Option<(PathBuf, bool)>>,
+    /// v1.57.0: set while `clone_voice` or `stop_voice_recording` makes a
+    /// voice; taken through [`CloneClaim`], so one runs at a time.
+    voice_clone_busy: Arc<AtomicBool>,
+    /// v1.57.0: the running model download's latest progress, `None` when
+    /// none runs; taken through [`DownloadSlot`], so one runs at a time.
+    model_download: Arc<Mutex<Option<CloneDownloadProgress>>>,
     /// `VoxCPM` accent-preserving cloning engine (4 ONNX sessions + tokenizer),
     /// lazy-loaded on first `VoxCPM` cloned-voice speak and held (each is hundreds
     /// of MB). `None` until first use / when the models aren't installed. The
@@ -356,8 +365,11 @@ fn set_speak_monitor(state: State<'_, AppState>, enabled: bool) {
 }
 
 /// v1.56.0: mute or unmute the voice; answers the state after. Takes effect
-/// on the next buffer once the command runs (sync commands share the main
-/// thread with each other and with `WM_HOTKEY`). Idempotent.
+/// on the next buffer once the command runs. Sync commands share the main
+/// thread with each other and with `WM_HOTKEY`, so a mute waits for a sync
+/// command already running; since v1.57.0 the model downloads and voice
+/// cloning are not sync commands, so it no longer waits minutes behind
+/// them. Idempotent.
 #[tauri::command]
 fn set_input_muted(state: State<'_, AppState>, muted: bool) -> InputMute {
     state.engine.set_input_muted(muted).after
@@ -1765,13 +1777,62 @@ fn list_cloned_voice_infos(dir: &Path) -> Vec<ClonedVoiceInfo> {
 /// Create a cloned voice from a reference audio file: decode it, extract a
 /// speaker embedding via the `OpenVoice` extractor, and store it under
 /// `<voices>/cloned/<id>/`. Returns the new voice for the picker.
+///
+/// v1.57.0: runs on a blocking thread, not the main thread: the whole-file
+/// decode and a fresh ONNX session take seconds to tens of seconds. One voice
+/// at a time ([`CloneClaim`]).
 #[tauri::command]
-fn clone_voice(
+async fn clone_voice(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     reference_path: String,
 ) -> Result<ClonedVoiceInfo, String> {
-    clone_from_path(&state, &name, Path::new(&reference_path))
+    let claim = CloneClaim::try_claim(&state.voice_clone_busy)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let made = clone_from_path(&app.state::<AppState>(), &name, Path::new(&reference_path));
+        drop(claim);
+        made
+    })
+    .await
+    .map_err(|e| format!("voice cloning stopped: {e}"))?
+}
+
+/// v1.57.0: what a second voice-making command refuses with, and a recording
+/// started while one runs.
+const VOICE_CLONE_BUSY: &str = "Divora is still making a voice. Try again when it's done.";
+
+/// v1.57.0: held by [`clone_voice`] and [`stop_voice_recording`] while they
+/// make a voice, so only one runs at a time, a page reload included. Taken
+/// before the work is handed to its blocking thread and given back when
+/// dropped, so an error (or a panic in a debug build) can't leave it held.
+#[must_use]
+struct CloneClaim(Arc<AtomicBool>);
+
+impl CloneClaim {
+    /// Takes `busy`, or refuses with [`VOICE_CLONE_BUSY`] while it's held.
+    fn try_claim(busy: &Arc<AtomicBool>) -> Result<Self, String> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| VOICE_CLONE_BUSY.to_owned())?;
+        Ok(Self(Arc::clone(busy)))
+    }
+}
+
+impl Drop for CloneClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// v1.57.0: refuses while a voice is being made. `stop_voice_recording`'s
+/// thread still reads, then deletes, the one temp WAV that a new recording
+/// would overwrite.
+fn voice_clone_idle(busy: &AtomicBool) -> Result<(), String> {
+    if busy.load(Ordering::Acquire) {
+        Err(VOICE_CLONE_BUSY.to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 /// Decode a reference clip, extract a speaker embedding, auto-pick the closest
@@ -1845,8 +1906,19 @@ fn clone_from_path(
 /// reference. Requires the engine to be running (the dry tap lives in the
 /// live input callback). The path is held in `AppState` until
 /// [`stop_voice_recording`] consumes it.
+///
+/// v1.57.0: which engine the recording becomes is decided here, not at stop.
+/// `VoxCPM` is given [`READ_ALOUD_PROMPT`](divora_core::tts::voxcpm::READ_ALOUD_PROMPT)
+/// as the clip's transcript, and the page asks for that sentence only when
+/// `VoxCPM` is installed as the take begins. A recording can now run while the
+/// `VoxCPM` download does; checked at stop, a take spoken freely became a
+/// `VoxCPM` voice whenever the download finished during it. The answer is the
+/// sentence to read when the take becomes a `VoxCPM` voice, or `None` to speak
+/// freely, so the page's hint is this decision, not its own status read (which
+/// lags the disk by a round trip after a download ends).
 #[tauri::command]
-fn start_voice_recording(state: State<'_, AppState>) -> Result<(), String> {
+fn start_voice_recording(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    voice_clone_idle(&state.voice_clone_busy)?;
     if !state.engine.is_running() {
         return Err("start the engine first, then record your voice".to_string());
     }
@@ -1855,32 +1927,51 @@ fn start_voice_recording(state: State<'_, AppState>) -> Result<(), String> {
     // A fixed name is fine — only one capture runs at a time and it's consumed
     // (deleted) on stop.
     let path = dir.join("voice-reference.wav");
-    *state.voice_recording_path.lock().unwrap() = Some(path.clone());
+    // The check `voxcpm_status` answers the page with.
+    let voxcpm = divora_core::tts::voxcpm::models_present(&voxcpm_dir(&state));
+    *state.voice_recording_path.lock().unwrap() = Some((path.clone(), voxcpm));
     state.engine.start_reference_recording(path);
-    Ok(())
+    Ok(voxcpm.then(|| divora_core::tts::voxcpm::READ_ALOUD_PROMPT.to_string()))
 }
 
 /// v1.23.0: stop the dry-mic capture (blocks until the WAV is finalized) and
 /// turn it into a cloned voice named `name`. The temp clip is deleted after.
+///
+/// v1.57.0: all of it, the wait for the WAV included, runs on a blocking
+/// thread, not the main thread; one voice at a time ([`CloneClaim`]).
 #[tauri::command]
-fn stop_voice_recording(
+async fn stop_voice_recording(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ClonedVoiceInfo, String> {
+    let claim = CloneClaim::try_claim(&state.voice_clone_busy)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let made = clone_from_recording(&app.state::<AppState>(), &name);
+        drop(claim);
+        made
+    })
+    .await
+    .map_err(|e| format!("voice cloning stopped: {e}"))?
+}
+
+/// [`stop_voice_recording`]'s work, on its blocking thread.
+fn clone_from_recording(state: &AppState, name: &str) -> Result<ClonedVoiceInfo, String> {
     state.engine.stop_reference_recording();
-    let path = state
+    let (path, voxcpm) = state
         .voice_recording_path
         .lock()
         .unwrap()
         .take()
         .ok_or_else(|| "no voice recording in progress".to_string())?;
-    // The recorder has the user read READ_ALOUD_PROMPT, so the recording is a
-    // `VoxCPM` reference (accent-preserving) when those models are present; else
-    // fall back to OpenVoice timbre-transfer.
-    let result = if divora_core::tts::voxcpm::models_present(&voxcpm_dir(&state)) {
-        store_voxcpm_clone(&state, &name, &path)
+    // A `VoxCPM` reference (accent-preserving) when `VoxCPM` was installed as
+    // the recording started, so the page had the user read READ_ALOUD_PROMPT;
+    // else OpenVoice timbre-transfer. Not checked again here: v1.57.0 lets the
+    // `VoxCPM` download finish during a take (see `start_voice_recording`).
+    let result = if voxcpm {
+        store_voxcpm_clone(state, name, &path)
     } else {
-        clone_from_path(&state, &name, &path)
+        clone_from_path(state, name, &path)
     };
     // Best-effort cleanup of the transient reference clip.
     let _ = std::fs::remove_file(&path);
@@ -2065,6 +2156,8 @@ const VOXCPM_MODEL_FILES: &[&str] = &[
     // WeSpeaker best-of-N reranker (~25 MB) — see `divora_core::tts::speaker`.
     "voxcpm-speaker.onnx",
 ];
+/// The optional fp16 `DirectML` decode model (~1.2 GB) GPU cloning uses.
+const VOXCPM_GPU_MODEL_FILES: &[&str] = &["voxcpm-decode-step-gpu.onnx"];
 
 /// Where to read the cloning models from: the downloaded user dir if it
 /// has them, else the bundled/dev asset dir (covers dev, where they're staged
@@ -2181,16 +2274,120 @@ struct CloneModelsStatus {
     ready: bool,
 }
 
-/// Progress event payload for the cloning-model download (`clone-model-download`).
-#[derive(Debug, Clone, Serialize)]
+/// The model downloads' progress event (named before the `VoxCPM` sets
+/// shared it).
+const MODEL_DOWNLOAD_EVENT: &str = "clone-model-download";
+/// v1.57.0: sent once when a download ends, either way ([`ModelDownloadDone`]).
+const MODEL_DOWNLOAD_DONE_EVENT: &str = "clone-model-download-done";
+
+/// v1.57.0: which model set a download fetches, on its events and in
+/// [`model_download_status`], so a page knows which status to refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum ModelDownloadKind {
+    /// [`CLONE_MODEL_FILES`], by [`download_clone_models`].
+    #[serde(rename = "clone")]
+    Clone,
+    /// [`VOXCPM_MODEL_FILES`], by [`download_voxcpm_models`].
+    #[serde(rename = "voxcpm")]
+    VoxCpm,
+    /// [`VOXCPM_GPU_MODEL_FILES`], by [`download_voxcpm_gpu_model`].
+    #[serde(rename = "voxcpmGpu")]
+    VoxCpmGpu,
+}
+
+/// Progress event payload for the model downloads ([`MODEL_DOWNLOAD_EVENT`]),
+/// and what [`model_download_status`] answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CloneDownloadProgress {
+    /// v1.57.0: which download this is.
+    kind: ModelDownloadKind,
     /// Current file (1-based) and how many total.
     file: usize,
     file_count: usize,
     /// Bytes received / total for the current file (total 0 if unknown).
     received: u64,
     total: u64,
+}
+
+/// v1.57.0: payload of [`MODEL_DOWNLOAD_DONE_EVENT`]. `error` is the string
+/// the command rejects with; `None` when every file is on disk.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelDownloadDone {
+    kind: ModelDownloadKind,
+    error: Option<String>,
+}
+
+/// v1.57.0: what a download started while another runs refuses with. The UI
+/// shows it as it is.
+const MODEL_DOWNLOAD_BUSY: &str = "A model download is already running.";
+
+/// v1.57.0: the one model download allowed at a time, keeping its latest
+/// progress for [`model_download_status`]. Two downloads of one set would
+/// write the same `.part` files, and any two would mix their progress on one
+/// event and in the one snapshot. Given back when dropped, so an error, or a
+/// panic in a debug build, can't leave it held.
+#[must_use]
+struct DownloadSlot {
+    snapshot: Arc<Mutex<Option<CloneDownloadProgress>>>,
+    kind: ModelDownloadKind,
+    file_count: usize,
+}
+
+impl DownloadSlot {
+    /// Takes the slot for `kind`'s `file_count` files, or refuses with
+    /// [`MODEL_DOWNLOAD_BUSY`] while another download holds it.
+    fn try_claim(
+        snapshot: &Arc<Mutex<Option<CloneDownloadProgress>>>,
+        kind: ModelDownloadKind,
+        file_count: usize,
+    ) -> Result<Self, String> {
+        let mut latest = snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+        if latest.is_some() {
+            return Err(MODEL_DOWNLOAD_BUSY.to_owned());
+        }
+        let slot = Self {
+            snapshot: Arc::clone(snapshot),
+            kind,
+            file_count,
+        };
+        *latest = Some(slot.payload(1, 0, 0));
+        Ok(slot)
+    }
+
+    /// The progress of `file` (1-based), kept as the latest.
+    fn progress(&self, file: usize, received: u64, total: u64) -> CloneDownloadProgress {
+        let progress = self.payload(file, received, total);
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = Some(progress.clone());
+        progress
+    }
+
+    fn payload(&self, file: usize, received: u64, total: u64) -> CloneDownloadProgress {
+        CloneDownloadProgress {
+            kind: self.kind,
+            file,
+            file_count: self.file_count,
+            received,
+            total,
+        }
+    }
+}
+
+impl Drop for DownloadSlot {
+    fn drop(&mut self) {
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// The running download's latest progress, `None` when none runs.
+fn download_snapshot(
+    snapshot: &Mutex<Option<CloneDownloadProgress>>,
+) -> Option<CloneDownloadProgress> {
+    snapshot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Whether the cloning models are installed.
@@ -2201,48 +2398,29 @@ fn clone_models_status(state: State<'_, AppState>) -> CloneModelsStatus {
     }
 }
 
-/// Download the cloning models into the user dir, emitting
-/// `clone-model-download` progress events. Blocks until done (the worker
-/// thread); the UI awaits it and tracks progress via the events. Skips files
-/// already present, and writes via a `.part` temp so a failed/partial download
-/// never looks complete.
+/// v1.57.0: the running model download's latest progress, `None` when none
+/// runs, so a page that loads mid-download can show it. Reads the slot only.
 #[tauri::command]
-fn download_clone_models(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let dir = state.clone_models_dir.clone();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let count = CLONE_MODEL_FILES.len();
-    for (i, name) in CLONE_MODEL_FILES.iter().enumerate() {
-        let dest = dir.join(name);
-        if dest.is_file() {
-            continue;
-        }
-        let url = format!("{}/{name}", models_base_url());
-        download_to_file(&app, &url, &dest, i + 1, count)
-            .map_err(|e| format!("downloading {name}: {e}"))?;
-    }
-    tracing::info!(path = %dir.display(), "clone models downloaded");
-    Ok(())
+fn model_download_status(state: State<'_, AppState>) -> Option<CloneDownloadProgress> {
+    download_snapshot(&state.model_download)
+}
+
+/// Download the cloning models into the user dir, emitting
+/// `clone-model-download` progress events. Resolves once every file is on
+/// disk; the UI awaits it and tracks progress via the events. Skips files
+/// already present, and writes via a `.part` temp so a failed/partial download
+/// never looks complete. v1.57.0: off the main thread ([`run_model_download`]).
+#[tauri::command]
+async fn download_clone_models(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    run_model_download(app, &state, ModelDownloadKind::Clone, CLONE_MODEL_FILES).await
 }
 
 /// Download the `VoxCPM` accent-cloning models (~1.6 GB) into the user dir,
 /// reusing the `clone-model-download` progress events. Mirrors
 /// [`download_clone_models`]; skips files already present.
 #[tauri::command]
-fn download_voxcpm_models(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let dir = state.clone_models_dir.clone();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let count = VOXCPM_MODEL_FILES.len();
-    for (i, name) in VOXCPM_MODEL_FILES.iter().enumerate() {
-        let dest = dir.join(name);
-        if dest.is_file() {
-            continue;
-        }
-        let url = format!("{}/{name}", models_base_url());
-        download_to_file(&app, &url, &dest, i + 1, count)
-            .map_err(|e| format!("downloading {name}: {e}"))?;
-    }
-    tracing::info!(path = %dir.display(), "voxcpm models downloaded");
-    Ok(())
+async fn download_voxcpm_models(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    run_model_download(app, &state, ModelDownloadKind::VoxCpm, VOXCPM_MODEL_FILES).await
 }
 
 /// `DirectML` GPU-acceleration status for the Speak UI: whether the platform can run
@@ -2270,73 +2448,228 @@ fn voxcpm_gpu_status(state: State<'_, AppState>) -> VoxCpmGpuStatus {
 /// Download the optional fp16 `DirectML` decode model (~1.2 GB) that GPU cloning
 /// uses. Reuses the `clone-model-download` progress events; no-op if present.
 #[tauri::command]
-fn download_voxcpm_gpu_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn download_voxcpm_gpu_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    run_model_download(
+        app,
+        &state,
+        ModelDownloadKind::VoxCpmGpu,
+        VOXCPM_GPU_MODEL_FILES,
+    )
+    .await
+}
+
+/// v1.57.0: one model download, the body of the three download commands.
+///
+/// Tauri runs a sync command on the main thread, which also handles the
+/// hotkeys (the mute among them), the tray and every other sync command, so
+/// until v1.57.0 a download held all of them for minutes. The files now come
+/// down on a blocking thread, one download at a time ([`DownloadSlot`]); a
+/// set already on disk answers at once without taking the slot. At the end
+/// the slot is given back, then [`MODEL_DOWNLOAD_DONE_EVENT`] goes out, then
+/// the command answers, so a page that starts the next download on that
+/// event isn't refused.
+async fn run_model_download(
+    app: AppHandle,
+    state: &AppState,
+    kind: ModelDownloadKind,
+    files: &'static [&'static str],
+) -> Result<(), String> {
     let dir = state.clone_models_dir.clone();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let name = "voxcpm-decode-step-gpu.onnx";
-    let dest = dir.join(name);
-    if dest.is_file() {
+    if files.iter().all(|name| dir.join(name).is_file()) {
         return Ok(());
     }
-    let url = format!("{}/{name}", models_base_url());
-    download_to_file(&app, &url, &dest, 1, 1).map_err(|e| format!("downloading {name}: {e}"))?;
-    tracing::info!(path = %dest.display(), "voxcpm gpu model downloaded");
+    let slot = DownloadSlot::try_claim(&state.model_download, kind, files.len())?;
+    let emitter = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let agent = model_agent(MODEL_READ_TIMEOUT);
+        let result = download_model_files(&agent, &models_base_url(), &dir, files, &slot, |p| {
+            let _ = emitter.emit(MODEL_DOWNLOAD_EVENT, p);
+        });
+        drop(slot);
+        result
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("model download stopped: {e}")));
+    if let Err(e) = &result {
+        tracing::warn!(?kind, error = %e, "model download failed");
+    }
+    let done = ModelDownloadDone {
+        kind,
+        error: result.as_ref().err().cloned(),
+    };
+    let _ = app.emit(MODEL_DOWNLOAD_DONE_EVENT, done);
+    result
+}
+
+/// v1.57.0: the file loop of [`run_model_download`]. Each of `files` not yet
+/// in `dir` comes from `base_url`, in order, with its progress kept in `slot`
+/// and handed to `emit`. An error names the file, as the commands' always have.
+fn download_model_files(
+    agent: &ureq::Agent,
+    base_url: &str,
+    dir: &Path,
+    files: &[&str],
+    slot: &DownloadSlot,
+    mut emit: impl FnMut(CloneDownloadProgress),
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for (i, name) in files.iter().enumerate() {
+        let dest = dir.join(name);
+        if dest.is_file() {
+            continue;
+        }
+        let file = i + 1;
+        // A page that reads the status now sees this file, not the last one.
+        slot.progress(file, 0, 0);
+        download_to_file(
+            agent,
+            &format!("{base_url}/{name}"),
+            &dest,
+            |received, total| {
+                emit(slot.progress(file, received, total));
+            },
+        )
+        .map_err(|e| format!("downloading {name}: {e}"))?;
+    }
+    tracing::info!(kind = ?slot.kind, path = %dir.display(), "models downloaded");
     Ok(())
 }
 
-/// Stream `url` to `dest` (via a `.part` temp), emitting progress events.
+/// v1.57.0: how long a model download waits for its next byte.
+const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// v1.57.0: the HTTP agent the model downloads use. ureq's default agent has
+/// no read timeout, so a connection that stalls mid-file never errors and the
+/// download would sit at its last percent for good; once `read_timeout` goes
+/// by without a byte, of the headers or of the body, it fails and can be
+/// retried.
+///
+/// Every request gets a new connection. ureq 2 clears a connection's
+/// timeouts when it keeps it for reuse and sets the read timeout again only
+/// for the body, so from a set's second file on, GitHub's redirect and the
+/// file itself would come over reused connections whose wait for the headers
+/// has no timeout at all. The cost is a connection, TLS included, per request.
+fn model_agent(read_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(read_timeout)
+        .max_idle_connections(0)
+        .build()
+}
+
+/// Stream `url` to `dest` via a `.part` temp beside it, calling
+/// `on_progress(received, total)` every MiB or so and once more when the file
+/// is in place (`total` 0 when the server gave no length).
+///
+/// v1.57.0: takes the agent and a callback rather than an `AppHandle`, so the
+/// tests run it against a local server. Any error once the `.part` exists
+/// removes it, and a body that doesn't match its `Content-Length` is an
+/// error. A process that ends mid-download (a tray Quit, a kill) leaves the
+/// `.part`: the next start removes it ([`sweep_model_parts`]), and downloading
+/// that file again empties and reuses it. On Windows the `.part` is opened
+/// unshared: a second Divora downloading the same file at once gets an error
+/// instead of emptying this one's `.part` and writing into it.
 fn download_to_file(
-    app: &AppHandle,
+    agent: &ureq::Agent,
     url: &str,
     dest: &Path,
-    file: usize,
-    file_count: usize,
+    mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), String> {
-    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
     let total: u64 = resp
         .header("Content-Length")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let tmp = dest.with_extension("part");
-    let mut file_w = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    let mut reader = resp.into_reader();
+    let file = create_part(&tmp).map_err(|e| e.to_string())?;
+    let landed = write_body(resp.into_reader(), file, total, &mut on_progress).and_then(|n| {
+        std::fs::rename(&tmp, dest)
+            .map(|()| n)
+            .map_err(|e| e.to_string())
+    });
+    match landed {
+        Ok(received) => {
+            on_progress(received, total);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Creates (or empties) a download's `.part`; on Windows no one else can open
+/// it while it's held (see [`download_to_file`]).
+fn create_part(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    options.open(path)
+}
+
+/// v1.57.0: the `.part` files the model downloads write into `dir`, one for
+/// each file of every set, and nothing else.
+fn model_part_paths(dir: &Path) -> Vec<PathBuf> {
+    CLONE_MODEL_FILES
+        .iter()
+        .chain(VOXCPM_MODEL_FILES)
+        .chain(VOXCPM_GPU_MODEL_FILES)
+        .map(|name| dir.join(name).with_extension("part"))
+        .collect()
+}
+
+/// v1.57.0: at startup, removes the `.part`s a download left in `dir` when
+/// the app quit during it (a `.part` can be up to 1.2 GB). Best effort: a
+/// missing one is the usual case, and one a second Divora is writing right
+/// now is held unshared ([`create_part`]), so its removal fails and it stays.
+fn sweep_model_parts(dir: &Path) {
+    for part in model_part_paths(dir) {
+        if std::fs::remove_file(&part).is_ok() {
+            tracing::info!(path = %part.display(), "removed an unfinished model download");
+        }
+    }
+}
+
+/// Copies `body` into `file`, which is closed on return, calling
+/// `on_progress` every MiB or so; answers the bytes copied. A `total` other
+/// than 0 that the body doesn't match is an error.
+fn write_body(
+    mut body: impl Read,
+    mut file: std::fs::File,
+    total: u64,
+    on_progress: &mut impl FnMut(u64, u64),
+) -> Result<u64, String> {
     let mut buf = vec![0u8; 1 << 16];
     let mut received: u64 = 0;
-    let mut last_emit: u64 = 0;
+    let mut reported: u64 = 0;
     loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = body.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
-        file_w.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         received += n as u64;
-        // Throttle events to ~every 1 MB.
-        if received - last_emit >= 1 << 20 {
-            last_emit = received;
-            let _ = app.emit(
-                "clone-model-download",
-                CloneDownloadProgress {
-                    file,
-                    file_count,
-                    received,
-                    total,
-                },
-            );
+        // Throttle reports to ~every 1 MiB.
+        if received - reported >= 1 << 20 {
+            reported = received;
+            on_progress(received, total);
         }
     }
-    file_w.flush().map_err(|e| e.to_string())?;
-    drop(file_w);
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-    let _ = app.emit(
-        "clone-model-download",
-        CloneDownloadProgress {
-            file,
-            file_count,
-            received,
-            total,
-        },
-    );
-    Ok(())
+    file.flush().map_err(|e| e.to_string())?;
+    // ureq already fails a body that ends before its length; this also
+    // catches a chunked body sent with a length it doesn't match.
+    if total != 0 && received != total {
+        return Err(format!("expected {total} bytes, got {received}"));
+    }
+    Ok(received)
 }
 
 #[tauri::command]
@@ -3068,6 +3401,9 @@ pub fn run() {
             if let Err(e) = std::fs::create_dir_all(&clone_models_dir) {
                 tracing::warn!(?e, path = %clone_models_dir.display(), "could not create clone models dir");
             }
+            // v1.57.0: a Quit no longer waits for a running download, so it
+            // can leave a `.part` behind.
+            sweep_model_parts(&clone_models_dir);
             tracing::info!(path = %clone_models_dir.display(), "clone models dir ready");
 
             app.manage(AppState {
@@ -3084,6 +3420,8 @@ pub fn run() {
                 logs_dir,
                 midi_connection: Mutex::new(None),
                 voice_recording_path: Mutex::new(None),
+                voice_clone_busy: Arc::new(AtomicBool::new(false)),
+                model_download: Arc::new(Mutex::new(None)),
                 voxcpm_engine: Mutex::new(None),
                 screen: Arc::new(ScreenRecorder::default()),
                 overlay_assets_dir,
@@ -3190,6 +3528,7 @@ pub fn run() {
             download_voxcpm_models,
             voxcpm_gpu_status,
             download_voxcpm_gpu_model,
+            model_download_status,
             detect_virtual_mic,
             register_global_shortcut,
             unregister_global_shortcut,
@@ -3213,14 +3552,26 @@ mod tests {
         VoiceReadingUpdate, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
         PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
     };
+    use super::{
+        create_part, download_model_files, download_snapshot, download_to_file, model_agent,
+        model_part_paths, sweep_model_parts, voice_clone_idle, CloneClaim, CloneDownloadProgress,
+        DownloadSlot, ModelDownloadDone, ModelDownloadKind, MODEL_DOWNLOAD_BUSY,
+        MODEL_DOWNLOAD_DONE_EVENT, MODEL_DOWNLOAD_EVENT, VOICE_CLONE_BUSY,
+    };
     use divora_core::audio::{AudioEngine, InputMute, ReadingSnapshot};
     use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
     use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
     use divora_core::tts::babble;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
     use tauri_plugin_global_shortcut::Shortcut;
 
     /// Every combination, in the order the menu shows it. The first two are
@@ -3324,6 +3675,562 @@ mod tests {
         resp.into_reader().read_to_end(&mut buf).unwrap();
         assert_eq!(buf.len(), len);
         assert_eq!(buf.len(), 3_364_792);
+    }
+
+    // ---- v1.57.0: model downloads and voice cloning off the main thread ----
+
+    /// A one-request HTTP server on 127.0.0.1 for the download tests. Once
+    /// the request is in it sends `response` as it is and closes, or with
+    /// `hold` keeps the connection open and silent until `release` sends (10 s
+    /// at most). Joining it gives the request line.
+    fn http_stub(response: Vec<u8>, hold: bool) -> (String, mpsc::Sender<()>, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release, released) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "the client hung up mid-request");
+                request.extend_from_slice(&buf[..n]);
+            }
+            // The client may have given up already; what it saw is the test.
+            let _ = stream.write_all(&response);
+            if hold {
+                let _ = released.recv_timeout(Duration::from_secs(10));
+            }
+            let _ = stream.shutdown(Shutdown::Write);
+            let line = String::from_utf8_lossy(&request);
+            line.lines().next().unwrap_or_default().to_owned()
+        });
+        (url, release, server)
+    }
+
+    fn ok_response(body: &[u8]) -> Vec<u8> {
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        [head.as_bytes(), body].concat()
+    }
+
+    /// Neither the file nor its `.part` is on disk.
+    fn nothing_at(dest: &Path) -> bool {
+        !dest.exists() && !dest.with_extension("part").exists()
+    }
+
+    /// v1.57.0: a whole body becomes `dest` with no `.part` left, reported
+    /// once per MiB and once more, at the whole length, when it's in place.
+    #[test]
+    fn a_download_lands_whole_and_reports_its_end() {
+        let dir = scratch("dl-whole");
+        let dest = dir.join("model.onnx");
+        // 2.5 MiB: two throttled reports, both short of the end (a read is at
+        // most 64 KiB), so only the end report can carry the whole length.
+        let body: Vec<u8> = (0..5_u32 << 19)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let (url, _release, server) = http_stub(ok_response(&body), false);
+        let mut seen = Vec::new();
+        download_to_file(
+            &model_agent(Duration::from_secs(10)),
+            &format!("{url}/model.onnx"),
+            &dest,
+            |received, total| seen.push((received, total)),
+        )
+        .unwrap();
+        assert_eq!(server.join().unwrap(), "GET /model.onnx HTTP/1.1");
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert!(!dest.with_extension("part").exists());
+        let len = body.len() as u64;
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(
+            seen[0].0 >= 1 << 20 && seen[1].0 - seen[0].0 >= 1 << 20,
+            "{seen:?}"
+        );
+        assert!(seen[1].0 < len, "{seen:?}");
+        assert_eq!(seen[2], (len, len));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: a connection that closes before `Content-Length` is an error
+    /// and leaves neither the file nor its `.part`.
+    #[test]
+    fn a_body_cut_short_leaves_nothing_behind() {
+        let dir = scratch("dl-short");
+        let dest = dir.join("model.onnx");
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n".to_vec();
+        response.extend_from_slice(&[7; 400]);
+        let (url, _release, server) = http_stub(response, false);
+        let agent = model_agent(Duration::from_secs(10));
+        let err = download_to_file(&agent, &url, &dest, |_, _| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(nothing_at(&dest), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: ureq reads a chunked body to its end whatever length the
+    /// headers give, so a mismatch there is caught by the length check.
+    #[test]
+    fn a_body_that_misses_its_length_is_refused() {
+        let dir = scratch("dl-chunked");
+        let dest = dir.join("model.onnx");
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+            Content-Length: 1000\r\n\r\n190\r\n"
+            .to_vec();
+        response.extend_from_slice(&[7; 400]);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (url, _release, server) = http_stub(response, false);
+        let agent = model_agent(Duration::from_secs(10));
+        let err = download_to_file(&agent, &url, &dest, |_, _| {}).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(err, "expected 1000 bytes, got 400");
+        assert!(nothing_at(&dest));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: a server that stops sending mid-file fails the download
+    /// within the read timeout (ureq's default agent waits forever), and the
+    /// `.part` goes.
+    #[test]
+    fn a_stalled_download_times_out_and_cleans_up() {
+        let dir = scratch("dl-stall");
+        let dest = dir.join("model.onnx");
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n".to_vec();
+        response.extend_from_slice(&[7; 100]);
+        let (url, release, server) = http_stub(response, true);
+        let agent = model_agent(Duration::from_millis(300));
+        let started = Instant::now();
+        let result = download_to_file(&agent, &url, &dest, |_, _| {});
+        let took = started.elapsed();
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            took < Duration::from_secs(5),
+            "took {took:?}: no read timeout"
+        );
+        assert!(nothing_at(&dest));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reads one request's head from `stream`; false if it closes first.
+    fn read_request(stream: &mut TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+        }
+        true
+    }
+
+    /// A keep-alive HTTP server on 127.0.0.1: it answers the first request
+    /// with `body` and keeps that connection open, then answers nothing more
+    /// until `release` sends (10 s at most). Joining it says whether the
+    /// client sent its next request down that same connection.
+    fn keep_alive_stub(body: &[u8]) -> (String, mpsc::Sender<()>, JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = ok_response(body);
+        let (release, released) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream), "the client hung up mid-request");
+            stream.write_all(&response).unwrap();
+            // A client that doesn't keep the connection closes it, and its
+            // next request waits unanswered in the listener's queue.
+            let reused = read_request(&mut stream);
+            let _ = released.recv_timeout(Duration::from_secs(10));
+            let _ = stream.shutdown(Shutdown::Write);
+            reused
+        });
+        (url, release, server)
+    }
+
+    /// v1.57.0: a set's next file can't hang on the connection the last one
+    /// came over. ureq 2 waits for a reused connection's headers with no
+    /// timeout, so a server that took the request and went quiet would hold
+    /// the download, and the slot with it, until the app closed.
+    #[test]
+    fn a_quiet_server_cannot_hang_the_next_file() {
+        let dir = scratch("dl-reuse");
+        let agent = model_agent(Duration::from_millis(300));
+        let (url, release, server) = keep_alive_stub(b"the first file");
+        let first = dir.join("a.onnx");
+        download_to_file(&agent, &format!("{url}/a.onnx"), &first, |_, _| {}).unwrap();
+        let dest = dir.join("b.onnx");
+        let started = Instant::now();
+        let result = download_to_file(&agent, &format!("{url}/b.onnx"), &dest, |_, _| {});
+        let took = started.elapsed();
+        let _ = release.send(());
+        let reused = server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            took < Duration::from_secs(5),
+            "took {took:?}; the request reused the connection: {reused}"
+        );
+        assert!(nothing_at(&dest));
+        assert_eq!(fs::read(&first).unwrap(), b"the first file");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: what the startup sweep removes: the `.part` of each file of
+    /// every set (a Quit mid-download leaves one), nothing else, and on
+    /// Windows not one a second Divora is writing right now.
+    #[test]
+    fn the_startup_sweep_takes_only_the_downloads_parts() {
+        let dir = scratch("dl-sweep");
+        let parts: Vec<PathBuf> = [
+            "openvoice-extractor.part",
+            "openvoice-converter.part",
+            "voxcpm-prefill.part",
+            "voxcpm-decode-step.part",
+            "voxcpm-vae-encoder.part",
+            "voxcpm-vae-decoder.part",
+            "voxcpm-tokenizer.part",
+            "voxcpm-speaker.part",
+            "voxcpm-decode-step-gpu.part",
+        ]
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+        assert_eq!(model_part_paths(&dir), parts);
+        for part in &parts {
+            fs::write(part, b"half a model").unwrap();
+        }
+        // A finished model, and a `.part` that isn't a model download's.
+        let others = ["voxcpm-prefill.onnx", "preview.part"];
+        for name in others {
+            fs::write(dir.join(name), b"keep").unwrap();
+        }
+        sweep_model_parts(&dir);
+        for part in &parts {
+            assert!(!part.exists(), "{}", part.display());
+        }
+        for name in others {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        #[cfg(windows)]
+        {
+            let held = create_part(&parts[1]).unwrap();
+            sweep_model_parts(&dir);
+            assert!(parts[1].exists(), "removed while another download held it");
+            drop(held);
+            sweep_model_parts(&dir);
+            assert!(!parts[1].exists());
+        }
+        fs::remove_dir_all(&dir).ok();
+        // And the app runs it as it starts, on the folder the downloads use.
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let setup = body_of(&file[..tests_at], concat!(".setup(", "|app|"));
+        assert!(setup.contains(concat!("sweep_model_parts(", "&clone_models_dir);")));
+    }
+
+    /// v1.57.0: an error status is an error, with nothing written.
+    #[test]
+    fn a_missing_file_writes_nothing() {
+        let dir = scratch("dl-404");
+        let dest = dir.join("model.onnx");
+        let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let (url, _release, server) = http_stub(response, false);
+        let agent = model_agent(Duration::from_secs(10));
+        let err = download_to_file(&agent, &url, &dest, |_, _| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("404"), "{err}");
+        assert!(nothing_at(&dest));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: Divora isn't single-instance, so two copies can download one
+    /// file at once. The second can't open the first one's `.part`, so it
+    /// fails instead of emptying it and writing into it.
+    #[cfg(windows)]
+    #[test]
+    fn a_second_download_cannot_write_into_the_first_ones_part() {
+        let dir = scratch("dl-shared");
+        let dest = dir.join("model.onnx");
+        let mut first = create_part(&dest.with_extension("part")).unwrap();
+        first.write_all(b"first").unwrap();
+        let (url, _release, server) = http_stub(ok_response(b"second"), false);
+        let agent = model_agent(Duration::from_secs(10));
+        let err = download_to_file(&agent, &url, &dest, |_, _| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(!dest.exists(), "{err}");
+        drop(first);
+        assert_eq!(fs::read(dest.with_extension("part")).unwrap(), b"first");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: the file loop skips a file already on disk, numbers the rest
+    /// against the whole set, keeps the slot's snapshot current, and names
+    /// the file an error came from, as the commands always have.
+    #[test]
+    fn the_file_loop_skips_whats_there_and_names_what_failed() {
+        let dir = scratch("dl-loop");
+        fs::write(dir.join("a.onnx"), b"already here").unwrap();
+        let files = ["a.onnx", "b.onnx"];
+        let agent = model_agent(Duration::from_secs(10));
+        let snapshot = Arc::new(Mutex::new(None));
+
+        let body = vec![9; 1000];
+        let (url, _release, server) = http_stub(ok_response(&body), false);
+        let slot = DownloadSlot::try_claim(&snapshot, ModelDownloadKind::VoxCpm, 2).unwrap();
+        let mut seen = Vec::new();
+        download_model_files(&agent, &url, &dir, &files, &slot, |p| seen.push(p)).unwrap();
+        assert_eq!(server.join().unwrap(), "GET /b.onnx HTTP/1.1");
+        assert_eq!(fs::read(dir.join("a.onnx")).unwrap(), b"already here");
+        assert_eq!(fs::read(dir.join("b.onnx")).unwrap(), body);
+        let end = CloneDownloadProgress {
+            kind: ModelDownloadKind::VoxCpm,
+            file: 2,
+            file_count: 2,
+            received: 1000,
+            total: 1000,
+        };
+        assert_eq!(seen, std::slice::from_ref(&end));
+        assert_eq!(download_snapshot(&snapshot), Some(end));
+        drop(slot);
+
+        fs::remove_file(dir.join("b.onnx")).unwrap();
+        let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let (url, _release, server) = http_stub(response, false);
+        let slot = DownloadSlot::try_claim(&snapshot, ModelDownloadKind::VoxCpm, 2).unwrap();
+        let err = download_model_files(&agent, &url, &dir, &files, &slot, |_| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(err.starts_with("downloading b.onnx: "), "{err}");
+        drop(slot);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.57.0: one model download at a time. A second claim, of any set, is
+    /// refused in words the UI shows as they are; the snapshot follows the
+    /// progress; dropping the slot frees it.
+    #[test]
+    fn one_model_download_at_a_time() {
+        use ModelDownloadKind as Kind;
+        let snapshot = Arc::new(Mutex::new(None));
+        assert_eq!(download_snapshot(&snapshot), None);
+        let slot = DownloadSlot::try_claim(&snapshot, Kind::Clone, 2).unwrap();
+        let progress = |file, received, total| CloneDownloadProgress {
+            kind: Kind::Clone,
+            file,
+            file_count: 2,
+            received,
+            total,
+        };
+        assert_eq!(download_snapshot(&snapshot), Some(progress(1, 0, 0)));
+        for kind in [Kind::Clone, Kind::VoxCpm, Kind::VoxCpmGpu] {
+            let second = DownloadSlot::try_claim(&snapshot, kind, 1);
+            assert_eq!(second.err().as_deref(), Some(MODEL_DOWNLOAD_BUSY));
+        }
+        assert_eq!(download_snapshot(&snapshot), Some(progress(1, 0, 0)));
+        assert_eq!(slot.progress(2, 5, 10), progress(2, 5, 10));
+        assert_eq!(download_snapshot(&snapshot), Some(progress(2, 5, 10)));
+        drop(slot);
+        assert_eq!(download_snapshot(&snapshot), None);
+        drop(DownloadSlot::try_claim(&snapshot, Kind::VoxCpmGpu, 1).unwrap());
+    }
+
+    /// v1.57.0: a download thread that panics (debug builds; release aborts)
+    /// still gives the slot back, as it unwinds.
+    #[test]
+    fn a_panicking_download_gives_the_slot_back() {
+        let snapshot = Arc::new(Mutex::new(None));
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _slot = DownloadSlot::try_claim(&snapshot, ModelDownloadKind::VoxCpm, 6).unwrap();
+            panic!("a download thread panicked");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(download_snapshot(&snapshot), None);
+        drop(DownloadSlot::try_claim(&snapshot, ModelDownloadKind::VoxCpm, 6).unwrap());
+    }
+
+    /// v1.57.0: one voice is made at a time, a recording can't start while
+    /// one is, and the claim is given back on drop, an unwinding panic
+    /// included.
+    #[test]
+    fn one_voice_at_a_time_and_no_recording_meanwhile() {
+        let busy = Arc::new(AtomicBool::new(false));
+        assert_eq!(voice_clone_idle(&busy), Ok(()));
+        let claim = CloneClaim::try_claim(&busy).unwrap();
+        let refused = Err(VOICE_CLONE_BUSY.to_owned());
+        assert_eq!(CloneClaim::try_claim(&busy).map(|_| ()), refused);
+        assert_eq!(voice_clone_idle(&busy), refused);
+        drop(claim);
+        assert_eq!(voice_clone_idle(&busy), Ok(()));
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _claim = CloneClaim::try_claim(&busy).unwrap();
+            panic!("a cloning thread panicked");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(voice_clone_idle(&busy), Ok(()));
+        drop(CloneClaim::try_claim(&busy).unwrap());
+    }
+
+    /// v1.57.0: the names and payloads the frontend listens for and reads.
+    #[test]
+    fn the_download_wire_is_what_the_frontend_reads() {
+        use ModelDownloadKind as Kind;
+        assert_eq!(MODEL_DOWNLOAD_EVENT, "clone-model-download");
+        assert_eq!(MODEL_DOWNLOAD_DONE_EVENT, "clone-model-download-done");
+        for (kind, wire) in [
+            (Kind::Clone, "clone"),
+            (Kind::VoxCpm, "voxcpm"),
+            (Kind::VoxCpmGpu, "voxcpmGpu"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+        }
+        let progress = CloneDownloadProgress {
+            kind: Kind::VoxCpmGpu,
+            file: 1,
+            file_count: 1,
+            received: 2,
+            total: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&progress).unwrap(),
+            serde_json::json!({
+                "kind": "voxcpmGpu", "file": 1, "fileCount": 1, "received": 2, "total": 3
+            })
+        );
+        let done = |kind, error: Option<&str>| ModelDownloadDone {
+            kind,
+            error: error.map(str::to_owned),
+        };
+        assert_eq!(
+            serde_json::to_value(done(Kind::Clone, None)).unwrap(),
+            serde_json::json!({ "kind": "clone", "error": null })
+        );
+        assert_eq!(
+            serde_json::to_value(done(Kind::VoxCpm, Some("downloading a.onnx: boom"))).unwrap(),
+            serde_json::json!({ "kind": "voxcpm", "error": "downloading a.onnx: boom" })
+        );
+    }
+
+    /// The `{…}` body of the first item in `prod` that starts with `head`.
+    fn body_of<'a>(prod: &'a str, head: &str) -> &'a str {
+        let at = prod.find(head).unwrap_or_else(|| panic!("{head:?}"));
+        let open = at + prod[at..].find('{').expect("a body");
+        let mut depth = 0_usize;
+        let close = prod[open..]
+            .char_indices()
+            .find_map(|(i, c)| {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(open + i)
+            })
+            .expect("the body closes");
+        &prod[open..=close]
+    }
+
+    /// v1.57.0: the commands need an `AppHandle`, so this reads the source.
+    /// The five slow ones are `async fn`s whose work runs under
+    /// `spawn_blocking` (the downloads through `run_model_download`), none is
+    /// a sync `fn` again, a recording checks for a voice being made, and
+    /// `model_download_status` is a registered, sync command. And what the
+    /// pure parts' tests can't see: the two voice-making commands take their
+    /// claim before handing off and give it back on the thread, a download
+    /// uses the agent with the read timeout, and frees its slot before the
+    /// done event goes out (a page may start the next download on it).
+    #[test]
+    fn the_slow_commands_run_off_the_main_thread() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let command = |name: &str| format!("#[tauri::command]\nasync fn {name}(");
+        let blocking = "tauri::async_runtime::spawn_blocking(move ||";
+        let at = |body: &str, needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        for name in ["clone_voice", "stop_voice_recording"] {
+            let body = body_of(prod, &command(name));
+            let claim = at(
+                body,
+                concat!(
+                    "let claim = CloneClaim::",
+                    "try_claim(&state.voice_clone_busy)?;"
+                ),
+            );
+            let handed_off = at(body, blocking);
+            let given_back = at(body, concat!("drop(", "claim);"));
+            assert!(claim < handed_off && handed_off < given_back, "{name}");
+        }
+        for name in [
+            "download_clone_models",
+            "download_voxcpm_models",
+            "download_voxcpm_gpu_model",
+        ] {
+            let body = body_of(prod, &command(name));
+            assert!(body.contains("run_model_download("), "{name}");
+        }
+        let download = body_of(prod, "async fn run_model_download(");
+        assert!(download.contains(concat!("model_agent(", "MODEL_READ_TIMEOUT)")));
+        let handed_off = at(download, blocking);
+        let freed = at(download, concat!("drop(", "slot);"));
+        assert!(handed_off < freed);
+        // The body's first use of the done event's name is its emit.
+        assert!(freed < at(download, concat!("MODEL_DOWNLOAD_", "DONE_EVENT")));
+        for name in [
+            "clone_voice",
+            "stop_voice_recording",
+            "download_clone_models",
+            "download_voxcpm_models",
+            "download_voxcpm_gpu_model",
+        ] {
+            assert!(
+                !prod.contains(&format!("\nfn {name}(")),
+                "{name} is sync again"
+            );
+        }
+        let start = body_of(prod, "fn start_voice_recording(");
+        assert!(start.contains("voice_clone_idle(&state.voice_clone_busy)?;"));
+        assert!(prod.contains("#[tauri::command]\nfn model_download_status("));
+        let handler = &prod[prod.find("tauri::generate_handler![").expect("the handler")..];
+        let handler = &handler[..handler.find(']').expect("its end")];
+        assert!(handler.contains("\n            model_download_status,\n"));
+        // Every emit goes through the two names the frontend listens for.
+        assert_eq!(prod.matches("\"clone-model-download").count(), 2);
+    }
+
+    /// v1.57.0: a recording becomes the voice its start chose. A recording
+    /// can now run while the `VoxCPM` download does, so checking at stop made
+    /// a freely spoken take a `VoxCPM` voice, with the read-aloud sentence as
+    /// its transcript, whenever the download finished during it. The commands
+    /// need a running engine, so this reads the source: the start checks and
+    /// keeps the answer with the path, and the stop goes by that answer.
+    #[test]
+    fn a_recording_keeps_the_engine_it_started_with() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let start = body_of(prod, concat!("fn start_voice_", "recording("));
+        assert!(start.contains(concat!(
+            "let voxcpm = divora_core::tts::voxcpm::",
+            "models_present(&voxcpm_dir(&state));"
+        )));
+        assert!(start.contains(concat!("Some((path.clone(), ", "voxcpm));")));
+        // The page's hint is the start's answer: the sentence exactly when
+        // the take becomes a `VoxCPM` voice.
+        assert!(start.contains(concat!(
+            "Ok(voxcpm.then(|| divora_core::tts::voxcpm::",
+            "READ_ALOUD_PROMPT.to_string()))"
+        )));
+        let stop = body_of(prod, concat!("fn clone_from_", "recording("));
+        assert!(stop.contains(concat!("let (path, ", "voxcpm) = state")));
+        assert!(stop.contains(concat!("let result = if ", "voxcpm {")));
+        for again in ["models_present", "voxcpm_dir(", "present()"] {
+            assert!(!stop.contains(again), "checked again at stop: {again}");
+        }
     }
 
     // ---- v1.14.0: preset-import id helpers -----------------------------
