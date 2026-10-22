@@ -2041,6 +2041,17 @@ fn delete_cloned_voice(state: State<'_, AppState>, id: String) -> Result<(), Str
 /// downloaded from here on demand rather than shipped in the installer).
 const CLONE_MODELS_BASE_URL: &str =
     "https://github.com/NickSanft/DivoraVoiceMod/releases/download/voice-assets-v2";
+/// Where the model downloads come from: [`CLONE_MODELS_BASE_URL`], or in a
+/// debug build `DIVORA_MODELS_BASE_URL` when it is set, so a real-app check can
+/// serve them from a local server. Release builds never read the variable.
+fn models_base_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("DIVORA_MODELS_BASE_URL") {
+        return url;
+    }
+    CLONE_MODELS_BASE_URL.to_string()
+}
+
 /// The cloning model files to fetch (extractor is tiny; converter is ~157 MB).
 const CLONE_MODEL_FILES: &[&str] = &["openvoice-extractor.onnx", "openvoice-converter.onnx"];
 /// The `VoxCPM` accent-cloning model files to fetch (Q8 graphs + tokenizer,
@@ -2205,7 +2216,7 @@ fn download_clone_models(app: AppHandle, state: State<'_, AppState>) -> Result<(
         if dest.is_file() {
             continue;
         }
-        let url = format!("{CLONE_MODELS_BASE_URL}/{name}");
+        let url = format!("{}/{name}", models_base_url());
         download_to_file(&app, &url, &dest, i + 1, count)
             .map_err(|e| format!("downloading {name}: {e}"))?;
     }
@@ -2226,7 +2237,7 @@ fn download_voxcpm_models(app: AppHandle, state: State<'_, AppState>) -> Result<
         if dest.is_file() {
             continue;
         }
-        let url = format!("{CLONE_MODELS_BASE_URL}/{name}");
+        let url = format!("{}/{name}", models_base_url());
         download_to_file(&app, &url, &dest, i + 1, count)
             .map_err(|e| format!("downloading {name}: {e}"))?;
     }
@@ -2267,7 +2278,7 @@ fn download_voxcpm_gpu_model(app: AppHandle, state: State<'_, AppState>) -> Resu
     if dest.is_file() {
         return Ok(());
     }
-    let url = format!("{CLONE_MODELS_BASE_URL}/{name}");
+    let url = format!("{}/{name}", models_base_url());
     download_to_file(&app, &url, &dest, 1, 1).map_err(|e| format!("downloading {name}: {e}"))?;
     tracing::info!(path = %dest.display(), "voxcpm gpu model downloaded");
     Ok(())
