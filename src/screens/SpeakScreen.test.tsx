@@ -360,3 +360,85 @@ describe("SpeakScreen — Critter Chatter voices (v1.50.0)", () => {
     expect(queryByText("Saved clips")).toBeTruthy();
   });
 });
+
+describe("SpeakScreen — the recording hint (v1.57.0)", () => {
+  /** Kokoro and the cloning models are there; VoxCPM is whatever `voxcpm`
+   *  says when its status is read, or when a take starts. */
+  function seed(state: { voxcpm: boolean }) {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_tts_voices":
+          return [{ id: "af_heart", name: "Aria", lang: "en-us", installed: true, engine: "kokoro" }];
+        case "list_cloned_voices":
+        case "list_speak_clips":
+          return [];
+        case "clone_models_status":
+          return { ready: true };
+        case "voxcpm_status":
+          return { available: state.voxcpm, readPrompt: "Read this aloud." };
+        // The backend's decision as the take starts: the sentence, or null.
+        case "start_voice_recording":
+          return state.voxcpm ? "Read this aloud." : null;
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  function setupWithApp() {
+    let captured: ReturnType<typeof useApp> | null = null;
+    function Inner() {
+      captured = useApp();
+      return <SpeakScreen />;
+    }
+    const utils = render(() => (
+      <AppProvider>
+        <Inner />
+      </AppProvider>
+    ));
+    return { ...utils, app: () => captured! };
+  }
+
+  /** Name the voice and press Record, once the screen has read VoxCPM's status. */
+  async function record(utils: ReturnType<typeof setupWithApp>) {
+    const name = await utils.findByPlaceholderText(/Name your voice/);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("voxcpm_status"));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("voxcpm_gpu_status"));
+    fireEvent.input(name, { target: { value: "Me" } });
+    fireEvent.click(utils.getByRole("button", { name: "Record" }));
+    await utils.findByRole("button", { name: "Stop & save" });
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* fine */
+    }
+  });
+
+  it("a take started without VoxCPM keeps 'speak naturally' when VoxCPM lands mid-take", async () => {
+    const state = { voxcpm: false };
+    seed(state);
+    const utils = setupWithApp();
+    await record(utils);
+    expect(utils.getByText(/speak naturally/)).toBeTruthy();
+
+    // The VoxCPM download ends mid-take; the backend keeps this take free speech.
+    state.voxcpm = true;
+    await utils.app().refreshVoxcpmStatus();
+    expect(utils.app().voxcpmAvailable()).toBe(true);
+    expect(utils.getByText(/speak naturally/)).toBeTruthy();
+    expect(utils.queryByText(/read this aloud/i)).toBeNull();
+  });
+
+  it("a take started with VoxCPM shows the sentence to read", async () => {
+    seed({ voxcpm: true });
+    const utils = setupWithApp();
+    await record(utils);
+    expect(utils.getByText(/read this aloud, then Stop/)).toBeTruthy();
+    expect(utils.getByText("“Read this aloud.”")).toBeTruthy();
+    expect(utils.queryByText(/speak naturally/)).toBeNull();
+  });
+});

@@ -3020,7 +3020,9 @@ different rates, and joining them flashed "Input silent" after every unmute.
   there too. A mute pressed or invoked while another sync command holds it —
   a `start_audio_engine` blocked on opening a device — lands when that command
   returns. `Command::Start` tears the old session down first, so no stream
-  runs while it waits.
+  runs while it waits. (Until v1.57.0 the Speak screen's model downloads and
+  voice cloning held it too, for minutes and seconds; see "Long commands off
+  the main thread".)
 - **The level emitter:** one load per tick, so `inputMuted` and
   `inputMuteSeq` always agree.
 - **The reading worker:** one load per pass.
@@ -3135,3 +3137,119 @@ app, silence began 0 to 11 ms after each command was sent, at 48 kHz.
     monitor's output; a real device loss (the rebuilds were direct restarts);
     a mute held for minutes in the app (the bench covers its CPU only). Several
     of these are the owner's checks in `MANUAL_TESTS.md`.
+
+## Long commands off the main thread (v1.57.0)
+
+**Why.** Tauri 2 runs a plain sync `#[tauri::command] fn` on the main thread,
+start to finish: WebView2 raises `WebResourceRequested` for every IPC request
+on its UI thread, and tauri-macros' `body_blocking` calls the function right
+there (tauri-macros 2.6.2 `command/wrapper.rs`; wry 0.55.1
+`webview2/mod.rs`). That thread is also where global-hotkey's hidden window
+gets `WM_HOTKEY` (so every hotkey press, the backend-handled **Mute your
+voice** included), where the tray and window events run, where events
+emitted from other threads are delivered, and where async commands' answers
+are handed to the page. A sync command that takes minutes freezes all of it:
+the window can't close to the tray, hotkey presses wait in the queue and
+all land, in a burst, when the command returns, and every other command
+waits. `async fn` commands, and `#[tauri::command(async)]`, run on
+tauri's tokio workers (`async_runtime::spawn`), not the blocking pool, so
+blocking work inside them ties up a worker; the shape for long work is
+`async fn` + `tauri::async_runtime::spawn_blocking`, as `speak` (v1.27.0)
+and the screen-recording commands already were.
+
+**What moved.** The Speak screen's three model downloads
+(`download_clone_models` ~157 MB, `download_voxcpm_models` ~1.6 GB,
+`download_voxcpm_gpu_model` ~1.2 GB) and voice cloning (`clone_voice`,
+`stop_voice_recording`: a whole-file decode and a fresh ONNX session, and
+stop's wait for the engine to finalize the WAV). Each is an `async fn` that
+claims what it needs, then runs in `spawn_blocking`. Their answers are
+unchanged, and a download that fails still rejects with
+`downloading {name}: {e}`; the one-at-a-time refusals below are new.
+
+**Measured** (debug builds, a local server through `DIVORA_MODELS_BASE_URL`
+trickling 64 KiB every 100 ms and cutting the connection at 6 of 8 MiB, so
+nothing was installed): 1.5 s into `download_clone_models`, a sync
+`input_mute` took 9,151 ms with the old build — it answered as the server
+cut the connection, 10.6 s in — and the main window didn't answer `WM_NULL`
+within 2 s. With this build: 1–2 ms and 5 ms, three times during the
+download; a second download was refused in 2 ms; `model_download_status`
+read file 1 of 2 at 1, 2 and 3 MiB; the done event carried the kind and the
+error, the status read null after, and the `.part` was gone.
+
+**One download at a time.** `AppState.model_download` holds the running
+download's latest progress (`None` when idle). `DownloadSlot::try_claim`
+refuses a second with `MODEL_DOWNLOAD_BUSY` ("A model download is already
+running."); the slot updates the snapshot as bytes arrive and frees it on
+drop, so an error, or a panic in a debug build, can't leave it claimed. A
+set already on disk answers `Ok` before claiming, with no events. The end of
+a download, in order: the slot is freed as the blocking task ends,
+`clone-model-download-done` `{kind, error}` goes out, the command answers —
+so a page reacting to the done event can start the next download at once.
+`model_download_status` (sync, instant) answers the snapshot, for a page
+loaded mid-download: once the main thread is free, F5 is reachable during a
+download.
+
+**`download_to_file`.** Takes a `ureq::Agent` and a progress callback (no
+`AppHandle`), so it is tested against local HTTP stubs. `model_agent`: 30 s
+to connect, 60 s with nothing read (`MODEL_READ_TIMEOUT`) — ureq's default
+agent has no read timeout, so a silent server used to hang the download
+forever, and with it, before this change, the whole app — and no pooled
+connections (`max_idle_connections(0)`): ureq 2 clears a pooled connection's
+timeouts and sets the read timeout again only for the body, so from a set's
+second file on, the wait for GitHub's redirect and the file's headers had no
+timeout at all. The temp file is still the file's name with its extension
+swapped for `.part` (`openvoice-extractor.part`, `voxcpm-tokenizer.part`),
+opened with
+`share_mode(0)` on Windows so a second Divora process gets an error instead
+of writing into it; any error once it exists removes it, and a body that
+doesn't match its `Content-Length` is an error. A process that ends
+mid-download (tray Quit doesn't wait for it, nor should it) leaves the
+`.part`; `sweep_model_parts` removes the known names at startup (a live one
+held by another instance won't delete), and downloading the file again
+empties and reuses it. The model file isn't synced to disk before the
+rename, as before.
+
+**Voice cloning.** `AppState.voice_clone_busy`, an `AtomicBool` claimed by
+`CloneClaim` in the async body before the hand-off and freed when the worker
+ends: a second `clone_voice` or `stop_voice_recording` is refused with
+"Divora is still making a voice. Try again when it's done.", and so is
+`start_voice_recording` (still sync), because the stop's worker reads and
+then deletes the fixed `voice-reference.wav` a new take would truncate.
+In-page the store's `cloning()` already serialised these; the claim covers a
+reload. A recording can now run while the VoxCPM download does, so the
+engine a take becomes is decided when it **starts** (`voice_recording_path`
+keeps `(path, voxcpm)`), and `start_voice_recording` answers the sentence to
+read (VoxCPM) or null, which the page shows for the whole take. Checked at
+stop, as before, a take spoken freely became a VoxCPM voice, with the
+read-aloud sentence as its transcript, whenever the download finished
+during it.
+
+**The page.** One permanent subscription to `clone-model-download` and
+`clone-model-download-done`, made when the store is created, replaces the
+per-call listener, so a page that didn't start a download still shows it.
+At creation the store awaits the done listener, then the progress listener,
+and only then reads `model_download_status` (an event emitted before its
+listener is registered reaches no one, and a listen answers only once
+registered), applying the read only if no event arrived meanwhile (the
+v1.55.0 answer-vs-event rule) and never applying a null. The three start
+functions keep the page's guard and identity-check their own state, so a
+late answer never clears a newer download; the done event refreshes the
+status of its kind before clearing, so the button doesn't flash back.
+
+**Left on the main thread, on purpose or for later.** The three shortcut
+commands must stay sync: global-hotkey registers on its window's thread, and
+the plugin holds its own lock while it runs our handler. Mute, chain edits
+and other atomic or channel-send commands stay sync: they are fast and rely
+on arriving in order. Deferred, each needing more than a move:
+`start_audio_engine` (roughly 150–450 ms here, added up from parts timed
+separately rather than end to end; likely seconds with a Bluetooth headset
+mic and unbounded if a driver hangs, neither tested; an async Start loses its
+place in IPC order, so it needs a two-step split); device enumeration
+(`list_audio_*`, `detect_virtual_mic`; about 0.1–0.2 s here, more with many
+endpoints; cpal leaves its thread in an STA and owns a process-wide
+enumerator, so it needs one long-lived thread); `play_soundboard_clip` on a
+cache miss (150–500 ms for a ten-minute file; a later Stop must still win);
+`scan_soundboard_folder` (only a network folder is slow; a slow scan of the
+old folder could land after the new one). Also left, though a plain move
+would do: `import_preset` (slow only for a cloud or network file) and
+`list_speak_clips` (grows with the number of saved clips).
