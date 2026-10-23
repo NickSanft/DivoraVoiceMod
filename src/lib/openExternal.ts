@@ -4,7 +4,23 @@
 //
 // Extracted from SettingsScreen in v1.49.0 when the What's new panel
 // needed the same behaviour for its "full changelog" link.
+//
+// v1.57.0: the backend's `open_external` first, which has the Windows
+// desktop open it. The shell plugin's `open` runs ShellExecute in Divora's
+// own process, so a browser that wasn't running started as Divora's child,
+// and "Everything except Divora" (which leaves out Divora's whole process
+// tree) left its sound out of recordings until it was restarted. Only when
+// that fails (no desktop shell, a browser preview) does it fall back to the
+// plugin, and then to a plain anchor.
+import { openExternalTarget } from "../audio/api";
+
 export async function openExternal(url: string): Promise<void> {
+  try {
+    await openExternalTarget(url);
+    return;
+  } catch (err) {
+    console.warn("[shell] opening it from the desktop failed", err);
+  }
   try {
     const { open } = await import("@tauri-apps/plugin-shell");
     await open(url);

@@ -47,6 +47,19 @@ pub fn process_loopback_available() -> bool {
     false
 }
 
+/// See the Windows build's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Show {
+    Normal,
+    Hidden,
+}
+
+/// Always fails: there is no desktop Explorer to open it from, so the caller
+/// opens it the usual way.
+pub fn open_outside_tree(_file: &str, _args: Option<&str>, _show: Show) -> Result<(), String> {
+    Err("no desktop Explorer here".to_string())
+}
+
 pub fn list_playback_devices() -> Result<Vec<PlaybackDevice>, CaptureError> {
     Ok(Vec::new())
 }

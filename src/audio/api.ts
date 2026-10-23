@@ -655,6 +655,17 @@ export async function openSpeakClipsFolder(): Promise<void> {
   await invoke("open_speak_clips_folder");
 }
 
+/**
+ * v1.57.0: open a web link or a folder from the Windows desktop (its
+ * Explorer), so a browser it starts isn't Divora's child and "Everything
+ * except Divora" still records it. Rejects for anything but an http(s) link
+ * or an existing folder, and where the desktop can't open it; use
+ * `openExternal` (src/lib/openExternal.ts), which then opens it the old way.
+ */
+export async function openExternalTarget(target: string): Promise<void> {
+  await invoke("open_external", { target });
+}
+
 /** List saved Speak clips, newest first. */
 export async function listSpeakClips(): Promise<SpeakClip[]> {
   return invoke<SpeakClip[]>("list_speak_clips");

@@ -2209,7 +2209,10 @@ What the PC plays, mixed into the same AAC track. Two sources, one loop:
   (`ActivateAudioInterfaceAsync`, `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`
   on Divora's own PID): every other process's audio, on whichever device it
   plays, without Divora's voice, soundboard or monitor — or anything Divora
-  started — except on a device loopback can't hear: on the development PC,
+  started (v1.57.0: links and folders are opened by the desktop's Explorer,
+  `divora_capture::open_outside_tree`, so a browser opened from Divora is
+  Explorer's child and is recorded; `tests/launch_outside_tree.rs` measures
+  both ways) — except on a device loopback can't hear: on the development PC,
   the default Realtek USB speakers (which have a vendor virtual mixer) were
   silent to both loopbacks. Whenever another app opens or closes a stream on
   a device, Windows skips about 15 ms of that device's sound and then sends

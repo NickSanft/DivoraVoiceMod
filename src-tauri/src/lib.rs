@@ -1548,10 +1548,29 @@ fn speak_clips_dir(state: State<'_, AppState>) -> String {
 /// Creates it first so it opens even before the first clip is saved. Uses a
 /// native process rather than the frontend shell plugin so it reliably reveals
 /// a *directory* (the plugin's `open` is scoped/validated for URLs + files).
+///
+/// v1.57.0: through the desktop's Explorer first ([`open_folder`]), off the
+/// main thread.
 #[tauri::command]
-fn open_speak_clips_folder(state: State<'_, AppState>) -> Result<(), String> {
+async fn open_speak_clips_folder(state: State<'_, AppState>) -> Result<(), String> {
     let dir = speak_clips_path(&state);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || open_folder(&dir))
+        .await
+        .map_err(|e| format!("opening the folder stopped: {e}"))?
+}
+
+/// v1.57.0: open `dir` in the file manager. On Windows the desktop's
+/// Explorer opens it ([`divora_capture::open_outside_tree`]), so nothing the
+/// user starts from that window becomes Divora's descendant (and left out of
+/// "Everything except Divora"); where that fails, Divora starts the file
+/// manager itself, as before.
+fn open_folder(dir: &Path) -> Result<(), String> {
+    if divora_capture::open_outside_tree(&dir.to_string_lossy(), None, divora_capture::Show::Normal)
+        .is_ok()
+    {
+        return Ok(());
+    }
     #[cfg(target_os = "windows")]
     let program = "explorer";
     #[cfg(target_os = "macos")]
@@ -1561,10 +1580,66 @@ fn open_speak_clips_folder(state: State<'_, AppState>) -> Result<(), String> {
     // `explorer` returns a non-zero exit even on success, so just spawn (don't
     // wait) — a successful launch is all we need.
     std::process::Command::new(program)
-        .arg(&dir)
+        .arg(dir)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// v1.57.0: what [`open_external`] opens: a web link, or a folder that exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalTarget {
+    Link,
+    Folder,
+}
+
+/// v1.57.0: what the page may ask [`open_external`] to open. Only `http(s)`
+/// links and absolute paths of folders that exist — what the page opens (the
+/// changelog, GitHub, the update and VB-Cable pages, the voice-library and
+/// logs folders) — never a file or a program, which Explorer would run.
+fn external_target(target: &str) -> Result<ExternalTarget, String> {
+    const REFUSED: &str = "Divora opens only web links and folders.";
+    if target.is_empty() || target.chars().any(char::is_control) {
+        return Err(REFUSED.to_string());
+    }
+    let lower = target.to_ascii_lowercase();
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = lower.strip_prefix(scheme) {
+            return if rest.is_empty()
+                || rest.starts_with('/')
+                || target.contains(char::is_whitespace)
+            {
+                Err(REFUSED.to_string())
+            } else {
+                Ok(ExternalTarget::Link)
+            };
+        }
+    }
+    let path = Path::new(target);
+    if path.is_absolute() && path.is_dir() {
+        Ok(ExternalTarget::Folder)
+    } else {
+        Err(REFUSED.to_string())
+    }
+}
+
+/// v1.57.0: open a web link or a folder from the desktop's Explorer, so a
+/// browser it starts is Explorer's child, not Divora's: "Everything except
+/// Divora" leaves out Divora's whole process tree, and a browser the shell
+/// plugin's `open` started (when it wasn't running) was in it, so its sound
+/// was missing from recordings until it was restarted. Errors when the
+/// target isn't a link or folder, or when Explorer can't open it (no desktop
+/// shell); the page then opens it the old way. Async with `spawn_blocking`:
+/// the cross-process call takes tens of milliseconds, and the main thread is
+/// the hotkeys' too.
+#[tauri::command]
+async fn open_external(target: String) -> Result<(), String> {
+    external_target(&target)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        divora_capture::open_outside_tree(&target, None, divora_capture::Show::Normal)
+    })
+    .await
+    .map_err(|e| format!("opening it stopped: {e}"))?
 }
 
 /// List saved Speak clips, newest first (each with its WAV `path` for replay).
@@ -3165,6 +3240,7 @@ pub fn run() {
             stop_preview_voice,
             speak_clips_dir,
             open_speak_clips_folder,
+            open_external,
             list_speak_clips,
             delete_speak_clip,
             clone_voice,
@@ -3194,13 +3270,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloned_voices_dir, default_clone_base, emit_speak, hides_on_close, hotkey_mute_request,
-        is_safe_voice_id, level_update, list_cloned_voice_infos, load_cloned_voice, mute_on_hotkey,
-        preview_path_in, read_preview, rebind, release, rename_cloned_voice_in, save_tts_clip,
-        scan_voice_dir, slugify_preset_id, speak_commands, unique_preset_id, write_preview,
-        ClonedMeta, EngineStatus, LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo,
-        VoiceReadingUpdate, MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT,
-        PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
+        cloned_voices_dir, default_clone_base, emit_speak, external_target, hides_on_close,
+        hotkey_mute_request, is_safe_voice_id, level_update, list_cloned_voice_infos,
+        load_cloned_voice, mute_on_hotkey, preview_path_in, read_preview, rebind, release,
+        rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
+        unique_preset_id, write_preview, ClonedMeta, EngineStatus, ExternalTarget, LevelUpdate,
+        Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo, VoiceReadingUpdate, MAX_CLONE_NAME_LEN,
+        PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
     };
     use divora_core::audio::{AudioEngine, InputMute, ReadingSnapshot};
     use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
@@ -3562,6 +3638,71 @@ mod tests {
         for id in ["Mute", "mute:hold", "monitor", "sb:mute", ""] {
             assert!(!hotkey_mute_request(id, true), "{id:?} pressed");
             assert!(!hotkey_mute_request(id, false), "{id:?} released");
+        }
+    }
+
+    /// v1.57.0: the page may open web links and folders that exist, and
+    /// nothing Explorer would run.
+    #[test]
+    fn open_external_takes_only_links_and_folders() {
+        for link in [
+            "https://github.com/NickSanft/DivoraVoiceMod/blob/main/CHANGELOG.md",
+            "https://vb-audio.com/Cable/",
+            "HTTP://example.com",
+        ] {
+            assert_eq!(external_target(link), Ok(ExternalTarget::Link), "{link}");
+        }
+        let dir = std::env::temp_dir();
+        let folder = dir.to_string_lossy().into_owned();
+        assert_eq!(external_target(&folder), Ok(ExternalTarget::Folder));
+        let file = dir.join("divora-open-external-test.txt");
+        fs::write(&file, b"x").unwrap();
+        let exe = std::env::current_exe().unwrap();
+        for refused in [
+            String::new(),
+            "https://".to_string(),
+            "https:///etc".to_string(),
+            "https://example.com/a b".to_string(),
+            "https://example.com/\n".to_string(),
+            "file:///C:/Windows/System32/calc.exe".to_string(),
+            "ms-settings:privacy".to_string(),
+            "javascript:alert(1)".to_string(),
+            "calc.exe".to_string(),
+            "relative\\folder".to_string(),
+            file.to_string_lossy().into_owned(),
+            exe.to_string_lossy().into_owned(),
+            dir.join("no-such-folder-divora")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert!(
+                external_target(&refused).is_err(),
+                "{refused:?} was let through"
+            );
+        }
+        let _ = fs::remove_file(&file);
+    }
+
+    /// v1.57.0: `open_external` and the clips folder go through
+    /// `open_outside_tree` off the main thread; they need an `AppHandle` and a
+    /// desktop, so this reads the source (`divora-capture`'s
+    /// `tests/launch_outside_tree.rs` measures what it changes).
+    #[test]
+    fn links_and_folders_open_from_the_desktop() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        for (needle, n) in [
+            (concat!("async fn open_", "external(target: String)"), 1),
+            (concat!("async fn open_speak_", "clips_folder("), 1),
+            (concat!("external_", "target(&target)?;"), 1),
+            (concat!("divora_capture::open_", "outside_tree("), 2),
+            (concat!("spawn_blocking(move || open_", "folder(&dir))"), 1),
+            (concat!("            open_", "external,\n"), 1),
+        ] {
+            assert_eq!(prod.matches(needle).count(), n, "{needle}");
         }
     }
 

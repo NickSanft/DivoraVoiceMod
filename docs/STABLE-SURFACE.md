@@ -293,6 +293,12 @@ emit / emit-to and dragging its window; `default.json` now covers `main`
 alone and no longer grants creating webview windows or setting a window's
 position or size, which the backend does.
 
+### Opening links and folders (v1.57.0)
+
+| Command | Args | Returns |
+|---|---|---|
+| `open_external` | `target: string` — an `http(s)://` link, or the absolute path of a folder that exists | — / error ("Divora opens only web links and folders.", or why the desktop couldn't open it). Opens it from the desktop's Explorer, so a browser it starts isn't in Divora's process tree (which "Everything except Divora" leaves out). The page falls back to the shell plugin's `open` when this fails |
+
 ### MIDI control surfaces (v1.9.0)
 
 | Command | Args | Returns |

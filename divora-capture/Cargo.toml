@@ -32,6 +32,10 @@ hound = "3"
 # run time (`native::loopback`), so the exe gains no mmdevapi.dll import.
 # `windows-core` is named directly only because `#[implement]` expands to
 # `::windows_core` paths; 0.61.2 is already in the lock.
+#
+# v1.57.0 adds `Win32_UI_Shell` (and `_Common`) for `native::shell`, which
+# opens links through the desktop's Explorer so they start outside Divora's
+# process tree. Features only, no new copy.
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.61"
 windows = { version = "0.61", features = [
@@ -64,6 +68,14 @@ windows = { version = "0.61", features = [
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# v1.57.0: `tests/launch_outside_tree.rs` starts a program the way the shell
+# plugin opens a link (`ShellExecuteExW`), whose info struct names a registry
+# key. Test-only features of the same 0.61 copy.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61", features = ["Win32_System_Registry", "Win32_UI_Shell"] }

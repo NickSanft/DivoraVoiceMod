@@ -27,6 +27,7 @@ import { Kbd } from "./Kbd";
 import { Select, type SelectOption } from "./Select";
 import { Sigil, type SigilName } from "./Sigil";
 import { useApp } from "../stores/app";
+import { openExternal } from "../lib/openExternal";
 
 const STORAGE_KEY = "divora.wizardSeen";
 const VB_CABLE_URL = "https://vb-audio.com/Cable/";
@@ -180,17 +181,10 @@ function WizardOverlay(props: OverlayProps): JSX.Element {
     if (step() > 0) setStep(step() - 1);
   };
 
+  // v1.57.0: through openExternal, so the browser starts from the desktop,
+  // not as Divora's child (see src/lib/openExternal.ts).
   const openDownload = (): void => {
-    void (async () => {
-      try {
-        const { open } = await import("@tauri-apps/plugin-shell");
-        await open(app.virtualMicStatus()?.downloadUrl ?? VB_CABLE_URL);
-      } catch {
-        if (typeof window !== "undefined") {
-          window.open(VB_CABLE_URL, "_blank", "noopener");
-        }
-      }
-    })();
+    void openExternal(app.virtualMicStatus()?.downloadUrl ?? VB_CABLE_URL);
   };
 
   return (
