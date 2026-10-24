@@ -12,9 +12,9 @@
 //! Local only, and opt-in twice over: `#[ignore]`d, and it needs
 //! `DIVORA_TEST_DEVICE` set to part of a playback device's name. It refuses a
 //! device named like a virtual cable — a cable can lead into a live call —
-//! and the tones are −90 dBFS, far below hearing. Build the example first
-//! (any `cargo test` does), then run
-//! `DIVORA_TEST_DEVICE=SMSL cargo test -p divora-capture --test launch_outside_tree -- --include-ignored --nocapture`.
+//! and the tones are −90 dBFS, far below hearing. A `--test` run doesn't
+//! build examples, so build the player first:
+//! `cargo build -p divora-capture --example tone_child && DIVORA_TEST_DEVICE=SMSL cargo test -p divora-capture --test launch_outside_tree -- --include-ignored --nocapture`.
 
 #![cfg(windows)]
 #![allow(unsafe_code)]
@@ -32,7 +32,8 @@ const AMP: f64 = 3.162e-5; // −90 dBFS, what tone_child plays
 /// How long each tone plays: a settle, then two 2 s captures, with room.
 const PLAY_MS: u64 = 6_000;
 
-/// The tone player, built beside this test (examples are built by `cargo test`).
+/// The tone player, built beside this test (`cargo build --example
+/// tone_child`, or a `cargo test` that names no target).
 fn tone_child() -> PathBuf {
     let exe = std::env::current_exe().expect("test exe");
     let dir = exe.parent().and_then(|d| d.parent()).expect("target dir");
@@ -82,7 +83,8 @@ fn tone_level(left: &[f32], hz: f64) -> (f64, f64) {
     (level_at(left, hz), neighbours)
 }
 
-/// Two seconds of `source`'s left channel.
+/// Two seconds of `source`'s left channel. A working capture gets a packet
+/// every 10 ms even in silence, so a short one means it wasn't capturing.
 fn capture(source: &DesktopSource) -> Vec<f32> {
     let mut cap = DesktopCapture::start(source).expect("desktop capture");
     let mut drain = cap.take_drain().expect("drain");
@@ -90,11 +92,17 @@ fn capture(source: &DesktopSource) -> Vec<f32> {
     let mut chunks = Vec::new();
     drain.drain(Instant::now(), 0.0, &mut chunks);
     drop(cap);
-    chunks
+    let left: Vec<f32> = chunks
         .iter()
         .flat_map(|c| c.frames.chunks(2).map(|lr| lr[0]))
         .skip(4_800)
-        .collect()
+        .collect();
+    assert!(
+        left.len() >= 72_000,
+        "a 2 s capture gave {} frames",
+        left.len()
+    );
+    left
 }
 
 /// Start the player with `start`, let it settle, then measure its tone in
@@ -111,8 +119,11 @@ fn measure(
         &format!("\"{device}\" {hz} {PLAY_MS}"),
     );
     std::thread::sleep(Duration::from_millis(800));
-    let everything = tone_level(&capture(&DesktopSource::Everything), hz);
+    // The device first: a tone it carries by now plays on through the
+    // everything-except-us window that follows, so a late start fails the
+    // device check instead of passing as "left out".
     let on_device = tone_level(&capture(&DesktopSource::Device(device.to_owned())), hz);
+    let everything = tone_level(&capture(&DesktopSource::Everything), hz);
     eprintln!(
         "{how}: {hz} Hz (tone, loudest neighbour) everything-except-us ({:.3e}, {:.3e}), \
          on the device ({:.3e}, {:.3e})",

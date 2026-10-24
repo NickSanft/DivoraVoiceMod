@@ -11,7 +11,8 @@
 // and "Everything except Divora" (which leaves out Divora's whole process
 // tree) left its sound out of recordings until it was restarted. Only when
 // that fails (no desktop shell, a browser preview) does it fall back to the
-// plugin, and then to a plain anchor.
+// plugin, and then to a plain anchor; both are for links (the plugin refuses
+// a folder path), and the backend already falls back for folders.
 import { openExternalTarget } from "../audio/api";
 
 export async function openExternal(url: string): Promise<void> {

@@ -1639,16 +1639,22 @@ fn external_target(target: &str) -> Result<ExternalTarget, String> {
 /// browser it starts is Explorer's child, not Divora's: "Everything except
 /// Divora" leaves out Divora's whole process tree, and a browser the shell
 /// plugin's `open` started (when it wasn't running) was in it, so its sound
-/// was missing from recordings until it was restarted. Errors when the
-/// target isn't a link or folder, or when Explorer can't open it (no desktop
-/// shell); the page then opens it the old way. Async with `spawn_blocking`:
-/// the cross-process call takes tens of milliseconds, and the main thread is
-/// the hotkeys' too.
+/// was missing from recordings until it was restarted. A folder that the
+/// desktop can't open is opened by starting the file manager here
+/// ([`open_folder`]), as the Speak clips folder is. Errors when the target
+/// isn't a link or folder, or, for a link, when the desktop can't open it (no
+/// desktop shell, Explorer not answering within `DESKTOP_WAIT`, or Explorer's
+/// own open failed); the page then opens the link the old way. Async with
+/// `spawn_blocking`: the cross-process call takes tens of milliseconds, and
+/// the main thread is the hotkeys' too.
 #[tauri::command]
 async fn open_external(target: String) -> Result<(), String> {
-    external_target(&target)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        divora_capture::open_outside_tree(&target, None, divora_capture::Show::Normal)
+    let kind = external_target(&target)?;
+    tauri::async_runtime::spawn_blocking(move || match kind {
+        ExternalTarget::Folder => open_folder(Path::new(&target)),
+        ExternalTarget::Link => {
+            divora_capture::open_outside_tree(&target, None, divora_capture::Show::Normal)
+        }
     })
     .await
     .map_err(|e| format!("opening it stopped: {e}"))?
@@ -4615,7 +4621,14 @@ mod tests {
         for (needle, n) in [
             (concat!("async fn open_", "external(target: String)"), 1),
             (concat!("async fn open_speak_", "clips_folder("), 1),
-            (concat!("external_", "target(&target)?;"), 1),
+            (concat!("let kind = external_", "target(&target)?;"), 1),
+            (
+                concat!(
+                    "ExternalTarget::Folder => open_",
+                    "folder(Path::new(&target)),"
+                ),
+                1,
+            ),
             (concat!("divora_capture::open_", "outside_tree("), 2),
             (concat!("spawn_blocking(move || open_", "folder(&dir))"), 1),
             (concat!("            open_", "external,\n"), 1),

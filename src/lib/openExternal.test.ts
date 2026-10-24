@@ -41,13 +41,11 @@ describe("openExternal", () => {
     expect(windowOpen).not.toHaveBeenCalled();
   });
 
-  it("falls back to the shell plugin when the desktop can't open it", async () => {
+  it("falls back to the shell plugin when the desktop can't open a link", async () => {
     invokeMock.mockRejectedValue("no desktop window: …");
     shellOpen.mockResolvedValue(undefined);
-    await openExternal("C:\\Users\\me\\AppData\\Roaming\\com.divora.voicemod\\logs");
-    expect(shellOpen).toHaveBeenCalledWith(
-      "C:\\Users\\me\\AppData\\Roaming\\com.divora.voicemod\\logs",
-    );
+    await openExternal("https://github.com/NickSanft/DivoraVoiceMod/issues");
+    expect(shellOpen).toHaveBeenCalledWith("https://github.com/NickSanft/DivoraVoiceMod/issues");
     expect(windowOpen).not.toHaveBeenCalled();
   });
 

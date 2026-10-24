@@ -1797,7 +1797,9 @@ function ScreenRecordCard(): JSX.Element {
               "Everything except Divora" leaves out Divora's own sound, so your voice isn't
               recorded twice. It also leaves out anything Divora starts itself. Links and folders
               Divora opens are started by the Windows desktop instead, so a browser opened from
-              Divora is recorded like any other app.
+              Divora is recorded like any other app. If the desktop can't open one (another
+              shell, or Explorer restarting), Divora opens it itself, and a browser it starts
+              that way is left out until you close it.
             </li>
             <li>
               Apps that play your voice back themselves, such as a mic test, can be recorded
