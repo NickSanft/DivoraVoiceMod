@@ -2209,7 +2209,11 @@ What the PC plays, mixed into the same AAC track. Two sources, one loop:
   (`ActivateAudioInterfaceAsync`, `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`
   on Divora's own PID): every other process's audio, on whichever device it
   plays, without Divora's voice, soundboard or monitor — or anything Divora
-  started — except on a device loopback can't hear: on the development PC,
+  started (v1.57.0: links and folders are opened by the desktop's Explorer,
+  `divora_capture::open_outside_tree`, so a browser opened from Divora is
+  Explorer's child and is recorded; `tests/launch_outside_tree.rs` measures
+  both ways. Where the desktop can't open it, Divora opens it itself, and a
+  browser started that way is still left out) — except on a device loopback can't hear: on the development PC,
   the default Realtek USB speakers (which have a vendor virtual mixer) were
   silent to both loopbacks. Whenever another app opens or closes a stream on
   a device, Windows skips about 15 ms of that device's sound and then sends
@@ -3164,7 +3168,10 @@ and the screen-recording commands already were.
 stop's wait for the engine to finalize the WAV). Each is an `async fn` that
 claims what it needs, then runs in `spawn_blocking`. Their answers are
 unchanged, and a download that fails still rejects with
-`downloading {name}: {e}`; the one-at-a-time refusals below are new.
+`downloading {name}: {e}`; the one-at-a-time refusals below are new. The
+same release's `open_external` and `open_speak_clips_folder`, which make a
+cross-process call to the desktop's Explorer (see the desktop audio
+section), run there too.
 
 **Measured** (debug builds, a local server through `DIVORA_MODELS_BASE_URL`
 trickling 64 KiB every 100 ms and cutting the connection at 6 of 8 MiB, so

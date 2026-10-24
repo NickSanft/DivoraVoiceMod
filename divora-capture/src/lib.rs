@@ -59,6 +59,7 @@ pub use native::{
     pipeline::{record_monitor_direct, spawn_pipeline},
     probe::capture_status,
     record::record_monitor,
+    shell::{open_outside_tree, Show},
     system::{free_bytes, local_time, total_physical_memory, PRETEND_FREE_ENV},
     window::{
         can_take_foreground, capture_exclusion_available, display_affinity, foreground_window,
@@ -92,7 +93,7 @@ mod elsewhere;
 pub use elsewhere::{
     can_take_foreground, capture_exclusion_available, capture_status, display_affinity,
     foreground_window, free_bytes, list_monitors, list_playback_devices, local_time,
-    make_layered_opaque, mark_non_rude, process_loopback_available, record_monitor,
-    record_monitor_direct, spawn_pipeline, total_physical_memory, try_foreground, unmark_non_rude,
-    MIN_CONTRACT, PRETEND_FREE_ENV, PRETEND_NO_CAPTURE_EXCLUSION_ENV,
+    make_layered_opaque, mark_non_rude, open_outside_tree, process_loopback_available,
+    record_monitor, record_monitor_direct, spawn_pipeline, total_physical_memory, try_foreground,
+    unmark_non_rude, Show, MIN_CONTRACT, PRETEND_FREE_ENV, PRETEND_NO_CAPTURE_EXCLUSION_ENV,
 };

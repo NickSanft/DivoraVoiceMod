@@ -14,6 +14,7 @@ pub mod power;
 pub mod probe;
 pub mod record;
 pub mod save;
+pub mod shell;
 pub mod sink;
 pub mod system;
 pub mod take_mux;

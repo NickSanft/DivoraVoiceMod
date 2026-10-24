@@ -99,6 +99,7 @@ import {
   setOverlayHideFromRecordings,
   overlayStatus,
   importOverlayAsset,
+  openExternalTarget,
   deleteOverlayAsset,
   pickImageFile,
   subscribeOverlayStatus,
@@ -109,6 +110,14 @@ describe("audio api", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     listenMock.mockReset();
+  });
+
+  it("openExternalTarget asks the backend to open it from the desktop (v1.57.0)", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await openExternalTarget("https://vb-audio.com/Cable/");
+    expect(invokeMock).toHaveBeenCalledWith("open_external", {
+      target: "https://vb-audio.com/Cable/",
+    });
   });
 
   it("listInputDevices invokes list_audio_input_devices", async () => {

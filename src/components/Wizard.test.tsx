@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render } from "@solidjs/testing-library";
+import { render, waitFor } from "@solidjs/testing-library";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -114,6 +114,17 @@ describe("Wizard", () => {
     getByText("Enter Divora").click();
     expect(app().wizardOpen()).toBe(false);
     expect(window.localStorage.getItem("divora.wizardSeen")).toBe("true");
+  });
+
+  it("the VB-Cable Download button opens the page from the desktop (v1.57.0)", async () => {
+    const { getByText, findByRole } = setup();
+    getByText("Continue").click();
+    (await findByRole("button", { name: /Download/ })).click();
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("open_external", {
+        target: "https://vb-audio.com/Cable/",
+      }),
+    );
   });
 
   it("wizardSteps drops the calibration step once already calibrated", () => {
