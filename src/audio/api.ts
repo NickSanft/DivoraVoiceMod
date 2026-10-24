@@ -717,9 +717,13 @@ export async function cloneVoice(
  * so a user can add their voice without an external WAV. The audio engine
  * must be running; rejects with a message (e.g. "start the engine first")
  * otherwise.
+ *
+ * v1.57.0: answers the sentence the user is to read when the take will become
+ * a VoxCPM voice, or null to speak freely. The backend decides when the take
+ * starts and keeps to it, so this answer, not VoxCPM's status, is the hint.
  */
-export async function startVoiceRecording(): Promise<void> {
-  return invoke("start_voice_recording");
+export async function startVoiceRecording(): Promise<string | null> {
+  return invoke<string | null>("start_voice_recording");
 }
 
 /**
@@ -755,12 +759,29 @@ export interface CloneModelsStatus {
   ready: boolean;
 }
 
-/** Progress for the on-demand cloning-model download. */
+/** v1.57.0: which of the three model downloads an event is about. */
+export type ModelDownloadKind = "clone" | "voxcpm" | "voxcpmGpu";
+
+/** Progress for the on-demand model downloads (`clone-model-download`): file
+ *  `file` of `fileCount`, `received` of that file's `total` bytes (`total` is
+ *  0 while the length isn't known: the server sent none, or, in
+ *  `model_download_status`'s answer, the file has only just started). */
 export interface CloneDownloadProgress {
   file: number;
   fileCount: number;
   received: number;
   total: number;
+  /** v1.57.0: which download. Optional so an older payload still reads. */
+  kind?: ModelDownloadKind;
+}
+
+/** v1.57.0: the end of a model download (`clone-model-download-done`), sent
+ *  just before the command answers. Not sent for a set already on disk: that
+ *  command just answers, at once. `error` is the string the command rejects
+ *  with, or null when the set is all there. */
+export interface ModelDownloadDone {
+  kind: ModelDownloadKind;
+  error: string | null;
 }
 
 export async function cloneModelsStatus(): Promise<CloneModelsStatus> {
@@ -784,6 +805,9 @@ export async function voxcpmStatus(): Promise<VoxCpmStatus> {
 /**
  * Download the voice-cloning models (~157 MB, one-time) into the user dir.
  * Resolves when complete; progress arrives via {@link subscribeCloneDownload}.
+ * v1.57.0: the three downloads run one at a time; while one runs, starting
+ * another rejects with a message to show as-is, unless that set is already
+ * on disk, which resolves at once (with no done event).
  */
 export async function downloadCloneModels(): Promise<void> {
   await invoke("download_clone_models");
@@ -819,11 +843,31 @@ export async function downloadVoxcpmGpuModel(): Promise<void> {
   await invoke("download_voxcpm_gpu_model");
 }
 
-/** Subscribe to cloning-model download progress. Returns the unlisten fn. */
+/**
+ * v1.57.0: the running model download's last progress, or null when none
+ * runs. The downloads run on a worker, so a page can load while one runs
+ * (a reload) and pick it up from here.
+ */
+export async function modelDownloadStatus(): Promise<CloneDownloadProgress | null> {
+  return invoke<CloneDownloadProgress | null>("model_download_status");
+}
+
+/** Subscribe to model download progress (all three downloads). Returns the
+ *  unlisten fn. */
 export async function subscribeCloneDownload(
   handler: (p: CloneDownloadProgress) => void,
 ): Promise<UnlistenFn> {
   return listen<CloneDownloadProgress>("clone-model-download", (e) =>
+    handler(e.payload),
+  );
+}
+
+/** v1.57.0: subscribe to the end of each model download, whichever page
+ *  started it. Returns the unlisten fn. */
+export async function subscribeCloneDownloadDone(
+  handler: (d: ModelDownloadDone) => void,
+): Promise<UnlistenFn> {
+  return listen<ModelDownloadDone>("clone-model-download-done", (e) =>
     handler(e.payload),
   );
 }

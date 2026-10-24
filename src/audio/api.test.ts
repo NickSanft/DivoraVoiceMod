@@ -58,6 +58,13 @@ import {
   stopPreviewVoice,
   cloneModelsStatus,
   downloadCloneModels,
+  downloadVoxcpmModels,
+  downloadVoxcpmGpuModel,
+  voxcpmStatus,
+  voxcpmGpuStatus,
+  modelDownloadStatus,
+  subscribeCloneDownload,
+  subscribeCloneDownloadDone,
   stopAllSoundboardClips,
   stopAudioEngine,
   stopRecording,
@@ -1070,5 +1077,58 @@ describe("stream overlay api (v1.55.0)", () => {
     await subscribeOverlayEdit((e) => seen.push(e));
     expect(listenMock.mock.calls.map((c) => c[0])).toEqual(["overlay:status", "overlay:edit"]);
     expect(seen).toEqual([{ from: "overlay:status" }, { from: "overlay:edit" }]);
+  });
+});
+
+// v1.57.0: the model downloads. Literals on purpose, as above: the backend's
+// names (lib.rs), and the done event and the status command are new.
+describe("model downloads api (v1.57.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+  });
+
+  it("each command goes by its name, with no args", async () => {
+    invokeMock.mockResolvedValue(null);
+    await downloadCloneModels();
+    expect(invokeMock).toHaveBeenLastCalledWith("download_clone_models");
+    await downloadVoxcpmModels();
+    expect(invokeMock).toHaveBeenLastCalledWith("download_voxcpm_models");
+    await downloadVoxcpmGpuModel();
+    expect(invokeMock).toHaveBeenLastCalledWith("download_voxcpm_gpu_model");
+    await voxcpmStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("voxcpm_status");
+    await voxcpmGpuStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("voxcpm_gpu_status");
+    await modelDownloadStatus();
+    expect(invokeMock).toHaveBeenLastCalledWith("model_download_status");
+  });
+
+  it("modelDownloadStatus answers the running download's progress, or null", async () => {
+    const running = { file: 2, fileCount: 6, received: 1_048_576, total: 4_194_304, kind: "voxcpm" };
+    invokeMock.mockResolvedValueOnce(running);
+    expect(await modelDownloadStatus()).toEqual(running);
+    invokeMock.mockResolvedValueOnce(null);
+    expect(await modelDownloadStatus()).toBeNull();
+  });
+
+  it("a refused download rejects with the backend's words", async () => {
+    invokeMock.mockRejectedValueOnce("A model download is already running.");
+    await expect(downloadVoxcpmGpuModel()).rejects.toBe("A model download is already running.");
+  });
+
+  it("listens to clone-model-download and clone-model-download-done, and forwards the payloads", async () => {
+    const seen: unknown[] = [];
+    listenMock.mockImplementation(async (event: string, handler: (e: { payload: unknown }) => void) => {
+      handler({ payload: { from: event } });
+      return () => {};
+    });
+    await subscribeCloneDownload((p) => seen.push(p));
+    await subscribeCloneDownloadDone((d) => seen.push(d));
+    expect(listenMock.mock.calls.map((c) => c[0])).toEqual([
+      "clone-model-download",
+      "clone-model-download-done",
+    ]);
+    expect(seen).toEqual([{ from: "clone-model-download" }, { from: "clone-model-download-done" }]);
   });
 });

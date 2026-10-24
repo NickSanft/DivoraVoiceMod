@@ -2751,6 +2751,9 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     });
     const { result } = setupApp();
     await result.previewVoice("af_heart");
+    // Let the store's reads at creation finish first (v1.57.0: the model
+    // download read goes out only after its two listens have answered).
+    await new Promise<void>((r) => setTimeout(r, 0));
     invokeMock.mockClear();
     await result.previewVoice("bm_george");
     // Assert the SEQUENCE, not just that both happened: moving the stop after
@@ -2923,6 +2926,52 @@ describe("app store — v1.17.0 text-to-speech (Speak)", () => {
     expect(result.cloneError()).toBe(
       "start the engine first, then record your voice",
     );
+  });
+
+  it("the sentence to read is fixed when a take starts, as the backend's engine is (v1.57.0)", async () => {
+    let voxcpm = false;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "voxcpm_status") return { available: voxcpm, readPrompt: "Read this aloud." };
+      // The backend's own decision, from the disk as the take starts.
+      if (cmd === "start_voice_recording") return voxcpm ? "Read this aloud." : null;
+      if (cmd === "stop_voice_recording") return { id: "me", name: "Me", baseName: "Puck" };
+      if (cmd === "list_cloned_voices") return [];
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshVoxcpmStatus();
+    await result.startRecordingVoice();
+    expect(result.recordingVoice()).toBe(true);
+    expect(result.recordingReadPrompt()).toBe("");
+
+    // VoxCPM's download ends mid-take. The backend saves this take with the
+    // engine it picked at the start (free speech), so the hint stays too.
+    voxcpm = true;
+    await result.refreshVoxcpmStatus();
+    expect(result.voxcpmAvailable()).toBe(true);
+    expect(result.recordingReadPrompt()).toBe("");
+
+    await result.stopRecordingVoice("Me");
+    expect(result.recordingReadPrompt()).toBe("");
+    // The next take starts with VoxCPM there: it is read from the sentence.
+    await result.startRecordingVoice();
+    expect(result.recordingReadPrompt()).toBe("Read this aloud.");
+  });
+
+  it("the hint is the start's answer, not the page's VoxCPM status (v1.57.0)", async () => {
+    // The download has just ended: the backend sees all six files, the page
+    // hasn't read VoxCPM's status since. The take is a VoxCPM voice, so the
+    // page asks for the sentence anyway.
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "voxcpm_status") return { available: false, readPrompt: "Read this aloud." };
+      if (cmd === "start_voice_recording") return "Read this aloud.";
+      return undefined;
+    });
+    const { result } = setupApp();
+    await result.refreshVoxcpmStatus();
+    expect(result.voxcpmAvailable()).toBe(false);
+    await result.startRecordingVoice();
+    expect(result.recordingReadPrompt()).toBe("Read this aloud.");
   });
 });
 
@@ -3962,5 +4011,453 @@ describe("app store — the mute (v1.56.0)", () => {
     const signal = checks.find((c) => c.id === "signal");
     expect(signal?.status).toBe("warn");
     expect(signal?.detail).toBe("Your voice is muted in Divora. Unmute it, then run the test again.");
+  });
+});
+
+// ---- v1.57.0: the model downloads --------------------------------------
+
+describe("app store — model downloads (v1.57.0)", () => {
+  type Handler = (e: { payload: unknown }) => void;
+  type App = ReturnType<typeof useApp>;
+  const handlers = new Map<string, Handler[]>();
+  const fire = (event: string, payload: unknown) => {
+    for (const h of handlers.get(event) ?? []) h({ payload });
+  };
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  const BUSY = "A model download is already running.";
+
+  const FLOWS = [
+    {
+      kind: "clone",
+      cmd: "download_clone_models",
+      status: "clone_models_status",
+      start: (r: App) => r.downloadCloneModels(),
+      present: (r: App) => r.cloneModelsReady(),
+    },
+    {
+      kind: "voxcpm",
+      cmd: "download_voxcpm_models",
+      status: "voxcpm_status",
+      start: (r: App) => r.downloadVoxcpmModels(),
+      present: (r: App) => r.voxcpmAvailable(),
+    },
+    {
+      kind: "voxcpmGpu",
+      cmd: "download_voxcpm_gpu_model",
+      status: "voxcpm_gpu_status",
+      start: (r: App) => r.downloadVoxcpmGpuModel(),
+      present: (r: App) => r.voxcpmGpuModelPresent(),
+    },
+  ] as const;
+  type Flow = (typeof FLOWS)[number];
+  const DOWNLOAD_CMDS: readonly string[] = FLOWS.map((f) => f.cmd);
+
+  /** The backend: a download command stays open until the test ends it (as
+   *  the real one stays open for minutes), each status says whether its set
+   *  is there, and a command in `held` waits until the test releases it. */
+  function backend(opts: { status?: unknown; held?: string[] } = {}) {
+    const present = { clone: false, voxcpm: false, voxcpmGpu: false };
+    const open = new Map<string, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+    const waiting = new Map<string, Array<() => void>>();
+    const answer = (cmd: string): unknown => {
+      switch (cmd) {
+        case "model_download_status":
+          return opts.status ?? null;
+        case "clone_models_status":
+          return { ready: present.clone };
+        case "voxcpm_status":
+          return { available: present.voxcpm, readPrompt: "Read this aloud." };
+        case "voxcpm_gpu_status":
+          return { supported: true, modelPresent: present.voxcpmGpu };
+        default:
+          return undefined;
+      }
+    };
+    invokeMock.mockImplementation((cmd: string) => {
+      if (DOWNLOAD_CMDS.includes(cmd)) {
+        return new Promise((resolve, reject) => open.set(cmd, { resolve, reject }));
+      }
+      if (opts.held?.includes(cmd)) {
+        return new Promise((resolve) =>
+          waiting.set(cmd, [...(waiting.get(cmd) ?? []), () => resolve(answer(cmd))]),
+        );
+      }
+      return Promise.resolve(answer(cmd));
+    });
+    return {
+      present,
+      /** Answer every waiting call of a held command, with what it says now. */
+      release(cmd: string) {
+        for (const go of waiting.get(cmd)?.splice(0) ?? []) go();
+      },
+      /** End a download as the backend does: the set is there (on success),
+       *  the done event goes out, then the command answers. */
+      end(flow: Flow, error: string | null = null) {
+        if (error === null) present[flow.kind] = true;
+        fire("clone-model-download-done", { kind: flow.kind, error });
+        const call = open.get(flow.cmd);
+        open.delete(flow.cmd);
+        if (error === null) call?.resolve(null);
+        else call?.reject(error);
+      },
+      /** Only the command's answer, with no event: a refused start (nothing
+       *  ran), or the late answer to a download whose done event the test
+       *  already sent. */
+      answer(flow: Flow, error: string | null = null) {
+        const call = open.get(flow.cmd);
+        open.delete(flow.cmd);
+        if (error === null) call?.resolve(null);
+        else call?.reject(error);
+      },
+    };
+  }
+  const calls = (cmd: string) => invokeMock.mock.calls.filter((c) => c[0] === cmd).length;
+  const progress = (more: Record<string, unknown>) => ({
+    file: 1,
+    fileCount: 1,
+    received: 0,
+    total: 0,
+    ...more,
+  });
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    handlers.clear();
+    vi.mocked(listen).mockClear();
+    vi.mocked(listen).mockImplementation((async (event: string, handler: Handler) => {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+      return () => {};
+    }) as unknown as typeof listen);
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    vi.mocked(listen).mockImplementation((async () => () => {}) as unknown as typeof listen);
+  });
+
+  describe.each(FLOWS)("$kind", (flow) => {
+    it("a second start, of any of the three, waits for the first", async () => {
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      const first = flow.start(result);
+      expect(result.cloneDownloading()).toBe(true);
+      for (const f of FLOWS) void f.start(result);
+      await settle();
+      for (const f of FLOWS) expect(calls(f.cmd)).toBe(f === flow ? 1 : 0);
+
+      be.end(flow);
+      await first;
+      await settle();
+      expect(result.cloneDownloading()).toBe(false);
+      void flow.start(result);
+      expect(calls(flow.cmd)).toBe(2);
+    });
+
+    it("the % comes from received over total; a payload with no length keeps it", async () => {
+      backend();
+      const { result } = setupApp();
+      await settle();
+      void flow.start(result);
+      expect(result.modelDownload()).toEqual({ kind: flow.kind, pct: 0 });
+      fire("clone-model-download", progress({ kind: flow.kind, received: 50, total: 200 }));
+      expect(result.cloneDownloadPct()).toBe(25);
+      fire("clone-model-download", progress({ kind: flow.kind, received: 60, total: 0 }));
+      expect(result.cloneDownloadPct()).toBe(25);
+      expect(result.modelDownload()).toEqual({ kind: flow.kind, pct: 25 });
+    });
+
+    it("success reads its own status, and the set shows as there", async () => {
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      const run = flow.start(result);
+      fire("clone-model-download", progress({ kind: flow.kind, received: 10, total: 10 }));
+      be.end(flow);
+      await run;
+      await settle();
+      expect(result.cloneDownloading()).toBe(false);
+      expect(result.cloneError()).toBeNull();
+      expect(flow.present(result)).toBe(true);
+      for (const f of FLOWS) expect(calls(f.status) > 0).toBe(f === flow);
+    });
+
+    it("a failure lands in cloneError, and the button comes back", async () => {
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      const run = flow.start(result);
+      fire("clone-model-download", progress({ kind: flow.kind, received: 1, total: 10 }));
+      be.end(flow, "downloading x.onnx: ended early: got 1 of 10 bytes");
+      await run;
+      await settle();
+      expect(result.cloneError()).toBe("downloading x.onnx: ended early: got 1 of 10 bytes");
+      expect(result.cloneDownloading()).toBe(false);
+      expect(flow.present(result)).toBe(false);
+    });
+  });
+
+  it("the progress and done events are listened to once, at creation, not per download", async () => {
+    const be = backend();
+    const { result } = setupApp();
+    await settle();
+    for (const flow of [FLOWS[0], FLOWS[1]]) {
+      const run = flow.start(result);
+      be.end(flow);
+      await run;
+      await settle();
+    }
+    const heard = vi.mocked(listen).mock.calls.map((c) => c[0]);
+    expect(heard.filter((e) => e === "clone-model-download")).toHaveLength(1);
+    expect(heard.filter((e) => e === "clone-model-download-done")).toHaveLength(1);
+  });
+
+  it("a download another page started shows here, and its done event ends it", async () => {
+    const be = backend();
+    const { result } = setupApp();
+    await settle();
+    fire(
+      "clone-model-download",
+      progress({ kind: "voxcpm", file: 3, fileCount: 6, received: 10, total: 40 }),
+    );
+    expect(result.modelDownload()).toEqual({ kind: "voxcpm", pct: 25 });
+    expect(result.cloneDownloading()).toBe(true);
+
+    be.present.voxcpm = true;
+    fire("clone-model-download-done", { kind: "voxcpm", error: null });
+    await settle();
+    expect(result.cloneDownloading()).toBe(false);
+    expect(result.voxcpmAvailable()).toBe(true);
+    for (const f of FLOWS) expect(calls(f.cmd)).toBe(0);
+
+    // A failure there shows here too.
+    fire("clone-model-download", progress({ kind: "clone", received: 1, total: 2 }));
+    fire("clone-model-download-done", { kind: "clone", error: "downloading a.onnx: timed out" });
+    await settle();
+    expect(result.cloneDownloading()).toBe(false);
+    expect(result.cloneError()).toBe("downloading a.onnx: timed out");
+  });
+
+  it("the read at creation shows a download already running (a reload)", async () => {
+    const be = backend({
+      status: { file: 1, fileCount: 1, received: 300, total: 1200, kind: "voxcpmGpu" },
+    });
+    const { result } = setupApp();
+    await settle();
+    expect(result.modelDownload()).toEqual({ kind: "voxcpmGpu", pct: 25 });
+    void result.downloadVoxcpmGpuModel();
+    expect(calls("download_voxcpm_gpu_model")).toBe(0);
+
+    fire("clone-model-download", progress({ kind: "voxcpmGpu", received: 600, total: 1200 }));
+    expect(result.cloneDownloadPct()).toBe(50);
+    be.present.voxcpmGpu = true;
+    fire("clone-model-download-done", { kind: "voxcpmGpu", error: null });
+    await settle();
+    expect(result.cloneDownloading()).toBe(false);
+    expect(result.voxcpmGpuModelPresent()).toBe(true);
+  });
+
+  it.each([
+    [
+      "progress",
+      () => fire("clone-model-download", progress({ kind: "clone", received: 90, total: 100 })),
+      { kind: "clone", pct: 90 },
+    ],
+    ["done", () => fire("clone-model-download-done", { kind: "clone", error: null }), null],
+  ] as const)(
+    "the read at creation is dropped when a %s event came while it was on its way",
+    async (_name, event, want) => {
+      const be = backend({
+        status: { file: 1, fileCount: 2, received: 10, total: 100, kind: "clone" },
+        held: ["model_download_status"],
+      });
+      const { result } = setupApp();
+      await settle();
+      event();
+      be.release("model_download_status");
+      await settle();
+      expect(result.modelDownload()).toEqual(want);
+    },
+  );
+
+  /** Tauri's listen: the listener is registered (and an event can reach it)
+   *  only when the test lets its listen answer. Other events listen at once. */
+  function heldListens() {
+    const pending = new Map<string, () => void>();
+    const HELD = ["clone-model-download", "clone-model-download-done"];
+    vi.mocked(listen).mockImplementation(((event: string, handler: Handler) => {
+      const register = () => {
+        handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        return () => {};
+      };
+      if (!HELD.includes(event)) return Promise.resolve(register());
+      return new Promise((resolve) => pending.set(event, () => resolve(register())));
+    }) as unknown as typeof listen);
+    return {
+      asked: () => [...pending.keys()],
+      registered: (event: string) => pending.get(event)!(),
+    };
+  }
+
+  it("the read at creation waits for both listeners, the done one first", async () => {
+    backend({ status: { file: 1, fileCount: 2, received: 40, total: 100, kind: "clone" } });
+    const tauri = heldListens();
+    const { result } = setupApp();
+    await settle();
+    // Progress and the read are what can show a download here, so neither
+    // goes out before the done event that ends it is sure to arrive.
+    expect(tauri.asked()).toEqual(["clone-model-download-done"]);
+    expect(calls("model_download_status")).toBe(0);
+
+    tauri.registered("clone-model-download-done");
+    await settle();
+    expect(tauri.asked()).toEqual(["clone-model-download-done", "clone-model-download"]);
+    expect(calls("model_download_status")).toBe(0);
+
+    tauri.registered("clone-model-download");
+    await settle();
+    expect(calls("model_download_status")).toBe(1);
+    expect(result.modelDownload()).toEqual({ kind: "clone", pct: 40 });
+  });
+
+  it("a download that ends before the listeners are in isn't shown for good (a reload at its end)", async () => {
+    const opts: { status: unknown } = {
+      status: { file: 2, fileCount: 2, received: 99, total: 100, kind: "clone" },
+    };
+    backend(opts);
+    const tauri = heldListens();
+    const { result } = setupApp();
+    await settle();
+    // It ends now: the slot is free, and its done event reaches no one.
+    opts.status = null;
+    fire("clone-model-download-done", { kind: "clone", error: null });
+    tauri.registered("clone-model-download-done");
+    await settle();
+    tauri.registered("clone-model-download");
+    await settle();
+    expect(result.modelDownload()).toBeNull();
+    expect(result.cloneDownloading()).toBe(false);
+  });
+
+  it("a failed read at creation leaves nothing shown", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "model_download_status") throw "unknown command";
+      return undefined;
+    });
+    const { result } = setupApp();
+    await settle();
+    expect(result.modelDownload()).toBeNull();
+    expect(result.cloneError()).toBeNull();
+  });
+
+  it("a read of none running never clears this page's own start", async () => {
+    const be = backend({ held: ["model_download_status"] });
+    const { result } = setupApp();
+    await settle();
+    void result.downloadCloneModels();
+    be.release("model_download_status");
+    await settle();
+    expect(result.modelDownload()).toEqual({ kind: "clone", pct: 0 });
+  });
+
+  it("a late answer doesn't clear a newer download", async () => {
+    const be = backend();
+    const { result } = setupApp();
+    await settle();
+    // The command answers after its done event, so its answer can land
+    // after the next download (another page's) has begun.
+    const run = result.downloadCloneModels();
+    fire("clone-model-download", progress({ kind: "clone", received: 5, total: 10 }));
+    be.present.clone = true;
+    fire("clone-model-download-done", { kind: "clone", error: null });
+    await settle();
+    expect(result.modelDownload()).toBeNull();
+    fire("clone-model-download", progress({ kind: "voxcpm", received: 1, total: 10 }));
+    be.answer(FLOWS[0]);
+    await run;
+    await settle();
+    expect(result.modelDownload()).toEqual({ kind: "voxcpm", pct: 10 });
+  });
+
+  it.each([
+    // The end with no progress before it: another process finished the
+    // files between the backend's presence check and its loop. (A set
+    // already on disk sends no done event at all; the command just answers.)
+    ["another process finished the files", null],
+    // Or the first file failed before its first MiB (a 404, a refused
+    // connection): the done event and the answer carry the same words.
+    ["the first file failed", "downloading a.onnx: connection refused"],
+  ] as const)(
+    "a late answer to a start that saw no progress doesn't clear a newer download (%s)",
+    async (_case, error) => {
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      const run = result.downloadCloneModels();
+      if (error === null) be.present.clone = true;
+      fire("clone-model-download-done", { kind: "clone", error });
+      await settle();
+      expect(result.modelDownload()).toBeNull();
+      fire("clone-model-download", progress({ kind: "voxcpm", received: 3, total: 10 }));
+      be.answer(FLOWS[0], error);
+      await run;
+      await settle();
+      expect(result.modelDownload()).toEqual({ kind: "voxcpm", pct: 30 });
+      expect(result.cloneError()).toBe(error);
+      expect(result.cloneModelsReady()).toBe(error === null);
+    },
+  );
+
+  it("a start the backend refuses shows its words as-is", async () => {
+    const be = backend();
+    const { result } = setupApp();
+    await settle();
+    const run = result.downloadVoxcpmModels();
+    be.answer(FLOWS[1], BUSY);
+    await run;
+    await settle();
+    expect(result.cloneError()).toBe(BUSY);
+    expect(result.cloneDownloading()).toBe(false);
+  });
+
+  it("a start refused under another page's download keeps showing that download", async () => {
+    const be = backend({
+      status: { file: 2, fileCount: 6, received: 5, total: 10, kind: "voxcpm" },
+      held: ["model_download_status"],
+    });
+    const { result } = setupApp();
+    await settle();
+    // Clicked before the read at creation answered: the read is older than
+    // the start, but it is this page's only word on the download that
+    // refuses it.
+    const run = result.downloadCloneModels();
+    expect(calls("download_clone_models")).toBe(1);
+    be.release("model_download_status");
+    await settle();
+    be.answer(FLOWS[0], BUSY);
+    await run;
+    await settle();
+    expect(result.cloneError()).toBe(BUSY);
+    expect(result.modelDownload()).toEqual({ kind: "voxcpm", pct: 50 });
+  });
+
+  it("the end clears only once the status says the set is there", async () => {
+    const be = backend({ held: ["clone_models_status"] });
+    const { result } = setupApp();
+    await settle();
+    const run = result.downloadCloneModels();
+    fire("clone-model-download", progress({ kind: "clone", received: 10, total: 10 }));
+    be.end(FLOWS[0]);
+    await settle();
+    // Still "Downloading… 100%", not the idle label, while the status is out.
+    expect(result.cloneDownloading()).toBe(true);
+    expect(result.cloneDownloadPct()).toBe(100);
+    be.release("clone_models_status");
+    await run;
+    await settle();
+    expect(result.cloneModelsReady()).toBe(true);
+    expect(result.cloneDownloading()).toBe(false);
   });
 });

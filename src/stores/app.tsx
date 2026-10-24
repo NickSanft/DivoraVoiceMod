@@ -48,7 +48,9 @@ import {
   downloadCloneModels as downloadCloneModelsCmd,
   downloadVoxcpmModels as downloadVoxcpmModelsCmd,
   downloadVoxcpmGpuModel as downloadVoxcpmGpuModelCmd,
+  modelDownloadStatus as modelDownloadStatusCmd,
   subscribeCloneDownload,
+  subscribeCloneDownloadDone,
   openMidiInput as openMidiInputCmd,
   closeMidiInput as closeMidiInputCmd,
   onnxRuntimeStatus as onnxRuntimeStatusCmd,
@@ -132,6 +134,9 @@ import {
   type MidiMessage,
   type OnnxRuntimeStatus,
   type ClonedVoiceInfo,
+  type CloneDownloadProgress,
+  type ModelDownloadDone,
+  type ModelDownloadKind,
   type SpeakClip,
   type SoundboardTile,
   type StreamInfo,
@@ -209,6 +214,11 @@ import {
 } from "../data/hotkeys";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
+import {
+  downloadAfter,
+  readDownloadProgress,
+  type ModelDownload,
+} from "../data/modelDownload";
 import { routeMidi, triggerFor, type MidiHandlers } from "../midi/router";
 import type {
   AbSlot,
@@ -789,16 +799,24 @@ export interface AppState {
   renameClonedVoice: (id: string, name: string) => Promise<boolean>;
   /** v1.23.0: true while the dry mic is being captured for an in-app clone. */
   recordingVoice: () => boolean;
+  /** v1.57.0: the sentence the take in progress is to be read from (a VoxCPM
+   *  clone), or "" to speak freely. Fixed when the take starts, as the
+   *  backend's choice of engine is, so it can't change mid-take. */
+  recordingReadPrompt: () => string;
   /** v1.23.0: start capturing the dry mic (engine must be running). */
   startRecordingVoice: () => Promise<void>;
   /** v1.23.0: stop the capture and clone it into a voice named `name`, then select it. */
   stopRecordingVoice: (name: string) => Promise<void>;
   /** v1.21.0: whether the (on-demand) voice-cloning models are downloaded. */
   cloneModelsReady: () => boolean;
-  /** True while the cloning models are downloading. */
+  /** True while any of the three model downloads runs (v1.57.0: whichever
+   *  page started it). */
   cloneDownloading: () => boolean;
-  /** Download progress 0–100 for the cloning models. */
+  /** Download progress 0–100, of the file being downloaded. */
   cloneDownloadPct: () => number;
+  /** v1.57.0: the running model download (which one, and its %), or null.
+   *  `cloneDownloading` and `cloneDownloadPct` read it. */
+  modelDownload: () => ModelDownload | null;
   /** Refresh whether the cloning models are present. */
   refreshCloneModelsStatus: () => Promise<void>;
   /** Download the cloning models (~157 MB, one-time). */
@@ -3483,12 +3501,20 @@ export function createAppState(): AppState {
 
   // v1.23.0: in-app dry-mic recording of a clone reference.
   const [recordingVoice, setRecordingVoice] = createSignal(false);
+  // v1.57.0: the backend picks the engine when the take starts and answers
+  // the sentence to read (or null). A model download no longer holds the
+  // main thread, so VoxCPM's last file can land mid-take: the hint is the
+  // start's answer, kept for the take, not VoxCPM's status now, which could
+  // turn it into "read this aloud" partway through a take saved as a
+  // free-speech clone (or, a round trip after the download ends, say
+  // "speak naturally" for a take the backend makes a VoxCPM voice).
+  const [recordingReadPrompt, setRecordingReadPrompt] = createSignal("");
 
   const startRecordingVoice = async (): Promise<void> => {
     if (recordingVoice() || cloning()) return;
     setCloneError(null);
     try {
-      await startVoiceRecordingCmd();
+      setRecordingReadPrompt((await startVoiceRecordingCmd()) ?? "");
       setRecordingVoice(true);
     } catch (err) {
       setCloneError(
@@ -3504,6 +3530,7 @@ export function createAppState(): AppState {
   const stopRecordingVoice = async (name: string): Promise<void> => {
     if (!recordingVoice()) return;
     setRecordingVoice(false);
+    setRecordingReadPrompt("");
     setCloneError(null);
     setCloning(true);
     try {
@@ -3525,8 +3552,14 @@ export function createAppState(): AppState {
 
   // v1.21.0: on-demand cloning-model download.
   const [cloneModelsReady, setCloneModelsReady] = createSignal(false);
-  const [cloneDownloading, setCloneDownloading] = createSignal(false);
-  const [cloneDownloadPct, setCloneDownloadPct] = createSignal(0);
+  // v1.57.0: the running model download, any of the three, or null. The
+  // backend runs it on a worker and keeps its progress, so this is set by
+  // this page's start, by the progress and done events (whichever page
+  // started it) and by the read at creation. One download at a time, so the
+  // three buttons share it, as they shared the flag before.
+  const [modelDownload, setModelDownload] = createSignal<ModelDownload | null>(null);
+  const cloneDownloading = createMemo(() => modelDownload() !== null);
+  const cloneDownloadPct = createMemo(() => modelDownload()?.pct ?? 0);
 
   const refreshCloneModelsStatus = async (): Promise<void> => {
     try {
@@ -3566,24 +3599,86 @@ export function createAppState(): AppState {
     }
   };
 
-  const downloadCloneModels = async (): Promise<void> => {
+  /** The status a download of `kind` changes. */
+  const refreshDownloaded = async (kind: ModelDownloadKind): Promise<void> => {
+    if (kind === "clone") await refreshCloneModelsStatus();
+    else if (kind === "voxcpm") await refreshVoxcpmStatus();
+    else await refreshVoxcpmGpuStatus();
+  };
+
+  /** A download has ended: read its status, then clear `held` — in that
+   *  order, so the button goes from "Downloading… 100%" straight to what
+   *  the models unlock, never showing its idle label for a round trip (as
+   *  before v1.57.0). Only `held` is cleared: a download that started since,
+   *  this page's or another's, keeps what it shows. */
+  const endModelDownload = async (
+    held: ModelDownload | null,
+    kind: ModelDownloadKind,
+  ): Promise<void> => {
+    await refreshDownloaded(kind);
+    if (modelDownload() === held) setModelDownload(null);
+  };
+
+  // One subscription for the life of the provider, so a download started by
+  // a page since reloaded still shows here and ends here. A command's answer
+  // can land after the events that followed it (v1.55.0), so the read at
+  // creation counts only if no event came while it was on its way. A read of
+  // "none running" is never applied: with no event heard, the only thing it
+  // could clear is a start from this page that the read didn't see.
+  let downloadHeard = 0;
+  const onDownloadProgress = (p: CloneDownloadProgress): void => {
+    downloadHeard += 1;
+    setModelDownload(downloadAfter(modelDownload(), p));
+  };
+  const onDownloadDone = (d: ModelDownloadDone): void => {
+    downloadHeard += 1;
+    if (d.error) setCloneError(d.error);
+    void endModelDownload(modelDownload(), d.kind);
+  };
+  const downloadUnlisten: Array<() => void> = [];
+  let downloadDisposed = false;
+  void (async () => {
+    // v1.57.0: one after another — the done listener, then progress, then
+    // the read. An event emitted before its listener is registered reaches
+    // no one, and a listen answers only once Tauri has registered it. A
+    // progress event or the read is all that can show a download here, so
+    // with the done listener in first, the done event that ends it always
+    // arrives. (Sent together, the read could see a download whose done
+    // event went out before the listener was in, and show it until a
+    // reload.) Each failure (a browser preview without the Tauri bridge) is
+    // caught where it starts.
+    const keep = (un: (() => void) | null): void => {
+      if (!un) return;
+      if (downloadDisposed) un();
+      else downloadUnlisten.push(un);
+    };
+    keep(await subscribeCloneDownloadDone(onDownloadDone).catch(() => null));
+    keep(await subscribeCloneDownload(onDownloadProgress).catch(() => null));
+    const before = downloadHeard;
+    const now = readDownloadProgress(await modelDownloadStatusCmd().catch(() => null));
+    if (now && downloadHeard === before) setModelDownload(downloadAfter(null, now));
+  })();
+  onCleanup(() => {
+    downloadDisposed = true;
+    for (const un of downloadUnlisten.splice(0)) un();
+  });
+
+  /** Start one of the three downloads. The page's guard keeps a running
+   *  download on screen: the backend refuses another (in words shown as-is),
+   *  or answers at once for a set already on disk, and either answer would
+   *  clear what this start put up in its place. The command answers after
+   *  the done event, so its answer clears only this start's own state, which
+   *  the first progress event replaces. */
+  const startModelDownload = async (
+    kind: ModelDownloadKind,
+    run: () => Promise<void>,
+  ): Promise<void> => {
     if (cloneDownloading()) return;
     setCloneError(null);
-    setCloneDownloading(true);
-    setCloneDownloadPct(0);
-    let unlisten: (() => void) | null = null;
+    const mine: ModelDownload = { kind, pct: 0 };
+    setModelDownload(mine);
     try {
-      unlisten = await subscribeCloneDownload((p) => {
-        if (p.total > 0) {
-          setCloneDownloadPct(Math.round((p.received / p.total) * 100));
-        }
-      });
-    } catch {
-      /* not under Tauri — no progress events */
-    }
-    try {
-      await downloadCloneModelsCmd();
-      await refreshCloneModelsStatus();
+      await run();
     } catch (err) {
       setCloneError(
         typeof err === "string"
@@ -3593,78 +3688,22 @@ export function createAppState(): AppState {
             : String(err),
       );
     } finally {
-      setCloneDownloading(false);
-      if (unlisten) unlisten();
+      await endModelDownload(mine, kind);
     }
   };
 
-  // v2: download the VoxCPM accent-cloning models (~1.6 GB). Reuses the same
-  // download progress signals + event; refreshes VoxCPM availability on done.
-  const downloadVoxcpmModels = async (): Promise<void> => {
-    if (cloneDownloading()) return;
-    setCloneError(null);
-    setCloneDownloading(true);
-    setCloneDownloadPct(0);
-    let unlisten: (() => void) | null = null;
-    try {
-      unlisten = await subscribeCloneDownload((p) => {
-        if (p.total > 0) {
-          setCloneDownloadPct(Math.round((p.received / p.total) * 100));
-        }
-      });
-    } catch {
-      /* not under Tauri — no progress events */
-    }
-    try {
-      await downloadVoxcpmModelsCmd();
-      await refreshVoxcpmStatus();
-    } catch (err) {
-      setCloneError(
-        typeof err === "string"
-          ? err
-          : err instanceof Error
-            ? err.message
-            : String(err),
-      );
-    } finally {
-      setCloneDownloading(false);
-      if (unlisten) unlisten();
-    }
-  };
+  const downloadCloneModels = (): Promise<void> =>
+    startModelDownload("clone", downloadCloneModelsCmd);
 
-  // v1.30.0: download the optional fp16 DirectML decode model (~1.2 GB). Reuses
-  // the same download progress signals + event; refreshes GPU status on done.
-  const downloadVoxcpmGpuModel = async (): Promise<void> => {
-    if (cloneDownloading()) return;
-    setCloneError(null);
-    setCloneDownloading(true);
-    setCloneDownloadPct(0);
-    let unlisten: (() => void) | null = null;
-    try {
-      unlisten = await subscribeCloneDownload((p) => {
-        if (p.total > 0) {
-          setCloneDownloadPct(Math.round((p.received / p.total) * 100));
-        }
-      });
-    } catch {
-      /* not under Tauri — no progress events */
-    }
-    try {
-      await downloadVoxcpmGpuModelCmd();
-      await refreshVoxcpmGpuStatus();
-    } catch (err) {
-      setCloneError(
-        typeof err === "string"
-          ? err
-          : err instanceof Error
-            ? err.message
-            : String(err),
-      );
-    } finally {
-      setCloneDownloading(false);
-      if (unlisten) unlisten();
-    }
-  };
+  // v2: download the VoxCPM accent-cloning models (~1.6 GB). Refreshes VoxCPM
+  // availability when done.
+  const downloadVoxcpmModels = (): Promise<void> =>
+    startModelDownload("voxcpm", downloadVoxcpmModelsCmd);
+
+  // v1.30.0: download the optional fp16 DirectML decode model (~1.2 GB).
+  // Refreshes GPU status when done.
+  const downloadVoxcpmGpuModel = (): Promise<void> =>
+    startModelDownload("voxcpmGpu", downloadVoxcpmGpuModelCmd);
 
   return {
     nav,
@@ -3855,11 +3894,13 @@ export function createAppState(): AppState {
     removeClonedVoice,
     renameClonedVoice,
     recordingVoice,
+    recordingReadPrompt,
     startRecordingVoice,
     stopRecordingVoice,
     cloneModelsReady,
     cloneDownloading,
     cloneDownloadPct,
+    modelDownload,
     refreshCloneModelsStatus,
     downloadCloneModels,
     voxcpmAvailable,
