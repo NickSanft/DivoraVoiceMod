@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.57.0] — 2026-10-25 — Voice Convert keeps up
+
 Voice Convert keeps up with you now: with the bundled voice it converts as you speak, about 23 ms behind you instead of about a quarter-second, and it no longer stalls the audio for a tenth of a second at a time. Downloading a voice model or making a voice no longer freezes Divora, and a browser opened from Divora is now in your screen recordings.
 
 ### Fixed
