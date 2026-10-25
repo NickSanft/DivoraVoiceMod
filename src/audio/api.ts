@@ -158,6 +158,9 @@ export interface LevelUpdate {
   /** v1.56.0: the mute's change count, read with `inputMuted` in one load.
    *  Orders ticks against command answers (see {@link InputMute}). */
   inputMuteSeq?: number;
+  /** v1.58.0: push-to-modulate, engine running or not, one load. Optional:
+   *  absent means "no information", never "always". */
+  ptm?: PtmState;
 }
 
 /** Why the panel is or isn't showing a live reading.
@@ -327,6 +330,53 @@ export async function toggleInputMuted(): Promise<InputMute> {
 /** v1.56.0: the current mute. The store reads it once, at creation. */
 export async function inputMute(): Promise<InputMute> {
   return invoke<InputMute>("input_mute");
+}
+
+/** v1.58.0: what push-to-modulate's key does. `"always"`: nothing, the
+ *  effects always apply (push-to-modulate off, the engine's launch state).
+ *  `"apply"`: the effects apply only while something holds it. `"bypass"`:
+ *  they are off while something holds it. Declared once, here, on the wire;
+ *  `types.ts` re-exports it. */
+export type PtmMode = "always" | "apply" | "bypass";
+
+/** v1.58.0: which way the Mixer card's hold goes while push-to-modulate is
+ *  on: the two modes that aren't `"always"`. Saved in `divora.ptm`. */
+export type PtmHold = Exclude<PtmMode, "always">;
+
+/** v1.58.0: the sources the page may hold with {@link setPtmHeld}: the
+ *  in-app key, the Mixer's Hold to switch button and MIDI. The global key is
+ *  the fourth, and only the backend holds it (`"hotkey"` is refused). */
+export type PtmPageSource = "key" | "button" | "midi";
+
+/** v1.58.0: push-to-modulate as the engine holds it, one word. `held`: any
+ *  source holds it. `bypassed`: what the engine is switching to from this
+ *  state on. The sound crosses toward the effects at the next buffer, and
+ *  away from them only after the dry's delay (the chain's latency), so what
+ *  you said while they were on keeps them. `seq` counts
+ *  changes since the app started; of two states, the larger `seq` is newer. */
+export interface PtmState {
+  mode: PtmMode;
+  held: boolean;
+  bypassed: boolean;
+  seq: number;
+}
+
+/** v1.58.0: set push-to-modulate's mode; answers the state after. Sync in
+ *  the backend, so a press can't overtake its release. Without `restore`
+ *  (the Mixer card) it lets go of every hold, the global key's included,
+ *  which must then be pressed again. `restore: true` is the page's boot,
+ *  with the saved mode: it lets go of the page's holds (key, button, MIDI)
+ *  and keeps a global key that is still held. Idempotent: nothing to change
+ *  moves nothing, `seq` included. */
+export async function setPtmMode(mode: PtmMode, restore = false): Promise<PtmState> {
+  return invoke<PtmState>("set_ptm_mode", { mode, restore });
+}
+
+/** v1.58.0: hold or let go of push-to-modulate for one page source; answers
+ *  the state after. Sync, and idempotent: a set to the value it has moves
+ *  nothing, `seq` included. */
+export async function setPtmHeld(source: PtmPageSource, held: boolean): Promise<PtmState> {
+  return invoke<PtmState>("set_ptm_held", { source, held });
 }
 
 /** v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 = unity). */

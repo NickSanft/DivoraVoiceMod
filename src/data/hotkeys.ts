@@ -22,7 +22,9 @@ import type { HotkeyAction } from "../stores/app";
  *  stop a recorder" and a save is neither. v1.55.0 adds the stream overlay's
  *  Arrange / Lock switch under `overlay:`, which the backend acts on itself.
  *  v1.56.0 adds `mute`, which the backend also acts on itself; the `mute:`
- *  prefix is reserved for later variants. */
+ *  prefix is reserved for later variants. v1.58.0: the backend acts on `ptm`
+ *  itself, press and release; the `ptm:` prefix is reserved (a latched
+ *  push-to-modulate, later). */
 export const HOTKEY_ACTIONS: readonly HotkeyAction[] = [
   "ptm",
   "panic",

@@ -40,6 +40,8 @@ import {
   setInputMuted,
   toggleInputMuted,
   inputMute,
+  setPtmMode,
+  setPtmHeld,
   setEffectChain,
   setEffectEnabled,
   setEffectParam,
@@ -199,6 +201,30 @@ describe("audio api", () => {
     const answer = await inputMute();
     expect(invokeMock).toHaveBeenCalledWith("input_mute");
     expect(answer).toEqual({ muted: true, seq: 4 });
+  });
+
+  // v1.58.0: push-to-modulate's two commands, each answering the state. The
+  // card's set sends `restore: false`; the boot sends `restore: true`.
+  it("setPtmMode invokes set_ptm_mode with the mode and restore false by default", async () => {
+    invokeMock.mockResolvedValueOnce({ mode: "apply", held: false, bypassed: true, seq: 1 });
+    const answer = await setPtmMode("apply");
+    expect(invokeMock).toHaveBeenCalledWith("set_ptm_mode", { mode: "apply", restore: false });
+    expect(answer).toEqual({ mode: "apply", held: false, bypassed: true, seq: 1 });
+  });
+
+  it("setPtmMode with restore sends restore true (the boot)", async () => {
+    invokeMock.mockResolvedValueOnce({ mode: "always", held: true, bypassed: false, seq: 3 });
+    await setPtmMode("always", true);
+    expect(invokeMock).toHaveBeenCalledWith("set_ptm_mode", { mode: "always", restore: true });
+  });
+
+  it("setPtmHeld invokes set_ptm_held with the source and the level", async () => {
+    invokeMock.mockResolvedValueOnce({ mode: "bypass", held: true, bypassed: true, seq: 2 });
+    const answer = await setPtmHeld("key", true);
+    expect(invokeMock).toHaveBeenCalledWith("set_ptm_held", { source: "key", held: true });
+    expect(answer).toEqual({ mode: "bypass", held: true, bypassed: true, seq: 2 });
+    await setPtmHeld("midi", false);
+    expect(invokeMock).toHaveBeenLastCalledWith("set_ptm_held", { source: "midi", held: false });
   });
 
   it("getEngineStatus invokes audio_engine_status", async () => {

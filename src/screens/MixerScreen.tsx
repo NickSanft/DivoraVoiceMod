@@ -57,7 +57,8 @@ import {
   type ReadingMetrics,
   type VoiceReadingUpdate,
 } from "../audio/api";
-import type { EffectId, GlyphId, Preset, PtmMode } from "../types";
+import { ptmButtonLabel, ptmButtonTitle, ptmCardLine } from "../data/ptm";
+import type { EffectId, GlyphId, Preset, PtmHold } from "../types";
 
 export function MixerScreen(): JSX.Element {
   const app = useApp();
@@ -445,7 +446,23 @@ function PushToModulateCard(): JSX.Element {
   // Show the key the way Settings does: "Win", not the accelerator's
   // "Super" (v1.51.4 stores the backend form).
   const ptmLabel = (): string => acceleratorToKeys(app.ui.ptmKey).join("+") || "Space";
-  const pressed = () => app.ui.pressed;
+  // v1.58.0: the card drives the engine. Its on/off and hold come from
+  // `divora.ptm` (moved by the engine's answer); the button holds the
+  // "button" source. The rest of the card (focus, keyboard, the in-call
+  // key's words) is v1.58.0's track D.
+  const on = (): boolean => app.ptmSetting().on;
+  const inCallKey = (): boolean =>
+    app.hotkeyBindings.ptm !== "" || app.midiMappings().some((m) => m.action === "ptm");
+  const [down, setDown] = createSignal(false);
+  const hold = (): void => {
+    setDown(true);
+    app.ptmDown("button");
+  };
+  const letGo = (): void => {
+    setDown(false);
+    app.ptmUp("button");
+  };
+  onCleanup(() => app.ptmUp("button"));
   return (
     <div class="card" style={{ padding: "var(--s4)" }}>
       <div
@@ -459,34 +476,48 @@ function PushToModulateCard(): JSX.Element {
       >
         <span class="eyebrow">Push to modulate</span>
         <Kbd>{ptmLabel()}</Kbd>
+        <Toggle
+          on={on()}
+          ariaLabel="Push to modulate"
+          onChange={(next) => void app.setPtmOn(next)}
+        />
       </div>
-      <Segmented<PtmMode>
+      <div
+        style={{
+          "font-size": "var(--t-xs)",
+          color: "var(--text-lo)",
+          "margin-bottom": "var(--s3)",
+        }}
+      >
+        {ptmCardLine(app.ptmSetting(), ptmLabel(), inCallKey())}
+      </div>
+      <Segmented<PtmHold>
         options={[
           { value: "apply", label: "Hold to apply" },
           { value: "bypass", label: "Hold to bypass" },
         ]}
-        value={app.ui.ptmMode}
-        onChange={(v) => app.setUi("ptmMode", v)}
+        value={app.ptmSetting().hold}
+        onChange={(v) => void app.setPtmHold(v)}
+        disabled={!on()}
       />
       <button
         type="button"
         class="btn btn-secondary btn-block"
+        disabled={!on()}
+        title={ptmButtonTitle(on())}
         style={{
           "margin-top": "var(--s3)",
           height: "44px",
-          background: pressed() ? "var(--accent-bg)" : undefined,
-          "border-color": pressed() ? "var(--line-glow)" : undefined,
-          color: pressed() ? "var(--indigo)" : undefined,
+          background: down() ? "var(--accent-bg)" : undefined,
+          "border-color": down() ? "var(--line-glow)" : undefined,
+          color: down() ? "var(--indigo)" : undefined,
         }}
-        onPointerDown={() => app.setUi("pressed", true)}
-        onPointerUp={() => app.setUi("pressed", false)}
-        onPointerLeave={() => app.setUi("pressed", false)}
+        onPointerDown={hold}
+        onPointerUp={letGo}
+        onPointerLeave={letGo}
+        onPointerCancel={letGo}
       >
-        {pressed()
-          ? app.ui.ptmMode === "apply"
-            ? "APPLYING"
-            : "BYPASSED"
-          : `Hold to test · press ${ptmLabel()}`}
+        {ptmButtonLabel(down(), app.ptmBypassed(), ptmLabel())}
       </button>
     </div>
   );

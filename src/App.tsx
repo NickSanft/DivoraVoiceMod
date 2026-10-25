@@ -24,6 +24,7 @@ import {
   type LevelUpdate,
 } from "./audio/api";
 import { levelMute } from "./data/mute";
+import { levelPtm, ptmKeyMatches } from "./data/ptm";
 import { overlayPayload } from "./overlay/state";
 import { syncOverlay } from "./overlay/sync";
 import { Toast } from "./components/Toast";
@@ -48,10 +49,13 @@ function applyRootAttr(name: string, value: string | null) {
 // Global hotkeys. The backend emits `global-shortcut` events with the
 // binding's id and pressed/released state; this turns them into store
 // actions. It is the path every id takes, except that `overlay:arrange`
-// (v1.55.0) and `mute` (v1.56.0) are acted on by the backend; here the
-// first only shows a notice while the overlay is off or starting, and the
-// second does nothing. It runs while the window is hidden to the tray too:
-//   ptm             → set ui.pressed on press, clear on release
+// (v1.55.0), `mute` (v1.56.0) and `ptm` (v1.58.0) are acted on by the
+// backend; here the first only shows a notice while the overlay is off or
+// starting, and the other two do nothing. It runs while the window is
+// hidden to the tray too:
+//   ptm             → nothing: the backend holds push-to-modulate on the
+//                     press and lets go on the release; acting here would
+//                     do it twice (v1.58.0)
 //   panic           → stop all soundboard clips on press
 //   monitor         → toggle sidetone on press
 //   rec:screen      → start / stop the screen recording (v1.52.0)
@@ -69,7 +73,8 @@ function applyRootAttr(name: string, value: string | null) {
 //   sb:<clip>       → play that soundboard tile
 export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent): void {
   if (event.id === "ptm") {
-    app.setUi("pressed", event.state === "pressed");
+    // The backend already held or let go (v1.58.0); acting here would do it
+    // twice. The next level tick brings the new state.
     return;
   }
   if (event.state !== "pressed") return;
@@ -99,7 +104,8 @@ export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent
 
 /** One `audio-levels` tick into the store. v1.56.0 adds the mute: the tick's
  *  pair is adopted only when it is newer than what the mirror holds, and a
- *  tick without it changes nothing. */
+ *  tick without it changes nothing. v1.58.0 adds push-to-modulate's state,
+ *  by the same rule. */
 export function applyLevelUpdate(app: AppState, update: LevelUpdate): void {
   app.setInputLevels(update.input);
   app.setOutputLevels(update.output);
@@ -111,6 +117,7 @@ export function applyLevelUpdate(app: AppState, update: LevelUpdate): void {
   app.setDeviceLost(update.deviceLost);
   app.setModEnv(update.modEnv);
   app.applyMuteState(levelMute(update));
+  app.applyPtmState(levelPtm(update));
 }
 
 function Shell(): JSX.Element {
@@ -197,36 +204,31 @@ function Shell(): JSX.Element {
     },
   });
 
-  // Push-to-modulate fallback (in-app keyboard). The system-level
-  // tauri-plugin-global-shortcut wiring lives in the next onMount and
-  // fires even while the app is unfocused — this listener covers the
-  // case where the window IS focused, since global-shortcut on Windows
-  // does NOT swallow the key from the focused app.
+  // Push-to-modulate's in-app key: the default input (Space), which works
+  // only while Divora's window has the focus. A global key is the
+  // backend's own source (it acts on the press and the release); a key
+  // registered globally takes the key-down from the focused app (CHANGELOG
+  // v0.7.1) while the key-up still arrives here. v1.58.0: this listener
+  // holds its own source in the engine ("key"), so either path may fire
+  // and neither releases the other's hold. A press needs the bound key's
+  // modifiers exactly and ignores autorepeat; a release matches the
+  // trailing key alone, wherever focus ended up.
   onMount(() => {
-    const matches = (e: KeyboardEvent): boolean => {
-      const target = app.ui.ptmKey || "Space";
-      // Tauri accelerators look like "Space", "Ctrl+Shift+P". We only
-      // need to match the trailing key for the in-app fallback.
-      const parts = target.split("+");
-      const last = parts[parts.length - 1] ?? "Space";
-      if (last === "Space") return e.code === "Space";
-      if (last.length === 1) return e.key.toUpperCase() === last.toUpperCase();
-      return e.key === last;
-    };
+    const key = (): string => app.ui.ptmKey || "Space";
     const down = (e: KeyboardEvent) => {
-      if (matches(e) && e.target === document.body) {
+      if (ptmKeyMatches(key(), e, "down") && e.target === document.body) {
         e.preventDefault();
-        if (!app.ui.pressed) app.setUi("pressed", true);
+        if (!e.repeat) app.ptmDown("key");
       }
     };
     const up = (e: KeyboardEvent) => {
-      if (!matches(e)) return;
+      if (!ptmKeyMatches(key(), e, "up")) return;
       // Only swallow the key when nothing else wants it. Browsers activate a
       // focused button on Space *keyup*, so preventing it unconditionally
       // silently broke Space on every button and radio in the app. Releasing
-      // still clears the pressed state wherever focus ended up.
+      // still lets go wherever focus ended up.
       if (e.target === document.body) e.preventDefault();
-      app.setUi("pressed", false);
+      app.ptmUp("key");
     };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);

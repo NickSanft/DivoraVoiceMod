@@ -73,9 +73,11 @@ describe("App shell", () => {
     expect(getByText(/LOCAL · NO ACCOUNT/)).toBeInTheDocument();
   });
 
-  it("shows the Clean status by default", () => {
-    const { getAllByText } = render(() => <App />);
-    expect(getAllByText(/Clean/).length).toBeGreaterThanOrEqual(1);
+  // v1.58.0: push-to-modulate is off by default, so the default preset's
+  // effects are on (it said Clean while the call heard the preset).
+  it("shows the Modulated status by default", () => {
+    const { getByTestId } = render(() => <App />);
+    expect(getByTestId("titlebar-status")).toHaveTextContent("Modulated");
   });
 });
 

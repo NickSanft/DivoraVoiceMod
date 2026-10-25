@@ -27,6 +27,7 @@ use super::denormals;
 use super::level::LevelMeter;
 use super::loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS};
 use super::mute::{mute_ramp_len, InputMute, MuteChange, MuteGate, MuteOp};
+use super::ptm::{PtmChange, PtmMode, PtmOp, PtmSource, PtmStage, PtmState, StageReport};
 use super::resampler::MonoResampler;
 use super::state::{EngineState, Levels};
 use super::AudioEngineError;
@@ -42,8 +43,9 @@ const RING_BUFFER_FRAMES: usize = 8192;
 
 /// Max samples processed in a single callback. Realistic cpal buffers
 /// stay well under this; the array sits on the stack so no allocation
-/// happens in the audio thread.
-const MAX_FRAMES_PER_CALLBACK: usize = 4096;
+/// happens in the audio thread. v1.58.0: also the length of push-to-modulate's
+/// aligned dry (`audio::ptm`).
+pub(super) const MAX_FRAMES_PER_CALLBACK: usize = 4096;
 
 /// Capacity of the bounded UI→audio soundboard command queue. The realtime
 /// output callback drains it every buffer, so in normal use it holds only a
@@ -343,6 +345,36 @@ impl AudioEngine {
     #[must_use]
     pub fn input_mute(&self) -> InputMute {
         self.state.load_input_mute()
+    }
+
+    /// v1.58.0: push-to-modulate's mode, from the Mixer card. Lets go of
+    /// every hold, a held global key included (it must be pressed again), so
+    /// picking the mode again is the way out of a stuck hold. A direct atomic
+    /// op, like the mute's: takes effect on the next buffer, also mid-start,
+    /// also while stopped, from any thread. Idempotent: nothing to change
+    /// moves nothing, `seq` included.
+    pub fn set_ptm_mode(&self, mode: PtmMode) -> PtmChange {
+        self.state.apply_ptm(PtmOp::SetMode(mode))
+    }
+
+    /// v1.58.0: the page's boot restore of push-to-modulate's mode. Lets go
+    /// of the page's holds (in-app key, button, MIDI), which a fresh page no
+    /// longer holds, and keeps the global key's, which the backend still
+    /// tracks: a reload while the key is held must not drop it.
+    pub fn restore_ptm_mode(&self, mode: PtmMode) -> PtmChange {
+        self.state.apply_ptm(PtmOp::Restore(mode))
+    }
+
+    /// v1.58.0: one source's hold, by level. Idempotent: a set to the value
+    /// it has moves nothing. Held while any source holds it.
+    pub fn set_ptm_held(&self, source: PtmSource, held: bool) -> PtmChange {
+        self.state.apply_ptm(PtmOp::SetHeld(source, held))
+    }
+
+    /// v1.58.0: push-to-modulate and its change count.
+    #[must_use]
+    pub fn ptm(&self) -> PtmState {
+        self.state.load_ptm()
     }
 
     /// v1.6.0: set the gain applied to the separate monitor ("hear
@@ -1703,6 +1735,7 @@ fn build_input_stream(
 
 #[allow(clippy::too_many_arguments)] // builder-style; each arg is necessary
 #[allow(clippy::too_many_lines)] // single realtime callback; clearer inline
+#[allow(clippy::similar_names)] // `state`, and the voice `stage`'s report
 fn build_output_stream(
     device: &Device,
     config: &StreamConfig,
@@ -1792,6 +1825,10 @@ fn build_output_stream(
     // v1.56.0: per session, but it starts where the engine-wide word is, so
     // a Start or a rebuild while muted sends no voice at all.
     let mut mute_gate = MuteGate::new(mute_ramp_len(input_rate), state.input_muted());
+    // v1.58.0: push-to-modulate, per session, settled at the engine-wide
+    // word; the line starts at delay 0 (the chain is empty until the first
+    // `ReplaceChain`, D4). It allocates here, never in the callback.
+    let mut ptm = PtmStage::new(input_rate, state.ptm_bypassed());
 
     let stream = device
         .build_output_stream(
@@ -1851,6 +1888,10 @@ fn build_output_stream(
                 // the UI readout. Cheap — just sums enabled effects'
                 // fixed delays — and reflects the live chain, so it
                 // moves the moment Voice Convert / denoiser toggle.
+                // v1.58.0: for the readout only. The voice stage reads its
+                // own after the modulator has set this buffer's params, and
+                // that one goes to push-to-modulate's dry and the screen
+                // recorder's tap, so the two always agree.
                 let chain_latency = chain.latency_samples(input_rate);
                 #[allow(clippy::cast_precision_loss)]
                 let lat_ms = chain_latency as f32 / input_rate as f32 * 1000.0;
@@ -1917,23 +1958,21 @@ fn build_output_stream(
                 // Folded back into `mono` for the main send below.
                 let mut sb = [0f32; MAX_FRAMES_PER_CALLBACK];
 
-                // Voice reading, DRY half. `mono` is the raw mic here — the
-                // chain rewrites it in place below, so this is the one point
-                // on this thread where the untouched signal exists. Room is
-                // reserved in BOTH rings now so the WET copy after the chain
+                // Voice reading: whether this buffer taps. Room is reserved
+                // in BOTH rings here, before either push, so the WET copy
                 // cannot be the one that gets dropped, which would leave the
-                // two taps permanently out of step.
+                // two taps permanently out of step. Both are pushed after the
+                // stage, below.
                 // `block`, not `span`: these two measure the user's VOICE, and
                 // a microphone gap is not part of it. Identical in steady state,
                 // where the gap is empty.
                 let tapping = reading_taps.armed(reading.is_enabled(), block);
-                if tapping {
-                    reading_taps.push_dry(&mono[..block]);
-                }
 
                 // v1.56.0: the mute, read once per buffer.
                 let muted = state_for_callback.input_muted();
-                mix_voice_and_soundboard(
+                // v1.58.0: push-to-modulate, read once per buffer.
+                let bypass = state_for_callback.ptm_bypassed();
+                let stage = mix_voice_and_soundboard(
                     &mut mono[..span],
                     &mut sb[..span],
                     &mut chain,
@@ -1942,19 +1981,34 @@ fn build_output_stream(
                     &mut soundboard,
                     &mut mute_gate,
                     muted,
+                    &mut ptm,
+                    bypass,
                     input_rate,
                 );
+                // v1.58.0: the voice crossed between the effects and the dry
+                // in this buffer, so the reading's after-effects window
+                // straddles the switch. Set where the audio changes, so a
+                // press and release between two worker passes still counts.
+                if stage.crossed {
+                    reading.note_ptm_crossed();
+                }
                 // Publish the makeup gain for the UI "it's working" readout.
                 state_for_callback.store_loudness_gain_db(loudness.gain_db());
                 state_for_callback.store_reactive_depth(modulator.depth());
 
-                // Voice reading, WET half — the chain's output after loudness
-                // and the mute, which is what the call hears from the mic
-                // (zeros while muted). Taken HERE, before the
-                // soundboard is folded in below, so Speak / Critter Chatter /
-                // clip audio is on neither tap: those are mixed in after the
-                // chain and are not the user's voice.
+                // Voice reading. The DRY half is your voice as the stage would
+                // send it with no effects — after the mute's feed, delayed by
+                // the chain's latency (v1.58.0) — so the two halves are the
+                // same moment of speech, and a bypassed voice reads as a
+                // passthrough. The WET half is the chain's output after
+                // push-to-modulate, loudness and the mute, which is what the
+                // call hears from the mic (zeros while muted). DRY first, so
+                // the worker's `dry >= wet` holds. Both are taken HERE, before
+                // the soundboard is folded in below, so Speak / Critter
+                // Chatter / clip audio is on neither tap: those are mixed in
+                // after the chain and are not the user's voice.
                 if tapping {
+                    reading_taps.push_dry(ptm.aligned(block));
                     reading_taps.push_wet(&mono[..block]);
                 }
 
@@ -1971,7 +2025,9 @@ fn build_output_stream(
                         at: info.timestamp().callback,
                         out_frames: u32::try_from(out_frames).unwrap_or(u32::MAX),
                         occupancy: u32::try_from(occupancy).unwrap_or(u32::MAX),
-                        chain_latency: u32::try_from(chain_latency).unwrap_or(u32::MAX),
+                        // v1.58.0: the latency the stage aligned the dry to,
+                        // so a take places the voice right whichever is heard.
+                        chain_latency: u32::try_from(stage.latency).unwrap_or(u32::MAX),
                     },
                     &mono[..span],
                     &sb[..span],
@@ -2220,6 +2276,17 @@ fn main_output_plays(has_monitor: bool, monitoring: bool) -> bool {
 /// v1.56.0: the mute's gate wraps the voice. `feed` fades the chain's input
 /// and `mute` fades the voice after loudness, before anything taps or sends
 /// it; the soundboard is never touched.
+///
+/// v1.58.0: push-to-modulate switches between the chain's output and the dry
+/// voice, here and nowhere else, so the call, the monitor, recordings, takes
+/// and the reading all get the same voice. The order: the mute's `feed`, the
+/// modulator, the chain's latency (read after the modulator, so it is this
+/// buffer's), the dry captured, the chain, the switch, loudness, the mute's
+/// `mute`. The dry is captured after `feed`, so nothing said while muted can
+/// come out of it after an unmute; the switch sits before loudness, which
+/// treats either voice the same, and before the mute, which still wins. The
+/// chain runs whatever the switch says, so a press has no gap. Settled on
+/// the effects, the switch doesn't touch `mono`.
 #[allow(clippy::too_many_arguments)] // the voice stage's parts, in order
 fn mix_voice_and_soundboard(
     mono: &mut [f32],
@@ -2230,8 +2297,10 @@ fn mix_voice_and_soundboard(
     soundboard: &mut SoundboardMixer,
     gate: &mut MuteGate,
     muted: bool,
+    ptm: &mut PtmStage,
+    bypass: bool,
     sample_rate: u32,
-) {
+) -> StageReport {
     // v1.56.0: plan the mute's fade for this buffer, then fade the chain's
     // input. While muted the chain hears only silence, so nothing said then
     // can come out of an effect's tail after the unmute.
@@ -2244,10 +2313,17 @@ fn mix_voice_and_soundboard(
     // louder. It must also run before `loudness`, whose entire job is
     // removing the level variation the follower needs.
     modulator.apply(mono, chain, sample_rate);
+    // v1.58.0: the delay this buffer's chain reports, with the params the
+    // modulator just set; the dry is delayed by it, so the two carry the same
+    // moment of speech.
+    let latency = chain.latency_samples(sample_rate);
+    ptm.capture(mono, latency);
     chain.process(mono, sample_rate);
+    let crossed = ptm.blend(mono, bypass);
     loudness.process(mono, sample_rate);
     run.mute(mono);
     soundboard.mix_into(soundboard_out, sample_rate);
+    StageReport { latency, crossed }
 }
 
 // ---------------------------------------------------------------------------
@@ -2315,7 +2391,8 @@ impl ReadingFacts {
 ///   `Quiet`. The engine supplies stopped and muted (see [`ReadingFacts`]).
 pub trait ReadingAnalyzer: Send {
     /// Feed one aligned pair of blocks, `dry` before the chain and `wet`
-    /// after it, both `sample_rate` Hz and the same length.
+    /// after it, both `sample_rate` Hz and the same length. Since v1.58.0
+    /// `dry` is delayed by the chain's latency, so the two are one moment.
     fn push(&mut self, dry: &[f32], wet: &[f32], sample_rate: u32) -> Option<VoiceReading>;
 
     /// The effect chain changed, so anything measured from the wet tap
@@ -2517,6 +2594,11 @@ pub struct ReadingTap {
     /// already applied) and taken by the worker, because the two run on
     /// different threads and the worker cannot see the chain.
     chain_changed: AtomicBool,
+    /// v1.58.0: push-to-modulate moved the voice between the effects and the
+    /// dry since the worker last looked. Set by the callback in the buffer
+    /// where the audio changed, so a press and release between two passes
+    /// still counts, and a hold that switches nothing never does.
+    ptm_crossed: AtomicBool,
     snapshot: Mutex<ReadingSnapshot>,
 }
 
@@ -2527,6 +2609,7 @@ impl Default for ReadingTap {
             enabled: AtomicBool::new(false),
             muted: AtomicBool::new(false),
             chain_changed: AtomicBool::new(false),
+            ptm_crossed: AtomicBool::new(false),
             snapshot: Mutex::new(ReadingSnapshot::idle(ReadingState::Stopped)),
         }
     }
@@ -2551,6 +2634,18 @@ impl ReadingTap {
         self.chain_changed.swap(false, Ordering::AcqRel)
     }
 
+    /// v1.58.0: tell the reading push-to-modulate moved the voice (one
+    /// store, on the audio thread).
+    fn note_ptm_crossed(&self) {
+        self.ptm_crossed.store(true, Ordering::Release);
+    }
+
+    /// v1.58.0: whether the voice crossed since this was last asked, clearing
+    /// the flag.
+    fn take_ptm_crossed(&self) -> bool {
+        self.ptm_crossed.swap(false, Ordering::AcqRel)
+    }
+
     /// A poisoned lock means the worker panicked mid-write. The value behind
     /// it is a plain snapshot, so carrying on with it beats taking the UI
     /// thread down as well.
@@ -2568,8 +2663,8 @@ impl ReadingTap {
 
 /// The producer ends of the two taps, owned by the output callback.
 ///
-/// Both or neither. The DRY copy is taken before the chain overwrites the
-/// buffer in place and the WET copy after it, so a push that landed on one
+/// Both or neither. The two copies are separate pushes (since v1.58.0 both
+/// after the voice stage, the DRY one first), so a push that landed on one
 /// ring and was truncated on the other would slide the two taps out of step
 /// for the rest of the session — the later readings would compare a speaker
 /// against a different moment of themselves.
@@ -2765,6 +2860,7 @@ fn publish(tap: &ReadingTap, mut snapshot: ReadingSnapshot, divora_muted: bool) 
 /// disconnects at teardown, which is also what invalidates the baseline: a new
 /// session gets a new worker and therefore a new one.
 #[allow(clippy::needless_pass_by_value)] // owns everything for the thread's lifetime
+#[allow(clippy::too_many_lines)] // one pass, in order; each edge reads clearer inline
 fn reading_worker(
     mut dry: RingConsumer,
     mut wet: RingConsumer,
@@ -2821,6 +2917,11 @@ fn reading_worker(
         if tap.take_chain_changed() {
             analyzer.note_chain_changed();
         }
+        // v1.58.0: and whenever push-to-modulate moved the voice: a window
+        // half effects and half dry describes neither.
+        if tap.take_ptm_crossed() {
+            analyzer.note_chain_changed();
+        }
 
         if !enabled {
             // Discard anything the callback pushed around the edge of the
@@ -2861,7 +2962,7 @@ fn reading_worker(
 
         let mut published = false;
         loop {
-            // Size the drain by WET. It is pushed after the chain runs, so it
+            // Size the drain by WET. It is pushed right after DRY, so it
             // trails DRY by at most one buffer; draining by DRY would eat
             // samples whose WET half has not been written yet and the two taps
             // would never line up again.
@@ -3033,6 +3134,7 @@ mod tests {
         MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
     };
     use crate::audio::mute::{mute_ramp_len, InputMute, MuteChange, MuteGate, MuteOp};
+    use crate::audio::ptm::{PtmStage, StageReport};
     use crate::dsp::witness::witnessed_chain;
     use crate::dsp::{
         Descriptor, Displaced, DspEdit, EffectChain, Metrics, ReactiveModulator, ReadingState,
@@ -3409,6 +3511,8 @@ mod tests {
             &mut sb,
             &mut MuteGate::new(mute_ramp_len(48_000), false),
             false,
+            &mut PtmStage::new(48_000, false),
+            false,
             48_000,
         );
         for (i, (&m, &s)) in mono.iter().zip(&sb_out).enumerate() {
@@ -3447,6 +3551,8 @@ mod tests {
             &mut loudness,
             &mut sb,
             &mut MuteGate::new(mute_ramp_len(48_000), false),
+            false,
+            &mut PtmStage::new(48_000, false),
             false,
             48_000,
         );
@@ -3564,6 +3670,8 @@ mod tests {
                 &mut sb1,
                 &mut MuteGate::new(mute_ramp_len(48_000), false),
                 false,
+                &mut PtmStage::new(48_000, false),
+                false,
                 48_000,
             );
             mix_voice_and_soundboard(
@@ -3574,6 +3682,8 @@ mod tests {
                 &mut loud2,
                 &mut sb2,
                 &mut MuteGate::new(mute_ramp_len(48_000), false),
+                false,
+                &mut PtmStage::new(48_000, false),
                 false,
                 48_000,
             );
@@ -4532,10 +4642,13 @@ mod tests {
         loudness: LoudnessNormalizer,
         soundboard: SoundboardMixer,
         gate: MuteGate,
+        /// v1.58.0: push-to-modulate's switch and line, built applied.
+        ptm: PtmStage,
     }
 
     impl VoiceStage {
         /// `muted`: the session starts muted, as one built while muted does.
+        /// Push-to-modulate starts settled on the effects (its launch state).
         fn new(chain: EffectChain, loudness_on: bool, muted: bool) -> Self {
             let mut loudness = LoudnessNormalizer::new();
             loudness.set_enabled(loudness_on);
@@ -4545,6 +4658,7 @@ mod tests {
                 loudness,
                 soundboard: SoundboardMixer::new(),
                 gate: MuteGate::new(mute_ramp_len(RATE), muted),
+                ptm: PtmStage::new(RATE, false),
             }
         }
 
@@ -4558,7 +4672,20 @@ mod tests {
             }));
         }
 
+        /// One buffer with push-to-modulate on the effects.
         fn run(&mut self, mono: &mut [f32], sb: &mut [f32], muted: bool) {
+            self.run_ptm(mono, sb, muted, false);
+        }
+
+        /// v1.58.0: one buffer, push-to-modulate switching to the dry while
+        /// `bypass`, as the callback's read of the word says.
+        fn run_ptm(
+            &mut self,
+            mono: &mut [f32],
+            sb: &mut [f32],
+            muted: bool,
+            bypass: bool,
+        ) -> StageReport {
             mix_voice_and_soundboard(
                 mono,
                 sb,
@@ -4568,8 +4695,10 @@ mod tests {
                 &mut self.soundboard,
                 &mut self.gate,
                 muted,
+                &mut self.ptm,
+                bypass,
                 RATE,
-            );
+            )
         }
     }
 
@@ -4859,8 +4988,9 @@ mod tests {
         );
 
         // In the callback: the read, the stage, then the reading's wet tap, the
-        // screen recorder's tap and the monitor's mix (the dry tap comes before
-        // the stage; the WAV tap isn't pinned here).
+        // screen recorder's tap and the monitor's mix (since v1.58.0 the dry
+        // tap is pushed after the stage too, just before the wet one; the
+        // WAV tap isn't pinned here).
         let mut at = 0;
         for needle in [
             concat!("state_for_callback", ".input_muted();"),
@@ -5406,5 +5536,94 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // v1.58.0: push-to-modulate
+    // -----------------------------------------------------------------
+
+    /// v1.58.0 (S0): one hash per bundled preset of what the voice stage
+    /// sends, loudness off and on, for a fixed input: a 220 Hz tone, seeded
+    /// room tone, then bursts, with a mute and an unmute along the way; 480-
+    /// frame buffers, 4 s. Push-to-modulate refactors the stage; with it
+    /// applied (`VoiceStage::run`, settled on the effects), the stage must send
+    /// exactly what it did before. Run on the commit before the refactor and
+    /// after it, on one machine, and compare the listings line for line:
+    /// `cargo test -p divora-core --lib stage_fingerprints -- --ignored --nocapture`
+    #[test]
+    #[ignore = "fingerprints: compare the listing across a refactor"]
+    fn stage_fingerprints() {
+        use crate::dsp::EffectSpec;
+        use crate::presets::bundled_presets;
+        const FRAMES: usize = 480;
+        const BUFFERS: usize = 4 * 48_000 / FRAMES;
+
+        /// The input, the same every run: tone, room tone, bursts.
+        fn mic() -> impl FnMut(usize) -> f32 {
+            let inc = std::f32::consts::TAU * 220.0 / 48_000.0;
+            let mut phase = 0.0_f32;
+            let mut x = 0x2545_f491_4f6c_dd1d_u64;
+            move |n| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let noise = f32::from(u16::try_from(x >> 48).unwrap()) / 32_768.0 - 1.0;
+                phase = (phase + inc) % std::f32::consts::TAU;
+                match n / 48_000 {
+                    0 => 0.3 * phase.sin(),
+                    1 => 0.000_55 * noise,
+                    _ if (n / 4_800) % 2 == 0 => 0.4 * phase.sin() + 0.05 * noise,
+                    _ => 0.0,
+                }
+            }
+        }
+        /// FNV-1a over the samples' bits.
+        fn fold(h: &mut u64, xs: &[f32]) {
+            for s in xs {
+                for b in s.to_bits().to_le_bytes() {
+                    *h ^= u64::from(b);
+                    *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+
+        for loudness_on in [false, true] {
+            for preset in bundled_presets() {
+                let specs: Vec<EffectSpec> = preset
+                    .chain
+                    .iter()
+                    .map(|e| EffectSpec {
+                        kind: serde_json::from_value(serde_json::Value::String(e.id.clone()))
+                            .unwrap_or_else(|err| panic!("{}: {}: {err}", preset.id, e.id)),
+                        enabled: e.enabled,
+                        params: e.vals.clone(),
+                    })
+                    .collect();
+                let mut stage =
+                    VoiceStage::new(EffectChain::from_specs(&specs), loudness_on, false);
+                let mut input = mic();
+                let mut h = 0xcbf2_9ce4_8422_2325_u64;
+                let mut n = 0;
+                for b in 0..BUFFERS {
+                    let mut mono = [0.0_f32; FRAMES];
+                    for s in &mut mono {
+                        *s = input(n);
+                        n += 1;
+                    }
+                    let mut sb = [0.0_f32; FRAMES];
+                    // Muted for the second half of the room tone and the
+                    // first bursts.
+                    let muted = (150..250).contains(&b);
+                    stage.run(&mut mono, &mut sb, muted);
+                    fold(&mut h, &mono);
+                    fold(&mut h, &sb);
+                }
+                println!(
+                    "fingerprint loudness={} {:<22} {h:016x}",
+                    u8::from(loudness_on),
+                    preset.id
+                );
+            }
+        }
     }
 }

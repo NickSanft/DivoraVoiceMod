@@ -41,31 +41,46 @@ describe("app store — Phase 1", () => {
     expect(result.preset().id).toBe(result.presetId());
   });
 
-  it("defaults to clean status (no PTM pressed, not muted)", () => {
-    const { result } = setupApp();
-    expect(result.status()).toBe("clean");
-  });
-
-  it("becomes modulated when PTM is pressed (apply mode) and there are enabled effects", () => {
+  // v1.58.0: push-to-modulate is off ("always") by default, so a preset with
+  // effects on reads Modulated; the status follows the engine's mirror.
+  it("defaults to modulated with an effect on (push-to-modulate off, not muted)", () => {
     const { result } = setupApp();
     expect(result.hasEnabled()).toBe(true);
-    result.setUi("pressed", true);
+    expect(result.ptmState()).toBeNull();
+    expect(result.ptmBypassed()).toBe(false);
     expect(result.status()).toBe("modulated");
   });
 
-  it("becomes muted when the engine's mute is adopted, overriding PTM", () => {
+  it("is clean while the engine's push-to-modulate bypasses the effects", () => {
     const { result } = setupApp();
-    result.setUi("pressed", true);
+    result.applyPtmState({ mode: "apply", held: false, bypassed: true, seq: 1 });
+    expect(result.ptmBypassed()).toBe(true);
+    expect(result.status()).toBe("clean");
+    result.applyPtmState({ mode: "apply", held: true, bypassed: false, seq: 2 });
+    expect(result.status()).toBe("modulated");
+    result.applyPtmState({ mode: "bypass", held: true, bypassed: true, seq: 3 });
+    expect(result.status()).toBe("clean");
+  });
+
+  it("becomes muted when the engine's mute is adopted, overriding push-to-modulate", () => {
+    const { result } = setupApp();
     result.applyMuteState({ muted: true, seq: 1 });
+    expect(result.status()).toBe("muted");
+    result.applyPtmState({ mode: "apply", held: false, bypassed: true, seq: 1 });
+    expect(result.status()).toBe("muted");
+    result.applyPtmState({ mode: "apply", held: true, bypassed: false, seq: 2 });
     expect(result.status()).toBe("muted");
   });
 
-  it("PTM bypass mode inverts the pressed semantics", () => {
+  it("a chain with only the noise gate on reads clean (it passes speech at unity)", () => {
     const { result } = setupApp();
-    result.setUi("ptmMode", "bypass");
-    expect(result.status()).toBe("modulated");
-    result.setUi("pressed", true);
+    result.usePreset("clean");
+    expect(result.chain().map((c) => [c.id, c.enabled])).toEqual([["gate", true]]);
+    expect(result.hasEnabled()).toBe(true);
     expect(result.status()).toBe("clean");
+    // Any other effect on makes it modulated.
+    result.usePreset("hollow-king");
+    expect(result.status()).toBe("modulated");
   });
 });
 
@@ -3470,6 +3485,11 @@ describe("app store — Replay (v1.54.0)", () => {
     let now = 0;
     const saved = (durationMs: number) =>
       fire("replay-saved", { path: "C:/rec/divora-replay-x.mp4", durationMs, error: null });
+    // v1.58.0: push-to-modulate is off by default, so the preset's effects
+    // are on (modulated) from the store's creation. The mirror turns it on:
+    // Hold to apply, the key up (bypassed, clean) or held (modulated).
+    const ptm = (held: boolean, seq: number) =>
+      ({ mode: "apply", held, bypassed: !held, seq }) as const;
 
     beforeEach(() => {
       now = 1_000;
@@ -3480,7 +3500,6 @@ describe("app store — Replay (v1.54.0)", () => {
       replayBackend();
       const { result } = setupApp();
       await settle();
-      result.setUi("pressed", true);
       expect(result.status()).toBe("modulated");
       expect(result.modulatedSince()).toBe(1_000);
       now = 40_000;
@@ -3495,7 +3514,12 @@ describe("app store — Replay (v1.54.0)", () => {
       replayBackend();
       const { result } = setupApp();
       await settle();
-      result.setUi("pressed", true);
+      result.applyPtmState(ptm(false, 1));
+      expect(result.status()).toBe("clean");
+      expect(result.modulatedSince()).toBeNull();
+      now = 1_000;
+      result.applyPtmState(ptm(true, 2));
+      expect(result.modulatedSince()).toBe(1_000);
       now = 33_999;
       saved(30_000);
       expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
@@ -3505,11 +3529,13 @@ describe("app store — Replay (v1.54.0)", () => {
       replayBackend();
       const { result } = setupApp();
       await settle();
+      result.applyPtmState(ptm(false, 1));
+      expect(result.status()).toBe("clean");
       now = 40_000;
       saved(30_000);
       expect(result.toast()?.text).toBe("Saved a 30 s replay · your voice as your call heard it");
 
-      result.setUi("pressed", true);
+      result.applyPtmState(ptm(true, 2));
       result.applyMuteState({ muted: true, seq: 1 });
       expect(result.status()).toBe("muted");
       expect(result.modulatedSince()).toBeNull();
@@ -3522,7 +3548,7 @@ describe("app store — Replay (v1.54.0)", () => {
       replayBackend();
       const { result } = setupApp();
       await settle();
-      result.setUi("pressed", true);
+      expect(result.status()).toBe("modulated");
       now = 20_000;
       result.usePreset("static-wraith");
       expect(result.status()).toBe("modulated");
@@ -3540,7 +3566,7 @@ describe("app store — Replay (v1.54.0)", () => {
       replayBackend();
       const { result } = setupApp();
       await settle();
-      result.setUi("pressed", true);
+      expect(result.status()).toBe("modulated");
       fire("replay-buffer", { ...RING, seconds: 30 });
       // The screen goes at 40 s; the clip ends there, under the first preset.
       now = 40_000;
@@ -3561,7 +3587,7 @@ describe("app store — Replay (v1.54.0)", () => {
       replayBackend();
       const { result } = setupApp();
       await settle();
-      result.setUi("pressed", true);
+      expect(result.status()).toBe("modulated");
       now = 40_000;
       fire("replay-buffer", { ...RING, state: "held", heldReason: "screen-lost", seconds: 30 });
       now = 300_000;
@@ -3688,7 +3714,7 @@ describe("app store — the mute (v1.56.0)", () => {
     window.localStorage.clear();
   });
 
-  it("defaults to unmuted and clean; muteKnown waits for the read", async () => {
+  it("defaults to unmuted and modulated; muteKnown waits for the read", async () => {
     let answer!: (v: unknown) => void;
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "input_mute" ? new Promise((r) => (answer = r)) : Promise.resolve(undefined),
@@ -3696,7 +3722,9 @@ describe("app store — the mute (v1.56.0)", () => {
     const { result } = setupApp();
     expect(result.muted()).toBe(false);
     expect(result.muteState()).toBeNull();
-    expect(result.status()).toBe("clean");
+    // v1.58.0: push-to-modulate is off by default, so the preset's effects
+    // are on.
+    expect(result.status()).toBe("modulated");
     await settle();
     expect(result.muteKnown()).toBe(false);
 
@@ -3704,7 +3732,7 @@ describe("app store — the mute (v1.56.0)", () => {
     await settle();
     expect(result.muteKnown()).toBe(true);
     expect(result.muteState()).toEqual({ muted: false, seq: 0 });
-    expect(result.status()).toBe("clean");
+    expect(result.status()).toBe("modulated");
   });
 
   it("the boot read adopts a mute before any tick (a reload during a hotkey mute)", async () => {

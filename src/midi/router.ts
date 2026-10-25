@@ -13,7 +13,14 @@ import type { MidiMapping, MidiMessage, MidiTrigger } from "../types";
 export interface MidiHandlers {
   usePreset: (presetId: string) => void;
   playTile: (tileId: string) => void;
-  setPtm: (pressed: boolean) => void;
+  /** v1.58.0: a note on a `ptm` mapping, with the mapping's id: note-on
+   *  (`down`) holds push-to-modulate for that mapping, note-off lets go. The
+   *  store holds it while any mapping is down. */
+  ptmNote: (mappingId: string, down: boolean) => void;
+  /** v1.58.0: every CC on a `ptm` mapping, with the mapping's id. The store
+   *  keeps the side each mapping is on (64 or more holds, 59 or less lets
+   *  go) and acts only when it crosses. */
+  ptmCc: (mappingId: string, value: number) => void;
   toggleMonitor: () => void;
   setParam: (effectIndex: number, key: string, value: number) => void;
   /** v1.56.0: a note on a `mute` mapping flips the mute. */
@@ -79,9 +86,15 @@ export function routeMidi(
         if (isActivation(msg)) h.toggleMonitor();
         break;
       case "ptm":
-        // Momentary: held while the note is down / the CC is in its
-        // upper half. Note-off (and CC < 64) releases.
-        h.setPtm(isActivation(msg));
+        // Momentary: held while the note is down / the CC is up. v1.58.0:
+        // each mapping is its own hold, by id, and a CC goes to the store
+        // with every value (the dead band needs the side it was on, and the
+        // router keeps no state), as the mute's does.
+        if (msg.kind === "note-on" || msg.kind === "note-off") {
+          h.ptmNote(m.id, msg.kind === "note-on");
+        } else if (msg.kind === "control-change") {
+          h.ptmCc(m.id, msg.data2);
+        }
         break;
       case "param":
         if (

@@ -50,7 +50,10 @@ export type NavId =
 
 export type VoiceStatus = "clean" | "modulated" | "muted";
 
-export type PtmMode = "apply" | "bypass";
+/** v1.58.0: push-to-modulate's mode lives on the wire now (`"always"` was
+ *  added: off), and the Mixer card's two-way choice is `PtmHold`. Both are
+ *  declared with the IPC layer and re-exported here, as `MidiMessage` is. */
+export type { PtmHold, PtmMode } from "./audio/api";
 
 export type AbSlot = "A" | "B";
 
@@ -164,13 +167,14 @@ export interface TweaksState {
 }
 
 /** UI-side ephemeral state. v1.56.0: the mute left for the store's
- *  read-only `muted()`, a mirror of the engine's state. */
+ *  read-only `muted()`, a mirror of the engine's state. v1.58.0:
+ *  push-to-modulate's `ptmMode` and `pressed` left the same way: the engine
+ *  holds them, the store mirrors them (`ptmState()`), and the mode the user
+ *  picked is saved in `divora.ptm`. `ptmKey` stays: the in-app key. */
 export interface UiState {
   monitor: boolean;
   ab: AbSlot;
-  ptmMode: PtmMode;
   ptmKey: string;
-  pressed: boolean;
 }
 
 // ---- MIDI control surfaces (v1.9.0) ----

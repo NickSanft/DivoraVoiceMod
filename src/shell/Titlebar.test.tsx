@@ -33,6 +33,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+import type { PtmState } from "../audio/api";
 import { AppProvider, useApp, type AppState } from "../stores/app";
 import { Titlebar } from "./Titlebar";
 
@@ -143,6 +144,15 @@ describe("Titlebar — Replay chip (v1.54.0)", () => {
 describe("Titlebar — the mute (v1.56.0)", () => {
   beforeEach(() => handlers.clear());
 
+  // v1.58.0: push-to-modulate is the engine's too; the store mirrors it.
+  // Hold to apply: held → the effects apply (Modulated), up → bypassed.
+  const ptm = (held: boolean, seq: number): PtmState => ({
+    mode: "apply",
+    held,
+    bypassed: !held,
+    seq,
+  });
+
   const TITLE =
     "Your voice is muted for the call, your headphones, WAV and screen recordings and Replay. Clips and Speak still play.";
 
@@ -151,7 +161,8 @@ describe("Titlebar — the mute (v1.56.0)", () => {
     const pill = () => getByTestId("titlebar-status");
     expect(pill()).not.toHaveClass("is-muted");
     expect(pill()).not.toHaveAttribute("title");
-    expect(pill()).toHaveTextContent("Clean");
+    // v1.58.0: push-to-modulate is off by default and the preset has effects.
+    expect(pill()).toHaveTextContent("Modulated");
 
     app().applyMuteState({ muted: true, seq: 1 });
     expect(pill()).toHaveClass("is-muted");
@@ -160,8 +171,10 @@ describe("Titlebar — the mute (v1.56.0)", () => {
     expect(pill().title).toContain("headphones");
     expect(pill().title).toContain("recordings");
 
-    // Push-to-modulate can't take it over.
-    app().setUi("pressed", true);
+    // Push-to-modulate can't take it over, either way.
+    app().applyPtmState(ptm(true, 1));
+    expect(pill()).toHaveClass("is-muted");
+    app().applyPtmState(ptm(false, 2));
     expect(pill()).toHaveClass("is-muted");
 
     app().applyMuteState({ muted: false, seq: 2 });
@@ -196,21 +209,22 @@ describe("Titlebar — the mute (v1.56.0)", () => {
     expect(getByTestId("titlebar-status").contains(announcer)).toBe(false);
     expect(announcer.textContent).toBe("");
 
-    // A push-to-modulate press changes the pill, never the announcer.
-    app().setUi("pressed", true);
-    expect(getByTestId("titlebar-status")).toHaveTextContent("Modulated");
+    // A push-to-modulate edge changes the pill, never the announcer.
+    app().applyPtmState(ptm(false, 1));
+    expect(getByTestId("titlebar-status")).toHaveTextContent("Clean");
     expect(announcer.textContent).toBe("");
-    app().setUi("pressed", false);
+    app().applyPtmState(ptm(true, 2));
+    expect(getByTestId("titlebar-status")).toHaveTextContent("Modulated");
     expect(announcer.textContent).toBe("");
 
     app().applyMuteState({ muted: true, seq: 1 });
     expect(announcer.textContent).toBe("Your voice is muted.");
-    app().setUi("pressed", true);
+    app().applyPtmState(ptm(false, 3));
     expect(announcer.textContent).toBe("Your voice is muted.");
 
     app().applyMuteState({ muted: false, seq: 2 });
     expect(announcer.textContent).toBe("Your voice is unmuted.");
-    app().setUi("pressed", false);
+    app().applyPtmState(ptm(true, 4));
     expect(announcer.textContent).toBe("Your voice is unmuted.");
     // Still the same element: the region was never remounted.
     expect(getByTestId("mute-announcer")).toBe(announcer);

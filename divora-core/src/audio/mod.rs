@@ -18,6 +18,7 @@ mod engine;
 mod level;
 mod loudness;
 mod mute;
+mod ptm;
 mod resampler;
 mod state;
 mod virtual_mic;
@@ -34,6 +35,7 @@ pub use engine::{
 pub use level::LevelMeter;
 pub use loudness::{LoudnessNormalizer, DEFAULT_TARGET_DBFS, MAX_TARGET_DBFS, MIN_TARGET_DBFS};
 pub use mute::{InputMute, MuteChange};
+pub use ptm::{PtmChange, PtmMode, PtmPageSource, PtmSource, PtmState};
 pub use resampler::MonoResampler;
 pub use state::Levels;
 pub use virtual_mic::{detect_virtual_mic, VirtualMicStatus};

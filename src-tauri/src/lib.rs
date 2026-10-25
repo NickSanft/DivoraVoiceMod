@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use divora_core::audio::{
     detect_virtual_mic as detect_virtual_mic_core, list_input_devices as list_input_devices_core,
     list_output_devices as list_output_devices_core, AudioEngine, DeviceInfo, InputMute, Levels,
-    ReadingSnapshot, StreamInfo, VirtualMicStatus,
+    PtmMode, PtmPageSource, PtmSource, PtmState, ReadingSnapshot, StreamInfo, VirtualMicStatus,
 };
 use divora_core::dsp::{
     onnx_runtime_available, DspCommand, EffectSpec, Metrics, ReactiveConfig, ReadingState,
@@ -87,6 +87,10 @@ struct LevelUpdate {
     /// v1.56.0: the mute's change count, read with `input_muted` in one load.
     /// Orders ticks against command answers: the larger is newer.
     input_mute_seq: u64,
+    /// v1.58.0: push-to-modulate, engine running or not, from one load: its
+    /// mode, whether anything holds it, what the callback switches to, and
+    /// its change count (the larger `seq` is newer).
+    ptm: PtmState,
 }
 
 /// Level shown when a window measured nothing.
@@ -387,6 +391,31 @@ fn toggle_input_muted(state: State<'_, AppState>) -> InputMute {
 #[tauri::command]
 fn input_mute(state: State<'_, AppState>) -> InputMute {
     state.engine.input_mute()
+}
+
+/// v1.58.0: push-to-modulate's mode; answers the state after. Without
+/// `restore` (the Mixer card) it lets go of every hold, a held global key
+/// included, which must then be pressed again. With `restore: true` (the main
+/// window, once at each page load, with the saved mode) it lets go of the
+/// page's holds and keeps a held global key, so a reload doesn't drop it.
+/// Sync on purpose (D23): sync commands run in order on the main thread, so
+/// a press can't overtake its release. Idempotent.
+#[tauri::command]
+fn set_ptm_mode(state: State<'_, AppState>, mode: PtmMode, restore: Option<bool>) -> PtmState {
+    if restore == Some(true) {
+        state.engine.restore_ptm_mode(mode).after
+    } else {
+        state.engine.set_ptm_mode(mode).after
+    }
+}
+
+/// v1.58.0: one page source's hold on push-to-modulate (the in-app key, the
+/// Mixer's button, MIDI), by level; answers the state after. `"hotkey"` is
+/// refused (only the backend holds that one). Sync for the same reason as
+/// [`set_ptm_mode`]. Idempotent.
+#[tauri::command]
+fn set_ptm_held(state: State<'_, AppState>, source: PtmPageSource, held: bool) -> PtmState {
+    state.engine.set_ptm_held(source.into(), held).after
 }
 
 /// v1.6.0: set the monitor ("hear yourself") stream gain (linear, 1.0 =
@@ -2789,6 +2818,55 @@ fn rebind(
     (old, new)
 }
 
+/// v1.58.0: the parsed shortcut when `id` already holds exactly the key
+/// `accelerator` names. Re-registering it while it is live does nothing, so a
+/// page reload's re-sync keeps a held push-to-modulate key held (U4).
+fn same_binding(map: &HashMap<String, Shortcut>, id: &str, accelerator: &str) -> Option<Shortcut> {
+    let parsed = accelerator.parse::<Shortcut>().ok()?;
+    (map.get(id) == Some(&parsed)).then_some(parsed)
+}
+
+/// v1.58.0: [`rebind`], then [`ptm_key_unbound`], at the map update and
+/// before anything can return early (ST-5): once `ptm` leaves its key, that
+/// key's release can no longer reach the handler.
+fn take_binding(
+    map: &mut HashMap<String, Shortcut>,
+    engine: &AudioEngine,
+    id: &str,
+    accelerator: &str,
+) -> (Option<Shortcut>, Result<Shortcut, String>) {
+    let taken = rebind(map, id, accelerator);
+    ptm_key_unbound(engine, id);
+    taken
+}
+
+/// v1.58.0: [`release`], then [`ptm_key_unbound`], whether or not a
+/// shortcut comes back to unregister (a shared key doesn't).
+fn drop_binding(
+    map: &mut HashMap<String, Shortcut>,
+    engine: &AudioEngine,
+    id: &str,
+) -> Option<Shortcut> {
+    let old = release(map, id);
+    ptm_key_unbound(engine, id);
+    old
+}
+
+/// v1.58.0: every binding out of the map, to unregister, then
+/// [`ptm_key_unbound`] for `ptm`.
+fn drain_bindings(map: &mut HashMap<String, Shortcut>, engine: &AudioEngine) -> Vec<Shortcut> {
+    let all = map.drain().map(|(_, shortcut)| shortcut).collect();
+    ptm_key_unbound(engine, HOTKEY_PTM);
+    all
+}
+
+// v1.58.0: the three shortcut commands call the plugin only after
+// `AppState.shortcuts` is unlocked (D16). The plugin runs the handler under
+// its own store lock, and the handler takes `AppState.shortcuts`; a command
+// that held `AppState.shortcuts` into the plugin's `unregister`, which takes
+// the store lock, could deadlock the main thread against a key released on
+// global-hotkey's poller thread. Commands run one at a time on the main
+// thread, so unlocking early races nothing.
 #[tauri::command]
 fn register_global_shortcut(
     app: AppHandle,
@@ -2796,16 +2874,26 @@ fn register_global_shortcut(
     id: String,
     accelerator: String,
 ) -> Result<(), String> {
-    let shortcut = {
-        let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
-        let (old, new) = rebind(&mut map, &id, &accelerator);
-        if let Some(old) = old {
-            let _ = app.global_shortcut().unregister(old);
-        }
-        new?
+    let same = {
+        let map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+        same_binding(&map, &id, &accelerator)
     };
+    if let Some(same) = same {
+        // The same key, still registered: nothing to do, and a held key
+        // stays held. One whose register failed earlier is tried again.
+        if app.global_shortcut().is_registered(same) {
+            return Ok(());
+        }
+    }
+    let (old, new) = {
+        let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+        take_binding(&mut map, &state.engine, &id, &accelerator)
+    };
+    if let Some(old) = old {
+        let _ = app.global_shortcut().unregister(old);
+    }
     app.global_shortcut()
-        .register(shortcut)
+        .register(new?)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2816,8 +2904,11 @@ fn unregister_global_shortcut(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
-    if let Some(shortcut) = release(&mut map, &id) {
+    let old = {
+        let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+        drop_binding(&mut map, &state.engine, &id)
+    };
+    if let Some(shortcut) = old {
         app.global_shortcut()
             .unregister(shortcut)
             .map_err(|e| e.to_string())?;
@@ -2830,9 +2921,12 @@ fn unregister_all_global_shortcuts(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+    let all = {
+        let mut map = state.shortcuts.lock().map_err(|e| e.to_string())?;
+        drain_bindings(&mut map, &state.engine)
+    };
     let mut last_err: Option<String> = None;
-    for (_, shortcut) in map.drain() {
+    for shortcut in all {
         if let Err(e) = app.global_shortcut().unregister(shortcut) {
             last_err = Some(e.to_string());
         }
@@ -2928,6 +3022,37 @@ fn mute_on_hotkey(engine: &AudioEngine, id: &str, pressed: bool) {
     }
 }
 
+/// v1.58.0: the hotkey id the backend holds push-to-modulate on, press and
+/// release. The `ptm:` prefix is reserved (a latch, later).
+const HOTKEY_PTM: &str = "ptm";
+
+/// v1.58.0: what this shortcut event does to the hotkey's hold on
+/// push-to-modulate: `Some(true)` for a press of `ptm`, `Some(false)` for its
+/// release, `None` for any other id.
+fn hotkey_ptm_request(id: &str, pressed: bool) -> Option<bool> {
+    (id == HOTKEY_PTM).then_some(pressed)
+}
+
+/// v1.58.0: the handler's push-to-modulate step: a press of `ptm` holds, its
+/// release lets go. Releases come on global-hotkey's poller thread; the
+/// setter is one atomic op, safe there. Separate so a test can run it against
+/// a real engine (the handler itself needs an `AppHandle`).
+fn ptm_on_hotkey(engine: &AudioEngine, id: &str, pressed: bool) {
+    if let Some(held) = hotkey_ptm_request(id, pressed) {
+        engine.set_ptm_held(PtmSource::Hotkey, held);
+    }
+}
+
+/// v1.58.0: `id` left its key in the shortcut map. For `ptm` that key's
+/// release can no longer reach the handler (the plugin dropped the key, or
+/// another id shares it and the handler finds that one), so let go of the
+/// hotkey's hold here. A no-op for any other id.
+fn ptm_key_unbound(engine: &AudioEngine, id: &str) {
+    if id == HOTKEY_PTM {
+        engine.set_ptm_held(PtmSource::Hotkey, false);
+    }
+}
+
 /// Handle a global-shortcut event by looking up the registration id
 /// from the shared state and emitting a `global-shortcut` Tauri event
 /// the frontend can react to.
@@ -2951,6 +3076,9 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
         // the page is hidden, reloading or busy. The frontend ignores the
         // event (acting there would flip it twice).
         mute_on_hotkey(&state.engine, &id, event.state == ShortcutState::Pressed);
+        // v1.58.0: and push-to-modulate's, press and release, for the same
+        // reasons. The frontend does nothing with the event either.
+        ptm_on_hotkey(&state.engine, &id, event.state == ShortcutState::Pressed);
         let state_str = match event.state {
             ShortcutState::Pressed => "pressed",
             ShortcutState::Released => "released",
@@ -2965,7 +3093,8 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
 }
 
 /// One `audio-levels` tick's payload. Extracted so a test runs the emitter's
-/// real builder. The mute is one load, so its two fields always agree.
+/// real builder. The mute is one load, so its two fields always agree; so is
+/// push-to-modulate (v1.58.0).
 fn level_update(engine: &AudioEngine) -> LevelUpdate {
     let mute = engine.input_mute();
     LevelUpdate {
@@ -2980,6 +3109,7 @@ fn level_update(engine: &AudioEngine) -> LevelUpdate {
         mod_env: engine.reactive_depth(),
         input_muted: mute.muted,
         input_mute_seq: mute.seq,
+        ptm: engine.ptm(),
     }
 }
 
@@ -3537,6 +3667,8 @@ pub fn run() {
             set_input_muted,
             toggle_input_muted,
             input_mute,
+            set_ptm_mode,
+            set_ptm_held,
             set_monitor_gain,
             set_loudness_enabled,
             set_loudness_target,
@@ -3640,7 +3772,7 @@ mod tests {
         DownloadSlot, ModelDownloadDone, ModelDownloadKind, MODEL_DOWNLOAD_BUSY,
         MODEL_DOWNLOAD_DONE_EVENT, MODEL_DOWNLOAD_EVENT, VOICE_CLONE_BUSY,
     };
-    use divora_core::audio::{AudioEngine, InputMute, ReadingSnapshot};
+    use divora_core::audio::{AudioEngine, InputMute, PtmState, ReadingSnapshot};
     use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
     use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
     use divora_core::tts::babble;
@@ -4405,6 +4537,7 @@ mod tests {
             mod_env: 0.0,
             input_muted: false,
             input_mute_seq: 0,
+            ptm: PtmState::default(),
         };
         assert_eq!(
             sorted_keys(&serde_json::to_value(&u).unwrap()),
@@ -4419,6 +4552,8 @@ mod tests {
                 "modEnv",
                 "monitoring",
                 "output",
+                // v1.58.0: push-to-modulate (a `PtmState`).
+                "ptm",
                 "recording",
                 "running"
             ]
@@ -4697,9 +4832,11 @@ mod tests {
         assert_eq!(release(&mut map, "panic"), None, "an unbound action");
     }
 
-    /// v1.56.0: the two shortcut commands need an `AppHandle`, so this reads
-    /// the source: they take an action's key out only through `rebind` and
-    /// `release`, and nothing else takes one out of the map.
+    /// v1.56.0: the shortcut commands need an `AppHandle`, so this reads the
+    /// source: they take an action's key out only through `rebind` and
+    /// `release` (since v1.58.0 by way of `take_binding` and `drop_binding`,
+    /// which also let go of a held push-to-modulate key), and nothing else
+    /// takes one out of the map.
     #[test]
     fn the_shortcut_commands_let_keys_go_through_release() {
         let file = include_str!("lib.rs").replace('\r', "");
@@ -4708,8 +4845,15 @@ mod tests {
             .expect("the tests module");
         let prod = &file[..tests_at];
         for (call, n) in [
-            ("rebind(&mut map, &id, &accelerator)", 1),
-            ("release(&mut map, &id)", 1),
+            (
+                "take_binding(&mut map, &state.engine, &id, &accelerator)",
+                1,
+            ),
+            ("drop_binding(&mut map, &state.engine, &id)", 1),
+            ("drain_bindings(&mut map, &state.engine)", 1),
+            ("rebind(map, id, accelerator)", 1),
+            // `rebind`'s own, and `drop_binding`'s.
+            ("release(map, id)", 2),
             ("map.remove(", 1),
         ] {
             assert_eq!(prod.matches(call).count(), n, "{call}");

@@ -15,6 +15,8 @@
 //                     (v1.55.0: `plugin:event|emit`, `plugin:window|…`)
 //   __E2E_EMIT__(event, payload)          — fire a backend event
 //   __E2E_DOWNLOAD__ : { answer }         — the open download command's answer
+//   __E2E_PTM__ : { state, word, hotkey } — push-to-modulate's engine word
+//                     (v1.58.0; see mockPtm, pressPtmHotkey, emitLevels)
 //
 // v1.57.0: a model download stays open until the spec ends it
 // (emitDownloadProgress, endDownload), and the backend's download slot lives
@@ -242,6 +244,64 @@ export async function installTauriMock(
         const next = { muted, seq: now.seq + 1 };
         sessionStorage.setItem(MUTE_KEY, JSON.stringify(next));
         return next;
+      };
+
+      // v1.58.0: push-to-modulate, as the engine's word: the mode, a held bit
+      // per source and `seq`. A change bumps `seq`; a set that changes
+      // nothing moves nothing (ptm.rs's `ptm_transition`). `set_ptm_mode`
+      // without `restore` lets go of every hold; with it, of the page's (key,
+      // button, midi), keeping the global key's. Only pressPtmHotkey (the
+      // backend's own source) holds the global key. Kept in sessionStorage
+      // so it survives a reload, as the engine's word does. Read only inside
+      // the handlers, once the page has an origin.
+      const PTM_KEY = "__E2E_PTM__";
+      const PTM_MODES = ["always", "apply", "bypass"];
+      const PTM_SOURCES = ["hotkey", "key", "button", "midi"] as const;
+      const PTM_PAGE_SOURCES = ["key", "button", "midi"];
+      type PtmHeldBits = Record<(typeof PTM_SOURCES)[number], boolean>;
+      type PtmWord = { mode: string; held: PtmHeldBits; seq: number };
+      const noneHeld = (): PtmHeldBits => ({ hotkey: false, key: false, button: false, midi: false });
+      const readPtm = (): PtmWord => {
+        try {
+          const w = JSON.parse(sessionStorage.getItem(PTM_KEY) ?? "null") as Partial<PtmWord> | null;
+          if (
+            typeof w === "object" &&
+            w !== null &&
+            typeof w.mode === "string" &&
+            PTM_MODES.includes(w.mode) &&
+            typeof w.seq === "number" &&
+            typeof w.held === "object" &&
+            w.held !== null
+          ) {
+            return { mode: w.mode, held: { ...noneHeld(), ...w.held }, seq: w.seq };
+          }
+        } catch {
+          /* no storage: the launch state */
+        }
+        return { mode: "always", held: noneHeld(), seq: 0 };
+      };
+      // The wire's PtmState: held is any bit; bypassed per the design's §7.1.
+      const ptmState = (w: PtmWord) => {
+        const held = PTM_SOURCES.some((s) => w.held[s]);
+        const bypassed = w.mode === "apply" ? !held : w.mode === "bypass" ? held : false;
+        return { mode: w.mode, held, bypassed, seq: w.seq };
+      };
+      const writePtm = (mode: string, held: PtmHeldBits) => {
+        const now = readPtm();
+        if (mode === now.mode && PTM_SOURCES.every((s) => held[s] === now.held[s])) {
+          return ptmState(now);
+        }
+        const next = { mode, held, seq: now.seq + 1 };
+        sessionStorage.setItem(PTM_KEY, JSON.stringify(next));
+        return ptmState(next);
+      };
+      (window as unknown as { __E2E_PTM__: unknown }).__E2E_PTM__ = {
+        state: () => ptmState(readPtm()),
+        word: () => readPtm(),
+        hotkey: (pressed: boolean) => {
+          const now = readPtm();
+          return writePtm(now.mode, { ...now.held, hotkey: pressed });
+        },
       };
 
       // v1.57.0: the model downloads. The slot (the running download's last
@@ -476,6 +536,30 @@ export async function installTauriMock(
           return setMute(a.muted);
         },
         toggle_input_muted: () => setMute(!readMute().muted),
+        // v1.58.0: push-to-modulate's two commands, each answering the state.
+        // `"hotkey"` is refused, as Tauri refuses a variant the page may not
+        // send.
+        set_ptm_mode: (a: any) => {
+          if (!PTM_MODES.includes(a?.mode)) {
+            throw "invalid args `mode` for command `set_ptm_mode`";
+          }
+          const restore = a?.restore ?? false;
+          if (typeof restore !== "boolean") {
+            throw "invalid args `restore` for command `set_ptm_mode`";
+          }
+          const now = readPtm();
+          return writePtm(a.mode, restore ? { ...noneHeld(), hotkey: now.held.hotkey } : noneHeld());
+        },
+        set_ptm_held: (a: any) => {
+          if (!PTM_PAGE_SOURCES.includes(a?.source)) {
+            throw "invalid args `source` for command `set_ptm_held`";
+          }
+          if (typeof a?.held !== "boolean") {
+            throw "invalid args `held` for command `set_ptm_held`";
+          }
+          const now = readPtm();
+          return writePtm(now.mode, { ...now.held, [a.source]: a.held });
+        },
         start_audio_engine: (a: any) => ({
           inputName: a?.inputName ?? "Mock Mic",
           outputName: a?.outputName ?? "Mock Speakers",
@@ -728,12 +812,16 @@ export async function pressMuteHotkey(page: Page): Promise<MockMute> {
 /** v1.56.0: fire one `audio-levels` tick, as the backend's level emitter
  *  does ~30 times a second: a running engine at rest, under `patch` (the
  *  mute's pair, `inputMuted` + `inputMuteSeq`, goes here). The page only
- *  hears it once it listens, which it does before the boot's auto-start. */
+ *  hears it once it listens, which it does before the boot's auto-start.
+ *  v1.58.0: every tick carries push-to-modulate's `ptm`, read from the mock
+ *  engine's word as the backend does; a `ptm` in `patch` replaces it. */
 export async function emitLevels(page: Page, patch: Record<string, unknown> = {}): Promise<void> {
   await page.evaluate((p) => {
-    (
-      window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
-    ).__E2E_EMIT__("audio-levels", {
+    const w = window as unknown as {
+      __E2E_EMIT__: (e: string, payload: unknown) => void;
+      __E2E_PTM__?: { state: () => unknown };
+    };
+    w.__E2E_EMIT__("audio-levels", {
       input: { rms: 0, peak: 0 },
       output: { rms: 0, peak: 0 },
       running: true,
@@ -743,9 +831,55 @@ export async function emitLevels(page: Page, patch: Record<string, unknown> = {}
       loudnessGainDb: 0,
       deviceLost: false,
       modEnv: 0,
+      ptm: w.__E2E_PTM__?.state(),
       ...p,
     });
   }, patch);
+}
+
+/** v1.58.0: push-to-modulate as the mock engine holds it (sessionStorage
+ *  `__E2E_PTM__`, which `set_ptm_mode`, `set_ptm_held` and pressPtmHotkey
+ *  read and write): the mode, each source's held bit and `seq`. Unset means
+ *  "always", nothing held, seq 0, as at launch. */
+export interface MockPtm {
+  mode: "always" | "apply" | "bypass";
+  held: { hotkey: boolean; key: boolean; button: boolean; midi: boolean };
+  seq: number;
+}
+
+/** v1.58.0: the wire's `PtmState`, as the commands answer and ticks carry. */
+export interface MockPtmState {
+  mode: "always" | "apply" | "bypass";
+  held: boolean;
+  bypassed: boolean;
+  seq: number;
+}
+
+export function mockPtm(page: Page): Promise<MockPtm> {
+  return page.evaluate(
+    () => (window as unknown as { __E2E_PTM__: { word: () => MockPtm } }).__E2E_PTM__.word(),
+  );
+}
+
+/** v1.58.0: what the backend does on a press or a release of the `ptm`
+ *  hotkey: sets or clears the global key's held bit in the engine's word
+ *  (here, the mock's; seq bumps only if it changed), then sends
+ *  `global-shortcut` — with no command from the page. The page hears of the
+ *  new state only from the next `audio-levels` tick (emitLevels). Returns the
+ *  state after. */
+export async function pressPtmHotkey(
+  page: Page,
+  state: "pressed" | "released",
+): Promise<MockPtmState> {
+  return page.evaluate((s) => {
+    const w = window as unknown as {
+      __E2E_PTM__: { hotkey: (pressed: boolean) => MockPtmState };
+      __E2E_EMIT__: (e: string, p: unknown) => void;
+    };
+    const after = w.__E2E_PTM__.hotkey(s === "pressed");
+    w.__E2E_EMIT__("global-shortcut", { id: "ptm", accelerator: "F13", state: s });
+    return after;
+  }, state);
 }
 
 /** v1.57.0: the mock's download slot: the running download's last progress,

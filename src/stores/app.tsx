@@ -90,6 +90,8 @@ import {
   setInputMuted as setInputMutedCmd,
   toggleInputMuted as toggleInputMutedCmd,
   inputMute as inputMuteCmd,
+  setPtmMode as setPtmModeCmd,
+  setPtmHeld as setPtmHeldCmd,
   screenCaptureStatus as screenCaptureStatusCmd,
   listCaptureMonitors as listCaptureMonitorsCmd,
   listDesktopAudioSources as listDesktopAudioSourcesCmd,
@@ -133,6 +135,8 @@ import {
   type MidiInputInfo,
   type MidiMessage,
   type OnnxRuntimeStatus,
+  type PtmPageSource,
+  type PtmState,
   type ClonedVoiceInfo,
   type CloneDownloadProgress,
   type ModelDownloadDone,
@@ -215,6 +219,15 @@ import {
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
 import {
+  adoptPtm,
+  ptmModeOf,
+  readPtmSetting,
+  readPtmState,
+  settingOf,
+  transforms,
+  type PtmSetting,
+} from "../data/ptm";
+import {
   downloadAfter,
   readDownloadProgress,
   type ModelDownload,
@@ -231,6 +244,7 @@ import type {
   NavId,
   PlayingClip,
   Preset,
+  PtmHold,
   PtmMode,
   TweaksState,
   UiState,
@@ -284,9 +298,7 @@ export const BUILTIN_GLYPHS: GlyphId[] = [
 const defaultUi = (): UiState => ({
   monitor: true,
   ab: "A",
-  ptmMode: "apply",
   ptmKey: "Space",
-  pressed: false,
 });
 
 /** Per-preset A/B comparison snapshots. */
@@ -299,7 +311,10 @@ export interface AbSnapshots {
  *  recorders, under the reserved `rec:` prefix; v1.54.0 adds Replay's save
  *  and on/off, under `replay:`; v1.55.0 the stream overlay's Arrange / Lock
  *  switch, under `overlay:`. v1.56.0 adds `mute`, which the backend acts on
- *  itself (a toggle on press); the `mute:` prefix is reserved. */
+ *  itself (a toggle on press); the `mute:` prefix is reserved. v1.58.0: the
+ *  backend acts on `ptm` itself too, press and release (it holds
+ *  push-to-modulate while the key is down); the event still comes and the
+ *  page does nothing with it. The `ptm:` prefix is reserved. */
 export type HotkeyAction =
   | "ptm"
   | "panic"
@@ -366,6 +381,10 @@ const STORAGE_KEYS = {
   // `{seconds, explained, explainedDesktop}` and nothing else. Never whether
   // it is on: Replay is off at every launch.
   replayBuffer: "divora.replayBuffer",
+  // v1.58.0: push-to-modulate's `{on, hold}`, written only from the engine's
+  // answer to `set_ptm_mode`. Never a hold: what holds it lives in the engine
+  // and in memory.
+  ptm: "divora.ptm",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -1017,9 +1036,42 @@ export interface AppState {
    *  label (a MIDI pad). */
   toggleMuted: () => Promise<void>;
 
+  // Push-to-modulate (v1.58.0). The engine owns it; the store keeps a
+  // read-only mirror, ordered by `seq`, as the mute's.
+  /** The mirror: the newest state seen (largest `seq`), or null before any. */
+  ptmState: () => PtmState | null;
+  /** True once the boot restore settled (answer or failure) or 500 ms
+   *  passed. Never set by an adopted tick: a tick that lands before the
+   *  boot's answer carries the previous page's state. */
+  ptmKnown: () => boolean;
+  /** The mirror's `bypassed`: the engine is switching the effects off. Null
+   *  reads as applied, the engine's launch state. */
+  ptmBypassed: () => boolean;
+  /** What the user picked, saved in `divora.ptm`; changes only when an
+   *  answer to `set_ptm_mode` lands. */
+  ptmSetting: () => PtmSetting;
+  /** Turns push-to-modulate on (with the saved hold) or off ("always"). Lets
+   *  go of every hold, the global key's included. */
+  setPtmOn: (on: boolean) => Promise<void>;
+  /** Picks which way the hold goes; while off it is only remembered (the
+   *  engine stays at "always"). Lets go of every hold, even when it is the
+   *  hold already picked. */
+  setPtmHold: (hold: PtmHold) => Promise<void>;
+  /** The page holds it for `source`. Sends `set_ptm_held` only if the page
+   *  didn't hold it already, so a second down sends nothing. */
+  ptmDown: (source: "key" | "button") => void;
+  /** The page lets go for `source`. Sends only if the page held it, so a
+   *  stray up sends nothing. */
+  ptmUp: (source: "key" | "button") => void;
+  /** The mirror's only writer: takes `incoming` only if it is newer. Never
+   *  touches `ptmKnown`. */
+  applyPtmState: (incoming: PtmState | null) => void;
+
   // Derived
   hasEnabled: () => boolean;
-  effectiveModulated: () => boolean;
+  /** v1.58.0: "muted" while muted; else "modulated" while an effect other
+   *  than the noise gate is on and push-to-modulate isn't switching them
+   *  off; else "clean". */
   status: () => VoiceStatus;
 }
 
@@ -1916,12 +1968,100 @@ export function createAppState(): AppState {
   })();
   onCleanup(() => clearTimeout(muteKnownTimer));
 
-  const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
-  const effectiveModulated = createMemo(() =>
-    ui.ptmMode === "apply" ? ui.pressed : !ui.pressed,
+  // v1.58.0: push-to-modulate. The engine's word (mode + a held bit per
+  // source + `seq`) is the only truth; this is a read-only mirror of it,
+  // ordered by `seq` as the mute's is. The page never writes a mode or a
+  // hold it guessed: `divora.ptm` is saved from the engine's answer.
+  const [ptmState, setPtmState] = createSignal<PtmState | null>(null);
+  const [ptmKnown, setPtmKnown] = createSignal(false);
+  const [ptmSetting, setPtmSettingRaw] = createSignal<PtmSetting>(
+    readPtmSetting(loadJson<unknown>(STORAGE_KEYS.ptm, null)),
   );
+  const ptmBypassed = createMemo(() => ptmState()?.bypassed === true);
+  const applyPtmState = (incoming: PtmState | null): void => {
+    const next = adoptPtm(ptmState(), incoming);
+    if (next !== ptmState()) setPtmState(next);
+  };
+  // What the page itself holds, so it sends only edges: a second down, an
+  // autorepeat or a stray up sends nothing. The `midi` source is held while
+  // any `ptm` mapping is down; each CC mapping's side (up or down) is kept so
+  // a CC acts only when it crosses (the mute's `muteCcStep`).
+  const ptmPageHeld = { key: false, button: false };
+  const ptmMidiDown = new Set<string>();
+  const ptmCcSides = new Map<string, boolean>();
+  const sendPtmHeld = async (source: PtmPageSource, held: boolean): Promise<void> => {
+    try {
+      applyPtmState(readPtmState(await setPtmHeldCmd(source, held)));
+    } catch (e) {
+      console.warn("[ptm] set_ptm_held failed:", e);
+    }
+  };
+  // The flag is set before the invoke goes out, and both commands are sync
+  // in the backend, so a press can't overtake its release.
+  const ptmDown = (source: "key" | "button"): void => {
+    if (ptmPageHeld[source]) return;
+    ptmPageHeld[source] = true;
+    void sendPtmHeld(source, true);
+  };
+  const ptmUp = (source: "key" | "button"): void => {
+    if (!ptmPageHeld[source]) return;
+    ptmPageHeld[source] = false;
+    void sendPtmHeld(source, false);
+  };
+  /** Runs `change` on the set of `ptm` mappings that are down, and sends the
+   *  `midi` source only when the set turns empty or non-empty. */
+  const changePtmMidi = (change: () => void): void => {
+    const before = ptmMidiDown.size > 0;
+    change();
+    const after = ptmMidiDown.size > 0;
+    if (after !== before) void sendPtmHeld("midi", after);
+  };
+  // The card's set. This very call lets go of every hold in the engine, and
+  // the commands land in order, so the page forgets its own holds now: a
+  // press made while it is in flight lands after it and holds again. The CC
+  // sides are kept, so a CC left up must come down and back up to hold.
+  // Saved only from the answer: on failure the setting and the card stay.
+  const setPtmTo = async (want: PtmSetting): Promise<void> => {
+    ptmPageHeld.key = false;
+    ptmPageHeld.button = false;
+    ptmMidiDown.clear();
+    try {
+      const answer = readPtmState(await setPtmModeCmd(ptmModeOf(want)));
+      if (answer === null) return;
+      applyPtmState(answer);
+      const next = settingOf(answer.mode, want);
+      setPtmSettingRaw(next);
+      saveJson(STORAGE_KEYS.ptm, next);
+    } catch (e) {
+      console.warn("[ptm] set_ptm_mode failed:", e);
+    }
+  };
+  const setPtmOn = (on: boolean): Promise<void> => setPtmTo({ ...ptmSetting(), on });
+  const setPtmHold = (hold: PtmHold): Promise<void> => setPtmTo({ ...ptmSetting(), hold });
+  // The boot restore. Sent here, at creation, beside the mute's read, so it
+  // goes out before App's onMount enumerates devices. It restores the saved
+  // mode and lets go of the page's holds (a new page holds nothing) but
+  // keeps a global key that is still held: a reload must not drop it. Its
+  // answer is the boot read. `ptmKnown` comes true when it settles, or
+  // after 500 ms if it never does.
+  const ptmKnownTimer = setTimeout(() => setPtmKnown(true), 500);
+  void (async () => {
+    try {
+      applyPtmState(readPtmState(await setPtmModeCmd(ptmModeOf(ptmSetting()), true)));
+    } catch (err) {
+      console.warn("[ptm] boot restore failed", err);
+    } finally {
+      setPtmKnown(true);
+    }
+  })();
+  onCleanup(() => clearTimeout(ptmKnownTimer));
+
+  const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
+  // v1.58.0: the status says what happens to what you say from now on. Push
+  // to modulate is off ("always") by default, so a preset with effects on
+  // reads Modulated; a gate-only chain (Clean Passthrough) reads Clean.
   const status = createMemo<VoiceStatus>(() =>
-    muted() ? "muted" : hasEnabled() && effectiveModulated() ? "modulated" : "clean",
+    muted() ? "muted" : transforms(chain()) && !ptmBypassed() ? "modulated" : "clean",
   );
 
   // v1.54.0: when the voice last became modulated with the current preset,
@@ -2944,7 +3084,22 @@ export function createAppState(): AppState {
   const midiHandlers: MidiHandlers = {
     usePreset: (id) => usePreset(id),
     playTile: (id) => void playTileById(id),
-    setPtm: (pressed) => setUi("pressed", pressed),
+    // v1.58.0: each `ptm` mapping holds while it is down; the `midi` source
+    // is held while any is, so pad B can't be let go by pad A's note-off. A
+    // CC holds once it rises to 64 or more and lets go at 59 or less; 60-63
+    // keep the side it was on, so a knob near halfway can't flap.
+    ptmNote: (id, down) =>
+      changePtmMidi(() => {
+        if (down) ptmMidiDown.add(id);
+        else ptmMidiDown.delete(id);
+      }),
+    ptmCc: (id, value) =>
+      changePtmMidi(() => {
+        const step = muteCcStep(ptmCcSides.get(id), value);
+        if (step.up !== undefined) ptmCcSides.set(id, step.up);
+        if (step.act === true) ptmMidiDown.add(id);
+        else if (step.act === false) ptmMidiDown.delete(id);
+      }),
     toggleMonitor: () => void toggleMonitor(),
     setParam: (idx, key, value) => setChainParam(idx, key, value),
     // v1.56.0: a pad has no label, so it toggles in the backend. A CC sets
@@ -4021,8 +4176,17 @@ export function createAppState(): AppState {
     setMuted,
     toggleMuted,
 
+    ptmState,
+    ptmKnown,
+    ptmBypassed,
+    ptmSetting,
+    setPtmOn,
+    setPtmHold,
+    ptmDown,
+    ptmUp,
+    applyPtmState,
+
     hasEnabled,
-    effectiveModulated,
     status,
   };
 }
@@ -4049,6 +4213,7 @@ export type {
   GlyphId,
   NavId,
   Preset,
+  PtmHold,
   PtmMode,
   TweaksState,
   UiState,

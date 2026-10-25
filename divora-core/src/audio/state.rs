@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::mute::{mute_transition, unpack, InputMute, MuteChange, MuteOp};
+use super::ptm::{is_bypassed, ptm_transition, unpack as unpack_ptm, PtmChange, PtmOp, PtmState};
 
 /// RMS and peak for one audio path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -97,6 +98,10 @@ pub struct EngineState {
     /// `audio::mute`). Engine-lifetime: teardown never touches it. `Default`
     /// 0 = unmuted, seq 0.
     pub input_mute: AtomicU64,
+    /// v1.58.0: push-to-modulate: `seq << 16 | mode << 8 | held` (see
+    /// `audio::ptm`). Engine-lifetime: teardown never touches it. `Default`
+    /// 0 = always (push-to-modulate off), nothing held, seq 0.
+    pub ptm: AtomicU64,
 }
 
 impl EngineState {
@@ -233,6 +238,43 @@ impl EngineState {
         MuteChange {
             before: unpack(prev),
             after: unpack(next),
+        }
+    }
+
+    /// v1.58.0: the callback's read of push-to-modulate: whether it switches
+    /// to the dry voice, from one `Acquire` load.
+    #[must_use]
+    pub fn ptm_bypassed(&self) -> bool {
+        is_bypassed(self.ptm.load(Ordering::Acquire))
+    }
+
+    /// v1.58.0: push-to-modulate and its change count, from one load.
+    #[must_use]
+    pub fn load_ptm(&self) -> PtmState {
+        unpack_ptm(self.ptm.load(Ordering::Acquire))
+    }
+
+    /// v1.58.0: apply `op` in one atomic op, the compare-and-swap loop
+    /// [`apply_input_mute`](Self::apply_input_mute) runs. `before` is the
+    /// word it found; `after` is the word it left, which is `before` when
+    /// nothing changed.
+    pub(crate) fn apply_ptm(&self, op: PtmOp) -> PtmChange {
+        let mut prev = self.ptm.load(Ordering::Acquire);
+        let next = loop {
+            let Some(next) = ptm_transition(prev, op) else {
+                break prev;
+            };
+            match self
+                .ptm
+                .compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break next,
+                Err(actual) => prev = actual,
+            }
+        };
+        PtmChange {
+            before: unpack_ptm(prev),
+            after: unpack_ptm(next),
         }
     }
 }

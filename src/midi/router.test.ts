@@ -25,7 +25,8 @@ function mkHandlers() {
   return {
     usePreset: vi.fn(),
     playTile: vi.fn(),
-    setPtm: vi.fn(),
+    ptmNote: vi.fn(),
+    ptmCc: vi.fn(),
     toggleMonitor: vi.fn(),
     setParam: vi.fn(),
     toggleMuted: vi.fn(),
@@ -60,14 +61,45 @@ describe("midi router", () => {
     expect(h.usePreset).toHaveBeenCalledWith("velvet-demon");
   });
 
-  it("holds PTM on note-on and releases on note-off", () => {
+  // v1.58.0: each `ptm` mapping is its own hold, by id, so the store can hold
+  // push-to-modulate until every pad is up.
+  it("holds PTM on note-on and releases on note-off, with the mapping's id", () => {
     const h = mkHandlers();
     const mappings: MidiMapping[] = [
       { id: "p", action: "ptm", trigger: { kind: "note", data1: 36, channel: 0 } },
+      { id: "q", action: "ptm", trigger: { kind: "note", data1: 37, channel: 0 } },
     ];
     routeMidi(noteOn(36), mappings, h);
+    routeMidi(noteOn(37), mappings, h);
     routeMidi(noteOff(36), mappings, h);
-    expect(h.setPtm.mock.calls).toEqual([[true], [false]]);
+    routeMidi(noteOff(37), mappings, h);
+    expect(h.ptmNote.mock.calls).toEqual([
+      ["p", true],
+      ["q", true],
+      ["p", false],
+      ["q", false],
+    ]);
+    expect(h.ptmCc).not.toHaveBeenCalled();
+  });
+
+  it("PTM: a CC passes the mapping's id and every value (the store keeps the dead band)", () => {
+    const h = mkHandlers();
+    const mappings: MidiMapping[] = [
+      { id: "p-cc", action: "ptm", trigger: { kind: "cc", data1: 22, channel: 0 } },
+    ];
+    for (const v of [0, 63, 64, 62, 59, 127]) routeMidi(cc(22, v), mappings, h);
+    expect(h.ptmCc.mock.calls).toEqual([
+      ["p-cc", 0],
+      ["p-cc", 63],
+      ["p-cc", 64],
+      ["p-cc", 62],
+      ["p-cc", 59],
+      ["p-cc", 127],
+    ]);
+    expect(h.ptmNote).not.toHaveBeenCalled();
+    // Nothing else is driven by a ptm mapping.
+    expect(h.toggleMuted).not.toHaveBeenCalled();
+    expect(h.muteCc).not.toHaveBeenCalled();
   });
 
   it("sweeps a bound param from a CC across its full range", () => {
@@ -138,7 +170,8 @@ describe("midi router", () => {
     ]);
     expect(h.toggleMuted).not.toHaveBeenCalled();
     // Nothing else is driven by a mute mapping.
-    expect(h.setPtm).not.toHaveBeenCalled();
+    expect(h.ptmNote).not.toHaveBeenCalled();
+    expect(h.ptmCc).not.toHaveBeenCalled();
     expect(h.toggleMonitor).not.toHaveBeenCalled();
   });
 
