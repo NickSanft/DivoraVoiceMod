@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, renderHook } from "@solidjs/testing-library";
-import App, { applyLevelUpdate, dispatchGlobalShortcut } from "./App";
-import { AppProvider, useApp } from "./stores/app";
+import App, { applyLevelUpdate, dispatchGlobalShortcut, Shell } from "./App";
+import { AppProvider, useApp, type AppState } from "./stores/app";
 
 const invokeCalls: Array<{ cmd: string; args?: unknown }> = [];
 const onFocusChangedListeners: Array<(event: { payload: boolean }) => void> = [];
@@ -295,5 +295,333 @@ describe("App shell — the mute (v1.56.0)", () => {
     await settle();
     expect(states().length).toBeGreaterThan(0);
     expect(states().every((s) => s === "muted")).toBe(true);
+  });
+});
+
+// v1.58.0: push-to-modulate's seams in the shell — the boot restore's order,
+// the global key the backend owns, the in-app key and its releases, the level
+// tick, and the overlay push held until the restore settles.
+describe("App shell — push-to-modulate (v1.58.0)", () => {
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+
+  /** The engine's word, as the backend keeps it (a held bit per source; a
+   *  change bumps `seq`; a set to what it has moves nothing), behind both
+   *  commands. */
+  function ptmEngine() {
+    let mode = "always";
+    let bits: Record<string, boolean> = {};
+    let seq = 0;
+    const state = () => {
+      const any = Object.values(bits).some(Boolean);
+      const bypassed = mode === "apply" ? !any : mode === "bypass" ? any : false;
+      return { mode, held: any, bypassed, seq };
+    };
+    const write = (m: string, b: Record<string, boolean>) => {
+      const same =
+        m === mode && ["hotkey", "key", "button", "midi"].every((k) => !!b[k] === !!bits[k]);
+      if (!same) {
+        mode = m;
+        bits = b;
+        seq += 1;
+      }
+      return state();
+    };
+    invokeOverrides.set("set_ptm_mode", (a) => {
+      const { mode: m, restore } = a as { mode: string; restore: boolean };
+      return write(m, restore ? { hotkey: !!bits.hotkey } : {});
+    });
+    invokeOverrides.set("set_ptm_held", (a) => {
+      const { source, held } = a as { source: string; held: boolean };
+      return write(mode, { ...bits, [source]: held });
+    });
+    /** The sources held, as the engine has them. */
+    const held = () => Object.keys(bits).filter((k) => bits[k]);
+    return { held, state };
+  }
+
+  /** What the page sent the engine, in order. */
+  const ptmCalls = () =>
+    invokeCalls.filter((c) => c.cmd.startsWith("set_ptm")).map((c) => [c.cmd, c.args]);
+  const heldCall = (source: string, on: boolean) => ["set_ptm_held", { source, held: on }];
+
+  /** The real shell in a provider, with a handle on the store it drives. */
+  function renderShell(): AppState {
+    let app!: AppState;
+    const Probe = (): null => {
+      app = useApp();
+      return null;
+    };
+    render(() => (
+      <AppProvider>
+        <Shell />
+        <Probe />
+      </AppProvider>
+    ));
+    return app;
+  }
+
+  const key = (
+    type: "keydown" | "keyup",
+    init: KeyboardEventInit,
+    target: EventTarget = document.body,
+  ): boolean => {
+    const e = new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init });
+    target.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  const space = { key: " ", code: "Space" };
+
+  const setVisibility = (v: DocumentVisibilityState): void => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => v });
+  };
+
+  const tick = {
+    input: { rms: 0, peak: 0 },
+    output: { rms: 0, peak: 0 },
+    running: true,
+    monitoring: false,
+    dspLatencyMs: 0,
+    recording: false,
+    loudnessGainDb: 0,
+    deviceLost: false,
+    modEnv: 0,
+  };
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    invokeOverrides.clear();
+    onFocusChangedListeners.length = 0;
+  });
+  afterEach(() => {
+    invokeOverrides.clear();
+    emitted.length = 0;
+    window.localStorage.clear();
+    setVisibility("visible");
+  });
+
+  it("restores the saved mode before the boot enumerates devices", async () => {
+    ptmEngine();
+    invokeCalls.length = 0;
+    render(() => <App />);
+    await settle();
+    const cmds = invokeCalls.map((c) => c.cmd);
+    expect(cmds.indexOf("set_ptm_mode")).toBeGreaterThanOrEqual(0);
+    expect(cmds.indexOf("set_ptm_mode")).toBeLessThan(cmds.indexOf("list_audio_input_devices"));
+    // Off by default: the restore is "always", with `restore`, sent once.
+    expect(ptmCalls()).toEqual([["set_ptm_mode", { mode: "always", restore: true }]]);
+  });
+
+  it("restores a saved Hold to apply as apply, and the pill says Clean with the key up", async () => {
+    ptmEngine();
+    window.localStorage.setItem("divora.ptm", JSON.stringify({ on: true, hold: "apply" }));
+    invokeCalls.length = 0;
+    const { getByTestId } = render(() => <App />);
+    await settle();
+    expect(ptmCalls()).toEqual([["set_ptm_mode", { mode: "apply", restore: true }]]);
+    expect(getByTestId("titlebar-status")).toHaveTextContent("Clean");
+  });
+
+  it("a ptm hotkey press or release invokes nothing (the backend holds and lets go)", async () => {
+    ptmEngine();
+    const { result } = renderHook(() => useApp(), { wrapper: AppProvider });
+    await settle();
+    invokeCalls.length = 0;
+    dispatchGlobalShortcut(result, { id: "ptm", accelerator: "F13", state: "pressed" });
+    dispatchGlobalShortcut(result, { id: "ptm", accelerator: "F13", state: "released" });
+    await settle();
+    expect(invokeCalls).toEqual([]);
+  });
+
+  it("Space on the page holds once, ignores autorepeat and lets go on keyup", async () => {
+    const engine = ptmEngine();
+    renderShell();
+    await settle();
+    invokeCalls.length = 0;
+    expect(key("keydown", space)).toBe(true);
+    expect(key("keydown", { ...space, repeat: true })).toBe(true);
+    expect(key("keydown", { ...space, repeat: true })).toBe(true);
+    expect(ptmCalls()).toEqual([heldCall("key", true)]);
+    expect(engine.held()).toEqual(["key"]);
+    key("keyup", space);
+    expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+    // A keyup with nothing held sends nothing.
+    key("keyup", space);
+    expect(ptmCalls()).toHaveLength(2);
+  });
+
+  it("autorepeat after a mode set doesn't hold again: the set let go of the key", async () => {
+    const engine = ptmEngine();
+    const app = renderShell();
+    await settle();
+    await app.setPtmOn(true);
+    key("keydown", space);
+    await settle();
+    expect(engine.held()).toEqual(["key"]);
+    // Re-picking the hold on the card lets go of every hold, Space still down.
+    await app.setPtmHold("apply");
+    expect(engine.held()).toEqual([]);
+    invokeCalls.length = 0;
+    key("keydown", { ...space, repeat: true });
+    key("keydown", { ...space, repeat: true });
+    key("keyup", space);
+    await settle();
+    expect(ptmCalls()).toEqual([]);
+    // A fresh press holds.
+    key("keydown", space);
+    expect(ptmCalls()).toEqual([heldCall("key", true)]);
+  });
+
+  it("window blur lets go of the key", async () => {
+    ptmEngine();
+    renderShell();
+    await settle();
+    invokeCalls.length = 0;
+    key("keydown", space);
+    window.dispatchEvent(new Event("blur"));
+    expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+    // Nothing held: a blur sends nothing.
+    window.dispatchEvent(new Event("blur"));
+    expect(ptmCalls()).toHaveLength(2);
+  });
+
+  it("the page hidden lets go of the key; shown sends nothing", async () => {
+    ptmEngine();
+    renderShell();
+    await settle();
+    key("keydown", space);
+    invokeCalls.length = 0;
+    setVisibility("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(ptmCalls()).toEqual([]);
+    setVisibility("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(ptmCalls()).toEqual([heldCall("key", false)]);
+  });
+
+  it("Tauri's focus lost lets go of the key; gaining it holds nothing", async () => {
+    ptmEngine();
+    renderShell();
+    await settle();
+    expect(onFocusChangedListeners.length).toBeGreaterThanOrEqual(1);
+    key("keydown", space);
+    invokeCalls.length = 0;
+    onFocusChangedListeners.forEach((cb) => cb({ payload: false }));
+    expect(ptmCalls()).toEqual([heldCall("key", false)]);
+    onFocusChangedListeners.forEach((cb) => cb({ payload: true }));
+    await settle();
+    expect(ptmCalls()).toHaveLength(1);
+  });
+
+  it.each([
+    ["window blur", () => window.dispatchEvent(new Event("blur"))],
+    [
+      "the page hidden",
+      () => {
+        setVisibility("hidden");
+        document.dispatchEvent(new Event("visibilitychange"));
+      },
+    ],
+    ["Tauri's focus lost", () => onFocusChangedListeners.forEach((cb) => cb({ payload: false }))],
+  ])("%s lets go of the Mixer's button, from the shell too", async (_, lose) => {
+    ptmEngine();
+    const app = renderShell();
+    await settle();
+    // Off the Mixer, so this is the shell's own path: the card lets go of
+    // its button on blur and when hidden as well, while it is mounted.
+    app.setNav("presets");
+    await settle();
+    app.ptmDown("button");
+    invokeCalls.length = 0;
+    lose();
+    expect(ptmCalls()).toEqual([heldCall("button", false)]);
+  });
+
+  it("a bound key with modifiers needs them on the press, not on the release", async () => {
+    ptmEngine();
+    window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ ptm: "Ctrl+Shift+M" }));
+    renderShell();
+    await settle();
+    invokeCalls.length = 0;
+    // A bare M, or M with one of the two, doesn't switch the call.
+    expect(key("keydown", { key: "m", code: "KeyM" })).toBe(false);
+    key("keyup", { key: "m", code: "KeyM" });
+    key("keydown", { key: "M", code: "KeyM", shiftKey: true });
+    key("keyup", { key: "M", code: "KeyM" });
+    expect(ptmCalls()).toEqual([]);
+    // Space is no longer the key.
+    key("keydown", space);
+    expect(ptmCalls()).toEqual([]);
+
+    expect(key("keydown", { key: "M", code: "KeyM", ctrlKey: true, shiftKey: true })).toBe(true);
+    expect(ptmCalls()).toEqual([heldCall("key", true)]);
+    // Ctrl and Shift let go first: M's keyup alone still lets go.
+    key("keyup", { key: "m", code: "KeyM" });
+    expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+  });
+
+  it("applyLevelUpdate adopts a tick's ptm when newer; a tick without it leaves the mirror", async () => {
+    const { result } = renderHook(() => useApp(), { wrapper: AppProvider });
+    await settle();
+    const bypassed = { mode: "apply" as const, held: false, bypassed: true, seq: 5 };
+    applyLevelUpdate(result, { ...tick, ptm: bypassed });
+    expect(result.ptmState()).toEqual(bypassed);
+    expect(result.status()).toBe("clean");
+    applyLevelUpdate(result, tick);
+    expect(result.ptmState()).toEqual(bypassed);
+    // An older tick is stale; a newer one is taken.
+    applyLevelUpdate(result, { ...tick, ptm: { ...bypassed, held: true, bypassed: false, seq: 4 } });
+    expect(result.status()).toBe("clean");
+    applyLevelUpdate(result, { ...tick, ptm: { ...bypassed, held: true, bypassed: false, seq: 6 } });
+    expect(result.status()).toBe("modulated");
+  });
+
+  it("the overlay hears nothing until the boot restore settles, a tick before it included; then Modulated", async () => {
+    const open = {
+      open: true,
+      phase: "painted",
+      instance: 1,
+      mode: "locked",
+      arrangeGen: 0,
+      canArrange: true,
+      fit: false,
+      hideWanted: false,
+      hideAvailable: true,
+      capturing: false,
+      error: null,
+    };
+    invokeOverrides.set("overlay_status", () => open);
+    invokeOverrides.set("set_overlay_hide_from_recordings", () => open);
+    invokeOverrides.set("input_mute", () => ({ muted: false, seq: 0 }));
+    let answer!: (v: unknown) => void;
+    invokeOverrides.set("set_ptm_mode", () => new Promise((r) => (answer = r)));
+    const states = () =>
+      emitted
+        .filter((e) => e.event === "overlay:state")
+        .map((e) => (e.payload as { status: string }).status);
+
+    const app = renderShell();
+    await settle();
+    await settle();
+    expect(invokeCalls.some((c) => c.cmd === "overlay_status")).toBe(true);
+    expect(app.muteKnown()).toBe(true);
+    expect(states()).toEqual([]);
+
+    // A tick from before the restore (it may carry the previous page's
+    // hold): the mirror takes it, but it isn't the boot's answer.
+    applyLevelUpdate(app, { ...tick, ptm: { mode: "always", held: false, bypassed: false, seq: 3 } });
+    await settle();
+    expect(app.ptmState()?.seq).toBe(3);
+    expect(app.ptmKnown()).toBe(false);
+    expect(states()).toEqual([]);
+
+    answer({ mode: "always", held: false, bypassed: false, seq: 3 });
+    await settle();
+    await settle();
+    // Off by default, with the default preset's effects on.
+    expect(states().length).toBeGreaterThan(0);
+    expect(states().every((s) => s === "modulated")).toBe(true);
   });
 });

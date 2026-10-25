@@ -102,6 +102,19 @@ describe("midi router", () => {
     expect(h.muteCc).not.toHaveBeenCalled();
   });
 
+  it("PTM: no trigger, another control, or a message it doesn't bind drives nothing", () => {
+    const h = mkHandlers();
+    const mappings: MidiMapping[] = [
+      { id: "none", action: "ptm", trigger: null },
+      { id: "pad", action: "ptm", trigger: { kind: "note", data1: 36, channel: 0 } },
+    ];
+    routeMidi(noteOn(37), mappings, h);
+    routeMidi(cc(36, 127), mappings, h); // CC 36 is not note 36
+    routeMidi({ channel: 0, kind: "pitch-bend", data1: 36, data2: 64 }, mappings, h);
+    expect(h.ptmNote).not.toHaveBeenCalled();
+    expect(h.ptmCc).not.toHaveBeenCalled();
+  });
+
   it("sweeps a bound param from a CC across its full range", () => {
     const h = mkHandlers();
     const mappings: MidiMapping[] = [

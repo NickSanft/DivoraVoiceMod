@@ -9,7 +9,7 @@ import {
   type OverlayState,
   type ScenePush,
 } from "./state";
-import { syncOverlay, syncOverlayScene } from "./sync";
+import { overlayHeld, syncOverlay, syncOverlayScene } from "./sync";
 
 // Drives the same `syncOverlay` App.tsx calls, with an in-memory event bus
 // standing in for Tauri's.
@@ -210,6 +210,49 @@ describe("syncOverlay", () => {
     setStatus("clean");
     await flush();
     expect(b.sent.map((s) => s.payload.status)).toEqual(["muted", "clean"]);
+    dispose();
+  });
+
+  // v1.58.0: and until push-to-modulate's boot restore settles. Before it,
+  // the store's mirror is empty and reads as the effects on, so a reload
+  // with push-to-modulate on and the key up would show the stream Modulated
+  // over a clean voice. A tick doesn't make it known (it may carry the
+  // previous page's holds); only the restore's answer, its failure or 500 ms.
+  it.each([
+    [false, false, true],
+    [true, false, true],
+    [false, true, true],
+    [true, true, false],
+  ])("overlayHeld: mute known %s, push-to-modulate known %s → held %s", (mute, ptm, held) => {
+    expect(overlayHeld({ muteKnown: () => mute, ptmKnown: () => ptm })).toBe(held);
+  });
+
+  it("held while push-to-modulate isn't known, the mute known; then the state as it is, once", async () => {
+    const b = bus();
+    const [ptmKnown, setPtmKnown] = createSignal(false);
+    const [status, setStatus] = createSignal<OverlayState["status"]>("modulated");
+    const dispose = createRoot((d) => {
+      syncOverlay({
+        isOpen: () => true,
+        held: () => overlayHeld({ muteKnown: () => true, ptmKnown }),
+        payload: () => state(status()),
+        emit: b.emit,
+        listen: b.listen,
+      });
+      return d;
+    });
+    await flush();
+    expect(b.sent).toEqual([]);
+    // A tick lands (the mirror moves, the status with it) and the overlay
+    // says it is ready: still nothing.
+    setStatus("clean");
+    b.fire(OVERLAY_READY_EVENT);
+    await flush();
+    expect(b.sent).toEqual([]);
+
+    setPtmKnown(true);
+    await flush();
+    expect(b.sent.map((s) => s.payload.status)).toEqual(["clean"]);
     dispose();
   });
 

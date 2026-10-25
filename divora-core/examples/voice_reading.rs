@@ -218,7 +218,8 @@ fn scenes() {
         readings.last().expect("no reading"),
     );
 
-    // Push-to-modulate, key up: the chain is out of the path.
+    // Push-to-modulate switching the effects off (v1.58.0): the chain is out
+    // of the path, so the wet tap carries the dry signal.
     let plain = voice.render(4.0);
     let facts = InputFacts {
         chain_bypassed: true,
@@ -226,7 +227,7 @@ fn scenes() {
     };
     let readings = feed(&mut a, &plain, &plain, facts);
     show(
-        "Push-to-modulate released (wet is the dry signal, not a broken preset)",
+        "Push-to-modulate, effects off (wet is the dry signal, not a broken preset)",
         readings.last().expect("no reading"),
     );
 

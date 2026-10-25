@@ -2416,11 +2416,13 @@ pub trait ReadingAnalyzer: Send {
 /// * the sample rate, which [`Analyzer`] wants once at construction while the
 ///   seam passes it per block — so the analyzer is built on the first block
 ///   and rebuilt if the device rate ever changes under it;
-/// * whether the chain was a passthrough over the window. Nothing in the
-///   engine holds a "bypassed" flag, and a Clean preset is bypass by another
-///   name. So this measures it instead of trusting plumbing — see
-///   [`is_passthrough`] — which is right for every cause rather than the one
-///   we remembered to wire.
+/// * whether the chain was a passthrough over the window. A Clean preset is
+///   bypass by another name, and push-to-modulate's word (v1.58.0) says where
+///   its switch is heading, not what a window of audio held. So this measures
+///   it instead of trusting plumbing — see [`is_passthrough`] — which is right
+///   for every cause rather than the one we remembered to wire. Since v1.58.0
+///   the DRY tap is delayed by the chain's latency, so a voice push-to-modulate
+///   has switched to the dry measures as a passthrough at any latency.
 struct LiveAnalyzer {
     /// The rate it was built for, and the analyzer itself.
     inner: Option<(u32, Analyzer)>,
@@ -3134,7 +3136,11 @@ mod tests {
         MAX_FRAMES_PER_CALLBACK, READING_HOLD_SECS, RING_BUFFER_FRAMES,
     };
     use crate::audio::mute::{mute_ramp_len, InputMute, MuteChange, MuteGate, MuteOp};
-    use crate::audio::ptm::{PtmStage, StageReport};
+    use crate::audio::ptm::{
+        ptm_fade_len, DryLine, PtmChange, PtmMode, PtmOp, PtmSource, PtmStage, PtmState,
+        StageReport,
+    };
+    use crate::dsp::test_delay::{fixed_delay, test_delay, with_delay};
     use crate::dsp::witness::witnessed_chain;
     use crate::dsp::{
         Descriptor, Displaced, DspEdit, EffectChain, Metrics, ReactiveModulator, ReadingState,
@@ -4573,10 +4579,12 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn a_bypassed_chain_is_detected_by_measurement_not_plumbing() {
-        // Nothing in the engine holds a "bypassed" flag, so this is measured.
-        // Identical buffers are a passthrough whatever caused it; a gained
-        // copy still is (the wet tap sits after the loudness stage); a
-        // different waveform is not; silence votes neither way.
+        // A passthrough is measured, not read from a flag: a Clean preset is
+        // one by another name, and push-to-modulate's word (v1.58.0) says
+        // where its switch is heading, not what a window held. Identical
+        // buffers are a passthrough whatever caused it; a gained copy still
+        // is (the wet tap sits after the loudness stage); a different
+        // waveform is not; silence votes neither way.
         let dry: Vec<f32> = (0..512)
             .map(|i| ((f64::from(i) * 0.05).sin() * 0.3) as f32)
             .collect();
@@ -5624,6 +5632,1177 @@ mod tests {
                     preset.id
                 );
             }
+        }
+    }
+
+    // ---- v1.58.0: push-to-modulate in the voice stage ----
+
+    /// Push-to-modulate's fade at [`RATE`], as a count.
+    fn ptm_fade() -> usize {
+        usize::from(ptm_fade_len(RATE))
+    }
+
+    /// The longest delay push-to-modulate's dry line holds at [`RATE`].
+    fn ptm_max() -> usize {
+        DryLine::new(RATE, ptm_fade_len(RATE)).max_delay()
+    }
+
+    /// `k/L` at [`RATE`], exactly.
+    fn ptm_gain(k: usize) -> f32 {
+        f32::from(u16::try_from(k).unwrap()) / f32::from(ptm_fade_len(RATE))
+    }
+
+    fn bits(y: &[f32]) -> Vec<u32> {
+        y.iter().map(|s| s.to_bits()).collect()
+    }
+
+    /// `1, 2, 3, …`: every sample distinct, exact and positive, and
+    /// `value − 1` is its index, so a delayed copy names where it came from.
+    #[allow(clippy::cast_precision_loss)] // integers well under 2^24
+    fn ramp(n: usize) -> Vec<f32> {
+        (1..=n).map(|i| i as f32).collect()
+    }
+
+    /// `n` samples of a 150 Hz buzz (six harmonics) at `amp`: voiced, so the
+    /// reading hears speech, and nothing like itself pitch-shifted.
+    fn buzz(amp: f32, n: usize) -> Vec<f32> {
+        let mut phase = 0.0_f32;
+        (0..n)
+            .map(|_| {
+                phase = (phase + 150.0 / 48_000.0) % 1.0;
+                let sum: f32 = (1..=6_u8)
+                    .map(|h| (std::f32::consts::TAU * phase * f32::from(h)).sin() / f32::from(h))
+                    .sum();
+                amp * sum
+            })
+            .collect()
+    }
+
+    /// Real effects, as a preset builds them: (kind, params), all enabled.
+    fn effects(list: &[(crate::dsp::EffectKind, &[(&str, f32)])]) -> EffectChain {
+        use crate::dsp::EffectSpec;
+        let specs: Vec<EffectSpec> = list
+            .iter()
+            .map(|&(kind, params)| EffectSpec {
+                kind,
+                enabled: true,
+                params: params.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
+            })
+            .collect();
+        EffectChain::from_specs(&specs)
+    }
+
+    /// Pitch +5 semitones, which reports 1024.
+    fn pitch_up() -> EffectChain {
+        effects(&[(crate::dsp::EffectKind::Pitch, &[("shift", 5.0)])])
+    }
+
+    /// A bundled preset's chain specs, as the B1 bench builds them.
+    fn preset_specs(preset: &crate::presets::Preset) -> Vec<crate::dsp::EffectSpec> {
+        preset
+            .chain
+            .iter()
+            .map(|e| crate::dsp::EffectSpec {
+                kind: serde_json::from_value(serde_json::Value::String(e.id.clone()))
+                    .unwrap_or_else(|err| panic!("{}: {}: {err}", preset.id, e.id)),
+                enabled: e.enabled,
+                params: e.vals.clone(),
+            })
+            .collect()
+    }
+
+    impl VoiceStage {
+        /// v1.58.0: the same stage with its switch built settled on the dry,
+        /// as a session started while push-to-modulate bypasses builds it.
+        fn bypassed(mut self) -> Self {
+            self.ptm = PtmStage::new(RATE, true);
+            self
+        }
+
+        /// v1.58.0: `input` through the stage, unmuted, in phases of
+        /// `(bypass, length)`, each split into calls of `split` frames, as the
+        /// callback reads the word once a buffer. What it sends.
+        fn run_phases(
+            &mut self,
+            input: &[f32],
+            phases: &[(bool, usize)],
+            split: usize,
+        ) -> Vec<f32> {
+            let mut out = Vec::with_capacity(input.len());
+            let mut at = 0;
+            for &(bypass, n) in phases {
+                for start in (at..at + n).step_by(split) {
+                    let end = (start + split).min(at + n);
+                    let mut mono = input[start..end].to_vec();
+                    let mut sb = vec![0.0_f32; end - start];
+                    self.run_ptm(&mut mono, &mut sb, false, bypass);
+                    out.extend(mono);
+                }
+                at += n;
+            }
+            out
+        }
+    }
+
+    /// D3, the alignment test: through the real stage, with a chain that is a
+    /// pure delay of `n` (reported exactly), every sample sent is the input
+    /// delayed by `n`, float `==`, whichever voice is heard and through every
+    /// crossing, completed or turned round mid-fade, at every buffer size.
+    /// The first edge comes once the line has settled (`n + 2L`). An
+    /// undelayed dry, or one off by a sample, fails it. It can't see where or
+    /// how the switch happens (here the wet is the aligned dry): D8b's test
+    /// and the fade tests do.
+    #[test]
+    #[allow(clippy::float_cmp)] // the one exact copy or the other
+    fn the_dry_lines_up_with_the_wet_at_every_latency() {
+        let l = ptm_fade();
+        for n in [0, 1, 255, 480, 883, 1024, 2048, 12_547, ptm_max()] {
+            let mut phases = vec![(false, n + 2 * l)];
+            // (toward the dry, then toward the effects): some cross all the
+            // way, some turn round mid-fade.
+            for (dry, wet) in [
+                (n + l / 2, l / 2),
+                (n + l, l),
+                (n + 2 * l, 1_500),
+                (n + 1_500, l / 2),
+                (n + l, l),
+            ] {
+                phases.extend([(true, dry), (false, wet)]);
+            }
+            let input = ramp(phases.iter().map(|&(_, len)| len).sum());
+            for split in [1, 7, 100, 480, 1056, 4096] {
+                let mut stage = VoiceStage::new(fixed_delay(n), false, false);
+                let out = stage.run_phases(&input, &phases, split);
+                for (i, &y) in out.iter().enumerate() {
+                    let want = i.checked_sub(n).map_or(0.0, |j| input[j]);
+                    assert!(
+                        y == want,
+                        "delay {n}, buffers of {split}: sample {i} is {y}, not {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D8b: what you say while the effects are meant to be on goes out with
+    /// them. A chain that delays by `n` and negates, so the wet of a positive
+    /// input is negative and the dry positive. Effects off at stage sample
+    /// `t`: everything said before `t` (source index `s − n < t`) still goes
+    /// out negative; from `t + L` on, the dry exactly. Effects back on at
+    /// `t′`: everything said from `t′` on is negative. Switching at stage time
+    /// sends the last `n` said before `t` in your own voice and fails it.
+    #[test]
+    fn what_you_say_while_held_stays_disguised() {
+        let l = ptm_fade();
+        for n in [512, 1024, 2048, 12_547] {
+            let t = n + 2 * l + 1_000; // the line long settled
+            let back = t + n + l + 2_000; // the dry long reached
+            let total = back + n + 2 * l + 1_000;
+            let phases = [(false, t), (true, back - t), (false, total - back)];
+            let input = ramp(total);
+            for split in [1, 100, 480, 4096] {
+                let mut stage = VoiceStage::new(test_delay(n, -1.0), false, false);
+                let out = stage.run_phases(&input, &phases, split);
+                for (s, &y) in out.iter().enumerate().skip(n) {
+                    let source = s - n;
+                    if source < t || source >= back {
+                        assert!(
+                            y < 0.0,
+                            "delay {n}, buffers of {split}: said at {source}, sent {y}"
+                        );
+                    } else if source >= t + l && s < back {
+                        assert_eq!(
+                            y.to_bits(),
+                            input[source].to_bits(),
+                            "delay {n}, buffers of {split}: said at {source}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seam 1: with real effects (Pitch +5, which reports 1024, and an Echo
+    /// at 90 % feedback) and a clip playing, from `1024 + L` after an edge
+    /// toward the dry the send is the input delayed 1024, bit for bit, and
+    /// the clip is untouched throughout. A dry captured after the chain, or a
+    /// switch never applied, fails it.
+    #[test]
+    #[allow(clippy::float_cmp)] // the clip passes untouched
+    fn bypassed_send_is_the_dry_exactly() {
+        use crate::dsp::EffectKind::{Echo, Pitch};
+        const FRAMES: usize = 480;
+        let l = ptm_fade();
+        let chain = effects(&[(Pitch, &[("shift", 5.0)]), (Echo, &[("fb", 90.0)])]);
+        assert_eq!(chain.latency_samples(RATE), 1024);
+        let mut stage = VoiceStage::new(chain, false, false);
+        stage.play(0.25, 48_000 * 10);
+        let edge = 9_600; // the line long settled
+        let total = 48_000 * 2;
+        let tone = sine(220.0, 0.3, total);
+        let input: Vec<f32> = tone
+            .iter()
+            .zip(buzz(0.05, total))
+            .map(|(a, b)| a + b)
+            .collect();
+        let (mut send, mut clip) = (Vec::with_capacity(total), Vec::with_capacity(total));
+        for (i, block) in input.chunks(FRAMES).enumerate() {
+            let mut mono = block.to_vec();
+            let mut sb = [0.0_f32; FRAMES];
+            stage.run_ptm(&mut mono, &mut sb, false, i * FRAMES >= edge);
+            send.extend(mono);
+            clip.extend(sb);
+        }
+        assert!(
+            (2_048..edge).any(|i| send[i].to_bits() != input[i - 1024].to_bits()),
+            "the effects did nothing before the edge"
+        );
+        for i in edge + 1024 + l..total {
+            assert_eq!(send[i].to_bits(), input[i - 1024].to_bits(), "sample {i}");
+        }
+        assert!(clip.iter().all(|&s| s == 0.25), "the clip moved");
+    }
+
+    /// D4 through the stage, bypassed: a session starts with an empty chain
+    /// (latency 0) and the preset arrives as the drain's `ReplaceChain`
+    /// applies it, a pure delay of 2048. The dry pauses rather than repeating:
+    /// the old tap fades out over L (its last sample at gain 0), the send is
+    /// silent for exactly the 2048 samples between, the new tap fades in, and
+    /// no input sample is sent twice. Then 2048 → 0: the 2048 between the taps
+    /// are skipped, blended over L.
+    #[test]
+    #[allow(clippy::float_cmp)] // every gain is exact
+    fn a_growing_delay_pauses_and_repeats_nothing() {
+        const FRAMES: usize = 480;
+        const GROW: usize = 9_600;
+        const SHRINK: usize = 19_200;
+        let l = ptm_fade();
+        let input = ramp(SHRINK + 4_800);
+        let mut stage = VoiceStage::new(EffectChain::new(), false, false).bypassed();
+        let mut send = Vec::with_capacity(input.len());
+        for (i, block) in input.chunks(FRAMES).enumerate() {
+            let swap = match i * FRAMES {
+                GROW => Some(fixed_delay(2048)),
+                SHRINK => Some(EffectChain::new()),
+                _ => None,
+            };
+            if let Some(chain) = swap {
+                drop(stage.chain.apply(DspEdit::ReplaceChain(chain)));
+            }
+            let mut mono = block.to_vec();
+            let mut sb = [0.0_f32; FRAMES];
+            let report = stage.run_ptm(&mut mono, &mut sb, false, true);
+            assert!(!report.crossed, "the switch moved at {}", i * FRAMES);
+            send.extend(mono);
+        }
+        assert!(bits(&send[..GROW]) == bits(&input[..GROW]), "not the voice");
+
+        // The growth: (gain, source) per sample.
+        let (fade_in, settled) = (GROW + l + 2048, GROW + 2 * l + 2048);
+        let mut last = None;
+        let mut silent = 0;
+        for (i, &y) in send.iter().enumerate().take(SHRINK).skip(GROW) {
+            let (g, source) = if i < GROW + l {
+                (ptm_gain(GROW + l - 1 - i), i)
+            } else if i < fade_in {
+                (0.0, 0)
+            } else if i < settled {
+                (ptm_gain(i - fade_in + 1), i - 2048)
+            } else {
+                (1.0, i - 2048)
+            };
+            if g == 0.0 {
+                assert_eq!(y.to_bits(), 0, "not silent at {i}");
+                silent += 1;
+                continue;
+            }
+            assert_eq!(y, input[source] * g, "sample {i}");
+            assert!(last < Some(source), "input {source} sent twice, at {i}");
+            last = Some(source);
+        }
+        assert_eq!(silent, 2048 + 1, "the fade-out's last sample, then 2048");
+
+        // The shrink: the two taps crossfaded, then the voice itself.
+        for i in SHRINK..send.len() {
+            let (old, new) = (input[i - 2048], input[i]);
+            let want = if i < SHRINK + l - 1 {
+                old + (new - old) * ptm_gain(i - SHRINK + 1)
+            } else {
+                new
+            };
+            assert_eq!(send[i], want, "sample {i}");
+        }
+    }
+
+    /// The safety net (§11): settled on the effects, the stage sends exactly
+    /// what the chain alone would — a second, identical chain run as
+    /// `modulator.apply` + `chain.process` + `loudness.process` — for every
+    /// bundled preset, loudness off and on, bit for bit (same build, same
+    /// CPU; the noise beds' generators are seeded).
+    #[test]
+    fn the_applied_stage_matches_the_chain_alone() {
+        use crate::presets::bundled_presets;
+        const FRAMES: usize = 480;
+        // Half a second of tone, then bursts with silence between.
+        let input: Vec<f32> = sine(220.0, 0.3, 48_000)
+            .into_iter()
+            .zip(buzz(0.2, 48_000))
+            .enumerate()
+            .map(|(i, (t, b))| match i {
+                i if i < 24_000 => t,
+                i if (i / 4_800) % 2 == 0 => b,
+                _ => 0.0,
+            })
+            .collect();
+        for loudness_on in [false, true] {
+            for preset in bundled_presets() {
+                let specs = preset_specs(&preset);
+                let mut stage =
+                    VoiceStage::new(EffectChain::from_specs(&specs), loudness_on, false);
+                let mut chain = EffectChain::from_specs(&specs);
+                let mut modulator = ReactiveModulator::new();
+                let mut loudness = LoudnessNormalizer::new();
+                loudness.set_enabled(loudness_on);
+                for (b, block) in input.chunks(FRAMES).enumerate() {
+                    let (mut staged, mut alone) = (block.to_vec(), block.to_vec());
+                    let mut sb = [0.0_f32; FRAMES];
+                    stage.run(&mut staged, &mut sb, false);
+                    modulator.apply(&alone, &mut chain, RATE);
+                    chain.process(&mut alone, RATE);
+                    loudness.process(&mut alone, RATE);
+                    assert!(
+                        bits(&staged) == bits(&alone),
+                        "{} (loudness {loudness_on}): buffer {b} differs",
+                        preset.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// No click: with real Pitch +5 on a 220 Hz tone, around each crossing
+    /// (an edge toward the dry crosses 1024 after it, one toward the effects
+    /// at once), the send's largest step within ±L is no more than the
+    /// steeper of the two voices' own plus `(max|wet| + max|dry|)/L`, the
+    /// most a linear fade between them can add. A switch in one step fails it.
+    #[test]
+    fn no_click_at_the_switch() {
+        const FRAMES: usize = 480;
+        let l = ptm_fade();
+        // Toward the dry, the effects, the dry, the effects.
+        let edges = [9_600, 19_200, 28_800, 38_400];
+        let input = sine(220.0, 0.3, 48_000);
+        let mut stage = VoiceStage::new(pitch_up(), false, false);
+        let mut alone = VoiceStage::new(pitch_up(), false, false);
+        let (mut send, mut wet) = (Vec::new(), Vec::new());
+        for (i, block) in input.chunks(FRAMES).enumerate() {
+            let bypass = edges.iter().filter(|&&e| e <= i * FRAMES).count() % 2 == 1;
+            let (mut mono, mut chain_only) = (block.to_vec(), block.to_vec());
+            let mut sb = [0.0_f32; FRAMES];
+            stage.run_ptm(&mut mono, &mut sb, false, bypass);
+            alone.run(&mut chain_only, &mut sb, false);
+            send.extend(mono);
+            wet.extend(chain_only);
+        }
+        let peak = |x: &[f32]| x.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        for (k, &edge) in edges.iter().enumerate() {
+            let to_dry = k % 2 == 0;
+            let c = if to_dry { edge + 1024 } else { edge };
+            let (from, to) = (c - l, c + l);
+            let w = &wet[from..=to];
+            let d = &input[from - 1024..=to - 1024];
+            let bound = max_step(w[0], &w[1..]).max(max_step(d[0], &d[1..]))
+                + (peak(w) + peak(d)) / f32::from(ptm_fade_len(RATE));
+            let step = max_step(send[from], &send[from + 1..=to]);
+            assert!(
+                step <= bound,
+                "crossing at {c}: a step of {step} over {bound}"
+            );
+            // And it did cross there: one voice before, the other after.
+            let (before, after) = if to_dry { (w, d) } else { (d, w) };
+            assert_eq!(send[c - 1].to_bits(), before[l - 1].to_bits(), "at {c}");
+            assert_eq!(
+                send[c + l - 1].to_bits(),
+                after[2 * l - 1].to_bits(),
+                "at {c}"
+            );
+        }
+    }
+
+    /// D2: the chain runs while the effects are off, on the same voice the
+    /// dry gets. An Echo of 100 ms with no feedback; a 50 ms burst said while
+    /// bypassed; the effects back on 60 ms after it ends: the burst's echo is
+    /// heard after the re-apply. A chain starved or skipped while bypassed
+    /// has no echo to give.
+    #[test]
+    fn the_chain_keeps_running_while_bypassed() {
+        const FRAMES: usize = 480;
+        let l = ptm_fade();
+        let (burst, burst_end) = (9_600, 12_000);
+        let apply_at = burst_end + 2_880;
+        let echo_end = burst_end + 4_800;
+        let mut mic = vec![0.0_f32; 24_000];
+        mic[burst..burst_end].copy_from_slice(&sine(660.0, 0.5, burst_end - burst));
+        let mut stage = VoiceStage::new(echo_chain(100.0, 0.0), false, false).bypassed();
+        let mut send = Vec::with_capacity(mic.len());
+        for (i, block) in mic.chunks(FRAMES).enumerate() {
+            let mut mono = block.to_vec();
+            let mut sb = [0.0_f32; FRAMES];
+            stage.run_ptm(&mut mono, &mut sb, false, i * FRAMES < apply_at);
+            send.extend(mono);
+        }
+        // Bypassed, the echo's latency is 0: the voice alone, no echo yet.
+        assert!(
+            bits(&send[..apply_at]) == bits(&mic[..apply_at]),
+            "bypassed, the send was not the voice alone"
+        );
+        let tail = &send[apply_at + l..echo_end];
+        let peak = tail.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.2, "the burst's echo never came: peak {peak}");
+    }
+
+    /// D6: the dry is captured after the mute's `feed`, so nothing said while
+    /// muted can come out of it after the unmute, even with the longest
+    /// delay a bundled voice reports (a non-streaming Voice Convert model).
+    #[test]
+    fn what_is_said_while_muted_never_reaches_a_bypassed_send() {
+        const FRAMES: usize = 480;
+        const N: usize = 12_547;
+        let ramp_len = usize::from(mute_ramp_len(RATE));
+        let mute_at = 14_400; // the line settled at N (N + 2L = 13 571)
+        let tone_at = mute_at + 960; // the chain's input closed
+        let tone_end = tone_at + 9_600; // 200 ms
+        let unmute_at = tone_end + 4_800; // 100 ms later
+        let end = unmute_at + 48_000;
+        let mut mic = vec![0.0_f32; end];
+        mic[tone_at..tone_end].copy_from_slice(&sine(440.0, 0.3, tone_end - tone_at));
+        // The precondition: once the send is open again, some of what it
+        // sends was said N earlier, inside the tone, so a dry captured
+        // before `feed` would carry it out.
+        let open = unmute_at + 2 * ramp_len;
+        assert!((open..end).any(|t| (tone_at..tone_end).contains(&(t - N))));
+
+        let mut stage = VoiceStage::new(fixed_delay(N), false, false).bypassed();
+        for (i, block) in mic.chunks(FRAMES).enumerate() {
+            let at = i * FRAMES;
+            let mut mono = block.to_vec();
+            let mut sb = [0.0_f32; FRAMES];
+            stage.run_ptm(&mut mono, &mut sb, (mute_at..unmute_at).contains(&at), true);
+            if at >= unmute_at {
+                assert!(
+                    mono.iter().all(|s| s.to_bits() == 0),
+                    "what was said while muted came out after the unmute, at {at}"
+                );
+            }
+        }
+    }
+
+    /// D9 through the real `is_passthrough`: the reading's DRY half is the
+    /// stage's aligned dry, so with the effects off the send reads as a
+    /// passthrough for every block after the crossing (from 50 ms after it
+    /// with loudness on, whose 30 ms attack can move the gain inside a
+    /// block), and with them on, Pitch +5 never does.
+    #[test]
+    fn the_reading_sees_a_passthrough_while_bypassed() {
+        const FRAMES: usize = 480;
+        let l = ptm_fade();
+        let edge = 14_400;
+        let crossed = edge + 1024 + l;
+        let input = buzz(0.2, 48_000);
+        for loudness_on in [false, true] {
+            let settle = if loudness_on { 2_400 } else { 0 };
+            let mut stage = VoiceStage::new(pitch_up(), loudness_on, false);
+            let (mut applied, mut bypassed) = (0, 0);
+            for (i, block) in input.chunks(FRAMES).enumerate() {
+                let at = i * FRAMES;
+                let mut mono = block.to_vec();
+                let mut sb = [0.0_f32; FRAMES];
+                stage.run_ptm(&mut mono, &mut sb, false, at >= edge);
+                let verdict = is_passthrough(stage.ptm.aligned(FRAMES), &mono);
+                if at >= 1024 + 2 * l && at + FRAMES <= edge + 1024 {
+                    assert_eq!(
+                        verdict,
+                        Some(false),
+                        "loudness {loudness_on}: applied at {at}"
+                    );
+                    applied += 1;
+                } else if at >= crossed + settle {
+                    assert_eq!(
+                        verdict,
+                        Some(true),
+                        "loudness {loudness_on}: bypassed at {at}"
+                    );
+                    bypassed += 1;
+                }
+            }
+            assert!(applied > 10 && bypassed > 10);
+        }
+    }
+
+    /// The callback's half of the reading with push-to-modulate in it, on its
+    /// own thread: a 480-frame block every 10 ms through a real stage
+    /// (Pitch +5), the word read once a block, the crossing noted, then DRY
+    /// from the stage's aligned dry and WET from the send, as the callback
+    /// does. `talking`: a 220 Hz tone; otherwise seeded −60 dBFS room tone.
+    fn feed_the_stage(
+        mut taps: ReadingTaps,
+        state: Arc<EngineState>,
+        tap: Arc<ReadingTap>,
+        talking: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        const BLOCK: usize = 480;
+        std::thread::spawn(move || {
+            let mut voice = VoiceStage::new(pitch_up(), false, false);
+            let inc = std::f32::consts::TAU * 220.0 / 48_000.0;
+            let room = 10.0_f32.powf(-60.0 / 20.0) * 3.0_f32.sqrt();
+            let (mut phase, mut x) = (0.0_f32, 0x9e37_79b9_7f4a_7c15_u64);
+            while !stop.load(Ordering::Acquire) {
+                let mut mono = [0.0_f32; BLOCK];
+                let speech = talking.load(Ordering::Acquire);
+                for s in &mut mono {
+                    *s = if speech {
+                        0.3 * phase.sin()
+                    } else {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        room * (f32::from(u16::try_from(x >> 48).unwrap()) / 32_768.0 - 1.0)
+                    };
+                    phase = (phase + inc) % std::f32::consts::TAU;
+                }
+                let mut sb = [0.0_f32; BLOCK];
+                let bypass = state.ptm_bypassed();
+                let report = voice.run_ptm(&mut mono, &mut sb, false, bypass);
+                if report.crossed {
+                    tap.note_ptm_crossed();
+                }
+                if taps.armed(true, BLOCK) {
+                    taps.push_dry(voice.ptm.aligned(BLOCK));
+                    taps.push_wet(&mono);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
+
+    /// Seam 2, D9 / U6: the real worker on its own thread, fed as the
+    /// callback feeds it, push-to-modulate in Hold to apply.
+    ///
+    /// 1. The key held: speech read with the effects, not a passthrough.
+    /// 2. Let go: the crossing drops the after-effects window (the flag the
+    ///    callback sets, taken by the worker), and "passing the signal
+    ///    through" follows within two emits (the one the crossing lands in,
+    ///    then a clean one; up to about 540 ms, so 1 s here); back on within
+    ///    500 ms of holding it again.
+    /// 3. U6: a pause after a disguised phrase, then the effects off: the
+    ///    held window keeps its own verdict.
+    /// 4. "Always": holds change nothing, so they never reset the wet window.
+    #[test]
+    fn the_reading_worker_sees_ptm_bypass() {
+        let (taps, dry, wet) = taps();
+        let tap = Arc::new(ReadingTap::default());
+        tap.enabled.store(true, Ordering::Release);
+        let state = Arc::new(EngineState::default());
+        state.running.store(true, Ordering::Release);
+        state.apply_ptm(PtmOp::SetMode(PtmMode::Apply));
+        state.apply_ptm(PtmOp::SetHeld(PtmSource::Key, true));
+        let (alive_tx, alive_rx) = channel::<()>();
+        let worker = {
+            let (tap, state) = (Arc::clone(&tap), Arc::clone(&state));
+            std::thread::spawn(move || reading_worker(dry, wet, tap, state, alive_rx, RATE))
+        };
+        let guard = StopOnDrop {
+            stop: Arc::new(AtomicBool::new(false)),
+            alive: Some(alive_tx),
+        };
+        let talking = Arc::new(AtomicBool::new(true));
+        let feeder = feed_the_stage(
+            taps,
+            Arc::clone(&state),
+            Arc::clone(&tap),
+            Arc::clone(&talking),
+            Arc::clone(&guard.stop),
+        );
+        let hold = |held: bool| state.apply_ptm(PtmOp::SetHeld(PtmSource::Key, held));
+        let speaking = |s: &ReadingSnapshot| {
+            s.reading.state == ReadingState::Speaking && s.reading.wet.energy_dbfs.is_finite()
+        };
+
+        // (1) The effects on, read over a whole window.
+        assert!(
+            reading_within(&tap, Duration::from_secs(8), |s| speaking(s)
+                && !s.reading.wet_bypassed
+                && s.reading.wet_settled),
+            "the tone never read as speech with its effects"
+        );
+
+        // (2) Off: the crossing drops the after-effects window, then the
+        // reading says the effects are off. Then on again.
+        hold(false);
+        assert!(
+            reading_within(&tap, Duration::from_millis(500), |s| !s.reading.wet_settled),
+            "the crossing didn't drop the after-effects window"
+        );
+        assert!(
+            reading_within(&tap, Duration::from_secs(1), |s| speaking(s)
+                && s.reading.wet_bypassed),
+            "the reading never said the effects were off"
+        );
+        hold(true);
+        assert!(
+            reading_within(&tap, Duration::from_millis(500), |s| speaking(s)
+                && !s.reading.wet_bypassed),
+            "the reading still said the effects were off"
+        );
+
+        // (3) U6: a disguised phrase, a pause, then the effects off.
+        std::thread::sleep(Duration::from_secs(1));
+        talking.store(false, Ordering::Release);
+        assert!(
+            reading_within(&tap, Duration::from_secs(3), |s| s.reading.held
+                && s.reading.state == ReadingState::Quiet),
+            "the pause never held the reading"
+        );
+        assert!(
+            !tap.load().reading.wet_bypassed,
+            "the phrase read as bypassed"
+        );
+        hold(false);
+        readings_for(&tap, Duration::from_secs(1), |s| {
+            assert!(s.reading.held, "{s:?}");
+            assert!(
+                !s.reading.wet_bypassed,
+                "the held window took the pause's verdict: {s:?}"
+            );
+        });
+
+        // (4) "Always": the holds move `seq` and nothing else.
+        state.apply_ptm(PtmOp::SetMode(PtmMode::Always));
+        talking.store(true, Ordering::Release);
+        assert!(
+            reading_within(&tap, Duration::from_secs(8), |s| speaking(s)
+                && s.reading.wet_settled),
+            "the wet window never filled"
+        );
+        let since = Instant::now();
+        let mut down = false;
+        while since.elapsed() < Duration::from_millis(1_500) {
+            down = !down;
+            hold(down);
+            let s = tap.load();
+            assert!(
+                speaking(&s) && s.reading.wet_settled,
+                "a hold reset the wet window: {s:?}"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        drop(guard);
+        feeder.join().unwrap();
+        worker.join().unwrap();
+    }
+
+    /// RT-5 / D24: the voice stage — an echo, two test delays whose
+    /// `SetEnabled` moves the chain's latency between 0 and 4096, loudness,
+    /// a clip — allocates and frees nothing while push-to-modulate and the
+    /// mute switch, including flips that turn a fade round, cancel a wait,
+    /// and latency changes mid-move. The claim is this stage, not the whole
+    /// callback (Voice Convert's inference still allocates).
+    #[test]
+    fn the_voice_stage_allocates_nothing_while_ptm_switches() {
+        use crate::alloc_probe::{arm, disarm};
+        let chain = with_delay(
+            with_delay(echo_chain(100.0, 90.0), 1024, false),
+            3072,
+            false,
+        );
+        let mut stage = VoiceStage::new(chain, true, false);
+        stage.play(0.25, 48_000 * 30);
+        let mut mono = [0.1_f32; 480];
+        let mut sb = [0.0_f32; 480];
+
+        // The counter is live: the same window around a real allocation is
+        // not zero, so the zeros below are a measurement, not a dead hook.
+        arm();
+        drop(std::hint::black_box(vec![0u8; 16]));
+        assert_eq!(disarm(), (1, 1), "the allocation probe is not counting");
+
+        // Warm: the first buffer is not the steady state.
+        stage.run(&mut mono, &mut sb, false);
+
+        for frames in [100, 480] {
+            let (mut bypass, mut muted, mut delays) = (false, false, 0_usize);
+            let (mut turned, mut cancelled, mut moved) = (0_usize, 0_usize, 0_usize);
+            arm();
+            for i in 0..600 {
+                // 100-frame buffers flip every 300 samples: inside a fade
+                // (512) and inside most waits (up to 4096).
+                if i % 3 == 0 {
+                    turned += usize::from(!stage.ptm.settled());
+                    cancelled += usize::from(stage.ptm.waiting() && bypass);
+                    bypass = !bypass;
+                }
+                if i % 7 == 0 {
+                    moved += usize::from(stage.ptm.line_moving());
+                    delays = (delays + 1) % 4;
+                    for (index, on) in [(1, delays & 1 != 0), (2, delays & 2 != 0)] {
+                        let edit = DspEdit::SetEnabled { index, enabled: on };
+                        assert!(stage.chain.apply(edit).is_none());
+                    }
+                }
+                if i % 50 == 49 {
+                    muted = !muted;
+                }
+                mono[..frames].fill(0.1);
+                sb[..frames].fill(0.0);
+                stage.run_ptm(&mut mono[..frames], &mut sb[..frames], muted, bypass);
+            }
+            let counts = disarm();
+            assert_eq!(counts, (0, 0), "{frames}-frame buffers allocated or freed");
+            if frames == 100 {
+                assert!(
+                    turned > 0 && cancelled > 0 && moved > 0,
+                    "not every case was measured: {turned} {cancelled} {moved}"
+                );
+            }
+        }
+    }
+
+    /// The seams no behaviour test can reach (they need a device): the
+    /// output callback's closure and the reading worker, read from the
+    /// source like `the_output_callback_mutes_the_voice_stage`.
+    #[test]
+    fn the_output_callback_switches_the_voice_stage() {
+        let file = include_str!("engine.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let count = |needle: &str| prod.matches(needle).count();
+
+        // Built at the engine's word, read once a buffer, passed as read.
+        let built = concat!(
+            "let mut ptm = PtmStage::new(input_rate, ",
+            "state.ptm_bypassed());"
+        );
+        assert_eq!(
+            count(built),
+            1,
+            "the switch must be built at the engine's word"
+        );
+        let read = concat!("let bypass = state_for_callback", ".ptm_bypassed();");
+        assert_eq!(count(read), 1, "the callback must read the word once");
+        let passed = concat!("&mut ptm,\n", "                    bypass,");
+        assert_eq!(count(passed), 1, "the callback must pass what it read");
+        // D9: the reading's DRY half is the aligned dry, not the raw mic.
+        let aligned = concat!("reading_taps.push_dry(", "ptm.aligned(");
+        assert_eq!(count(aligned), 1, "the DRY tap must be the aligned dry");
+        let raw = concat!("reading_taps.push_dry(", "&mono");
+        assert_eq!(count(raw), 0, "the DRY tap must not be the raw mic");
+        // RT-10: the screen recorder places the voice by the stage's read.
+        let av = concat!("chain_latency: u32::try_from(", "stage.latency)");
+        assert_eq!(count(av), 1, "the AV tap must get the stage's latency");
+
+        // Once a session, before the per-buffer closure.
+        let callback = block_after(prod, concat!("fn build_output", "_stream("));
+        let closure_at = callback
+            .find(concat!("move |data: &mut [f32], ", "info"))
+            .expect("the output callback's closure");
+        let closure = block_after(&callback[closure_at..], "move |");
+        assert!(
+            callback.find(built).expect("the switch's construction") < closure_at,
+            "the switch must be built before the callback's closure"
+        );
+        assert!(
+            !closure.contains(concat!("PtmStage", "::new(")),
+            "the switch must not be rebuilt every buffer"
+        );
+
+        // In the closure, in this order.
+        let mut at = 0;
+        for needle in [
+            concat!("state_for_callback", ".input_muted();"),
+            concat!("state_for_callback", ".ptm_bypassed();"),
+            concat!("&mut mute", "_gate,"),
+            concat!("reading.note_ptm", "_crossed()"),
+            concat!("reading_taps.push_dry(", "ptm.aligned("),
+            concat!("reading_taps.push", "_wet("),
+            concat!("av.", "tap("),
+            concat!("mix_monitor", "_into("),
+        ] {
+            let found = closure[at..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is missing or out of order"));
+            at += found + needle.len();
+        }
+
+        // In the stage, in this order, each once (D6).
+        let stage = block_after(prod, concat!("fn mix_voice_and", "_soundboard("));
+        let mut at = 0;
+        for needle in [
+            concat!("run.feed", "(mono)"),
+            concat!("modulator", ".apply("),
+            concat!("chain.latency", "_samples("),
+            concat!("ptm.", "capture("),
+            concat!("chain.", "process("),
+            concat!("ptm.", "blend("),
+            concat!("loudness.", "process("),
+            concat!("run.mute", "(mono)"),
+            concat!("soundboard.mix", "_into("),
+        ] {
+            assert_eq!(stage.matches(needle).count(), 1, "`{needle}` in the stage");
+            let found = stage[at..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is out of order in the stage"));
+            at += found + needle.len();
+        }
+
+        // In the reading worker: a crossing drops the wet window.
+        let worker = block_after(prod, concat!("fn reading", "_worker("));
+        let taken = block_after(worker, concat!("if tap.take_ptm", "_crossed() {"));
+        assert!(taken.contains(concat!("analyzer.note_chain", "_changed()")));
+    }
+
+    /// Design §7.2 through the public setters, each row from where the last
+    /// left the word, with what each call says it found and left.
+    #[test]
+    fn ptm_is_idempotent_and_counted() {
+        use PtmMode::{Always, Apply, Bypass};
+        use PtmSource::{Button, Hotkey, Key, Midi};
+        let st = |mode, held, seq| PtmState {
+            mode,
+            held,
+            bypassed: match mode {
+                Always => false,
+                Apply => !held,
+                Bypass => held,
+            },
+            seq,
+        };
+        let same = |s| PtmChange {
+            before: s,
+            after: s,
+        };
+        let change = |before, after| PtmChange { before, after };
+        let engine = AudioEngine::new();
+        assert_eq!(engine.ptm(), st(Always, false, 0));
+        assert_eq!(engine.set_ptm_mode(Always), same(st(Always, false, 0)));
+        assert_eq!(
+            engine.set_ptm_mode(Apply),
+            change(st(Always, false, 0), st(Apply, false, 1))
+        );
+        assert_eq!(engine.set_ptm_held(Key, true).after, st(Apply, true, 2));
+        // Picking the mode again lets go of every hold, the global key's too.
+        assert_eq!(
+            engine.set_ptm_mode(Apply),
+            change(st(Apply, true, 2), st(Apply, false, 3))
+        );
+        assert_eq!(engine.set_ptm_held(Hotkey, true).after, st(Apply, true, 4));
+        assert_eq!(
+            engine.set_ptm_mode(Apply),
+            change(st(Apply, true, 4), st(Apply, false, 5))
+        );
+        // A set to what a source has moves nothing, `seq` included.
+        assert_eq!(
+            engine.set_ptm_held(Key, true),
+            change(st(Apply, false, 5), st(Apply, true, 6))
+        );
+        assert_eq!(engine.set_ptm_held(Key, true), same(st(Apply, true, 6)));
+        assert_eq!(engine.set_ptm_held(Hotkey, false), same(st(Apply, true, 6)));
+        // Held while any source holds it.
+        assert_eq!(engine.set_ptm_held(Hotkey, true).after, st(Apply, true, 7));
+        assert_eq!(
+            engine.set_ptm_held(Key, false),
+            change(st(Apply, true, 7), st(Apply, true, 8))
+        );
+        // The boot's restore keeps the global key's hold, and only that.
+        assert_eq!(engine.set_ptm_held(Key, true).after, st(Apply, true, 9));
+        assert_eq!(
+            engine.restore_ptm_mode(Apply),
+            change(st(Apply, true, 9), st(Apply, true, 10))
+        );
+        assert_eq!(engine.restore_ptm_mode(Apply), same(st(Apply, true, 10)));
+        assert_eq!(engine.set_ptm_mode(Always).after, st(Always, false, 11));
+        assert_eq!(
+            engine.set_ptm_held(Hotkey, true).after,
+            st(Always, true, 12)
+        );
+        assert_eq!(
+            engine.restore_ptm_mode(Apply),
+            change(st(Always, true, 12), st(Apply, true, 13))
+        );
+        engine.set_ptm_held(Hotkey, false);
+        for source in [Key, Button, Midi] {
+            engine.set_ptm_held(source, true);
+        }
+        assert_eq!(
+            engine.restore_ptm_mode(Apply),
+            change(st(Apply, true, 17), st(Apply, false, 18))
+        );
+        // Hold to bypass: bypassed while held.
+        assert_eq!(engine.set_ptm_mode(Bypass).after, st(Bypass, false, 19));
+        assert_eq!(engine.set_ptm_held(Midi, true).after, st(Bypass, true, 20));
+        assert_eq!(
+            engine.set_ptm_held(Midi, false).after,
+            st(Bypass, false, 21)
+        );
+        assert_eq!(engine.ptm(), st(Bypass, false, 21));
+    }
+
+    /// U4 / D14: the boot's restore lets go of the page's holds and keeps the
+    /// global key's (a reload must not drop a key still down); the card's set
+    /// lets go of both.
+    #[test]
+    fn restore_keeps_a_held_global_key() {
+        let engine = AudioEngine::new();
+        let held = || engine.state.ptm.load(Ordering::Acquire).to_le_bytes()[0];
+        engine.set_ptm_mode(PtmMode::Apply);
+        engine.set_ptm_held(PtmSource::Hotkey, true);
+        engine.set_ptm_held(PtmSource::Key, true);
+        assert_eq!(held(), 0b0011);
+        assert!(engine.restore_ptm_mode(PtmMode::Apply).after.held);
+        assert_eq!(held(), 0b0001, "the restore must keep only the global key");
+        engine.set_ptm_held(PtmSource::Key, true);
+        assert!(!engine.set_ptm_mode(PtmMode::Apply).after.held);
+        assert_eq!(held(), 0, "the card's set must let go of both");
+    }
+
+    /// D10: a hold is one atomic op. Four sources set by four threads at
+    /// once lose nothing: each call is a change of exactly one, and all of
+    /// them are counted.
+    #[test]
+    fn concurrent_holds_are_all_counted() {
+        let engine = AudioEngine::new();
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|s| {
+            for source in [
+                PtmSource::Hotkey,
+                PtmSource::Key,
+                PtmSource::Button,
+                PtmSource::Midi,
+            ] {
+                let (engine, start) = (&engine, &start);
+                s.spawn(move || {
+                    start.wait();
+                    for i in 0..10_000 {
+                        let c = engine.set_ptm_held(source, i % 2 == 0);
+                        assert_eq!(c.after.seq, c.before.seq + 1, "{source:?}");
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            engine.ptm(),
+            PtmState {
+                mode: PtmMode::Always,
+                held: false,
+                bypassed: false,
+                seq: 40_000
+            }
+        );
+    }
+
+    /// The word is the engine's, not a session's: Stop, Start and a
+    /// device-loss rebuild keep it, holds included.
+    #[test]
+    fn ptm_survives_stop_start_and_a_rebuild() {
+        #[allow(clippy::unnecessary_wraps)] // a `StartFn`, whose sessions may fail
+        fn start(
+            _input: Option<&str>,
+            _output: Option<&str>,
+            _monitor: Option<&str>,
+            _state: Arc<EngineState>,
+            _reading: Arc<ReadingTap>,
+            _cmd_tx: Sender<Command>,
+        ) -> Result<StartedStreams<()>, AudioEngineError> {
+            Ok(deviceless_session())
+        }
+        // Answered in order, so everything sent before it has been handled.
+        fn settle(engine: &AudioEngine) {
+            let _ = engine.stop_reference_recording();
+        }
+
+        let engine = AudioEngine::spawn(start);
+        engine.set_ptm_mode(PtmMode::Apply);
+        let held = engine.set_ptm_held(PtmSource::Key, true).after;
+        assert_eq!((held.held, held.bypassed, held.seq), (true, false, 2));
+        engine.start(None, None, None).unwrap();
+        assert_eq!(engine.ptm(), held);
+
+        engine.tx.send(Command::StreamError).unwrap();
+        settle(&engine);
+        assert!(engine.is_running(), "the rebuild came back up");
+        assert_eq!(engine.ptm(), held);
+
+        engine.stop();
+        settle(&engine);
+        assert!(!engine.is_running());
+        assert_eq!(engine.ptm(), held);
+
+        engine.start(None, None, None).unwrap();
+        assert_eq!(engine.ptm(), held);
+        let let_go = engine.set_ptm_held(PtmSource::Key, false).after;
+        assert_eq!((let_go.bypassed, let_go.seq), (true, 3));
+    }
+
+    /// D10: a hold lands while the engine thread is stuck in a Start (a device
+    /// open), because the setter never goes through the engine's command
+    /// channel — the global key's release on the poller thread included.
+    #[test]
+    fn a_ptm_change_lands_while_the_engine_thread_is_busy() {
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        #[allow(clippy::unnecessary_wraps)] // a `StartFn`, whose sessions may fail
+        fn start(
+            _input: Option<&str>,
+            _output: Option<&str>,
+            _monitor: Option<&str>,
+            _state: Arc<EngineState>,
+            _reading: Arc<ReadingTap>,
+            _cmd_tx: Sender<Command>,
+        ) -> Result<StartedStreams<()>, AudioEngineError> {
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(deviceless_session())
+        }
+
+        let engine = AudioEngine::spawn(start);
+        std::thread::scope(|s| {
+            let starter = s.spawn(|| engine.start(None, None, None));
+            let since = Instant::now();
+            while !ENTERED.load(Ordering::Acquire) && since.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (tx, rx) = channel();
+            let setter = &engine;
+            s.spawn(move || {
+                tx.send(setter.set_ptm_held(PtmSource::Hotkey, true))
+                    .unwrap();
+            });
+            let answer = rx.recv_timeout(Duration::from_millis(200));
+            let (running, word) = (engine.is_running(), engine.ptm());
+            // Let the Start finish before asserting, so a failure can't hang
+            // the scope on a thread that never returns.
+            RELEASE.store(true, Ordering::Release);
+            assert!(ENTERED.load(Ordering::Acquire), "the Start never began");
+            let answer = answer.expect("the hold waited behind the Start");
+            assert_eq!(
+                answer.after,
+                PtmState {
+                    mode: PtmMode::Always,
+                    held: true,
+                    bypassed: false,
+                    seq: 1
+                }
+            );
+            assert!(!running, "the engine thread was still inside the Start");
+            assert!(word.held);
+            starter.join().unwrap().unwrap();
+        });
+        assert!(engine.is_running());
+        assert!(engine.ptm().held);
+    }
+
+    /// Design §4: `PtmState` is the commands' answer and every level tick's
+    /// `ptm`, so its camelCase keys are a stable contract.
+    #[test]
+    fn ptm_state_json_keys_are_frozen() {
+        let v = serde_json::to_value(PtmState {
+            mode: PtmMode::Bypass,
+            held: true,
+            bypassed: true,
+            seq: 7,
+        })
+        .unwrap();
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["bypassed", "held", "mode", "seq"]);
+        assert_eq!(v["mode"], "bypass");
+        assert_eq!(v["held"], true);
+        assert_eq!(v["bypassed"], true);
+        assert_eq!(v["seq"], 7);
+    }
+
+    /// Design §4: the mode's wire values, both ways, and nothing else parses.
+    #[test]
+    fn ptm_mode_wire_values_are_frozen() {
+        for (mode, wire) in [
+            (PtmMode::Always, "always"),
+            (PtmMode::Apply, "apply"),
+            (PtmMode::Bypass, "bypass"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+            let parsed: PtmMode = serde_json::from_value(serde_json::json!(wire)).unwrap();
+            assert_eq!(parsed, mode);
+        }
+        for bad in ["Always", "APPLY", "off", "hold", ""] {
+            assert!(
+                serde_json::from_value::<PtmMode>(serde_json::json!(bad)).is_err(),
+                "{bad:?} parsed"
+            );
+        }
+        assert_eq!(PtmMode::default(), PtmMode::Always, "the launch mode");
+    }
+
+    /// RT-6 / K1: the denoiser reports 480 and, alone, delays by 480 only
+    /// when the buffer is a multiple of its 480-sample frame; otherwise its
+    /// queue adds `480 − gcd(N, 480)`. Measured here as `map_engine` §7.3's
+    /// probe did (the lag of best correlation on a pulse-train-plus-noise
+    /// burst signal), so the figure K1 states can't drift silently.
+    #[test]
+    fn the_denoisers_real_delay_is_pinned() {
+        use crate::dsp::{AudioEffect, RnnDenoiser};
+        /// A 140 Hz sawtooth, low-passed, plus noise, in 200 ms bursts.
+        fn probe(n: usize) -> Vec<f32> {
+            let (mut seed, mut lp, mut ph) = (0x2545_f491_u32, 0.0_f32, 0.0_f32);
+            (0..n)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let nz = f32::from(u16::try_from(seed >> 16).unwrap()) / 32_768.0 - 1.0;
+                    ph = (ph + 140.0 / 48_000.0).fract();
+                    lp += 0.2 * ((ph * 2.0 - 1.0) - lp);
+                    if (i / 9_600) % 2 == 0 {
+                        0.3 * (lp + 0.3 * nz)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        }
+        /// The lag in 0..=1100 at which `y` best matches `x`.
+        fn best_lag(x: &[f32], y: &[f32]) -> usize {
+            let corr = |lag: usize| {
+                let (mut xy, mut xx, mut yy) = (0.0_f64, 0.0_f64, 0.0_f64);
+                for t in 20_000..x.len() - 1_200 {
+                    let (a, b) = (f64::from(x[t]), f64::from(y[t + lag]));
+                    xy += a * b;
+                    xx += a * a;
+                    yy += b * b;
+                }
+                xy / (xx.sqrt() * yy.sqrt()).max(1e-12)
+            };
+            (0..=1_100)
+                .map(|lag| (lag, corr(lag)))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+                .0
+        }
+        let x = probe(96_000);
+        for (span, delay) in [(480, 480), (512, 928), (1056, 864)] {
+            let mut denoiser = RnnDenoiser::new();
+            denoiser.set_enabled(true);
+            denoiser.set_param("mix", 100.0);
+            assert_eq!(denoiser.latency_samples(RATE), 480, "what it reports");
+            let mut y = Vec::with_capacity(x.len());
+            for block in x.chunks(span) {
+                let mut buf = block.to_vec();
+                denoiser.process(&mut buf, RATE);
+                y.extend(buf);
+            }
+            assert_eq!(best_lag(&x, &y), delay, "{span}-frame buffers");
         }
     }
 }

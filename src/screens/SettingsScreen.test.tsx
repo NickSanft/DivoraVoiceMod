@@ -508,3 +508,74 @@ describe("SettingsScreen — the mute (v1.56.0)", () => {
     expect(text).not.toMatch(/push-to-modulate/i);
   });
 });
+
+describe("SettingsScreen — push-to-modulate (v1.58.0)", () => {
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  const squash = (s: string | null | undefined): string => (s ?? "").replace(/\s+/g, " ").trim();
+  const PTM_DESC =
+    "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.";
+  const PTM_MIDI =
+    "Hold push-to-modulate holds while a pad's note is down, or while a knob, fader or CC button is past halfway (it lets go at 59 or less); with two pads on it, it holds until both are up.";
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    overlayReply = null;
+    invokeCalls.length = 0;
+  });
+
+  it("the Push-to-modulate hotkey row says it switches your effects as the Mixer card is set", async () => {
+    const view = mount();
+    await flush();
+    const desc = view.getByText(PTM_DESC);
+    expect(desc.previousElementSibling?.textContent).toBe("Push-to-modulate");
+    // The old words promised a switch that didn't happen; the copy rules.
+    const text = desc.textContent ?? "";
+    expect(text).not.toMatch(/chain|clean|bypass|instant|at once/i);
+    expect(view.queryByText(/Hold to apply the chain/)).toBeNull();
+    // Still the first row.
+    const rows = desc.closest("section")!.textContent ?? "";
+    expect(rows.indexOf(PTM_DESC)).toBeLessThan(rows.indexOf("Panic — stop all clips"));
+  });
+
+  it("MIDI: the intro says how a Hold push-to-modulate pad and CC hold", async () => {
+    const view = mount();
+    await flush();
+    const section = view.getByText("Control surfaces").closest("section")!;
+    const intro = squash(section.querySelector("p")?.textContent);
+    expect(intro).toContain(PTM_MIDI);
+    // After the mute's sentences, not in the middle of them.
+    expect(intro.indexOf(PTM_MIDI)).toBeGreaterThan(intro.indexOf("mutes if it is past halfway."));
+    // The sentence against the rule the store holds a CC by (data/mute.ts,
+    // as the mute's): past halfway holds, 60..63 keeps, 59 or less lets go.
+    expect(muteCcStep(undefined, 64).act).toBe(true);
+    expect(muteCcStep(false, 64).act).toBe(true);
+    expect(muteCcStep(true, 63).act).toBeNull();
+    expect(muteCcStep(true, 60).act).toBeNull();
+    expect(muteCcStep(true, 59).act).toBe(false);
+    expect(muteCcStep(false, 63).act).toBeNull();
+    // Nothing in the section promises a switch with no delay.
+    expect(squash(section.textContent)).not.toMatch(/instant|at once/i);
+  });
+
+  it("MIDI: the action is still called Hold push-to-modulate and saves as kind ptm", async () => {
+    window.localStorage.setItem(
+      "divora.midiMappings",
+      JSON.stringify([{ id: "m1", action: "preset", trigger: { kind: "note", data1: 36, channel: 0 } }]),
+    );
+    const view = mount();
+    await flush();
+    const section = view.getByText("Control surfaces").closest("section")!;
+    fireEvent.click(view.getByText("Summon preset"));
+    fireEvent.click(view.getByRole("option", { name: /Hold push-to-modulate/ }));
+    await flush();
+    const saved = JSON.parse(window.localStorage.getItem("divora.midiMappings") ?? "[]") as Array<{
+      action: string;
+    }>;
+    expect(saved.map((m) => m.action)).toEqual(["ptm"]);
+    const shown = Array.from(section.querySelectorAll(".select-main")).map((e) => e.textContent);
+    expect(shown).toContain("Hold push-to-modulate");
+  });
+});

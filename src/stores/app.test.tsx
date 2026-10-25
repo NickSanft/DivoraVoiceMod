@@ -4489,3 +4489,423 @@ describe("app store — model downloads (v1.57.0)", () => {
     expect(result.cloneDownloading()).toBe(false);
   });
 });
+
+// ---- v1.58.0: push-to-modulate ------------------------------------------
+
+describe("app store — push-to-modulate (v1.58.0)", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+
+  type Bits = Partial<Record<"hotkey" | "key" | "button" | "midi", boolean>>;
+
+  /** The engine's word, as the backend keeps it: a held bit per source, a
+   *  change bumps `seq`, a set to what it has moves nothing. `set_ptm_mode`
+   *  lets go of every hold; with `restore`, of the page's only. The engine
+   *  changes when the call arrives; `gate` holds its answer back until
+   *  released, `hang` never answers, `fail` refuses. */
+  function ptmEngine(start: { mode?: string; bits?: Bits; seq?: number } = {}) {
+    let mode = start.mode ?? "always";
+    let bits: Bits = { ...start.bits };
+    let seq = start.seq ?? 0;
+    const state = () => {
+      const any = Object.values(bits).some(Boolean);
+      const bypassed = mode === "apply" ? !any : mode === "bypass" ? any : false;
+      return { mode, held: any, bypassed, seq };
+    };
+    const write = (m: string, b: Bits) => {
+      const sources = ["hotkey", "key", "button", "midi"] as const;
+      const same = m === mode && sources.every((k) => !!b[k] === !!bits[k]);
+      if (!same) {
+        mode = m;
+        bits = b;
+        seq += 1;
+      }
+      return state();
+    };
+    const ctl = {
+      gate: null as Array<() => void> | null,
+      hang: false,
+      fail: null as Error | null,
+    };
+    invokeMock.mockImplementation(async (cmd: string, a?: Record<string, unknown>) => {
+      if (cmd !== "set_ptm_mode" && cmd !== "set_ptm_held") return undefined;
+      if (ctl.hang) return new Promise(() => {});
+      if (ctl.fail) throw ctl.fail;
+      const answer =
+        cmd === "set_ptm_mode"
+          ? write(a!.mode as string, a!.restore === true ? { hotkey: !!bits.hotkey } : {})
+          : write(mode, { ...bits, [a!.source as string]: a!.held as boolean });
+      if (ctl.gate) await new Promise<void>((r) => ctl.gate!.push(r));
+      return answer;
+    });
+    return {
+      ctl,
+      state,
+      /** The sources the engine holds. */
+      held: () => Object.keys(bits).filter((k) => bits[k as keyof Bits]),
+      /** The global key, in Rust: the page hears of it only by a tick. */
+      hotkey: (on: boolean) => write(mode, { ...bits, hotkey: on }),
+    };
+  }
+
+  /** What the page sent the engine, in order. */
+  const ptmCalls = () =>
+    invokeMock.mock.calls
+      .filter((c) => String(c[0]).startsWith("set_ptm"))
+      .map((c) => [c[0], c[1]]);
+  const heldCall = (source: string, on: boolean) => ["set_ptm_held", { source, held: on }];
+  const modeCall = (mode: string, restore = false) => ["set_ptm_mode", { mode, restore }];
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  describe("the boot restore", () => {
+    it("sends the saved mode with restore at creation; off reads always", async () => {
+      ptmEngine();
+      const { result } = setupApp();
+      // Sent while the store is created: nothing has been awaited yet.
+      expect(ptmCalls()).toEqual([modeCall("always", true)]);
+      expect(result.ptmKnown()).toBe(false);
+      expect(result.ptmSetting()).toEqual({ on: false, hold: "apply" });
+      await settle();
+      expect(result.ptmKnown()).toBe(true);
+      expect(result.ptmState()).toEqual({ mode: "always", held: false, bypassed: false, seq: 0 });
+      expect(result.status()).toBe("modulated");
+    });
+
+    it.each([
+      [{ on: true, hold: "apply" }, "apply"],
+      [{ on: true, hold: "bypass" }, "bypass"],
+      [{ on: false, hold: "bypass" }, "always"],
+      [{ on: "yes", hold: "apply" }, "always"],
+      ["apply", "always"],
+    ])("restores %j as %s", (saved, mode) => {
+      ptmEngine();
+      window.localStorage.setItem("divora.ptm", JSON.stringify(saved));
+      setupApp();
+      expect(ptmCalls()).toEqual([modeCall(mode, true)]);
+    });
+
+    it("a global key held across the reload stays held; the page's key is let go", async () => {
+      const engine = ptmEngine({ mode: "apply", bits: { hotkey: true, key: true }, seq: 4 });
+      window.localStorage.setItem("divora.ptm", JSON.stringify({ on: true, hold: "apply" }));
+      const { result } = setupApp();
+      await settle();
+      expect(engine.held()).toEqual(["hotkey"]);
+      expect(result.ptmState()).toEqual({ mode: "apply", held: true, bypassed: false, seq: 5 });
+      expect(result.status()).toBe("modulated");
+    });
+
+    it("a tick adopted before the answer updates the mirror but leaves ptmKnown false", async () => {
+      // The previous page held the in-app key.
+      const engine = ptmEngine({ mode: "apply", bits: { key: true }, seq: 7 });
+      engine.ctl.gate = [];
+      window.localStorage.setItem("divora.ptm", JSON.stringify({ on: true, hold: "apply" }));
+      const { result } = setupApp();
+      // A tick from before the restore landed: the key was held, so applied.
+      result.applyPtmState({ mode: "apply", held: true, bypassed: false, seq: 7 });
+      await settle();
+      expect(result.ptmState()?.seq).toBe(7);
+      expect(result.status()).toBe("modulated");
+      expect(result.ptmKnown()).toBe(false);
+      // The restore let go of it.
+      engine.ctl.gate.shift()!();
+      await settle();
+      expect(result.ptmKnown()).toBe(true);
+      expect(result.ptmState()).toEqual({ mode: "apply", held: false, bypassed: true, seq: 8 });
+      expect(result.status()).toBe("clean");
+    });
+
+    it("ptmKnown comes true after 500 ms when the restore never answers", () => {
+      vi.useFakeTimers();
+      const engine = ptmEngine();
+      engine.ctl.hang = true;
+      const { result } = setupApp();
+      vi.advanceTimersByTime(499);
+      expect(result.ptmKnown()).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(result.ptmKnown()).toBe(true);
+      expect(result.ptmState()).toBeNull();
+    });
+
+    it("ptmKnown comes true when the restore fails (off Tauri), with a warning", async () => {
+      const engine = ptmEngine();
+      engine.ctl.fail = new Error("no bridge");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { result } = setupApp();
+      await settle();
+      expect(result.ptmKnown()).toBe(true);
+      expect(result.ptmState()).toBeNull();
+      expect(warn).toHaveBeenCalledWith("[ptm] boot restore failed", expect.any(Error));
+    });
+  });
+
+  describe("the card's set", () => {
+    it("setPtmOn(true) sends apply; divora.ptm and the card follow only the answer", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      invokeMock.mockClear();
+      engine.ctl.gate = [];
+      const done = result.setPtmOn(true);
+      expect(ptmCalls()).toEqual([modeCall("apply")]);
+      await settle();
+      // In flight: nothing saved, the card unchanged.
+      expect(window.localStorage.getItem("divora.ptm")).toBeNull();
+      expect(result.ptmSetting()).toEqual({ on: false, hold: "apply" });
+      engine.ctl.gate.shift()!();
+      await done;
+      expect(result.ptmSetting()).toEqual({ on: true, hold: "apply" });
+      expect(JSON.parse(window.localStorage.getItem("divora.ptm")!)).toEqual({
+        on: true,
+        hold: "apply",
+      });
+      // Key up, Hold to apply: the effects are off.
+      expect(result.status()).toBe("clean");
+    });
+
+    it("a refused set_ptm_mode leaves divora.ptm and the card as they were", async () => {
+      const engine = ptmEngine();
+      window.localStorage.setItem("divora.ptm", JSON.stringify({ on: true, hold: "bypass" }));
+      const { result } = setupApp();
+      await settle();
+      engine.ctl.fail = new Error("refused");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await result.setPtmOn(false);
+      await result.setPtmHold("apply");
+      expect(result.ptmSetting()).toEqual({ on: true, hold: "bypass" });
+      expect(JSON.parse(window.localStorage.getItem("divora.ptm")!)).toEqual({
+        on: true,
+        hold: "bypass",
+      });
+      expect(warn).toHaveBeenCalledWith("[ptm] set_ptm_mode failed:", expect.any(Error));
+    });
+
+    it("setPtmHold('bypass') while on sends bypass; setPtmOn(false) sends always and keeps the hold", async () => {
+      ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      await result.setPtmOn(true);
+      invokeMock.mockClear();
+      await result.setPtmHold("bypass");
+      expect(ptmCalls()).toEqual([modeCall("bypass")]);
+      expect(result.ptmSetting()).toEqual({ on: true, hold: "bypass" });
+      // Bypass with nothing held: the effects are on.
+      expect(result.status()).toBe("modulated");
+      await result.setPtmOn(false);
+      expect(ptmCalls()).toEqual([modeCall("bypass"), modeCall("always")]);
+      expect(result.ptmSetting()).toEqual({ on: false, hold: "bypass" });
+    });
+
+    it("re-picking the current hold sends set_ptm_mode and forgets the page's holds", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      await result.setPtmOn(true);
+      result.ptmDown("key");
+      result.ptmDown("button");
+      await settle();
+      expect(engine.held()).toEqual(["key", "button"]);
+      invokeMock.mockClear();
+      await result.setPtmHold("apply");
+      expect(ptmCalls()).toEqual([modeCall("apply")]);
+      expect(engine.held()).toEqual([]);
+      expect(result.ptmState()?.held).toBe(false);
+      // The page holds nothing now: a later release sends nothing.
+      result.ptmUp("key");
+      result.ptmUp("button");
+      expect(ptmCalls()).toEqual([modeCall("apply")]);
+    });
+
+    it("a stale answer or tick after a newer one is ignored", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      await result.setPtmOn(true);
+      const now = engine.state();
+      expect(result.ptmState()).toEqual(now);
+      result.applyPtmState({ ...now, mode: "always", bypassed: false, seq: now.seq - 1 });
+      expect(result.ptmState()).toEqual(now);
+      expect(result.status()).toBe("clean");
+    });
+  });
+
+  describe("the page's holds", () => {
+    it("ptmDown twice sends one hold; ptmUp without a down sends nothing", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      invokeMock.mockClear();
+      result.ptmUp("key");
+      result.ptmUp("button");
+      expect(ptmCalls()).toEqual([]);
+      result.ptmDown("key");
+      result.ptmDown("key");
+      expect(ptmCalls()).toEqual([heldCall("key", true)]);
+      result.ptmUp("key");
+      result.ptmUp("key");
+      expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+      await settle();
+      expect(engine.held()).toEqual([]);
+    });
+
+    it("changing the push-to-modulate binding lets go of the key before the key changes", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      result.ptmDown("key");
+      await settle();
+      expect(engine.held()).toEqual(["key"]);
+      // What the in-app key was when the release went out.
+      const keyAtRelease: string[] = [];
+      const real = invokeMock.getMockImplementation()!;
+      invokeMock.mockImplementation((cmd: string, a?: Record<string, unknown>) => {
+        if (cmd === "set_ptm_held") keyAtRelease.push(result.ui.ptmKey);
+        return real(cmd, a);
+      });
+      invokeMock.mockClear();
+      await result.setHotkeyBinding("ptm", "F14");
+      expect(ptmCalls()).toEqual([heldCall("key", false)]);
+      expect(keyAtRelease).toEqual(["Space"]);
+      expect(result.ui.ptmKey).toBe("F14");
+      await settle();
+      expect(engine.held()).toEqual([]);
+      // Nothing held: binding another key sends nothing.
+      await result.setHotkeyBinding("ptm", "");
+      expect(ptmCalls()).toEqual([heldCall("key", false)]);
+    });
+  });
+
+  describe("MIDI, through the real handlers", () => {
+    const noteOn = (n: number) => ({ channel: 0, kind: "note-on" as const, data1: n, data2: 100 });
+    const noteOff = (n: number) => ({ channel: 0, kind: "note-off" as const, data1: n, data2: 0 });
+    const cc = (controller: number, value: number) => ({
+      channel: 0,
+      kind: "control-change" as const,
+      data1: controller,
+      data2: value,
+    });
+
+    /** A store with one learned `ptm` mapping per trigger given, and its ids
+     *  in the same order. */
+    async function withMappings(...triggers: Array<{ kind: "note" | "cc"; data1: number }>) {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      await result.setPtmOn(true);
+      for (const t of triggers) {
+        result.addMidiMapping({ action: "ptm", trigger: { ...t, channel: 0 } });
+      }
+      const ids = result.midiMappings().map((m) => m.id);
+      invokeMock.mockClear();
+      return { result, engine, ids };
+    }
+
+    it("two pads hold until both are up", async () => {
+      const { result, engine } = await withMappings(
+        { kind: "note", data1: 36 },
+        { kind: "note", data1: 37 },
+      );
+      result.handleMidiMessage(noteOn(36));
+      result.handleMidiMessage(noteOn(37));
+      result.handleMidiMessage(noteOff(36));
+      // Pad B is still down: no release.
+      expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+      await settle();
+      expect(engine.held()).toEqual(["midi"]);
+      result.handleMidiMessage(noteOff(37));
+      expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
+      // A stray note-off sends nothing.
+      result.handleMidiMessage(noteOff(37));
+      expect(ptmCalls()).toHaveLength(2);
+    });
+
+    it("a CC holds at 64 or more and lets go at 59 or less; jitter at halfway doesn't flap", async () => {
+      const { result } = await withMappings({ kind: "cc", data1: 20 });
+      for (const v of [63, 64, 62, 64, 60, 63]) result.handleMidiMessage(cc(20, v));
+      expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+      result.handleMidiMessage(cc(20, 59));
+      expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
+    });
+
+    it.each([
+      ["another device", "Deck B"],
+      ["None", null],
+    ] as const)("picking the input (%s) while a pad is held lets go", async (_, pick) => {
+      const { result, engine } = await withMappings({ kind: "note", data1: 36 });
+      result.handleMidiMessage(noteOn(36));
+      await result.selectMidiInput(pick);
+      expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
+      expect(engine.held()).toEqual([]);
+      // The old port's note-off, if it ever came, sends nothing.
+      result.handleMidiMessage(noteOff(36));
+      expect(ptmCalls()).toHaveLength(2);
+    });
+
+    it("entering learn on another mapping while a pad is held lets go", async () => {
+      const { result, engine, ids } = await withMappings(
+        { kind: "note", data1: 36 },
+        { kind: "note", data1: 37 },
+      );
+      result.handleMidiMessage(noteOn(36));
+      // Learn on mapping Y; learn swallows pad X's note-off.
+      result.setMidiLearnId(ids[1]!);
+      expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
+      result.handleMidiMessage(noteOff(36));
+      expect(result.midiLearnId()).toBeNull();
+      await settle();
+      expect(engine.held()).toEqual([]);
+      // Cancelling learn lets go of nothing more.
+      result.handleMidiMessage(noteOn(36));
+      result.setMidiLearnId(null);
+      expect(ptmCalls()).toEqual([
+        heldCall("midi", true),
+        heldCall("midi", false),
+        heldCall("midi", true),
+      ]);
+    });
+
+    it("editing or removing the held mapping lets go; editing another doesn't", async () => {
+      const { result, ids } = await withMappings(
+        { kind: "note", data1: 36 },
+        { kind: "note", data1: 37 },
+      );
+      result.handleMidiMessage(noteOn(36));
+      result.updateMidiMapping(ids[1]!, { trigger: { kind: "note", data1: 38, channel: 0 } });
+      expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+      result.updateMidiMapping(ids[0]!, { trigger: { kind: "note", data1: 40, channel: 0 } });
+      expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
+
+      invokeMock.mockClear();
+      result.handleMidiMessage(noteOn(40));
+      result.removeMidiMapping(ids[0]!);
+      expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
+    });
+
+    it("after a mode change, a CC resting up doesn't hold until it goes down and back up", async () => {
+      const { result, engine } = await withMappings({ kind: "cc", data1: 20 });
+      result.handleMidiMessage(cc(20, 70));
+      expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+      // The card's set lets go of every hold; the CC stays up.
+      await result.setPtmHold("bypass");
+      expect(engine.held()).toEqual([]);
+      invokeMock.mockClear();
+      result.handleMidiMessage(cc(20, 70));
+      result.handleMidiMessage(cc(20, 72));
+      expect(ptmCalls()).toEqual([]);
+      // Down: the set is already empty, so nothing to let go.
+      result.handleMidiMessage(cc(20, 50));
+      expect(ptmCalls()).toEqual([]);
+      result.handleMidiMessage(cc(20, 70));
+      expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+    });
+  });
+});

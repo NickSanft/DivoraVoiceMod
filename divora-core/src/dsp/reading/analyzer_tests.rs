@@ -553,9 +553,9 @@ fn the_wet_tap_reads_the_chain_and_the_dry_tap_reads_the_speaker() {
 
 #[test]
 fn a_bypassed_chain_is_labelled_not_diagnosed() {
-    // Push-to-modulate, key up: the chain is out of the path, so the wet tap
-    // is carrying the dry signal. That is not the preset having stopped
-    // working, and the reading says which it is.
+    // Push-to-modulate switching the effects off (v1.58.0): the chain is out
+    // of the path, so the wet tap is carrying the dry signal. That is not the
+    // preset having stopped working, and the reading says which it is.
     let sig = Voice::talking(48_000.0).render(4.0);
     let mut a = Analyzer::new(48_000);
     let facts = InputFacts {
@@ -574,6 +574,53 @@ fn a_bypassed_chain_is_labelled_not_diagnosed() {
         (r.wet.f0_hz - r.dry.f0_hz).abs() < 1.0,
         "a passthrough read differently from its own input"
     );
+}
+
+/// v1.58.0 (U6): a held reading keeps the verdict of the window it holds, as
+/// it keeps that window's numbers. Push-to-modulate can switch the effects
+/// off in the pause after a disguised phrase; the live verdict beside that
+/// phrase's held after-effects numbers would call them a passthrough. With
+/// nothing held, the live verdict is all there is.
+#[test]
+fn a_held_reading_keeps_its_windows_bypass_verdict() {
+    let rate = 48_000.0;
+    let mut a = Analyzer::new(48_000);
+    let bypassed = InputFacts {
+        chain_bypassed: true,
+        ..InputFacts::default()
+    };
+    let room = noise(rate, 4.0, 0.0003);
+    let fresh = feed(&mut a, &room[..48_000], &room[..48_000], bypassed);
+    assert!(!fresh.is_empty() && fresh.iter().all(|r| !r.held && r.wet_bypassed));
+
+    let voice = Voice::talking(rate);
+    let mut shifted = voice.clone();
+    shifted.f0 = voice.f0 * 2f32.powf(5.0 / 12.0);
+    // (the phrase's wet, its facts, the facts once the pause holds it)
+    for (wet, during, after) in [
+        (shifted.render(4.0), InputFacts::default(), bypassed),
+        (voice.render(4.0), bypassed, InputFacts::default()),
+    ] {
+        let spoken = feed(&mut a, &voice.render(4.0), &wet, during);
+        let phrase = last_speaking(&spoken).wet_bypassed;
+        assert_eq!(phrase, during.chain_bypassed);
+        // The pause, until the window no longer carries the phrase: a
+        // reading still Speaking describes the window it measured.
+        let (settle, rest) = room.split_at(96_000);
+        let quiet = feed(&mut a, settle, settle, during);
+        assert!(quiet.last().is_some_and(|r| r.held), "the pause never held");
+        // Then the switch, in the pause.
+        let pause = feed(&mut a, rest, rest, after);
+        let held: Vec<_> = pause.iter().filter(|r| r.held).collect();
+        assert_eq!(held.len(), pause.len(), "a pause read as speech");
+        assert!(held.len() > 4, "only {} held readings", held.len());
+        for r in held {
+            assert_eq!(
+                r.wet_bypassed, phrase,
+                "a held reading took the pause's verdict"
+            );
+        }
+    }
 }
 
 #[test]

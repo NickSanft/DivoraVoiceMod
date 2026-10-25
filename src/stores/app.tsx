@@ -943,15 +943,20 @@ export interface AppState {
   refreshMidiInputs: () => Promise<void>;
   /** The currently-open MIDI input name, or null when disconnected. */
   selectedMidiInput: () => string | null;
-  /** Open (name) or close (null) a MIDI input port; persists the choice. */
+  /** Open (name) or close (null) a MIDI input port; persists the choice.
+   *  v1.58.0: lets go of push-to-modulate's MIDI hold, every mapping's. */
   selectMidiInput: (name: string | null) => Promise<void>;
   /** User's note/CC → action mappings (persisted). */
   midiMappings: () => MidiMapping[];
   addMidiMapping: (mapping: Omit<MidiMapping, "id">) => void;
+  /** v1.58.0: lets go of push-to-modulate's MIDI hold for that mapping. */
   updateMidiMapping: (id: string, patch: Partial<MidiMapping>) => void;
+  /** v1.58.0: lets go of push-to-modulate's MIDI hold for that mapping. */
   removeMidiMapping: (id: string) => void;
   /** The mapping id currently capturing its trigger via MIDI-learn, or null. */
   midiLearnId: () => string | null;
+  /** v1.58.0: entering learn (any id) lets go of push-to-modulate's MIDI
+   *  hold, every mapping's: learn swallows the note-offs. */
   setMidiLearnId: (id: string | null) => void;
   /** Feed a `midi-message` in: learns a trigger if armed, else routes it. */
   handleMidiMessage: (msg: MidiMessage) => void;
@@ -1061,7 +1066,9 @@ export interface AppState {
    *  didn't hold it already, so a second down sends nothing. */
   ptmDown: (source: "key" | "button") => void;
   /** The page lets go for `source`. Sends only if the page held it, so a
-   *  stray up sends nothing. */
+   *  stray up sends nothing. The shell calls it for both sources when the
+   *  window loses the focus or the page is hidden, where no keyup or
+   *  pointerup would come. */
   ptmUp: (source: "key" | "button") => void;
   /** The mirror's only writer: takes `incoming` only if it is newer. Never
    *  touches `ptmKnown`. */
@@ -2067,8 +2074,14 @@ export function createAppState(): AppState {
   // v1.54.0: when the voice last became modulated with the current preset,
   // for Replay's save toast. The AV tap carries what the call hears, so a
   // clip holds the disguised voice only while the status says "modulated":
-  // push-to-modulate up in apply mode, no effect on, or muted is the user's
-  // own voice (or nothing). A preset change restarts the clock.
+  // push-to-modulate up in Hold to apply (or down in Hold to bypass), no
+  // effect on but the noise gate, or muted is the user's own voice (or
+  // nothing). A preset change restarts the clock. v1.58.0: true of
+  // push-to-modulate now, not only of the pill: the engine switches the
+  // effects inside the voice stage, before the AV tap, and the status reads
+  // its mirror. The mirror lands a tick or a round trip after the engine
+  // turns the effects on, so this clock starts after they did: it errs
+  // toward not naming the preset.
   const [modulatedSince, setModulatedSince] = createSignal<number | null>(null);
   createEffect(
     on([status, presetId], ([s]) => {
@@ -2959,8 +2972,11 @@ export function createAppState(): AppState {
     const accelerator = normalizeAccelerator(rawAccelerator);
     setHotkeyBindings(action, accelerator);
     saveJson(STORAGE_KEYS.hotkeyBindings, { ...hotkeyBindings });
-    // PTM also drives the in-app fallback listener via ui.ptmKey.
+    // PTM also drives the in-app fallback listener via ui.ptmKey. v1.58.0:
+    // the page lets go of the in-app key first, so a key held under the old
+    // binding can't stay held: its keyup would no longer match.
     if (action === "ptm") {
+      ptmUp("key");
       setUi("ptmKey", accelerator || "Space");
     }
     if (!accelerator) {
@@ -3040,8 +3056,27 @@ export function createAppState(): AppState {
   // while closed) is a control we haven't heard yet.
   const muteCcSides = new Map<string, boolean>();
 
+  // v1.58.0: push-to-modulate's MIDI hold, forgotten where a note-off or a
+  // CC's fall could no longer reach it. Every mapping on an input pick (the
+  // old port's pads go quiet, and the same numbers on the new one are
+  // controls we haven't heard) and on entering learn (learn swallows every
+  // message, the note-off of a pad held on another mapping included); one
+  // mapping when it changes or goes. Lets go in the engine if that empties
+  // the set.
+  const forgetPtmMidi = (id?: string): void =>
+    changePtmMidi(() => {
+      if (id === undefined) {
+        ptmMidiDown.clear();
+        ptmCcSides.clear();
+      } else {
+        ptmMidiDown.delete(id);
+        ptmCcSides.delete(id);
+      }
+    });
+
   const selectMidiInput = async (name: string | null): Promise<void> => {
     muteCcSides.clear();
+    forgetPtmMidi();
     setSelectedMidiInput(name);
     saveJson(STORAGE_KEYS.midiInput, name);
     try {
@@ -3065,6 +3100,7 @@ export function createAppState(): AppState {
 
   const updateMidiMapping = (id: string, patch: Partial<MidiMapping>): void => {
     muteCcSides.delete(id);
+    forgetPtmMidi(id);
     persistMidiMappings(
       midiMappings().map((m) => (m.id === id ? { ...m, ...patch } : m)),
     );
@@ -3073,10 +3109,12 @@ export function createAppState(): AppState {
   const removeMidiMapping = (id: string): void => {
     if (midiLearnId() === id) setMidiLearnIdRaw(null);
     muteCcSides.delete(id);
+    forgetPtmMidi(id);
     persistMidiMappings(midiMappings().filter((m) => m.id !== id));
   };
 
   const setMidiLearnId = (id: string | null): void => {
+    if (id !== null) forgetPtmMidi();
     setMidiLearnIdRaw(id);
   };
 

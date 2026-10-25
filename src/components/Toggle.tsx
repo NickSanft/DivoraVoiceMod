@@ -2,8 +2,12 @@
 // `tone` lets you swap the on-tint to danger or success.
 //
 // v1.54.0: `disabled` (Settings' screen-recording rows while Replay is on).
+// v1.58.0: `blurOnPointer` hands focus back to the page after a mouse or
+// touch click, so Space reaches push-to-modulate again (Push to modulate's
+// own switch); `ariaDescribedBy` names the line that says what it does.
 
 import type { JSX } from "solid-js";
+import { blurOnPointer } from "./blurOnPointer";
 
 export interface ToggleProps {
   on: boolean;
@@ -12,6 +16,9 @@ export interface ToggleProps {
   ariaLabel?: string;
   disabled?: boolean;
   title?: string;
+  /** A pointer click leaves the focus on the page, not on the switch. */
+  blurOnPointer?: boolean;
+  ariaDescribedBy?: string;
 }
 
 export function Toggle(props: ToggleProps): JSX.Element {
@@ -22,9 +29,11 @@ export function Toggle(props: ToggleProps): JSX.Element {
       role="switch"
       aria-checked={props.on}
       aria-label={props.ariaLabel}
+      aria-describedby={props.ariaDescribedBy}
       disabled={props.disabled}
       title={props.title}
-      onClick={() => {
+      onClick={(e) => {
+        if (props.blurOnPointer) blurOnPointer(e);
         if (!props.disabled) props.onChange?.(!props.on);
       }}
     >

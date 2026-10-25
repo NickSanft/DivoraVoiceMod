@@ -3,9 +3,13 @@
 //
 // v1.54.0: the whole group can be `disabled`, and so can one option, with a
 // `title` that says why (Replay's lengths over this PC's memory ceiling).
+// v1.58.0: `blurOnPointer` hands focus back to the page after a mouse or
+// touch click, so Space reaches push-to-modulate again (Push to modulate's
+// Hold to apply / Hold to bypass).
 
 import type { JSX } from "solid-js";
 import { For } from "solid-js";
+import { blurOnPointer } from "./blurOnPointer";
 
 export type SegmentedOption<T extends string> =
   | T
@@ -17,6 +21,8 @@ export interface SegmentedProps<T extends string> {
   onChange: (next: T) => void;
   accent?: boolean;
   disabled?: boolean;
+  /** A pointer click leaves the focus on the page, not on the option. */
+  blurOnPointer?: boolean;
 }
 
 export function Segmented<T extends string>(props: SegmentedProps<T>): JSX.Element {
@@ -37,7 +43,8 @@ export function Segmented<T extends string>(props: SegmentedProps<T>): JSX.Eleme
               }`}
               disabled={off()}
               title={typeof o === "string" ? undefined : o.title}
-              onClick={() => {
+              onClick={(e) => {
+                if (props.blurOnPointer) blurOnPointer(e);
                 if (!off()) props.onChange(value);
               }}
             >

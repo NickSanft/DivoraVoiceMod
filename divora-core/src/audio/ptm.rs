@@ -610,12 +610,105 @@ impl PtmStage {
 #[allow(clippy::float_cmp)] // every gain is exact, so the outputs are compared exactly
 mod tests {
     use super::{
-        is_bypassed, pack, ptm_fade_len, ptm_transition, unpack, DryLine, PtmMode, PtmOp,
-        PtmSource, PtmStage, PtmState, SEQ_MAX,
+        is_bypassed, pack, ptm_fade_len, ptm_transition, unpack, DryLine, Move, PtmGate, PtmMode,
+        PtmOp, PtmSource, PtmStage, PtmState, ALIGN_DRY, SEQ_MAX,
     };
 
     /// The bundled presets' rate.
     const RATE: u32 = 48_000;
+
+    /// Every fade length there is.
+    const LENS: [u16; 6] = [128, 256, 512, 1024, 2048, 4096];
+
+    /// Design §7.3's rates.
+    const RATES: [u32; 13] = [
+        8_000, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
+        192_000, 384_000,
+    ];
+
+    /// A signalling NaN. x86 `mulss` quiets it, so it is the one value that
+    /// shows a multiply by 1.0: every other value survives `x · 1.0` intact.
+    const SNAN: f32 = f32::from_bits(0x7f80_0001);
+
+    /// Values a gain or a copy could change: NaNs, infinities, both zeros,
+    /// subnormals, the extremes.
+    const ODD: [f32; 15] = [
+        f32::NAN,
+        f32::from_bits(0x7fc0_1234),
+        f32::from_bits(0xffc0_0001),
+        SNAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -0.0,
+        0.0,
+        f32::from_bits(1),
+        f32::from_bits(0x8000_0001),
+        f32::from_bits(0x007f_ffff),
+        f32::MIN_POSITIVE,
+        0.5,
+        -1.0,
+        f32::MAX,
+    ];
+
+    /// The fade length at [`RATE`], as a count.
+    fn fade() -> usize {
+        usize::from(ptm_fade_len(RATE))
+    }
+
+    /// `1, 2, 3, …`: every value distinct and exact, so a delayed copy can be
+    /// told from any other, and `value − 1` is the index it came from.
+    #[allow(clippy::cast_precision_loss)] // integers well under 2^24
+    fn ramp(n: usize) -> Vec<f32> {
+        (1..=n).map(|i| i as f32).collect()
+    }
+
+    /// The largest step in `y`, counting the one from `prev` into it.
+    fn max_step(prev: f32, y: &[f32]) -> f32 {
+        let mut last = prev;
+        let mut max = 0.0_f32;
+        for &s in y {
+            max = max.max((s - last).abs());
+            last = s;
+        }
+        max
+    }
+
+    /// xorshift64: a seeded walk, the same every run.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// Uniform in `0..n`.
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(n).unwrap()).unwrap()
+        }
+
+        /// Uniform in `-0.5..0.5`.
+        fn unit(&mut self) -> f32 {
+            f32::from(u16::try_from(self.next() >> 48).unwrap()) / 65_536.0 - 0.5
+        }
+    }
+
+    /// The `i`th sample of a stream named by `salt`, in `-0.5..0.5`, from the
+    /// index alone (splitmix64), so an oracle can ask for any past sample.
+    fn noise_at(i: usize, salt: u64) -> f32 {
+        let mut z = u64::try_from(i)
+            .unwrap()
+            .wrapping_add(salt)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        f32::from(u16::try_from(z >> 48).unwrap()) / 65_536.0 - 0.5
+    }
 
     /// A signal with no repeats in any window shorter than 997 and no zeros,
     /// so a bit compare means something.
@@ -929,5 +1022,783 @@ mod tests {
         let (crossed, _, _) = buffer(&mut stage, 1, false);
         assert!(crossed && !stage.settled());
         assert_eq!(usize::from(stage.gate.pos()), l - 1);
+    }
+
+    // ---- the gate ----
+
+    /// Settled on the effects, and with an edge toward the dry still
+    /// waiting, the gate leaves the wet as it is, bit for bit, and never
+    /// reads the dry: a gain of 1 would quiet the signalling NaN, and a
+    /// blend of 0 with a NaN dry would be NaN.
+    #[test]
+    fn an_applied_gate_is_bit_exact() {
+        let nan = [f32::NAN; ODD.len()];
+        for len in LENS {
+            let mut gate = PtmGate::new(len, false);
+            for _ in 0..3 {
+                let mut wet = ODD;
+                assert!(!gate.blend(false, 4096, &mut wet, &nan));
+                assert_eq!(bits(&wet), bits(&ODD), "L {len}: settled applied");
+            }
+            assert!(gate.settled());
+
+            // Waiting out a latency longer than three buffers.
+            let wait = 3 * ODD.len() + 1;
+            for _ in 0..3 {
+                let mut wet = ODD;
+                assert!(!gate.blend(true, wait, &mut wet, &nan));
+                assert_eq!(bits(&wet), bits(&ODD), "L {len}: waiting");
+                assert!(gate.waiting() && gate.pos() == 0);
+            }
+
+            // A wait that ends inside the buffer: nothing before the turn.
+            for wait in [1, 5, ODD.len() - 1] {
+                let mut gate = PtmGate::new(len, false);
+                let mut wet = ODD;
+                assert!(gate.blend(true, wait, &mut wet, &nan));
+                assert_eq!(
+                    bits(&wet[..wait]),
+                    bits(&ODD[..wait]),
+                    "L {len}: wait {wait}"
+                );
+            }
+        }
+    }
+
+    /// Settled on the dry, the gate copies it, bits and all (a signalling
+    /// NaN and −0.0 survive a copy, not a multiply), and nothing of the wet
+    /// leaks through, NaN included; the same from the sample a crossing
+    /// settles on.
+    #[test]
+    fn a_bypassed_gate_is_the_dry_exactly() {
+        for len in LENS {
+            let l = usize::from(len);
+            let mut gate = PtmGate::new(len, true);
+            for _ in 0..3 {
+                let mut wet = [f32::NAN; ODD.len()];
+                assert!(!gate.blend(true, 4096, &mut wet, &ODD));
+                assert_eq!(bits(&wet), bits(&ODD), "L {len}: settled bypassed");
+            }
+
+            let dry: Vec<f32> = ODD.iter().copied().cycle().take(l + 45).collect();
+            let mut wet = vec![f32::NAN; dry.len()];
+            let mut gate = PtmGate::new(len, false);
+            assert!(gate.blend(true, 0, &mut wet, &dry));
+            assert_eq!(
+                bits(&wet[l - 1..]),
+                bits(&dry[l - 1..]),
+                "L {len}: settling"
+            );
+            assert!(gate.settled());
+        }
+    }
+
+    /// Design §3.2: a wet of 0 against a dry of 0.5 reads the gain straight
+    /// off the output: `0.5·k/L` for `k = 1..L` exactly, then the dry; and
+    /// back down the same steps, ending on the wet itself.
+    #[test]
+    fn the_fade_is_linear_and_exact() {
+        for len in LENS {
+            let l = usize::from(len);
+            let at = |k: u16| 0.5 * (f32::from(k) / f32::from(len));
+            let dry = vec![0.5_f32; 2 * l];
+            let mut gate = PtmGate::new(len, false);
+            let mut y = vec![0.0_f32; 2 * l];
+            assert!(gate.blend(true, 0, &mut y, &dry));
+            for k in 1..=len {
+                assert_eq!(y[usize::from(k) - 1], at(k), "L {len}: k {k}");
+            }
+            assert!(y[l..].iter().all(|&s| s == 0.5), "L {len}: not settled");
+
+            let mut y = vec![0.0_f32; 2 * l];
+            assert!(gate.blend(false, 0, &mut y, &dry));
+            for (i, k) in (0..len).rev().enumerate() {
+                assert_eq!(y[i].to_bits(), at(k).to_bits(), "L {len}: back, k {k}");
+            }
+            assert!(
+                y[l..].iter().all(|s| s.to_bits() == 0),
+                "L {len}: not the wet"
+            );
+        }
+    }
+
+    /// When the dry is the wet (a chain that is a pure delay, aligned), every
+    /// crossing changes nothing at all: `w + (d − w)·g` is `w` when `d == w`.
+    #[test]
+    fn a_pure_delay_crosses_with_no_change() {
+        let mut rng = XorShift(0x853c_49e6_748f_ea9b);
+        for len in LENS {
+            let l = usize::from(len);
+            let mut gate = PtmGate::new(len, false);
+            let mut crossed = 0;
+            for _ in 0..300 {
+                let frames = 1 + rng.below(3 * l);
+                let bypassed = rng.next().is_multiple_of(2);
+                let wait = rng.below(2 * l);
+                let wet: Vec<f32> = (0..frames).map(|_| rng.unit()).collect();
+                let mut y = wet.clone();
+                crossed += usize::from(gate.blend(bypassed, wait, &mut y, &wet));
+                assert_eq!(bits(&y), bits(&wet), "L {len}");
+            }
+            assert!(crossed > 10, "L {len}: only {crossed} buffers crossed");
+        }
+    }
+
+    /// A wet of +0.5 against a dry of −0.5, the largest jump there is: every
+    /// step of every fade is exactly 1/L, at every rate.
+    #[test]
+    fn no_step_larger_than_the_slope() {
+        for rate in RATES {
+            let len = ptm_fade_len(rate);
+            let l = usize::from(len);
+            let slope = 1.0 / f32::from(len);
+            let dry = vec![-0.5_f32; 2 * l];
+            let mut gate = PtmGate::new(len, false);
+            let mut last = 0.5_f32;
+            for bypassed in [true, false, true, false] {
+                let mut y = vec![0.5_f32; 2 * l];
+                gate.blend(bypassed, 0, &mut y, &dry);
+                let mut steps = 0;
+                for &s in &y {
+                    let step = (s - last).abs();
+                    assert!(step == 0.0 || step == slope, "{rate} Hz: a step of {step}");
+                    steps += usize::from(step > 0.0);
+                    last = s;
+                }
+                assert_eq!(steps, l, "{rate} Hz: not one whole fade");
+                assert_eq!(last, if bypassed { -0.5 } else { 0.5 });
+            }
+        }
+    }
+
+    /// D8b: an edge toward the dry holds `pos` at 0 for exactly the wait it
+    /// was given, then moves one step a sample. The wait is taken at the
+    /// edge: what later calls pass (here 0 and 99 999 in turn) doesn't
+    /// change when it moves.
+    #[test]
+    fn an_edge_toward_the_dry_waits() {
+        let len = ptm_fade_len(RATE);
+        let l = usize::from(len);
+        // Where `pos` is after sample `i` of an edge that waits `wait`.
+        let pos_at = |wait: usize, i: usize| (i + 1).saturating_sub(wait).min(l);
+        // The wait later calls pass.
+        let later = |call: usize| if call.is_multiple_of(2) { 0 } else { 99_999 };
+        for wait in [0, 1, 511, 512, 2048, 12_547] {
+            // A sample a call, read through the accessor.
+            let mut gate = PtmGate::new(len, false);
+            for i in 0..wait + l + 10 {
+                let mut y = [0.0_f32];
+                gate.blend(true, if i == 0 { wait } else { later(i) }, &mut y, &[1.0]);
+                assert_eq!(usize::from(gate.pos()), pos_at(wait, i), "wait {wait}: {i}");
+                assert_eq!(gate.waiting(), i < wait, "wait {wait}: {i}");
+            }
+            // Bigger calls, read off the output: a wet of 0 and a dry of 1
+            // put `pos/L` on every sample.
+            for split in [7, 480, 4096] {
+                let mut gate = PtmGate::new(len, false);
+                let total = wait + l + 10;
+                let mut y = vec![0.0_f32; total];
+                for (call, chunk) in y.chunks_mut(split).enumerate() {
+                    let w = if call == 0 { wait } else { later(call) };
+                    gate.blend(true, w, chunk, &vec![1.0; chunk.len()]);
+                }
+                for (i, &s) in y.iter().enumerate() {
+                    let want = f32::from(u16::try_from(pos_at(wait, i)).unwrap()) / f32::from(len);
+                    assert_eq!(s, want, "wait {wait}, buffers of {split}: sample {i}");
+                }
+            }
+        }
+    }
+
+    /// An edge back toward the effects before the wait ends cancels it: at
+    /// every offset into the wait, `pos` never leaves 0, and a NaN dry never
+    /// reaches the buffer however long it then runs.
+    #[test]
+    fn a_flip_back_during_the_wait_cancels_it() {
+        let len = ptm_fade_len(RATE);
+        for wait in [600, 2048] {
+            let nan = vec![f32::NAN; 2 * wait + 4 * usize::from(len)];
+            let wet = signal(nan.len());
+            for offset in 1..wait {
+                let mut gate = PtmGate::new(len, false);
+                let mut y = wet.clone();
+                let (first, rest) = y.split_at_mut(offset);
+                assert!(!gate.blend(true, wait, first, &nan));
+                assert!(gate.waiting());
+                assert!(!gate.blend(false, wait, rest, &nan));
+                assert!(gate.settled() && gate.pos() == 0, "wait {wait}: {offset}");
+                assert!(
+                    bits(&y) == bits(&wet),
+                    "wait {wait}: touched, flipped at {offset}"
+                );
+            }
+        }
+    }
+
+    /// An edge toward the effects doesn't wait, whatever wait it is passed:
+    /// `pos` moves on its first sample.
+    #[test]
+    fn an_edge_toward_the_wet_starts_at_once() {
+        for len in LENS {
+            for frames in [1, 7, 480] {
+                let mut gate = PtmGate::new(len, true);
+                let mut y = vec![0.0_f32; frames];
+                assert!(gate.blend(false, 2048, &mut y, &vec![1.0; frames]));
+                assert_eq!(y[0], f32::from(len - 1) / f32::from(len), "L {len}");
+                assert_eq!(
+                    usize::from(gate.pos()),
+                    usize::from(len).saturating_sub(frames),
+                    "L {len}, {frames} frames"
+                );
+            }
+        }
+    }
+
+    /// A flip mid-fade turns round rather than snapping to either end: toward
+    /// the effects on the very next sample; toward the dry only after the
+    /// wait, heading on toward the effects meanwhile. Either way the output
+    /// stays continuous, no step over the slope, at every offset into the
+    /// fade.
+    #[test]
+    fn a_toggle_mid_fade_turns_round() {
+        let len = ptm_fade_len(RATE);
+        let l = usize::from(len);
+        let slope = 1.0 / f32::from(len);
+        // A wet of +0.5 and a dry of −0.5: `0.5 − pos/L`, exactly.
+        let out = |pos: usize| 0.5 - f32::from(u16::try_from(pos).unwrap()) * slope;
+        for offset in 1..l {
+            // Heading for the dry, then back toward the effects at once.
+            let mut gate = PtmGate::new(len, false);
+            let mut there = vec![0.5_f32; offset];
+            gate.blend(true, 0, &mut there, &vec![-0.5; offset]);
+            assert_eq!(usize::from(gate.pos()), offset);
+            let mut back = vec![0.5_f32; 2 * l];
+            gate.blend(false, 0, &mut back, &vec![-0.5; 2 * l]);
+            for (j, &s) in back.iter().enumerate() {
+                assert_eq!(
+                    s,
+                    out(offset.saturating_sub(j + 1)),
+                    "back at {offset}: {j}"
+                );
+            }
+            let step = max_step(0.5, &there).max(max_step(there[offset - 1], &back));
+            assert!(step <= slope, "back at {offset}: a step of {step}");
+            assert!(gate.settled());
+
+            // Heading for the effects, then back toward the dry after `wait`.
+            for wait in [0, 1, 100, l / 2, 2 * l] {
+                let mut gate = PtmGate::new(len, true);
+                let mut there = vec![0.5_f32; offset];
+                gate.blend(false, 0, &mut there, &vec![-0.5; offset]);
+                let from = l - offset;
+                assert_eq!(usize::from(gate.pos()), from);
+                let mut back = vec![0.5_f32; wait + 2 * l];
+                gate.blend(true, wait, &mut back, &vec![-0.5; wait + 2 * l]);
+                let turned = from.saturating_sub(wait);
+                for (j, &s) in back.iter().enumerate() {
+                    let pos = if j < wait {
+                        from.saturating_sub(j + 1)
+                    } else {
+                        (turned + j + 1 - wait).min(l)
+                    };
+                    assert_eq!(s, out(pos), "forth at {offset}, wait {wait}: {j}");
+                }
+                let step = max_step(out(l), &there).max(max_step(there[offset - 1], &back));
+                assert!(
+                    step <= slope,
+                    "forth at {offset}, wait {wait}: a step of {step}"
+                );
+                assert!(gate.settled());
+            }
+        }
+    }
+
+    // ---- buffers ----
+
+    /// The gate, the line and the whole stage give the same output however a
+    /// run is split into buffers, given the request holds within each phase
+    /// (the callback reads it once a buffer): one call per phase against
+    /// calls of 1 to 4096 frames, bit for bit. Phases shorter than a fade, a
+    /// wait and a line move put flips and latency changes mid-fade, mid-wait
+    /// and mid-move. A rule applied once a call instead of once a sample (the
+    /// fade's position reset, a pending move picked up at the next call)
+    /// fails it.
+    #[test]
+    fn buffers_of_any_size_give_one_result() {
+        // (bypassed, latency, length); no phase over 4096, the most one
+        // call may carry.
+        let phases: [(bool, usize, usize); 18] = [
+            (false, 0, 3000),
+            (false, 1024, 700),
+            (true, 1024, 300),
+            (true, 2048, 4000),
+            (false, 2048, 200),
+            (true, 2048, 2500),
+            (true, 512, 1000),
+            (false, 512, 100),
+            (true, 512, 4096),
+            (true, 0, 4096),
+            (false, 100, 300),
+            (true, 3000, 4096),
+            (false, 3000, 4096),
+            (true, 3000, 4096),
+            (true, 3000, 4096),
+            (false, 0, 50),
+            (true, 0, 600),
+            (true, 70_000, 4096),
+        ];
+        let total = phases.iter().map(|&(_, _, n)| n).sum();
+        let (input, wet) = (
+            signal(total),
+            (0..total).map(|i| noise_at(i, 1)).collect::<Vec<_>>(),
+        );
+        // One run of each part, every phase split into `split`-frame calls:
+        // the gate (the latency as its wait), the line, the stage.
+        let run = |split: usize| {
+            let len = ptm_fade_len(RATE);
+            let (mut gate, mut line) = (PtmGate::new(len, false), DryLine::new(RATE, len));
+            let mut stage = PtmStage::new(RATE, false);
+            let (mut gated, mut lined, mut staged) = (Vec::new(), Vec::new(), Vec::new());
+            let mut at = 0;
+            for &(bypassed, latency, n) in &phases {
+                for start in (at..at + n).step_by(split) {
+                    let end = (start + split).min(at + n);
+                    let mut y = wet[start..end].to_vec();
+                    gate.blend(bypassed, latency, &mut y, &input[start..end]);
+                    gated.extend(y);
+                    line.capture(&input[start..end], latency);
+                    lined.extend_from_slice(line.aligned(end - start));
+                    stage.capture(&input[start..end], latency);
+                    let mut y = wet[start..end].to_vec();
+                    stage.blend(&mut y, bypassed);
+                    staged.extend(y);
+                }
+                at += n;
+            }
+            (bits(&gated), bits(&lined), bits(&staged))
+        };
+        let whole = run(4096);
+        for split in [1, 7, 100, 255, 480, 1056] {
+            let (gated, lined, staged) = run(split);
+            assert!(gated == whole.0, "the gate: buffers of {split} differ");
+            assert!(lined == whole.1, "the line: buffers of {split} differ");
+            assert!(staged == whole.2, "the stage: buffers of {split} differ");
+        }
+    }
+
+    // ---- the line ----
+
+    /// Once the line's move from 0 has ended (`d + 2L` samples), its output
+    /// is the input delayed by `d`, exactly, at every buffer size, out to the
+    /// longest delay it holds.
+    #[test]
+    fn the_dry_is_the_input_delayed_by_the_latency() {
+        let len = ptm_fade_len(RATE);
+        let l = usize::from(len);
+        let max = DryLine::new(RATE, len).max_delay();
+        for d in [0, 1, 63, 480, 883, 1023, 1024, 2048, 4096, 12_547, max] {
+            let input = ramp(d + 2 * l + 3000);
+            for split in [1, 7, 100, 255, 480, 1056, 4096] {
+                let mut line = DryLine::new(RATE, len);
+                let mut out = Vec::with_capacity(input.len());
+                for chunk in input.chunks(split) {
+                    line.capture(chunk, d);
+                    out.extend_from_slice(line.aligned(chunk.len()));
+                }
+                assert!(!line.moving() && line.delay() == d && line.want() == d);
+                for i in d + 2 * l..input.len() {
+                    assert_eq!(
+                        out[i].to_bits(),
+                        input[i - d].to_bits(),
+                        "delay {d}, buffers of {split}: sample {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// K11: a latency past the ring's reach is clamped to it, without a
+    /// panic, and the line then delays by the most it can.
+    #[test]
+    fn a_latency_past_the_ring_is_clamped() {
+        let len = ptm_fade_len(RATE);
+        let l = usize::from(len);
+        let max = DryLine::new(RATE, len).max_delay();
+        let input = ramp(max + 2 * l + 3000);
+        for asked in [max + 1, 10 * max, usize::MAX] {
+            let mut line = DryLine::new(RATE, len);
+            let mut out = Vec::with_capacity(input.len());
+            for chunk in input.chunks(4096) {
+                line.capture(chunk, asked);
+                out.extend_from_slice(line.aligned(chunk.len()));
+            }
+            assert_eq!((line.want(), line.delay()), (max, max), "asked {asked}");
+            for i in max + 2 * l..input.len() {
+                assert_eq!(out[i], input[i - max], "asked {asked}: sample {i}");
+            }
+        }
+    }
+
+    /// One line run: `input` in `split`-frame calls, the latency `latency(i)`
+    /// for the call starting at sample `i`. Its output.
+    fn line_run(input: &[f32], split: usize, latency: impl Fn(usize) -> usize) -> Vec<f32> {
+        let mut line = DryLine::new(RATE, ptm_fade_len(RATE));
+        let mut out = Vec::with_capacity(input.len());
+        for (call, chunk) in input.chunks(split).enumerate() {
+            line.capture(chunk, latency(call * split));
+            out.extend_from_slice(line.aligned(chunk.len()));
+        }
+        out
+    }
+
+    /// D4, a shrink: the old tap crossfades to the new one over L, so the
+    /// difference is skipped, blended. A steady input doesn't change at all;
+    /// a ramp's step is never more than its own plus `Δ/L` of it, and from L
+    /// on the output is the input delayed by the new latency.
+    #[test]
+    fn a_shrink_crossfades_between_the_taps() {
+        let l = fade();
+        // Settled at 2048 well before it, and a multiple of every split.
+        let edge = 4800;
+        let latency = |i: usize| if i < edge { 2048 } else { 1024 };
+        for split in [1, 100, 480, 2400] {
+            let dc = line_run(&vec![1.0; edge + 3 * l], split, latency);
+            assert!(
+                dc[2048 + 2 * l..].iter().all(|&s| s == 1.0),
+                "buffers of {split}: a steady input moved"
+            );
+
+            let input = ramp(edge + 3 * l);
+            let out = line_run(&input, split, latency);
+            // The ramp rises 1 a sample; the shrink adds 1024/L a sample.
+            let bound = 1.0 + 1024.0 / f32::from(u16::try_from(l).unwrap());
+            let step = max_step(out[edge - 1], &out[edge..]);
+            assert!(step <= bound, "buffers of {split}: a step of {step}");
+            assert!(step > 1.0, "buffers of {split}: no crossfade");
+            for i in edge + l - 1..out.len() {
+                assert_eq!(out[i], input[i - 1024], "buffers of {split}: sample {i}");
+            }
+        }
+    }
+
+    /// The gain the line puts on its taps through one growth from `from` to
+    /// `to` that starts at sample `t0`, and the input index it is reading:
+    /// `L` out from the old tap (its last sample at gain 0), `to − from`
+    /// silent, `L` in on the new tap, then the new tap.
+    fn growth(i: usize, t0: usize, from: usize, to: usize) -> (f32, usize) {
+        let l = fade();
+        let gain = |k: usize| f32::from(u16::try_from(k).unwrap()) / f32::from(ptm_fade_len(RATE));
+        let gap = to - from;
+        if i < t0 {
+            (1.0, i - from)
+        } else if i < t0 + l {
+            (gain(l - (i - t0 + 1)), i - from)
+        } else if i < t0 + l + gap {
+            (0.0, 0)
+        } else if i < t0 + 2 * l + gap {
+            (gain(i - (t0 + l + gap) + 1), i - to)
+        } else {
+            (1.0, i - to)
+        }
+    }
+
+    /// D4, a growth: the old tap fades out, the line is silent for the
+    /// difference, the new tap fades in. With a steady input the output is
+    /// that envelope exactly; with `x[i] = i + 1` every sample heard (gain
+    /// over 0) names its source as `y / g`, and the sources only ever rise
+    /// across the whole run: nothing is heard twice. Two runs: a new line
+    /// given 2048, and one at 1024 given 2048.
+    #[test]
+    fn a_growth_pauses_and_repeats_nothing() {
+        /// Where the second run grows, once settled at 1024: a multiple of
+        /// every split below, so a call starts there.
+        const EDGE: usize = 4800;
+        // (the latency asked for from sample i, the envelope at i)
+        type Run = (fn(usize) -> usize, fn(usize) -> (f32, usize));
+        let runs: [Run; 2] = [
+            (|_| 2048, |i| growth(i, 0, 0, 2048)),
+            (
+                |i| if i < EDGE { 1024 } else { 2048 },
+                |i| {
+                    if i < EDGE {
+                        growth(i, 0, 0, 1024)
+                    } else {
+                        growth(i, EDGE, 1024, 2048)
+                    }
+                },
+            ),
+        ];
+        let total = EDGE + 2048 + 2 * fade() + 1000;
+        for (latency, envelope) in runs {
+            for split in [1, 100, 480, 2400] {
+                let dc = line_run(&vec![1.0; total], split, latency);
+                for (i, &y) in dc.iter().enumerate() {
+                    assert_eq!(y, envelope(i).0, "buffers of {split}: steady, sample {i}");
+                }
+                let input = ramp(total);
+                let out = line_run(&input, split, latency);
+                let mut last = None;
+                for (i, &y) in out.iter().enumerate() {
+                    let (g, source) = envelope(i);
+                    if g == 0.0 {
+                        assert_eq!(y.to_bits(), 0, "buffers of {split}: sample {i}");
+                        continue;
+                    }
+                    let heard = y / g;
+                    assert_eq!(heard, input[source], "buffers of {split}: sample {i}");
+                    assert!(last < Some(source), "buffers of {split}: {source} twice");
+                    last = Some(source);
+                }
+            }
+        }
+    }
+
+    /// D4: a latency that changes while the line is moving is acted on at
+    /// the first sample after that move ends, not by restarting it: a change
+    /// at L/2 of a shrink, and one inside a growth's silence. Then the
+    /// output is the input delayed by the last request.
+    #[test]
+    fn a_change_mid_move_waits_for_it() {
+        let len = ptm_fade_len(RATE);
+        let l = usize::from(len);
+        let settle = 4096 + 2 * l + 1000;
+        // (settled at, then asked for at `settle`, then at `settle + change`;
+        // the sample the first move ends on)
+        let cases = [
+            (2048, 1024, l / 2, 3000, settle + l - 1),
+            (1024, 2048, l + 500, 512, settle + 2 * l + 1024 - 1),
+        ];
+        for (from, first, change, second, ends) in cases {
+            let latency = move |i: usize| match i {
+                i if i < settle => from,
+                i if i < settle + change => first,
+                _ => second,
+            };
+            let total = ends + 2 * l + second + 3000;
+            let input = ramp(total);
+            // A sample a call, through the accessors.
+            let mut line = DryLine::new(RATE, len);
+            let mut one = Vec::with_capacity(total);
+            for (i, x) in input.iter().enumerate() {
+                line.capture(std::slice::from_ref(x), latency(i));
+                one.extend_from_slice(line.aligned(1));
+                if (settle..ends).contains(&i) {
+                    assert!(line.moving() && line.delay() == first, "{from}: {i}");
+                } else if i == ends {
+                    assert!(!line.moving() && line.delay() == first, "{from}: the end");
+                } else if i == ends + 1 {
+                    assert!(line.moving() && line.delay() == second, "{from}: the next");
+                }
+            }
+            assert!(!line.moving() && line.delay() == second);
+            for i in total - 3000..total {
+                assert_eq!(one[i], input[i - second], "{from}: sample {i}");
+            }
+            // Every split agrees, the calls starting where the latency changes.
+            for split in [7, 100, 480] {
+                let mut line = DryLine::new(RATE, len);
+                let mut out = Vec::with_capacity(total);
+                let bounds = [0, settle, settle + change, total];
+                for pair in bounds.windows(2) {
+                    for start in (pair[0]..pair[1]).step_by(split) {
+                        let end = (start + split).min(pair[1]);
+                        line.capture(&input[start..end], latency(start));
+                        out.extend_from_slice(line.aligned(end - start));
+                    }
+                }
+                assert!(
+                    bits(&out) == bits(&one),
+                    "{from}: buffers of {split} differ"
+                );
+            }
+        }
+    }
+
+    /// D4: a new line starts at delay 0, whatever its first call asks for,
+    /// and moves there by a growth: the session's chain is empty until the
+    /// page sends one, so its first buffers report 0 anyway.
+    #[test]
+    fn a_new_line_starts_at_zero() {
+        let len = ptm_fade_len(RATE);
+        let mut line = DryLine::new(RATE, len);
+        assert!(!line.moving() && line.delay() == 0 && line.want() == 0);
+        line.capture(&[0.5], 1024);
+        assert!(line.moving(), "the first call took its latency at once");
+        assert_eq!((line.delay(), line.want()), (1024, 1024));
+        assert_eq!(line.moving, Move::Out(1));
+        assert_eq!(line.aligned(1), [0.5 * f32::from(len - 1) / f32::from(len)]);
+    }
+
+    // ---- the stage ----
+
+    /// D8b: an edge toward the dry waits the latency the line was asked for
+    /// at that edge, clamped as the line clamps it: 2048 waits 2048 samples,
+    /// 0 none, a latency past the ring the ring's reach. A latency asked for
+    /// after the edge doesn't move it. (With [`ALIGN_DRY`] off the line is
+    /// asked for 0, so nothing waits.)
+    #[test]
+    fn the_wait_is_the_requested_latency() {
+        let max = DryLine::new(RATE, ptm_fade_len(RATE)).max_delay();
+        // (asked for until the edge, asked for after it, the wait)
+        for (before, after, wait) in [
+            (2048, 2048, 2048),
+            (2048, 0, 2048),
+            (0, 4096, 0),
+            (10 * max, 10 * max, max),
+        ] {
+            let wait = if ALIGN_DRY { wait } else { 0 };
+            let mut stage = PtmStage::new(RATE, false);
+            stage.capture(&[0.25], before);
+            let mut y = [0.5];
+            stage.blend(&mut y, false);
+            for i in 0..=wait {
+                stage.capture(&[0.25], if i == 0 { before } else { after });
+                let mut y = [0.5];
+                stage.blend(&mut y, true);
+                let moved = stage.gate.pos() > 0;
+                assert_eq!(moved, i == wait, "asked {before} then {after}: sample {i}");
+            }
+        }
+    }
+
+    /// Thousands of buffers of 1 to 4096 frames with random flips and
+    /// latencies (now and then past the ring), and quiet stretches where
+    /// nothing changes. The oracle is the inputs alone:
+    ///
+    /// * a buffer that asks for the effects while `pos` is 0 is the wet, bit
+    ///   for bit;
+    /// * every sample's `pos`, read off the output, is in `0..=L` and moves
+    ///   at most one step from the last (0 is the wet's bits, L the dry's);
+    /// * after `Q = 3·dmax + 4L` quiet samples (dmax the longest clamped
+    ///   latency since the last stretch, which bounds the line's moves and
+    ///   the gate's wait) the output is the input delayed by the clamped
+    ///   latency when bypassed, the wet when applied.
+    ///
+    /// And it reached every case it claims to check: each kind of line move,
+    /// a cancelled wait, a fade turned round both ways, a clamp.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one walk, its oracle inline
+    fn seeded_walk() {
+        // The voice is `noise_at(i, 0)`; the chain's output `2 + noise/2`,
+        // which no dry sample comes near, so `pos` can be read off any
+        // sample: `y = w + (d − w)·pos/L`.
+        struct Walk {
+            stage: PtmStage,
+            at: usize,
+            pos: usize,
+        }
+        let wet = |i: usize| 2.0 + 0.5 * noise_at(i, 7);
+        let len = ptm_fade_len(RATE);
+        let l = usize::from(len);
+        let max = DryLine::new(RATE, len).max_delay();
+        let clamp = |d: usize| if ALIGN_DRY { d.min(max) } else { 0 };
+        let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+        let latency_of = |rng: &mut XorShift| {
+            if rng.below(20) == 0 {
+                max - 100 + rng.below(201)
+            } else {
+                rng.below(4097)
+            }
+        };
+        // One buffer; the output.
+        let step = |walk: &mut Walk, frames: usize, bypass: bool, latency: usize| {
+            let input: Vec<f32> = (walk.at..walk.at + frames)
+                .map(|i| noise_at(i, 0))
+                .collect();
+            let w: Vec<f32> = (walk.at..walk.at + frames).map(wet).collect();
+            let untouched = !bypass && walk.stage.gate.pos() == 0;
+            walk.stage.capture(&input, latency);
+            let dry = walk.stage.aligned(frames).to_vec();
+            let mut y = w.clone();
+            walk.stage.blend(&mut y, bypass);
+            if untouched {
+                assert!(
+                    bits(&y) == bits(&w),
+                    "applied at pos 0 touched, at {}",
+                    walk.at
+                );
+            }
+            for j in 0..frames {
+                let ratio = f64::from(y[j] - w[j]) / f64::from(dry[j] - w[j]);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let pos = (ratio * f64::from(len)).round() as usize;
+                assert!(pos <= l, "pos {pos} at {}", walk.at + j);
+                assert!(
+                    pos.abs_diff(walk.pos) <= 1,
+                    "pos jumped to {pos} at {}",
+                    walk.at + j
+                );
+                if pos == 0 {
+                    assert_eq!(y[j].to_bits(), w[j].to_bits(), "at {}", walk.at + j);
+                } else if pos == l {
+                    assert_eq!(y[j].to_bits(), dry[j].to_bits(), "at {}", walk.at + j);
+                }
+                walk.pos = pos;
+            }
+            walk.at += frames;
+            y
+        };
+
+        let mut walk = Walk {
+            stage: PtmStage::new(RATE, false),
+            at: 0,
+            pos: 0,
+        };
+        let (mut bypass, mut latency, mut dmax) = (false, 0, 0);
+        let mut seen = [false; 8]; // Cross, Out, Gap, In, cancel, turn ×2, clamp
+        let mut quiet = 0;
+        for b in 0..10_000 {
+            if b % 97 == 96 {
+                // A quiet stretch: one request, long enough for everything
+                // in flight to finish, then checked.
+                bypass = rng.next().is_multiple_of(2);
+                latency = latency_of(&mut rng);
+                dmax = dmax.max(clamp(latency));
+                let q = 3 * dmax + 4 * l;
+                let start = walk.at;
+                while walk.at < start + q + 2000 {
+                    let frames = (1 + rng.below(4096)).min(start + q + 2000 - walk.at);
+                    let from = walk.at;
+                    let y = step(&mut walk, frames, bypass, latency);
+                    for (j, &s) in y.iter().enumerate() {
+                        let i = from + j;
+                        if i >= start + q {
+                            let want = if bypass {
+                                noise_at(i - clamp(latency), 0)
+                            } else {
+                                wet(i)
+                            };
+                            assert_eq!(s.to_bits(), want.to_bits(), "quiet {quiet}: {i}");
+                        }
+                    }
+                }
+                quiet += 1;
+                dmax = clamp(latency);
+                continue;
+            }
+            // Before the buffer: what it is about to do.
+            let gate = walk.stage.gate;
+            let next_bypass = if rng.below(10) < 3 { !bypass } else { bypass };
+            if rng.below(10) < 2 {
+                latency = latency_of(&mut rng);
+                dmax = dmax.max(clamp(latency));
+            }
+            seen[4] |= gate.waiting() && !next_bypass;
+            let mid = gate.pos() > 0 && gate.pos() < len;
+            seen[5] |= mid && gate.to_dry && !next_bypass;
+            seen[6] |= mid && !gate.to_dry && next_bypass && !gate.want_dry;
+            seen[7] |= latency > max;
+            bypass = next_bypass;
+            step(&mut walk, 1 + rng.below(4096), bypass, latency);
+            match walk.stage.line.moving {
+                Move::Cross(_) => seen[0] = true,
+                Move::Out(_) => seen[1] = true,
+                Move::Gap(_) => seen[2] = true,
+                Move::In(_) => seen[3] = true,
+                Move::Settled => {}
+            }
+        }
+        assert!(quiet > 100, "only {quiet} quiet stretches");
+        assert!(seen.iter().all(|&s| s), "cases not reached: {seen:?}");
     }
 }

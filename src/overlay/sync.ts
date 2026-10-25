@@ -12,7 +12,10 @@
 // v1.56.0: the status says Muted to an audience that relies on it, so the
 // pushes go out in order (one emit at a time, as `syncOverlayScene` does),
 // and none goes out until the main window knows the mute or stops waiting
-// for it (`held`; at worst 500 ms).
+// for it (`held`; at worst 500 ms). v1.58.0: and push-to-modulate's state,
+// for the same reason: until the boot restore answers, the store's mirror is
+// empty and reads as the effects on, so a push would say Modulated over a
+// voice that is clean (`overlayHeld`).
 
 import { batch, createEffect, createSignal, onCleanup } from "solid-js";
 import {
@@ -29,12 +32,23 @@ export interface OverlaySyncDeps {
   /** The state to send. Read only while open, so it is tracked only then. */
   payload: () => OverlayState;
   /** v1.56.0: while true nothing is sent; when it turns false, the current
-   *  state goes once. App.tsx holds until the store knows the mute, or its
-   *  read of it fails, or 500 ms pass, so the hold always ends; after a
-   *  failure or the 500 ms, what goes may say not muted. Absent = never held. */
+   *  state goes once. App.tsx passes {@link overlayHeld}: it holds until the
+   *  store knows the mute and push-to-modulate (v1.58.0), each by its boot
+   *  call's answer or failure or 500 ms, so the hold always ends; after a
+   *  failure or the 500 ms, what goes may say not muted, or Modulated over a
+   *  clean voice. Absent = never held. */
   held?: () => boolean;
   emit: (event: string, payload: OverlayState) => Promise<void>;
   listen: (event: string, handler: () => void) => Promise<() => void>;
+}
+
+/** What the main window's push waits for: the mute's boot read and
+ *  push-to-modulate's boot restore (v1.58.0), each settled or given up on
+ *  after 500 ms. A level tick makes the mute known, but not push-to-modulate:
+ *  the restore changes the engine's word (it lets go of the page's holds), so
+ *  a tick that lands before its answer may carry the previous page's. */
+export function overlayHeld(known: { muteKnown: () => boolean; ptmKnown: () => boolean }): boolean {
+  return !known.muteKnown() || !known.ptmKnown();
 }
 
 /** Keep the overlay in step with the main window: send the state whenever it

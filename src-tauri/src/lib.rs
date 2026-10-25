@@ -402,10 +402,17 @@ fn input_mute(state: State<'_, AppState>) -> InputMute {
 /// a press can't overtake its release. Idempotent.
 #[tauri::command]
 fn set_ptm_mode(state: State<'_, AppState>, mode: PtmMode, restore: Option<bool>) -> PtmState {
+    ptm_mode_command(&state.engine, mode, restore)
+}
+
+/// v1.58.0: [`set_ptm_mode`]'s body, on the engine, so a test runs the real
+/// choice between the card's set and the boot's restore (the command itself
+/// needs a `State`). Only `restore: true` restores; absent or `false` sets.
+fn ptm_mode_command(engine: &AudioEngine, mode: PtmMode, restore: Option<bool>) -> PtmState {
     if restore == Some(true) {
-        state.engine.restore_ptm_mode(mode).after
+        engine.restore_ptm_mode(mode).after
     } else {
-        state.engine.set_ptm_mode(mode).after
+        engine.set_ptm_mode(mode).after
     }
 }
 
@@ -3758,13 +3765,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloned_voices_dir, default_clone_base, emit_speak, external_target, hides_on_close,
-        hotkey_mute_request, is_safe_voice_id, level_update, list_cloned_voice_infos,
-        load_cloned_voice, mute_on_hotkey, preview_path_in, read_preview, rebind, release,
-        rename_cloned_voice_in, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
-        unique_preset_id, write_preview, ClonedMeta, EngineStatus, ExternalTarget, LevelUpdate,
-        Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo, VoiceReadingUpdate, MAX_CLONE_NAME_LEN,
-        PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION, READING_FLOOR_DBFS, TTS_CLIP_ID,
+        cloned_voices_dir, default_clone_base, drain_bindings, drop_binding, emit_speak,
+        external_target, hides_on_close, hotkey_mute_request, hotkey_ptm_request, is_safe_voice_id,
+        level_update, list_cloned_voice_infos, load_cloned_voice, mute_on_hotkey, preview_path_in,
+        ptm_mode_command, ptm_on_hotkey, read_preview, rebind, release, rename_cloned_voice_in,
+        same_binding, save_tts_clip, scan_voice_dir, slugify_preset_id, speak_commands,
+        take_binding, unique_preset_id, write_preview, ClonedMeta, EngineStatus, ExternalTarget,
+        LevelUpdate, Levels, OnnxRuntimeStatus, SpeakClip, VoiceInfo, VoiceReadingUpdate,
+        MAX_CLONE_NAME_LEN, PREVIEW_CLIP_ID, PREVIEW_TEXT, PREVIEW_TEXT_VERSION,
+        READING_FLOOR_DBFS, TTS_CLIP_ID,
     };
     use super::{
         create_part, download_model_files, download_snapshot, download_to_file, model_agent,
@@ -3772,7 +3781,9 @@ mod tests {
         DownloadSlot, ModelDownloadDone, ModelDownloadKind, MODEL_DOWNLOAD_BUSY,
         MODEL_DOWNLOAD_DONE_EVENT, MODEL_DOWNLOAD_EVENT, VOICE_CLONE_BUSY,
     };
-    use divora_core::audio::{AudioEngine, InputMute, PtmState, ReadingSnapshot};
+    use divora_core::audio::{
+        AudioEngine, InputMute, PtmMode, PtmPageSource, PtmSource, PtmState, ReadingSnapshot,
+    };
     use divora_core::dsp::{Descriptor, Metrics, ReadingState, VoiceReading, MAX_DESCRIPTORS};
     use divora_core::soundboard::{SoundboardCommand, SoundboardMixer};
     use divora_core::tts::babble;
@@ -4560,6 +4571,24 @@ mod tests {
         );
     }
 
+    /// v1.58.0: `set_ptm_held`'s `source`, as the page sends it. Only the
+    /// three page sources parse: `"hotkey"` is refused, so only the backend
+    /// ever holds that bit, and the names are exact.
+    #[test]
+    fn ptm_page_source_wire_values_are_frozen() {
+        let parse = |wire: &str| serde_json::from_value::<PtmPageSource>(serde_json::json!(wire));
+        for (wire, source) in [
+            ("key", PtmPageSource::Key),
+            ("button", PtmPageSource::Button),
+            ("midi", PtmPageSource::Midi),
+        ] {
+            assert_eq!(parse(wire).ok(), Some(source), "{wire:?}");
+        }
+        for refused in ["hotkey", "Key", "BUTTON", "Midi", "always", ""] {
+            assert!(parse(refused).is_err(), "{refused:?} parsed");
+        }
+    }
+
     #[test]
     fn every_word_on_the_wire_comes_from_the_vocabulary() {
         // Provenance, swept rather than spot-checked. `words` is a plain
@@ -4673,6 +4702,46 @@ mod tests {
         assert_eq!(v["inputMuteSeq"], 2);
     }
 
+    /// v1.58.0: the tick carries push-to-modulate from the engine's word,
+    /// engine running or not, under the names and mode strings the frontend
+    /// reads.
+    #[test]
+    fn the_level_tick_carries_ptm() {
+        let engine = AudioEngine::new();
+        let st = |mode, held, bypassed, seq| PtmState {
+            mode,
+            held,
+            bypassed,
+            seq,
+        };
+        let tick = level_update(&engine);
+        assert_eq!(tick.ptm, st(PtmMode::Always, false, false, 0));
+        engine.set_ptm_mode(PtmMode::Apply);
+        let tick = level_update(&engine);
+        assert_eq!(tick.ptm, st(PtmMode::Apply, false, true, 1));
+        assert_eq!(
+            serde_json::to_value(&tick).unwrap()["ptm"],
+            serde_json::json!({ "mode": "apply", "held": false, "bypassed": true, "seq": 1 })
+        );
+        ptm_on_hotkey(&engine, "ptm", true);
+        let tick = level_update(&engine);
+        assert_eq!(tick.ptm, st(PtmMode::Apply, true, false, 2));
+        // The card's set lets go of the global key too.
+        engine.set_ptm_mode(PtmMode::Bypass);
+        let tick = level_update(&engine);
+        assert_eq!(tick.ptm, st(PtmMode::Bypass, false, false, 3));
+        assert_eq!(
+            serde_json::to_value(&tick).unwrap()["ptm"]["mode"],
+            "bypass"
+        );
+        engine.set_ptm_mode(PtmMode::Always);
+        let v = serde_json::to_value(level_update(&engine)).unwrap();
+        assert_eq!(
+            v["ptm"],
+            serde_json::json!({ "mode": "always", "held": false, "bypassed": false, "seq": 4 })
+        );
+    }
+
     /// v1.56.0: "Muted in Divora" crosses the bridge on the same snapshot as
     /// the state it explains, both ways.
     #[test]
@@ -4697,6 +4766,18 @@ mod tests {
         for id in ["Mute", "mute:hold", "monitor", "sb:mute", ""] {
             assert!(!hotkey_mute_request(id, true), "{id:?} pressed");
             assert!(!hotkey_mute_request(id, false), "{id:?} released");
+        }
+    }
+
+    /// v1.58.0: `ptm` holds on its press and lets go on its release. Other
+    /// ids, a different case and the reserved `ptm:` prefix ask nothing.
+    #[test]
+    fn hotkey_ptm_request_table() {
+        assert_eq!(hotkey_ptm_request("ptm", true), Some(true));
+        assert_eq!(hotkey_ptm_request("ptm", false), Some(false), "its release");
+        for id in ["PTM", "ptm:toggle", "mute", "sb:ptm", ""] {
+            assert_eq!(hotkey_ptm_request(id, true), None, "{id:?} pressed");
+            assert_eq!(hotkey_ptm_request(id, false), None, "{id:?} released");
         }
     }
 
@@ -4902,6 +4983,351 @@ mod tests {
             !handler.contains(concat!("_input", "_muted(")),
             "the handler must not touch the mute any other way"
         );
+    }
+
+    // ---- v1.58.0: push-to-modulate's global key and commands ----------
+
+    /// v1.58.0: the handler's push-to-modulate step, against a real engine.
+    /// In Hold to apply a press of `ptm` applies the effects and its release
+    /// takes them off again; other ids, pressed or released, change nothing.
+    #[test]
+    fn the_ptm_hotkey_holds_and_lets_go() {
+        let engine = AudioEngine::new();
+        let others = ["PTM", "ptm:toggle", "mute", "sb:ptm", ""];
+        let apply = |held, bypassed, seq| PtmState {
+            mode: PtmMode::Apply,
+            held,
+            bypassed,
+            seq,
+        };
+        engine.set_ptm_mode(PtmMode::Apply);
+        assert_eq!(engine.ptm(), apply(false, true, 1));
+        ptm_on_hotkey(&engine, "ptm", true);
+        assert_eq!(engine.ptm(), apply(true, false, 2), "the press applies");
+        ptm_on_hotkey(&engine, "ptm", true);
+        assert_eq!(engine.ptm(), apply(true, false, 2), "a second press moved");
+        for id in others {
+            ptm_on_hotkey(&engine, id, false);
+        }
+        assert_eq!(engine.ptm(), apply(true, false, 2), "another id let go");
+        ptm_on_hotkey(&engine, "ptm", false);
+        assert_eq!(engine.ptm(), apply(false, true, 3), "the release lets go");
+        for id in others {
+            ptm_on_hotkey(&engine, id, true);
+        }
+        assert_eq!(engine.ptm(), apply(false, true, 3), "another id held");
+        // In Hold to bypass the same key takes the effects off while held.
+        engine.set_ptm_mode(PtmMode::Bypass);
+        ptm_on_hotkey(&engine, "ptm", true);
+        assert!(engine.ptm().held && engine.ptm().bypassed);
+        ptm_on_hotkey(&engine, "ptm", false);
+        assert!(!engine.ptm().held && !engine.ptm().bypassed);
+    }
+
+    /// v1.58.0: `set_ptm_mode`'s real body. The card's set (`restore` absent
+    /// or `false`) lets go of every hold, the global key's included; the
+    /// boot's restore lets go of the page's holds and keeps a held global
+    /// key, so a reload doesn't drop it (U4). Each answers the state after.
+    #[test]
+    fn set_ptm_mode_restores_only_when_asked() {
+        let held_by_both = || {
+            let engine = AudioEngine::new();
+            ptm_on_hotkey(&engine, "ptm", true);
+            engine.set_ptm_held(PtmSource::Key, true);
+            engine
+        };
+        for restore in [None, Some(false)] {
+            let engine = held_by_both();
+            let answer = ptm_mode_command(&engine, PtmMode::Apply, restore);
+            assert_eq!(answer, engine.ptm(), "{restore:?}: not the state after");
+            assert!(!answer.held, "{restore:?}: a hold survived the card's set");
+            assert_eq!((answer.mode, answer.seq), (PtmMode::Apply, 3));
+        }
+        let engine = held_by_both();
+        let answer = ptm_mode_command(&engine, PtmMode::Apply, Some(true));
+        assert_eq!(answer, engine.ptm(), "not the state after");
+        assert_eq!(
+            (answer.mode, answer.held, answer.bypassed, answer.seq),
+            (PtmMode::Apply, true, false, 3),
+            "the restore let go of the global key"
+        );
+        // It kept only the global key's: letting that go leaves none held.
+        ptm_on_hotkey(&engine, "ptm", false);
+        assert!(!engine.ptm().held, "the restore kept the page's hold");
+        // Nothing left to change: the same restore moves nothing.
+        let seq = engine.ptm().seq;
+        assert_eq!(
+            ptm_mode_command(&engine, PtmMode::Apply, Some(true)).seq,
+            seq
+        );
+    }
+
+    /// v1.58.0: §7.4's second table. `same_binding` names the key only when
+    /// `id` already holds exactly it, however the accelerator spells it;
+    /// then a live registration is left alone, and a held push-to-modulate
+    /// key stays held through a page's re-sync (U4).
+    #[test]
+    fn same_binding_table() {
+        let f13: Shortcut = "F13".parse().unwrap();
+        let ptm_on = |key: Shortcut| HashMap::from([("ptm".to_owned(), key)]);
+        let shared = HashMap::from([("ptm".to_owned(), f13), ("mute".to_owned(), f13)]);
+        let mute_on = HashMap::from([("mute".to_owned(), f13)]);
+        assert_eq!(same_binding(&ptm_on(f13), "ptm", "F13"), Some(f13));
+        assert_eq!(same_binding(&ptm_on(f13), "ptm", "F14"), None);
+        assert_eq!(same_binding(&ptm_on(f13), "ptm", "Shift+!"), None);
+        assert_eq!(same_binding(&shared, "ptm", "F14"), None);
+        assert_eq!(same_binding(&shared, "ptm", "F13"), Some(f13), "shared");
+        assert_eq!(same_binding(&HashMap::new(), "ptm", "F13"), None);
+        assert_eq!(same_binding(&mute_on, "ptm", "F13"), None, "mute's key");
+        let chord: Shortcut = "Ctrl+Shift+M".parse().unwrap();
+        assert_eq!(
+            same_binding(&ptm_on(chord), "ptm", "shift+ctrl+m"),
+            Some(chord),
+            "the same key, spelled another way"
+        );
+    }
+
+    /// v1.58.0: once `ptm` leaves its key that key's release can't reach the
+    /// handler, so `take_binding` lets go of the global key's hold at the map
+    /// update whatever comes back: a different key, a key the parser refuses
+    /// (the old one still comes out to unregister), a key shared with `mute`
+    /// (nothing to unregister), or no key before. Another action's rebind
+    /// leaves the hold alone.
+    #[test]
+    fn take_binding_lets_go_of_ptm() {
+        let f13: Shortcut = "F13".parse().unwrap();
+        let f14: Shortcut = "F14".parse().unwrap();
+        let ptm_on = HashMap::from([("ptm".to_owned(), f13)]);
+        let shared = HashMap::from([("ptm".to_owned(), f13), ("mute".to_owned(), f13)]);
+        let take = |mut map: HashMap<String, Shortcut>, id: &str, accelerator: &str| {
+            let engine = AudioEngine::new();
+            ptm_on_hotkey(&engine, "ptm", true);
+            assert!(engine.ptm().held && engine.ptm().seq == 1);
+            let (old, new) = take_binding(&mut map, &engine, id, accelerator);
+            (old, new.ok(), map, engine.ptm())
+        };
+        let (old, new, map, after) = take(ptm_on.clone(), "ptm", "F14");
+        assert_eq!((old, new), (Some(f13), Some(f14)));
+        assert_eq!(map.get("ptm"), Some(&f14));
+        assert!(!after.held, "a different key kept the hold");
+        let (old, new, map, after) = take(ptm_on, "ptm", "Shift+!");
+        assert_eq!((old, new), (Some(f13), None));
+        assert!(!map.contains_key("ptm"));
+        assert!(!after.held, "an unparsable key kept the hold");
+        let (old, new, map, after) = take(shared.clone(), "ptm", "F14");
+        assert_eq!((old, new), (None, Some(f14)));
+        assert_eq!(map.get("mute"), Some(&f13));
+        assert!(!after.held, "a key shared with mute kept the hold");
+        let (old, new, _, after) = take(HashMap::new(), "ptm", "F13");
+        assert_eq!((old, new), (None, Some(f13)));
+        assert!(!after.held, "binding a first key kept the hold");
+        let (old, new, map, after) = take(shared, "mute", "F14");
+        assert_eq!((old, new), (None, Some(f14)));
+        assert_eq!(map.get("ptm"), Some(&f13));
+        assert!(after.held && after.seq == 1, "mute's rebind let go of ptm");
+    }
+
+    /// v1.58.0: clearing `ptm`'s key lets go of the global key's hold, a
+    /// shared key or not, and so does clearing every key; clearing another
+    /// action's key leaves it.
+    #[test]
+    fn drop_and_drain_let_go_of_ptm() {
+        let f13: Shortcut = "F13".parse().unwrap();
+        let f14: Shortcut = "F14".parse().unwrap();
+        let held = || {
+            let engine = AudioEngine::new();
+            ptm_on_hotkey(&engine, "ptm", true);
+            engine
+        };
+        for (name, mut map, unregister) in [
+            ("alone", HashMap::from([("ptm".to_owned(), f13)]), Some(f13)),
+            (
+                "shared with mute",
+                HashMap::from([("ptm".to_owned(), f13), ("mute".to_owned(), f13)]),
+                None,
+            ),
+            ("unbound", HashMap::new(), None),
+        ] {
+            let engine = held();
+            assert_eq!(drop_binding(&mut map, &engine, "ptm"), unregister, "{name}");
+            assert!(!map.contains_key("ptm"), "{name}");
+            assert!(!engine.ptm().held, "{name}: clearing ptm kept the hold");
+        }
+        let both = || HashMap::from([("ptm".to_owned(), f13), ("mute".to_owned(), f14)]);
+        let engine = held();
+        let mut map = both();
+        assert_eq!(drop_binding(&mut map, &engine, "mute"), Some(f14));
+        assert!(
+            engine.ptm().held && engine.ptm().seq == 1,
+            "clearing mute let go"
+        );
+        let mut map = both();
+        let all = drain_bindings(&mut map, &engine);
+        assert!(map.is_empty());
+        assert!(all.len() == 2 && all.contains(&f13) && all.contains(&f14));
+        assert!(!engine.ptm().held, "clearing every key kept the hold");
+    }
+
+    /// v1.58.0 (D23): the two push-to-modulate commands stay sync. The
+    /// commands need an `AppHandle`, so this reads the source.
+    #[test]
+    fn ptm_commands_stay_sync() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        for name in ["set_ptm_mode", "set_ptm_held"] {
+            assert!(
+                !prod.contains(&format!("async fn {name}(")),
+                "{name} must stay a sync command (D23): sync commands run in \
+                 order on the main thread, so a press can't overtake its \
+                 release. An async one runs on a tokio worker, in any order, \
+                 and a quick tap could land release-then-press: stuck held"
+            );
+            assert!(
+                prod.contains(&format!("#[tauri::command]\nfn {name}(")),
+                "{name} is not a sync command"
+            );
+        }
+        let handler = &prod[prod.find("tauri::generate_handler![").expect("the handler")..];
+        let handler = &handler[..handler.find(']').expect("its end")];
+        assert!(handler.contains(concat!(
+            "\n            set_ptm_mode,\n",
+            "            set_ptm_held,\n"
+        )));
+    }
+
+    /// v1.58.0: the handler passes the event's real press state to the
+    /// push-to-modulate step, press and release, and doesn't touch PTM any
+    /// other way. The handler needs an `AppHandle`, so this reads the source.
+    #[test]
+    fn the_shortcut_handler_runs_the_ptm_hotkey() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let handler = body_of(
+            &file[..tests_at],
+            concat!("fn global_shortcut", "_handler("),
+        );
+        let call = concat!(
+            "ptm_on_hotkey(&state.engine, &id, ",
+            "event.state == ShortcutState::Pressed);"
+        );
+        assert_eq!(
+            handler.matches(call).count(),
+            1,
+            "the handler must run the push-to-modulate step once, with the press state"
+        );
+        for other in [concat!("set_ptm", "_held("), concat!("_ptm", "_mode(")] {
+            assert!(!handler.contains(other), "the handler calls {other}");
+        }
+    }
+
+    /// v1.58.0 (D16): the plugin runs the handler under its own store lock,
+    /// and the handler takes `AppState.shortcuts`. A command that called the
+    /// plugin while holding `AppState.shortcuts` could deadlock the main
+    /// thread against a key released on global-hotkey's poller thread, and
+    /// push-to-modulate makes releases the most frequent hotkey event. So in
+    /// each shortcut command no plugin call (`is_registered` included) sits in
+    /// a block that holds the map's lock, and the map is updated, through the
+    /// helpers that let go of a held PTM key, inside such a block and before
+    /// the plugin call it feeds. The commands need an `AppHandle`, so this
+    /// reads the source.
+    #[test]
+    fn the_shortcut_commands_unlock_before_the_plugin() {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let at = |body: &str, needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        // Each lock's block: the innermost `{…}` around it, whose end drops
+        // the guard.
+        let locked = |body: &str| -> Vec<(usize, usize)> {
+            body.match_indices(concat!("state.shortcuts", ".lock()"))
+                .map(|(lock, _)| {
+                    let mut depth = 0_usize;
+                    let open = body[..lock]
+                        .char_indices()
+                        .rev()
+                        .find_map(|(i, c)| match c {
+                            '}' => {
+                                depth += 1;
+                                None
+                            }
+                            '{' if depth == 0 => Some(i),
+                            '{' => {
+                                depth -= 1;
+                                None
+                            }
+                            _ => None,
+                        })
+                        .expect("a block around the lock");
+                    (open, open + body_of(&body[open..], "{").len())
+                })
+                .collect()
+        };
+        for (command, updates) in [
+            (
+                "fn register_global_shortcut(",
+                &[
+                    "same_binding(&map, &id, &accelerator)",
+                    "take_binding(&mut map, &state.engine, &id, &accelerator)",
+                ][..],
+            ),
+            (
+                "fn unregister_global_shortcut(",
+                &["drop_binding(&mut map, &state.engine, &id)"][..],
+            ),
+            (
+                "fn unregister_all_global_shortcuts(",
+                &["drain_bindings(&mut map, &state.engine)"][..],
+            ),
+        ] {
+            let body = body_of(prod, command);
+            let blocks = locked(body);
+            assert!(!blocks.is_empty(), "{command} never locks the map");
+            assert!(body.contains("global_shortcut()"), "{command}");
+            for &(open, close) in &blocks {
+                for plugin in [
+                    "global_shortcut()",
+                    ".is_registered(",
+                    ".register(",
+                    ".unregister(",
+                ] {
+                    assert!(
+                        !body[open..close].contains(plugin),
+                        "{command} calls {plugin} with the map locked (D16)"
+                    );
+                }
+            }
+            for update in updates {
+                let i = at(body, update);
+                assert!(
+                    blocks.iter().any(|&(open, close)| open < i && i < close),
+                    "{command}: {update} outside the lock"
+                );
+            }
+        }
+        let register = body_of(prod, "fn register_global_shortcut(");
+        let order = [
+            "same_binding(",
+            ".is_registered(",
+            "take_binding(",
+            ".unregister(",
+            ".register(new?)",
+        ]
+        .map(|step| at(register, step));
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        for (command, update) in [
+            ("fn unregister_global_shortcut(", "drop_binding("),
+            ("fn unregister_all_global_shortcuts(", "drain_bindings("),
+        ] {
+            let body = body_of(prod, command);
+            assert!(at(body, update) < at(body, ".unregister("), "{command}");
+        }
     }
 
     /// A silent window is −∞ dBFS, which JSON cannot carry: serialized as-is

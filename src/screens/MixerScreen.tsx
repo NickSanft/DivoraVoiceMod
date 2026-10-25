@@ -9,8 +9,17 @@
 // (shape outline + preset name + "◆ SPELL CAST ◆"). Matches the
 // prototype's headline gesture: the Mixer *is* the casting surface.
 
-import { createMemo, createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
+import {
+  createMemo,
+  createSignal,
+  createUniqueId,
+  onCleanup,
+  onMount,
+  Show,
+  type JSX,
+} from "solid-js";
 import { Badge } from "../components/Badge";
+import { blurOnPointer } from "../components/blurOnPointer";
 import { Button } from "../components/Button";
 import { Inspector } from "../components/Inspector";
 import { Kbd } from "../components/Kbd";
@@ -431,7 +440,7 @@ function VoiceStatusCard(): JSX.Element {
         }
         style={{ "margin-left": "auto", "flex-shrink": 0 }}
         onClick={(e) => {
-          if (e.detail > 0) e.currentTarget.blur();
+          blurOnPointer(e);
           void app.setMuted(!app.muted());
         }}
       >
@@ -446,15 +455,34 @@ function PushToModulateCard(): JSX.Element {
   // Show the key the way Settings does: "Win", not the accelerator's
   // "Super" (v1.51.4 stores the backend form).
   const ptmLabel = (): string => acceleratorToKeys(app.ui.ptmKey).join("+") || "Space";
-  // v1.58.0: the card drives the engine. Its on/off and hold come from
-  // `divora.ptm` (moved by the engine's answer); the button holds the
-  // "button" source. The rest of the card (focus, keyboard, the in-call
-  // key's words) is v1.58.0's track D.
+  // v1.58.0: the card drives the engine. It renders from `divora.ptm` (on or
+  // off, and which way the hold goes), which moves only when the engine's
+  // answer lands. Setting either from here, even to what it already is,
+  // lets go of every hold: the way out of a stuck one (D13).
   const on = (): boolean => app.ptmSetting().on;
+  // Something that still works while a call has the focus: a global key, or
+  // a `ptm` MIDI mapping that has learned its pad or knob (one that hasn't
+  // can never fire). Without either, the line says the key works only in
+  // Divora's window and where to set one.
   const inCallKey = (): boolean =>
-    app.hotkeyBindings.ptm !== "" || app.midiMappings().some((m) => m.action === "ptm");
+    app.hotkeyBindings.ptm !== "" ||
+    app.midiMappings().some((m) => m.action === "ptm" && m.trigger !== null);
+  const lineId = `ptm-line-${createUniqueId()}`;
+
+  // Hold to switch holds the "button" source while it is down, by the
+  // pointer or by Enter or Space while it has the focus. `down` is only its
+  // look: the store sends each edge once, so letting go twice sends one
+  // release. Everything that can end a hold with no pointerup or keyup to
+  // follow lets go as well: the pointer leaving the button (no pointer
+  // capture, so it can't stick) or being cancelled, the button losing the
+  // focus, the window losing it or being hidden, and the card going away.
   const [down, setDown] = createSignal(false);
+  // A press that began with the pointer, so only its own end hands focus
+  // back to the page (the Mute button's rule), and a pointer that merely
+  // passes over the button can't end a hold made from the keyboard.
+  let byPointer = false;
   const hold = (): void => {
+    if (!on()) return;
     setDown(true);
     app.ptmDown("button");
   };
@@ -462,7 +490,26 @@ function PushToModulateCard(): JSX.Element {
     setDown(false);
     app.ptmUp("button");
   };
+  const pointerEnd = (e: PointerEvent & { currentTarget: HTMLButtonElement }): void => {
+    if (!byPointer) return;
+    byPointer = false;
+    e.currentTarget.blur();
+    letGo();
+  };
+  const holdKey = (e: KeyboardEvent): boolean => e.key === "Enter" || e.key === " ";
+  onMount(() => {
+    const hidden = (): void => {
+      if (document.visibilityState === "hidden") letGo();
+    };
+    window.addEventListener("blur", letGo);
+    document.addEventListener("visibilitychange", hidden);
+    onCleanup(() => {
+      window.removeEventListener("blur", letGo);
+      document.removeEventListener("visibilitychange", hidden);
+    });
+  });
   onCleanup(() => app.ptmUp("button"));
+
   return (
     <div class="card" style={{ padding: "var(--s4)" }}>
       <div
@@ -471,21 +518,34 @@ function PushToModulateCard(): JSX.Element {
           "align-items": "center",
           "justify-content": "space-between",
           gap: "var(--s2)",
-          "margin-bottom": "var(--s3)",
+          "margin-bottom": "var(--s2)",
         }}
       >
         <span class="eyebrow">Push to modulate</span>
-        <Kbd>{ptmLabel()}</Kbd>
-        <Toggle
-          on={on()}
-          ariaLabel="Push to modulate"
-          onChange={(next) => void app.setPtmOn(next)}
-        />
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            gap: "var(--s2)",
+            "flex-shrink": 0,
+          }}
+        >
+          <Kbd>{ptmLabel()}</Kbd>
+          <Toggle
+            on={on()}
+            ariaLabel="Push to modulate"
+            ariaDescribedBy={lineId}
+            blurOnPointer
+            onChange={(next) => void app.setPtmOn(next)}
+          />
+        </div>
       </div>
       <div
+        id={lineId}
         style={{
           "font-size": "var(--t-xs)",
           color: "var(--text-lo)",
+          "line-height": 1.5,
           "margin-bottom": "var(--s3)",
         }}
       >
@@ -499,10 +559,13 @@ function PushToModulateCard(): JSX.Element {
         value={app.ptmSetting().hold}
         onChange={(v) => void app.setPtmHold(v)}
         disabled={!on()}
+        blurOnPointer
       />
       <button
         type="button"
         class="btn btn-secondary btn-block"
+        data-testid="ptm-hold"
+        aria-pressed={down()}
         disabled={!on()}
         title={ptmButtonTitle(on())}
         style={{
@@ -512,10 +575,20 @@ function PushToModulateCard(): JSX.Element {
           "border-color": down() ? "var(--line-glow)" : undefined,
           color: down() ? "var(--indigo)" : undefined,
         }}
-        onPointerDown={hold}
-        onPointerUp={letGo}
-        onPointerLeave={letGo}
-        onPointerCancel={letGo}
+        onPointerDown={() => {
+          byPointer = true;
+          hold();
+        }}
+        onPointerUp={pointerEnd}
+        onPointerLeave={pointerEnd}
+        onPointerCancel={pointerEnd}
+        onKeyDown={(e) => {
+          if (holdKey(e) && !e.repeat) hold();
+        }}
+        onKeyUp={(e) => {
+          if (holdKey(e)) letGo();
+        }}
+        onBlur={letGo}
       >
         {ptmButtonLabel(down(), app.ptmBypassed(), ptmLabel())}
       </button>

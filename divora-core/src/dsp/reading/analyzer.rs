@@ -128,9 +128,9 @@ pub struct InputFacts {
     /// The input is muted — at the device, or by the app.
     pub input_muted: bool,
     /// The effect chain is bypassed, so the wet tap is carrying the dry
-    /// signal. Push-to-modulate with the key up is exactly this: the dry tap
-    /// has speech on it and the wet tap is a passthrough, which is not the
-    /// preset failing.
+    /// signal. Push-to-modulate switching the effects off (v1.58.0) is
+    /// exactly this: the dry tap has speech on it and the wet tap is a
+    /// passthrough, which is not the preset failing.
     pub chain_bypassed: bool,
 }
 
@@ -573,6 +573,12 @@ struct Held {
     dry: Metrics,
     wet: Metrics,
     descriptors: Vec<Descriptor>,
+    /// v1.58.0: whether the chain was bypassed over that window. The held
+    /// numbers say what the window measured, so this has to say how the
+    /// window was measured too: push-to-modulate can switch the effects off
+    /// in the pause that follows, and the live verdict beside held
+    /// after-effects numbers would call a disguised window a passthrough.
+    wet_bypassed: bool,
 }
 
 /// Turns dry and wet audio into [`VoiceReading`]s.
@@ -707,6 +713,7 @@ impl Analyzer {
             dry,
             wet,
             descriptors: self.descriptors.clone(),
+            wet_bypassed: facts.chain_bypassed,
         });
         VoiceReading {
             state: ReadingState::Speaking,
@@ -727,6 +734,9 @@ impl Analyzer {
     /// slid toward "quiet, flat, narrow" through every pause would be handing
     /// down a verdict on the speaker several times a minute without printing a
     /// word. The state says why the numbers are standing still.
+    ///
+    /// v1.58.0: `wet_bypassed` is the held window's, like the numbers beside
+    /// it; the live verdict only when nothing is held.
     fn emit_held(&mut self, state: ReadingState, facts: InputFacts) -> VoiceReading {
         let held = self.held.as_ref();
         VoiceReading {
@@ -737,7 +747,7 @@ impl Analyzer {
             calibrated: self.baseline.calibrated(),
             held: held.is_some(),
             held_descriptors: held.map_or_else(Vec::new, |h| h.descriptors.clone()),
-            wet_bypassed: facts.chain_bypassed,
+            wet_bypassed: held.map_or(facts.chain_bypassed, |h| h.wet_bypassed),
             wet_settled: self.wet_settled(),
         }
     }

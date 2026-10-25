@@ -867,7 +867,9 @@ function ReadyStep(): JSX.Element {
           "margin-bottom": "22px",
         }}
       >
-        Pick a spell from the Mixer and hold <Kbd>Space</Kbd> to modulate.
+        {/* v1.58.0: push-to-modulate is off until the Mixer card turns it
+            on, so a spell changes the voice by itself. */}
+        Pick a spell from the Mixer to change your voice.
         One last thing — point your chat app at DivoraVoice:
       </p>
       <div

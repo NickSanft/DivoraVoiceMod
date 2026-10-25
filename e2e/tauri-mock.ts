@@ -16,7 +16,8 @@
 //   __E2E_EMIT__(event, payload)          — fire a backend event
 //   __E2E_DOWNLOAD__ : { answer }         — the open download command's answer
 //   __E2E_PTM__ : { state, word, hotkey } — push-to-modulate's engine word
-//                     (v1.58.0; see mockPtm, pressPtmHotkey, emitLevels)
+//                     (v1.58.0; see mockPtm, pressPtmHotkey, emitLevels,
+//                     delayPtmModeAnswers)
 //
 // v1.57.0: a model download stays open until the spec ends it
 // (emitDownloadProgress, endDownload), and the backend's download slot lives
@@ -255,6 +256,7 @@ export async function installTauriMock(
       // so it survives a reload, as the engine's word does. Read only inside
       // the handlers, once the page has an origin.
       const PTM_KEY = "__E2E_PTM__";
+      const PTM_LATE_KEY = "__E2E_PTM_LATE_MS__";
       const PTM_MODES = ["always", "apply", "bypass"];
       const PTM_SOURCES = ["hotkey", "key", "button", "midi"] as const;
       const PTM_PAGE_SOURCES = ["key", "button", "midi"];
@@ -538,7 +540,9 @@ export async function installTauriMock(
         toggle_input_muted: () => setMute(!readMute().muted),
         // v1.58.0: push-to-modulate's two commands, each answering the state.
         // `"hotkey"` is refused, as Tauri refuses a variant the page may not
-        // send.
+        // send. A spec can make `set_ptm_mode` run late (delayPtmModeAnswers),
+        // as a sync command does behind a main thread busy elsewhere: the
+        // word changes, and the answer comes, only then.
         set_ptm_mode: (a: any) => {
           if (!PTM_MODES.includes(a?.mode)) {
             throw "invalid args `mode` for command `set_ptm_mode`";
@@ -547,8 +551,12 @@ export async function installTauriMock(
           if (typeof restore !== "boolean") {
             throw "invalid args `restore` for command `set_ptm_mode`";
           }
-          const now = readPtm();
-          return writePtm(a.mode, restore ? { ...noneHeld(), hotkey: now.held.hotkey } : noneHeld());
+          const run = () => {
+            const now = readPtm();
+            return writePtm(a.mode, restore ? { ...noneHeld(), hotkey: now.held.hotkey } : noneHeld());
+          };
+          const late = Number(sessionStorage.getItem(PTM_LATE_KEY) ?? "0");
+          return late > 0 ? new Promise((resolve) => setTimeout(() => resolve(run()), late)) : run();
         },
         set_ptm_held: (a: any) => {
           if (!PTM_PAGE_SOURCES.includes(a?.source)) {
@@ -880,6 +888,15 @@ export async function pressPtmHotkey(
     w.__E2E_EMIT__("global-shortcut", { id: "ptm", accelerator: "F13", state: s });
     return after;
   }, state);
+}
+
+/** v1.58.0: from now on, and across reloads of this tab, `set_ptm_mode`
+ *  changes the mock engine's word and answers `ms` after it is sent (0: at
+ *  once again), as the sync command does when the main thread is busy
+ *  elsewhere. It lets a spec see what the page does before the boot's
+ *  restore has answered. */
+export async function delayPtmModeAnswers(page: Page, ms: number): Promise<void> {
+  await page.evaluate((late) => sessionStorage.setItem("__E2E_PTM_LATE_MS__", String(late)), ms);
 }
 
 /** v1.57.0: the mock's download slot: the running download's last progress,

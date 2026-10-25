@@ -1167,10 +1167,14 @@ interface HotkeyRowDef {
 }
 
 const HOTKEY_ROWS: HotkeyRowDef[] = [
+  // v1.58.0: it really switches the effects now, and which way follows the
+  // Mixer card (off by default, when the key does nothing). The backend acts
+  // on this key itself, press and release, so it works while Divora is
+  // hidden.
   {
     action: "ptm",
     label: "Push-to-modulate",
-    desc: "Hold to apply the chain. Lifts back to clean.",
+    desc: "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.",
     icon: "bolt",
   },
   {
@@ -1469,7 +1473,12 @@ function ControlSurfacesSection(): JSX.Element {
           halfway and unmutes when it comes back a little below halfway (59
           or less); a control that stays on one side never changes it,
           except that its first move after launch (or after you pick the
-          device or change its mapping) mutes if it is past halfway.
+          device or change its mapping) mutes if it is past halfway.{" "}
+          {/* v1.58.0: push-to-modulate's mappings hold for real, with the
+              mute's dead band (data/mute.ts muteCcStep). */}
+          <strong>Hold push-to-modulate</strong> holds while a pad's note is
+          down, or while a knob, fader or CC button is past halfway (it lets go
+          at 59 or less); with two pads on it, it holds until both are up.
         </p>
 
         <FieldRow label="MIDI input">

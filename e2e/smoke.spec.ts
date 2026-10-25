@@ -5,6 +5,7 @@
 import {
   test,
   expect,
+  delayPtmModeAnswers,
   emitLevels,
   emitOverlayStatus,
   emitReplay,
@@ -12,7 +13,9 @@ import {
   emitsOf,
   invokesOf,
   mockMute,
+  mockPtm,
   pressMuteHotkey,
+  pressPtmHotkey,
 } from "./tauri-mock";
 
 const nav = (page: import("@playwright/test").Page, label: string) =>
@@ -946,7 +949,9 @@ test.describe("replay (v1.54)", () => {
     await emitReplay(page, ARMED);
     await press(page, "replay:save");
     await expect.poll(() => argsOf(page, "save_replay")).toHaveLength(1);
-    // The clean voice (push-to-modulate up) is named as what the call heard.
+    // Hollow King's effects are on from the start (push-to-modulate is off by
+    // default, v1.58.0), but only since this page loaded: not for the whole
+    // 12 s clip plus the save's own 3 s, so the preset isn't named.
     await expect(page.getByTestId("toast")).toHaveText(
       "Saved a 12 s replay · your voice as your call heard it",
     );
@@ -962,25 +967,63 @@ test.describe("replay (v1.54)", () => {
     await page.reload();
     await engineUp(page);
     const saved = { path: "C:/mock/recordings/divora-replay-x.mp4", durationMs: 400 };
+    const pill = page.getByTestId("titlebar-status");
+    const toast = page.getByTestId("toast");
+    const DISGUISED = "Saved a 1 s replay · Hollow King";
+    const HEARD = "Saved a 1 s replay · your voice as your call heard it";
+    /** A save, its toast cleared first, so the same text twice is two toasts. */
+    const save = async (): Promise<void> => {
+      await page.keyboard.press("Escape");
+      await expect(toast).toHaveText("");
+      await emitReplaySaved(page, saved);
+    };
 
-    // Push-to-modulate off ("Hold to bypass"), Hollow King's effects on.
-    await seg(page, "Hold to bypass").click();
-    await expect(page.locator(".titlebar-status")).toContainText(/Modulated/i);
-    // The clip (and the save's own 3 s) must lie after the voice turned.
+    // v1.58.0: push-to-modulate is off by default, so Hollow King's effects
+    // are on from the start. The clip (and the save's own 3 s) must lie after
+    // the voice turned.
+    await expect(pill).toHaveText("Modulated");
     await page.waitForTimeout(4_000);
-    await emitReplaySaved(page, saved);
-    await expect(page.getByTestId("toast")).toHaveText("Saved a 1 s replay · Hollow King");
+    await save();
+    await expect(toast).toHaveText(DISGUISED);
 
+    // Muted, the call hears none of it.
     await traceTriangle(page);
-    await expect(page.locator(".titlebar-status")).toContainText(/Muted/i);
+    await expect(pill).toHaveText("Muted");
     // v1.56.0: the glyph really mutes, through the engine.
     expect(await invokesOf(page, "set_input_muted")).toEqual([
       { cmd: "set_input_muted", args: { muted: true } },
     ]);
-    await emitReplaySaved(page, saved);
-    await expect(page.getByTestId("toast")).toHaveText(
-      "Saved a 1 s replay · your voice as your call heard it",
-    );
+    await save();
+    await expect(toast).toHaveText(HEARD);
+    await traceTriangle(page);
+    await expect(pill).toHaveText("Modulated");
+
+    // Push-to-modulate on (Hold to apply) with the key up: the call hears
+    // your own voice.
+    await page.getByRole("switch", { name: "Push to modulate", exact: true }).click();
+    await expect(pill).toHaveText("Clean");
+    await save();
+    await expect(toast).toHaveText(HEARD);
+
+    // Held, the preset from the press on: a clip that starts before it isn't
+    // named, one that lies after it is.
+    await page.keyboard.down("Space");
+    await expect(pill).toHaveText("Modulated");
+    await save();
+    await expect(toast).toHaveText(HEARD);
+    await page.waitForTimeout(4_000);
+    await save();
+    await expect(toast).toHaveText(DISGUISED);
+    await page.keyboard.up("Space");
+    await expect(pill).toHaveText("Clean");
+    expect(
+      (await invokesOf(page)).filter((i) => i.cmd === "set_ptm_mode" || i.cmd === "set_ptm_held"),
+    ).toEqual([
+      { cmd: "set_ptm_mode", args: { mode: "always", restore: true } },
+      { cmd: "set_ptm_mode", args: { mode: "apply", restore: false } },
+      { cmd: "set_ptm_held", args: { source: "key", held: true } },
+      { cmd: "set_ptm_held", args: { source: "key", held: false } },
+    ]);
   });
 
   test("6: a held ring says why, and can still be saved", async ({ page }) => {
@@ -1409,6 +1452,510 @@ test.describe("mute (v1.56)", () => {
     await expectUnmuted(page);
     expect(await muteWrites(page)).toEqual([TOGGLE, SET_TRUE, SET_FALSE, TOGGLE]);
     expect(await mockMute(page)).toEqual({ muted: false, seq: 4 });
+  });
+});
+
+// v1.58.0: push-to-modulate (design §10.5). The mock keeps the engine's word
+// (the mode, a held bit per source, `seq`) in sessionStorage, so it outlives
+// a reload as the engine's does, and answers `set_ptm_mode` and
+// `set_ptm_held` by the engine's rules. As for the mute, it never sends a
+// tick: what the backend changes on its own (the global key) is played with
+// pressPtmHotkey, and the tick that carries it with emitLevels. Every list of
+// push-to-modulate commands below is compared whole, the boot's restore
+// included, so a command sent where none should be shows up in it.
+test.describe("push-to-modulate (v1.58)", () => {
+  type Page = import("@playwright/test").Page;
+
+  const pill = (page: Page) => page.getByTestId("titlebar-status");
+  const ptmSwitch = (page: Page) =>
+    page.getByRole("switch", { name: "Push to modulate", exact: true });
+  const segment = (page: Page, label: string) =>
+    page.getByRole("tab", { name: label, exact: true });
+  const holdButton = (page: Page) => page.getByTestId("ptm-hold");
+  /** The card's line under its switch (the switch's description). */
+  const cardLine = (page: Page) => page.locator('[id^="ptm-line-"]');
+  /** `divora.ptm`, as saved from the engine's answers. */
+  const stored = (page: Page) =>
+    page.evaluate(() => JSON.parse(localStorage.getItem("divora.ptm") ?? "null") as unknown);
+  const focusIsOnThePage = (page: Page) =>
+    page.evaluate(() => document.activeElement === document.body);
+
+  const RESTORE = (mode: string) => ({ cmd: "set_ptm_mode", args: { mode, restore: true } });
+  const SET = (mode: string) => ({ cmd: "set_ptm_mode", args: { mode, restore: false } });
+  const HELD = (source: string, held: boolean) => ({ cmd: "set_ptm_held", args: { source, held } });
+  const NONE = { hotkey: false, key: false, button: false, midi: false };
+  const APPLY_LINE_IN_APP =
+    "Your effects are on only while you hold Space in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
+
+  /** The push-to-modulate commands this page has sent, in order, the boot's
+   *  restore included. */
+  const ptmCalls = async (page: Page) =>
+    (await invokesOf(page)).filter((i) => i.cmd === "set_ptm_mode" || i.cmd === "set_ptm_held");
+  /** Fire a `midi-message`, as the backend does for each note or CC. */
+  const midi = (page: Page, kind: string, data1: number, data2: number) =>
+    page.evaluate(
+      (m) => {
+        (
+          window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void }
+        ).__E2E_EMIT__("midi-message", m);
+      },
+      { channel: 0, kind, data1, data2 },
+    );
+
+  /** The Mixer with the engine up, once the boot has restored `mode` and
+   *  sent nothing else for push-to-modulate. */
+  async function mixerReady(page: Page, mode = "always"): Promise<void> {
+    await nav(page, "Mixer").click();
+    await expect(page.getByTestId("screen-record-toggle")).toBeEnabled();
+    await expect.poll(() => ptmCalls(page)).toEqual([RESTORE(mode)]);
+  }
+  /** Turn it on from the card's switch, as a user does, and wait for the
+   *  engine's answer to move the card. */
+  async function turnOn(page: Page): Promise<void> {
+    await ptmSwitch(page).click();
+    await expect(ptmSwitch(page)).toHaveAttribute("aria-checked", "true");
+  }
+
+  test("off by default; the card turns it on and off and picks the hold, from the engine's answers", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await mixerReady(page);
+    // Off ("always"): the effects are on whatever is held, and the boot told
+    // the engine so, which changed nothing there.
+    await expect(pill(page)).toHaveText("Modulated");
+    expect(await mockPtm(page)).toEqual({ mode: "always", held: NONE, seq: 0 });
+    const line = cardLine(page);
+    await expect(ptmSwitch(page)).toHaveAttribute("aria-checked", "false");
+    await expect(ptmSwitch(page)).toHaveAttribute("aria-describedby", (await line.getAttribute("id"))!);
+    await expect(line).toHaveText("Off · your effects are always on.");
+    await expect(segment(page, "Hold to apply")).toHaveAttribute("aria-selected", "true");
+    await expect(segment(page, "Hold to apply")).toBeDisabled();
+    await expect(segment(page, "Hold to bypass")).toBeDisabled();
+    await expect(holdButton(page)).toBeDisabled();
+    await expect(holdButton(page)).toHaveAttribute("title", "Turn on Push to modulate to try it.");
+    await expect(holdButton(page)).toHaveText("Hold to switch · or press Space");
+    expect(await stored(page)).toBeNull();
+
+    // On, Hold to apply: with the key up the call hears your own voice. The
+    // setting is saved from the answer.
+    await turnOn(page);
+    expect(await ptmCalls(page)).toEqual([RESTORE("always"), SET("apply")]);
+    await expect(pill(page)).toHaveText("Clean");
+    expect(await stored(page)).toEqual({ on: true, hold: "apply" });
+    expect(await mockPtm(page)).toEqual({ mode: "apply", held: NONE, seq: 1 });
+    // No global key and no MIDI mapping: the line says where the key works,
+    // and where to set one that works in a call.
+    await expect(line).toHaveText(APPLY_LINE_IN_APP);
+    await expect(segment(page, "Hold to bypass")).toBeEnabled();
+    await expect(holdButton(page)).toBeEnabled();
+    await expect(holdButton(page)).toHaveAttribute(
+      "title",
+      "Switches your effects for the call, your headphones, recordings and Replay while held.",
+    );
+    // The click handed the focus back to the page, so Space holds
+    // push-to-modulate. On a focused switch it would have turned it off.
+    expect(await focusIsOnThePage(page)).toBe(true);
+    await page.keyboard.press("Space");
+    await expect
+      .poll(() => ptmCalls(page))
+      .toEqual([RESTORE("always"), SET("apply"), HELD("key", true), HELD("key", false)]);
+    await expect(ptmSwitch(page)).toHaveAttribute("aria-checked", "true");
+
+    // Hold to bypass: the effects are on with the key up.
+    await segment(page, "Hold to bypass").click();
+    await expect(segment(page, "Hold to bypass")).toHaveAttribute("aria-selected", "true");
+    await expect(pill(page)).toHaveText("Modulated");
+    expect(await stored(page)).toEqual({ on: true, hold: "bypass" });
+    await expect(line).toHaveText(
+      "Your effects are off while you hold Space in Divora's window. To use it in a call, set a key in Settings → Hotkeys.",
+    );
+    expect(await focusIsOnThePage(page)).toBe(true);
+
+    // Off keeps the hold for the next time it is turned on.
+    await ptmSwitch(page).click();
+    await expect(ptmSwitch(page)).toHaveAttribute("aria-checked", "false");
+    await expect(line).toHaveText("Off · your effects are always on.");
+    expect(await stored(page)).toEqual({ on: false, hold: "bypass" });
+    await expect(segment(page, "Hold to bypass")).toHaveAttribute("aria-selected", "true");
+    await expect(segment(page, "Hold to bypass")).toBeDisabled();
+    await expect(holdButton(page)).toBeDisabled();
+    await expect(pill(page)).toHaveText("Modulated");
+    await turnOn(page);
+    expect(await stored(page)).toEqual({ on: true, hold: "bypass" });
+    // Picking the hold it already has sends it again: the way out of a
+    // stuck hold.
+    await segment(page, "Hold to bypass").click();
+    await expect
+      .poll(() => ptmCalls(page))
+      .toEqual([
+        RESTORE("always"),
+        SET("apply"),
+        HELD("key", true),
+        HELD("key", false),
+        SET("bypass"),
+        SET("always"),
+        SET("bypass"),
+        SET("bypass"),
+      ]);
+    // Nothing was held, so the last moved nothing in the engine.
+    expect(await mockPtm(page)).toEqual({ mode: "bypass", held: NONE, seq: 6 });
+    await expect(pill(page)).toHaveText("Modulated");
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("Space holds while it's down: once, with exactly its modifiers; the pill and the ticks follow", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await mixerReady(page);
+    await turnOn(page);
+    await expect(pill(page)).toHaveText("Clean");
+
+    await page.keyboard.down("Space");
+    await expect(pill(page)).toHaveText("Modulated");
+    expect(await ptmCalls(page)).toEqual([RESTORE("always"), SET("apply"), HELD("key", true)]);
+    expect(await mockPtm(page)).toEqual({ mode: "apply", held: { ...NONE, key: true }, seq: 2 });
+    // Autorepeat (every down after the first is a repeat): nothing more.
+    await page.keyboard.down("Space");
+    await page.keyboard.down("Space");
+    // The tick says the same. One built before the hold and arriving after
+    // its answer is ignored; its latency readout shows the page took it.
+    await emitLevels(page);
+    await expect(pill(page)).toHaveText("Modulated");
+    await emitLevels(page, {
+      ptm: { mode: "apply", held: false, bypassed: true, seq: 1 },
+      dspLatencyMs: 12,
+    });
+    await expect(page.getByText(/\+12 ms latency/)).toBeVisible();
+    await expect(pill(page)).toHaveText("Modulated");
+
+    await page.keyboard.up("Space");
+    await expect(pill(page)).toHaveText("Clean");
+    await emitLevels(page);
+    await expect(pill(page)).toHaveText("Clean");
+    expect(await mockPtm(page)).toEqual({ mode: "apply", held: NONE, seq: 3 });
+
+    // The key is Space alone: Shift+Space holds nothing.
+    await page.keyboard.down("Shift");
+    await page.keyboard.down("Space");
+    await page.keyboard.up("Space");
+    await page.keyboard.up("Shift");
+    // A press after it still holds, and the whole list shows nothing went
+    // for the repeats or for Shift+Space.
+    await page.keyboard.press("Space");
+    await expect
+      .poll(() => ptmCalls(page))
+      .toEqual([
+        RESTORE("always"),
+        SET("apply"),
+        HELD("key", true),
+        HELD("key", false),
+        HELD("key", true),
+        HELD("key", false),
+      ]);
+    await expect(pill(page)).toHaveText("Clean");
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("Hold to switch holds while the pointer or Enter is down, and a pointer press hands the focus back", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await mixerReady(page);
+    await turnOn(page);
+    const button = holdButton(page);
+    await expect(button).toHaveText("Hold to switch · or press Space");
+    await expect(button).toHaveAttribute("aria-pressed", "false");
+
+    // The pointer: held from down to up.
+    await button.hover();
+    await page.mouse.down();
+    await expect(button).toHaveAttribute("aria-pressed", "true");
+    await expect(button).toHaveText("Effects on");
+    await expect(pill(page)).toHaveText("Modulated");
+    expect(await mockPtm(page)).toEqual({ mode: "apply", held: { ...NONE, button: true }, seq: 2 });
+    await page.mouse.up();
+    await expect(button).toHaveAttribute("aria-pressed", "false");
+    await expect(button).toHaveText("Hold to switch · or press Space");
+    await expect(pill(page)).toHaveText("Clean");
+    expect(await ptmCalls(page)).toEqual([
+      RESTORE("always"),
+      SET("apply"),
+      HELD("button", true),
+      HELD("button", false),
+    ]);
+    // The focus is back on the page, so Space holds the key, not the button.
+    expect(await focusIsOnThePage(page)).toBe(true);
+    await page.keyboard.press("Space");
+    await expect.poll(async () => (await ptmCalls(page)).slice(4)).toEqual([
+      HELD("key", true),
+      HELD("key", false),
+    ]);
+
+    // Leaving the button lets go, with the mouse still down (no capture, so
+    // it can't stick); the release over the card sends nothing more.
+    await button.hover();
+    await page.mouse.down();
+    await expect(pill(page)).toHaveText("Modulated");
+    await page.getByText("Push to modulate", { exact: true }).hover();
+    await expect(pill(page)).toHaveText("Clean");
+    await page.mouse.up();
+    await expect(button).toHaveAttribute("aria-pressed", "false");
+
+    // From the keyboard: Enter holds while down, ignores its autorepeat, and
+    // the focus stays on the button.
+    await button.focus();
+    await page.keyboard.down("Enter");
+    await expect(button).toHaveText("Effects on");
+    await expect(pill(page)).toHaveText("Modulated");
+    await page.keyboard.down("Enter");
+    await page.keyboard.up("Enter");
+    await expect(button).toHaveText("Hold to switch · or press Space");
+    await expect(pill(page)).toHaveText("Clean");
+    await expect(button).toBeFocused();
+
+    // Hold to bypass: held, the effects are off.
+    await segment(page, "Hold to bypass").click();
+    await expect(pill(page)).toHaveText("Modulated");
+    await button.hover();
+    await page.mouse.down();
+    await expect(button).toHaveText("Effects off");
+    await expect(pill(page)).toHaveText("Clean");
+    await page.mouse.up();
+    await expect(pill(page)).toHaveText("Modulated");
+    await expect
+      .poll(async () => (await ptmCalls(page)).slice(6))
+      .toEqual([
+        HELD("button", true),
+        HELD("button", false),
+        HELD("button", true),
+        HELD("button", false),
+        SET("bypass"),
+        HELD("button", true),
+        HELD("button", false),
+      ]);
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("the global key is the backend's: the page sends nothing, the tick brings it, and a reload keeps it held", async ({
+    page,
+    consoleErrors,
+  }) => {
+    // Bound in Settings, as a user would.
+    await nav(page, "Settings").click();
+    const rows = page
+      .locator("section", { has: page.locator(".eyebrow", { hasText: /^Hotkeys$/ }) })
+      .locator(".panel > div");
+    const row = rows.filter({ has: page.getByText("Push-to-modulate", { exact: true }) });
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText(
+      "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.",
+    );
+    await row.getByRole("button", { name: "Click to set" }).click();
+    await page.keyboard.press("F8");
+    const bound = { cmd: "register_global_shortcut", args: { id: "ptm", accelerator: "F8" } };
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+
+    await mixerReady(page);
+    await turnOn(page);
+    await expect(pill(page)).toHaveText("Clean");
+    // A key that works in a call: the line no longer sends you to Settings.
+    await expect(cardLine(page)).toHaveText("Your effects are on only while you hold F8.");
+
+    // The backend holds it on the press and still sends the event.
+    expect(await pressPtmHotkey(page, "pressed")).toEqual({
+      mode: "apply",
+      held: true,
+      bypassed: false,
+      seq: 2,
+    });
+    // The page must not act on it as well.
+    await page.waitForTimeout(300);
+    expect(await ptmCalls(page)).toEqual([RESTORE("always"), SET("apply")]);
+    // The next tick brings it.
+    await emitLevels(page);
+    await expect(pill(page)).toHaveText("Modulated");
+
+    // A reload while it is held: the boot restores the mode, before it
+    // enumerates devices, and keeps the global key's hold.
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+    await mixerReady(page, "apply");
+    const cmds = (await invokesOf(page)).map((i) => i.cmd);
+    expect(cmds.indexOf("set_ptm_mode")).toBeLessThan(cmds.indexOf("list_audio_input_devices"));
+    expect(await mockPtm(page)).toEqual({ mode: "apply", held: { ...NONE, hotkey: true }, seq: 2 });
+    await expect(pill(page)).toHaveText("Modulated");
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+
+    // Let go: the backend's again, and the tick brings it.
+    expect(await pressPtmHotkey(page, "released")).toEqual({
+      mode: "apply",
+      held: false,
+      bypassed: true,
+      seq: 3,
+    });
+    await page.waitForTimeout(300);
+    expect(await ptmCalls(page)).toEqual([RESTORE("apply")]);
+    await expect(pill(page)).toHaveText("Modulated");
+    await emitLevels(page);
+    await expect(pill(page)).toHaveText("Clean");
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("a reload restores the mode and lets go of the page's holds, sending no hold", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await mixerReady(page);
+    await turnOn(page);
+    await page.keyboard.down("Space");
+    await expect(pill(page)).toHaveText("Modulated");
+    // As a page that went away without letting go would leave them: the
+    // button and a pad held too.
+    await page.evaluate(() => {
+      const w = JSON.parse(sessionStorage.getItem("__E2E_PTM__") ?? "null") as {
+        held: Record<string, boolean>;
+        seq: number;
+      };
+      w.held = { ...w.held, button: true, midi: true };
+      w.seq += 1;
+      sessionStorage.setItem("__E2E_PTM__", JSON.stringify(w));
+    });
+
+    // Space is still down when the page comes back.
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+    // One restore, sent before the boot enumerates devices; the engine let go
+    // of everything the page held.
+    await expect.poll(() => ptmCalls(page)).toEqual([RESTORE("apply")]);
+    const cmds = (await invokesOf(page)).map((i) => i.cmd);
+    expect(cmds.indexOf("set_ptm_mode")).toBeLessThan(cmds.indexOf("list_audio_input_devices"));
+    expect((await mockPtm(page)).held).toEqual(NONE);
+    // Clean from the answer alone: the mock sends no tick.
+    await expect(pill(page)).toHaveText("Clean");
+
+    // This page never held the key, so letting go of it sends nothing.
+    await page.keyboard.up("Space");
+    await page.waitForTimeout(300);
+    expect(await ptmCalls(page)).toEqual([RESTORE("apply")]);
+    // A new press holds as before.
+    await page.keyboard.press("Space");
+    await expect
+      .poll(() => ptmCalls(page))
+      .toEqual([RESTORE("apply"), HELD("key", true), HELD("key", false)]);
+    // The card says what was restored.
+    await nav(page, "Mixer").click();
+    await expect(ptmSwitch(page)).toHaveAttribute("aria-checked", "true");
+    await expect(cardLine(page)).toHaveText(APPLY_LINE_IN_APP);
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("MIDI: a pad holds while its note is down; a CC past halfway, until 59 or less; two hold until both let go", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await page.evaluate(() =>
+      localStorage.setItem(
+        "divora.midiMappings",
+        JSON.stringify([
+          { id: "pad", action: "ptm", trigger: { kind: "note", data1: 36, channel: 0 } },
+          { id: "fader", action: "ptm", trigger: { kind: "cc", data1: 7, channel: 0 } },
+        ]),
+      ),
+    );
+    await page.reload();
+    await mixerReady(page);
+    await expect.poll(async () => (await invokesOf(page, "list_midi_inputs")).length).toBeGreaterThan(0);
+    await turnOn(page);
+    // A learned mapping works in a call, so the line doesn't send you to
+    // Settings.
+    await expect(cardLine(page)).toHaveText("Your effects are on only while you hold Space.");
+    await expect(pill(page)).toHaveText("Clean");
+    const before = [RESTORE("always"), SET("apply")];
+
+    // Routing is synchronous, so the command list is final when the emit
+    // returns.
+    await midi(page, "note-on", 36, 100);
+    await expect(pill(page)).toHaveText("Modulated");
+    expect((await mockPtm(page)).held).toEqual({ ...NONE, midi: true });
+    await midi(page, "note-off", 36, 0);
+    await expect(pill(page)).toHaveText("Clean");
+    expect(await ptmCalls(page)).toEqual([...before, HELD("midi", true), HELD("midi", false)]);
+
+    // The fader: past halfway holds, the dead band (60-63) keeps it, 59 or
+    // less lets go.
+    await midi(page, "control-change", 7, 70);
+    await expect(pill(page)).toHaveText("Modulated");
+    await midi(page, "control-change", 7, 62);
+    expect(await ptmCalls(page)).toEqual([
+      ...before,
+      HELD("midi", true),
+      HELD("midi", false),
+      HELD("midi", true),
+    ]);
+    await midi(page, "control-change", 7, 50);
+    await expect(pill(page)).toHaveText("Clean");
+
+    // The pad and the fader together: held until both have let go.
+    await midi(page, "note-on", 36, 100);
+    await midi(page, "control-change", 7, 90);
+    await midi(page, "note-off", 36, 0);
+    await expect(pill(page)).toHaveText("Modulated");
+    await midi(page, "control-change", 7, 20);
+    await expect(pill(page)).toHaveText("Clean");
+    expect(await ptmCalls(page)).toEqual([
+      ...before,
+      HELD("midi", true),
+      HELD("midi", false),
+      HELD("midi", true),
+      HELD("midi", false),
+      HELD("midi", true),
+      HELD("midi", false),
+    ]);
+    expect(await mockPtm(page)).toEqual({ mode: "apply", held: NONE, seq: 7 });
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("the stream overlay's status follows it, and waits for the boot's restore after a reload", async ({
+    page,
+  }) => {
+    type State = { status: string };
+    const statuses = async (): Promise<string[]> =>
+      ((await emitsOf(page, "overlay:state")) as State[]).map((s) => s.status);
+    const lastStatus = async (): Promise<string | undefined> => (await statuses()).at(-1);
+
+    // Open the overlay from Settings: Hollow King with push-to-modulate off.
+    await nav(page, "Settings").click();
+    await page.getByRole("switch", { name: "Show stream overlay window" }).click();
+    await expect.poll(() => invokesOf(page, "open_overlay")).toHaveLength(1);
+    await expect.poll(lastStatus).toBe("modulated");
+
+    await mixerReady(page);
+    await turnOn(page);
+    await expect.poll(lastStatus).toBe("clean");
+    await page.keyboard.down("Space");
+    await expect.poll(lastStatus).toBe("modulated");
+    await page.keyboard.up("Space");
+    await expect.poll(lastStatus).toBe("clean");
+
+    // A reload with the overlay already open and the engine slow to answer
+    // the restore: nothing goes to the stream until the answer lands, so the
+    // circle never says Modulated over a voice that is clean. (The overlay's
+    // status lives in the page's mock; this opens it in the next one.)
+    await page.addInitScript(() => {
+      const o = (window as unknown as { __E2E_OVERLAY__: { status: Record<string, unknown> } })
+        .__E2E_OVERLAY__;
+      o.status = { ...o.status, open: true, phase: "painted", instance: 1, canArrange: true };
+    });
+    await delayPtmModeAnswers(page, 300);
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+    await expect.poll(() => ptmCalls(page)).toEqual([RESTORE("apply")]);
+    await expect(pill(page)).toHaveText("Clean");
+    await expect.poll(lastStatus).toBe("clean");
+    await page.waitForTimeout(300);
+    expect(await statuses()).not.toContain("modulated");
   });
 });
 

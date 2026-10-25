@@ -564,6 +564,82 @@ pub(crate) mod witness {
     }
 }
 
+/// Test-only, and shared with the audio engine's tests (v1.58.0): an effect
+/// whose output is `gain ×` its input delayed by exactly `n` samples and which
+/// reports exactly `n`, so its reported and actual delays agree by
+/// construction. Push-to-modulate delays the dry by the chain's reported
+/// latency, so with this chain the wet and the aligned dry carry the same
+/// moment, and a test can tell the stage's alignment from an effect's own
+/// reporting error. A `gain` of −1 makes the wet of a positive input negative,
+/// so a test can tell which voice it is hearing.
+#[cfg(test)]
+pub(crate) mod test_delay {
+    use super::{AudioEffect, EffectChain, EffectKind};
+
+    struct TestDelay {
+        /// The last `n` inputs, oldest at `at`; empty for `n` = 0. Allocated
+        /// here, never in `process`.
+        ring: Box<[f32]>,
+        at: usize,
+        gain: f32,
+        enabled: bool,
+    }
+
+    impl AudioEffect for TestDelay {
+        fn process(&mut self, buffer: &mut [f32], _: u32) {
+            for sample in buffer.iter_mut() {
+                let delayed = match self.ring.get_mut(self.at) {
+                    Some(slot) => std::mem::replace(slot, *sample),
+                    None => *sample,
+                };
+                self.at = (self.at + 1) % self.ring.len().max(1);
+                *sample = self.gain * delayed;
+            }
+        }
+        fn set_param(&mut self, _: &str, _: f32) {}
+        fn enabled(&self) -> bool {
+            self.enabled
+        }
+        fn set_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+        /// The nearest kind there is; nothing these tests run asks for it.
+        fn kind(&self) -> EffectKind {
+            EffectKind::Echo
+        }
+        fn latency_samples(&self, _: u32) -> usize {
+            self.ring.len()
+        }
+    }
+
+    /// `chain` with a delay of `n` and `gain` appended, enabled or not.
+    fn push(mut chain: EffectChain, n: usize, gain: f32, enabled: bool) -> EffectChain {
+        chain.effects.push(Box::new(TestDelay {
+            ring: vec![0.0; n].into_boxed_slice(),
+            at: 0,
+            gain,
+            enabled,
+        }));
+        chain
+    }
+
+    /// A one-effect chain: `gain ×` the input delayed by `n`, reporting `n`.
+    pub(crate) fn test_delay(n: usize, gain: f32) -> EffectChain {
+        push(EffectChain::new(), n, gain, true)
+    }
+
+    /// `test_delay(n, 1.0)`: a pure delay of `n` that reports `n`.
+    pub(crate) fn fixed_delay(n: usize) -> EffectChain {
+        test_delay(n, 1.0)
+    }
+
+    /// `chain` with a pure delay of `n` appended, enabled or not, so a test
+    /// can move the chain's latency with `SetEnabled`, as the drain does.
+    pub(crate) fn with_delay(chain: EffectChain, n: usize, enabled: bool) -> EffectChain {
+        push(chain, n, 1.0, enabled)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::witness::witnessed_chain;
@@ -800,5 +876,40 @@ mod tests {
         // Passthrough (no model loaded) → no buffering delay.
         let chain = EffectChain::from_specs(&[spec(EffectKind::VoiceConvert, true)]);
         assert_eq!(chain.latency_samples(48_000), 0);
+    }
+
+    /// v1.58.0: the engine's push-to-modulate tests lean on the test delay
+    /// being exactly what it reports, at any buffer size, so pin that here.
+    #[test]
+    #[allow(clippy::float_cmp)] // `gain × x` for exactly representable values
+    fn the_test_delay_is_exactly_what_it_reports() {
+        use super::test_delay::{fixed_delay, test_delay, with_delay};
+        #[allow(clippy::cast_precision_loss)] // integers well under 2^24
+        let input: Vec<f32> = (1..=5_000).map(|i| i as f32).collect();
+        for n in [0, 1, 480, 1023] {
+            for (gain, mut chain) in [(1.0, fixed_delay(n)), (-1.0, test_delay(n, -1.0))] {
+                assert_eq!(chain.latency_samples(48_000), n);
+                let mut out = Vec::new();
+                for block in input.chunks(7) {
+                    let mut buf = block.to_vec();
+                    chain.process(&mut buf, 48_000);
+                    out.extend(buf);
+                }
+                for (i, &y) in out.iter().enumerate() {
+                    let x = i.checked_sub(n).map_or(0.0, |j| input[j]);
+                    assert_eq!(y, gain * x, "delay {n}, gain {gain}: sample {i}");
+                }
+            }
+        }
+        // `SetEnabled` moves the chain's latency, as the drain applies it.
+        let mut chain = with_delay(with_delay(EffectChain::new(), 1024, false), 3072, true);
+        assert_eq!(chain.latency_samples(48_000), 3072);
+        assert!(chain
+            .apply(DspEdit::SetEnabled {
+                index: 0,
+                enabled: true,
+            })
+            .is_none());
+        assert_eq!(chain.latency_samples(48_000), 4096);
     }
 }

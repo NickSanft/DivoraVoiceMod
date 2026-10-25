@@ -116,6 +116,28 @@ describe("Wizard", () => {
     expect(window.localStorage.getItem("divora.wizardSeen")).toBe("true");
   });
 
+  // v1.58.0: push-to-modulate is off until the Mixer card turns it on, so
+  // the ready step no longer tells a new user to hold Space; and no step
+  // promises a switch with no delay.
+  it("the ready step says a spell changes your voice, with no key to hold", () => {
+    window.localStorage.setItem("divora.calibrated", "true");
+    const { getByText, getByRole, container } = setup();
+    // Welcome, Virtual cable, Devices, then Ready (calibration done).
+    const seen: string[] = [container.textContent ?? ""];
+    for (let i = 0; i < 3; i++) {
+      getByText("Continue").click();
+      seen.push(container.textContent ?? "");
+    }
+    expect(getByRole("heading", { name: /You.{0,3}re ready/i })).toBeInTheDocument();
+    const ready = (container.textContent ?? "").replace(/\s+/g, " ");
+    expect(ready).toContain(
+      "Pick a spell from the Mixer to change your voice. One last thing — point your chat app at DivoraVoice:",
+    );
+    expect(ready).not.toMatch(/hold\s*Space/i);
+    expect(ready).not.toMatch(/to modulate/i);
+    for (const text of seen) expect(text).not.toMatch(/at once|instant/i);
+  });
+
   it("the VB-Cable Download button opens the page from the desktop (v1.57.0)", async () => {
     const { getByText, findByRole } = setup();
     getByText("Continue").click();

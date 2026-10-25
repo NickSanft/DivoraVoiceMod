@@ -28,7 +28,19 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/plugin-shell", () => ({
   open: vi.fn(async () => undefined),
 }));
+// v1.58.0: one test renders the whole app, for its push-to-modulate key.
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: vi.fn(() => ({
+    minimize: vi.fn(),
+    maximize: vi.fn(),
+    unmaximize: vi.fn(),
+    close: vi.fn(),
+    isMaximized: vi.fn(async () => false),
+    onFocusChanged: vi.fn(async () => () => undefined),
+  })),
+}));
 
+import App from "../App";
 import { AppProvider, useApp } from "../stores/app";
 import { MixerScreen } from "./MixerScreen";
 
@@ -36,8 +48,9 @@ type Word = { muted: boolean; seq: number };
 
 /** Render the Mixer through the real store over a mock engine word. With
  *  `bootReads: false` the boot read answers nothing, so the mirror stays
- *  unknown whatever the word says. */
-function setup(start: Word, bootReads: boolean) {
+ *  unknown whatever the word says. With `whole`, the whole app (its
+ *  push-to-modulate key listener included), on the Mixer. */
+function setup(start: Word, bootReads: boolean, whole = false) {
   let word: Word = { ...start };
   invokeMock.mockImplementation(async (cmd: string, args?: { muted?: boolean }) => {
     switch (cmd) {
@@ -60,10 +73,24 @@ function setup(start: Word, bootReads: boolean) {
       case "toggle_input_muted":
         word = { muted: !word.muted, seq: word.seq + 1 };
         return word;
+      case "audio_engine_status":
+        return {
+          running: false,
+          monitoring: true,
+          input: { rms: 0, peak: 0 },
+          output: { rms: 0, peak: 0 },
+        };
       default:
         return undefined;
     }
   });
+
+  if (whole) {
+    // Past the first-run wizard; the shell opens on the Mixer.
+    localStorage.setItem("divora.wizardSeen", "true");
+    const utils = render(() => <App />);
+    return { ...utils, word: () => word };
+  }
 
   let api: ReturnType<typeof useApp> | null = null;
   function Harness() {
@@ -84,6 +111,9 @@ const flush = async (): Promise<void> => {
 
 const muteCalls = (): unknown[][] =>
   invokeMock.mock.calls.filter(([cmd]) => cmd === "set_input_muted" || cmd === "toggle_input_muted");
+
+const ptmHeldCalls = (): unknown[][] =>
+  invokeMock.mock.calls.filter(([cmd]) => cmd === "set_ptm_held");
 
 // jsdom has no default actions for the mouse or keys, so these two play
 // Chromium's (WebView2's) part. A mouse press focuses a button unless
@@ -197,6 +227,29 @@ describe("the Voice status card's mute button (v1.56.0)", () => {
     expect(muteCalls()).toEqual([["set_input_muted", { muted: true }]]);
     expect(word()).toEqual({ muted: true, seq: 1 });
     expect(button.textContent?.trim()).toBe("Unmute");
+  });
+
+  // v1.58.0: and that Space now reaches push-to-modulate. Through the whole
+  // app, so App's own key listener (which acts only on keys aimed at the
+  // page) is the one that hears it.
+  it("through the whole app, Space after a Mute click holds push-to-modulate and doesn't unmute", async () => {
+    const { getByTestId, word } = setup({ muted: false, seq: 0 }, true, true);
+    await flush();
+    const button = getByTestId("mute-button");
+
+    mouseClick(button);
+    await flush();
+    expect(muteCalls()).toEqual([["set_input_muted", { muted: true }]]);
+    expect(document.activeElement).toBe(document.body);
+
+    press("Space");
+    await flush();
+    expect(ptmHeldCalls()).toEqual([
+      ["set_ptm_held", { source: "key", held: true }],
+      ["set_ptm_held", { source: "key", held: false }],
+    ]);
+    expect(muteCalls()).toEqual([["set_input_muted", { muted: true }]]);
+    expect(word()).toEqual({ muted: true, seq: 1 });
   });
 
   it("from the keyboard it keeps focus, so Space and Enter keep working it", async () => {

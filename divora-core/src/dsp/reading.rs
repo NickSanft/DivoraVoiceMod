@@ -228,9 +228,12 @@ pub struct VoiceReading {
     pub held_descriptors: Vec<Descriptor>,
     /// The chain was bypassed over this window, so `wet` is `dry`.
     ///
-    /// Push-to-modulate with the key up is exactly this: the dry tap has
-    /// speech on it while the wet tap is a passthrough. Without this flag the
-    /// panel would read that as the preset having stopped working.
+    /// Push-to-modulate switching the effects off (v1.58.0) is exactly this:
+    /// the dry tap has speech on it while the wet tap is a passthrough (the
+    /// engine delays the dry tap by the chain's latency, so the two are the
+    /// same moment). Without this flag the panel would read that as the
+    /// preset having stopped working. A held reading's flag is its window's,
+    /// like its numbers, not the moment's.
     pub wet_bypassed: bool,
     /// `wet` covers a full window of the *current* chain.
     ///

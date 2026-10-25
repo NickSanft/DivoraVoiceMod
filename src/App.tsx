@@ -26,7 +26,7 @@ import {
 import { levelMute } from "./data/mute";
 import { levelPtm, ptmKeyMatches } from "./data/ptm";
 import { overlayPayload } from "./overlay/state";
-import { syncOverlay } from "./overlay/sync";
+import { overlayHeld, syncOverlay } from "./overlay/sync";
 import { Toast } from "./components/Toast";
 import { Wizard } from "./components/Wizard";
 import { WhatsNewBanner, WhatsNewModal } from "./components/WhatsNew";
@@ -102,6 +102,16 @@ export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent
   }
 }
 
+/** v1.58.0: lets go of everything the page holds of push-to-modulate, the
+ *  in-app key and the Mixer's Hold to switch button, where no keyup or
+ *  pointerup will come: the window lost the focus, or the page is hidden.
+ *  Each sends only if the page held it, so a second path sends nothing.
+ *  MIDI isn't the page's: a pad keeps holding while Divora is behind. */
+function letGoOfPagePtm(app: AppState): void {
+  app.ptmUp("key");
+  app.ptmUp("button");
+}
+
 /** One `audio-levels` tick into the store. v1.56.0 adds the mute: the tick's
  *  pair is adopted only when it is newer than what the mirror holds, and a
  *  tick without it changes nothing. v1.58.0 adds push-to-modulate's state,
@@ -120,7 +130,9 @@ export function applyLevelUpdate(app: AppState, update: LevelUpdate): void {
   app.applyPtmState(levelPtm(update));
 }
 
-function Shell(): JSX.Element {
+/** The shell inside the store's provider. Exported so its tests can render
+ *  it in a provider of their own and reach the store it drives. */
+export function Shell(): JSX.Element {
   const app = useApp();
 
   // Reflect Tweaks state on the root so CSS variable cascades fire.
@@ -179,10 +191,13 @@ function Shell(): JSX.Element {
   // which the store's overlay controller pushes. v1.56.0: held until the
   // store knows the mute or 500 ms pass (`muteKnown`), so a reload during a
   // mute shows the stream unmuted only if the boot read takes longer than
-  // that, and then only until the read or a level tick lands.
+  // that, and then only until the read or a level tick lands. v1.58.0: and
+  // until push-to-modulate's boot restore settles or 500 ms pass
+  // (`ptmKnown`; a tick doesn't count), so a reload with it on and the key
+  // up doesn't show the stream Modulated over a clean voice.
   syncOverlay({
     isOpen: app.overlayOpen,
-    held: () => !app.muteKnown(),
+    held: () => overlayHeld(app),
     payload: () =>
       overlayPayload({
         chain: app.chain(),
@@ -212,7 +227,11 @@ function Shell(): JSX.Element {
   // holds its own source in the engine ("key"), so either path may fire
   // and neither releases the other's hold. A press needs the bound key's
   // modifiers exactly and ignores autorepeat; a release matches the
-  // trailing key alone, wherever focus ended up.
+  // trailing key alone, wherever focus ended up. Where no keyup or
+  // pointerup will come, the page lets go of the key and the Mixer's
+  // button: the window losing the focus (`blur`, and Tauri's own focus
+  // event below), or the page hidden (`visibilitychange`). Without that, a
+  // key held across Alt-Tab stays held.
   onMount(() => {
     const key = (): string => app.ui.ptmKey || "Space";
     const down = (e: KeyboardEvent) => {
@@ -230,11 +249,19 @@ function Shell(): JSX.Element {
       if (e.target === document.body) e.preventDefault();
       app.ptmUp("key");
     };
+    const blur = (): void => letGoOfPagePtm(app);
+    const visibility = (): void => {
+      if (document.visibilityState === "hidden") letGoOfPagePtm(app);
+    };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    document.addEventListener("visibilitychange", visibility);
     onCleanup(() => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+      document.removeEventListener("visibilitychange", visibility);
     });
   });
 
@@ -394,7 +421,9 @@ function Shell(): JSX.Element {
   // window-level `onFocusChanged` event is the source of truth on the
   // OS-window level; we also listen to the browser-level `focus` event
   // as a belt-and-suspenders fallback (covers browser preview / older
-  // Tauri builds where the plugin import fails).
+  // Tauri builds where the plugin import fails). v1.58.0: losing the focus
+  // lets go of the page's push-to-modulate holds here too, beside the DOM's
+  // `blur` above; whichever comes second sends nothing.
   onMount(() => {
     let unlistenTauri: UnlistenFn | null = null;
     let cancelled = false;
@@ -404,7 +433,10 @@ function Shell(): JSX.Element {
         const mod = await import("@tauri-apps/api/window");
         const w = mod.getCurrentWindow();
         const fn = await w.onFocusChanged(({ payload: focused }) => {
-          if (!focused) return;
+          if (!focused) {
+            letGoOfPagePtm(app);
+            return;
+          }
           void app.refreshDevices();
         });
         if (cancelled) {
