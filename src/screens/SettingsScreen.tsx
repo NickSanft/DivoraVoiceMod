@@ -1480,9 +1480,9 @@ function ControlSurfacesSection(): JSX.Element {
               left past halfway holds only after it crosses again. */}
           <strong>Hold push-to-modulate</strong> holds while a pad's note is
           down, or while a knob, fader or CC button is past halfway (it lets go
-          at 59 or less); with two pads on it, it holds until both are up.
-          Turning Push to modulate on or off on the Mixer, or picking its hold,
-          lets go: a pad then holds again on its next press, and a control left
+          at 59 or less); with two pads on it, it holds until both are up. It
+          does nothing while the Mixer's Push to modulate card is off. Turning
+          Push to modulate on or off on the Mixer, or picking its hold, lets go: a pad then holds again on its next press, and a control left
           past halfway once it comes back down and up again.
         </p>
 

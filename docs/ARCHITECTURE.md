@@ -3620,8 +3620,9 @@ when the release reaches the stage fails it.
 
 What is left is the input's buffering: the cushion between the microphone and
 the stage, about one or two device buffers. Up to that much of what you said
-just before letting go can reach the call in your own voice, less however late
-the release reached the callback (the global key's release comes 0 to 50 ms
+just before the effects turn off (the release with Hold to apply, the press with
+Hold to bypass) can reach the call in your own voice, less however late the
+key reached the callback (the global key's release comes 0 to 50 ms
 after the key-up, which often covers it). Worked out from the code; not
 measured.
 
