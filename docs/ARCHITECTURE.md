@@ -75,7 +75,7 @@ State across threads:
 | 0 | `ping`, `project_name` (smoke tests) |
 | 1 | (no new audio commands — design system + app shell) |
 | 2 | `list_devices`, `start_engine`, `stop_engine`, `set_monitor`, `subscribe_levels` |
-| 3 | `set_effect_chain`, `set_effect_param`, `set_ptm_state` |
+| 3 | `set_effect_chain`, `set_effect_param`, `set_ptm_state` (never built; v1.58.0 has `set_ptm_mode` / `set_ptm_held`) |
 | 4 | `list_presets`, `load_preset`, `save_preset`, `delete_preset`, `export_preset_json`, `ab_compare_swap` |
 | 5 | `pick_soundboard_folder`, `list_soundboard_tiles`, `play_clip`, `stop_clip`, `stop_all` |
 | 6 | `detect_virtual_mic`, `set_virtual_mic_output`, `set_hotkey`, `set_hotkey_mode`, `set_tweaks`, `bind_glyph` |
@@ -130,7 +130,7 @@ src/
 | `preset` | memo | Active preset object (from PRESETS) |
 | `chains` / `setChains` | store | Per-preset editable copies of the chain (mutated when sliders move) |
 | `chain` | memo | Active preset's current chain |
-| `ui` / `setUi` | store | `{ monitor, ab, ptmMode, ptmKey, pressed }` (`muted` left it in v1.56.0) |
+| `ui` / `setUi` | store | `{ monitor, ab, ptmKey }` (`muted` left it in v1.56.0; `ptmMode` and `pressed` in v1.58.0, for the engine's push-to-modulate state) |
 | `wizardOpen` / `setWizardOpen` | signal | First-run overlay visibility |
 | `tweaks` / `setTweaks` | store | Mystical / motion / mood / accent / grain / vignette |
 | `glyphBindings` / `setGlyphBinding` | store | Glyph id → the action it casts (v1.15.0; persisted to `divora.glyphBindings`) |
@@ -138,9 +138,13 @@ src/
 | `muteState` / `applyMuteState` | signal / action | The newest `InputMute` seen; `applyMuteState` is the mirror's only writer and keeps the larger `seq` |
 | `muteKnown` | signal | True once the boot read of the mute settles, a state is adopted, or 500 ms pass; holds the overlay push |
 | `setMuted` / `toggleMuted` | action | `set_input_muted` (controls with a label) / `toggle_input_muted` (a MIDI pad); each adopts the answer |
+| `ptmState` / `applyPtmState` | signal / action | Push-to-modulate (v1.58.0): a read-only mirror of the engine's state, the newest `PtmState` seen; `applyPtmState` is its only writer and keeps the larger `seq` |
+| `ptmBypassed` | memo | The mirror's `bypassed`: the engine is switching the effects off. Null reads as applied, the engine's launch state |
+| `ptmKnown` | signal | True once the boot restore settles (answer or failure) or 500 ms pass, never from a tick; holds the overlay push |
+| `ptmSetting` / `setPtmOn` / `setPtmHold` | signal / action | What the Mixer card picked, `{ on, hold }`, saved in `divora.ptm` only from the engine's answer to `set_ptm_mode` |
+| `ptmDown` / `ptmUp` | action | The in-app key's and the Mixer button's holds (`set_ptm_held`), sent only on an edge |
 | `hasEnabled` | memo | Any effect on the active chain enabled |
-| `effectiveModulated` | memo | PTM apply/bypass logic |
-| `status` | memo | "muted" (from `muted()`) / "modulated" / "clean" |
+| `status` | memo | "muted" (from `muted()`) / "modulated" / "clean". v1.58.0: "modulated" while an effect other than the noise gate is on and `ptmBypassed()` is false (`effectiveModulated`, the old push-to-modulate label logic, is gone) |
 
 Components access this via `useApp()`; tests use `renderHook(() => useApp(), { wrapper: AppProvider })`.
 
@@ -550,18 +554,20 @@ And rejects unrelated devices (`Blue Yeti X`, `HyperX Cloud II`, `Realtek HD Aud
 GlobalShortcutEvent { id, accelerator, state }  // state: "pressed" | "released"
 ```
 
-Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor` / `mute`, the reserved prefixes `sb:`, `rec:`, `replay:`, `overlay:` and `mute:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. Two ids are acted on in Rust before they get there, when the press arrives inside `WM_HOTKEY`; `global_shortcut_handler` still emits both events afterwards:
+Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor` / `mute`, the reserved prefixes `sb:`, `rec:`, `replay:`, `overlay:`, `mute:` and `ptm:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. Three ids are acted on in Rust before they get there; `global_shortcut_handler` still emits their events afterwards. A press arrives inside `WM_HOTKEY`, on the main thread; a release arrives on global-hotkey's poller thread, which reads the key's state every 50 ms from the press until it reads the key up:
 
 - **`overlay:arrange`** (v1.55.0): the handler hands every event to `overlay_windows::hotkey`, and a press switches the open overlay between Arrange and Locked (see "Stream overlay window"). Its JavaScript branch never calls `set_overlay_mode`, which would toggle the press twice.
 - **`mute`** (v1.56.0): the handler then hands every event to `mute_on_hotkey`, and a press — never a release (`hotkey_mute_request`) — calls `engine.toggle_input_muted()`, one atomic operation on the engine's mute (see "Mute (v1.56.0)"). The page plays no part, so it doesn't matter whether it is hidden, reloading or busy, and two quick presses are two flips. global-hotkey 0.8.0 registers every key with `MOD_NOREPEAT`, so a held key doesn't repeat. Its JavaScript branch does nothing: acting there would flip it twice. The page learns the new state from the next `audio-levels` tick.
+- **`ptm`** (v1.58.0): the handler then hands every event to `ptm_on_hotkey`, and a press holds push-to-modulate's global-key source and its release lets go (`engine.set_ptm_held(PtmSource::Hotkey, …)`, one atomic operation, safe on the poller thread; see "Push-to-modulate (v1.58.0)"). The page plays no part, for the mute's reasons. Its JavaScript branch does nothing: acting there would hold it twice. The page learns the new state from the next `audio-levels` tick.
 
 The routes:
 
 ```
 event.id         | event.state | action
 -----------------|-------------|-------------------------------
-"ptm"            | "pressed"   | setUi("pressed", true)
-"ptm"            | "released"  | setUi("pressed", false)
+"ptm"            | either      | nothing — the backend already held or
+                 |             | let go (global_shortcut_handler →
+                 |             | ptm_on_hotkey)               (v1.58.0)
 "panic"          | "pressed"   | panicSoundboard()
 "monitor"        | "pressed"   | toggleMonitor()
 "rec:screen"     | "pressed"   | toggleScreenRecording()   (v1.52.0)
@@ -587,11 +593,16 @@ event.id         | event.state | action
 
 - **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), `overlay:arrange` (v1.55.0) and `mute` (v1.56.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
 - **A refused key leaves the action unbound (v1.56.0).** `register_global_shortcut` takes the action's old shortcut out of the map, and unregisters it, before it parses the new accelerator (`rebind`, tested by `a_refused_key_never_leaves_the_old_one_bound`). Until v1.56.0 the parse came first, so an accelerator the parser refuses — Shift with a digit, captured as "!", the number pad's + ("Ctrl++") or *, a letter outside A to Z — returned early and left the old key live under a binding Settings no longer showed, until a restart or a Clear. The refusal itself is still only logged to the console. **A shared key stays registered (v1.56.0):** Windows keeps one registration per key, so two actions bound to one key share it; `release` returns a key to unregister only when no other action in the map still holds it (`a_shared_key_stays_registered_for_the_other_action`), where until v1.56.0 changing or clearing either action unregistered it and silenced the other. Which of the two a shared key runs is still the handler's first match in the map, which can differ from launch to launch.
+- **The same live key is kept (v1.58.0).** `register_global_shortcut` first parses the accelerator and compares it with what the map holds for that id (`same_binding`, so `shift+ctrl+m` matches `Ctrl+Shift+M`); if it is the same key and the plugin still has it registered (`is_registered`), it answers `Ok` and does nothing. Until v1.58.0 it unregistered and registered the key again, and `syncHotkeyBindings` does that for every binding each time the page mounts, so a key held across a reload lost its release in between. A key whose earlier register failed isn't registered, so it is tried again.
+- **The plugin is called with the map unlocked (v1.58.0).** The plugin runs our handler under its own lock, and the handler takes `AppState.shortcuts`; `register_global_shortcut` used to hold `AppState.shortcuts` while it called the plugin's `unregister`, which takes the plugin's lock. A key let go on the poller thread during a rebind or a reload's re-sync could therefore deadlock the main thread (found by reading the code; never seen). The three shortcut commands now update the map inside a lock block and call the plugin, `is_registered` included, only after it, which races nothing: commands run one at a time on the main thread. `the_shortcut_commands_unlock_before_the_plugin` reads the source to pin that shape. Push-to-modulate made key releases the most common hotkey event, which is why it was fixed now.
+- **Unbinding `ptm` lets go of its hold (v1.58.0).** Once `ptm` leaves its key in the map, that key's release can no longer reach the handler: the plugin dropped the key, or another id shares it and the handler finds that one. So the map updates themselves let go of the global key's hold (`take_binding`, `drop_binding`, `drain_bindings`, each calling `ptm_key_unbound`): binding `ptm` to another key, to one the parser refuses, or to the same key when it isn't registered, clearing it, and clearing every key. They do it before anything can return early, whether or not a shortcut comes back to unregister.
 - **The Windows key:** the capture component labels it "Win", but the parser behind `register_global_shortcut` (global-hotkey 0.8.0) accepts only `Super` / `Cmd` / `Command`. `keysToAccelerator` and `normalizeAccelerator` turn "Win" into "Super" for every accelerator handed to the backend: the three actions, and soundboard tiles, including ones saved before the fix. `acceleratorToKeys` shows "Super" as "Win" again.
 
 ### Why two PTM listeners?
 
-The OS-level hotkey works while the app is unfocused but **does not** swallow the keypress from the focused app. So if a user is typing in Discord with PTM = Space, Discord still gets the spaces. To handle that, `App.tsx` also keeps an in-app `window.addEventListener("keydown")` that triggers the same `ui.pressed` flip when our window has focus AND the event target is `document.body`. Both listeners converge on the same store mutation; the user can't tell which fired.
+*(Rewritten for v1.58.0. Until then this said the global key doesn't swallow the press from the focused app and that both listeners flipped one `ui.pressed`; v0.7.1 had already found the first wrong — a registered Space was taken from every other app — and v1.58.0 removed the second.)*
+
+The two are two sources, not two routes to one flag. A key registered globally works while Divora isn't focused, and Windows hands its key-down to the hotkey instead of the focused app (that is why the default global PTM key has been unbound since v0.7.1, when a registered Space was taken from Discord, browsers and games). The in-app listener in `App.tsx` is the default input: `ui.ptmKey`, Space unless a global key is bound, matched while Divora's window has the focus and the event's target is `document.body`. Each holds its own bit in the engine's word — the global key `hotkey`, held in Rust, and the in-app key `key`, sent with `set_ptm_held` — and push-to-modulate is held while either is. So either may fire, and neither lets go of the other's hold: with the same key bound globally, the page may see only its key-up, which sends nothing because the page holds nothing. The in-app press needs the accelerator's modifiers exactly and ignores autorepeat; its release, the window losing the focus and the rest are in "Push-to-modulate (v1.58.0)".
 
 ### Hotkey accelerator format
 
@@ -611,7 +622,7 @@ An empty string means "no binding"; `setHotkeyBinding(action, "")` calls `unregi
 | `virtualMicStatus` / `setVirtualMicStatus` | signal | Last result of `detect_virtual_mic`, or `null` before first refresh |
 | `refreshVirtualMicStatus` | action | Calls backend; swallows errors (logs + stays `null`) |
 | `hotkeyBindings` / `setHotkeyBindings` | store | `Record<HotkeyAction, string>` — Tauri accelerator strings |
-| `setHotkeyBinding(action, accel)` | action | Empty string → unregister; non-empty → register; PTM also mirrors to `ui.ptmKey` |
+| `setHotkeyBinding(action, accel)` | action | Empty string → unregister; non-empty → register; PTM also mirrors to `ui.ptmKey` (v1.58.0: after letting go of the in-app key, whose keyup would no longer match) |
 | `clearHotkeyBinding(action)` | action | Shorthand for `setHotkeyBinding(action, "")` |
 | `syncHotkeyBindings` | action | Re-register every non-empty binding (idempotent; used on startup) |
 
@@ -1171,7 +1182,9 @@ serial). Implemented for the effects that buffer:
 
 The engine publishes the chain's added latency (ms) on the ~30 Hz
 `audio-levels` event; the Mixer header shows "· +N ms latency" and moves
-live as effects toggle. (The originally-sketched buffer-size selector was
+live as effects toggle. (v1.58.0: it is also the delay push-to-modulate gives
+your own voice while it has the effects off, so the two voices line up; see
+"Push-to-modulate (v1.58.0)".) (The originally-sketched buffer-size selector was
 dropped — WASAPI shared mode largely ignores requested buffer sizes.)
 
 ## Phase 15 — soundboard volume + folder persistence + system tray
@@ -2163,7 +2176,10 @@ from the voice — after the chain, loudness and the mute (v1.56.0: a muted
 voice goes in as zeros, never skipped), before the fold and before the
 monitor-only previews — into preallocated rings, plus one mark per buffer:
 cpal's callback instant, the buffer's index, the device frames it wrote, the
-input ring's depth before the pop, and the chain's latency. Idle, each
+input ring's depth before the pop, and the chain's latency (v1.58.0: the one
+the voice stage read after the reactive modulator, which push-to-modulate's
+dry is delayed by, so a take places your voice the same way with the effects
+on or off). Idle, each
 callback does one atomic load. While recording, the output callback reads the
 input ring's depth and makes three ring pushes a buffer, and the input
 callback takes one timestamp difference and stores the input latency; one
@@ -2813,6 +2829,11 @@ output callback, per buffer:
   WAV tap → resample_render → fan-out → OUT meter
 ```
 
+That is the stage as v1.56.0 left it. v1.58.0 puts push-to-modulate's switch
+between the chain and loudness, reads the chain's latency once after the
+modulator, and moves the reading's DRY tap after the stage, beside the WET
+tap: see "Push-to-modulate (v1.58.0)", "Where it sits".
+
 "After loudness, before the soundboard fold", as the plan put it, is not one
 point: between the two sit the reading's WET tap, the AV tap, the monitor's
 mic copy and, with no monitor device, the previews mixed into `mono`. Muting
@@ -2955,7 +2976,12 @@ trip rather than after the enumeration. Ticks still start after it (the boot
 comment in `App.tsx` says why). The boot sends no mute of its own, so a reload
 never unmutes the call. `muteKnown` comes true when the read settles (an
 answer or a failure), when any state is adopted, or after 500 ms; until the
-read lands, the pill shows the push-to-modulate status.
+read lands, the pill shows Clean or Modulated, as push-to-modulate's mirror
+says. (v1.58.0: that mirror is empty until push-to-modulate's own boot
+answer or a tick lands, and empty reads as the effects on, so with
+push-to-modulate on and the key up the pill can say Modulated for that long;
+the overlay is held until both boot calls settle. See "Push-to-modulate
+(v1.58.0)", "The mirror in the store".)
 
 **Labels set, triggers toggle.** A control with a label sends the state its
 label names (`setMuted`): the Mixer's Mute / Unmute button, a glyph (its omen,
@@ -2981,7 +3007,8 @@ mute, a latching CC button's next press does nothing.
 
 **The overlay.** `syncOverlay` sends `overlay:state` through one promise
 chain, and sends nothing while `held()` is true; `App.tsx` passes
-`() => !app.muteKnown()`. A reload during a mute therefore shows the stream
+`() => !app.muteKnown()` (v1.58.0: `overlayHeld(app)`, which also waits for
+push-to-modulate's `ptmKnown`). A reload during a mute therefore shows the stream
 unmuted (Clean or Modulated) only if the boot read takes more than 500 ms or
 fails, and then only until the read or a tick lands. The hold can't freeze the
 overlay, because `muteKnown` always comes true. The mute rides
@@ -3031,7 +3058,9 @@ different rates, and joining them flashed "Input silent" after every unmute.
   `inputMuteSeq` always agree.
 - **The reading worker:** one load per pass.
 - `AudioEngine::set_input_muted` takes `&self` and no lock, so any thread can
-  call it; that is the way in planned for v1.58.0's break timer.
+  call it; that is the way in planned for the break timer in "Timers that
+  change your voice" (now planned as v1.60.0; see
+  [`research/stream-studio.md`](research/stream-studio.md)).
 
 **Latency**, from the press: the main-thread queue (normally empty), then up
 to one buffer before the callback reads the word (about 10 ms at 480 frames),
@@ -3260,3 +3289,673 @@ cache miss (150–500 ms for a ten-minute file; a later Stop must still win);
 old folder could land after the new one). Also left, though a plain move
 would do: `import_preset` (slow only for a cloud or network file) and
 `list_speak_clips` (grows with the number of saved clips).
+
+## Push-to-modulate (v1.58.0)
+
+Push-to-modulate switches your effects off and on for everything Divora sends
+your voice to — the call, the headphone monitor and Divora's own recordings
+(the WAV recorder, screen takes and their voice stem, Replay). The soundboard,
+Speak and Critter Chatter are never switched. The switch crosses between the
+two voices over about 11 ms (512 samples at 44.1 and 48 kHz) rather than in
+one step. Four inputs hold it, each on its own: the `ptm` global key (acted
+on in Rust), the in-app key (Space unless a global key is bound), the Mixer's
+**Hold to switch** button and a MIDI pad or CC. What a hold does is the mode, set on the Mixer's **Push to
+modulate** card: off (`always`, the default: the effects always apply),
+**Hold to apply** (`apply`: on only while held) or **Hold to bypass**
+(`bypass`: off while held).
+Until v1.58.0 push-to-modulate was a label. Its inputs set `ui.pressed`, which
+fed only the Clean / Modulated status, and the call heard the preset whatever
+they did: in the default Hold to apply, with the key up, Divora said Clean
+while the call heard the effects. The Mixer's button was **Hold to test**, a
+trial of that label. The plan, and what the build changed from it, are in
+[`research/stream-studio.md`](research/stream-studio.md) (v1.58.0,
+"Push-to-modulate that modulates").
+
+### The state
+
+`EngineState.ptm` is one `AtomicU64` holding `seq << 16 | mode << 8 | held`
+(`audio/ptm.rs` packs and unpacks it):
+
+- `held` is a bit per source: 0 the global key (`hotkey`), 1 the in-app key
+  (`key`), 2 the Mixer's button (`button`), 3 MIDI (`midi`); 4 to 7 are
+  reserved. It is held while any bit is set, so one source letting go never
+  lets go of another. (Until v1.58.0 one flag served them all, so a Space tap
+  let go of a held MIDI pad.)
+- `mode` is 0 `always`, 1 `apply`, 2 `bypass`; any other byte reads as
+  `always`.
+- `seq` counts changes since launch: every change bumps it by one, and of two
+  states the larger `seq` is newer. It stops at 2^48 − 1, which is never
+  reached.
+
+What the output callback does with it (`is_bypassed`):
+
+| mode | nothing held | something held |
+|---|---|---|
+| `always` | effects on | effects on |
+| `apply` | **effects off** | effects on |
+| `bypass` | effects on | **effects off** |
+
+Three operations change it. Each is one compare-and-swap loop
+(`EngineState::apply_ptm`, the loop the mute's `apply_input_mute` runs) that
+returns `PtmChange { before, after }`, and a call that changes nothing moves
+nothing, `seq` included:
+
+- **`SetMode`**, the Mixer card's set (`AudioEngine::set_ptm_mode`): the mode,
+  and every bit cleared, the global key's included. Setting the mode again,
+  even to the one it has, is how a stuck hold is let go.
+- **`Restore`**, the page's boot restore (`restore_ptm_mode`): the mode, and
+  the page's bits (`key`, `button`, `midi`) cleared. The global key's bit is
+  kept: the backend still tracks that key, and a reload must not drop it.
+- **`SetHeld`**, one source by level (`set_ptm_held`).
+
+`AudioEngine::ptm()` loads the word once and returns `PtmState { mode, held,
+bypassed, seq }`. These are atomic operations on the shared state, never sent
+through the engine's command channel, so a change lands on the next buffer
+from any thread, while the engine is stopped, and while the engine thread is
+blocked inside a Start (`a_ptm_change_lands_while_the_engine_thread_is_busy`).
+The word lives in `EngineState` for the engine's life: Stop, Start and a
+device-loss rebuild keep it, holds included
+(`ptm_survives_stop_start_and_a_rebuild`). The backend never stores it, so
+every launch starts at `always`, nothing held, `seq` 0; the page stores what
+the user picked and restores it (below).
+
+The commands `set_ptm_mode {mode, restore?}` and `set_ptm_held {source, held}`
+each make one of those calls and answer the `PtmState` after. Only
+`restore: true` restores; absent or `false` is the card's set (the body is
+`ptm_mode_command`, so `set_ptm_mode_restores_only_when_asked` runs the real
+choice). `set_ptm_held` takes a `PtmPageSource`, which has no `hotkey`, so
+Tauri refuses `"hotkey"`: only the backend holds that bit. Both commands are
+sync on purpose (`ptm_commands_stay_sync`). Tauri runs sync commands on the
+main thread in the order they were sent, so a press can't overtake its
+release; async commands run on tokio workers in any order, and a quick tap
+could land release-then-press and stay held. The cost is that a press waits
+behind any sync command already holding the main thread (see "Threads and
+latency" below).
+
+### Where it sits
+
+Inside `mix_voice_and_soundboard`, the voice stage, after the chain and before
+loudness and the mute:
+
+```
+output callback, per buffer:
+  denormals::flush_to_zero()
+  drains → chain latency (the Mixer's readout only) → resample_pop → loudness params
+  tapping = reading_taps.armed(…)
+  let muted  = state_for_callback.input_muted();     one Acquire load
+  let bypass = state_for_callback.ptm_bypassed();    one Acquire load
+  let stage = mix_voice_and_soundboard(…, &mut mute_gate, muted, &mut ptm, bypass, input_rate):
+      run.feed(mono)                       the mute: the chain's input
+      modulator.apply(mono, chain)         the reactive envelope, on the fed voice
+      latency = chain.latency_samples()    once, with this buffer's params
+      ptm.capture(mono, latency)           the voice into the dry line
+      chain.process(mono)                  the effects, whatever the switch says
+      crossed = ptm.blend(mono, bypass)    the effects' output ↔ the delayed dry
+      loudness.process(mono)
+      run.mute(mono)                       the mute: the voice
+      soundboard.mix_into(sb)              untouched
+      → StageReport { latency, crossed }
+  if stage.crossed: reading.note_ptm_crossed()
+  reading DRY tap ← ptm.aligned(block)     the delayed dry (was the raw mic, before the stage)
+  reading WET tap ← mono                   what the call hears from the mic
+  AV tap (takes, Replay)                   chain_latency = stage.latency
+  monitor ring, fold, WAV tap, resample, fan-out, OUT meter     unchanged
+```
+
+`PtmStage` — the switch (`PtmGate`) and the dry line (`DryLine`) — is built
+once per session in `build_output_stream`, beside the mute's gate, where the
+word stands: `PtmStage::new(input_rate, state.ptm_bypassed())`. So a session
+started or rebuilt while the effects are off starts on the dry, with no
+crossing. It allocates there, never in the callback. The callback reads the
+word once per buffer and passes what it read.
+
+Why each place:
+
+- **Inside the stage.** Between the stage and the fold sit the reading's WET
+  tap, the AV tap, the monitor's copy and, with no monitor device, the
+  previews mixed into `mono` (see the mute's "Where it sits"). Only a point
+  inside the stage gives all of them the same voice.
+- **A crossfade, not a chain swap or `SetEnabled`.** A swap rebuilds every
+  effect on the main thread, and a fresh Voice Convert has no model, so each
+  press would start its load again. `SetEnabled(false)` clears Voice
+  Convert's and the noise remover's state and freezes the rest's, so the
+  effects would come back with stale audio. The chain is never touched.
+- **The dry is captured after the mute's `feed`.** It then holds only what the
+  chain holds, so nothing said while muted can come out of the dry line after
+  the unmute, even a quarter-second later
+  (`what_is_said_while_muted_never_reaches_a_bypassed_send`, at 12,547 samples
+  of delay).
+- **The latency is read after the modulator.** Reactive modulation can move
+  an effect's latency (Warble reports 0 at mix 0), so the dry gets the delay
+  this buffer's chain runs with. The stage returns that number, and the AV tap
+  is given it (`StageReport.latency`), so a take places your voice by the same
+  latency the dry line is asked for. The read at the top of the callback
+  stays, for the Mixer's readout only.
+- **Before loudness.** Loudness, when on, treats whichever voice leaves the
+  switch the same, so your own voice doesn't jump in level at a press and the
+  limiter still guards it. Its gain re-adapts after a switch, as after a
+  preset change. With loudness off, the voice with the effects off is the
+  delayed dry, bit for bit.
+- **Before the mute.** The mute fades the voice after the switch, so it still
+  wins either way.
+
+No test can run the callback's closure without a device, so
+`the_output_callback_switches_the_voice_stage` reads the source, as the mute's
+does: the stage built once, before the closure, at the word; the word read
+once and passed as read; the DRY tap on the aligned dry and never on `&mono`;
+the AV tap on `stage.latency`; the stage's steps in the order above, each
+once; and the reading worker dropping the after-effects window when it takes
+the crossing.
+
+### The chain keeps running
+
+While the effects are off, the chain still processes the same voice the dry
+line gets, and its output is crossfaded away. So the effects are ready the
+moment you press: no priming gap, and no stale tail from before. The cost is
+that tails go on: words said while the effects were off still feed an Echo or
+a Reverb, and their echo is heard after a press
+(`the_chain_keeps_running_while_bypassed`). The CPU cost is unchanged, since
+the chain ran whatever the label said before. The reactive envelope follows
+the fed voice either way.
+
+Tails at the switch are cut within the fade: an echo still ringing when the
+effects go off is on the effects' side of the crossfade, so it fades out with
+them.
+
+With the effects off, every effect is off, the noise gate and the noise
+remover included: the call hears your raw microphone, delayed.
+
+### The dry line
+
+`DryLine` keeps the voice in a ring of `next_power_of_two(rate + 1)` samples
+(65,536 at 44.1 and 48 kHz; at least a second at every rate; at most 2^20),
+allocated with the session, and reads it back `d` samples late into `aligned`
+(4,096 samples, the callback's cap). `d` is the chain's reported latency,
+`EffectChain::latency_samples` — the number the Mixer shows as "+N ms
+latency" (see Phase 14's table) — latched every call and clamped to what the
+ring holds, its length − 1 samples (1.37 s at 48 kHz). A longer latency is
+clamped, and the dry is then early by the excess
+(`a_latency_past_the_ring_is_clamped`). A session at 48 kHz holds 256 KiB of
+ring and 16 KiB of `aligned`; at 384 kHz the ring is 2 MiB.
+
+**Why delay it.** The effects' output is late by the chain's delay. Against an
+undelayed dry, each switch to the dry would skip the last `d` of what you
+said, and each switch back would repeat it: 21 ms for one pitch or formant
+effect, 43 ms for both, 18.4 ms more for a streaming Voice Convert voice and
+261.4 ms more for a non-streaming one. Delayed by the same amount, the two
+voices carry the same moment, and a switch neither skips nor repeats.
+`the_dry_lines_up_with_the_wet_at_every_latency` drives the real stage with a
+chain that is a pure delay of `n`, reported exactly, for `n` from 0 to what
+the ring holds (12,547 included), and requires every sample sent to be the
+input delayed by `n`, float `==`, through crossings completed and turned
+round, at buffers of 1 to 4,096 frames. Voice Convert's Mix already delays
+its dry the same way (Phase 12, "The hold"). The cost: with your effects off,
+your own voice keeps your preset's delay.
+
+**Where an effect's real delay differs from what it reports**, a switch skips
+or repeats the difference. Worked out from the code and the effects' tests,
+not heard in the app:
+
+- The noise remover reports 480 samples, and at `N`-frame buffers delays
+  `480 + (480 − gcd(N, 480))`: 480 at 480 frames, 928 at 512, 864 at 1,056
+  (`the_denoisers_real_delay_is_pinned`). So a switch is off by 9.3 ms at
+  512-frame buffers, 8 ms at 1,056, and nothing at 480.
+- Pitch or formant set to exactly 0, and the noise remover at mix 0, pass the
+  voice through undelayed but still report their delay (21 ms and 10 ms).
+- Warble reports 12 ms, and its delay wavers up to 8 ms either side of that;
+  below mix 100, part of its output isn't delayed at all.
+- Voice Convert reports its hold; the model adds about 5 ms past it (Phase
+  12, "The hold").
+
+They add up: Deep Narrator runs a noise remover and, with a voice model
+loaded, Voice Convert, so at 512-frame buffers most of its output is off by
+about 14 ms at a switch. A slip well under the fade's 10.7 ms is smeared by
+it; a larger one is a short skip or repeat.
+
+**When the delay changes** while the dry is in use — a preset switch, an
+effect turned on or off, a Voice Convert model finishing loading (0 → 883
+samples, or 0 → 12,547 for a non-streaming one), Warble's mix crossing 0
+under reactive modulation (576 ↔ 0) — jumping the read point would click, and
+a plain crossfade between the old and new read points would play the
+difference twice when the delay grows. So the line moves its read point by
+the sign of the change:
+
+- **Shrink:** the old read point crossfades to the new one over L (the fade
+  length, below). The difference is skipped, blended.
+- **Growth:** the old read point fades out over L, the dry is silent for the
+  difference, then the new read point fades in over L. Nothing is heard
+  twice: it is a pause, like the priming gap the effects give after a chain
+  swap.
+
+At 48 kHz: a preset switch from 0 to 2,048 samples pauses 43 ms between two
+10.7 ms fades; 2,048 → 1,024 skips 21 ms; a streaming Voice Convert model
+landing pauses 18 ms, a non-streaming one 261 ms; reactive Warble crossing mix
+0 pauses 12 ms at each speech onset and skips 12 ms at each offset (only
+Enderman and Ghast carry Warble, and only a reactive route moves its mix
+while you speak).
+
+Every rule is per sample: a move starts at the first sample where none is
+running and the requested delay differs, and a change that arrives during a
+move starts on the sample after it ends. So the output is the same for every
+split into buffers (`buffers_of_any_size_give_one_result`,
+`a_change_mid_move_waits_for_it`). The same rule runs whether or not the dry
+is heard, because it also feeds the reading. While it moves, a sample costs at
+most one more ring read.
+
+A new line starts at delay 0. Every session starts with an empty chain, and
+the page's chain arrives with the first `ReplaceChain`, so the preset's delay
+arrives as a growth — almost always during start-up silence — while the
+effects prime from the empty chain at the same time
+(`a_new_line_starts_at_zero`; through the stage,
+`a_growing_delay_pauses_and_repeats_nothing`, which also counts the silence:
+2,049 samples, the fade-out's last sample at gain 0, then 2,048).
+
+### The switch
+
+`PtmGate` holds one position, `pos`, in `0..=L`: 0 is the effects' output,
+untouched; L is the delayed dry, copied. Each sample moves `pos` one step
+toward its target before the sample is scaled; in between, the sample is
+`w + (d − w)·pos/L`, a linear crossfade.
+
+**L** is `ptm_fade_len(rate)`, twice the mute's ramp: 512 at 44.1 and 48 kHz
+(11.6 and 10.7 ms), 1,024 at 88.2 and 96 kHz, 2,048 at 176.4 and 192 kHz, 256
+at 16 to 24 kHz and 128 at 8 and 11.025 kHz; at least 10 ms and under 20 ms
+for every rate from 12.8 to 409.6 kHz. Twice the mute's because it splices
+two voices rather than fading one to silence. A power of two makes every gain
+`pos/L` exact, so a dry equal to the wet crosses with no change at all.
+
+Linear rather than equal-power, because the two are the same speech, lined
+up: where the effects keep the voice's waveform close (an EQ, a compressor), a
+linear fade keeps the level, where equal power would raise it by up to 3 dB
+mid-fade and could clip with loudness off; where they don't (pitch, Voice
+Convert), a linear fade dips by up to 3 dB for a few milliseconds. That is the
+design's reasoning, not a measurement.
+
+- Settled on the effects, the buffer is untouched and the dry isn't read
+  (`an_applied_gate_is_bit_exact`). With push-to-modulate off nothing else
+  happens in the switch, so the stage sends exactly what the chain alone
+  would (`the_applied_stage_matches_the_chain_alone`: every bundled preset,
+  loudness off and on, bit for bit).
+- Settled on the dry, the delayed dry is copied. With real effects (Pitch +5
+  and an Echo at 90 % feedback) and a clip playing, the send is the input
+  delayed by 1,024 samples, bit for bit, from 1,024 + L after the edge, and
+  the clip is untouched (`bypassed_send_is_the_dry_exactly`).
+- A toggle mid-fade turns round from where it is.
+- No click: around each crossing, the send's largest step stays within the
+  steeper of the two voices' own plus the most a linear fade between them can
+  add (`no_click_at_the_switch`; `no_step_larger_than_the_slope` for the gate
+  alone).
+
+`blend` returns whether `pos` moved in the buffer: the voice crossed.
+
+### Where a switch lands in what you said
+
+Your voice reaches the stage a little after you speak (the input's own
+buffering), and both voices leave it a further `d` later. If the switch to the
+dry happened when your release reached the stage, the end of what you said
+while holding would go out in your own voice: the last `d` and a little more,
+about 43 ms of the last word on a preset with pitch and formant, and a
+quarter-second or more with a non-streaming Voice Convert voice.
+
+So the two directions differ:
+
+- **Toward the effects**, the switch starts on the next buffer and crosses
+  over L.
+- **Away from the effects**, it first waits `d` samples — the line's
+  requested delay when the edge arrives; a later change of the delay doesn't
+  move the wait — then crosses over L. Turning back during the wait cancels
+  it.
+
+So the effects cover everything said while they were meant to be on, and up
+to `d` around it, never less: the rule errs toward the disguise.
+`what_you_say_while_held_stays_disguised` pins it with chains that delay by
+`n` and negate (`n` up to 12,547): everything said before the edge goes out
+negative, and from `L` after the wait the send is the dry exactly; switching
+when the release reaches the stage fails it.
+
+What is left is the input's buffering: the cushion between the microphone and
+the stage, about one or two device buffers. Up to that much of what you said
+just before letting go can reach the call in your own voice, less however late
+the release reached the callback (the global key's release comes 0 to 50 ms
+after the key-up, which often covers it). Worked out from the code; not
+measured.
+
+The word, the ticks and the pill change at the edge: `bypassed` says what
+happens to what you say from now on. When the effects go off the sound
+follows `d` later, so the pill leads it by your preset's delay. A take's
+timeline places the voice by the chain's latency, so in a take the switch
+sits where you let go (from the code; not checked in a take).
+
+### The inputs, and how each lets go
+
+| Source | Holds | Lets go |
+|---|---|---|
+| **Global key** (`hotkey`) | a press, in Rust: `ptm_on_hotkey` in `global_shortcut_handler`, inside `WM_HOTKEY` on the main thread | its release, which global-hotkey's poller thread sees: it reads the key (`GetAsyncKeyState` of the trailing key) every 50 ms from the press until it reads it up, so 0 to 50 ms after the key-up, plus however late Windows wakes the thread. Also: `ptm` bound to another key, to one the parser refuses or to the same key when it isn't registered, cleared, or every key cleared (`ptm_key_unbound`, at the map update; see "Global hotkey architecture") |
+| **In-app key** (`key`) | keydown with the page body as its target, not an autorepeat, with the accelerator's modifiers exactly (`ptmKeyMatches(…, "down")`): with the key set to Ctrl+Shift+M, a bare M doesn't count | keyup of the trailing key anywhere, whatever the modifiers, so letting go of a modifier first still lets go; or keyup of the physical key (`code`) that made the press, for a character that changes with Shift or AltGr (Shift+1 binds as "Shift+!", and with Shift let go first its keyup says "1"). Also: the window's `blur`, Tauri's `onFocusChanged(false)`, the page hidden (`visibilitychange`), and the PTM binding changing (the store lets go before `ui.ptmKey` changes) |
+| **Hold to switch** (`button`) | pointerdown; Enter or Space while it has the focus, not an autorepeat. Disabled while push-to-modulate is off | pointerup, pointerleave (no pointer capture, so leaving the button can't leave it held), pointercancel, keyup of Enter or Space, the button's own `blur`; the window's `blur`, Tauri focus loss or the page hidden; the card unmounting |
+| **MIDI** (`midi`) | a `ptm` mapping's note-on, or its CC rising to 64 or more | that mapping's note-off, or its CC falling to 59 or less (60 to 63 keep the side it was on: the mute's `muteCcStep`, unknown side included). The bit is held while any `ptm` mapping is down, so one pad's note-off can't let go of another. Also: picking a MIDI input or starting MIDI-learn on any mapping (every mapping: learn swallows every message, a note-off included), and changing or removing a mapping (that one). Focus doesn't matter: a pad keeps holding while Divora is behind |
+
+**Every source.** Setting the mode from the card — turning it on or off, or
+picking a hold, even the one already picked — lets go of every hold, the
+global key's included. The store forgets the page's own holds and which pads
+are down before the call goes out: commands land in order, so a press made
+while it is in flight lands after it and holds again. It keeps each CC's
+side, so a CC left up holds again only after it comes down and back up. A
+key, pad or button still down must be pressed again: the global key doesn't
+repeat (global-hotkey registers every key with `MOD_NOREPEAT`), a pad sends
+one note-on, and the in-app listener and the button ignore autorepeat.
+
+**Edges only.** The store keeps what the page holds, so a second down, an
+autorepeat or a stray up sends nothing, and when two releases race (the DOM's
+`blur` and Tauri's focus event both fire as the window loses the focus) the
+second sends nothing. The flag is set before the invoke goes out. MIDI sends
+only when the set of mappings down turns empty or non-empty.
+
+**The global key and the in-app key** are two sources, not two routes to one
+flag (see "Why two PTM listeners?").
+
+**Focus.** A pointer press on the card's switch, its hold choices or Hold to
+switch hands the focus back to the page (`blurOnPointer`, the Mute button's
+rule, now shared by `Toggle` and `Segmented`), because a focused button takes
+Space, and Space is the in-app key. From the keyboard they keep the focus.
+The card also listens for the window's `blur` and the page hidden itself, to
+clear the button's held look, which the store doesn't track.
+
+**Not checked:** whether the in-app key and the button let go across the lock
+screen, sleep or UAC's secure desktop (Win+L is expected to take the focus and
+fire `blur`), and whether an elevated window in front makes the poller read
+the global key as up while it is still down. These are owner checks in
+[`MANUAL_TESTS.md`](MANUAL_TESTS.md).
+
+### The mirror in the store
+
+`ui.pressed` and `ui.ptmMode` are gone. The store keeps a read-only mirror
+(`ptmState`, and `ptmBypassed()` from it) whose only writer is
+`applyPtmState`. Three things reach it, in any order: command answers, the
+boot restore's answer, and every `audio-levels` tick, which carries `ptm` from
+one load of the word (about 30 Hz, engine running or not). `adoptPtm` keeps
+whichever state has the larger `seq`. A tick without `ptm` is no information,
+never "always". Until the first state lands the mirror is null, and null
+reads as the effects on, the engine's launch state.
+
+**The status.** `muted ? "muted" : transforms(chain) && !ptmBypassed ?
+"modulated" : "clean"`, where `transforms` means an enabled effect other than
+the noise gate. The gate passes speech at unity (its gain is exactly 1 above
+its threshold), so a gate-only chain such as Clean Passthrough reads Clean.
+With push-to-modulate off by default, a preset with effects now reads
+Modulated, and the titlebar, the Mixer's spell circle and the stream
+overlay's spell circle show Modulated and animate where they used to say
+Clean. The status says what happens to what you say from now on. The mirror
+lands a tick after a change the backend made (up to about 33 ms) and one
+round trip after one the page made. Replay's save toast names the preset only
+while the status said Modulated (v1.54.0), so it now follows the switch, and
+errs toward not naming the preset, because the mirror lands after the engine
+switched.
+
+**What is saved.** `divora.ptm = {on, hold}`, only from an answer to
+`set_ptm_mode`: `settingOf(answer.mode, …)`, built on the setting as it
+stands when the answer lands, plus the hold a hold pick asked for, so an off
+sent while a hold pick is still in flight keeps the pick. A refused call
+changes neither the setting nor the card, so the card never shows a mode the
+engine doesn't have; it renders from the setting, so it moves when the answer
+lands. Holds are never saved.
+
+**The boot restore.** The store sends `set_ptm_mode {mode, restore: true}`
+once, when it is created, beside the mute's read and before `App`'s `onMount`
+enumerates devices, with the saved mode (`hold` while on; `always` while off
+or with nothing saved). Its answer is the boot read. `ptmKnown` comes true
+when the call settles (an answer or a failure) or after 500 ms, never from a
+tick: the restore changes the word (it lets go of the page's holds), so a tick
+that lands before its answer may carry the previous page's holds. The overlay
+waits for both `muteKnown` and `ptmKnown` (`overlayHeld`), so a reload with
+push-to-modulate on and the key up doesn't show the stream Modulated over a
+clean voice. The main pill doesn't wait: it can say Modulated until the first
+tick or the answer lands (about 11 ms in the real app: Modulated from 38 to 49 ms after a reload, sampled every 20 ms).
+
+**The card.** An on/off switch (on sends the saved hold, off sends `always`),
+Hold to apply / Hold to bypass (disabled while off), a line under them, and
+**Hold to switch** (was Hold to test). The line says what the key does and
+where it works: with no global key bound it adds that the key works only in
+Divora's window and where to set one; with a learned `ptm` MIDI mapping but
+no global key, that the key works in Divora's window and the MIDI control
+anywhere. No live region announces push-to-modulate's edges: it would speak
+at every press.
+
+### Who hears what
+
+| Consumer | Effects on | Effects off | Why |
+|---|---|---|---|
+| **The send** (the call) | the chain's output | your voice, delayed by the chain's latency; with loudness off, exactly | the switch is inside the stage, before the fold |
+| **Monitor** (a separate headphone device) | as the send | as the send | its copy is taken after the stage |
+| **Single output** (no monitor device) | as the send | as the send | |
+| **WAV recorder** | as the send | as the send | its tap is after the fold |
+| **Screen takes, their voice stem, Replay** | as the send | as the send, placed by the same latency, so the take stays in step (from the code; not checked in a take) | the AV tap is after the stage and gets the stage's latency |
+| **Soundboard, Speak, Critter Chatter** | unchanged | unchanged | rendered beside the voice |
+| **Voice reading**, after-effects half | the chain's output | your delayed voice: reads as passing through | see "The reading" below |
+| **Voice reading**, microphone half | your delayed voice | your delayed voice | lined up with the other half |
+| **IN meter, voice-clone reference recording** | the raw microphone | the raw microphone | the input callback |
+| **OUT meter** | the send | the send | after the fold |
+| **Latency readout** | the chain's | the chain's: your own voice keeps it | read before the stage |
+| **Reactive envelope** (`modEnv`) | the fed voice | the fed voice | the chain keeps running |
+| **Mute** | wins | wins | it fades the voice after the switch |
+| **Titlebar, Mixer, spell circles, overlay** | Modulated, animated (with an effect other than the gate on) | Clean | the store's mirror |
+
+### The reading
+
+The reading's DRY half is now the dry line's output, `ptm.aligned(block)`:
+your voice after the mute's `feed`, delayed by the chain's latency. It is
+pushed after the stage, just before the WET half and from the same callback,
+DRY first, so the worker's `dry ≥ wet` rule still holds. With the effects off
+the WET half is that same delayed voice (scaled by loudness, if it is on), so
+`is_passthrough`, which correlates the two at lag 0, reads it as a
+passthrough for every preset (`the_reading_sees_a_passthrough_while_bypassed`);
+the raw microphone as the DRY half would not have, on any preset with a delay.
+With the effects on, the two halves are now the same moment too.
+
+**A crossing drops the after-effects window.** The callback calls
+`note_ptm_crossed` in any buffer where the switch moved, and the worker takes
+the flag every pass, as it takes a chain change, and drops the after-effects
+window, which would otherwise straddle two voices. Because the flag is set
+where the audio changes, a press and a release between two 20 ms passes still
+count, and a hold while push-to-modulate is off (which moves `seq` and nothing
+else) never drops a window. The worker never reads the word.
+
+**The verdict travels with the numbers.** The analyzer keeps `wet_bypassed`
+beside the after-effects numbers it describes (`last_wet_bypassed`). While a
+dropped window refills (0.4 s of audio) the panel keeps the previous numbers,
+and their verdict with them; the new verdict comes with fresh numbers at the
+next emit, about 0.45 to 0.75 s after the voice crosses. Kept apart, a
+reading taken just after letting go would print the disguised phrase's
+numbers under "passing the signal through", and a pause would hold that
+pairing. A held reading's flag is its window's: the worker publishes its last
+speaking reading through a pause, and that reading's flag came with its
+numbers (`Held.wet_bypassed` does the same for the analyzer's own held
+output).
+
+**The cost.** A chain of effects that pass the voice through but still report
+a delay — pitch or formant at exactly 0, the noise remover at mix 0 — no
+longer reads as a passthrough: their output isn't delayed, and the DRY half
+is.
+
+The panel's after-effects subtitle reads "What the call hears: your voice
+after your effects, or as it is while Push to modulate has them off", and its
+passthrough note "your effects are off, or they are passing the signal
+through".
+
+### Threads and latency
+
+- **The output callback:** one more `Acquire` load per buffer and one more
+  `latency_samples` call; a ring write and a ring read per sample, one more
+  read while the line moves; the crossfade only while `pos` is between its
+  ends, and a copy while settled on the dry. No allocation, lock or system
+  call. `the_voice_stage_allocates_nothing_while_ptm_switches` measures the
+  voice stage — an Echo, two test delays whose `SetEnabled` moves the chain's
+  latency between 0 and 4,096, loudness and a clip, with push-to-modulate and
+  the mute flipping, fades turned round, waits cancelled and the line moving,
+  with a live-probe control — not the whole callback, where Voice Convert's
+  inference still allocates.
+- **The main thread:** both commands, and every press of the global key
+  (`WM_HOTKEY`). It is a shared queue, so a press or a command waits for any
+  sync command ahead of it: the device enumeration that runs each time
+  Divora's window gains the focus (about 0.1 to 0.2 s here; see "Long
+  commands off the main thread") — just when you click into Divora to use the
+  in-app key — or a `start_audio_engine` opening a device.
+- **global-hotkey's poller thread:** each release of the global key, one
+  atomic operation. The plugin runs our handler there under its own lock,
+  which is why the shortcut commands now unlock before calling the plugin.
+- **The level emitter:** one load per tick, so `mode`, `held`, `bypassed` and
+  `seq` always agree.
+- **The reading worker:** takes the crossing flag every pass.
+- `AudioEngine::set_ptm_mode`, `restore_ptm_mode` and `set_ptm_held` take
+  `&self` and no lock, so any thread can call them; that is the way in for
+  the planned timers. If one ever changes the mode from Rust, the page's boot
+  restore must become a read, or a reload would put the saved mode back.
+
+**Latency**, worked out from the code:
+
+- **Effects on:** the main-thread queue (normally empty), then up to one
+  buffer before the callback reads the word (about 10 ms at 480 frames), then
+  L (10.7 ms at 48 kHz).
+- **Effects off:** the same, with `d` (your preset's delay) before L.
+- **Letting go of the global key:** the poller sees it 0 to 50 ms after the
+  key-up, plus however late Windows wakes the thread; then as above. In the
+  app: [S2: P3 — key-up to the tick that showed it let go, over 8 holds, as
+  an upper bound on the poller plus the tick's wait].
+- **The in-app key, the button, MIDI:** an IPC round trip, plus any sync
+  command ahead of it; then as above.
+- **The pill:** the next tick (up to about 33 ms) after a change the backend
+  made; the answer after one the page made.
+
+### Tests
+
+- **Pure** (`ptm.rs`): `bypassed_table`; `transition_table` (every operation,
+  the restore's rows, a set that moves no `seq`, the saturation);
+  `fade_len_table` and `ring_table`; the switch:
+  `an_applied_gate_is_bit_exact`, `a_bypassed_gate_is_the_dry_exactly`,
+  `the_fade_is_linear_and_exact`, `a_pure_delay_crosses_with_no_change` (and
+  `…_at_any_split`), `no_step_larger_than_the_slope`,
+  `an_edge_toward_the_dry_waits`, `a_flip_back_during_the_wait_cancels_it`,
+  `an_edge_toward_the_wet_starts_at_once`, `a_toggle_mid_fade_turns_round`,
+  `the_wait_is_the_requested_latency`,
+  `the_stage_waits_out_the_latency_then_crosses`; the line:
+  `the_dry_is_the_input_delayed_by_the_latency`,
+  `a_latency_past_the_ring_is_clamped`,
+  `a_shrink_crossfades_between_the_taps`,
+  `a_growth_pauses_and_repeats_nothing`, `a_change_mid_move_waits_for_it`,
+  `a_new_line_starts_at_zero`; `buffers_of_any_size_give_one_result` (the
+  gate, the line and the stage); and `seeded_walk`.
+- **The voice stage** (the real `mix_voice_and_soundboard`, with real effects
+  and `test_delay`, an effect that delays by exactly what it reports, scaled):
+  `the_dry_lines_up_with_the_wet_at_every_latency`,
+  `what_you_say_while_held_stays_disguised`,
+  `bypassed_send_is_the_dry_exactly`,
+  `a_growing_delay_pauses_and_repeats_nothing`,
+  `the_applied_stage_matches_the_chain_alone`, `no_click_at_the_switch`,
+  `the_chain_keeps_running_while_bypassed`,
+  `what_is_said_while_muted_never_reaches_a_bypassed_send`,
+  `the_voice_stage_allocates_nothing_while_ptm_switches`,
+  `the_denoisers_real_delay_is_pinned`, and the source test
+  `the_output_callback_switches_the_voice_stage`.
+- **Fingerprints:** `stage_fingerprints` (ignored; run by hand) hashes what
+  the voice stage sends for every bundled preset, loudness off and on — 48
+  lines — on a fixed input with a mute along the way. The listing taken from
+  main before the change and the one taken after it, on this machine, are
+  identical: with push-to-modulate off, the stage sends what it sent before,
+  bit for bit.
+- **The state:** `ptm_is_idempotent_and_counted`,
+  `restore_keeps_a_held_global_key`, `concurrent_holds_are_all_counted` (four
+  sources on four threads × 10,000 sets from a barrier: all 40,000 counted,
+  each a change of one), `ptm_survives_stop_start_and_a_rebuild`,
+  `a_ptm_change_lands_while_the_engine_thread_is_busy`,
+  `ptm_state_json_keys_are_frozen`, `ptm_mode_wire_values_are_frozen`.
+- **The reading:** `the_reading_sees_a_passthrough_while_bypassed`;
+  `the_reading_worker_sees_ptm_bypass` (the real worker on its own thread,
+  fed through a real stage as the callback feeds it: read with the effects;
+  let go, the window dropped and the effects read as off within 1 s; held
+  again, back within 1.5 s; a held window keeping its own verdict through a
+  pause; holds while push-to-modulate is off never resetting the window);
+  `a_held_reading_keeps_its_windows_bypass_verdict` and
+  `a_bypass_verdict_never_outruns_the_wet_numbers` (the analyzer).
+- **The shell** (`lib.rs`): `hotkey_ptm_request_table`,
+  `the_ptm_hotkey_holds_and_lets_go` (the handler's step against a real
+  engine, both modes), `the_shortcut_handler_runs_the_ptm_hotkey` (a source
+  test: the step runs once, with the press state),
+  `ptm_page_source_wire_values_are_frozen`, `the_level_tick_carries_ptm`,
+  `set_ptm_mode_restores_only_when_asked`, `ptm_commands_stay_sync`,
+  `same_binding_table`, `take_binding_lets_go_of_ptm`,
+  `drop_and_drain_let_go_of_ptm`,
+  `the_shortcut_commands_unlock_before_the_plugin`; the frozen `LevelUpdate`
+  keys gain `ptm`.
+- **Vitest:** `data/ptm.test.ts` (`adoptPtm`, `readPtmState`, `levelPtm`,
+  `readPtmSetting`, `settingOf`, the card's words, `transforms`,
+  `ptmKeyMatches`); the store (the boot restore, `ptmKnown` after an answer, a
+  failure and 500 ms and never from a tick, the setting saved only from an
+  answer and kept through an off sent while a hold pick is in flight, the
+  card's set letting go, page holds sending edges only, MIDI through the real
+  handlers: two pads, the CC's dead band, an input pick, learn on another
+  mapping, an edited and a removed mapping, a CC resting up after a mode
+  change); `App.test.tsx` (the restore sent before the device enumeration, the
+  hotkey branch invoking nothing, Space holding once with exactly its
+  modifiers, the release by the physical key, `blur`, Tauri focus loss and the
+  page hidden letting go, `applyLevelUpdate`, the overlay held until the
+  restore); `sync.test.ts` (`overlayHeld`); the router;
+  `MixerScreen.ptm.test.tsx` (the card); the Settings and Wizard copy;
+  `blurOnPointer` on `Toggle` and `Segmented`.
+- **E2E** (mocked Tauri, whose word lives in `sessionStorage` so it survives
+  a reload): off by default and the card following the answers; Space; Hold
+  to switch; the global key left to the backend and kept across a reload; a
+  reload letting go of the page's holds; MIDI; the overlay's status; Replay's
+  save toast with push-to-modulate on and held.
+- **Mutations:** every row of the design's mutation table was put back and
+  seen failing its named test, then restored. A review of the whole change
+  confirmed six findings (five distinct), each fixed with a test that fails
+  when the defect is put back.
+- **In the real app** (see "Push-to-modulate (v1.58.0)" in
+  [`MANUAL_TESTS.md`](MANUAL_TESTS.md)): one debug build of
+  `93ab993`, on Windows 11 26200 with an i7-14700K, driven over
+  WebView2's DevTools protocol, with the commands sent from the page over the
+  real IPC and the global key through real `WM_HOTKEY` from `SendInput`. **No
+  audio was played**: the owner declined a test tone, and the SMSL's loopback
+  has recorded only silence since 2026-10-24. So the sound itself — the switch
+  on a recording, takes, Replay, the alignment, where a switch lands, clicks —
+  rests on the unit tests and the stage fingerprints above, not on the app.
+  - The commands from the page: `set_ptm_mode {mode: "apply"}` twice answered `{apply, nothing held, effects off, seq 1}` both times (the second changed nothing, `seq` included); `set_ptm_held {source: "key", held: true}` twice answered `{held, effects on, seq 2}` both times; `{source: "hotkey"}` was refused before it reached the engine ("unknown variant `hotkey`") and changed nothing; `{mode: "apply", restore: true}` let go of the key (`seq` 3), and `{mode: "bypass"}` answered `seq` 4. The ticks agreed with every answer within 1 to 24 ms.
+  - A reload with push-to-modulate on: one `set_ptm_mode {mode: "apply", restore: true}`, sent 24 ms after the reload and answered at 27 ms, before `list_audio_input_devices` (sent at 29 ms) and nothing else of push-to-modulate's; it changed nothing (`seq` 6 before and after). The titlebar showed Modulated from 38 ms to 49 ms after the reload, then Clean from the first adoption on; the one `overlay:state` main sent (at 51 ms) and the one the overlay received (at 152 ms) both said clean.
+  - The window losing the focus with the in-app key held: [S2: P4 — the
+    `set_ptm_held {key, false}` and the next tick; which of the DOM's `blur`
+    and Tauri's focus event let go, since either does].
+  - The global key, 8 holds of 1 s, 4 with Divora visible and 4 hidden to the
+    tray: [S2: P3 — `held` within a tick of each press, the key-up-to-tick
+    figures, `seq` +2 per hold].
+  - The long-mute bench, which now runs the dry line in every buffer: passes on all 24 bundled presets: the last 10 s muted cost 0.70 to 1.00 × max(speech, pause) (the bar is 2 ×), for example Zombie 277.3 µs on the tone, 293.2 µs on the pause and 241.7 µs muted per 480-frame buffer, Clean 4.3, 12.1 and 11.9 µs (`cargo test --release`, this machine).
+  - Not tried here: real speech; the far end of a call; a MIDI device; a
+    Stream Deck; another app's push-to-talk on the same key; the lock screen,
+    sleep and UAC; an elevated window in front; the headphone monitor's
+    output; a Voice Convert voice; rates other than 48 kHz; Windows 10.
+    Several of these are the owner's checks in `MANUAL_TESTS.md`.
+
+### Kill switches
+
+- `ALIGN_DRY` (`ptm.rs`): `false` delays the dry by 0, and so waits 0. A
+  switch then skips or repeats your preset's delay, and a take is off by it
+  while the effects are off.
+- Push-to-modulate off (`always`, the default) leaves the stage sending what
+  the chain alone sends (above).
+- The reading's DRY tap can go back to the raw microphone before the stage:
+  the identity effects' cost goes away, and so does the passthrough reading
+  with the effects off on any chain with a delay. The source test pins where
+  it is now.
+
+### Not in this release
+
+- A latched push-to-modulate, under the reserved `ptm:` prefix: for a Stream
+  Deck **Hotkey** action, which is said to send a tap, so it would hold only
+  for the tap and the poller's 0 to 50 ms (unverified; no copy names a Stream
+  Deck for push-to-modulate), or for a glyph, which is one gesture with no
+  hold.
+- A tray item.
+- Keeping cleanup effects (the noise gate, the noise remover) while the
+  effects are off.
+- Reporting effects' real delays, so the dry line matches them.
+- A warning when a global key is refused: it is still only logged, and a
+  refused push-to-modulate key now changes what the call hears.

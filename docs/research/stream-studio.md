@@ -64,7 +64,7 @@ Every correction is folded in below. The refuted claims and what replaced them a
 | Does "record audio" include the screen's own audio? | Yes — game and Discord audio | Desktop audio is v1.53.0, directly after the recorder |
 | Timers before or after charms? | After | Charms v1.55.0; mute, Hourglass and voice timers follow |
 | "Charms" and "Hourglass" as names? | Approved | Used throughout |
-| Replay buffer and OBS WebSocket in this cycle? | Yes, add both to scope | Replay is v1.54.0; OBS is v1.59.0, the last core release |
+| Replay buffer and OBS WebSocket in this cycle? | Yes, add both to scope | Replay is v1.54.0; OBS is v1.61.0 (planned as v1.59.0; see [Releases](#releases)), the last core release |
 
 **Calls made in this revision, which the owner may veto:**
 - **Replay goes directly after desktop audio, before charms.** It refactors v1.52.0's encoder: the H.264 MFT is driven directly and fans out to the take and the ring. That refactor is cheapest while v1.52.0's spike results and A/V measurements are fresh. The cost is that Charms land ~9–13 days later.
@@ -126,7 +126,7 @@ Nothing in the app captures video, encodes, or opens a loopback stream.
 
 ## Architecture
 
-End state after v1.59.0. Every item is additive to the v1.51.2 surface.
+End state after v1.61.0. Every item is additive to the v1.51.2 surface.
 
 **Windows.**
 - **`main`** is unchanged except that the close handler becomes label-scoped.
@@ -140,7 +140,7 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
 - **`divora-core`** keeps its contract and gains:
   - **two new rings** at the tap site. **Voice** carries `mono` *before* the soundboard fold; **soundboard** carries `sb`. Each gets its own latency correction;
   - a preallocated **side ring** of `(StreamInstant, span, cushion occupancy)` per callback;
-  - an `AtomicU64` **drop counter**, and the mute: one `AtomicU64` word, `input_mute` (`seq << 1 | muted`, v1.56.0);
+  - an `AtomicU64` **drop counter**, and the mute: one `AtomicU64` word, `input_mute` (`seq << 1 | muted`, v1.56.0); and push-to-modulate's, `ptm` (`seq << 16 | mode << 8 | held`, v1.58.0), with a per-session dry line inside the voice stage;
   - a **drain thread** whose sender lives *outside* the engine session, so a device-loss rebuild re-attaches it rather than silencing the rest of the take.
 - **`divora-capture`** is a new workspace member with no tauri or cpal dependency.
   - **Unsafe scope:** its FFI modules are the tree's only production FFI `unsafe`, each with a justification and `// SAFETY:` comments. The one other production `#[allow(unsafe_code)]` is `divora-core`'s `audio::denormals` (v1.56.0), an `asm!` block that sets FTZ and DAZ on the audio thread.
@@ -154,7 +154,7 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
 
   Recorder, replay and OBS commands are `async`. Tauri 2 runs sync commands on the main thread, which every window shares.
 
-**Threads.** The cpal callbacks keep their rules. Per buffer, the new work is two ring pushes, one side-ring push, one `fetch_add`, one atomic load and (v1.56.0) setting FTZ and DAZ in MXCSR, all lock-free and allocation-free.
+**Threads.** The cpal callbacks keep their rules. Per buffer, the new work is two ring pushes, one side-ring push, one `fetch_add`, one atomic load and (v1.56.0) setting FTZ and DAZ in MXCSR, plus (v1.58.0) one more atomic load and push-to-modulate's dry line (a ring write and a delayed read every buffer; the voice itself is touched only while the effects are off or switching), all lock-free and allocation-free.
 - **`divora-av-tap` (5 ms):** forwards chunks over a bounded channel.
 - **`divora-encoder` (MTA COM):** owns the D3D11 device, frame pool, video processor, H.264 MFT and fan-out. It lives one per take in v1.52.0 and becomes one per pipeline in v1.54.0. WGC's FrameArrived only signals it.
 - **`divora-replay-save`:** short-lived, one per save. It muxes a snapshot so capture never waits on disk.
@@ -173,7 +173,7 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
  ════════════════╪════════════════ Tauri IPC ═══════════════════╪═════════════════════
  src-tauri                                                       │
  ├─ commands: *_screen_recording · *_replay_buffer · save_replay · open_overlay ·
- │            set_overlay_mode · import_overlay_asset · *_timer · set_input_muted · obs_*
+ │            set_overlay_mode · import_overlay_asset · *_timer · set_input_muted · set_ptm_* · obs_*
  ├─ AppState.screen_recorder (outlives engine sessions; owns the CapturePipeline + replay state)
  ├─ thread divora-timers (100 ms; timers/<id>.txt on whole seconds) ──text/ops──┐
  ├─ obs link (2 tokio tasks, only when enabled) ◀───────────────────────────────┘
@@ -184,20 +184,20 @@ End state after v1.59.0. Every item is additive to the v1.51.2 surface.
  divora-capture (NEW; windows 0.61;            divora-core (callback contract unchanged)
  the tree's only FFI unsafe scope)             ├─ output callback: + voice ring, + sb ring,
  ├─ probe   (LoadLibrary mfplat → MFStartup    │    + (StreamInstant, span, cushion) side ring,
- │           → MFTEnumEx; build ≥ 18362)       │    + dropped fetch_add, + input_muted load
+ │           → MFTEnumEx; build ≥ 18362)       │    + dropped fetch_add, + input_muted load, + ptm load
  ├─ wgc     (CreateForMonitor, 2-buffer pool)  ├─ thread divora-av-tap (5 ms) ──AvChunk──┐
  ├─ loopback (process loopback, v1.53.0) ──────┼──────────────────────────────────────┐  │
  ├─ thread divora-encoder: BGRA→NV12 (GPU) →   ├─ thread divora-recording (WAV, as today)│  │
  │   H.264 MFT ─┬─▶ TakeMux (IMFSinkWriter     └─ engine thread                          │  │
  │              │    passthrough + AAC)  ◀────────────── AudioTimeline (PCM) ◀───────────┴──┘
  │              └─▶ ReplayRing (RAM) ──snapshot──▶ thread divora-replay-save ──▶ *.mp4
- ├─ ffi::dpapi (OBS password, v1.59.0)
+ ├─ ffi::dpapi (OBS password, v1.61.0)
  └─ FrameSink trait (kill switch: windows-capture 2.0.1 behind it, a code branch, never a feature)
 ```
 
 ## Releases
 
-Version numbers are planning labels; a patch landing in between shifts the rest.
+Version numbers are planning labels; a patch landing in between shifts the rest. Two minors landed after v1.56.0: v1.57.0 (Voice Convert keeps up, outside this plan) and v1.58.0 (push-to-modulate, from v1.56.0's follow-ups). So Hourglass, the voice timers and Talk to OBS, planned as v1.57.0, v1.58.0 and v1.59.0, are now v1.59.0, v1.60.0 and v1.61.0, and the tail v1.62.0 to v1.64.0.
 
 **Every release ships with:**
 - **The full ship loop:** tests, the pre-push checklist, a CI conclusion of literally `success`, then the annotated tag.
@@ -771,16 +771,63 @@ The same holds after two hours armed.
 - **Done when** rests on M1 (a Stream Deck key in a real Discord call, a clip heard while muted, no click at unmute), not run yet; R1 and R7 stand in for parts of it.
 - **Not measured** (S2's gaps; the owner checks M1–M9 in MANUAL_TESTS → Mute haven't been run yet): real speech, and a voice as loud as speech at the mic — the click (R2's room-noise evidence only) and the echo leak (R4) rest on unit tests; the hotkey while hidden to the tray (R7's hide step didn't take) and a Stream Deck **Hotkey** action (M1); the headphone monitor (M2); MIDI (M3); a glyph (M4); a real unplug (M5; R5's rebuilds were direct restarts); Voice Convert (no model loaded) and its end-of-word cut (M6, M6b); Voice reading in the app (M7); Test my setup's muted message in the app; screen readers (M8); the light theme (M9); a game; OBS's own mic source; the far end of a Discord call (no call was live); a Bluetooth or high-rate device (only 48 kHz ran) and the device signal after the resampler when the rates differ (the WAV is taken before it); the overlay's Muted on the stream with main hidden; a mute held for minutes in the real app (B1 covers the CPU only); a take's MP4 audio (R5 measured its voice stem); Space after a mouse click on the Mixer's button, and the button from the keyboard; B1 on other CPUs; Windows 10.
 - **Follow-ups:**
-  - **Push-to-modulate's own release, next.** The release order changes: it comes before Hourglass (v1.57.0 below). Push-to-modulate is cosmetic too: its key changes the status, not the sound, so the pill can say Clean while the call hears the preset. What still claims a bypass: the app's own copy (Settings → Hotkeys: "Hold to apply the chain. Lifts back to clean."; the Mixer's Push to modulate card: Hold to apply / Hold to bypass, APPLYING / BYPASSED), README.md's feature list, MANUAL_TESTS' Voice reading check "Push-to-modulate with the key up" and its Hotkeys survive a restart check ("the voice modulates"), and comments in `dsp/reading.rs`, `dsp/reading/analyzer.rs` and `examples/voice_reading.rs` (this release corrected engine.rs's).
+  - **Push-to-modulate's own release, next.** *(Done in v1.58.0, below, after v1.57.0 shipped the Voice Convert fixes.)* The release order changes: it comes before Hourglass (v1.59.0 below, planned as v1.57.0). Push-to-modulate is cosmetic too: its key changes the status, not the sound, so the pill can say Clean while the call hears the preset. What still claims a bypass: the app's own copy (Settings → Hotkeys: "Hold to apply the chain. Lifts back to clean."; the Mixer's Push to modulate card: Hold to apply / Hold to bypass, APPLYING / BYPASSED), README.md's feature list, MANUAL_TESTS' Voice reading check "Push-to-modulate with the key up" and its Hotkeys survive a restart check ("the voice modulates"), and comments in `dsp/reading.rs`, `dsp/reading/analyzer.rs` and `examples/voice_reading.rs` (this release corrected engine.rs's).
   - **Keep the last words at the press** (K17): needs `VoiceConverter::latency_samples` to report its downsampler's chunk (about 256 ms, not the 13 ms it reports for the shipped streaming model), which also moves the latency readout and the take timeline's compensation; then the send's close can wait for the chain's real delay.
   - **Hotkey conflicts and refusals** (K4, Q7): a hotkey Windows refuses looks bound but does nothing (it is only logged); a toast for the row being set when its register fails.
   - **`mute:hold` / `mute:on` / `mute:off`** (Q4), under the reserved prefix.
-  - **A tray mute,** a tooltip (about 2 hours, no menu change) or an item (about half a day, a frozen-menu change), if the owner wants one (Q2); it fits v1.58.0's BRB.
-  - **v1.58.0's "restore what it was"** needs a compare-and-set on the word inside `AudioEngine` (no wire change); the setters already return `MuteChange {before, after}`.
+  - **A tray mute,** a tooltip (about 2 hours, no menu change) or an item (about half a day, a frozen-menu change), if the owner wants one (Q2); it fits v1.60.0's BRB.
+  - **v1.60.0's "restore what it was"** needs a compare-and-set on the word inside `AudioEngine` (no wire change); the setters already return `MuteChange {before, after}`.
   - **A latching MIDI button out of step** after another surface changed the mute (one dead press): a "pickup" mode if owners ask.
   - **The flush is x86-64 only,** and B1 has run on this machine's CPU only.
 
-### v1.57.0 — Hourglass: countdowns and stream clocks on a hotkey (5–7 days)
+### v1.58.0 — Push-to-modulate that modulates (added after v1.56.0)
+
+**Goal.** Make push-to-modulate real: its key, a MIDI pad and the Mixer's button switch your effects in the engine, so the call, the headphone monitor, the WAV, screen takes and Replay hear what the status says. Through v1.57.0 its key changed only the status (v1.56.0's follow-up above): in the default **Hold to apply**, the pill said Clean while the call heard the preset.
+
+**Why here.** The owner's v1.56.0 decision (Q6): its own small release right after the mute, before Hourglass. v1.57.0 (Voice Convert keeps up, outside this plan) shipped first, so this is v1.58.0, and the later labels here moved by two (see [Releases](#releases)). The plan had no section for it, so there are no plan deltas: the release's design (decisions D1–D24, risks K1–K21) stands in for one, and its differences are listed below.
+
+**As built** (`[S3: ship date]`).
+- **The switch** sits inside `mix_voice_and_soundboard`, after the chain and before loudness and the mute: `feed` → `modulator.apply` → the chain's reported latency, read once → `ptm.capture` → `chain.process` → `ptm.blend` → `loudness.process` → `run.mute` → the soundboard. Everything downstream gets the switched voice: the call, the headphone monitor, the WAV, screen takes, Replay and Voice reading's after-effects half. The soundboard, Speak and Critter Chatter never pass through it, and the mute still wins (D1, D6).
+- **The chain keeps running while the effects are off** (D2), so a press has no gap and no stale tail, and an echo of what you said with them off is heard after a press (K10). With them off the call hears your voice with every effect off, the noise gate and the noise remover included; loudness, if on, works on it as on the effects (D7, owner Q4).
+- **The dry voice is delayed by the chain's reported latency** through a per-session ring, the power of two above the rate (65,536 samples at 48 kHz, so up to 1.37 s; a longer latency is clamped), so the effects and your own voice carry the same moment of speech. The screen recorder's tap is given the latency the line used, so takes place the voice right in both states (D3; from the code, not checked in a take). A latency change moves the line's read point: a shrink crossfades the two taps over L, skipping the difference; a growth fades out, stays silent for the difference, then fades in, so nothing is heard twice (D4; a 2,048-sample growth is silent for 2,049 samples, the fade-out's last zero-gain sample and the 2,048). A new session starts at delay 0, so the preset's delay arrives as a growth, almost always during start-up silence. With the effects off, your own voice keeps the preset's delay: 21 to 71 ms on the bundled presets that delay you at all, and a Voice Convert voice that isn't streaming adds about a quarter-second (K21).
+- **The crossfade** (D5): linear, one position step per sample, L twice the mute's: 512 samples at 44.1 and 48 kHz (11.6 and 10.7 ms), at least 10 and under 20 ms at every rate from 12.8 to 409.6 kHz. A toggle mid-fade turns round. Settled on the effects the buffer isn't touched, so with push-to-modulate off the stage sends what it did before (`the_applied_stage_matches_the_chain_alone`, and the 48 stage fingerprints below).
+- **Where a switch lands in what you said** (D8b, owner Q9): an edge toward the effects starts crossing in the first buffer that sees it; an edge away from them keeps the effects for the chain's latency first (taken at the edge; a flip back meanwhile cancels it), so the effects cover everything said while they were meant to be on. The word, the ticks and the pill change at the edge, so the pill leads the sound by that delay when the effects turn off. What remains is the input's own buffering less how late the key reached Divora: up to about 20 ms said just before letting go can reach the call in your own voice (K18).
+- **The state** (D10): one engine-lifetime `AtomicU64`, `seq << 16 | mode << 8 | held`, a held bit per source (0 the global key, 1 the in-app key, 2 the Mixer's button, 3 MIDI; 4–7 reserved), so one source letting go never lets go of another. Modes `always` (push-to-modulate off, the launch default), `apply` and `bypass`. Hand-written compare-and-swap setters, from any thread; a set to the value it has changes nothing, `seq` included. The callback reads it once per buffer, the level emitter once per tick (`LevelUpdate.ptm`), and teardown never touches it.
+- **Two sync commands** (D23): `set_ptm_mode {mode, restore?}` and `set_ptm_held {source, held}` (`"hotkey"` refused: only the backend holds that source), sync so a press can't overtake its release (`ptm_commands_stay_sync`). A press made while another sync command holds the main thread (device enumeration just after the window gains the focus, a Start opening a device) waits for it (K8). Without `restore` (the Mixer card) the mode set lets go of every hold, the global key's included, which is the way out of a stuck hold (D13). The page's boot sends `restore: true` with the saved mode: it lets go of the page's holds and keeps a global key still held (D14).
+- **The global key** is acted on in Rust, press and release (`ptm_on_hotkey` in `global_shortcut_handler`; the release comes from global-hotkey's poller thread, which checks every 50 ms whether the key is still down); the page ignores the event (D15). Binding `ptm` to another key, to a key Divora can't read, clearing it or clearing every key lets go of its hold at the map update. Re-registering the same key while it is still registered only checks that it is (no unregister, no register), so a reload's re-sync keeps a held key held. `ptm:` is reserved. **The lock order** (D16; built in S1 rather than track B): the three shortcut commands call the plugin only after `AppState.shortcuts` is unlocked, which removes a deadlock found by reading the code (a key's release on the poller thread during a rebind), never seen.
+- **The page's sources** (D17–D19). The in-app key (Space, or the global key's accelerator) holds on a keydown on the page with exactly the bound modifiers, ignoring autorepeat. It lets go on the trailing key's keyup anywhere, or on the keyup of the physical key that started the hold: that second rule came from the review, for a character that changes with Shift or AltGr (Shift+1 binds as "!", and letting go of Shift first makes the keyup say "1"). The Mixer's **Hold to switch** (was **Hold to test**) holds while the pointer is down on it, or while Enter or Space is down with it focused; it lets go on pointerup, pointerleave, pointercancel, its own blur and the card unmounting, and a mouse press hands the keyboard back to the page. The page lets go of both on window `blur`, on `visibilitychange` to hidden and on Tauri's `onFocusChanged(false)`; whichever comes second sends nothing. MIDI: the store keeps the set of `ptm` mappings that are down and sends only when it turns empty or non-empty; a CC holds at 64 or more and lets go at 59 or less (the mute's dead band); an input pick or MIDI-learn on any mapping forgets them all, editing or removing a mapping forgets that one, and the card's set forgets the pads but keeps each CC's side, so a control left up must come down and go back up.
+- **The status** (D21, owner Q5): Modulated when an effect other than the noise gate is on and push-to-modulate isn't taking the effects off. `ui.pressed` and `ui.ptmMode` are gone: the pill reads the store's mirror of the word. With push-to-modulate off by default (owner Q2), a preset with effects reads Modulated, so the titlebar, the Mixer and the overlay's spell circle say Modulated and animate where they said Clean (K2); Clean Passthrough, the noise gate only, reads Clean.
+- **Saved** (D14, owner Q3): `divora.ptm = {on, hold}`, written only from an engine answer, from the setting as it stands when the answer lands. Holds are never saved. `ptmKnown` (the boot restore's answer or failure, or 500 ms; a tick doesn't count) holds the overlay's pushes beside the mute's.
+- **The Mixer card** (U2): a switch, a line under it, Hold to apply / Hold to bypass and Hold to switch, the last two disabled while it is off. With no global key the line says the key works only in Divora's window and where to set one; with only a learned `ptm` MIDI mapping it ends "…in Divora's window, or with your MIDI control." Settings → Hotkeys' row and the Control surfaces intro say what the key and a mapping do; the intro also says the card's set lets go.
+- **Voice reading** (D9, U6): the microphone half is now the dry voice after the mute's `feed`, delayed by the chain's latency, pushed just before the after-effects half, so the two halves are compared at the same moment, and with the effects off the after-effects half is the same samples as the microphone half (scaled, if loudness is on), so it reads as a passthrough whatever the preset. A crossing the stage reports drops the after-effects window. The "passing the signal through" flag goes with the after-effects numbers it describes and changes only when they refresh, so it turns about 0.45 to 0.75 s after a switch (the worker test saw 0.53 to 0.72 s), and a held reading keeps its window's verdict. The cost (K3): effects that change nothing but still report latency (pitch or formant at exactly 0, the noise remover at mix 0) no longer read as a passthrough.
+- **Allocation** (D24): the voice stage allocates nothing with push-to-modulate switching, fades turned round, waits cancelled and latency changes mid-move. That is the claim, not the callback (Voice Convert's inference still allocates there).
+- **The real-app run (S2)**, owner-set scope: no audio. The owner declined a test tone this time, and the SMSL DAC's loopback has recorded only silence since 2026-10-24, so P1 (the switch in a WAV) and P2 (takes and Replay) weren't run. The sound itself (the switch in a recording, takes, Replay, the dry voice lined up with the effects, clicks) rests on the unit tests through the real stage and on the stage fingerprints: one hash per bundled preset, loudness off and on, 48 lines identical to `main` before the change, run on this machine before S1 and again after S1, after track A and after the review's fixes. What S2 ran, in one debug build `93ab993`, over WebView2's DevTools protocol:
+  - **P6, the commands with real arguments:** every answer as expected (`seq` +1 on a change, unchanged on a repeat; the `hotkey` source refused; the restore letting go of the key); ticks within 1 to 24 ms.
+  - **P5, a reload** with it on in Hold to apply: the restore sent at 24 ms and answered at 27 ms, before `list_audio_input_devices` (29 ms); the pill read Modulated for Modulated from 38 to 49 ms, then Clean before Clean; the overlay received one `overlay:state`, clean.
+  - **P4, the window losing the focus** with the in-app key held: `set_ptm_held {key, false}` `[S2: P4 release latency]` after; harness check `[S2: P4 harness check]` (the planned check removed only the page's `blur` listener; with Tauri's focus event letting go too, it has to remove both).
+  - **P3, the real hotkey** (Ctrl+Alt+Shift+F24, 8 one-second holds by `SendInput`, 4 with Divora showing and 4 hidden to the tray): held within `[S2: P3 hotkey press latency]`, let go within `[S2: P3 hotkey release latency]` of each key-up (an upper bound on the 50 ms poller plus the tick wait; no audio timing in it); `seq` `[S2: P3 seq per hold]`.
+  - **B1, the release bench** (`a_long_mute_costs_at_most_twice_speech_or_a_pause`, its voice stage now carrying the dry line, settled on the effects): passes on all 24 bundled presets: the last 10 s muted cost 0.70 to 1.00 × max(speech, pause) (the bar is 2 ×), for example Zombie 277.3 µs on the tone, 293.2 µs on the pause and 241.7 µs muted per 480-frame buffer, Clean 4.3, 12.1 and 11.9 µs (`cargo test --release`, this machine).
+- **Differences from the design:**
+  - **D17:** the page also lets go on Tauri's `onFocusChanged(false)`, which the design kept out so P4 could show whether DOM `blur` alone works. P4 therefore tests both paths together.
+  - **D17, from the review:** the in-app key also lets go on the keyup of the physical key that started the hold (above).
+  - **U2, from the review:** with only a learned MIDI mapping the card's line names the MIDI control; it had said the key works in a call. A mapping that hasn't learned a control doesn't count.
+  - **D9 / U6, from the review:** the "passing through" flag travels with the after-effects numbers. The design's version could pair the disguised numbers from just before a release with "passing the signal through", and hold that for 30 s in a pause. It now turns 0.45 to 0.75 s after a switch, not within 500 ms.
+  - **Copy (§9 said unchanged):** Voice reading's after-effects line now reads "What the call hears: your voice after your effects, or as it is while Push to modulate has them off.", and its note "No measured difference from the microphone half — your effects are off, or they are passing the signal through." (it said the chain passes the signal through). Settings' MIDI sentence gained "Turning Push to modulate on or off on the Mixer, or picking its hold, lets go: …" (review).
+  - **D14, from the review:** the saved setting is built when the answer lands, keeping a hold picked just before. An off sent while a hold pick was in flight had saved the old hold.
+  - **K1:** the noise remover reports 480 samples and delays 480 at 480-frame buffers, 928 at 512 and 864 at 1056 (`the_denoisers_real_delay_is_pinned`; the design said 928–957). So with the noise remover on, a switch skips or repeats about 9 ms at 512-frame buffers and 8 ms at 1056. The other causes are as designed: Voice Convert's model about 5 ms past what it reports; Warble, which wavers by up to 8 ms; a pitch or formant shift set to exactly 0, 21 ms. Together, up to about 14 ms (Deep Narrator at 512-frame buffers, worked out from these figures). Not in the design: the harmonizer reports 0, and its harmony voices lag one vocoder window (21 ms) while its dry root doesn't, so at a switch the harmony, not your voice, is off by that much.
+  - **The review** (step R): six confirmed findings, five distinct defects, all fixed before S2: the reading flag, the in-app key's release, the card's MIDI line, the reading's note and the saved setting above, and the Settings MIDI sentence.
+- **Owner decisions** (the design's Q1–Q9, every default taken except Q8's tone): v1.57.0 shipped first (Q1); off by default (Q2); remembered (Q3); "effects off" is the whole chain, cut within the crossfade, with the chain running and your own voice keeping the preset's delay (Q4); a gate-only chain reads Clean (Q5); a latch later, `ptm:` reserved (Q6); the hotkey lock-order fix in this release (Q7); S2's eight `SendInput` holds yes, the test tone no (Q8); a switch lands where you spoke (Q9).
+- **Done when** rests on N1 (a global key in a real Discord call: the preset while held, your voice after, no click, nothing doubled or lost mid-word), not run yet.
+- **Not measured** (S2's gaps; the owner checks N1–N11 in MANUAL_TESTS → Push-to-modulate (v1.58.0) haven't been run yet): any sound in the app — the switch on the call, in the headphones, in a WAV, a take or Replay, its alignment and clicks (unit tests and fingerprints only); the far end of a call (N1); the headphone monitor (N2); MIDI with a device (N3); a Stream Deck **Hotkey** action, expected to blip (N4); a key held with Shift (N5); an elevated window (N6); Voice reading in the app (N7); Voice Convert (N8); Discord's own push-to-talk on the same key (N9); the lock screen, sleep and UAC (N10); a preset switch with the effects off (N11); the Mixer card and the in-app key's modifiers in the app (unit and e2e tests); a relaunch; any rate but 48 kHz; the device signal after the resampler; Windows 10; B1 on other CPUs.
+- **Follow-ups:**
+  - **Report actual delays** (K1): the noise remover at other buffer sizes, Voice Convert's model, the harmonizer's pad. The switch, the latency readout and the take's placement would then all use the real figure.
+  - **A latch** under `ptm:` (Q6), for a glyph, or a Stream Deck's stock **Hotkey** action, which is expected to send a tap (N4).
+  - **Keep cleanup effects while the effects are off** (Q4): the noise gate and the noise remover; needs the chain split.
+  - **A warning when Windows refuses a hotkey** (K20; v1.56.0's Q7): a refused push-to-modulate key now changes the sound, not only the status.
+  - **A hold stuck across Win+L,** if N10 finds one with both the DOM and Tauri focus paths in place: a release on the session lock.
+  - **The voice timers** (v1.60.0): `AudioEngine::set_ptm_mode` and `set_ptm_held` work from any thread, and source bits 4–7 are free. If Rust ever changes the mode itself, the page's boot restore must become a read, or a reload would put back the page's saved mode.
+
+### v1.59.0 — Hourglass: countdowns and stream clocks on a hotkey (5–7 days)
 
 **Goal.** A countdown *and* a count-up (stream uptime is the most common stream timer), each on hotkeys so Stream Deck works unchanged. Both are visible on the overlay and in an OBS text source while the main window is hidden to the tray.
 
@@ -806,7 +853,7 @@ The same holds after two hours armed.
 
 **Done when.** With the main window hidden, the overlay counts down within ±1 s of a stopwatch. An OBS text source counts down within ±2 s, because OBS reloads one 1 s poll after a seconds-resolution mtime change.
 
-### v1.58.0 — Timers that change your voice (4–6 days)
+### v1.60.0 — Timers that change your voice (4–6 days)
 
 **Goal.** The slice nothing else offers: a timer that switches preset for its duration and reverts, fires a tile, speaks a line, saves a replay, panics, or mutes for a break.
 
@@ -823,13 +870,13 @@ The same holds after two hours armed.
 4. **`speak` limits:** Kokoro and Critter Chatter voices only.
 5. **"Break (BRB)" template.** It mutes on start, then unmutes and optionally speaks a line at zero.
 6. **End now.** `finish_timer {id}`, plus the hotkey id `tm:<id>:finish`, runs a countdown's at-zero actions immediately. Ending a break early therefore unmutes, while Reset still cancels without firing.
-7. **Defined behaviour** for a deleted preset, push-to-modulate held, and A/B compare open.
+7. **Defined behaviour** for a deleted preset and A/B compare open. Push-to-modulate keeps switching your effects under a timer's preset (since v1.58.0 it switches them in the engine), and the status says which the call hears.
 
 **Done when.**
 - A 5:00 "Villager" timer switches preset at start and reverts at zero.
 - A BRB timer really silences the send, and End now brings the voice back early.
 
-### v1.59.0 — Talk to OBS: timer text, break scenes, live uptime (opt-in; 6–9 days)
+### v1.61.0 — Talk to OBS: timer text, break scenes, live uptime (opt-in; 6–9 days)
 
 **Goal.** For people who stream with OBS, let the Hourglass and the Break template reach into OBS:
 - a timer's time appears in an OBS text source as soon as it changes;
@@ -878,7 +925,7 @@ The protocol Divora needs is small and frozen: rpcVersion 1, unchanged since 202
    - **A blob that will not decrypt** (after a profile reset) shows *"Re-enter your OBS password."*
    - **The copy** says *"stored encrypted for your Windows account"* and never "secure", because OBS keeps its own plaintext copy.
 6. **What Divora does in OBS (all of it).**
-   - **Timer text.** A timer definition gains an optional `obsText: {uuid, name}`, delivered to Rust through v1.57.0's `sync_timers`.
+   - **Timer text.** A timer definition gains an optional `obsText: {uuid, name}`, delivered to Rust through v1.59.0's `sync_timers`.
      - **What it sends:** the timer thread pushes the same string as the `.txt` bridge, only when it changes, as `SetInputSettings {inputUuid, inputSettings:{text}, overlay:true}`.
      - **Which sources:** text sources are found by `unversionedInputKind` ∈ {`text_gdiplus`, `text_ft2_source`} from an unfiltered GetInputList, re-fetched every time a picker opens.
      - **What it leaves alone:** a source set to read from a file is labelled *"reads a file — it's using the .txt bridge"* and never switched over.
@@ -967,9 +1014,9 @@ The protocol Divora needs is small and frozen: rpcVersion 1, unchanged since 202
 
 | Release | Scope | Gate |
 |---|---|---|
-| v1.60.0 Charms everywhere | One overlay window per monitor (`overlay*` capability glob, monitor stored by name, physical-pixel placement); text and video charms; snapping; record a single window (`CreateForWindow`); a small "recording" charm | Mixed-DPI and hot-plug history (tauri #11718, #6784); one WebView2 per monitor |
-| v1.61.0 Remove the yellow border (Windows 11) | Spike: test `IsBorderRequired(false)` with *and* without `RequestAccessAsync(Borderless)`, and ship only if the border **visibly disappears** for the unpackaged app. Applies to takes and Replay. Client availability is Windows 11 22000+, gated by `IsPropertyPresent` | A drop outcome is acceptable |
-| v1.62.0 More timers and bindings | Laps, interval ("voice roulette"), wall-clock targets with clock-jump detection, the titlebar timer pill; MIDI and glyph actions for timers, Replay save (`replay`) and OBS scenes (`obs`), with router edge detection so a fader cannot fire a save repeatedly | — |
+| v1.62.0 Charms everywhere | One overlay window per monitor (`overlay*` capability glob, monitor stored by name, physical-pixel placement); text and video charms; snapping; record a single window (`CreateForWindow`); a small "recording" charm | Mixed-DPI and hot-plug history (tauri #11718, #6784); one WebView2 per monitor |
+| v1.63.0 Remove the yellow border (Windows 11) | Spike: test `IsBorderRequired(false)` with *and* without `RequestAccessAsync(Borderless)`, and ship only if the border **visibly disappears** for the unpackaged app. Applies to takes and Replay. Client availability is Windows 11 22000+, gated by `IsPropertyPresent` | A drop outcome is acceptable |
+| v1.64.0 More timers and bindings | Laps, interval ("voice roulette"), wall-clock targets with clock-jump detection, the titlebar timer pill; MIDI and glyph actions for timers, Replay save (`replay`) and OBS scenes (`obs`), with router edge detection so a fader cannot fire a save repeatedly | — |
 
 ## Decisions
 

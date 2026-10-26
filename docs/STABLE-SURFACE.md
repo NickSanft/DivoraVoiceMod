@@ -31,7 +31,11 @@ accidental break fails CI before it ships:
 - The overlay window's label and title and the tray's Lock id — `src-tauri/src/overlay_machine.rs` (`title_and_label_are_the_obs_contract`); every tray menu id, label and their order — `src-tauri/src/lib.rs` (`tray_entries_for_each_combination`; v1.55.0).
 - `divora.overlayScene`'s read and write rules (unknown keys, types and `src` values kept; nothing truncated) — `src/overlay/scene.test.ts` (v1.55.0).
 - The `mute` hotkey id: a press flips the mute; its release, `Mute` and `mute:` ids don't — `src-tauri/src/lib.rs` (`hotkey_mute_request_table`; v1.56.0).
-- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0).
+- `PtmState` keys and the `PtmMode` values `"always"`, `"apply"`, `"bypass"` (nothing else parses) — `divora-core/src/audio/engine.rs` (`ptm_state_json_keys_are_frozen`, `ptm_mode_wire_values_are_frozen`; v1.58.0). `LevelUpdate`'s `ptm` — `src-tauri/src/lib.rs` (`level_update_json_keys_are_frozen`, and `the_level_tick_carries_ptm`, which builds the tick from a real engine; v1.58.0).
+- `set_ptm_held`'s sources: `"key"`, `"button"`, `"midi"` parse; `"hotkey"`, other spellings and `""` don't — `src-tauri/src/lib.rs` (`ptm_page_source_wire_values_are_frozen`; v1.58.0).
+- The `ptm` hotkey id: a press holds push-to-modulate and its release lets go; `PTM`, `ptm:toggle`, `mute` and `sb:ptm` do nothing to it — `src-tauri/src/lib.rs` (`hotkey_ptm_request_table`; v1.58.0).
+- `set_ptm_mode` and `set_ptm_held` stay sync commands — `src-tauri/src/lib.rs` (`ptm_commands_stay_sync`; v1.58.0).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, and the push-to-modulate ones since v1.58.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -61,6 +65,8 @@ resolved `T` or a thrown string on the JS side.
 | `set_input_muted` | `muted: bool` | `InputMute`, the state after — v1.56.0. Idempotent: the same value twice moves nothing, `seq` included. Never fails, apart from ``"invalid args `muted` for command `set_input_muted`: {e}"`` (Tauri's own, for a missing or non-boolean `muted`) |
 | `toggle_input_muted` | — | `InputMute`, the state after — v1.56.0. Every call flips it, so two quick calls are two flips. Never fails |
 | `input_mute` | — | `InputMute`, the current state — v1.56.0. Only reads: the main window calls it once each time the page loads, so a reload never changes the mute |
+| `set_ptm_mode` | `mode: "always" \| "apply" \| "bypass"`, `restore?: bool` | `PtmState`, the state after — v1.58.0. Without `restore`, or with `false` (the Mixer card): sets the mode and lets go of every hold, a held global key included, which must then be pressed again; this is the way out of a stuck hold. With `restore: true` (the main window, once each time the page loads, with the mode saved in `divora.ptm`): sets the mode, lets go of the page's holds (the in-app key, the Mixer's button, MIDI) and keeps a global key that is still held, so a reload doesn't drop it. Idempotent: nothing to change moves nothing, `seq` included. Never fails, apart from Tauri's own ``"invalid args `mode` for command `set_ptm_mode`: {e}"`` (a missing or unknown `mode`) and the same for a `restore` that isn't a boolean |
+| `set_ptm_held` | `source: "key" \| "button" \| "midi"`, `held: bool` | `PtmState`, the state after — v1.58.0. One source's hold, by level. Idempotent: a set to the value that source has moves nothing, `seq` included. `"hotkey"` is refused with Tauri's own ``"invalid args `source` for command `set_ptm_held`: {e}"``: only the backend holds the global key |
 
 Divora's own mute of the voice (v1.56.0) — on the call, the headphone monitor
 and Divora's recordings (WAV, screen recordings and their stems, Replay).
@@ -70,6 +76,23 @@ and it is never stored; every launch starts unmuted. Every change adds 1 to
 `seq`. The three commands are sync (they run on the main thread, in turn with
 each other and with the hotkey), and each is one atomic operation;
 `LevelUpdate` carries the same state on every tick.
+
+Push-to-modulate (v1.58.0) switches your effects off and on for everything the
+mute covers, and in the same place: the call, the headphone monitor and
+Divora's recordings. Soundboard clips, Speak and Critter Chatter are never
+switched. `mode` says what a hold does: `"always"` nothing (push-to-modulate
+off: the effects always apply), `"apply"` the effects apply only while
+something holds it, `"bypass"` they are off while something holds it. Four
+sources hold it, each on its own: the global key (the backend's alone), the
+in-app key, the Mixer's **Hold to switch** button and MIDI; it is held while
+any of them holds it, so one letting go never lets go of another.
+Engine-wide: it can be set with the engine stopped, and it outlives Stop,
+Start and device-loss rebuilds, holds included. The backend never stores it:
+every launch of the app starts at `"always"`, nothing held, `seq` 0, and the
+page restores the mode it saved. Every change adds 1 to `seq`. Both commands
+are sync on purpose: sync commands run in order on the main thread, so a press
+can't overtake its release. Each is one atomic operation; `LevelUpdate`
+carries the same state on every tick.
 
 ### DSP chain
 
@@ -206,9 +229,9 @@ take: it records without desktop audio, and `desktopError` says why. The
 | Command | Args | Returns |
 |---|---|---|
 | `detect_virtual_mic` | — | `VirtualMicStatus` |
-| `register_global_shortcut` | `id`, `accelerator` | — / error |
-| `unregister_global_shortcut` | `id` | — / error |
-| `unregister_all_global_shortcuts` | — | — / error |
+| `register_global_shortcut` | `id`, `accelerator` | — / error. v1.58.0: when `id` already holds exactly that key (any spelling of it) and the key is still registered, it does nothing and answers `Ok`, so a held `ptm` key stays held through a page reload's re-sync; a key whose earlier register failed is registered again. For `ptm`, every call that gets past that check lets go of the global key's hold, whatever it answers: a new key, a key the parser refuses (Shift with a digit arrives as "!"), an old key that stays registered for another id sharing it |
+| `unregister_global_shortcut` | `id` | — / error. v1.58.0: for `ptm`, lets go of the global key's hold, even when the key stays registered for another id that shares it |
+| `unregister_all_global_shortcuts` | — | — / error. v1.58.0: lets go of the global key's hold on push-to-modulate |
 
 ### Replay (v1.54.0)
 
@@ -231,7 +254,7 @@ explainer has been seen. The tray has no item that turns Replay on.
 
 | Id | Meaning |
 |---|---|
-| `ptm` | push-to-modulate (press and release) |
+| `ptm` | push-to-modulate (press and release). v1.58.0: acted on by the backend, so it doesn't go through the page: a press holds push-to-modulate, its release lets go (which way that switches your effects is the mode, `set_ptm_mode`). The `global-shortcut` event still goes out, press and release, and the frontend does nothing with it. Unbound by default. The prefix `ptm:` is reserved (a latched push-to-modulate, later) |
 | `panic` | stop all soundboard clips |
 | `monitor` | toggle hearing yourself |
 | `sb:<clipId>` | play one soundboard tile (prefix reserved) |
@@ -321,7 +344,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `audio-levels` | `LevelUpdate` | ~30 Hz while the app runs |
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
-| `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0). v1.56.0: each emit waits for the one before it, and after the main window loads nothing goes until it knows the mute (its `input_mute` read settles or a state arrives; at most 500 ms). The payload is unchanged: while muted, `status` is `"muted"` |
+| `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0). v1.56.0: each emit waits for the one before it, and after the main window loads nothing goes until it knows the mute (its `input_mute` read settles or a state arrives; at most 500 ms). The payload is unchanged: while muted, `status` is `"muted"`. v1.58.0: and nothing goes until push-to-modulate's boot `set_ptm_mode` (with `restore`) settles, by its answer or a failure, or 500 ms pass; a level tick doesn't count for this one. `status` now follows push-to-modulate as the engine switches it: `"modulated"` while an effect other than the noise gate is on and push-to-modulate isn't switching them off, so with push-to-modulate off (the default) a preset with effects reads `"modulated"` where it used to read `"clean"`; a gate-only chain reads `"clean"`. The shape and the three values are unchanged |
 | `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3). v1.55.0: main also re-pushes the scene on it, with `ack` null, and the overlay listens for `overlay:scene` and `overlay:status` before sending it. The backend learns ready through `overlay_handshake`, not this event |
 | `overlay:status` | `OverlayStatus` | backend → all windows, on every change of any field — v1.55.0. The same shape is returned by every command in §1 "Stream overlay" except `overlay_alive` and the two asset commands |
 | `overlay:scene` | `ScenePush` | main → overlay window, while it is open: on every scene change, on each edit main acknowledges (changed or not), and on each `overlay:ready` — v1.55.0 |
@@ -344,7 +367,10 @@ opens the panel. And the panel's accessible summary is text: a value updating
 `LevelUpdate` keeps meaning "meter tick" and gains no reading fields.
 v1.56.0 adds the mute to it (`inputMuted`, `inputMuteSeq`), like `monitoring`
 and `recording`: a state every window may need, cheap, and the only always-on
-channel that reaches a hidden page whoever changed it.
+channel that reaches a hidden page whoever changed it. v1.58.0 adds
+push-to-modulate (`ptm`, a `PtmState`) for the same reasons: the backend
+changes it with no page involved (the global key), and the page needs it to
+say Clean or Modulated.
 
 ---
 
@@ -363,9 +389,22 @@ EngineStatus      { running, monitoring, input: Levels, output: Levels,
 LevelUpdate       { input: Levels, output: Levels, running, monitoring,
                     dspLatencyMs, recording, loudnessGainDb,
                     deviceLost, modEnv,         // modEnv v1.46.0, 0..1
-                    inputMuted, inputMuteSeq }  // v1.56.0: the InputMute pair
+                    inputMuted, inputMuteSeq,   // v1.56.0: the InputMute pair
+                    ptm }                       // v1.58.0: a PtmState, every
+                                                // tick, engine running or not;
+                                                // optional in TS (absent is no
+                                                // information, never "always")
 InputMute         { muted, seq }    // v1.56.0: seq counts changes since launch;
                                     // of two states, the larger is newer
+PtmState          { mode: "always" | "apply" | "bypass",
+                    held (some source holds it),
+                    bypassed (what the engine is switching to from this
+                      state on: toward the effects at the next buffer, away
+                      from them only after the chain's reported latency, so
+                      what you said while they were on keeps them),
+                    seq }           // v1.58.0: seq counts changes since launch;
+                                    // of two states, the larger is newer.
+                                    // The commands' answer and LevelUpdate.ptm
 EffectSpec        { kind: EffectKindWire, enabled, params: {string: number} }
 ReactiveConfig    { enabled, intensity, floorDb, ceilDb,           // v1.46.0
                     attackMs, holdMs, releaseMs,
@@ -530,10 +569,17 @@ OverlayScene      { version, designSize: { w, h }, frame,
   `state`) tells the two apart; the state set stays closed.
 - The wet tap is taken after the chain, loudness and the mute (v1.56.0). While
   muted nothing is analysed: both taps are dropped and the last reading is
-  held, as through a pause.
+  held, as through a pause. v1.58.0: and after push-to-modulate's switch,
+  which sits between the chain and loudness, so while push-to-modulate has
+  the effects off the wet tap carries your voice without them — what the
+  call hears.
 - `dry` is the microphone **before any effect**; `wet` is the same voice
   **after the chain**. Soundboard / Speak / Critter Chatter audio is mixed in
-  downstream of the wet tap, so it appears on neither half.
+  downstream of the wet tap, so it appears on neither half. v1.58.0: `dry` is
+  the voice the chain is given (after Divora's mute closes the chain's input),
+  delayed by the chain's reported latency, so the two halves are the same
+  moment of speech; `wet` is what the voice stage sends — the chain's output,
+  or that delayed `dry` while push-to-modulate has the effects off.
 - `words` carries the already-resolved vocabulary (`"wide range"`, not
   `"narrow"`), never descriptor enum names, and never more than three. The
   closed vocabulary in `divora-core/src/dsp/reading.rs` is the **only** source
@@ -545,6 +591,17 @@ OverlayScene      { version, designSize: { w, h }, frame,
   loudness stage sits between the chain and the wet tap. Do not re-derive it
   from the metrics here: they are summaries, and a level comparison is wrong
   whenever loudness normalization is on.
+- v1.58.0: `wetBypassed` also lights while push-to-modulate has the effects
+  off, for every preset. It goes with the `wet` numbers beside it, never ahead
+  of them: the voice crossing between the effects and the dry drops the
+  after-effects window, the previous numbers and their verdict stay until
+  0.4 s of new audio has refilled it, and the new verdict comes with the new
+  numbers, at the next emit — about 0.45 to 0.75 s after the voice crosses. A
+  held reading's `wetBypassed` describes the held window, not the moment
+  ("over that window", above, now kept through pauses too). The cost: a chain
+  of identity effects that still report latency — pitch or formant at exactly
+  0, the noise remover at mix 0 — no longer reads as a passthrough, because
+  the dry half is delayed by a latency their output doesn't have.
 - Not every measured field is displayed. The card shows four numbers per half
   — pitch, pitch range, level, pace. `energyRangeDb` and `brightnessHz` reach
   the screen only through `words` (`flat`/`dynamic`, `dark`/`bright`), and
@@ -637,13 +694,14 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
-| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super" |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super". `ptm`'s key also sets the in-app push-to-modulate key (`Space` while unbound) |
+| `divora.ptm` | `{ on: bool, hold: "apply" \| "bypass" }` — v1.58.0: whether push-to-modulate is on, and which way the Mixer card's hold goes (kept while it is off, so turning it back on restores it). Written only from the engine's answer to `set_ptm_mode`, from the mode that answer carries, so a refused call changes nothing. Absent or malformed (not an object, `on` not a boolean, `hold` neither value) reads as `{ on: false, hold: "apply" }`: off. Sent back to the engine as `set_ptm_mode {mode, restore: true}` each time the main window loads (`mode` is `hold` while on, `"always"` while off). **Never a hold**: what holds it lives in the engine |
 | `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
 | `divora.tileGains` | per-tile soundboard gain |
 | `divora.soundboardMasterGain` | master soundboard gain |
 | `divora.midiInput` | selected MIDI input port name (or null) — v1.9.0 |
-| `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0. Each `action` is one of `preset`, `tile`, `ptm`, `monitor`, `param` (v1.9.0), `mute` (v1.56.0: a note-on toggles. A CC acts only when it changes side: it mutes on rising to 64 or more and unmutes on falling to 59 or less; 60-63 keeps the side it was on. The side is kept per mapping, in memory only, and forgotten at launch (or a reload), when a MIDI input is picked and when that mapping changes; until it is known again, 64 or more mutes and 59 or less only records it. So a control that stays on one side never changes the mute, except that a move while its side is unknown mutes if it lands at 64 or more). An older build keeps a mapping whose kind it doesn't know and ignores it |
+| `divora.midiMappings` | MIDI note/CC → action mappings (array) — v1.9.0. Each `action` is one of `preset`, `tile`, `ptm`, `monitor`, `param` (v1.9.0), `mute` (v1.56.0: a note-on toggles. A CC acts only when it changes side: it mutes on rising to 64 or more and unmutes on falling to 59 or less; 60-63 keeps the side it was on. The side is kept per mapping, in memory only, and forgotten at launch (or a reload), when a MIDI input is picked and when that mapping changes; until it is known again, 64 or more mutes and 59 or less only records it. So a control that stays on one side never changes the mute, except that a move while its side is unknown mutes if it lands at 64 or more). `ptm` keeps its name and, since v1.58.0, holds push-to-modulate for real: a note-on holds and its note-off lets go; a CC holds when it rises to 64 or more and lets go when it falls to 59 or less, 60-63 keeping the side it was on (the mute's rule, side unknown included: a first move to 64 or more holds, one to 59 or less only records it). Several `ptm` mappings combine: the MIDI source holds while any of them is down, so one pad's note-off can't let go of another. Which mappings are down, and each CC's side, live in memory only: forgotten at launch (or a reload), for every mapping when a MIDI input is picked or MIDI-learn starts on any mapping, and for one mapping when it is changed or removed; each lets go if nothing is left down. Turning push-to-modulate on or off on the Mixer, or picking its hold, forgets which are down but keeps the CC sides, so a CC left up holds again only after it comes down and back up. An older build keeps a mapping whose kind it doesn't know and ignores it |
 | `divora.calibrated` | mic calibration completed flag (suppresses the wizard step) — v1.10.0 |
 | `divora.updateCheckEnabled` | opt-out for the in-app update check (default true) — v1.12.0 |
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0. The action's `kind` is one of `preset`, `tile`, `monitor`, `mute`, `panic` |
@@ -668,6 +726,12 @@ the session, and the baseline dies with the worker thread that held it.
 mute CC was last on. Every launch starts unmuted; only the bindings above
 (`divora.hotkeyBindings`, `divora.midiMappings`, the glyph keys) are kept.
 
+**Push-to-modulate's on/off and direction are stored, in `divora.ptm`
+(v1.58.0); its holds never are**, nor which MIDI mappings are down or the side
+a `ptm` CC was last on. The page restores the setting at each load and lets go
+of every hold the page had; a global key still held across a reload stays
+held, because the backend tracks that one.
+
 > **Ruling (v1.56.0): `{kind: "mute"}` keeps its name and now mutes.** Until
 > v1.56.0 the `mute` glyph action toggled a status label only. It was
 > documented as a mute from the start (CHANGELOG v1.15.0; the Mixer's
@@ -676,6 +740,17 @@ mute CC was last on. Every launch starts unmuted; only the bindings above
 > cast no longer toggles: it sends `set_input_muted` with the state its omen
 > names (Mute or Unmute, the opposite of what Divora shows). Settings now
 > calls it "Mute / unmute". No kind is renamed or removed.
+
+> **Ruling (v1.58.0): `ptm` — the hotkey id and the MIDI kind — keeps its name
+> and now switches the effects.** Until v1.58.0 its key, pad and the Mixer's
+> button changed only the Clean / Modulated status (`ui.pressed`), and the
+> call heard the preset whatever they did. It was documented as switching
+> the effects from the start (CHANGELOG v0.1.0: holding the key flips the
+> voice state, in apply or bypass mode; v1.9.0: **Hold push-to-modulate**,
+> momentary; the README: hold the key for effects on, release for bypass), so
+> making it real fulfils that meaning rather than repurposing the value. The
+> hotkey is now acted on by the backend, press and release, and the `ptm:`
+> prefix is reserved. No id or kind is renamed or removed.
 
 ---
 

@@ -61,7 +61,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Enabled effects show light-gradient threads to the core; disabled effects show dashed grey threads.
 - [ ] Click an effect node → it gets a focus ring + the right-rail Inspector updates to show its sigil + name + parameters.
 - [ ] Double-click an effect node → enabled flag flips; the thread style switches accordingly.
-- [ ] Voice core says "Clean" by default; hold Space → flips to "Modulated"; the core breathes and threads animate dash-flow; particles drift up.
+- [ ] Voice core says "Modulated" by default with a preset that has an effect on besides the noise gate (Push to modulate is off until the Mixer's card turns it on; since v1.58.0); the core breathes and threads animate dash-flow; particles drift up. With **Clean Passthrough** (the noise gate only) it says "Clean". Turn **Push to modulate** on (**Hold to apply**) → "Clean" until you hold Space → "Modulated".
 - [ ] In the Inspector, drag the Gate threshold slider → audible change within ~5 ms; OUT meter responds.
 - [ ] In the Inspector, drag the EQ Low slider → audible bass boost / cut.
 - [ ] In the Inspector, drag the Distortion drive → audible saturation that doesn't clip past unity.
@@ -149,11 +149,11 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## Hotkeys (Phase 6)
 
-- [ ] Settings → Hotkeys shows nine rows: Push-to-modulate, Panic — stop all clips, Toggle monitor, Mute your voice (v1.56.0), Record screen, Record voice (WAV), Save replay, Turn Replay on or off, Arrange or lock the overlay. On a fresh profile every row is unbound (push-to-modulate's in-app key is still Space).
+- [ ] Settings → Hotkeys shows nine rows: Push-to-modulate, Panic — stop all clips, Toggle monitor, Mute your voice (v1.56.0), Record screen, Record voice (WAV), Save replay, Turn Replay on or off, Arrange or lock the overlay. On a fresh profile every row is unbound (push-to-modulate's in-app key is still Space, and Push to modulate itself is off until the Mixer's card turns it on).
 - [ ] Click the Push-to-modulate field → "Press a key… (Esc to cancel)" hint shows.
 - [ ] Press a chord (e.g., Ctrl+Shift+P) → chip set updates to show `Ctrl` `Shift` `P` and the binding is registered with the backend.
-- [ ] Focus a different app (e.g., Notepad), press the bound chord → DivoraVoice's Mixer status flips to Modulated while held.
-- [ ] Release the chord → Mixer status returns to Clean within one buffer.
+- [ ] Turn **Push to modulate** on in the Mixer (**Hold to apply**). Focus a different app (e.g., Notepad), hold the bound chord → DivoraVoice's Mixer status reads Modulated while held, and your effects are on.
+- [ ] Release the chord → the Mixer status returns to Clean within about 50 ms, occasionally about 100 ms (Divora checks every 50 ms whether a global key is still down), plus up to one level update (33 ms). *(P3 measured the hotkey's release: see Push-to-modulate (v1.58.0).)*
 - [ ] Bind Panic to a key (e.g., F8). Trigger 4 soundboard clips. Focus another app. Press F8 → all clips stop immediately.
 - [ ] Bind Toggle monitor to a key (e.g., F9). Focus another app. Press F9 → engine monitor toggles in DivoraVoice; Settings reflects the new state on next focus.
 - [ ] Click Clear next to any binding → chip set clears, accelerator becomes empty, the OS hotkey stops firing.
@@ -161,12 +161,35 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Bind PTM to an invalid accelerator (e.g., a single modifier) → the in-app field accepts it but the backend log records the registration failure; nothing crashes.
 - [ ] (v1.56.0) Bind **Mute your voice** to a key another app already holds (e.g. a Discord or OBS keybind) → note what happens, in Divora and in that app. This build shows nothing on screen when Windows refuses a key: the refusal is only logged (`[hotkey] register failed` in the devtools console).
 
-## Push-to-modulate (focus-time fallback)
+## Push-to-modulate (v1.58.0)
 
-- [ ] With DivoraVoice focused and PTM = Space, hold Space → status flips to Modulated; the Spell circle threads animate; particles drift.
-- [ ] Release Space → status flips back to Clean within one buffer (~5 ms).
-- [ ] Rebind PTM to a different key (e.g., Ctrl+M) in Settings → the in-app fallback honours the new key immediately (no app restart needed).
-- [ ] Invert mode (`ui.ptmMode = "bypass"`) inverts: PTM held = Clean; idle = Modulated.
+Since v1.58.0 push-to-modulate switches your effects in the engine: the call, your headphones, WAV and screen recordings and Replay follow it. Before, its key changed only the status. It is off until the Mixer's **Push to modulate** card turns it on. The real-app run below played no audio, so every check of the sound itself is an owner check (N1–N11).
+
+- [ ] **Off by default.** On a fresh profile, Mixer → **Push to modulate**: the switch is off, the line under it reads "Off · your effects are always on.", **Hold to apply** / **Hold to bypass** and **Hold to switch · or press Space** are disabled, and the button's tooltip reads "Turn on Push to modulate to try it." With a preset that has an effect on besides the noise gate (e.g. **Hollow King**), the titlebar, the Mixer's status and the spell circle say **Modulated** and animate; with **Clean Passthrough** (the noise gate only) they say **Clean**. Holding Space changes nothing. *(e2e and unit tests; not run in the app.)*
+- [ ] **Turn it on** → **Hold to apply** is picked, and the status says **Clean**. With no global key and no learned `ptm` MIDI mapping, the line reads "Your effects are on only while you hold Space in Divora's window. To use it in a call, set a key in Settings → Hotkeys." Hold Space → **Modulated**; let go → **Clean**. Pick **Hold to bypass** → the line reads "Your effects are off while you hold Space in Divora's window. …" and the status goes the other way round. Bind a global key in Settings → Hotkeys → the line ends at the key ("…while you hold F13."). With no global key but a `ptm` MIDI mapping that has learned its control, it ends "…in Divora's window, or with your MIDI control." *(e2e and unit tests; not run in the app.)*
+- [ ] **Hold to switch** (was **Hold to test**), with the card on: hold it down with the mouse → it reads **Effects on** (Hold to apply) or **Effects off** (Hold to bypass) and the status follows; let go, or drag off the button → it lets go. After a mouse click on the switch, a hold or this button, Space holds push-to-modulate (a click hands the keyboard back to the page). Tab to the button and hold Enter or Space → it holds until you let go or the focus moves. Its tooltip reads "Switches your effects for the call, your headphones, recordings and Replay while held." *(e2e and unit tests; not run in the app.)*
+- [ ] **Remembered:** with the card on and **Hold to bypass** picked, quit from the tray and relaunch → the card is on, with **Hold to bypass**. Turn it off and relaunch → off; turn it on → **Hold to bypass** again. *(P5 reloaded the page with the card on: see below. A relaunch wasn't run.)*
+- [ ] **The in-app key needs its modifiers:** bind push-to-modulate to **Ctrl+Shift+M** → in Divora a bare M does nothing, Ctrl+Shift+M holds, and letting go of Ctrl and Shift before the M still lets go. Bind it to a key whose character changes with Shift (**Ctrl+Shift+1**, which Settings shows as **!**), hold it in Divora and let go of Shift first → it still lets go. A key held down doesn't press again: hold Space, re-pick the card's hold with the mouse → the hold is let go, and Space must be pressed again. *(Unit tests only.)*
+- [ ] **It lets go when it should:** hold Space and Alt-Tab to another app → the status goes back (the window lost the focus). Hold **Hold to switch** with Enter, then Tab away → it lets go. Re-pick the card's hold, or turn the card off and on → every hold is let go, a global key's included: press it again to hold. *(P4 checked a focus loss in the app, with another window brought to the front rather than Alt-Tab: see below. The rest are unit and e2e tests.)*
+- [ ] **N1 — A real call** (owner check — not run; the release's done-when): Settings → Hotkeys → **Push-to-modulate**: bind a global key; Mixer → **Push to modulate** on, **Hold to apply**, preset **Hollow King**. With Output on CABLE Input, in a live Discord call with someone listening: hold the key and talk → the far end hears Hollow King; let go and talk → it hears your own voice. Press and let go in the middle of words, a few times each → no click, and no syllable doubled or dropped. A word you are saying as you let go keeps its effects to its end: turning them off waits out your preset's delay (the Mixer's latency readout; about 43 ms for Hollow King). Up to about 20 ms of what you said just before letting go can still reach the call in your own voice: that is your microphone's own buffering, which Divora can't see. With the effects off, your own voice still carries the preset's delay, so that a switch lines up with what you say.
+- [ ] **N2 — Headphone monitor** (owner check — not run): Settings → Audio devices → **Monitor output (hear yourself)** set to your headphones, Monitor on. Hold and let go of the key while talking → the headphones follow it as the call does; a soundboard clip plays the same either way.
+- [ ] **N3 — MIDI** (owner check — not run): Settings → Control surfaces: a mapping set to **Hold push-to-modulate**, learned. A pad holds while its note is down. Two pads on two mappings: it holds until both are up. A momentary CC button holds while down. A fader holds past halfway (64 or more) and lets go at 59 or less; a knob left near halfway (60 to 63) doesn't flicker. Picking the MIDI input, or pressing **Learn** on any mapping, while a pad is down → it lets go. With a fader resting high, turn the card off and on → it doesn't hold until the fader comes down and goes back up.
+- [ ] **N4 — A Stream Deck** (owner check — not run): give a button a **Hotkey** action that sends the push-to-modulate key, and record what happens when you press it. Expected, not checked: a blip, since the action sends a quick press and release, so your effects switch for the tap plus up to 50 ms.
+- [ ] **N5 — Shift held** (owner check — not run): in a game or app, hold the global key while Shift is down, and record whether it holds.
+- [ ] **N6 — An elevated window** (owner check — not run): hold the global key over Task Manager (it runs elevated), and record whether it holds. Divora checks every 50 ms whether the key is still down, and over an elevated window that check may read it as up, so it may not hold at all.
+- [ ] **N7 — Voice reading** (owner check — not run): the block "Push-to-modulate with your effects off" under Voice reading, with Loudness off and on.
+- [ ] **N8 — Voice Convert** (owner check — not run): **Deep Narrator** with the bundled voice installed, on an output device with 480-frame buffers (note the buffer size, if its control panel shows it): press and let go in the middle of words → nothing doubled or missing, bar about 5 ms (Voice Convert's model delays about 5 ms past what it reports). At other buffer sizes the noise remover delays more than it reports (928 samples at 512-frame buffers against the 480 it reports), so expect up to about 14 ms skipped or repeated at each switch there.
+- [ ] **N9 — Discord's own push-to-talk** (owner check — not run): set Discord's push-to-talk to the same key as push-to-modulate, and record whether Discord still sees it.
+- [ ] **N10 — The lock screen** (owner check — not run): card on, **Hold to apply**; hold Space in Divora, press Win+L, unlock, and record from the status whether the hold was let go (Clean means it was).
+- [ ] **N11 — A preset switch with your effects off** (owner check — not run): **Hold to apply**, key up, talking: switch from **Clean Passthrough** to **Hollow King** in the middle of a word → a pause of about 43 ms (the delay grows by that much) between two short fades; switch back → about 43 ms skipped; nothing heard twice either way.
+- [ ] Measured on the development machine, on one debug build `93ab993` (`pnpm tauri build --debug --no-bundle`), driven over WebView2's DevTools protocol: the push-to-modulate commands sent from the page through the real IPC, except P3 (a real `WM_HOTKEY` from `SendInput`) and P4 (a key event dispatched in the page, then another window brought to the front). The engine on a silent route input "Analogue 1 + 2 (2- Focusrite USB Audio)", output "Speakers (Realtek USB Audio)", Monitor off, no monitor device. **No audio was played:** the owner declined a test tone this time, and the SMSL DAC's loopback has recorded only silence since 2026-10-24. So nothing below measures the sound itself.
+  - **P6, the commands with real arguments:** `set_ptm_mode {mode:"apply"}` twice, `set_ptm_held {source:"key", held:true}` twice, `{source:"hotkey", …}`, `set_ptm_mode {mode:"apply", restore:true}`, then `{mode:"bypass"}` → as expected: `seq` +1 on each change and unchanged on each repeat, the `hotkey` source refused, the restore letting go of the key; the ticks agreed within 1 to 24 ms.
+  - **P5, a reload** with the card on, **Hold to apply**: one `set_ptm_mode {apply, restore: true}`, sent at 24 ms and answered at 27 ms, before `list_audio_input_devices` (29 ms); `seq` unchanged; the titlebar, sampled every 20 ms from the reload, read Modulated for Modulated from 38 to 49 ms, then Clean before Clean; the overlay received one, clean, from main at 51 ms and received at 152 ms.
+  - **P4, the window losing the focus** (Space held by a key event in the page, then a harness window brought to the front): `set_ptm_held {source:"key", held:false}` went out `[S2: P4 release latency]` later, and the next tick read `[S2: P4 next tick]`. Harness check: `[S2: P4 harness check]`. Since this build also lets go on Tauri's own focus event, a check that removes only the page's `blur` listener can still pass.
+  - **P3, the real hotkey** (push-to-modulate bound to Ctrl+Alt+Shift+F24, held 1 s by `SendInput` 8 times, 4 with Divora showing and 4 hidden to the tray): held within `[S2: P3 hotkey press latency]` of each key-down; let go within `[S2: P3 hotkey release latency]` of each key-up, an upper bound on the 50 ms check plus the wait for a tick, with no audio timing in it; `seq` `[S2: P3 seq per hold]`.
+  - **B1, the release bench** (`a_long_mute_costs_at_most_twice_speech_or_a_pause`, whose voice stage now runs the push-to-modulate dry line too, settled on the effects): passes on all 24 bundled presets: the last 10 s muted cost 0.70 to 1.00 × max(speech, pause) (the bar is 2 ×), for example Zombie 277.3 µs on the tone, 293.2 µs on the pause and 241.7 µs muted per 480-frame buffer, Clean 4.3, 12.1 and 11.9 µs (`cargo test --release`, this machine).
+  - **The sound, from the tests only:** the switch in a WAV, screen takes and Replay, where it lands in what you said, the dry voice lined up with the effects, and clicks rest on unit tests through the real voice stage (`the_dry_lines_up_with_the_wet_at_every_latency`, `what_you_say_while_held_stays_disguised`, `bypassed_send_is_the_dry_exactly`, `no_click_at_the_switch`, `a_growing_delay_pauses_and_repeats_nothing`, `the_chain_keeps_running_while_bypassed`) and on the stage fingerprints: one hash per bundled preset, loudness off and on (48), of what the voice stage sends with push-to-modulate off, identical on this machine to `main` before the change.
+  - **Not measured:** any sound in the app — the switch on the call, in the headphones, in a WAV, a take or Replay, and clicks; the far end of a call (N1); the headphone monitor (N2); MIDI with a device (N3); a Stream Deck (N4); a key held with Shift in a game (N5); an elevated window (N6); Voice reading in the app (N7); Voice Convert (N8); Discord's own push-to-talk (N9); the lock screen, sleep and UAC (N10); a preset switch with the effects off (N11); the Mixer card, Hold to switch and the in-app key's modifiers in the app (e2e and unit tests); a relaunch with the card on; any rate but 48 kHz; the device signal after the resampler when the rates differ; Windows 10; B1 on other CPUs.
 
 ## Glyph casting bindings (Phase 6)
 
@@ -434,8 +457,8 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Mixer → **Record screen** card: a **Replay** row. Before it has been set up, a **Set up Replay…** button (not a switch); activating it opens the explainer (what is kept — calls included whenever the card records desktop audio — the memory, "Divora writes no picture or sound to disk until you press Save", the yellow border, the tray icon, the hardware encoder) with focus on its heading; **Not now** closes it and returns focus to the button.
 - [ ] Still before **Turn Replay on** has been pressed in the explainer (opening it or pressing **Not now** doesn't count): **Settings → Hotkeys → Turn Replay on or off** reads "Works once you've turned Replay on from the Record screen card."; bind it and press it → the error toast "Turn Replay on from the Record screen card first — it explains what Replay keeps." (held until the window is shown, if Divora is hidden), and Replay stays off. It is refused the same way if Replay was set up with desktop audio off and the card records desktop audio now.
 - [ ] **Turn Replay on** → within a second the titlebar shows `REPLAY · 30 s` (dimmed while it arms), Windows draws the yellow border around the screen, the tray icon gains a red dot and its tooltip says "DivoraVoice · Replay on (30 s, with desktop audio)" — or "… Replay on (30 s)" when the card's desktop audio is off — and the card's screen and desktop-audio pickers are replaced by a line naming what Replay keeps. Settings → Recordings: **Frame rate**, **Quality**, **Show the mouse pointer**, **Desktop audio volume** and (under **Advanced**) **A/V offset** are disabled with "Replay is on — turn it off to change these."; **Also save separate audio files** stays free.
-- [ ] Set the Mixer's **Push to modulate** to **Hold to bypass** (in the default **Hold to apply**, the voice counts as disguised only while the key is held), pick **Villager** with an effect on, and stay unmuted. Wait 40 s without changing any of that, play a soundboard sting, talk, and press **Save** (or the **Save replay** hotkey, or the tray's **Save replay**) → within 3 s a toast "Saved a 30 s replay · Villager" (30 to 32: the clip's length, rounded) and `recordings/divora-replay-<date>_<time>.mp4` of 30 to about 32 s, starting on a clean frame, with the sting; it plays in Windows Media Player, VLC and an editor.
-- [ ] If, at any point in the clip's length plus 3 s before Save, the voice was muted, had no effect on or had the **Hold to apply** key up, or the preset changed → the toast says "your voice as your call heard it" instead of a preset. (Since v1.56.0 a muted stretch of the clip has no voice at all; the toast's words are unchanged.)
+- [ ] Leave the Mixer's **Push to modulate** off (the default since v1.58.0; with it on, the voice counts as disguised only while it leaves your effects on), pick **Villager** with an effect on, and stay unmuted. Wait 40 s without changing any of that, play a soundboard sting, talk, and press **Save** (or the **Save replay** hotkey, or the tray's **Save replay**) → within 3 s a toast "Saved a 30 s replay · Villager" (30 to 32: the clip's length, rounded) and `recordings/divora-replay-<date>_<time>.mp4` of 30 to about 32 s, starting on a clean frame, with the sting; it plays in Windows Media Player, VLC and an editor.
+- [ ] If, at any point in the clip's length plus 3 s before Save, the voice was muted, had no effect on besides the noise gate, or had Push to modulate taking your effects off (its key up in **Hold to apply**, or held in **Hold to bypass**), or the preset changed → the toast says "your voice as your call heard it" instead of a preset. (Since v1.56.0 a muted stretch of the clip has no voice at all, and since v1.58.0 a stretch with your effects off has your own voice; the toast's words are unchanged.)
 - [ ] Hide Divora to the tray (close the window), save from the hotkey → the tray tooltip says "… · saved 30 s at hh:mm" while hidden; reopen the window → the toast shows then, for its full time.
 - [ ] **Record** while Replay is on → the take records on Replay's settings (the locked rows above) and **Also save separate audio files** as set; its file is whole and Replay keeps running.
 - [ ] **Stop the engine** while Replay is on → the chip says `REPLAY · HELD`; Save still saves what it kept, ending at the stop (with the soundboard that was playing then). Pick another preset before that Save → the toast names no preset: a held clip is judged up to the hold. Start the engine → it keeps again from empty.
@@ -571,14 +594,15 @@ Run this checklist before tagging any release that touches audio capture, output
 
 ## Hotkeys survive a restart (v1.51.4)
 
-- [ ] Settings → Hotkeys: bind push-to-modulate to **Ctrl+Alt+Win+F9** (the chip reads "Win"; it saves as `Ctrl+Alt+Super+F9`) → hold it while another app is focused → the voice modulates. Windows or another app owns many Win-key combinations (Ctrl+Win+P was taken on the verification machine); a taken one is refused and only logged (`[hotkey] register failed` in the devtools console), so pick another combination rather than counting it as a regression.
+- [ ] Settings → Hotkeys: bind push-to-modulate to **Ctrl+Alt+Win+F9** (the chip reads "Win"; it saves as `Ctrl+Alt+Super+F9`) → with **Push to modulate** on in the Mixer (**Hold to apply**), hold it while another app is focused → the voice modulates. Windows or another app owns many Win-key combinations (Ctrl+Win+P was taken on the verification machine); a taken one is refused and only logged (`[hotkey] register failed` in the devtools console), so pick another combination rather than counting it as a regression.
 - [ ] Bind panic and monitor too, quit from the tray, relaunch → all three are still shown **and still work** without re-binding.
 - [ ] Clear a binding, relaunch → it stays cleared, and the key is free in other apps.
 
 ## Stream overlay (v1.16.0)
 
 - [ ] Settings → Stream overlay → toggle **Show overlay window** on → a frameless, always-on-top window appears showing the spell circle.
-- [ ] On the Mixer, hold Space (modulate) / change the preset / move Mystical / switch the Color mood → the overlay's circle updates to match (status colour, node count, mystical detail, mood) within a frame.
+- [ ] On the Mixer, with **Push to modulate** on, hold Space (the status switches) / change the preset / move Mystical / switch the Color mood → the overlay's circle updates to match (status colour, node count, mystical detail, mood) within a frame.
+- [ ] (v1.58.0) With **Push to modulate** off (the default) and a preset with an effect on besides the noise gate, the circle says **Modulated** and animates, where it said **Clean** before v1.58.0. Turn Push to modulate on (**Hold to apply**) → **Clean** until you hold the key. *(e2e; P5 read the overlay's events after a reload: see Push-to-modulate (v1.58.0).)*
 - [ ] Set background = **Transparent** → in OBS, add a **Window Capture** of "DivoraVoice Overlay" with a method that supports transparency → the circle composites over your scene with no box.
 - [ ] Set background = **Green** (or Magenta) → the overlay fills solid green → add a **Chroma Key** filter in OBS → the green is removed, leaving the circle.
 - [ ] Close the overlay window's toggle (or the window's own close) → the window disappears and the toggle reflects it.
@@ -743,19 +767,29 @@ the cases CI cannot reach and the ones where this feature usually goes wrong.
       the panel does not keep showing the old reading, and a new baseline is
       built after the rebuild.
 
-**Push-to-modulate with the key up**
+**Push-to-modulate with your effects off** (owner check N7 — not run; rewritten for v1.58.0, when push-to-modulate began to switch the effects)
 
-- [ ] Set push-to-modulate to "Hold to apply" and leave the key **up**, engine
-      running, panel on. Speak.
+- [ ] Turn **Push to modulate** on in the Mixer (**Hold to apply**) and leave
+      the key **up**, engine running, panel on, a preset with a pitch shift
+      (e.g. Hollow King). Speak.
 - [ ] The **Your voice** half keeps reading normally: the mic is still open,
-      only the chain is bypassed. It must not read as muted or stopped.
+      only your effects are off. It must not read as muted or stopped.
 - [ ] The **After effects** half shows "No measured difference from the
-      microphone half — the chain is passing the signal through." It must not
-      look like a failure, and there must be no wording suggesting the preset
-      stopped working.
-- [ ] Hold the key down and keep speaking: the after-effects half diverges from
-      the microphone half (pitch and/or brightness move) while the microphone
-      half is unchanged.
+      microphone half — your effects are off, or they are passing the signal
+      through." It must not look like a failure, and there must be no wording
+      suggesting the preset stopped working. The line under its heading reads
+      "What the call hears: your voice after your effects, or as it is while
+      Push to modulate has them off."
+- [ ] Hold the key down and keep speaking: the note goes, and the after-effects
+      half diverges from the microphone half (pitch and/or brightness move)
+      while the microphone half is unchanged.
+- [ ] Let go and keep speaking: the note comes back with fresh after-effects
+      numbers, about half a second to three-quarters of a second after you let
+      go (the after-effects half first refills its window), never ahead of
+      them.
+- [ ] Hold the key, speak a phrase, and stop speaking just as you let go: the
+      last numbers stay, dimmed, without the note — they were measured with
+      your effects on.
 - [ ] **Repeat the whole block with Loudness normalization ON.** This is the
       case that matters: the passing-through note is measured by correlating
       the two taps, and the loudness stage sits between the chain and the wet
