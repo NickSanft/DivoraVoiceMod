@@ -3640,6 +3640,12 @@ sits where you let go (from the code; not checked in a take).
 | **Hold to switch** (`button`) | pointerdown; Enter or Space while it has the focus, not an autorepeat. Disabled while push-to-modulate is off | pointerup, pointerleave (no pointer capture, so leaving the button can't leave it held), pointercancel, keyup of Enter or Space, the button's own `blur`; the window's `blur`, Tauri focus loss or the page hidden; the card unmounting |
 | **MIDI** (`midi`) | a `ptm` mapping's note-on, or its CC rising to 64 or more | that mapping's note-off, or its CC falling to 59 or less (60 to 63 keep the side it was on: the mute's `muteCcStep`, unknown side included). The bit is held while any `ptm` mapping is down, so one pad's note-off can't let go of another. Also: picking a MIDI input or starting MIDI-learn on any mapping (every mapping: learn swallows every message, a note-off included), and changing or removing a mapping (that one). Focus doesn't matter: a pad keeps holding while Divora is behind |
 
+**The page hidden.** WebView2 keeps `visibilityState` at `visible` for a
+window hidden to the tray (seen in v1.54.0, and again in the real-app run
+below), so `visibilitychange` doesn't fire for a hide. A hide from the front
+takes the focus away, and that lets go (from the code; a hide with a key held
+wasn't tried in the app).
+
 **Every source.** Setting the mode from the card — turning it on or off, or
 picking a hold, even the one already picked — lets go of every hold, the
 global key's included. The store forgets the page's own holds and which pads
@@ -3826,8 +3832,8 @@ through".
 - **Effects off:** the same, with `d` (your preset's delay) before L.
 - **Letting go of the global key:** the poller sees it 0 to 50 ms after the
   key-up, plus however late Windows wakes the thread; then as above. In the
-  app: [S2: P3 — key-up to the tick that showed it let go, over 8 holds, as
-  an upper bound on the poller plus the tick's wait].
+  app, over 8 holds, the tick that showed it let go came 12 to 76 ms after
+  the key-up, an upper bound on the poller plus the tick's wait.
 - **The in-app key, the button, MIDI:** an IPC round trip, plus any sync
   command ahead of it; then as above.
 - **The pill:** the next tick (up to about 33 ms) after a change the backend
@@ -3918,8 +3924,9 @@ through".
   confirmed six findings and refuted none, each fixed with a test that fails
   when the defect is put back.
 - **In the real app** (see "Push-to-modulate (v1.58.0)" in
-  [`MANUAL_TESTS.md`](MANUAL_TESTS.md)): one debug build of
-  `93ab993`, on Windows 11 26200 with an i7-14700K, driven over
+  [`MANUAL_TESTS.md`](MANUAL_TESTS.md)): debug builds of
+  `93ab993` (the commands, the reload) and `6c180bf` (the focus loss, the
+  global key), on Windows 11 26200 with an i7-14700K, driven over
   WebView2's DevTools protocol, with the commands sent from the page over the
   real IPC and the global key through real `WM_HOTKEY` from `SendInput`. **No
   audio was played**: the owner declined a test tone, and the SMSL's loopback
@@ -3928,22 +3935,18 @@ through".
   rests on the unit tests and the stage fingerprints above, not on the app.
   - The commands from the page: `set_ptm_mode {mode: "apply"}` twice answered `{apply, nothing held, effects off, seq 1}` both times (the second changed nothing, `seq` included); `set_ptm_held {source: "key", held: true}` twice answered `{held, effects on, seq 2}` both times; `{source: "hotkey"}` was refused before it reached the engine ("unknown variant `hotkey`") and changed nothing; `{mode: "apply", restore: true}` let go of the key (`seq` 3), and `{mode: "bypass"}` answered `seq` 4. The ticks agreed with every answer within 1 to 24 ms.
   - A reload with push-to-modulate on: one `set_ptm_mode {mode: "apply", restore: true}`, sent 24 ms after the reload and answered at 27 ms, before `list_audio_input_devices` (sent at 29 ms) and nothing else of push-to-modulate's; it changed nothing (`seq` 6 before and after). The titlebar, sampled every 20 ms, read no pill at 7 ms after the reload, Modulated at 38 ms and Clean from 49 ms on, 22 ms after the restore's answer arrived (the check asked for Clean from 40 ms after it); the one `overlay:state` main sent (at 51 ms) and the one the overlay received (at 152 ms) both said clean.
-  - The window losing the focus with the in-app key held: [S2: P4 — the
-    `set_ptm_held {key, false}` and the next tick; which of the DOM's `blur`
-    and Tauri's focus event let go, since either does].
-  - The global key, 8 holds of 1 s, 4 with Divora visible and 4 hidden to the
-    tray: [S2: P3 — `held` within a tick of each press, the key-up-to-tick
-    figures, `seq` +2 per hold].
+  - The window losing the focus with the in-app key held (Space held by a key event in the page, then the harness's own window brought to the front): `set_ptm_held {source: "key", held: false}` went out 8 ms after the move began; the DOM's `blur` fired at 7 ms and Tauri's focus event at 8 ms, so either could have sent it. The next tick read not held (`seq` 3). With the page's `blur` listener removed, Tauri's event let go on its own, at 8 ms; with that listener removed and Tauri's event blocked, nothing let go. The DOM's `blur` alone wasn't isolated.
+  - The global key (Ctrl+Alt+Shift+F24), 8 holds of 1 s by `SendInput`, 4 with Divora visible and 4 hidden to the tray with the titlebar's Close button: the first tick after each key-down read held, 5 to 33 ms after it; a tick read let go 12 to 76 ms after each key-up (visible 19 to 76 ms, hidden 12 to 60 ms); `seq` rose by 2 a hold, 1 to 9 in each run; the page sent no push-to-modulate command. The hidden four ran in a second run, because the first run's check that the page had no focus refused them: the page read as focused just after the CDP click that hid the window. The rerun checked the foreground window instead. Hidden, the page read `visibilityState` `visible`, as in v1.54.0.
   - The long-mute bench, which now runs the dry line in every buffer: passes on all 24 bundled presets: the last 10 s muted cost 0.70 to 1.00 × max(speech, pause) (the bar is 2 ×), for example Zombie 277.3 µs on the tone, 293.2 µs on the pause and 241.7 µs muted per 480-frame buffer, Clean 4.3, 12.1 and 11.9 µs (`cargo test --release`, this machine).
   - Not tried here: real speech; the far end of a call; a MIDI device; a
     Stream Deck; another app's push-to-talk on the same key; the global key
     with Shift held; the lock screen, sleep and UAC; an elevated window in
-    front; the headphone monitor's output; a Voice Convert voice; Voice
-    reading; the card's line, Hold to switch and the in-app key's modifiers
-    (the card's switch and hold were clicked; the others have only e2e or
-    unit tests); a relaunch with the card on (only a page reload, above);
-    rates other than 48 kHz; Windows 10. Several of these are the owner's
-    checks in `MANUAL_TESTS.md`.
+    front; a hide to the tray with a key held; the headphone monitor's
+    output; a Voice Convert voice; Voice reading; the card's line, Hold to
+    switch and the in-app key's modifiers (the card's switch and hold were
+    clicked; the others have only e2e or unit tests); a relaunch with the
+    card on (only a page reload, above); rates other than 48 kHz; Windows
+    10. Several of these are the owner's checks in `MANUAL_TESTS.md`.
 
 ### Kill switches
 
