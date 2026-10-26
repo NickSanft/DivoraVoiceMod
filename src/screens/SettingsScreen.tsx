@@ -1475,10 +1475,15 @@ function ControlSurfacesSection(): JSX.Element {
           except that its first move after launch (or after you pick the
           device or change its mapping) mutes if it is past halfway.{" "}
           {/* v1.58.0: push-to-modulate's mappings hold for real, with the
-              mute's dead band (data/mute.ts muteCcStep). */}
+              mute's dead band (data/mute.ts muteCcStep). The card's set lets
+              go of every hold and keeps each CC's side (D19), so a control
+              left past halfway holds only after it crosses again. */}
           <strong>Hold push-to-modulate</strong> holds while a pad's note is
           down, or while a knob, fader or CC button is past halfway (it lets go
           at 59 or less); with two pads on it, it holds until both are up.
+          Turning Push to modulate on or off on the Mixer, or picking its hold,
+          lets go: a pad then holds again on its next press, and a control left
+          past halfway once it comes back down and up again.
         </p>
 
         <FieldRow label="MIDI input">

@@ -162,16 +162,22 @@ describe("ptmModeOf and settingOf", () => {
 describe("the words that follow the state (§7.5)", () => {
   const IN_APP =
     " in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
+  // No global key, but a learned MIDI control: the key the card names still
+  // works only in Divora's window; the control works in a call.
+  const OR_MIDI = " in Divora's window, or with your MIDI control.";
 
   it.each([
-    [{ on: false, hold: "apply" }, true, "Off · your effects are always on."],
-    [{ on: false, hold: "bypass" }, false, "Off · your effects are always on."],
-    [{ on: true, hold: "apply" }, true, "Your effects are on only while you hold Space."],
-    [{ on: true, hold: "apply" }, false, `Your effects are on only while you hold Space${IN_APP}`],
-    [{ on: true, hold: "bypass" }, true, "Your effects are off while you hold Space."],
-    [{ on: true, hold: "bypass" }, false, `Your effects are off while you hold Space${IN_APP}`],
-  ] as const)("ptmCardLine(%j, Space, in-call key %s)", (setting, inCallKey, want) => {
-    expect(ptmCardLine(setting, "Space", inCallKey)).toBe(want);
+    [{ on: false, hold: "apply" }, "key", "Off · your effects are always on."],
+    [{ on: false, hold: "bypass" }, null, "Off · your effects are always on."],
+    [{ on: false, hold: "apply" }, "midi", "Off · your effects are always on."],
+    [{ on: true, hold: "apply" }, "key", "Your effects are on only while you hold Space."],
+    [{ on: true, hold: "apply" }, "midi", `Your effects are on only while you hold Space${OR_MIDI}`],
+    [{ on: true, hold: "apply" }, null, `Your effects are on only while you hold Space${IN_APP}`],
+    [{ on: true, hold: "bypass" }, "key", "Your effects are off while you hold Space."],
+    [{ on: true, hold: "bypass" }, "midi", `Your effects are off while you hold Space${OR_MIDI}`],
+    [{ on: true, hold: "bypass" }, null, `Your effects are off while you hold Space${IN_APP}`],
+  ] as const)("ptmCardLine(%j, Space, in call: %s)", (setting, inCall, want) => {
+    expect(ptmCardLine(setting, "Space", inCall)).toBe(want);
   });
 
   it("ptmButtonLabel", () => {
@@ -190,9 +196,11 @@ describe("the words that follow the state (§7.5)", () => {
 
   it("no copy says the chain, instant or at once, or names a Stream Deck", () => {
     const copy = [
-      ptmCardLine({ on: false, hold: "apply" }, "Space", true),
-      ptmCardLine({ on: true, hold: "apply" }, "Space", false),
-      ptmCardLine({ on: true, hold: "bypass" }, "Space", false),
+      ptmCardLine({ on: false, hold: "apply" }, "Space", "key"),
+      ptmCardLine({ on: true, hold: "apply" }, "Space", null),
+      ptmCardLine({ on: true, hold: "bypass" }, "Space", null),
+      ptmCardLine({ on: true, hold: "apply" }, "Space", "midi"),
+      ptmCardLine({ on: true, hold: "bypass" }, "Space", "midi"),
       ptmButtonLabel(false, false, "Space"),
       ptmButtonLabel(true, false, "Space"),
       ptmButtonLabel(true, true, "Space"),

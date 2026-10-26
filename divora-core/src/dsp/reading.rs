@@ -232,8 +232,10 @@ pub struct VoiceReading {
     /// the dry tap has speech on it while the wet tap is a passthrough (the
     /// engine delays the dry tap by the chain's latency, so the two are the
     /// same moment). Without this flag the panel would read that as the
-    /// preset having stopped working. A held reading's flag is its window's,
-    /// like its numbers, not the moment's.
+    /// preset having stopped working. The flag always goes with the `wet`
+    /// numbers beside it, never ahead of them: a held reading's is its
+    /// window's, not the moment's, and while a chain change refills the wet
+    /// window and the previous numbers are still shown, so is their verdict.
     pub wet_bypassed: bool,
     /// `wet` covers a full window of the *current* chain.
     ///

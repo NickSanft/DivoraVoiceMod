@@ -289,7 +289,7 @@ describe("Push to modulate card (v1.58.0)", () => {
     expect(app().ptmBypassed()).toBe(true);
   });
 
-  it("the line names the in-app-only key unless a global key or a learned MIDI mapping holds it", async () => {
+  it("the line says the key works only in Divora's window unless a global key is bound, and names a learned MIDI control", async () => {
     const note = { kind: "note", data1: 36, channel: 0 };
     const cases: Array<[Setup, string]> = [
       [{ setting: { on: true, hold: "apply" } }, `Your effects are on only while you hold Space${IN_APP}`],
@@ -303,10 +303,24 @@ describe("Push to modulate card (v1.58.0)", () => {
         { setting: { on: true, hold: "bypass" }, hotkeyBindings: { ptm: "Ctrl+Shift+M" } },
         "Your effects are off while you hold Ctrl+Shift+M.",
       ],
-      // A learned `ptm` pad works in a call too.
+      // A learned `ptm` pad works in a call; Space still works only in
+      // Divora's window, so the line says so and names the pad.
       [
         { setting: { on: true, hold: "apply" }, midiMappings: [{ id: "p", action: "ptm", trigger: note }] },
-        "Your effects are on only while you hold Space.",
+        "Your effects are on only while you hold Space in Divora's window, or with your MIDI control.",
+      ],
+      [
+        { setting: { on: true, hold: "bypass" }, midiMappings: [{ id: "p", action: "ptm", trigger: note }] },
+        "Your effects are off while you hold Space in Divora's window, or with your MIDI control.",
+      ],
+      // A global key and a pad: the key works in a call.
+      [
+        {
+          setting: { on: true, hold: "apply" },
+          hotkeyBindings: { ptm: "F13" },
+          midiMappings: [{ id: "p", action: "ptm", trigger: note }],
+        },
+        "Your effects are on only while you hold F13.",
       ],
       // One that hasn't learned its pad yet can't fire; a global key on
       // another action doesn't count.

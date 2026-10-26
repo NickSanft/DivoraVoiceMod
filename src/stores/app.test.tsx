@@ -4705,6 +4705,48 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       expect(result.ptmSetting()).toEqual({ on: false, hold: "bypass" });
     });
 
+    it("an off sent while a hold pick is in flight keeps the pick", async () => {
+      // The card still shows the old hold until bypass's answer lands, so
+      // the off goes out built from Hold to apply.
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      await result.setPtmOn(true);
+      invokeMock.mockClear();
+      engine.ctl.gate = [];
+      const pick = result.setPtmHold("bypass");
+      const off = result.setPtmOn(false);
+      await settle();
+      expect(ptmCalls()).toEqual([modeCall("bypass"), modeCall("always")]);
+      engine.ctl.gate.shift()!();
+      await settle();
+      expect(result.ptmSetting()).toEqual({ on: true, hold: "bypass" });
+      engine.ctl.gate.shift()!();
+      await Promise.all([pick, off]);
+      expect(result.ptmSetting()).toEqual({ on: false, hold: "bypass" });
+      expect(JSON.parse(window.localStorage.getItem("divora.ptm")!)).toEqual({
+        on: false,
+        hold: "bypass",
+      });
+      // Turning it back on asks for the pick.
+      invokeMock.mockClear();
+      engine.ctl.gate = null;
+      await result.setPtmOn(true);
+      expect(ptmCalls()).toEqual([modeCall("bypass")]);
+    });
+
+    it("a hold picked while off is remembered; the engine stays at always", async () => {
+      ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      invokeMock.mockClear();
+      await result.setPtmHold("bypass");
+      expect(ptmCalls()).toEqual([modeCall("always")]);
+      expect(result.ptmSetting()).toEqual({ on: false, hold: "bypass" });
+      await result.setPtmOn(true);
+      expect(ptmCalls()).toEqual([modeCall("always"), modeCall("bypass")]);
+    });
+
     it("re-picking the current hold sends set_ptm_mode and forgets the page's holds", async () => {
       const engine = ptmEngine();
       const { result } = setupApp();

@@ -200,8 +200,10 @@ export interface VoiceReadingUpdate {
   state: VoiceReadingState;
   /** The mic, before any effect. */
   dry: ReadingMetrics;
-  /** The same voice after the chain — what the call hears. Soundboard and
-   *  Speak audio is mixed in after this tap, so it is on neither half. */
+  /** The same voice after the voice stage — what the call hears: after the
+   *  chain, or (v1.58.0) the dry voice while push-to-modulate has the
+   *  effects off. Soundboard and Speak audio is mixed in after this tap, so
+   *  it is on neither half. */
   wet: ReadingMetrics;
   /** The words to show, already resolved by the backend from its closed
    *  vocabulary. The frontend renders what it is handed and deliberately
@@ -211,8 +213,9 @@ export interface VoiceReadingUpdate {
    *  anything. Until then the panel says it is still listening. */
   calibrated: boolean;
   /**
-   * The chain passed the signal through unchanged over this window, so the
-   * two halves should read alike. Measured in the engine by correlating the
+   * The chain passed the signal through unchanged over this window, or
+   * (v1.58.0) push-to-modulate had the effects off, so the two halves should
+   * read alike. Measured in the engine by correlating the
    * taps — scale-invariant, because the wet tap sits after the loudness
    * stage. Do not try to re-derive this from the numbers here: they are
    * summaries, and a level comparison is wrong whenever loudness

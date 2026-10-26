@@ -623,6 +623,73 @@ fn a_held_reading_keeps_its_windows_bypass_verdict() {
     }
 }
 
+/// v1.58.0 (U6, D9): the bypass verdict goes with the wet numbers printed
+/// beside it. Letting go of push-to-modulate drops the wet window while the
+/// dry one still reads Speaking — through the tail grace after a phrase, or
+/// because the sentence goes on — and for `MIN_WET_S` after that the
+/// after-effects numbers shown are still the disguised phrase's. A verdict
+/// taken from the blocks since the last emit called those +5 st numbers a
+/// passthrough, and a pause then held that pairing for 30 s.
+#[test]
+fn a_bypass_verdict_never_outruns_the_wet_numbers() {
+    let rate = 48_000.0;
+    let voice = Voice::talking(rate);
+    let mut shifted = voice.clone();
+    shifted.f0 = voice.f0 * 2f32.powf(5.0 / 12.0);
+    let bypassed = InputFacts {
+        chain_bypassed: true,
+        ..InputFacts::default()
+    };
+    let room = noise(rate, 2.0, 0.001);
+    let more = voice.render(2.0);
+    let (mut carried, mut held_carried, mut fresh) = (0, 0, 0);
+    // Let go at the end of the phrase, then mid-sentence; the release lands
+    // anywhere on the emit clock.
+    for (label, after_dry) in [("end of phrase", &room), ("mid-sentence", &more)] {
+        for lead_ms in (0..250).step_by(25) {
+            let mut a = Analyzer::new(48_000);
+            let lead = &room[..lead_ms * 48];
+            feed(&mut a, lead, lead, InputFacts::default());
+            // A disguised phrase ending on its last syllable (9.7 periods).
+            let spoken = feed(
+                &mut a,
+                &voice.render(3.88),
+                &shifted.render(3.88),
+                InputFacts::default(),
+            );
+            let phrase = last_speaking(&spoken).clone();
+            assert!(!phrase.wet_bypassed, "{label}, lead {lead_ms} ms");
+            // Let go: the effects off, the wet tap now the dry.
+            a.note_chain_changed();
+            for r in feed(&mut a, after_dry, after_dry, bypassed) {
+                if r.wet == phrase.wet {
+                    assert!(
+                        !r.wet_bypassed,
+                        "{label}, lead {lead_ms} ms: the phrase's after-effects \
+                         numbers read as a passthrough: {r:?}"
+                    );
+                    carried += usize::from(r.state == ReadingState::Speaking);
+                    held_carried += usize::from(r.held);
+                } else {
+                    assert!(
+                        r.wet_bypassed,
+                        "{label}, lead {lead_ms} ms: fresh passthrough numbers \
+                         without the verdict: {r:?}"
+                    );
+                    fresh += usize::from(r.state == ReadingState::Speaking);
+                }
+            }
+        }
+    }
+    // The cases this is about all happened.
+    assert!(
+        carried > 0,
+        "no Speaking reading carried the phrase past the switch"
+    );
+    assert!(held_carried > 0, "no pause held the phrase's numbers");
+    assert!(fresh > 0, "the passthrough never got numbers of its own");
+}
+
 #[test]
 fn a_preset_switch_moves_the_wet_reading_within_half_a_second() {
     let rate = 48_000.0;

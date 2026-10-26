@@ -518,7 +518,7 @@ describe("SettingsScreen — push-to-modulate (v1.58.0)", () => {
   const PTM_DESC =
     "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.";
   const PTM_MIDI =
-    "Hold push-to-modulate holds while a pad's note is down, or while a knob, fader or CC button is past halfway (it lets go at 59 or less); with two pads on it, it holds until both are up.";
+    "Hold push-to-modulate holds while a pad's note is down, or while a knob, fader or CC button is past halfway (it lets go at 59 or less); with two pads on it, it holds until both are up. Turning Push to modulate on or off on the Mixer, or picking its hold, lets go: a pad then holds again on its next press, and a control left past halfway once it comes back down and up again.";
 
   beforeEach(() => {
     window.localStorage.clear();
@@ -550,6 +550,10 @@ describe("SettingsScreen — push-to-modulate (v1.58.0)", () => {
     expect(intro.indexOf(PTM_MIDI)).toBeGreaterThan(intro.indexOf("mutes if it is past halfway."));
     // The sentence against the rule the store holds a CC by (data/mute.ts,
     // as the mute's): past halfway holds, 60..63 keeps, 59 or less lets go.
+    // Its exception, a control left past halfway across the card's set
+    // holding only after it crosses again, is the store's own behaviour,
+    // pinned in app.test.tsx ("after a mode change, a CC resting up doesn't
+    // hold until it goes down and back up").
     expect(muteCcStep(undefined, 64).act).toBe(true);
     expect(muteCcStep(false, 64).act).toBe(true);
     expect(muteCcStep(true, 63).act).toBeNull();

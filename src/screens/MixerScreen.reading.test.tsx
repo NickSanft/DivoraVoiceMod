@@ -363,16 +363,18 @@ describe("voice reading — the card", () => {
     // a bare "/s" reads as syllables per second, which this is not.
     expect(dry).toHaveTextContent("4 onsets/s");
 
-    // The after-effects half is unmistakably labelled as the chain's output,
+    // The after-effects half is unmistakably labelled as what the call hears,
     // and carries the chain's numbers, not the mic's.
     const wet = getByTestId("reading-wet");
     expect(wet).toHaveTextContent(/after effects/i);
-    expect(wet).toHaveTextContent(/chain's output/i);
+    // v1.58.0: what the call hears, effects on or (push-to-modulate) off.
+    expect(wet).toHaveTextContent(/What the call hears: your voice after your effects/);
+    expect(wet).toHaveTextContent(/while Push to modulate has them off/);
     expect(wet).toHaveTextContent(/preset change moves these numbers/i);
     expect(wet).toHaveTextContent("84 Hz");
   });
 
-  it("says when the chain is only passing the signal through", async () => {
+  it("says when the after-effects half measures no different: effects off, or passing the signal through", async () => {
     const { getByLabelText, getByTestId, queryByTestId } = setup();
     fireEvent.click(getByLabelText("Voice reading"));
     await Promise.resolve();
@@ -399,6 +401,15 @@ describe("voice reading — the card", () => {
     expect(getByTestId("reading-passthrough")).toHaveTextContent(
       /passing the signal through/i,
     );
+    // v1.58.0: push-to-modulate lights it for every preset while it has the
+    // effects off, with the chain running in full; the words must be true
+    // of that cause too, so they don't pin it on the chain (§9: "your
+    // effects", never "the chain").
+    const note = getByTestId("reading-passthrough").textContent!.replace(/\s+/g, " ").trim();
+    expect(note).toBe(
+      "No measured difference from the microphone half — your effects are off, or they are passing the signal through.",
+    );
+    expect(note).not.toMatch(/\bchain\b/i);
   });
 
   it("carries one line saying what this is", async () => {

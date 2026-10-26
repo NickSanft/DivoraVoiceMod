@@ -6192,9 +6192,11 @@ mod tests {
     /// 1. The key held: speech read with the effects, not a passthrough.
     /// 2. Let go: the crossing drops the after-effects window (the flag the
     ///    callback sets, taken by the worker), and "passing the signal
-    ///    through" follows within two emits (the one the crossing lands in,
-    ///    then a clean one; up to about 540 ms, so 1 s here); back on within
-    ///    500 ms of holding it again.
+    ///    through" follows with the first fresh after-effects numbers, never
+    ///    ahead of them: the first emit once 0.4 s of wet audio (plus a
+    ///    frame) has refilled the window, so up to about 0.75 s after the
+    ///    release (measured 0.53-0.72 s). 1 s here from the drop; held again,
+    ///    the verdict goes back the same way, 1.5 s here from the press.
     /// 3. U6: a pause after a disguised phrase, then the effects off: the
     ///    held window keeps its own verdict.
     /// 4. "Always": holds change nothing, so they never reset the wet window.
@@ -6251,7 +6253,7 @@ mod tests {
         );
         hold(true);
         assert!(
-            reading_within(&tap, Duration::from_millis(500), |s| speaking(s)
+            reading_within(&tap, Duration::from_millis(1_500), |s| speaking(s)
                 && !s.reading.wet_bypassed),
             "the reading still said the effects were off"
         );

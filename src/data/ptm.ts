@@ -89,14 +89,23 @@ export function settingOf(mode: PtmMode, prev: PtmSetting): PtmSetting {
 const IN_APP_ONLY =
   " in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
 
+/** Where the key works when only a MIDI control reaches outside Divora. */
+const IN_APP_OR_MIDI = " in Divora's window, or with your MIDI control.";
+
 /** The Mixer card's line under its switch. `key` is the in-app key as the
- *  card shows it. `inCallKey`: a global push-to-modulate key is bound, or a
- *  `ptm` MIDI mapping exists, so something works while a call has the
- *  focus; without either, the line says the key works only in Divora's
- *  window and where to set one. */
-export function ptmCardLine(s: PtmSetting, key: string, inCallKey: boolean): string {
+ *  card shows it, the global key when one is bound. `inCall`: what still
+ *  works while a call has the focus. "key": a global push-to-modulate key is
+ *  bound, so `key` works anywhere. "midi": no global key, but a learned
+ *  `ptm` MIDI mapping, so `key` works only in Divora's window and the MIDI
+ *  control works anywhere. null: neither, so the line says the key works
+ *  only in Divora's window and where to set one. */
+export function ptmCardLine(
+  s: PtmSetting,
+  key: string,
+  inCall: "key" | "midi" | null,
+): string {
   if (!s.on) return "Off · your effects are always on.";
-  const where = inCallKey ? "." : IN_APP_ONLY;
+  const where = inCall === "key" ? "." : inCall === "midi" ? IN_APP_OR_MIDI : IN_APP_ONLY;
   return s.hold === "apply"
     ? `Your effects are on only while you hold ${key}${where}`
     : `Your effects are off while you hold ${key}${where}`;
@@ -142,7 +151,10 @@ const FLAGS = ["ctrlKey", "altKey", "shiftKey", "metaKey"] as const;
 /** The in-app push-to-modulate matcher. `"down"` needs the accelerator's
  *  modifiers exactly (no more, no fewer), so a bare M can't switch the call
  *  when the key is Ctrl+Shift+M. `"up"` matches the trailing key alone, so
- *  letting go of a modifier first still lets go. The trailing key matches as
+ *  letting go of a modifier first still lets go when the trailing key's
+ *  character doesn't change with it. One that does (Shift+1 binds as "!",
+ *  and its keyup after Shift says "1") is the shell's to match by the
+ *  physical key that held (`App.tsx`). The trailing key matches as
  *  it always has: "Space" by `code`, one character by `key` in any case,
  *  anything else (F13, Enter…) by `key` exactly. A modifier name the parser
  *  doesn't know never matches a press. */

@@ -562,6 +562,47 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
   });
 
+  it.each([
+    // Settings captures Shift+1 as "Shift+!" (e.key); letting go of Shift
+    // first makes the 1's keyup say "1".
+    [
+      "Shift+!",
+      { key: "!", code: "Digit1", shiftKey: true },
+      [{ key: "Shift", code: "ShiftLeft" }],
+      { key: "1", code: "Digit1" },
+    ],
+    // AltGr+Q is "@" on a German layout, with Ctrl and Alt; Q alone is "q".
+    [
+      "Ctrl+Alt+@",
+      { key: "@", code: "KeyQ", ctrlKey: true, altKey: true },
+      [{ key: "AltGraph", code: "AltRight" }],
+      { key: "q", code: "KeyQ" },
+    ],
+    // An unshifted 1, with Shift pressed during the hold: its keyup says "!".
+    ["1", { key: "1", code: "Digit1" }, [], { key: "!", code: "Digit1", shiftKey: true }],
+  ] as const)(
+    "%s held lets go on the same physical key's keyup, whatever character it says",
+    async (binding, press, before, release) => {
+      ptmEngine();
+      window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ ptm: binding }));
+      renderShell();
+      await settle();
+      invokeCalls.length = 0;
+      expect(key("keydown", press)).toBe(true);
+      expect(ptmCalls()).toEqual([heldCall("key", true)]);
+      for (const k of before) key("keyup", k);
+      expect(ptmCalls()).toEqual([heldCall("key", true)]);
+      // Another key's keyup doesn't let go.
+      key("keyup", { key: "2", code: "Digit2" });
+      expect(ptmCalls()).toEqual([heldCall("key", true)]);
+      key("keyup", release);
+      expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+      // And it holds again on the next press.
+      key("keydown", press);
+      expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false), heldCall("key", true)]);
+    },
+  );
+
   it("applyLevelUpdate adopts a tick's ptm when newer; a tick without it leaves the mirror", async () => {
     const { result } = renderHook(() => useApp(), { wrapper: AppProvider });
     await settle();

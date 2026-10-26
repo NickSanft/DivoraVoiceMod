@@ -1869,8 +1869,11 @@ test.describe("push-to-modulate (v1.58)", () => {
     await expect.poll(async () => (await invokesOf(page, "list_midi_inputs")).length).toBeGreaterThan(0);
     await turnOn(page);
     // A learned mapping works in a call, so the line doesn't send you to
-    // Settings.
-    await expect(cardLine(page)).toHaveText("Your effects are on only while you hold Space.");
+    // Settings; with no global key, Space still works only in Divora's
+    // window, so the line says so and names the MIDI control.
+    await expect(cardLine(page)).toHaveText(
+      "Your effects are on only while you hold Space in Divora's window, or with your MIDI control.",
+    );
     await expect(pill(page)).toHaveText("Clean");
     const before = [RESTORE("always"), SET("apply")];
 

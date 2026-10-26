@@ -597,6 +597,10 @@ pub struct Analyzer {
     emit_len: usize,
     min_wet_frames: usize,
     last_wet: Metrics,
+    /// v1.58.0: the bypass verdict that goes with `last_wet`, taken when it
+    /// was. The two are carried over a chain change together, because the
+    /// panel prints them side by side.
+    last_wet_bypassed: bool,
     emits_since_observation: usize,
     descriptors: Vec<Descriptor>,
     held: Option<Held>,
@@ -618,6 +622,7 @@ impl Analyzer {
             emit_len: (EMIT_S * rate).round().max(1.0) as usize,
             min_wet_frames: (MIN_WET_S / HOP_S).round().max(1.0) as usize,
             last_wet: Metrics::silent(),
+            last_wet_bypassed: false,
             emits_since_observation: 0,
             descriptors: Vec::with_capacity(super::super::MAX_DESCRIPTORS),
             held: None,
@@ -694,7 +699,7 @@ impl Analyzer {
 
     fn emit_speaking(&mut self, facts: InputFacts) -> VoiceReading {
         let dry = self.dry.metrics();
-        let wet = self.wet_metrics();
+        let (wet, wet_bypassed) = self.wet_metrics(facts.chain_bypassed);
         self.emits_since_observation += 1;
         if self.emits_since_observation >= STRIDE_EMITS {
             self.emits_since_observation = 0;
@@ -713,7 +718,7 @@ impl Analyzer {
             dry,
             wet,
             descriptors: self.descriptors.clone(),
-            wet_bypassed: facts.chain_bypassed,
+            wet_bypassed,
         });
         VoiceReading {
             state: ReadingState::Speaking,
@@ -723,7 +728,7 @@ impl Analyzer {
             calibrated: self.baseline.calibrated(),
             held: false,
             held_descriptors: Vec::new(),
-            wet_bypassed: facts.chain_bypassed,
+            wet_bypassed,
             wet_settled: self.wet_settled(),
         }
     }
@@ -753,12 +758,20 @@ impl Analyzer {
     }
 
     /// Wet metrics, or the previous ones while a freshly-changed chain fills
-    /// its window.
-    fn wet_metrics(&mut self) -> Metrics {
+    /// its window — each with the bypass verdict that describes it.
+    ///
+    /// `bypassed` covers only the blocks since the last emit, so it is about
+    /// the new chain. Beside the previous numbers it would be wrong: let go of
+    /// push-to-modulate at the end of a disguised phrase and the dry window
+    /// still reads Speaking through the tail grace, so for [`MIN_WET_S`] the
+    /// panel would print the phrase's after-effects numbers under "passing
+    /// the signal through", and a pause would then hold that pairing.
+    fn wet_metrics(&mut self, bypassed: bool) -> (Metrics, bool) {
         if self.wet.frames_since_reset >= self.min_wet_frames {
             self.last_wet = self.wet.metrics();
+            self.last_wet_bypassed = bypassed;
         }
-        self.last_wet
+        (self.last_wet, self.last_wet_bypassed)
     }
 
     fn wet_settled(&self) -> bool {
@@ -772,8 +785,8 @@ impl Analyzer {
     /// reading of neither. A +5 semitone preset then moves the wet pitch by
     /// +5 with no change whatsoever in the speaker, which is the entire point
     /// of the wet tap and is why the panel must label it as after-effects. The
-    /// new numbers appear within [`MIN_WET_S`]; `wet_settled` stays false
-    /// until a full window has passed.
+    /// new numbers appear within [`MIN_WET_S`], and the bypass verdict with
+    /// them; `wet_settled` stays false until a full window has passed.
     ///
     /// The dry tap and the baseline are untouched: the chain does not reach
     /// them.
@@ -803,6 +816,7 @@ impl Analyzer {
         self.descriptors.clear();
         self.held = None;
         self.last_wet = Metrics::silent();
+        self.last_wet_bypassed = false;
         self.emits_since_observation = 0;
     }
 

@@ -2028,7 +2028,12 @@ export function createAppState(): AppState {
   // press made while it is in flight lands after it and holds again. The CC
   // sides are kept, so a CC left up must come down and back up to hold.
   // Saved only from the answer: on failure the setting and the card stay.
-  const setPtmTo = async (want: PtmSetting): Promise<void> => {
+  // What is saved builds on the setting as it stands when the answer lands,
+  // not when the request went out: an off sent while a hold pick is still in
+  // flight was built from the old hold, and must keep the pick that landed
+  // before it. `picked` is the hold a hold pick asked for, so one made while
+  // off is still remembered.
+  const setPtmTo = async (want: PtmSetting, picked?: PtmHold): Promise<void> => {
     ptmPageHeld.key = false;
     ptmPageHeld.button = false;
     ptmMidiDown.clear();
@@ -2036,7 +2041,8 @@ export function createAppState(): AppState {
       const answer = readPtmState(await setPtmModeCmd(ptmModeOf(want)));
       if (answer === null) return;
       applyPtmState(answer);
-      const next = settingOf(answer.mode, want);
+      const now = ptmSetting();
+      const next = settingOf(answer.mode, picked === undefined ? now : { ...now, hold: picked });
       setPtmSettingRaw(next);
       saveJson(STORAGE_KEYS.ptm, next);
     } catch (e) {
@@ -2044,7 +2050,8 @@ export function createAppState(): AppState {
     }
   };
   const setPtmOn = (on: boolean): Promise<void> => setPtmTo({ ...ptmSetting(), on });
-  const setPtmHold = (hold: PtmHold): Promise<void> => setPtmTo({ ...ptmSetting(), hold });
+  const setPtmHold = (hold: PtmHold): Promise<void> =>
+    setPtmTo({ ...ptmSetting(), hold }, hold);
   // The boot restore. Sent here, at creation, beside the mute's read, so it
   // goes out before App's onMount enumerates devices. It restores the saved
   // mode and lets go of the page's holds (a new page holds nothing) but

@@ -462,11 +462,15 @@ function PushToModulateCard(): JSX.Element {
   const on = (): boolean => app.ptmSetting().on;
   // Something that still works while a call has the focus: a global key, or
   // a `ptm` MIDI mapping that has learned its pad or knob (one that hasn't
-  // can never fire). Without either, the line says the key works only in
-  // Divora's window and where to set one.
-  const inCallKey = (): boolean =>
-    app.hotkeyBindings.ptm !== "" ||
-    app.midiMappings().some((m) => m.action === "ptm" && m.trigger !== null);
+  // can never fire). With only the mapping, the key the card names still
+  // works only in Divora's window, so the line says so and names the MIDI
+  // control. Without either, it says where to set a key.
+  const inCall = (): "key" | "midi" | null =>
+    app.hotkeyBindings.ptm !== ""
+      ? "key"
+      : app.midiMappings().some((m) => m.action === "ptm" && m.trigger !== null)
+        ? "midi"
+        : null;
   const lineId = `ptm-line-${createUniqueId()}`;
 
   // Hold to switch holds the "button" source while it is down, by the
@@ -549,7 +553,7 @@ function PushToModulateCard(): JSX.Element {
           "margin-bottom": "var(--s3)",
         }}
       >
-        {ptmCardLine(app.ptmSetting(), ptmLabel(), inCallKey())}
+        {ptmCardLine(app.ptmSetting(), ptmLabel(), inCall())}
       </div>
       <Segmented<PtmHold>
         options={[
@@ -1302,8 +1306,9 @@ function VoiceReadingCard(): JSX.Element {
             </span>
           </div>
           <span style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
-            The chain's output — what the call hears. A preset change moves
-            these numbers on its own; the microphone half is unaffected.
+            What the call hears: your voice after your effects, or as it is
+            while Push to modulate has them off. A preset change moves these
+            numbers on its own; the microphone half is unaffected.
           </span>
           <Show
             when={view().hasNumbers && reading()}
@@ -1325,8 +1330,8 @@ function VoiceReadingCard(): JSX.Element {
                       color: "var(--text-mid)",
                     }}
                   >
-                    No measured difference from the microphone half — the chain
-                    is passing the signal through.
+                    No measured difference from the microphone half — your
+                    effects are off, or they are passing the signal through.
                   </div>
                 </Show>
                 <ReadoutGroup

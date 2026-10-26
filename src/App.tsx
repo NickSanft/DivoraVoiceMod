@@ -227,21 +227,32 @@ export function Shell(): JSX.Element {
   // holds its own source in the engine ("key"), so either path may fire
   // and neither releases the other's hold. A press needs the bound key's
   // modifiers exactly and ignores autorepeat; a release matches the
-  // trailing key alone, wherever focus ended up. Where no keyup or
+  // trailing key alone, or the physical key that made the press (its
+  // `code`), wherever focus ended up. The second is for a character that
+  // changes with Shift or AltGr: Shift+1 binds as "Shift+!", and letting go
+  // of Shift first makes the 1's keyup say "1". Where no keyup or
   // pointerup will come, the page lets go of the key and the Mixer's
   // button: the window losing the focus (`blur`, and Tauri's own focus
   // event below), or the page hidden (`visibilitychange`). Without that, a
   // key held across Alt-Tab stays held.
   onMount(() => {
     const key = (): string => app.ui.ptmKey || "Space";
+    // Set by every press before it holds, so while the page holds the key
+    // this is the key that held it. A stale one is harmless: `ptmUp` sends
+    // nothing unless the page holds the key.
+    let heldCode: string | null = null;
     const down = (e: KeyboardEvent) => {
       if (ptmKeyMatches(key(), e, "down") && e.target === document.body) {
         e.preventDefault();
-        if (!e.repeat) app.ptmDown("key");
+        if (!e.repeat) {
+          heldCode = e.code || null;
+          app.ptmDown("key");
+        }
       }
     };
     const up = (e: KeyboardEvent) => {
-      if (!ptmKeyMatches(key(), e, "up")) return;
+      if (!ptmKeyMatches(key(), e, "up") && (heldCode === null || e.code !== heldCode)) return;
+      heldCode = null;
       // Only swallow the key when nothing else wants it. Browsers activate a
       // focused button on Space *keyup*, so preventing it unconditionally
       // silently broke Space on every button and radio in the app. Releasing
@@ -249,9 +260,15 @@ export function Shell(): JSX.Element {
       if (e.target === document.body) e.preventDefault();
       app.ptmUp("key");
     };
-    const blur = (): void => letGoOfPagePtm(app);
+    const blur = (): void => {
+      heldCode = null;
+      letGoOfPagePtm(app);
+    };
     const visibility = (): void => {
-      if (document.visibilityState === "hidden") letGoOfPagePtm(app);
+      if (document.visibilityState === "hidden") {
+        heldCode = null;
+        letGoOfPagePtm(app);
+      }
     };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
