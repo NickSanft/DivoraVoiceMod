@@ -1274,7 +1274,7 @@ function VoiceReadingCard(): JSX.Element {
           </Show>
         </div>
 
-        {/* ---- After effects: the chain's output. ---- */}
+        {/* ---- After effects: what the call hears (v1.58.0: the dry voice while push-to-modulate has the effects off). ---- */}
         <div
           data-testid="reading-wet"
           style={{

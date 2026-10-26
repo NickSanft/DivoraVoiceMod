@@ -479,7 +479,7 @@ test.describe("voice reading", () => {
     ).toBe(true);
 
     // A speaking window arrives: both halves render, clearly separated, with
-    // the after-effects half labelled as the chain's output.
+    // the after-effects half labelled as what the call hears.
     await page.evaluate(() => {
       const m = {
         energyDbfs: -17.4,
@@ -511,7 +511,7 @@ test.describe("voice reading", () => {
     await expect(page.getByTestId("reading-dry")).toContainText("118 Hz");
     await expect(page.getByTestId("reading-wet")).toContainText("84 Hz");
     await expect(page.getByTestId("reading-wet")).toContainText(
-      /chain's output/i,
+      /What the call hears: your voice after your effects/,
     );
     await expect(page.getByTestId("reading-disclaimer")).toContainText(
       /not a reading of the person/i,
