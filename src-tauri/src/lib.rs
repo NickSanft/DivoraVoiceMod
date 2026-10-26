@@ -4916,7 +4916,8 @@ mod tests {
     /// v1.56.0: the shortcut commands need an `AppHandle`, so this reads the
     /// source: they take an action's key out only through `rebind` and
     /// `release` (since v1.58.0 by way of `take_binding` and `drop_binding`,
-    /// which also let go of a held push-to-modulate key), and nothing else
+    /// which also let go of a held push-to-modulate key), or every key at
+    /// once through `drain_bindings` (which lets go too), and nothing else
     /// takes one out of the map.
     #[test]
     fn the_shortcut_commands_let_keys_go_through_release() {

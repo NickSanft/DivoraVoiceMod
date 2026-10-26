@@ -160,11 +160,14 @@ describe("ptmModeOf and settingOf", () => {
 });
 
 describe("the words that follow the state (§7.5)", () => {
+  // The in-app key holds only while no control in the window has the
+  // keyboard, so the line says so.
   const IN_APP =
-    " in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
+    " in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.";
   // No global key, but a learned MIDI control: the key the card names still
   // works only in Divora's window; the control works in a call.
-  const OR_MIDI = " in Divora's window, or with your MIDI control.";
+  const OR_MIDI =
+    " in Divora's window, when no control in it has the keyboard, or with your MIDI control.";
 
   it.each([
     [{ on: false, hold: "apply" }, "key", "Off · your effects are always on."],

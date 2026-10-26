@@ -85,20 +85,25 @@ export function settingOf(mode: PtmMode, prev: PtmSetting): PtmSetting {
   return mode === "always" ? { on: false, hold: prev.hold } : { on: true, hold: mode };
 }
 
-/** Where the key works when nothing reaches it from outside Divora. */
+/** Where the key works when nothing reaches it from outside Divora. The
+ *  in-app key holds only while the page itself has the keyboard (`App.tsx`
+ *  matches it on `document.body`): after a mouse click on a slider, Space
+ *  goes to the slider. */
 const IN_APP_ONLY =
-  " in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
+  " in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.";
 
 /** Where the key works when only a MIDI control reaches outside Divora. */
-const IN_APP_OR_MIDI = " in Divora's window, or with your MIDI control.";
+const IN_APP_OR_MIDI =
+  " in Divora's window, when no control in it has the keyboard, or with your MIDI control.";
 
 /** The Mixer card's line under its switch. `key` is the in-app key as the
  *  card shows it, the global key when one is bound. `inCall`: what still
  *  works while a call has the focus. "key": a global push-to-modulate key is
  *  bound, so `key` works anywhere. "midi": no global key, but a learned
- *  `ptm` MIDI mapping, so `key` works only in Divora's window and the MIDI
- *  control works anywhere. null: neither, so the line says the key works
- *  only in Divora's window and where to set one. */
+ *  `ptm` MIDI mapping and a MIDI input picked in Settings, so `key` works
+ *  only in Divora's window and the MIDI control works anywhere. null:
+ *  neither, so the line says the key works only in Divora's window and
+ *  where to set one. */
 export function ptmCardLine(
   s: PtmSetting,
   key: string,
@@ -126,8 +131,9 @@ export function ptmButtonTitle(on: boolean): string {
 }
 
 /** Accelerator modifier names (as the global-hotkey parser takes them, any
- *  case) → the KeyboardEvent flag each one needs. On Windows "Command or
- *  Control" is Ctrl; "Super" is the Windows key (`metaKey`). */
+ *  case, plus Meta, Win and Windows, which the parser refuses and the store
+ *  saves as Super) → the KeyboardEvent flag each one needs. On Windows
+ *  "Command or Control" is Ctrl; "Super" is the Windows key (`metaKey`). */
 const MODIFIER_FLAGS: Readonly<Record<string, "ctrlKey" | "altKey" | "shiftKey" | "metaKey">> = {
   CTRL: "ctrlKey",
   CONTROL: "ctrlKey",
@@ -157,7 +163,8 @@ const FLAGS = ["ctrlKey", "altKey", "shiftKey", "metaKey"] as const;
  *  physical key that held (`App.tsx`). The trailing key matches as
  *  it always has: "Space" by `code`, one character by `key` in any case,
  *  anything else (F13, Enter…) by `key` exactly. A modifier name the parser
- *  doesn't know never matches a press. */
+ *  doesn't know never matches a press, except Meta, Win and Windows, which
+ *  match the Windows key as Super does (the store saves them as Super). */
 export function ptmKeyMatches(
   accelerator: string,
   e: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey">,

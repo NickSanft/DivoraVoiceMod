@@ -2981,7 +2981,8 @@ export function createAppState(): AppState {
     saveJson(STORAGE_KEYS.hotkeyBindings, { ...hotkeyBindings });
     // PTM also drives the in-app fallback listener via ui.ptmKey. v1.58.0:
     // the page lets go of the in-app key first, so a key held under the old
-    // binding can't stay held: its keyup would no longer match.
+    // binding can't outlive it. (Its keyup would let go too: the shell also
+    // matches the physical key that made the press.)
     if (action === "ptm") {
       ptmUp("key");
       setUi("ptmKey", accelerator || "Space");

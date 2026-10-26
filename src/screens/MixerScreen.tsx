@@ -462,13 +462,16 @@ function PushToModulateCard(): JSX.Element {
   const on = (): boolean => app.ptmSetting().on;
   // Something that still works while a call has the focus: a global key, or
   // a `ptm` MIDI mapping that has learned its pad or knob (one that hasn't
-  // can never fire). With only the mapping, the key the card names still
-  // works only in Divora's window, so the line says so and names the MIDI
-  // control. Without either, it says where to set a key.
+  // can never fire) while a MIDI input is picked (Settings' "None —
+  // disconnected" closes the port and keeps the mappings, so nothing can
+  // arrive). With only the mapping, the key the card names still works only
+  // in Divora's window, so the line says so and names the MIDI control.
+  // Without either, it says where to set a key.
   const inCall = (): "key" | "midi" | null =>
     app.hotkeyBindings.ptm !== ""
       ? "key"
-      : app.midiMappings().some((m) => m.action === "ptm" && m.trigger !== null)
+      : !!app.selectedMidiInput() &&
+          app.midiMappings().some((m) => m.action === "ptm" && m.trigger !== null)
         ? "midi"
         : null;
   const lineId = `ptm-line-${createUniqueId()}`;
@@ -1306,9 +1309,10 @@ function VoiceReadingCard(): JSX.Element {
             </span>
           </div>
           <span style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
-            What the call hears: your voice after your effects, or as it is
-            while Push to modulate has them off. A preset change moves these
-            numbers on its own; the microphone half is unaffected.
+            What the call hears: your voice after your effects, or without
+            them while Push to modulate has them off (Loudness, when it's on,
+            still applies). While your effects are on, a preset change moves
+            these numbers on its own; the microphone half is unaffected.
           </span>
           <Show
             when={view().hasNumbers && reading()}

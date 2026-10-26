@@ -33,10 +33,11 @@ export interface OverlaySyncDeps {
   payload: () => OverlayState;
   /** v1.56.0: while true nothing is sent; when it turns false, the current
    *  state goes once. App.tsx passes {@link overlayHeld}: it holds until the
-   *  store knows the mute and push-to-modulate (v1.58.0), each by its boot
-   *  call's answer or failure or 500 ms, so the hold always ends; after a
-   *  failure or the 500 ms, what goes may say not muted, or Modulated over a
-   *  clean voice. Absent = never held. */
+   *  store knows the mute (its boot read's answer or failure, a level tick or
+   *  a mute command's answer, or 500 ms) and push-to-modulate (v1.58.0: its
+   *  boot restore's answer or failure, or 500 ms; never a tick), so the hold
+   *  always ends; after a failure or the 500 ms, what goes may say not muted,
+   *  or Modulated over a clean voice. Absent = never held. */
   held?: () => boolean;
   emit: (event: string, payload: OverlayState) => Promise<void>;
   listen: (event: string, handler: () => void) => Promise<() => void>;

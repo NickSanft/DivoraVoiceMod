@@ -1485,7 +1485,7 @@ test.describe("push-to-modulate (v1.58)", () => {
   const HELD = (source: string, held: boolean) => ({ cmd: "set_ptm_held", args: { source, held } });
   const NONE = { hotkey: false, key: false, button: false, midi: false };
   const APPLY_LINE_IN_APP =
-    "Your effects are on only while you hold Space in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
+    "Your effects are on only while you hold Space in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.";
 
   /** The push-to-modulate commands this page has sent, in order, the boot's
    *  restore included. */
@@ -1568,7 +1568,7 @@ test.describe("push-to-modulate (v1.58)", () => {
     await expect(pill(page)).toHaveText("Modulated");
     expect(await stored(page)).toEqual({ on: true, hold: "bypass" });
     await expect(line).toHaveText(
-      "Your effects are off while you hold Space in Divora's window. To use it in a call, set a key in Settings → Hotkeys.",
+      "Your effects are off while you hold Space in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.",
     );
     expect(await focusIsOnThePage(page)).toBe(true);
 
@@ -1855,24 +1855,29 @@ test.describe("push-to-modulate (v1.58)", () => {
     page,
     consoleErrors,
   }) => {
-    await page.evaluate(() =>
+    await page.evaluate(() => {
       localStorage.setItem(
         "divora.midiMappings",
         JSON.stringify([
           { id: "pad", action: "ptm", trigger: { kind: "note", data1: 36, channel: 0 } },
           { id: "fader", action: "ptm", trigger: { kind: "cc", data1: 7, channel: 0 } },
         ]),
-      ),
-    );
+      );
+      // The input the pads come from: with none picked, nothing can arrive,
+      // and the line doesn't name the MIDI control.
+      localStorage.setItem("divora.midiInput", JSON.stringify("Pad"));
+    });
     await page.reload();
     await mixerReady(page);
     await expect.poll(async () => (await invokesOf(page, "list_midi_inputs")).length).toBeGreaterThan(0);
+    await expect.poll(async () => (await invokesOf(page, "open_midi_input")).length).toBeGreaterThan(0);
     await turnOn(page);
-    // A learned mapping works in a call, so the line doesn't send you to
-    // Settings; with no global key, Space still works only in Divora's
-    // window, so the line says so and names the MIDI control.
+    // A learned mapping on a picked input works in a call, so the line
+    // doesn't send you to Settings; with no global key, Space still works
+    // only in Divora's window, so the line says so and names the MIDI
+    // control.
     await expect(cardLine(page)).toHaveText(
-      "Your effects are on only while you hold Space in Divora's window, or with your MIDI control.",
+      "Your effects are on only while you hold Space in Divora's window, when no control in it has the keyboard, or with your MIDI control.",
     );
     await expect(pill(page)).toHaveText("Clean");
     const before = [RESTORE("always"), SET("apply")];

@@ -1998,8 +1998,10 @@ fn build_output_stream(
 
                 // Voice reading. The DRY half is your voice as the stage would
                 // send it with no effects — after the mute's feed, delayed by
-                // the chain's latency (v1.58.0) — so the two halves are the
-                // same moment of speech, and a bypassed voice reads as a
+                // the chain's reported latency (v1.58.0) — so the two halves
+                // are the same moment of speech wherever each effect's real
+                // delay is what it reports (ptm.rs's module doc has an
+                // example where it isn't), and a bypassed voice reads as a
                 // passthrough. The WET half is the chain's output after
                 // push-to-modulate, loudness and the mute, which is what the
                 // call hears from the mic (zeros while muted). DRY first, so
@@ -2315,7 +2317,7 @@ fn mix_voice_and_soundboard(
     modulator.apply(mono, chain, sample_rate);
     // v1.58.0: the delay this buffer's chain reports, with the params the
     // modulator just set; the dry is delayed by it, so the two carry the same
-    // moment of speech.
+    // moment of speech wherever each effect's real delay is what it reports.
     let latency = chain.latency_samples(sample_rate);
     ptm.capture(mono, latency);
     chain.process(mono, sample_rate);
@@ -2392,7 +2394,8 @@ impl ReadingFacts {
 pub trait ReadingAnalyzer: Send {
     /// Feed one aligned pair of blocks, `dry` before the chain and `wet`
     /// after it, both `sample_rate` Hz and the same length. Since v1.58.0
-    /// `dry` is delayed by the chain's latency, so the two are one moment.
+    /// `dry` is delayed by the chain's reported latency, so the two are one
+    /// moment wherever each effect's real delay is what it reports.
     fn push(&mut self, dry: &[f32], wet: &[f32], sample_rate: u32) -> Option<VoiceReading>;
 
     /// The effect chain changed, so anything measured from the wet tap
@@ -6195,8 +6198,9 @@ mod tests {
     ///    through" follows with the first fresh after-effects numbers, never
     ///    ahead of them: the first emit once 0.4 s of wet audio (plus a
     ///    frame) has refilled the window, so up to about 0.75 s after the
-    ///    release (measured 0.53-0.72 s). 1 s here from the drop; held again,
-    ///    the verdict goes back the same way, 1.5 s here from the press.
+    ///    release. 1 s here from the drop; held again, the verdict goes back
+    ///    the same way (measured 0.53-0.72 s, with instrumentation since
+    ///    removed), 1.5 s here from the press.
     /// 3. U6: a pause after a disguised phrase, then the effects off: the
     ///    held window keeps its own verdict.
     /// 4. "Always": holds change nothing, so they never reset the wet window.

@@ -3485,12 +3485,12 @@ effect, 43 ms for both, 18.4 ms more for a streaming Voice Convert voice and
 261.4 ms more for a non-streaming one. Delayed by the same amount, the two
 voices carry the same moment, and a switch neither skips nor repeats.
 `the_dry_lines_up_with_the_wet_at_every_latency` drives the real stage with a
-chain that is a pure delay of `n`, reported exactly, for `n` from 0 to what
-the ring holds (12,547 included), and requires every sample sent to be the
-input delayed by `n`, float `==`, through crossings completed and turned
-round, at buffers of 1 to 4,096 frames. Voice Convert's Mix already delays
-its dry the same way (Phase 12, "The hold"). The cost: with your effects off,
-your own voice keeps your preset's delay.
+chain that is a pure delay of `n`, reported exactly, for nine values of `n`
+from 0 to what the ring holds (12,547 among them), and requires every sample
+sent to be the input delayed by `n`, float `==`, through crossings completed
+and turned round, at six buffer sizes from 1 to 4,096 frames. Voice Convert's
+Mix already delays its dry the same way (Phase 12, "The hold"). The cost:
+with your effects off, your own voice keeps your preset's delay.
 
 **Where an effect's real delay differs from what it reports**, a switch skips
 or repeats the difference. Worked out from the code and the effects' tests,
@@ -3504,6 +3504,11 @@ not heard in the app:
   voice through undelayed but still report their delay (21 ms and 10 ms).
 - Warble reports 12 ms, and its delay wavers up to 8 ms either side of that;
   below mix 100, part of its output isn't delayed at all.
+- The harmonizer reports 0: its root passes undelayed, but its chord lags
+  one pitch window (1,024 samples, 21 ms). So a switch to the dry cuts off
+  the chord of the last 21 ms said with the effects on, and a switch back
+  plays the chord of the last 21 ms said with them off. Six bundled presets
+  carry it: Choir of Ash, Dirge, Seraph, The Possessed, The Swarm and Zombie.
 - Voice Convert reports its hold; the model adds about 5 ms past it (Phase
   12, "The hold").
 
@@ -3710,7 +3715,9 @@ that lands before its answer may carry the previous page's holds. The overlay
 waits for both `muteKnown` and `ptmKnown` (`overlayHeld`), so a reload with
 push-to-modulate on and the key up doesn't show the stream Modulated over a
 clean voice. The main pill doesn't wait: it can say Modulated until the first
-tick or the answer lands (about 11 ms in the real app: Modulated from 38 to 49 ms after a reload, sampled every 20 ms).
+tick or the answer lands (under 42 ms in the real app, after one reload: a
+sampler running every 20 ms saw no pill at 7 ms, Modulated at 38 ms and Clean
+at 49 ms).
 
 **The card.** An on/off switch (on sends the saved hold, off sends `always`),
 Hold to apply / Hold to bypass (disabled while off), a line under them, and
@@ -3908,7 +3915,7 @@ through".
   save toast with push-to-modulate on and held.
 - **Mutations:** every row of the design's mutation table was put back and
   seen failing its named test, then restored. A review of the whole change
-  confirmed six findings (five distinct), each fixed with a test that fails
+  confirmed six findings and refuted none, each fixed with a test that fails
   when the defect is put back.
 - **In the real app** (see "Push-to-modulate (v1.58.0)" in
   [`MANUAL_TESTS.md`](MANUAL_TESTS.md)): one debug build of
@@ -3920,7 +3927,7 @@ through".
   on a recording, takes, Replay, the alignment, where a switch lands, clicks —
   rests on the unit tests and the stage fingerprints above, not on the app.
   - The commands from the page: `set_ptm_mode {mode: "apply"}` twice answered `{apply, nothing held, effects off, seq 1}` both times (the second changed nothing, `seq` included); `set_ptm_held {source: "key", held: true}` twice answered `{held, effects on, seq 2}` both times; `{source: "hotkey"}` was refused before it reached the engine ("unknown variant `hotkey`") and changed nothing; `{mode: "apply", restore: true}` let go of the key (`seq` 3), and `{mode: "bypass"}` answered `seq` 4. The ticks agreed with every answer within 1 to 24 ms.
-  - A reload with push-to-modulate on: one `set_ptm_mode {mode: "apply", restore: true}`, sent 24 ms after the reload and answered at 27 ms, before `list_audio_input_devices` (sent at 29 ms) and nothing else of push-to-modulate's; it changed nothing (`seq` 6 before and after). The titlebar showed Modulated from 38 ms to 49 ms after the reload, then Clean from the first adoption on; the one `overlay:state` main sent (at 51 ms) and the one the overlay received (at 152 ms) both said clean.
+  - A reload with push-to-modulate on: one `set_ptm_mode {mode: "apply", restore: true}`, sent 24 ms after the reload and answered at 27 ms, before `list_audio_input_devices` (sent at 29 ms) and nothing else of push-to-modulate's; it changed nothing (`seq` 6 before and after). The titlebar, sampled every 20 ms, read no pill at 7 ms after the reload, Modulated at 38 ms and Clean from 49 ms on, 22 ms after the restore's answer arrived (the check asked for Clean from 40 ms after it); the one `overlay:state` main sent (at 51 ms) and the one the overlay received (at 152 ms) both said clean.
   - The window losing the focus with the in-app key held: [S2: P4 — the
     `set_ptm_held {key, false}` and the next tick; which of the DOM's `blur`
     and Tauri's focus event let go, since either does].
@@ -3929,10 +3936,14 @@ through".
     figures, `seq` +2 per hold].
   - The long-mute bench, which now runs the dry line in every buffer: passes on all 24 bundled presets: the last 10 s muted cost 0.70 to 1.00 × max(speech, pause) (the bar is 2 ×), for example Zombie 277.3 µs on the tone, 293.2 µs on the pause and 241.7 µs muted per 480-frame buffer, Clean 4.3, 12.1 and 11.9 µs (`cargo test --release`, this machine).
   - Not tried here: real speech; the far end of a call; a MIDI device; a
-    Stream Deck; another app's push-to-talk on the same key; the lock screen,
-    sleep and UAC; an elevated window in front; the headphone monitor's
-    output; a Voice Convert voice; rates other than 48 kHz; Windows 10.
-    Several of these are the owner's checks in `MANUAL_TESTS.md`.
+    Stream Deck; another app's push-to-talk on the same key; the global key
+    with Shift held; the lock screen, sleep and UAC; an elevated window in
+    front; the headphone monitor's output; a Voice Convert voice; Voice
+    reading; the card's line, Hold to switch and the in-app key's modifiers
+    (the card's switch and hold were clicked; the others have only e2e or
+    unit tests); a relaunch with the card on (only a page reload, above);
+    rates other than 48 kHz; Windows 10. Several of these are the owner's
+    checks in `MANUAL_TESTS.md`.
 
 ### Kill switches
 

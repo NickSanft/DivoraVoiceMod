@@ -50,7 +50,10 @@ import { MixerScreen } from "./MixerScreen";
 type Source = "hotkey" | "key" | "button" | "midi";
 type Word = { mode: PtmMode; held: Record<Source, boolean>; seq: number };
 
-const IN_APP = " in Divora's window. To use it in a call, set a key in Settings → Hotkeys.";
+const IN_APP =
+  " in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.";
+const OR_MIDI =
+  " in Divora's window, when no control in it has the keyboard, or with your MIDI control.";
 const ON_TITLE =
   "Switches your effects for the call, your headphones, recordings and Replay while held.";
 const OFF_TITLE = "Turn on Push to modulate to try it.";
@@ -73,6 +76,8 @@ interface Setup {
   engine?: Word;
   hotkeyBindings?: Record<string, string>;
   midiMappings?: unknown[];
+  /** `divora.midiInput`: the MIDI input picked in Settings (null = None). */
+  midiInput?: string | null;
   /** The whole app (App's key listener included) instead of the Mixer
    *  alone; it opens on the Mixer. */
   whole?: boolean;
@@ -88,6 +93,7 @@ function setup(opts: Setup = {}) {
     localStorage.setItem("divora.hotkeyBindings", JSON.stringify(opts.hotkeyBindings));
   }
   if (opts.midiMappings) localStorage.setItem("divora.midiMappings", JSON.stringify(opts.midiMappings));
+  if (opts.midiInput !== undefined) localStorage.setItem("divora.midiInput", JSON.stringify(opts.midiInput));
   let w: Word = structuredClone(opts.engine ?? wordOf());
   invokeMock.mockImplementation(
     async (
@@ -289,7 +295,7 @@ describe("Push to modulate card (v1.58.0)", () => {
     expect(app().ptmBypassed()).toBe(true);
   });
 
-  it("the line says the key works only in Divora's window unless a global key is bound, and names a learned MIDI control", async () => {
+  it("the line says the key works only in Divora's window unless a global key is bound, and names a learned MIDI control on a picked input", async () => {
     const note = { kind: "note", data1: 36, channel: 0 };
     const cases: Array<[Setup, string]> = [
       [{ setting: { on: true, hold: "apply" } }, `Your effects are on only while you hold Space${IN_APP}`],
@@ -303,35 +309,63 @@ describe("Push to modulate card (v1.58.0)", () => {
         { setting: { on: true, hold: "bypass" }, hotkeyBindings: { ptm: "Ctrl+Shift+M" } },
         "Your effects are off while you hold Ctrl+Shift+M.",
       ],
-      // A learned `ptm` pad works in a call; Space still works only in
-      // Divora's window, so the line says so and names the pad.
+      // A learned `ptm` pad on a picked input works in a call; Space still
+      // works only in Divora's window, so the line says so and names the pad.
       [
-        { setting: { on: true, hold: "apply" }, midiMappings: [{ id: "p", action: "ptm", trigger: note }] },
-        "Your effects are on only while you hold Space in Divora's window, or with your MIDI control.",
+        {
+          setting: { on: true, hold: "apply" },
+          midiInput: "Pad",
+          midiMappings: [{ id: "p", action: "ptm", trigger: note }],
+        },
+        `Your effects are on only while you hold Space${OR_MIDI}`,
       ],
       [
-        { setting: { on: true, hold: "bypass" }, midiMappings: [{ id: "p", action: "ptm", trigger: note }] },
-        "Your effects are off while you hold Space in Divora's window, or with your MIDI control.",
+        {
+          setting: { on: true, hold: "bypass" },
+          midiInput: "Pad",
+          midiMappings: [{ id: "p", action: "ptm", trigger: note }],
+        },
+        `Your effects are off while you hold Space${OR_MIDI}`,
       ],
       // A global key and a pad: the key works in a call.
       [
         {
           setting: { on: true, hold: "apply" },
           hotkeyBindings: { ptm: "F13" },
+          midiInput: "Pad",
           midiMappings: [{ id: "p", action: "ptm", trigger: note }],
         },
         "Your effects are on only while you hold F13.",
       ],
-      // One that hasn't learned its pad yet can't fire; a global key on
-      // another action doesn't count.
+      // A learned pad with no input picked (Settings' "None — disconnected"
+      // closes the port and keeps the mappings) can't fire; nor can one that
+      // hasn't learned its pad yet; a global key on another action doesn't
+      // count.
       [
-        { setting: { on: true, hold: "apply" }, midiMappings: [{ id: "p", action: "ptm", trigger: null }] },
+        {
+          setting: { on: true, hold: "apply" },
+          midiInput: null,
+          midiMappings: [{ id: "p", action: "ptm", trigger: note }],
+        },
+        `Your effects are on only while you hold Space${IN_APP}`,
+      ],
+      [
+        { setting: { on: true, hold: "apply" }, midiMappings: [{ id: "p", action: "ptm", trigger: note }] },
+        `Your effects are on only while you hold Space${IN_APP}`,
+      ],
+      [
+        {
+          setting: { on: true, hold: "apply" },
+          midiInput: "Pad",
+          midiMappings: [{ id: "p", action: "ptm", trigger: null }],
+        },
         `Your effects are on only while you hold Space${IN_APP}`,
       ],
       [
         {
           setting: { on: true, hold: "apply" },
           hotkeyBindings: { mute: "F20" },
+          midiInput: "Pad",
           midiMappings: [{ id: "m", action: "mute", trigger: note }],
         },
         `Your effects are on only while you hold Space${IN_APP}`,

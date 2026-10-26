@@ -10,10 +10,18 @@
 //! The switch is [`PtmStage`], inside the voice stage after the chain and
 //! before loudness. The chain always runs; the stage crossfades its output
 //! with the dry voice, delayed by the chain's reported latency so the two
-//! carry the same moment of speech ([`DryLine`]). [`PtmGate`] is the
-//! crossfade: an edge toward the effects starts at once, an edge away from
-//! them first waits out that latency, so the effects cover everything said
-//! while they were meant to be on.
+//! carry the same moment of speech ([`DryLine`]) wherever each effect's real
+//! delay is what it reports; where it isn't, a switch skips or repeats the
+//! difference (448 samples, 9.3 ms, for the noise remover at 512-frame
+//! buffers: `the_denoisers_real_delay_is_pinned` in engine.rs). [`PtmGate`]
+//! is the crossfade: an edge toward the effects starts at once, an edge away
+//! from them first waits out that latency, so the effects cover everything
+//! said while they were meant to be on, except just after an edge toward
+//! them when the chain reports less latency than the fade (`L`,
+//! [`ptm_fade_len`]): the first `L − 1 − latency` samples said after the
+//! edge go out partly dry while the effects fade in. That is 511 samples
+//! (10.6 ms at 48 kHz) from a chain that reports 0, as Dispatch's gate, EQ
+//! and distortion do.
 
 use serde::{Deserialize, Serialize};
 
@@ -248,9 +256,10 @@ impl PtmGate {
     /// The request is the same for the whole buffer, so step 1 runs once, on
     /// the first sample. While `pos` stays 0 (settled applied, or waiting)
     /// `wet` is not touched and `dry` is not read. `len` is a power of two,
-    /// so every gain is exact, and a `dry` equal to `wet` crosses with no
-    /// change at all. Returns whether `pos` moved in this buffer (the voice
-    /// crossed). An empty buffer moves nothing.
+    /// so every gain is exact, and a finite `dry` equal to `wet` crosses
+    /// unchanged, bit for bit, except a −0.0, which comes out +0.0 mid-fade.
+    /// Returns whether `pos` moved in this buffer (the voice crossed). An
+    /// empty buffer moves nothing.
     pub(crate) fn blend(
         &mut self,
         bypassed: bool,
@@ -353,8 +362,9 @@ enum Move {
 }
 
 /// The dry voice, delayed by the chain's reported latency so it carries the
-/// moment the chain's output does. Per session; it allocates in [`new`]
-/// (before the callback), never after.
+/// moment the chain's output does wherever each effect's real delay is what
+/// it reports (the module doc has an example where it isn't). Per session;
+/// it allocates in [`new`] (before the callback), never after.
 ///
 /// [`new`]: DryLine::new
 pub(crate) struct DryLine {
@@ -1123,7 +1133,9 @@ mod tests {
     }
 
     /// When the dry is the wet (a chain that is a pure delay, aligned), every
-    /// crossing changes nothing at all: `w + (d − w)·g` is `w` when `d == w`.
+    /// crossing leaves the samples as they were, bit for bit: `w + (d − w)·g`
+    /// is `w` when `d == w`, for any finite value but −0.0 (which comes out
+    /// +0.0 mid-fade; `unit` never draws it).
     #[test]
     fn a_pure_delay_crosses_with_no_change() {
         let mut rng = XorShift(0x853c_49e6_748f_ea9b);
