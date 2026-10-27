@@ -153,7 +153,7 @@ Run this checklist before tagging any release that touches audio capture, output
 - [ ] Click the Push-to-modulate field → "Press a key… (Esc to cancel)" hint shows.
 - [ ] Press a chord (e.g., Ctrl+Shift+P) → chip set updates to show `Ctrl` `Shift` `P` and the binding is registered with the backend.
 - [ ] Turn **Push to modulate** on in the Mixer (**Hold to apply**). Focus a different app (e.g., Notepad), hold the bound chord → DivoraVoice's Mixer status reads Modulated while held, and your effects are on.
-- [ ] Release the chord → the Mixer status returns to Clean within about 50 ms, occasionally about 100 ms (Divora checks every 50 ms whether a global key is still down), plus up to one level update (33 ms). *(P3 timed the level update that carries it, not the status: 12 to 76 ms after the key-up over 8 holds; see Push-to-modulate (v1.58.0).)*
+- [ ] Release the chord → the Mixer status returns to Clean within about 50 ms, often about 100 ms once the key has started repeating (Divora checks every 50 ms whether a global key is still down, and Windows counts each repeat as a fresh press), plus up to one level update (33 ms). *(P3 timed the level update that carries it, not the status: 12 to 76 ms after the key-up over 8 holds; see Push-to-modulate (v1.58.0).)*
 - [ ] Bind Panic to a key (e.g., F8). Trigger 4 soundboard clips. Focus another app. Press F8 → all clips stop immediately.
 - [ ] Bind Toggle monitor to a key (e.g., F9). Focus another app. Press F9 → engine monitor toggles in DivoraVoice; Settings reflects the new state on next focus.
 - [ ] Click Clear next to any binding → chip set clears, accelerator becomes empty, the OS hotkey stops firing.

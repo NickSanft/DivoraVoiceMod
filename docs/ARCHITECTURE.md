@@ -3636,7 +3636,7 @@ sits where you let go (from the code; not checked in a take).
 
 | Source | Holds | Lets go |
 |---|---|---|
-| **Global key** (`hotkey`) | a press, in Rust: `ptm_on_hotkey` in `global_shortcut_handler`, inside `WM_HOTKEY` on the main thread | its release, which global-hotkey's poller thread sees: it reads the key (`GetAsyncKeyState` of the trailing key) every 50 ms from the press until it reads it up, so 0 to 50 ms after the key-up, plus however late Windows wakes the thread. Also: `ptm` bound to another key, to one the parser refuses or to the same key when it isn't registered, cleared, or every key cleared (`ptm_key_unbound`, at the map update; see "Global hotkey architecture") |
+| **Global key** (`hotkey`) | a press, in Rust: `ptm_on_hotkey` in `global_shortcut_handler`, inside `WM_HOTKEY` on the main thread | its release, which global-hotkey's poller thread sees: it reads the key (`GetAsyncKeyState` of the trailing key) every 50 ms from the press until it reads exactly 0, so 0 to 50 ms after the key-up, or 50 to 100 ms when an autorepeat set the "pressed since the last read" bit after the previous read (likely once a held key repeats; from the code, not tried with a keyboard), plus however late Windows wakes the thread. Also: `ptm` bound to another key, to one the parser refuses or to the same key when it isn't registered, cleared, or every key cleared (`ptm_key_unbound`, at the map update; see "Global hotkey architecture") |
 | **In-app key** (`key`) | keydown with the page body as its target, not an autorepeat, with the accelerator's modifiers exactly (`ptmKeyMatches(…, "down")`): with the key set to Ctrl+Shift+M, a bare M doesn't count | keyup of the trailing key anywhere, whatever the modifiers, so letting go of a modifier first still lets go; or keyup of the physical key (`code`) that made the press, for a character that changes with Shift or AltGr (Shift+1 binds as "Shift+!", and with Shift let go first its keyup says "1"). Also: the window's `blur`, Tauri's `onFocusChanged(false)`, the page hidden (`visibilitychange`), and the PTM binding changing (the store lets go before `ui.ptmKey` changes) |
 | **Hold to switch** (`button`) | pointerdown; Enter or Space while it has the focus, not an autorepeat. Disabled while push-to-modulate is off | pointerup, pointerleave (no pointer capture, so leaving the button can't leave it held), pointercancel, keyup of Enter or Space, the button's own `blur`; the window's `blur`, Tauri focus loss or the page hidden; the card unmounting |
 | **MIDI** (`midi`) | a `ptm` mapping's note-on, or its CC rising to 64 or more | that mapping's note-off, or its CC falling to 59 or less (60 to 63 keep the side it was on: the mute's `muteCcStep`, unknown side included). The bit is held while any `ptm` mapping is down, so one pad's note-off can't let go of another. Also: picking a MIDI input or starting MIDI-learn on any mapping (every mapping: learn swallows every message, a note-off included), and changing or removing a mapping (that one). Focus doesn't matter: a pad keeps holding while Divora is behind |
@@ -3832,8 +3832,9 @@ through".
   L (10.7 ms at 48 kHz).
 - **Effects off:** the same, with `d` (your preset's delay) before L.
 - **Letting go of the global key:** the poller sees it 0 to 50 ms after the
-  key-up, plus however late Windows wakes the thread; then as above. In the
-  app, over 8 holds, the tick that showed it let go came 12 to 76 ms after
+  key-up (50 to 100 ms when an autorepeat landed after its previous read),
+  plus however late Windows wakes the thread; then as above. In the app, over
+  8 holds by `SendInput` (which doesn't repeat), the tick that showed it let go came 12 to 76 ms after
   the key-up, an upper bound on the poller plus the tick's wait.
 - **The in-app key, the button, MIDI:** an IPC round trip, plus any sync
   command ahead of it; then as above.
