@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.58.0] — 2026-10-27 — Push-to-modulate that modulates
+
 Push to modulate now switches your effects on and off for real: on the call, in your headphones, and in Divora's WAV recordings, screen recordings and Replay. It crosses over in about 11 ms instead of switching in one step. It's off until you turn it on in the Mixer's **Push to modulate** card, so your call sounds as it did until you do.
 
 ### Changed
