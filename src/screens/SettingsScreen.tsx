@@ -1168,13 +1168,14 @@ interface HotkeyRowDef {
 
 const HOTKEY_ROWS: HotkeyRowDef[] = [
   // v1.58.0: it really switches the effects now, and which way follows the
-  // Mixer card (off by default, when the key does nothing). The backend acts
+  // Mixer card (off by default, when the key switches nothing, though a bound
+  // key stays registered, so other apps still don't get it). The backend acts
   // on this key itself, press and release, so it works while Divora is
   // hidden.
   {
     action: "ptm",
     label: "Push-to-modulate",
-    desc: "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.",
+    desc: "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Switches nothing while that card is off, but other apps still don't get the key.",
     icon: "bolt",
   },
   {

@@ -1750,7 +1750,7 @@ test.describe("push-to-modulate (v1.58)", () => {
     const row = rows.filter({ has: page.getByText("Push-to-modulate", { exact: true }) });
     await expect(row).toHaveCount(1);
     await expect(row).toContainText(
-      "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.",
+      "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Switches nothing while that card is off, but other apps still don't get the key.",
     );
     await row.getByRole("button", { name: "Click to set" }).click();
     await page.keyboard.press("F8");

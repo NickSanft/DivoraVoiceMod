@@ -516,7 +516,7 @@ describe("SettingsScreen — push-to-modulate (v1.58.0)", () => {
   };
   const squash = (s: string | null | undefined): string => (s ?? "").replace(/\s+/g, " ").trim();
   const PTM_DESC =
-    "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Does nothing while that card is off.";
+    "Hold to switch your effects on or off, as the Mixer's Push to modulate card is set. Switches nothing while that card is off, but other apps still don't get the key.";
   const PTM_MIDI =
     "Hold push-to-modulate holds while a pad's note is down, or while a knob, fader or CC button is past halfway (it lets go at 59 or less); with two pads on it, it holds until both are up. It does nothing while the Mixer's Push to modulate card is off. Turning Push to modulate on or off on the Mixer, or picking its hold, lets go: a pad then holds again on its next press, and a control left past halfway once it comes back down and up again.";
 
