@@ -27,15 +27,19 @@ accidental break fails CI before it ships:
 - `ReplayStatus` / `ReplayArmed` / `ReplaySaved` / `ReplayMemory` / `ReplayLength` keys and the state and held-reason strings — `src-tauri/src/replay.rs` (`replay_wire_keys_are_frozen`; v1.54.0).
 - `OverlayStatus` keys, the mode strings and the `closed` / `painted` / `closing` phase strings (the phases in the fixture's three status samples; `starting` and `shown` aren't in it) — `src/overlay/wire.fixture.json`, read by `src-tauri/src/overlay_machine.rs` (`wire_fixture_matches_rust`) and `src/overlay/status.test.ts`; v1.55.0.
 - `ImportedAsset` keys — the same fixture, `src-tauri/src/overlay_assets.rs` (`imported_asset_wire_keys_are_frozen`; v1.55.0).
-- The `overlay:*` event names and the overlay page's three command names — the same fixture, read by `src/overlay/state.test.ts` and `status.test.ts`; `wire_fixture_matches_rust` checks the `overlay:status` name and parses the `mode` / `stage` strings (v1.55.0).
+- The `overlay:*` event names and the overlay page's three command names — the same fixture, read by `src/overlay/state.test.ts` and `status.test.ts`; `wire_fixture_matches_rust` checks the `overlay:status` name and parses the `mode` / `stage` strings (v1.55.0). Since v1.59.0 the overlay page also listens to `timer-state` and calls `timer_status`; those two names are pinned by `timer.fixture.json` (below).
 - The overlay window's label and title and the tray's Lock id — `src-tauri/src/overlay_machine.rs` (`title_and_label_are_the_obs_contract`); every tray menu id, label and their order — `src-tauri/src/lib.rs` (`tray_entries_for_each_combination`; v1.55.0).
-- `divora.overlayScene`'s read and write rules (unknown keys, types and `src` values kept; nothing truncated) — `src/overlay/scene.test.ts` (v1.55.0).
+- `divora.overlayScene`'s read and write rules (unknown keys, types and `src` values kept; nothing truncated) — `src/overlay/scene.test.ts` (v1.55.0); and, since v1.59.0, when a `timer` element is shown (`asTimer`), in the same file.
 - The `mute` hotkey id: a press flips the mute; its release, `Mute` and `mute:` ids don't — `src-tauri/src/lib.rs` (`hotkey_mute_request_table`; v1.56.0).
 - `PtmState` keys and the `PtmMode` values `"always"`, `"apply"`, `"bypass"` (nothing else parses) — `divora-core/src/audio/engine.rs` (`ptm_state_json_keys_are_frozen`, `ptm_mode_wire_values_are_frozen`; v1.58.0). `LevelUpdate`'s `ptm` — `src-tauri/src/lib.rs` (`level_update_json_keys_are_frozen`, and `the_level_tick_carries_ptm`, which builds the tick from a real engine; v1.58.0).
 - `set_ptm_held`'s sources: `"key"`, `"button"`, `"midi"` parse; `"hotkey"`, other spellings and `""` don't — `src-tauri/src/lib.rs` (`ptm_page_source_wire_values_are_frozen`; v1.58.0).
 - The `ptm` hotkey id: a press holds push-to-modulate and its release lets go; `PTM`, `ptm:toggle`, `mute` and `sb:ptm` do nothing to it — `src-tauri/src/lib.rs` (`hotkey_ptm_request_table`; v1.58.0).
 - `set_ptm_mode` and `set_ptm_held` stay sync commands — `src-tauri/src/lib.rs` (`ptm_commands_stay_sync`; v1.58.0).
-- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, and the push-to-modulate ones since v1.58.0).
+- `TimerSnapshot` / `TimerState` / `TimerRun` / `TimerDefWire` keys, the phase and kind strings, the timer id grammar, the `tm:` hotkey-id table, the timer limits, the run samples (what the page stores for a state, and what the backend seeds from it), and the `timer-state` event and `timer_status` command names — `src/overlay/timer.fixture.json`, read by `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`, `timer_id_table`, `hotkey_timer_request_table`, `seed_table`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/overlay/timerState.test.ts` / `src/data/timers.test.ts` (v1.59.0).
+- The `tm:` hotkey ids: a press of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id acts on that timer; a release, `tm:<id>:finish` and any other spelling don't — `src-tauri/src/timers.rs` (`hotkey_timer_request_table`), and `src-tauri/src/lib.rs` (`the_shortcut_handler_runs_the_timer_hotkey`; v1.59.0).
+- The eight Hourglass commands stay sync — `src-tauri/src/lib.rs` (`timer_commands_stay_sync`; v1.59.0).
+- `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, and the Hourglass ones since v1.59.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -262,6 +266,7 @@ explainer has been seen. The tray has no item that turns Replay on.
 | `replay:<action>` | Replay (prefix reserved) — v1.54.0. Defined: `replay:save` (save the replay), `replay:toggle` (turn Replay on / off; it works once Replay has been turned on from the Record screen card). Both unbound by default |
 | `overlay:<action>` | the stream overlay (prefix reserved) — v1.55.0. Defined: `overlay:arrange`, which switches the open overlay between Arrange and Locked. It is acted on by the backend when pressed; the frontend only shows a notice while the overlay is off or starting. Unbound by default. A different namespace from the `overlay:state` / `overlay:*` **event** names, despite the shared spelling |
 | `mute` | mute or unmute your voice (a toggle) — v1.56.0. Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. Unbound by default. The prefix `mute:` is reserved for later variants |
+| `tm:<timerId>:<verb>` | an Hourglass timer (prefix reserved) — v1.59.0. Defined: `toggle` (idle, done or ran out → start from the full length; running → pause; paused → resume) and `reset` (back to idle). Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. A press for a timer the backend doesn't run does nothing. Unbound by default; the keys are stored with each timer in `divora.timers`, not in `divora.hotkeyBindings`. `tm:<timerId>:finish` is reserved for v1.60.0 (it does nothing in v1.59.0); any other verb or spelling does nothing. A timer id is 1-32 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit, never a Windows device name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so never contains `:` |
 
 ### Stream overlay (v1.55.0)
 
@@ -312,8 +317,9 @@ over 20 MB, or an animated one over 2,097,152 px, is still added, with
 
 Capabilities don't restrict app commands (there is no app ACL manifest): the
 overlay window can call every command in this section, and every other one.
-It relies on `set_overlay_mode`, `overlay_handshake` and `overlay_alive`, and
-must be granted them if an app manifest is ever added. Its own capability,
+It relies on `set_overlay_mode`, `overlay_handshake`, `overlay_alive` and,
+since v1.59.0, `timer_status` (§1 "Hourglass"), and must be granted them if
+an app manifest is ever added. Its own capability,
 `src-tauri/capabilities/overlay.json`, grants only event listen / unlisten /
 emit / emit-to and dragging its window; `default.json` now covers `main`
 alone and no longer grants creating webview windows or setting a window's
@@ -324,6 +330,32 @@ position or size, which the backend does.
 | Command | Args | Returns |
 |---|---|---|
 | `open_external` | `target: string` — an `http(s)://` link, or the absolute path of a folder that exists | — / error ("Divora opens only web links and folders.", or, for a link, why the desktop couldn't open it: no desktop shell, Explorer not answering within 3 s, or Explorer's own open failing). Opens it from the desktop's Explorer, so a browser it starts isn't in Divora's process tree (which "Everything except Divora" leaves out). A folder the desktop can't open is opened by starting the file manager from Divora; for a link that fails, the page falls back to the shell plugin's `open` |
+
+### Hourglass (v1.59.0)
+
+Countdowns and count-ups the backend keeps. All eight commands are sync, on
+purpose: sync commands run one at a time on the main thread, in the order they
+were sent and in turn with the `tm:` hotkeys, so a quick Pause then Resume
+can't land reversed. Every one but `timers_dir` answers the whole
+`TimerSnapshot`; of two snapshots, the larger `seq` is newer, and the
+`timer-state` events (§2) carry the same shape. Each of those brings the
+timers up to date before it acts — a countdown already due finishes, a sleep since the
+last reading is handled — so a Pause sent just after a countdown's deadline
+answers it `done`. A labelled command that doesn't fit the timer's phase
+changes nothing and answers the timer as it is. `"no such timer"` is the
+answer for an `id` the backend doesn't run (never synced, deleted, or kept
+without being run).
+
+| Command | Args | Returns |
+|---|---|---|
+| `sync_timers` | `timers: TimerDefWire[]` — every stored timer, in list order | `TimerSnapshot`. The definitions become `timers`. Reads each entry on its own and never fails, apart from Tauri's own ``"invalid args `timers` for command `sync_timers`: {e}"`` when `timers` isn't a list: an entry that isn't an object, has no `id` passing the timer id grammar (§1 hotkey ids) or no string `kind`, repeats an earlier entry's id, or comes after the 64th is skipped; a `name` that isn't 1-40 characters after trimming runs as "Countdown" or "Count-up"; a `durationMs` that isn't a finite number is 300 000 (5:00), any other is rounded and held to 1 000..86 400 000; a `resume` that can't be read is ignored and the timer starts idle; unknown keys are ignored. The first 16 entries of kind `"countdown"` or `"countup"` run; any other kind, and a known kind past the 16th, is kept, not run, and its file stays. A timer already running keeps its run through a new name or length; a new kind makes it idle. `resume` seeds a timer only for an id the backend hasn't accepted since it started (`TimerRun` notes, §3); after that the backend's own state wins |
+| `arm_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Idle, done or ran out → running from the full length (a count-up from 0). Otherwise unchanged |
+| `pause_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Running → paused. Otherwise unchanged |
+| `resume_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Paused → running. Otherwise unchanged |
+| `reset_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Anything → idle |
+| `adjust_timer` | `id: string`, `deltaMs: number` | `TimerSnapshot` / `"no such timer"` / `"deltaMs must be a whole number of milliseconds, at most 24 hours either way"`. A running or paused countdown's time left moves by `deltaMs`, to at most 24 h, and, going down, to no less than 1 s (a time left already under 1 s stays as it is), so this never ends one; its `totalMs` moves by what the time left moved and can pass 24 h. A running or paused count-up's time counted moves by `deltaMs`, never below 0. Idle, done or ran out: unchanged. The app sends ±30 000 |
+| `timer_status` | — | `TimerSnapshot`, the set now. Main and the overlay page each call it once after they start listening to `timer-state`, since a paused or idle set sends no events |
+| `timers_dir` | — | `string`, the absolute path of the timers' folder (§6), created if missing / `"couldn't create the timers folder: {e}"` |
 
 ### MIDI control surfaces (v1.9.0)
 
@@ -345,7 +377,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `global-shortcut` | `GlobalShortcutEvent` | per press / release |
 | `midi-message` | `MidiMessage` | per MIDI note / CC, while a port is open (v1.9.0) |
 | `overlay:state` | `OverlayState` | main → overlay window, on state change, while the stream overlay is open (v1.16.0). v1.56.0: each emit waits for the one before it, and after the main window loads nothing goes until it knows the mute (its `input_mute` read settles or a state arrives; at most 500 ms). The payload is unchanged: while muted, `status` is `"muted"`. v1.58.0: and nothing goes until push-to-modulate's boot `set_ptm_mode` (with `restore`) settles, by its answer or a failure, or 500 ms pass; a level tick doesn't count for this one. `status` now follows push-to-modulate as the engine switches it: `"modulated"` while an effect other than the noise gate is on and push-to-modulate isn't switching them off, so with push-to-modulate off (the default) a preset with effects reads `"modulated"` where it used to read `"clean"`; a gate-only chain reads `"clean"`. The shape and the three values are unchanged |
-| `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3). v1.55.0: main also re-pushes the scene on it, with `ack` null, and the overlay listens for `overlay:scene` and `overlay:status` before sending it. The backend learns ready through `overlay_handshake`, not this event |
+| `overlay:ready` | — (no payload) | overlay window → main, once the overlay is listening for `overlay:state`; main answers with the current state (v1.51.3). v1.55.0: main also re-pushes the scene on it, with `ack` null, and the overlay listens for `overlay:scene` and `overlay:status` before sending it. The backend learns ready through `overlay_handshake`, not this event. v1.59.0: the overlay also listens for `timer-state` before sending it |
 | `overlay:status` | `OverlayStatus` | backend → all windows, on every change of any field — v1.55.0. The same shape is returned by every command in §1 "Stream overlay" except `overlay_alive` and the two asset commands |
 | `overlay:scene` | `ScenePush` | main → overlay window, while it is open: on every scene change, on each edit main acknowledges (changed or not), and on each `overlay:ready` — v1.55.0 |
 | `overlay:edit` | `SceneEdit` | overlay window → all (heard by main): on pointerup of a gesture that changed something; 300 ms after the last arrow nudge or keyboard resize (sooner when another editing key, a press, losing focus or Lock comes first); on Delete; on `[` `]` `{` `}` — v1.55.0 |
@@ -355,6 +387,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise — also while only Replay runs |
 | `replay-buffer` | `ReplayStatus` | on every change of Replay's state or `saving`, and about once a second while armed; a held ring only on change (v1.54.0) |
 | `replay-saved` | `ReplaySaved` | the outcome of every save attempt, refusals included — exactly one per attempt (v1.54.0) |
+| `timer-state` | `TimerSnapshot` | backend → all windows, on every change of a timer the backend runs: a command or `tm:` key that changed one, every `sync_timers`, a countdown finishing or running out, a sleep handled, an anchor moved after a wall-clock change, and each whole-second change of a running timer's `text`; nothing on a schedule beyond that, so a paused or idle set sends nothing — v1.59.0. Sent by the backend's timer thread alone, in `seq` order; a command's answer can arrive after the event that follows it, so readers keep the snapshot with the larger `seq` |
 
 **Why `voice-reading` is its own event and not a field on `LevelUpdate`.**
 Additive-only permits either, so this is a design choice, recorded here because
@@ -370,7 +403,9 @@ and `recording`: a state every window may need, cheap, and the only always-on
 channel that reaches a hidden page whoever changed it. v1.58.0 adds
 push-to-modulate (`ptm`, a `PtmState`) for the same reasons: the backend
 changes it with no page involved (the global key), and the page needs it to
-say Clean or Modulated.
+say Clean or Modulated. Hourglass (v1.59.0) has its own event, `timer-state`,
+for the reading's reasons: it changes about once a second, and only for
+people who use timers.
 
 ---
 
@@ -508,7 +543,9 @@ SceneEdit         { instance (OverlayStatus.instance), seq (this window's
                       edits numbered from 0, in the order sent),
                     op: SceneOp }                                    // v1.55.0
 SceneOp           { kind: "add", element (a "spellcircle" or "image"
-                      element, as in OverlayScene) }
+                      element, as in OverlayScene; v1.59.0: or a "timer"
+                      element, which main adds itself — it never comes from
+                      the overlay) }
                   | { kind: "remove", id }
                   | { kind: "place", id, rect: { x, y, w, h }, viewport: { w, h } }
                   | { kind: "order", id, to: "front" | "back" | "forward" | "backward" }
@@ -533,10 +570,11 @@ OverlayScene      { version, designSize: { w, h }, frame,
 // designSize: CSS px, each side finite and 1..16384, else { 480, 480 }
 // frame: "window" | "monitor"; missing or unknown reads as "window" and is kept until a reframe
 // elements: never truncated; not an array → the default elements (the circle, centred, at most 440 px)
-// SceneElement: { id, type, x, y, w, h, z }, plus { src, nw, nh, anim, bytes, name } for "image"
+// SceneElement: { id, type, x, y, w, h, z }, plus { src, nw, nh, anim, bytes, name } for "image", plus { timer } for "timer" (v1.59.0)
 // id: an entry that isn't an object, or has no non-empty string id, is dropped; a later duplicate is dropped; nothing else is
-// type: "spellcircle" (the first usable one is shown), "image", or anything else (kept verbatim, not shown)
-// shown: an id of 1..64 characters and usable x/y/w/h, and for "image" a valid src; everything else is kept, not shown
+// type: "spellcircle" (the first usable one is shown), "image", "timer" (shown since v1.59.0; kept, not shown, from v1.55.0 to v1.58.0), or anything else (kept verbatim, not shown)
+// shown: an id of 1..64 characters and usable x/y/w/h, and for "image" a valid src, for "timer" a `timer` passing the timer id grammar (§1 hotkey ids); everything else is kept, not shown
+// timer: a timer id, never a name; the element is shown whether or not that timer exists, and its face draws only while the backend's latest TimerSnapshot has that timer. Its aspect is its stored w·designSize.w / h·designSize.h (3:1 when added); it counts toward the 64 elements only, not the 16 pictures or the budget
 // x/y/w/h: fractions of designSize, never clamped on read; usable when all four are finite and w, h > 0
 // z: finite, else its array index (computed, not written)
 // src: an asset id matching ^[0-9a-f]{16}\.(png|jpg|gif|webp)$, never a path or URL; anything else keeps the image, unshown
@@ -544,7 +582,75 @@ OverlayScene      { version, designSize: { w, h }, frame,
 // anim: boolean (anything else → src ends in .gif); bytes: the file's size (missing or not positive → 0); both only for the scene budget
 // name: shown cut to 120 characters, "Picture" when missing or blank (computed, not written)
 // any other key, at any level: kept and written back unchanged
+TimerSnapshot     { seq, timers: TimerState[] }      // v1.59.0: seq rises with
+                                                     // every snapshot built,
+                                                     // answers and events alike;
+                                                     // of two, the larger is
+                                                     // newer. Only the timers the
+                                                     // backend runs, in sync order
+TimerState        { id, name,
+                    kind: "countdown" | "countup",
+                    phase: "idle" | "running" | "paused" | "done" | "expired",
+                    ms (a countdown's time left, rounded up to whole ms; a
+                      count-up's time counted, rounded down; idle: a
+                      countdown's length, a count-up's 0; done, expired: 0),
+                    totalMs (a countdown's length ± adjusts since it started,
+                      which can pass 24 h; 0 for a count-up),
+                    text ("MM:SS" under an hour, "H:MM:SS" from one: "05:00",
+                      "1:02:03", "100:00:00"; a countdown rounds up to whole
+                      seconds, a count-up down; always agrees with ms),
+                    anchorMs (nullable: while running, the Unix ms a
+                      countdown ends at, or a count-up effectively started
+                      at; set when the run is set or a held wall-clock
+                      change moves it, not per snapshot; null otherwise),
+                    fires (how often this timer has finished since its id
+                      was added; a deleted and re-added id starts at 0) }
+                                                     // v1.59.0
+TimerRun          { phase: "running" | "paused" | "done" | "expired",
+                    ms?, totalMs?, anchorMs? }       // v1.59.0: whole numbers
+                    // (ms, totalMs ≥ 0). Stored as divora.timers' `run`, sent
+                    // as `resume`. Running: anchorMs (required) and a
+                    // countdown's totalMs; paused: ms and a countdown's
+                    // totalMs; done or expired: totalMs. Idle has none
+TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun }
+                    // v1.59.0: an argument only (sync_timers). The page sends
+                    // validated fields only; later releases add fields, which
+                    // older builds ignore
 ```
+
+**`TimerState` notes (v1.59.0).**
+
+- `done`: a countdown reached zero while the PC was awake and Divora was
+  running, and finished — late, if Divora was held up. `expired`: it reached
+  zero while the PC slept or Divora was closed, and didn't finish. Both show
+  `00:00`. A count-up is only ever `idle`, `running` or `paused`.
+- A countdown never finishes early, and finishes at most once until it is
+  started again (`arm_timer`, or the hotkey's toggle from `done` or
+  `expired`); each finish adds 1 to `fires`.
+- The page reads a snapshot with every timer's keys checked: a timer entry it
+  can't read (a missing key, a phase or kind it doesn't know) is dropped and
+  the rest kept, keys a later version adds are ignored, and a snapshot without
+  a whole-number `seq` and a `timers` list is ignored whole.
+- `text` is the one string every surface shows — the overlay, the text file,
+  Settings — so its format is part of the contract: no sign, no overtime, and
+  paused shows the digits as they stopped.
+
+**`TimerRun` notes (v1.59.0): what a stored run seeds.** The backend seeds a
+timer from its `resume` only the first time it accepts that id after it
+starts; otherwise its own state wins. Time passes while Divora is closed:
+
+- running countdown: time left = `anchorMs` − now, at most `totalMs` and 24 h,
+  so a clock set back adds no time; 0 or less → `expired`;
+- running count-up: time counted = now − `anchorMs`, from 0 to 10 000 h;
+- paused countdown: paused at `ms` when it is 1..86 400 000, its total the
+  larger of `totalMs` and `ms`;
+- paused count-up: paused at `ms`, at most 10 000 h;
+- done or expired countdown: the same phase, its total `totalMs` or its
+  length;
+- anything else — a running or paused countdown without `totalMs` (or a
+  running one with 0), a count-up done or expired, a run that isn't one of
+  the shapes above — starts idle, and the timer is kept. `fires` is never
+  stored or seeded.
 
 **`StreamInfo` notes.**
 
@@ -694,7 +800,8 @@ to defaults (never throw).
 | `divora.tileColors` | per-tile color overrides |
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
-| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super". `ptm`'s key also sets the in-app push-to-modulate key (`Space` while unbound) |
+| `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super". `ptm`'s key also sets the in-app push-to-modulate key (`Space` while unbound). Hourglass's `tm:` keys (v1.59.0) aren't kept here: each timer's are in `divora.timers` |
+| `divora.timers` | `{version: 1, timers: [{id, name, kind, durationMs, hotkeys?: {toggle?, reset?, …}, run?: TimerRun}]}` — v1.59.0, Hourglass's timers in list order. Read field by field, each falling back alone: missing, unparseable or not an object → no timers; `version` an integer ≥ 1 (else 1), a larger one read with these rules and never lowered on write; an entry is dropped when it isn't an object, its `id` fails the timer id grammar (§1 hotkey ids) or repeats an earlier one, or its `kind` isn't a string; a `name` that isn't 1-40 characters after trimming gets a default ("Countdown", "Count-up", "Timer", numbered " 2", " 3"… to stay unique); a `"countdown"` or `"countup"` `durationMs` that isn't a finite number is 300 000, any other is rounded and held to 1 000..86 400 000 (another kind's finite value is kept as it is); `hotkeys` keeps every string value, read as `divora.hotkeyBindings`' are ("Win" → "Super"), and anything else is `{}`; a `run` that isn't a `TimerRun` (§3) is dropped and the timer is idle. Unknown keys, kinds and hotkey verbs are kept and written back. The page adds no timer once 16 are stored (a kind it doesn't know counted); the first 16 of kind `"countdown"` or `"countup"` among the first 64 entries run, and the rest are kept, shown with Delete only, and their keys never registered. v1.59.0 registers `toggle` and `reset` only; `finish` is v1.60.0's. `run` is the last running, paused, done or ran-out state the page saw, written only when a snapshot changes it (a start, a pause, a finish — never a running timer's text alone); every `sync_timers` sends it as `resume`, and the backend uses it only for an id it hasn't accepted since it started. Absent: boot sends no timer command. Once written it stays, `timers: []` after the last delete. **Never `fires`**, and never the backend's clock |
 | `divora.ptm` | `{ on: bool, hold: "apply" \| "bypass" }` — v1.58.0: whether push-to-modulate is on, and which way the Mixer card's hold goes (kept while it is off, so turning it back on restores it). Written only from the engine's answer to `set_ptm_mode`, from the mode that answer carries, so a refused call changes nothing. Absent or malformed (not an object, `on` not a boolean, `hold` neither value) reads as `{ on: false, hold: "apply" }`: off. Sent back to the engine as `set_ptm_mode {mode, restore: true}` each time the main window loads (`mode` is `hold` while on, `"always"` while off). **Never a hold**: what holds it lives in the engine |
 | `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
@@ -707,7 +814,7 @@ to defaults (never throw).
 | `divora.glyphBindings` | built-in glyph → `GlyphAction` map (any glyph → any action) — v1.15.0. The action's `kind` is one of `preset`, `tile`, `monitor`, `mute`, `panic` |
 | `divora.customGlyphs` | user-recorded custom glyphs (template + action) — v1.15.0. The action's `kind` as in `divora.glyphBindings` |
 | `divora.overlay` | stream-overlay background mode (`{ bg }`) — v1.16.0; plus the window's last place, all optional (`x`, `y`, `w`, `h` in physical pixels, `monitor` name, `scale` factor) — v1.51.3. A `{ bg }`-only blob still loads, and unknown keys are kept on save; plus `fit` and `hideFromRecordings` (booleans, off unless stored as `true`; `fit` counts only with the Transparent background, so a stored `fit` with Green or Magenta reads as off) — v1.55.0. While the window is fitted, the place keys keep its last unfitted place. `hideFromRecordings` is sent to the backend each time the main window loads; the backend doesn't save it |
-| `divora.overlayScene` | `{version, designSize, frame, elements[]}` — v1.55.0, the first versioned key. Each field falls back on its own (see `OverlayScene` in §3). Absent or unreadable, the scene is made from `divora.overlay`'s last window size (the circle centred, at most 440 CSS px) and first written when the overlay is next seen open (opened, or adopted after a main-window reload) or a charm is first added or removed, whichever comes first. Every stored element is kept and written back, including ones this version can't show (an unknown `type`, an unrecognised `src`, a second circle, unusable geometry); only an entry without an id and a later duplicate id are dropped. Caps apply when adding, never when reading: 64 elements, 16 shown pictures, one circle, and a budget over the distinct pictures of 200 MB of files, 16,777,216 animated px and 67,108,864 px in all. A picture file is kept while any string anywhere in the scene names it. `src` holds an asset id, never a path or URL; `version` is never lowered on write. **Never the mode**: the overlay opens Locked at every launch |
+| `divora.overlayScene` | `{version, designSize, frame, elements[]}` — v1.55.0, the first versioned key. Each field falls back on its own (see `OverlayScene` in §3). Absent or unreadable, the scene is made from `divora.overlay`'s last window size (the circle centred, at most 440 CSS px) and first written when the overlay is next seen open (opened, or adopted after a main-window reload) or a charm is first added or removed, whichever comes first. Every stored element is kept and written back, including ones this version can't show (an unknown `type`, an unrecognised `src`, a second circle, unusable geometry); only an entry without an id and a later duplicate id are dropped. v1.59.0: `type: "timer"` elements, kept and not shown since v1.55.0, are shown (an Hourglass timer's face; `OverlayScene` in §3); Settings adds one per timer and removes every element naming a timer when its Show on overlay goes off or the timer is deleted. Caps apply when adding, never when reading: 64 elements, 16 shown pictures, one circle, and a budget over the distinct pictures of 200 MB of files, 16,777,216 animated px and 67,108,864 px in all; a timer face counts toward the 64 only. A picture file is kept while any string anywhere in the scene names it. `src` holds an asset id, never a path or URL; `version` is never lowered on write. **Never the mode**: the overlay opens Locked at every launch |
 | `divora.ttsVoice` | selected "Speak" voice id (or null) — v1.17.0: a preset id, a cloned id (v1.20.0), or a Critter Chatter `babble:*` id (v1.50.0) |
 | `divora.ttsVolume` | "Speak" playback volume (linear 0..2) — v1.18.0 |
 | `divora.ttsPreviewOnly` | "Speak" preview-only (monitor-only) toggle — v1.18.0 |
@@ -731,6 +838,13 @@ mute CC was last on. Every launch starts unmuted; only the bindings above
 a `ptm` CC was last on. The page restores the setting at each load and lets go
 of every hold the page had; a global key still held across a reload stays
 held, because the backend tracks that one.
+
+**Hourglass's timers are stored by the page, in `divora.timers` (v1.59.0);
+the backend keeps no timer state on disk** (its text files, §6, are output
+only). Each timer's last run is kept with wall-clock anchors, so a restart
+picks a running timer up with the time that passed while Divora was closed. A
+page reload changes nothing in the backend, which keeps its own state and
+ignores the runs the reload sends.
 
 > **Ruling (v1.56.0): `{kind: "mute"}` keeps its name and now mutes.** Until
 > v1.56.0 the `mute` glyph action toggled a status label only. It was
@@ -799,6 +913,34 @@ overlay/.import-<pid>-<nanos>.part   temporary file written while a picture is
                          imported — v1.55.0; renamed into the pictures' folder when
                          complete and removed if the import fails. One left behind
                          by a crash is incomplete and safe to delete
+timers/<id>.txt          an Hourglass timer's text — v1.59.0: exactly what the timer
+                         shows ("05:00", "1:02:03"), UTF-8, no BOM, no newline, for an
+                         OBS text source's Read from file. Written by the backend for
+                         each timer it runs, from its first sync of each run on,
+                         whenever the text changes. Replaced by writing
+                         `.<id>.tmp` and renaming it over the file, never removed
+                         first, so the file is never missing, empty or
+                         part-written (an open that lands inside a rename can
+                         fail with a sharing violation; OBS's Text (GDI+) then
+                         shows nothing until the next change). Removed once
+                         nothing holds it when its timer
+                         leaves the sync (deleted); written again if it goes missing.
+                         Kept, with its last text, while Divora is closed. Named by
+                         the timer's id, which a rename never changes; a deleted
+                         timer's `timer-<n>` goes to the next timer added. A kept,
+                         not-run timer's file is left as it is until that timer is
+                         deleted
+timers/.<id>.tmp         a write in flight — v1.59.0. A `.timer-<n>.tmp` left by a
+                         crash is removed at the next run's first sync
+                         The sweep: once per run, at the backend's first sync, every
+                         `timer-<n>.txt` (n 1-99999, no leading zero) whose id isn't
+                         in that sync, and every `.timer-<n>.tmp`, is removed.
+                         Nothing else in the folder is ever touched, so a user's own
+                         files there stay. The folder is created at the first write,
+                         or by `timers_dir` (Settings' Open folder and Copy path),
+                         never at startup.
+                         `tauri dev` builds use `timers-dev/` (a `tauri build --debug`
+                         build uses `timers/`, as the installed app does)
 ```
 
 Installer-bundled, read-only, next to the executable's resource dir:

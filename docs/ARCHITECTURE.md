@@ -554,11 +554,12 @@ And rejects unrelated devices (`Blue Yeti X`, `HyperX Cloud II`, `Realtek HD Aud
 GlobalShortcutEvent { id, accelerator, state }  // state: "pressed" | "released"
 ```
 
-Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor` / `mute`, the reserved prefixes `sb:`, `rec:`, `replay:`, `overlay:`, `mute:` and `ptm:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. Three ids are acted on in Rust before they get there; `global_shortcut_handler` still emits their events afterwards. A press arrives inside `WM_HOTKEY`, on the main thread; a release arrives on global-hotkey's poller thread, which reads the key's state every 50 ms from the press until it reads the key up:
+Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor` / `mute`, the reserved prefixes `sb:`, `rec:`, `replay:`, `overlay:`, `mute:`, `ptm:` and `tm:`); the accelerator is whatever string the user picked (`Space`, `Ctrl+Shift+P`, etc.). The frontend subscribes once in `App.tsx` `onMount` and routes by id in `dispatchGlobalShortcut`, the one JavaScript path every id takes — also while the window is hidden to the tray. Four kinds of id are acted on in Rust before they get there; `global_shortcut_handler` still emits their events afterwards. A press arrives inside `WM_HOTKEY`, on the main thread; a release arrives on global-hotkey's poller thread, which reads the key's state every 50 ms from the press until it reads the key up:
 
 - **`overlay:arrange`** (v1.55.0): the handler hands every event to `overlay_windows::hotkey`, and a press switches the open overlay between Arrange and Locked (see "Stream overlay window"). Its JavaScript branch never calls `set_overlay_mode`, which would toggle the press twice.
 - **`mute`** (v1.56.0): the handler then hands every event to `mute_on_hotkey`, and a press — never a release (`hotkey_mute_request`) — calls `engine.toggle_input_muted()`, one atomic operation on the engine's mute (see "Mute (v1.56.0)"). The page plays no part, so it doesn't matter whether it is hidden, reloading or busy, and two quick presses are two flips. global-hotkey 0.8.0 registers every key with `MOD_NOREPEAT`, so a held key doesn't repeat. Its JavaScript branch does nothing: acting there would flip it twice. The page learns the new state from the next `audio-levels` tick.
 - **`ptm`** (v1.58.0): the handler then hands every event to `ptm_on_hotkey`, and a press holds push-to-modulate's global-key source and its release lets go (`engine.set_ptm_held(PtmSource::Hotkey, …)`, one atomic operation, safe on the poller thread; see "Push-to-modulate (v1.58.0)"). The page plays no part, for the mute's reasons. Its JavaScript branch does nothing: acting there would hold it twice. The page learns the new state from the next `audio-levels` tick.
+- **`tm:<id>:toggle` and `tm:<id>:reset`** (v1.59.0): the handler then hands every event to `timer_thread::timer_on_hotkey`, and a press — never a release (`hotkey_timer_request`) — toggles or resets that Hourglass timer under the timers' lock: start, pause or resume by its phase, or back to idle (see "Hourglass (v1.59.0)"). It never registers, unregisters, writes, logs or emits; the timer thread emits what changed as `timer-state`. Its JavaScript branch does nothing: acting there would do it twice. `tm:<id>:finish` is reserved for v1.60.0 and does nothing yet.
 
 The routes:
 
@@ -584,6 +585,10 @@ event.id         | event.state | action
 "mute"           | "pressed"   | nothing — the backend already flipped
                  |             | the mute (global_shortcut_handler →
                  |             | mute_on_hotkey)              (v1.56.0)
+"tm:<id>:<verb>" | either      | nothing — the backend already toggled
+                 |             | or reset the timer on the press
+                 |             | (global_shortcut_handler →
+                 |             | timer_on_hotkey)             (v1.59.0)
 "sb:<clipId>"    | "pressed"   | playTileById(clipId)
 ```
 
@@ -591,7 +596,7 @@ event.id         | event.state | action
 
 **Persistence (v1.51.4).**
 
-- **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), `overlay:arrange` (v1.55.0) and `mute` (v1.56.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`.
+- **What is saved:** every action in `HOTKEY_ACTIONS` (`src/data/hotkeys.ts`), in `divora.hotkeyBindings`: the `ptm` / `panic` / `monitor` bindings (v1.51.4), `rec:screen` and `rec:wav` (v1.52.0), `replay:save` and `replay:toggle` (v1.54.0), `overlay:arrange` (v1.55.0) and `mute` (v1.56.0). They are read back through `readHotkeyBindings`, which keeps only the known actions and only string values; an action missing from an older save reads as unbound. A bound PTM key also restores `ui.ptmKey` for the in-app listener. Before v1.51.4 the paragraph above was aspirational: these three bindings were held only in memory, so `syncHotkeyBindings()` had nothing to re-register after a restart. Per-tile `sb:` hotkeys were already persisted, in `divora.tileHotkeys`. Hourglass's timer keys (v1.59.0) are kept with each timer in `divora.timers`, by verb; `syncHotkeyBindings()` registers them after the actions and the tiles, only `toggle` and `reset`, and only for timers the backend runs.
 - **A refused key leaves the action unbound (v1.56.0).** `register_global_shortcut` takes the action's old shortcut out of the map, and unregisters it, before it parses the new accelerator (`rebind`, tested by `a_refused_key_never_leaves_the_old_one_bound`). Until v1.56.0 the parse came first, so an accelerator the parser refuses — Shift with a digit, captured as "!", the number pad's + ("Ctrl++") or *, a letter outside A to Z — returned early and left the old key live under a binding Settings no longer showed, until a restart or a Clear. The refusal itself is still only logged to the console. **A shared key stays registered (v1.56.0):** Windows keeps one registration per key, so two actions bound to one key share it; `release` returns a key to unregister only when no other action in the map still holds it (`a_shared_key_stays_registered_for_the_other_action`), where until v1.56.0 changing or clearing either action unregistered it and silenced the other. Which of the two a shared key runs is still the handler's first match in the map, which can differ from launch to launch.
 - **The same live key is kept (v1.58.0).** `register_global_shortcut` first parses the accelerator and compares it with what the map holds for that id (`same_binding`, so `shift+ctrl+m` matches `Ctrl+Shift+M`); if it is the same key and the plugin still has it registered (`is_registered`), it answers `Ok` and does nothing. Until v1.58.0 it unregistered and registered the key again, and `syncHotkeyBindings` does that for every binding each time the page mounts, so a key held across a reload lost its release in between. A key whose earlier register failed isn't registered, so it is tried again.
 - **The plugin is called with the map unlocked (v1.58.0).** The plugin runs our handler under its own lock, and the handler takes `AppState.shortcuts`; `register_global_shortcut` used to hold `AppState.shortcuts` while it called the plugin's `unregister`, which takes the plugin's lock. A key let go on the poller thread during a rebind or a reload's re-sync could therefore deadlock the main thread (found by reading the code; never seen). The three shortcut commands now update the map inside a lock block and call the plugin, `is_registered` included, only after it, which races nothing: commands run one at a time on the main thread. `the_shortcut_commands_unlock_before_the_plugin` reads the source to pin that shape. Push-to-modulate made key releases the most common hotkey event, which is why it was fixed now.
@@ -1274,7 +1279,8 @@ owns its mode. Main still decides where it goes and owns what it shows. The
 page is a second Vite entry (`overlay.html` → `src/overlay.tsx`,
 `rollupOptions.input` in `vite.config.ts`), loaded as
 `overlay.html?instance=<n>`. It draws the **scene** — the spell circle and the
-pictures and GIFs the user adds, together the **charms** — through `Stage`
+pictures and GIFs the user adds, together the **charms**, and since v1.59.0
+Hourglass timer faces (see "Hourglass (v1.59.0)") — through `Stage`
 (`src/overlay/Stage.tsx`). It has no store and no engine of its own. The plan,
 and what changed from it, are in
 [`research/stream-studio.md`](research/stream-studio.md) (v1.55.0, "As
@@ -1540,7 +1546,9 @@ is its own signal, after the show.
 
 **The overlay draws nothing until it has the state (for the circle) and a
 scene (for the pictures).** The window can be shown before they arrive, and a
-first frame of defaults would be captured by OBS.
+first frame of defaults would be captured by OBS. A timer face (v1.59.0)
+also waits for the backend's first timer snapshot, which the page hears on
+`timer-state` and reads once with `timer_status`, and for its font.
 
 The event names, the `OverlayStatus` and `ImportedAsset` keys, and sample
 statuses are held once in `src/overlay/wire.fixture.json`. Rust
@@ -1571,7 +1579,8 @@ it.
   changes nothing.
   A drag or a nudge keeps a shrunk element's designed size and takes only its
   new centre; a resize takes the new size.
-- **The shape is always kept:** `nw/nh` for a picture, square for the circle.
+- **The shape is always kept:** `nw/nh` for a picture, square for the circle,
+  and a timer face's stored shape (3:1 when it is added; v1.59.0).
 - **Frame.** `frame` says what `designSize` was measured against: the window,
   or the whole monitor (Fit to monitor). Changing Fit commits a `reframe` that
   keeps every element that lies wholly inside the new frame where it is on
@@ -1579,13 +1588,18 @@ it.
   sets `designSize` to the new frame's size, so turning Fit off shrinks it to
   the window's.
 - **Live and inert.** An element this version can show is live: the first
-  usable `spellcircle`, and each `image` with usable geometry and an asset-id
-  `src`. Anything else — an unknown type, a picture it can't recognise, a
-  second circle, unusable geometry — is inert: kept exactly as stored, written
-  back unchanged, neither drawn nor listed. Reading drops only entries that
-  aren't objects or have no non-empty string id, and later duplicate ids. The
-  caps (16 pictures, 64 stored elements, one live circle, and the budget
-  under Charm pictures) apply when adding, never when reading.
+  usable `spellcircle`, each `image` with usable geometry and an asset-id
+  `src`, and (v1.59.0) each `timer` with usable geometry and a `timer` that
+  passes the timer id grammar, whether or not that timer exists. Anything
+  else — an unknown type, a picture it can't recognise, a second circle,
+  unusable geometry — is inert: kept exactly as stored, written back
+  unchanged, neither drawn nor listed. From v1.55.0 to v1.58.0 a `timer`
+  element was inert like any unknown type, and the tests used it as theirs;
+  they use `"future"` now. Reading drops only entries that aren't objects or
+  have no non-empty string id, and later duplicate ids. The caps (16
+  pictures, 64 stored elements, one live circle, and the budget under Charm
+  pictures) apply when adding, never when reading; a timer face counts toward
+  the 64 only.
 - **Migration.** With no stored scene, `migrateScene` puts the circle where
   v1.51.3 drew it: at most 440 px, centred in the saved window (its size in
   `divora.overlay`, divided by its scale). That scene is saved the first time
@@ -1596,7 +1610,9 @@ it.
   is pure, rounds what it writes to 6 decimals, and returns the same object
   when nothing changes. Main and the overlay run the same function. The
   overlay may send only `remove`, `place` and `order` (`readOp`); main ignores
-  anything else with a `console.warn`, and still acks it.
+  anything else with a `console.warn`, and still acks it. Main adds a timer
+  face itself, from Settings' Show on overlay (v1.59.0); the overlay still
+  can't add one.
 - The circle can be removed like a picture. Settings' Charms list then offers
   **Add the spell circle**, which adds it at the back.
 
@@ -1652,7 +1668,9 @@ focused charm keeps focus. Rows stay in scene-array order and stack with
   the overlay", and "Recordings can see the overlay while you arrange." while
   a capture runs with Hide on and available (`capturing`, `hideWanted` and
   `hideAvailable`). A picture that won't load shows "Picture missing" while
-  arranging. Locked shows no frame, outline or handle.
+  arranging, and a timer face whose timer the backend's snapshot lacks shows
+  "Timer missing" (v1.59.0; only once a snapshot has arrived). Locked shows no
+  frame, outline or handle.
 
 ### Charm pictures
 
@@ -1910,10 +1928,13 @@ fit keeper read the overlay and listen to it through `core:default`.
 Capabilities don't restrict app commands. There is no app ACL manifest
 (`build.rs` is the plain `tauri_build::build()`), and tauri checks app commands
 only when one exists, so the overlay can invoke every `#[tauri::command]`. It
-relies on three: `set_overlay_mode` (Esc and Lock), `overlay_handshake` and
-`overlay_alive`. `overlay.json`'s description says they must be granted if an
-app manifest is ever added. The overlay logs failed calls with `console.warn`
-(a failing beat once per Arrange), so a refusal would show in its console.
+relies on four: `set_overlay_mode` (Esc and Lock), `overlay_handshake`,
+`overlay_alive` and, since v1.59.0, `timer_status` (a sync command, read once
+after the ready handshake). `overlay.json`'s description says they must be
+granted if an app manifest is ever added. The overlay logs failed calls with
+`console.warn` (a failing beat once per Arrange), so a refusal would show in
+its console; a failed `timer_status` is left silent, and the events update
+the face.
 
 ### Threads and locks
 
@@ -3975,3 +3996,894 @@ through".
 - Reporting effects' real delays, so the dry line matches them.
 - A warning when a global key is refused: it is still only logged, and a
   refused push-to-modulate key now changes what the call hears.
+
+## Hourglass (v1.59.0)
+
+Hourglass adds countdowns and count-ups, up to 16, in a **Settings →
+Hourglass** section. Each has Start / Pause, Reset, ±30 s and two global keys
+of its own, `tm:<id>:toggle` and `tm:<id>:reset`, for a Stream Deck
+**Hotkey** action to press (not tried with a Stream Deck here: owner check
+O4). The backend keeps the time: a pure core owns every deadline, and a
+thread, `divora-timers`, wakes at each running timer's next second boundary
+and emits `timer-state`. The main window can hide to the tray; its page's
+JavaScript timers play no part. Besides Settings, a timer shows in
+two places: a `timer` element on the stream overlay, and a text file,
+`timers/<id>.txt`, for an OBS **Text (GDI+)** source's **Read from file**. A
+second thread, `divora-timer-files`, writes the files, so no disk wait reaches
+the timer thread. At zero a countdown shows `00:00` and says Done, and nothing
+else happens: actions at zero are v1.60.0's. The plan, and what the build
+changed from it, are in [`research/stream-studio.md`](research/stream-studio.md)
+(v1.59.0).
+
+Where it lives:
+
+- `src-tauri/src/timers.rs` (pure): the constants, the wire types, how a sync
+  entry and a stored run are read, the timer id grammar, which `tm:` ids act,
+  the text a timer shows, and `TimerCore`.
+- `src-tauri/src/timer_thread.rs`: the clocks, the sleep check, `TimerShared`,
+  the `divora-timers` loop, the `tm:` step and the file writer.
+- `src-tauri/src/lib.rs`: `AppState.timers`, the folder and both threads in
+  `setup`, the eight commands, one line in the shortcut handler.
+- `divora-capture`: `pub use native::power::SleepWatch`, and a stub for other
+  platforms.
+- `src/overlay/timerState.ts`: the snapshot's types, `readTimerSnapshot`,
+  `adoptTimers`, `isTimerId` and `fitTimerFont`. It sits flat in
+  `src/overlay/` and imports nothing, so the overlay page can use it.
+- `src/overlay/timer.fixture.json`: the wire contract, read by the tests on
+  both sides (below).
+- `src/data/timers.ts`: the page's pure rules — reading `divora.timers`, what
+  a sync sends, roles, ids, runs, the Length field, the live region's words.
+- The store (`src/stores/app.tsx`), the overlay page (`src/overlay.tsx`,
+  `Stage.tsx`, `scene.ts`, `controller.ts`), `HourglassSection` in
+  `src/screens/SettingsScreen.tsx`, `HotkeyCapture`, and two new sigils,
+  `hourglass` and `pause`.
+
+`timers.rs` and `timer_thread.rs` are `pub` modules, so `lib.rs`'s tests and
+the thread's tests drive the real functions.
+
+### The core
+
+Nothing in `timers.rs` reads a clock, waits, touches a file, logs or calls
+Tauri. Every caller hands in its own clock reading, so every rule is tested on
+any machine.
+
+**Kinds and phases.** A timer is a `countdown` or a `countup`. A countdown is
+`idle`, `running`, `paused`, `done` or `expired`; a count-up is only ever idle,
+running or paused.
+
+- `done`: a countdown reached zero while the PC was awake and Divora running,
+  and finished — late, if Divora was held up.
+- `expired`: it reached zero while the PC slept or Divora was closed, and
+  didn't finish.
+
+Both show `00:00`. They differ on the wire so that v1.60.0, which runs
+actions at zero, can tell a finish from a timer that ran out unseen.
+
+**A running timer** holds `since` (the clock reading its run was last set at)
+and `base_ms` (a countdown's time left at `since`, rounded up to whole ms; a
+count-up's time counted, rounded down). A countdown's deadline is `since +
+base_ms`. So nothing is ever a negative `Duration`, and every step saturates:
+a panic aborts the app.
+
+**The ops** (`TimerOp`; "—" leaves the timer as it is, and the answer shows
+it):
+
+| phase \ op | Arm | Pause | Resume | Reset | Toggle (the key) | Adjust |
+|---|---|---|---|---|---|---|
+| idle | running from the full length (a count-up from 0) | — | — | — | = Arm | — |
+| running | — | paused at its value now | — | idle | = Pause | below |
+| paused | — | — | running from its value | idle | = Resume | below |
+| done, expired | running from the full length | — | — | idle | = Arm | — |
+
+Labelled ops do only what they name, so a stale Start can't restart a paused
+timer. Only Toggle decides from the phase, and only the `tm:` key sends it:
+there is no toggle command, so it always decides from the core's own state,
+never from a page's copy. Arm sets the total back to the length. An op that
+changes nothing marks nothing changed and sets no new anchor.
+
+**Adjust** (`adjust_timer`; ±30 s in Settings) moves a running or paused timer
+only. A countdown keeps at most 24 h left, and going down stops at 1 s, so
+−30 s never ends one (in v1.60.0 ending runs the actions at zero); a left
+already under 1 s stays as it is. Its total moves by what its left moved, so
+the total can pass 24 h. A count-up moves by the whole delta and stops at 0. A
+running timer runs on from the new value, with a new anchor.
+
+**Fires once, never early.** The only way into `done` is `Timer::fire`, which
+`tick`'s settle step calls for a running countdown whose deadline is at or
+before `now`. Every entry point runs `tick` first, so a due countdown fires
+before any op: Pause can't freeze a timer at 0, and a Toggle that finds its
+countdown due fires it, then arms it again (`fires` + 1, running). `fires`
+counts per definition: 0 when an id enters the set, so a deleted and re-added
+id starts again at 0. v1.60.0's Finish is to call the same `fire`.
+
+**The text** is formatted once, in Rust (`timer_text`), and shown the same on
+the overlay, in the file and in Settings. Under an hour it is `MM:SS`
+(`05:00`, `00:07`); from an hour `H:MM:SS` (`1:00:00`, `24:00:00`,
+`100:00:00`). A countdown rounds up to whole seconds and a count-up down: a
+5:00 countdown shows `05:00` for its first second and `00:01` for its last,
+and `00:00` only once it has fired. Its `ms` is rounded up to whole ms the
+same way, so 1 ns before its deadline it is 1 and the text `00:01`
+(`never_fires_early`). Paused shows the digits as they stopped; there is no
+minus sign and no overtime. The app's other clocks floor (the take timer, the
+screen recorder's), which would read `04:59` as a 5:00 countdown starts. Every
+transition recomputes its timer's text, and `tick` and `snapshot` recompute
+running ones, so a snapshot's `ms` and `text` always agree.
+
+**Transitions and notes.** What happens to a timer — `Fired {id, fires,
+late_ms}`, `Expired`, `SleepPaused`, `Seeded` — is pushed onto the core's
+list wherever it happens: in the thread's tick, in the tick a command or a
+`tm:` press runs on the main thread, in a sync's seed. The core's rarer
+decisions — a sleep handled, a wall-clock step followed, a duplicate id
+skipped — are pushed as `Note`s (at most 64 wait, `MAX_NOTES`; more are
+dropped). Only the timer thread drains both, under the lock it builds its
+snapshot under, and logs each one after letting go of the lock. So each is
+reported once, and no reader writes the log file under the lock (the app's
+log writer is a blocking file appender). A fire more than 1 s late
+(`LATE_LOG`) is logged at warn, with its lateness.
+
+### The clocks
+
+Every reader — the timer thread's pass, a command, a `tm:` press — takes the
+core's lock, reads two clocks once, asks the sleep check about that reading,
+runs `tick`, then acts (`TimerShared::with_core`):
+
+- **The clock** (`now`): a `Duration` since an `Instant` taken at startup
+  (`RealClock`). It doesn't jump when Windows' time is set or synced. Live
+  deadlines use only this.
+- **The wall** (`wall_ms`): Unix ms from `SystemTime`. It sets each running
+  timer's **anchor** — the wall ms a countdown ends at, or a count-up
+  effectively started at — which is what the page stores for a restart, and
+  it checks a sleep the clock may have missed (below).
+
+The anchor is set at the transitions that set a run — Arm, Resume, Adjust, a
+seed, a (b) correction — and cleared when the timer stops. It is never
+recomputed per snapshot, so the page writes storage only on transitions
+(`the_anchor_is_set_at_transitions` drives a wall that runs 1 ms a tick ahead
+of the clock and sees the anchor hold). With no sleep signal, `tick` compares
+the wall less the clock with what it was when the anchor was set: a step over
+1 s (`ANCHOR_SLACK_MS`) that still holds 10 s later (`ANCHOR_HOLD`) moves the
+anchor by the step, once, and the thread logs it; a step that comes back
+within 1 s is forgotten. So a restart doesn't move a timer by a clock change
+made while it ran (a resync after a resume, or the user setting the clock).
+The live time doesn't move: it runs on the clock
+(`a_wall_step_moves_the_anchor_after_10_s`). How far the two drift apart over
+an hour wasn't measured: `[S2: H1 drift over the run]`; owner check O5 runs
+an hour against a phone's stopwatch.
+
+### Sleep
+
+`divora-capture` now re-exports v1.54.0's `SleepWatch` (one `pub use`, no new
+`unsafe`), and the timers keep one of their own beside the core, under the
+same lock. `jumped(now)` answers `Some(before)` once per sleep, to whichever
+reader comes first, `before` being the last reading anyone took awake (the
+`LoopSleep` rule; see Replay's "Sleep"). It is an atomic load and two clock
+reads, so it is safe inside `WM_HOTKEY`. Windows' resume count is
+process-wide, so this watcher and the capture pipeline's coexist. Other
+platforms get a stub whose `jumped` never reports a sleep; no CI job compiles
+it, since every job runs on Windows.
+
+With `Some(before)`, `tick` takes one of two cases:
+
+- **(a) The clock counted the sleep:** `now − before` is over 500 ms
+  (`Discontinuities::THRESHOLD`). This is the case to expect on Windows:
+  `divora-capture`'s `sleep.rs` records that `Instant` keeps counting while
+  the PC sleeps (measured for v1.54.0), though Rust doesn't promise it. A
+  running countdown whose deadline fell in the sleep is `expired`,
+  unfired (a check at `before` would already have fired one due by then). One
+  still ahead keeps running, the sleep counted. A count-up pauses at `before`,
+  where the PC went to sleep, as the stream did.
+- **(b) A signal with no jump:** Windows' notification arriving after the jump
+  was handled, or a clock that didn't count the sleep. Each running timer is
+  checked against its anchor. A countdown with more than 2 s (`CLOCK_SLACK`)
+  more left on the clock than the wall says missed the sleep: `expired` if the
+  wall says it has ended, else it runs on with the wall's time left. A
+  count-up the wall says has counted more than 2 s beyond the clock pauses at
+  `before`. When the two agree nothing changes.
+
+**The 60 s rule.** Within 60 s (`RECENT_SLEEP`) of a handled (a), (b) is
+skipped: that sleep was counted, and a clock resync after the resume isn't
+another one. Since step R, within that minute a gap of 5 s
+(`Discontinuities::COALESCE`) or less is never an (a) either. Windows'
+notification can come more than 5 s after the jump, as a second signal; if
+the readers were held up past 500 ms just then (a PC busy after its resume),
+the gap is that hold, not a sleep, and taking it for one would expire
+countdowns and pause count-ups with the PC awake
+(`a_late_second_signal_after_a_stall_changes_nothing`). The trade-off: a real
+second sleep of 5 s or less inside that minute counts as awake time — its
+countdowns finish up to about 5 s late, and its count-ups count it. A longer
+second sleep is still an (a). With no timers, the core still notes an (a), so
+the rule covers timers added soon after
+(`a_sleep_seen_with_no_timers_still_counts`).
+
+**A stall isn't a sleep.** With no sleep signal, a countdown found past its
+deadline finishes, however late (a debugger, a starved CPU), and the thread
+logs by how much. Only a sleep or a closed Divora expires a countdown, so in
+v1.60.0 a break's unmute will run late rather than not at all.
+
+**A limit, on a clock that doesn't count sleep.** With no (a) in the last
+minute, a resume signal that arrives while the readers are held up past
+500 ms, the PC awake, still takes (a): a countdown due during that hold
+expires instead of finishing late, and the wall check is skipped. It needs a
+clock that misses sleep — this PC's counts it — and a stall at the moment of
+the signal. Stated, not fixed: telling the two apart would take other
+evidence that the clock counted a sleep. To check a PC, sleep it with a timer
+running and read the log after the resume: "the clock counted it" means the
+limit can't arise there.
+
+**Every reader checks under the lock**, so a command or a `tm:` press that is
+the first reader after a resume sees the sleep itself and applies it before
+its op (`a_command_after_a_resume_sees_the_sleep`), and an op's own reading
+can never fall after `before`
+(`an_op_just_before_a_sleep_pauses_the_countup_at_its_reading`).
+
+Each (a) and (b) with a timer running is logged by the thread, naming the
+clock that decided — "timers: the PC slept, and the clock counted it" or
+"timers: a sleep signal with no clock jump; checked against the wall clock" —
+with counts of the timers that ran out, were corrected and were paused.
+**None of this has been through a real sleep.** It rests on the core's tests
+and one thread test with a scripted sleep check
+(`the_thread_expires_across_a_simulated_sleep`). Owner check O3 sleeps the
+PC and reads from the log which case decided.
+
+### Seeds, and Rust wins
+
+The page stores each timer's last run in `divora.timers` and sends it as
+`resume` with every `sync_timers`. The core keeps the ids it has accepted in
+this process (`seen`) and seeds a timer from its `resume` only at the first
+acceptance of its id. After that `resume` is ignored: a page reload sends the
+runs again, and the backend, which kept running, keeps its own state. A
+restart starts the core empty, so the stored runs are all there is. Time
+keeps passing while Divora is closed (`seed`, one function, so v1.61.0 can
+reuse its arithmetic):
+
+| Stored run | Seeds |
+|---|---|
+| running countdown (`totalMs`; `anchorMs`, when it ends) | running, time left = anchor − now, at most its total and 24 h; 0 or less → `expired` |
+| running count-up (`anchorMs`, when it started) | running, time counted = now − anchor, 0 to 10 000 h |
+| paused countdown (`ms`, `totalMs`) | paused at `ms` if that is 1 ms to 24 h; its total the larger of `totalMs` and `ms` |
+| paused count-up (`ms`) | paused at `ms`, at most 10 000 h |
+| done or expired countdown | the same phase; its total `totalMs`, or its length |
+| anything else: a running or paused countdown with no `totalMs` (or a running one with 0), a count-up done or expired, a run that can't be read | idle; the definition is kept |
+
+A wall clock set back while Divora was closed can't add time to a countdown
+(it is held to its total); one set forward expires it. A count-up comes back
+with the time Divora was closed included, which is right after a crash
+mid-stream and wrong after a night closed: Reset fixes that. `fires` is never
+seeded. A seed is a `Seeded` transition. A known-kind timer past the 16th is
+kept without being accepted, so its stored run still seeds it if a delete
+brings it under the limit. A pause 0.3 ms before a deadline stores `ms: 1`
+(rounded up) and comes back paused at 1 ms (`seed_table`, which also seeds
+every run sample in the fixture at its wall time).
+
+### Reading a sync
+
+`sync_timers` takes `timers: Vec<serde_json::Value>`, so one bad field can't
+fail the call: serde would fail the whole list, and Tauri would then refuse
+the call. `TimerShared::sync` reads each entry on its own, before taking the
+lock, with `entry_from_wire`:
+
+- skipped, with a warning: an entry that isn't an object, has no string `id`
+  passing the id grammar, or has no string `kind`; every entry past the 64th
+  (`MAX_SYNC_ENTRIES`); an entry whose id an earlier one had (a
+  `DuplicateId` note);
+- kept, not run: a valid id of a kind this build doesn't know;
+- a `name` that isn't 1-40 characters after trimming runs as "Countdown" or
+  "Count-up";
+- a `durationMs` that isn't a finite number is 5:00; any other is rounded and
+  held to 1 s..24 h;
+- a `resume` that can't be read (`run_from_wire`) is none, and the timer
+  starts idle;
+- other keys are ignored, so later releases can add fields.
+
+Then the core replaces the set. The first 16 known-kind entries run, in list
+order; every other entry is kept, not run — the rule the page's `timerRoles`
+applies too. A timer the core already runs keeps its run through a rename or
+a new length: an idle countdown shows its new length, and one running, paused
+or ended keeps its run until it starts again. A kind change makes it idle. An
+id the core doesn't run starts idle with `fires` 0, or from its seed. A kept
+entry's id stays on the writer's keep list, so its file isn't swept. The call
+answers the whole set and never fails (`sync_skips_bad_entries_and_stops_at_64`
+drives the real `TimerShared::sync`).
+
+**The id grammar** (`is_timer_id`, and `isTimerId` in TypeScript, both
+checked against one table in the fixture): 1 to 32 of `a-z`, `0-9` and `-`,
+starting and ending with a letter or digit, and not a Windows device name
+(`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`). The id sits
+between two colons in `tm:<id>:<verb>` and names `timers/<id>.txt`, so it
+can hold no `:`, `.`, slash or upper case (NTFS ignores case). The page picks
+`timer-<n>`, the lowest free n, and never changes it: a rename changes only
+the name, so an OBS source keeps its file. A deleted timer's number goes to
+the next one added, so an OBS source left on the old file shows the new
+timer.
+
+### Two threads and the lock
+
+`TimerShared` (`AppState.timers`, an `Arc`) holds a `Mutex` around the core
+and its sleep check, the clocks, the timer thread's wake and the folder. The
+wake is a `sync_channel(1)` sent with `try_send`: one pending wake is enough,
+since the thread reads everything again when it wakes, and a full or closed
+channel never blocks the sender.
+
+**The lock is a leaf.** Nothing else is locked while it is held, and nothing
+slow happens under it: no file work, no emit, no log line, no plugin call.
+Locks use the tree's poison-tolerant `lock()`.
+`commands_never_wait_for_the_sink` blocks the thread's emit and its hand-off
+while commands and status reads return; `a_slow_log_write_never_holds_the_core`
+blocks the thread's log write while `apply` and `timer_on_hotkey` return.
+
+**`divora-timers`** (`run_timer_loop`), spawned in `setup`:
+
+```
+loop:
+  wait until wake_at, or a reader's wake
+  lock → now, wall → sleep.jumped(now) → tick
+       → a snapshot, if anything changed (seq + 1)
+       → the texts, if there is a snapshot and a sync has happened
+       → wake_at = now + next_wake(now, TICK)       from the same reading
+       → drain transitions and notes
+  unlock → log notes and transitions → emit timer-state
+         → put the texts in the writer's slot
+```
+
+`next_wake` is the soonest moment a running timer's text changes — a
+countdown's deadline being its last boundary — computed in ns from the pass's
+own reading and capped at 100 ms (`TICK`), so the sleep check keeps that
+cadence with nothing running. Since the wake comes from the tick's own
+reading, time spent emitting and handing off doesn't move it.
+`the_thread_waits_next_wake` checks every wait the loop asks for on a fake
+clock, and that each emitted text change is stamped on its boundary. The wait
+is a `Waiter` trait: `ChannelWaiter` in the app, a fake in the tests.
+
+**Ordering.** `seq` is taken under the lock every time a snapshot is built,
+by a command's answer on the main thread or by the thread, so all snapshots
+fall in one order. Only the thread emits, so events leave in `seq` order. A
+command builds its answer, leaves the core marked changed and wakes the
+thread, which emits a newer snapshot; transitions the op caused wait in the
+core until the thread drains them. The answer can land after that event, as
+the overlay's status answers can (see the stream overlay's "Lifecycle"), so
+the page and the overlay keep whichever snapshot has the larger `seq`
+(`adoptTimers`). A `timer_status` read wakes the thread only when its own
+tick changed something.
+
+**Emits** (`TimerEvents for AppHandle`): from a std thread, `emit` posts to
+the event loop and returns; only the first failure is logged, since the next
+change sends the whole set again. `timer-state` goes out on every change — an
+op, a sync, a fire, an expiry, a sleep pause, a (b) correction, a moved
+anchor, and each whole-second change of a running timer's text — and never
+on a schedule beyond that. A paused or idle set sends nothing, which is why a
+page that starts listening reads `timer_status` once (below). The plan asked
+for 4 Hz while anything runs; emitting at each boundary instead puts each
+second's change within a timer tick of it (from the code) and sends a quarter
+as many.
+
+**`divora-timer-files`** (`spawn_text_writer`) takes the latest texts from a
+`TextSlot`, a `Mutex<Option<TextUpdate>>` with a `Condvar`: a newer set
+replaces one not yet taken, and the lock is held only for the swap. So the
+hand-off never waits on the disk, and a slow disk, a scanner opening a new
+temp or a redirected AppData can't delay a deadline
+(`a_slow_writer_never_delays_a_countdown`: with the writer blocked 3 s, a
+1.5 s countdown still finishes once, and its last emits arrive within 1 s of
+their boundaries). The writer holds the slot weakly and ends when it is
+dropped; in the app the timer thread holds it for the life of the process.
+Divora has no exit hook, so neither thread is joined: a write cut short by
+Quit leaves only a temp, never a half-written file.
+
+### The files
+
+`TextFiles` does one pass at a time (`TextWriter::apply`, with `now` passed
+in so the tests drive time):
+
+- **A write** (`write_text`) creates `.<id>.tmp` (and the folder, if it went
+  missing, trying once more), writes and closes it, then renames it over
+  `<id>.txt`. The target is never removed first. What a file holds is
+  remembered only after the rename lands. A failed write or rename removes
+  its temp if it can. A temp can't be an id's file: ids never start with `.`.
+- **Why a rename, never a removal first.** Measured here while designing: a
+  rename onto a file held the way OBS reads it (`_wfopen "rb"`: sharing read
+  and write, not delete) fails with raw 5, `PermissionDenied` — not the
+  sharing violation, 32, which comes only when the temp itself is held — and
+  the same rename succeeds once the reader closes. An in-place write would let
+  a reader see an empty or part-written file; GDI+ blanks its source on an
+  empty read and reloads only when the mtime changes, so a lost write to a
+  stopped timer would stay blank. Removing the target first leaves the name
+  missing for a moment. In `a_reader_never_sees_a_partial_file` a reader
+  opens, reads and closes in a loop while 2,000 writes alternate `59:59` and
+  `1:00:00`: every read is one of the two, and every failed open is raw 32,
+  none NotFound. With the defect put back, an in-place write gave 39 empty
+  reads, and removing first gave 7,966 NotFound opens.
+- **Retries.** A write or removal that fails stays pending and is tried again
+  at every pass; while anything is pending the writer comes back after 10 ms
+  (`RETRY_WAIT`), a wait that on Windows ends at the next system timer tick
+  (about 16 ms by default; from the code). A newer text replaces a pending
+  one. After 1 s of failures (`BACKOFF_AFTER`) a file is tried once a second,
+  or when a new text for it arrives. `retryable` is `PermissionDenied` (raw 5)
+  or raw 32. A reader's hold is logged only once it has lasted 1 s, any other
+  error when it first happens; either way one warning per file and error, and
+  one info line when it lands again. Writes that waited for a reader are
+  counted and logged at most once a minute: "timer files: N writes waited for
+  a reader (longest M ms)".
+- **Removal.** A file whose timer left the sync, run or kept, is removed once
+  nothing holds it: removing a file held as OBS holds it fails with raw 32
+  (measured here) and is retried. An id that comes back first keeps its file.
+  The writer remembers the last keep list, so a deleted kept timer's file goes
+  too (step R).
+- **Repair.** Every 5 s (`REPAIR_EVERY`) the writer checks that each file it
+  wrote still exists, and writes again any that doesn't (deleted by hand, or
+  with its folder).
+- **The sweep**, once per run, at the writer's first set, which comes only
+  after the first `sync_timers`: every `timer-<n>.txt` (n from 1 to 99999, no
+  leading zero) whose id isn't in that set, and every `.timer-<n>.tmp`.
+  Nothing else in the folder is touched (`sweepable`), since the Settings
+  footer sends users into it: `brb.txt`, `notes.txt` and `Timer-3.txt` stay.
+  Before a sync the set of timers is unknown, so nothing is written or swept
+  (`nothing_is_swept_before_the_first_sync`).
+- **The folder** is `app_data_dir()/timers/`, with a `%TEMP%\DivoraVoice\timers`
+  fallback. `tauri dev` builds use `timers-dev/` (`timers_dir_name`), as they
+  keep their own storage and so their own timers; a `tauri build --debug`
+  build uses `timers/`. `setup` resolves the folder but doesn't create it:
+  the writer does at its first write, and `timers_dir` does for Open folder
+  and Copy path, so starting Divora creates no folder
+  (`a_writer_with_nothing_handed_over_waits`).
+
+**How OBS reads it** (from OBS's code; OBS isn't installed here). Text
+(GDI+) checks the file's mtime about once a second and loads it at the check
+after the one that saw it change; Text (FreeType 2) does the same on its own
+1 s timer. The mtime it reads is in whole seconds, and a rename keeps the
+temp's write time (measured here). So OBS's text is up to about 2 s behind
+the overlay after a quiet spell, and about 0 to 1 s behind while it changes
+every second: the plan's ±2 s. A GDI+ read that lands inside a rename fails
+to open and shows nothing until the next change, about 1 to 2 s of blank,
+rarely; FreeType 2 keeps its old text instead. Owner checks O1 (GDI+) and O2
+(FreeType 2) put OBS beside the overlay for 5 minutes.
+
+### The commands
+
+Eight, all sync (`timer_commands_stay_sync`): Tauri runs sync commands one at
+a time on the main thread, in the order they were sent and in turn with
+`WM_HOTKEY`, so a quick Pause then Resume can't land reversed, and a key press
+can't overtake a click. Each locks, reads the clocks, checks for a sleep,
+ticks, acts, builds its answer, unlocks and wakes the thread. The cost: a
+click waits behind any sync command already holding the main thread, such as
+the device enumeration that runs when Divora's window gains the focus (see
+"Long commands off the main thread").
+
+| Command | Does |
+|---|---|
+| `sync_timers {timers}` | the definitions become `timers` (above); never fails |
+| `arm_timer {id}`, `pause_timer {id}`, `resume_timer {id}`, `reset_timer {id}` | the op; "no such timer" for an id the core doesn't run |
+| `adjust_timer {id, deltaMs}` | `adjust_delta` refuses a delta that isn't a whole number of ms within ±24 h; then Adjust |
+| `timer_status` | ticks, then answers the set; wakes the thread only if that tick changed something |
+| `timers_dir` | creates the folder, then answers its absolute path: the only file work on the main thread |
+
+Every answer but `timers_dir`'s is the whole `TimerSnapshot`. A refused op
+still ran its tick, so it wakes the thread too. The overlay page calls
+`timer_status`; `overlay.json`'s description now names it among the commands
+the overlay would need granted if an app manifest is ever added.
+
+### The keys
+
+`global_shortcut_handler` calls `timer_thread::timer_on_hotkey(&state.timers,
+&id, pressed)` after `ptm_on_hotkey`. `hotkey_timer_request` acts on a press
+of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id; a release,
+`tm:<id>:finish` (reserved for v1.60.0) and any other spelling do nothing, and
+take no lock. A press arrives inside `WM_HOTKEY` on the main thread. The step
+locks the core, reads the clocks, checks for a sleep, applies Toggle or
+Reset, unlocks and wakes the thread, which emits. It never registers,
+unregisters, writes, logs or emits, so it works while the main page is
+hidden, reloading or busy, and decides from the core's state. The shortcut
+map's lock is released before the steps run, and the core's lock is a leaf
+held across no plugin call (see "Global hotkey architecture" for the
+deadlock v1.58.0 fixed there). The `global-shortcut` event still goes out,
+and the page's `tm:` branch does nothing with it.
+
+The keys live with each timer in `divora.timers` (`hotkeys`, accelerators by
+verb), not in `divora.hotkeyBindings`, whose action list is closed. v1.59.0
+registers `toggle` and `reset`; any other verb, such as v1.60.0's `finish`, is
+kept, written back unchanged and never registered. `syncHotkeyBindings`
+registers them after the fixed actions and the tiles, for timers the backend
+runs only, reading each key just before it goes out. A bind saves, then
+registers, and changes only its own verb; a clear saves, then unregisters. A
+bind for a timer that isn't stored, or isn't run, does nothing: a capture can
+outlive its card, and the next timer to take that id would otherwise answer
+to a key nothing shows. Every key is unbound until the user sets it.
+
+### The page's store
+
+- **Boot.** The store reads `divora.timers` when it is created. If the key
+  exists, it sends `sync_timers` with every stored timer and its run, right
+  after the mute's read and push-to-modulate's restore, so it goes out before
+  `App`'s `onMount` enumerates devices and registers hotkeys: the backend
+  knows every timer before any of their keys works. Then it awaits
+  `listen("timer-state")` and calls `timer_status` once, because an emit
+  reaches only a listener already registered (a seeded countdown running out
+  in between would reach nobody) and a paused or done timer sends nothing
+  more. Without the key, boot sends no timer command and doesn't listen. The
+  first Add starts the same subscription if boot didn't; there is one per
+  page, and a failed listen still reads `timer_status` once.
+- **The mirror.** Every answer and every event goes through
+  `adoptTimerSnapshot`, which keeps the snapshot with the larger `seq`. The
+  page never decides a timer's state.
+- **Runs.** When an adopted snapshot changes a stored timer's run (`runOf`,
+  compared by `sameRun`: phase, anchor, paused value, total), the key is
+  written once. A running timer's text changes every second while its anchor
+  holds still, so the text alone writes nothing. Only timers still stored are
+  written, so a late snapshot never brings back a deleted one. Events reach a
+  hidden page, so runs are saved with the window in the tray too.
+- **Add, rename, length.** Each saves, then sends `sync_timers` with every
+  stored timer. Add refuses at 16 stored timers, a newer build's kinds
+  counted, so each counted timer has a card with Delete. Rename and length act
+  only on timers the backend runs, and an unchanged commit sends nothing.
+- **Delete** saves first, so a capture still open can't bind the timer's keys
+  again. Then, in the same turn, it sends the two unregisters, takes the
+  timer's faces off the overlay and sends the sync without it; the backend
+  runs them in that order. Awaiting the unregisters before sending the sync
+  would free the id meanwhile: an Add in that gap would take it, its sync
+  would reach the backend first, and the new timer would inherit the deleted
+  one's run (step R). A delete can bring a timer that was over the limit under
+  it; that timer's stored keys are registered after the sync, in the same turn
+  (step R). Deleting the last timer leaves the key (`{version, timers: []}`),
+  so the next boot still syncs an empty list and listens.
+- **Buttons.** Start sends `arm_timer`, `pause_timer` or `resume_timer` by the
+  mirror's phase, the label it drew (`timerAction`); with no state yet there
+  is no button. Pause, Reset and ±30 s send their commands. Each adopts its
+  answer.
+
+### The overlay face
+
+- **The element:** `{id, type: "timer", x, y, w, h, z, timer}`, where `timer`
+  is a timer id. It is live with usable geometry and a `timer` that passes the
+  id grammar, whether or not that timer exists (`asTimer`); from v1.55.0 to
+  v1.58.0 `"timer"` was an unknown type, kept inert. Its shape is the stored
+  one, 3:1 when added, kept as a picture's is. Arrange moves, resizes,
+  restacks and deletes it like a picture. It counts toward the 64 stored
+  elements only, not the 16 pictures or the picture budget.
+- **Show on overlay** is the controller's `addOverlayTimer`: one face per
+  timer, unless the scene has a live one, at `defaultTimerRect` — its height
+  12 % of the window's short side (32 to 160 px), centred across, its top 8 %
+  down and 6 % lower for each of the next four faces, then round again.
+  Turning it off, or deleting the timer, removes every element with that
+  `timer` (`removeOverlayTimer`), inert ones included. The scene is the
+  toggle's only record, so an Arrange Delete turns it off; `overlayHasTimer`
+  hears a change of the set, not every drag. Main adds the face itself; the
+  overlay still can't send an add (`readOp` is unchanged).
+- **The data.** The overlay page listens to `timer-state` itself, after
+  `overlay:status` and before it emits `overlay:ready`, never through main,
+  and calls `timer_status` once after its ready handshake. It keeps the
+  snapshot with the larger `seq`. It reads both through `timerState.ts`,
+  since it can't import `src/audio/api.ts`.
+- **The face:** white Space Mono Bold (already bundled with the overlay, so no
+  network), outlined by a `text-shadow` and centred, its size set in
+  JavaScript to fit the box: `min(0.78·h, w / (0.62·chars + 0.4))`
+  (`fitTimerFont`). So `59:59` turning into `1:00:00` shrinks the text instead
+  of reflowing a locked box. White with an outline reads over a game and
+  isn't keyed out by the green or magenta backgrounds. The text node is
+  written only when the text changes, and nothing about the face is a CSS
+  animation or transition, so Functional motion can't freeze it.
+- **What it waits for.** No face draws before the backend's first snapshot: a
+  frame of defaults would reach OBS. The faces also wait for
+  `document.fonts.load('700 1em "Space Mono"')`, at most 1 s
+  (`FONT_WAIT_MS`), so a first frame doesn't swap fonts on stream unless the
+  font takes longer than that; where `document.fonts` is missing, or the load
+  fails, they don't wait. Once a snapshot has arrived, a face whose timer the
+  snapshot lacks draws nothing while Locked, and in Arrange shows "Timer
+  missing" with the hourglass sigil, as "Picture missing" does. Before any
+  snapshot there is no badge, since Arrange is visible to recordings.
+- **Labels:** "Timer: {name}" on the overlay, from the snapshot ("Timer:
+  Timer" while the snapshot lacks it); "Timer · {name}" with the hourglass
+  sigil in Settings' Charms list, from the stored name.
+- **Hide from recordings** hides the face with the rest of the overlay while
+  Divora records or Replay is on. The timer's text file reaches OBS either
+  way, and the Show on overlay help says so while both are on.
+
+### Settings → Hourglass
+
+A section after Stream overlay and before About. Its cards are the stored
+timers in list order, keyed by id, so a storage write — a run saved at a
+transition, a rename — never rebuilds a card mid-edit; each is joined by id
+with the mirror.
+
+- **A timer the backend runs, once it has state:** its name; its kind line
+  ("Countdown · 5:00", "Count-up"); the live text; the status word (Ready,
+  Running, Paused, Done, Ran out while away); Start / Pause / Resume / Start
+  again; Reset; −30 s and +30 s, disabled unless it is running or paused;
+  Length, for a countdown; two hotkey rows; Show on overlay; the file line
+  with Copy path; Rename and Delete. A timer that ran out adds "It reached
+  00:00 while your PC was asleep or Divora was closed, so it didn't finish."
+- **With no state yet** (before the backend's first answer, or after a failed
+  sync): the name, the kind line, "Starting…", Rename and Delete.
+- **A timer this build doesn't run:** a read-only row with Delete only, "Made
+  by a newer Divora" or "Over the 16-timer limit".
+- **Length and Name** apply on Enter or on leaving the field, never per
+  keystroke, which would put every prefix of `1:30:00` on stream and in
+  storage. Esc puts the stored value back. A Length that can't be read
+  (`parseLength`: minutes, `m:ss` or `h:mm:ss`, from 1 s to 24 h) stays in the
+  field, marked with `aria-invalid` and its reason, and nothing is sent; after
+  a commit the field shows the length in its usual form (`lengthText`). A
+  name that trims to nothing puts the old one back.
+- **Delete asks twice:** the first click turns it into "Confirm?" for 3 s, as
+  deleting a preset does, since a delete stops a timer that may be on stream
+  and blanks its OBS source.
+- **A key set twice.** A hotkey row says "Also set for {other}." when another
+  stored binding — an action, a tile ("a soundboard tile" when the tile isn't
+  in the folder scanned now), another timer's row — has the same key
+  (`sameKey`: the same modifiers in any order or spelling, and the same main
+  key). A key Divora has registered never reaches the capture, so a shared key
+  comes from storage or from one that didn't register, and the line promises
+  nothing about which binding runs.
+- **The hotkey note** under the cards states the limits of a global key by
+  their cause, each with an example: a key set here is taken from every app
+  while Divora runs; it works only with exactly its modifiers; a key already
+  set in Divora can't be picked here; and some keys can't be set, without
+  Divora saying so — with the check for that: press it with Divora in the
+  tray, then look at the timer.
+- **The live region.** The time is never in a live region: it changes every
+  second. One polite region, present from the first render, speaks edges only
+  (`timerAnnouncement`): "{name} is done." when a timer's `fires` rises — so a
+  Toggle that fires and re-arms in one press, which no snapshot shows as
+  `done`, is still heard — and "{name} ran out while away." when it turns
+  `expired`. Nothing for the first snapshot after the section mounts, or for
+  an id seen for the first time. A snapshot with no edge leaves the region
+  alone: another timer's second, or the thread's emit right after a command's
+  answer, often lands within milliseconds, and words set and cleared inside
+  one frame never reach a screen reader. Since step R, an edge empties the
+  region and puts its words up on the next animation frame, as the toast does,
+  so the same words twice are spoken twice; edges before that frame are joined,
+  the same words once; and the words are emptied 2 s (`HOURGLASS_SAID_MS`)
+  after they go up. Frames don't run in a window that isn't being drawn, so
+  words from an edge while the window was hidden are spoken when it is drawn
+  again, by which time they can be out of date (from the code; not tried with
+  a screen reader).
+- **Focus.** A pointer click on Start / Pause / Resume, Reset, ±30 s, Add
+  countdown, Add count-up, Show on overlay, Copy path, Open folder or Delete
+  hands the focus back to the page (`blurOnPointer`), because a focused button
+  takes Space, push-to-modulate's in-app key: after Add, each Space would add
+  a timer. From the keyboard they keep it.
+- **`HotkeyCapture`**, shared with Settings → Hotkeys, now holds its `keydown`
+  listener in the component and removes it however the capture ends: a key,
+  Esc, a second click on the field, the focus leaving it (step R: a click
+  elsewhere, a Tab into a text field, another capture armed), or the field
+  going away while armed. Until v1.59.0 the cleanup sat inside the click
+  handler, where Solid has no owner and drops it, so a field removed while
+  armed, or clicked again to cancel, left its listener behind and the next key
+  went to it. A capture armed by a pointer gives the focus back when it ends.
+  An optional `ariaLabel` names each timer's capture ("BRB start or pause
+  hotkey: Ctrl Alt F13", "… not set", "… press a key, Esc to cancel"); without
+  it the name is still its content, "Click to set".
+- **The folder footer** names Text (GDI+) and Read from file, and says OBS's
+  text can run up to 2 s behind the overlay. Open folder (named "Open the
+  timer files folder", apart from Recordings' Open folder on the same page) and
+  Copy path ask for `timers_dir` when clicked, never on mount, so opening
+  Settings creates no folder.
+
+Every control names its timer ("Pause BRB", "Add 30 seconds to BRB", "Copy the
+path of BRB's file").
+
+### Threads and latency
+
+| Work | Thread | Holds | Never |
+|---|---|---|---|
+| a timer command | main (sync IPC) | the core lock: clocks, sleep check, tick, op, answer | file work (but `timers_dir`), emit, drain; `sync_timers` logs the entries it skipped and the ids that left, outside the lock |
+| a `tm:` press | main, inside `WM_HOTKEY` | the core lock: clocks, sleep check, tick, op | plugin calls, file work, emit, log |
+| tick, snapshot, drain, next wake | `divora-timers` | the core lock | file work, log |
+| logging, the emit | `divora-timers`, unlocked | nothing | — |
+| the hand-off | `divora-timers`, unlocked | the slot's lock, for a swap | waiting on the writer |
+| writes, removals, the sweep, repair | `divora-timer-files` | nothing | the core lock |
+
+**Latency**, from the code, with the real-app figures still to come from S2:
+
+- **A boundary to the thread's pass:** the wait ends at or after its wake time.
+  `recv_timeout` parks through `WaitOnAddress`, which wakes on the system
+  timer's tick, so a pass can come up to about one tick late (15.6 ms by
+  default); Divora doesn't raise the timer resolution. Never early: a pass
+  that wakes early only checks again.
+- **The pass to the overlay's text:** the emit posts to the main thread's
+  event loop and is delivered when that thread services it, normally within a
+  frame; then the overlay page sets the text. A sync command holding the main
+  thread delays it by that command's length. Hidden to the tray, in the real
+  app: `[S2: H1 worst face change against its boundary]`; around five
+  `list_audio_input_devices` calls: `[S2: H1b face lag around the calls]`.
+- **The pass to the file:** a swap, then the writer's create, write, close and
+  rename. While a reader holds the file, the rename is tried again about every
+  system timer tick until the hold ends. The file never waits on the main
+  thread. In the real app: `[S2: H2 worst file change after its boundary,
+  collided seconds included]`.
+- **The file to OBS:** up to about 2 s (above; from OBS's code). A simulated
+  OBS reading H2's file: `[S2: H2 simulated OBS worst lag]`; OBS itself is
+  owner check O1.
+- **A key to the timer:** the main thread's queue (normally empty), the step
+  under the lock, then the thread's emit. In the real app: `[S2: H3 key-down
+  to timer-state in the hidden page, or "not run: owner check O4"]`.
+- **A click:** an IPC round trip, plus any sync command ahead of it.
+
+The plan's bars: the overlay within ±1 s of a stopwatch, an OBS text source
+within ±2 s.
+
+### Two Divoras share `timers/`
+
+Divora isn't single-instance. The installed app and a `tauri build --debug`
+build use the same `timers/` folder and the same storage; `tauri dev` uses
+`timers-dev/` and its own. Two running together each write their own timers'
+files, so a file both have shows whichever wrote last, and each writes it
+again only when its own text changes or the file goes missing. Each one's
+first sync sweeps the `timer-<n>.txt` files its own sync lacks, the other's
+included, and the other writes a missing file again at its next repair pass,
+within 5 s. Running one at a time avoids all of it. Not tried with two
+running.
+
+### Tests
+
+- **The core** (`timers.rs`, 43): the wire against the fixture
+  (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`,
+  `timer_id_table`, `hotkey_timer_request_table`); `timer_text_table`,
+  `entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`,
+  `run_from_wire_table`, `adjust_delta_table`; finishing
+  (`fires_exactly_once`, `never_fires_early`,
+  `a_rearmed_countdown_fires_again_once`,
+  `a_fire_taken_by_an_op_is_reported_once`,
+  `a_toggle_at_the_deadline_fires_then_rearms`,
+  `a_late_countdown_fires_late_when_awake`); sleep
+  (`a_countdown_that_ran_out_asleep_expires_unfired`,
+  `a_countdown_counts_the_sleep`, `a_countup_pauses_where_the_pc_slept`,
+  `a_late_second_signal_changes_nothing`,
+  `a_late_second_signal_after_a_stall_changes_nothing`,
+  `a_clock_that_missed_the_sleep_is_caught_by_the_wall`,
+  `instant_counted_the_sleep_is_left_to_a`,
+  `a_signal_without_a_jump_changes_nothing_when_the_clocks_agree`,
+  `an_op_just_before_a_sleep_pauses_the_countup_at_its_reading`,
+  `a_command_after_a_resume_sees_the_sleep`,
+  `a_countup_started_after_the_resume_runs_on`,
+  `a_sleep_seen_with_no_timers_still_counts`); the wall
+  (`a_wall_step_moves_the_anchor_after_10_s`,
+  `the_anchor_is_set_at_transitions`); the tables `op_table` (both kinds,
+  every phase and op, each row with its `ms` and text), `toggle_table`,
+  `adjust_table`, `seed_table`, `sync_table` and `next_wake_table`; and
+  `texts_follow_every_transition`, `rust_wins_while_it_knows_a_timer`,
+  `snapshots_count_up`, `dirty_only_on_change`, `later_fields_are_ignored`,
+  `notes_wait_for_the_thread_up_to_a_cap`, `nothing_panics_at_the_edges`,
+  `an_empty_core_is_quiet`.
+- **The shell** (`timer_thread.rs`, 29): the loop on a fake clock and waiter
+  (`the_thread_waits_next_wake`, `a_short_countdown_through_the_thread`,
+  `the_thread_expires_across_a_simulated_sleep`,
+  `an_empty_core_keeps_the_loop_quiet`); in real time, every bound 1 s or more
+  (`a_command_wakes_the_thread`, with a 5 s cap so a loop that ignores the
+  wake fails, `commands_never_wait_for_the_sink`,
+  `a_slow_writer_never_delays_a_countdown`,
+  `a_slow_log_write_never_holds_the_core`);
+  `the_timer_hotkey_toggles_through_the_core`,
+  `an_empty_core_answers_every_reader`,
+  `sync_skips_bad_entries_and_stops_at_64`; the files against a reader opened
+  as OBS opens (`share_mode(READ | WRITE)`, no `unsafe`; Windows only):
+  `a_write_while_obs_reads_is_retried`,
+  `an_unchanged_text_lands_after_a_long_hold`,
+  `a_readded_id_keeps_its_new_file`,
+  `a_read_only_file_backs_off_with_one_warning`,
+  `a_reader_never_sees_a_partial_file` (about 7 s in the parallel suite), and
+  the held half of `a_deleted_timers_file_goes`; and `the_folder_comes_back`,
+  `a_file_deleted_behind_our_back_is_rewritten`,
+  `nothing_is_swept_before_the_first_sync`,
+  `the_sweep_removes_only_divoras_names`, `a_deleted_kept_timers_file_goes`,
+  `the_writer_thread_waits_as_asked`, `the_slot_keeps_the_latest_set`,
+  `a_writer_with_nothing_handed_over_waits`, `write_text_lands_by_rename`,
+  `retryable_table`, `sweepable_table`, `timers_dir_name_table`.
+- **The app** (`lib.rs`, 5): `timer_commands_stay_sync`,
+  `the_timer_commands_are_registered`,
+  `the_shortcut_handler_runs_the_timer_hotkey` (the handler needs an
+  `AppHandle`, so a source test pins the call once, with the press state, and
+  no other timer call), `adjust_timer_rejects_bad_deltas`,
+  `the_setup_spawns_the_timer_threads`. The existing needles pass unchanged.
+- **Counts at `de6d8ab`:** `divora-app`'s lib 253 passed, 1 ignored (176 at
+  v1.58.0); `divora-core` 560 and `divora-capture` 181, unchanged; the
+  workspace 1,018 passed, 24 ignored. Vitest 1,671 in 56 files (1,376 in 53
+  at v1.58.0); E2E 62 (56 at v1.58.0).
+- **Vitest:** `timerState.test.ts` (the fixture's names, keys, phases, kinds
+  and limits; `readTimerSnapshot`; `adoptTimers`; `isTimerId`;
+  `fitTimerFont`); `data/timers.test.ts` (`readTimers`; `defsForSync` against
+  the fixture's `defKeys`; `timerRoles`; ids and default names; `runOf`
+  against the run samples; `parseTimerHotkeyId` against the hotkey-id table;
+  `parseLength` and `lengthText`; `sameKey`; `timerAction`;
+  `timerAnnouncement`); the store (boot with and without the key, the sync
+  before device enumeration and key registration, a `done` emitted before
+  the listener caught by the read, an older answer ignored, storage written
+  on transitions only, the cap, the delete's order and an Add during it, a
+  promoted timer's keys, binds and the third `syncHotkeyBindings` loop);
+  `App.test.tsx` (a `tm:` press and release invoke nothing); `api.test.ts`
+  (the eight names and arguments); `scene.test.ts`, `controller.test.ts`,
+  `Stage.test.tsx` and `overlay.test.tsx` (the element, the toggle, the face,
+  the pinned listen order, the font wait under fake timers, the badge only
+  after a snapshot); `HotkeyCapture.test.tsx` (unmounted while armed, the
+  cancel click, Esc, the focus leaving, the names, the focus after a
+  pointer); `SettingsScreen.test.tsx` (the card's states, Length, Delete
+  twice, the shared-key line, the hotkey note, the live region under fake
+  timers, the focus after a pointer); `Sigil.test.tsx`.
+- **E2E** (mocked Tauri): a profile without timers sends no timer command and
+  doesn't listen; Add countdown and drive it (the card waits for the backend,
+  takes only newer snapshots, Pause sends `pause_timer`); a bound key and a
+  reload (the sync carries `resume` and goes before device enumeration and
+  registration; exactly the run timers' `toggle` and `reset` register, no
+  `finish`, no newer kind); the key left to the backend; Delete twice; and
+  the overlay's face (nothing before a snapshot, no badge in Arrange, newer
+  `seq` only, updates under Functional motion, "Timer missing" in Arrange).
+  The mock answers every timer command `null`, so the e2e never runs Rust's
+  rules; the store's unit tests and S2 cover real answers.
+- **Mutations.** Every row of the design's mutation table was put back by
+  the track that owns it and seen failing its named test, then restored, each
+  file checked byte for byte; the Rust ones in a copy of the workspace, so no
+  shared file was ever broken.
+- **The review (step R)**, in six lenses, confirmed 12 findings (two of them
+  found twice) and refuted 2. All are fixed, each behaviour fix with a test
+  that fails when the defect is put back: the core logging under its lock
+  (now notes), a late second resume signal after a stall taken for a sleep, a
+  deleted kept timer's file left behind, a delete freeing the id before its
+  sync, a delete that brought a timer under the limit without registering its
+  keys, a capture left armed after the focus moved, the live region's words
+  cleared before a screen reader could speak them, a test that copied the
+  sync's reader instead of driving it, and a writer-thread test that could
+  flake. The overlay's comment about fonts was corrected (no behaviour).
+- **In the real app:** `[S2: build commit, machine and engine route]`.
+  - H1, hidden to the tray, a 3:00 countdown and a count-up on the overlay
+    for 4 min: `[S2: H1 worst face change against its boundary, values
+    skipped, divora.timers writes per transition, drift over the run]`.
+  - H1b, five `list_audio_input_devices` calls during H1: `[S2: H1b face lag
+    around the calls; the file's change times]`.
+  - H2, a count-up's file for 5 min, read every 10 ms, held 40 ms once a
+    second: `[S2: H2 every second once and in order, worst change after its
+    boundary, the collision line's N and longest wait, simulated OBS worst
+    lag]`.
+  - H3, the keys by `SendInput` with the window hidden: `[S2: H3 result, or
+    "not run: owner check O4"]`.
+  - H4, a reload mid-countdown: `[S2: H4 the IPC order, anchorMs before and
+    after, the face never blank]`.
+  - H5, Quit and relaunch after 40 s: `[S2: H5 the countdowns' left and phase,
+    the count-up's elapsed, files rewritten]`.
+  - H6, 20 Pause / Resume pairs unawaited, ±30 s, 20 clicks: `[S2: H6 seq
+    order, adjust answers, data-timer-seq never decreasing]`.
+  - H7, a delete while the file is held 3 s: `[S2: H7 removal after the hold
+    ended]`.
+- **Owner checks** (`MANUAL_TESTS.md`, "Hourglass (v1.59.0)"; not run): O1
+  and O2 OBS's two text sources beside the overlay, O3 a real sleep, O4 a
+  Stream Deck, O5 an hour against a stopwatch, O6 End task and relaunch, O7 a
+  key shared through `divora.timers`.
+- **Not tried here:** a real sleep (this PC sleeps in S3 only, and can't
+  hibernate), a clock that doesn't count sleep, OBS itself, a Stream Deck,
+  Windows 10, the overlay on a second monitor, two Divoras running together,
+  a screen reader, and the stub for other platforms compiled.
+
+### Kill switches
+
+- `TEXT_FILES` (`timer_thread.rs`): `false` keeps `divora-timer-files` from
+  starting, so no timer file is written, removed or swept. The overlay and
+  Settings don't depend on the files.
+- Without the handler's line, `tm:` keys do nothing.
+- `asTimer` answering null makes `timer` elements inert again, kept as stored,
+  as v1.55.0 to v1.58.0 kept them.
+- **The safety net:** with no `divora.timers`, boot sends no timer command and
+  the store doesn't listen. The thread ticks an empty core every 100 ms,
+  emits nothing and hands the writer nothing
+  (`an_empty_core_keeps_the_loop_quiet`), and the writer writes nothing and
+  makes no folder (`a_writer_with_nothing_handed_over_waits`). The only timer
+  command is the overlay page's one `timer_status` after its handshake, which
+  answers an empty set.
+
+### Not in this release
+
+- **v1.60.0, "Timers that change your voice":** actions at zero. Its Finish
+  (`finish_timer`, and the reserved `tm:<id>:finish`) is to call the same
+  `fire`, so "finishes once" covers both. Actions are to run from the drained
+  transitions on a worker of their own: nothing may block `divora-timers` or
+  `WM_HOTKEY` (a replay save waits up to 90 s), so where the plan has the
+  timer thread run mute, unmute, panic and saving a replay, a worker fed from
+  it runs them. Open: whether a timer that ends `expired` runs its restoring
+  actions (an unmute, a preset reverted) while skipping one-shot ones (a
+  spoken line, a tile, a replay save); skipping all of them would leave a
+  break muted. `Seeded` transitions let it put a start action back for a
+  timer restored running after a crash. Its new definition fields arrive
+  through `sync_timers`, read one by one.
+- **v1.61.0, "Talk to OBS":** the same text pushed to an OBS source. The
+  thread hands texts to one `TextSink`, which is to take a `watch` sender
+  beside the writer's slot. A count-up that follows OBS's stream needs a core
+  op of its own to set a known timer's time, since a seed applies only to an
+  id not yet seen; it can reuse `seed`'s arithmetic.
+- Later, or not planned: overtime; laps; styling the face (style the text
+  file in OBS instead); a sound at zero (with v1.60.0's tile action); a tray
+  item; a Mixer card; a titlebar pill; MIDI or glyph actions for timers; a
+  fix for the sleep limit above.
