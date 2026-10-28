@@ -12,6 +12,9 @@
 // Everything outside is injected, so the tests drive this controller rather
 // than a copy of it (the sync.ts pattern). It replaces the overlay block
 // app.tsx carried since v1.16.0. Call it inside a reactive owner.
+//
+// v1.59.0: an Hourglass timer's Show on overlay adds and removes its face
+// here, one per timer; the scene is the toggle's only record.
 
 import { createMemo, createSignal, onCleanup } from "solid-js";
 import type { ImportedAsset } from "../audio/api";
@@ -39,7 +42,9 @@ import {
   CIRCLE_ID,
   defaultImageRect,
   defaultScene,
+  defaultTimerRect,
   frameOf,
+  liveElements,
   MAX_PICTURES,
   migrateScene,
   pictureCount,
@@ -53,10 +58,12 @@ import {
   type PxRect,
   type SceneOp,
   type Size,
+  type TimerElement,
 } from "./scene";
 import type { OverlayBg, ScenePush } from "./state";
 import { closedStatus, readOverlayStatus, type OverlayStatus } from "./status";
 import { syncOverlayScene } from "./sync";
+import { isTimerId } from "./timerState";
 
 /** Where the overlay's settings and its scene are kept. */
 export const OVERLAY_PREFS_KEY = "divora.overlay";
@@ -85,7 +92,8 @@ const REFUSED: Record<AddRefusal, string> = {
   budget: "That's more than the overlay can hold. Remove a picture or pick a smaller one.",
   invalid: DAMAGED,
   // Not reachable from here: ids are picked unused, and the circle button
-  // shows only without a circle.
+  // shows only without a circle. (Nor is `invalid` for a timer face: its
+  // timer id is checked first, and its rect is the default one.)
   exists: DAMAGED,
   circle: DAMAGED,
 };
@@ -160,13 +168,15 @@ export interface OverlayController {
   removeOverlayElement(id: string): Promise<void>;
   addSpellCircle(): void;
   /** v1.59.0: Show on overlay for an Hourglass timer. Adds one `timer`
-   *  element for it, unless the scene has one. The scene is the only record
-   *  of the toggle, so an Arrange delete turns it off. */
+   *  element for it, where `defaultTimerRect` says, unless the scene has a
+   *  live one. The scene is the only record of the toggle, so an Arrange
+   *  delete turns it off. */
   addOverlayTimer(timerId: string): void;
-  /** v1.59.0: removes every `timer` element for this timer (the toggle
-   *  off, or the timer deleted). */
+  /** v1.59.0: removes every `timer` element for this timer, inert ones
+   *  included (the toggle off, or the timer deleted). */
   removeOverlayTimer(timerId: string): void;
-  /** v1.59.0: the scene has a `timer` element for this timer. Reactive. */
+  /** v1.59.0: the scene has a live `timer` element for this timer.
+   *  Reactive. */
   overlayHasTimer(timerId: string): boolean;
 }
 
@@ -547,6 +557,21 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
     return true;
   };
 
+  // v1.59.0: the timers with a live face, for Settings' Show on overlay
+  // toggles. Recounted when the scene changes; a toggle hears only a change
+  // of the set, not every drag.
+  const liveTimers = createMemo(
+    () => {
+      const out = new Set<string>();
+      for (const e of liveElements(scene())) if (e.type === "timer") out.add(e.timer);
+      return out;
+    },
+    new Set<string>(),
+    { equals: (a, b) => a.size === b.size && [...a].every((t) => b.has(t)) },
+  );
+
+  /** The window's CSS size, where a new picture or timer face is sized
+   *  for. */
   const pictureView = (): Size | undefined => {
     // Fitted, the scene's own size is the monitor's.
     if (frameOf(scene()) === "monitor" || !geometry) return undefined;
@@ -708,11 +733,36 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
       if (commit({ kind: "add", element })) publish();
     },
 
-    // v1.59.0: the contract only, for now; timer elements stay inert until
-    // the scene draws them.
-    addOverlayTimer: () => undefined,
-    removeOverlayTimer: () => undefined,
-    overlayHasTimer: () => false,
+    addOverlayTimer: (timerId) => {
+      if (!isTimerId(timerId) || liveTimers().has(timerId)) return;
+      const s = scene();
+      const element: TimerElement = {
+        id: freshId(),
+        type: "timer",
+        ...defaultTimerRect(s, pictureView()),
+        z: 0,
+        timer: timerId,
+      };
+      const refusal = addRefusal(s, element);
+      if (refusal) {
+        d.toast(REFUSED[refusal], WARN);
+        return;
+      }
+      if (commit({ kind: "add", element })) publish();
+    },
+
+    removeOverlayTimer: (timerId) => {
+      // Inert ones too (a face whose geometry this version can't use): each
+      // one is this timer's, and the toggle is off.
+      const ids = scene()
+        .elements.filter((e) => e.type === "timer" && e.timer === timerId)
+        .map((e) => e.id);
+      let changed = false;
+      for (const id of ids) changed = commit({ kind: "remove", id }) || changed;
+      if (changed) publish();
+    },
+
+    overlayHasTimer: (timerId) => liveTimers().has(timerId),
   };
 }
 

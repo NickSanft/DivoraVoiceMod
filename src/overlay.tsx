@@ -16,6 +16,12 @@
 // once it has drawn since being shown (painted). Both are commands, never
 // events the backend listens for: tauri can park a Rust listener's event on
 // lock contention.
+//
+// v1.59.0 (Hourglass): hears the backend's `timer-state` itself, never
+// through main, and reads `timer_status` once after the handshake, since a
+// paused timer sends nothing more. It keeps the snapshot with the largest
+// `seq`. A timer face waits for Space Mono Bold, at most FONT_WAIT_MS, so a
+// first frame never swaps fonts on stream.
 
 import "@fontsource-variable/bricolage-grotesque";
 import "@fontsource-variable/space-grotesk";
@@ -44,7 +50,22 @@ import {
   sendHandshake,
   type OverlayStatus,
 } from "./overlay/status";
+import {
+  adoptTimers,
+  readTimerSnapshot,
+  TIMER_STATE_EVENT,
+  TIMER_STATUS_CMD,
+  type TimerSnapshot,
+} from "./overlay/timerState";
 import "./styles.css";
+
+/** The longest a timer face waits for its font before it draws in the
+ *  fallback. */
+export const FONT_WAIT_MS = 1000;
+
+/** The face's font, as `document.fonts.load` names it: Space Mono Bold,
+ *  bundled (no network). */
+const FACE_FONT = '700 1em "Space Mono"';
 
 /** The browser preview (not under Tauri) draws the default circle. */
 const PREVIEW_STATE: OverlayState = {
@@ -90,6 +111,13 @@ export function OverlayApp(): JSX.Element {
   // Moved on when a held scene's time runs out.
   const [now, setNow] = createSignal(performance.now());
   const scene = createMemo(() => renderedScene(mirror(), viewport(), now()));
+  // Null until the backend's first snapshot: no face draws before it.
+  const [timers, setTimers] = createSignal<TimerSnapshot | null>(null);
+  const [fontReady, setFontReady] = createSignal(false);
+
+  const adoptTimerSnapshot = (raw: unknown): void => {
+    setTimers((held) => adoptTimers(held, readTimerSnapshot(raw)));
+  };
 
   let painted = false;
   let send: ((event: string, payload: unknown) => Promise<void>) | null = null;
@@ -145,6 +173,21 @@ export function OverlayApp(): JSX.Element {
     };
     window.addEventListener("resize", onResize);
 
+    // A timer face draws once its font is loaded, or FONT_WAIT_MS on in the
+    // fallback; at once where the page can't tell.
+    let fontWait: ReturnType<typeof setTimeout> | undefined;
+    const fontLoaded = (): void => {
+      clearTimeout(fontWait);
+      setFontReady(true);
+    };
+    const fonts = (document as { fonts?: Partial<FontFaceSet> }).fonts;
+    if (typeof fonts?.load === "function") {
+      fontWait = setTimeout(fontLoaded, FONT_WAIT_MS);
+      fonts.load(FACE_FONT).then(fontLoaded, fontLoaded);
+    } else {
+      setFontReady(true);
+    }
+
     let gone = false;
     const unlisteners: Array<() => void> = [];
     const keep = (unlisten: () => void): void => {
@@ -155,6 +198,7 @@ export function OverlayApp(): JSX.Element {
       gone = true;
       window.removeEventListener("resize", onResize);
       cancelAnimationFrame(frame);
+      clearTimeout(fontWait);
       for (const u of unlisteners) u();
     });
 
@@ -169,6 +213,7 @@ export function OverlayApp(): JSX.Element {
         );
         keep(await listen<ScenePush>(OVERLAY_SCENE_EVENT, (e) => onScene(e.payload)));
         keep(await listen<unknown>(OVERLAY_STATUS_EVENT, (e) => onStatus(e.payload)));
+        keep(await listen<unknown>(TIMER_STATE_EVENT, (e) => adoptTimerSnapshot(e.payload)));
         if (gone) return;
         send = (event, payload) => emit(event, payload);
         // Only now can a push reach us, so only now ask for one. Deliberately
@@ -176,9 +221,20 @@ export function OverlayApp(): JSX.Element {
         // the ready handshake.
         await emit(OVERLAY_READY_EVENT);
         // The debug switch that lets the watchdog be checked.
-        if ((window as unknown as Record<string, unknown>)[NO_READY_GLOBAL] !== true) {
-          void sendHandshake(instance, "ready");
-        }
+        const ready =
+          (window as unknown as Record<string, unknown>)[NO_READY_GLOBAL] !== true
+            ? sendHandshake(instance, "ready")
+            : Promise.resolve();
+        // The timers as they are now: a paused one sends nothing more. After
+        // the handshake, so the window isn't kept waiting; by `seq`, so an
+        // event that overtook this answer still wins. A failure leaves the
+        // events to tell.
+        void ready
+          .then(async () => {
+            const { invoke } = await import("@tauri-apps/api/core");
+            adoptTimerSnapshot(await invoke(TIMER_STATUS_CMD));
+          })
+          .catch(() => undefined);
       } catch {
         // Not under Tauri (the browser preview): the default circle.
         setState(PREVIEW_STATE);
@@ -196,6 +252,8 @@ export function OverlayApp(): JSX.Element {
       viewport={viewport()}
       // A fitted window covers its monitor: never a colour there.
       background={status().fit ? "transparent" : state()?.bg}
+      timers={timers()}
+      fontReady={fontReady()}
       onEdit={onEdit}
     />
   );

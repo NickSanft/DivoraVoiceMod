@@ -6,6 +6,7 @@
 //
 // The mock never sends a status on its own: each step sends the one it
 // needs with emitOverlayStatus, so each assertion is the page's answer to it.
+// v1.59.0: the same for Hourglass's timers, with emitTimers.
 
 import type { Page } from "@playwright/test";
 import {
@@ -13,14 +14,18 @@ import {
   expect,
   emitOverlayStatus,
   emitsOf,
+  emitTimers,
   IMPORTED_ASSET_SAMPLE,
   installTauriMock,
   invokesOf,
   linkWindows,
+  listenCount,
   OVERLAY_STATUS_SAMPLES,
   pluginInvokesOf,
+  TIMER_SAMPLES,
 } from "./tauri-mock";
 import type { OverlayStatus } from "../src/overlay/status";
+import type { TimerSnapshot } from "../src/overlay/timerState";
 
 const INSTANCE = 3;
 
@@ -61,6 +66,10 @@ const PICTURE = {
   nh: 1,
   name: "wave.png",
 };
+
+/** v1.59.0: BRB's face (`timer-1`), top left, in front of the circle: at
+ *  480×480 it draws at (48, 24) 192×72. */
+const FACE = { id: "face-1", type: "timer", x: 0.1, y: 0.05, w: 0.4, h: 0.15, z: 1, timer: "timer-1" };
 
 // The fixture's sample is a PC that can't hide the overlay; this one can, so
 // the recordings warning is due.
@@ -404,6 +413,75 @@ test.describe("stream overlay page (v1.55)", () => {
     await page.keyboard.press("Escape");
     await page.waitForTimeout(200);
     expect(await lockRequests(page)).toHaveLength(1);
+
+    expect(noise, noise.join("\n")).toEqual([]);
+  });
+});
+
+test.describe("Hourglass timer face (v1.59)", () => {
+  /** BRB (`timer-1`) alone, from one of the fixture's snapshots. */
+  const brb = (s: TimerSnapshot): TimerSnapshot => ({
+    seq: s.seq,
+    timers: s.timers.filter((t) => t.id === "timer-1"),
+  });
+
+  test("draws only the backend's text, keeps the newest, updates with motion off, and says when its timer is missing", async ({
+    page,
+  }) => {
+    const noise = watchConsole(page);
+    await load(page);
+    // The page hears the backend itself, not through main.
+    expect(await listenCount(page, "timer-state")).toBe(1);
+    await shown(page, [CIRCLE, FACE]);
+    const row = page.locator('[data-charm][data-id="face-1"]');
+    const face = row.locator("[data-timer-face]");
+    const badge = row.locator("[data-missing]");
+
+    // It asks once, after the ready handshake; the mock answers no snapshot.
+    await expect.poll(() => invokesOf(page, "timer_status")).toEqual([
+      { cmd: "timer_status", args: {} },
+    ]);
+    // Before the backend's first snapshot: no face, which OBS would capture
+    // as a made-up time…
+    await page.waitForTimeout(300);
+    await expect(face).toHaveCount(0);
+    // …and in Arrange no badge, though every timer is "missing" until then.
+    await arranging(page);
+    await page.waitForTimeout(300);
+    await expect(badge).toHaveCount(0);
+    await expect(face).toHaveCount(0);
+    await emitOverlayStatus(page, { mode: "locked" });
+    await expect(page.locator("[data-chrome]")).toHaveCount(0);
+
+    await emitTimers(page, brb(TIMER_SAMPLES.idle));
+    await expect(face).toHaveText("05:00");
+    await expect(row).toHaveAttribute("aria-label", "Timer: BRB");
+    await emitTimers(page, brb(TIMER_SAMPLES.running));
+    await expect(face).toHaveText("04:59");
+    // An older snapshot, arriving late, changes nothing.
+    await emitTimers(page, brb(TIMER_SAMPLES.idle));
+    await page.waitForTimeout(300);
+    await expect(face).toHaveText("04:59");
+
+    // Motion is off (main's state says 0): Functional cuts every CSS
+    // animation short, and nothing on the face is one, so it still follows
+    // the backend.
+    expect(await page.evaluate(() => document.documentElement.dataset.motion)).toBe("functional");
+    expect(await face.evaluate((el) => getComputedStyle(el).animationName)).toBe("none");
+    expect(await face.getAttribute("style")).not.toMatch(/animation|transition/);
+    await emitTimers(page, brb(TIMER_SAMPLES.done));
+    await expect(face).toHaveText("00:00");
+
+    // Its timer gone from the backend's set: locked, nothing at all; in
+    // Arrange, the badge.
+    await emitTimers(page, { seq: 4, timers: [] });
+    await expect(face).toHaveCount(0);
+    await page.waitForTimeout(300);
+    await expect(badge).toHaveCount(0);
+    await emitOverlayStatus(page, { mode: "arrange", arrangeGen: 2 });
+    await expect(page.locator("[data-chrome]")).toBeVisible();
+    await expect(badge).toHaveText("Timer missing");
+    await expect(face).toHaveCount(0);
 
     expect(noise, noise.join("\n")).toEqual([]);
   });

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "overlay",
-  "description": "The stream overlay window (v1.55.0): events and dragging its own window. Capabilities cover core and plugin calls only. With no app ACL manifest, app commands aren't checked; the overlay calls set_overlay_mode, overlay_handshake and overlay_alive, and must be granted them if an app manifest is ever added.",
+  "description": "The stream overlay window (v1.55.0): events and dragging its own window. Capabilities cover core and plugin calls only. With no app ACL manifest, app commands aren't checked; the overlay calls set_overlay_mode, overlay_handshake, overlay_alive and (v1.59.0) timer_status, and must be granted them if an app manifest is ever added.",
   "windows": ["overlay"],
   "permissions": [
     "core:event:allow-listen",

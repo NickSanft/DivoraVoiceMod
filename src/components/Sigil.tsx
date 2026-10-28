@@ -20,7 +20,7 @@ export type SigilName =
   | "compressor" | "deesser"
   | "mixer" | "soundboard" | "presets" | "settings"
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
-  | "lock" | "unlock" | "panic" | "play" | "stop" | "record" | "screen" | "replay"
+  | "lock" | "unlock" | "panic" | "play" | "stop" | "pause" | "hourglass" | "record" | "screen" | "replay"
   | "image" | "expand"
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
@@ -241,6 +241,23 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
   // ---------- UTILITY ----------
   play: () => <path d="M8 5.5 L18 12 L8 18.5 Z" fill="currentColor" />,
   stop: () => <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />,
+  // v1.59.0: Hourglass. Pause is two filled bars, beside play and stop; the
+  // hourglass is stroked: two caps, the glass pinched at its waist, and a
+  // little sand run through.
+  pause: () => (
+    <g fill="currentColor">
+      <rect x="7" y="5.5" width="3.6" height="13" rx="1.2" />
+      <rect x="13.4" y="5.5" width="3.6" height="13" rx="1.2" />
+    </g>
+  ),
+  hourglass: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6 3.5 H18 M6 20.5 H18" />
+      <path d="M7.5 3.5 V6.5 C7.5 9.5 12 10.5 12 12 C12 13.5 7.5 14.5 7.5 17.5 V20.5" />
+      <path d="M16.5 3.5 V6.5 C16.5 9.5 12 10.5 12 12 C12 13.5 16.5 14.5 16.5 17.5 V20.5" />
+      <path d="M10 18.5 Q12 16.6 14 18.5" />
+    </g>
+  ),
   chevronR: () => <path d="M9.5 6 L15.5 12 L9.5 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />,
   chevronD: () => <path d="M6 9.5 L12 15.5 L18 9.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />,
   chevronL: () => <path d="M14.5 6 L8.5 12 L14.5 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />,

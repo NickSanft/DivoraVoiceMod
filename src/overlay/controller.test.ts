@@ -1,4 +1,4 @@
-import { createRoot } from "solid-js";
+import { createEffect, createRoot } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ImportedAsset } from "../audio/api";
 import {
@@ -13,9 +13,11 @@ import type { MonitorInfo, OverlayGeometry, Rect } from "./geometry";
 import { emptyMirror, proposeEdit, receiveScene, renderedScene } from "./mirror";
 import {
   CIRCLE_ID,
+  defaultTimerRect,
   frameOf,
   layoutScene,
   liveElements,
+  MAX_ELEMENTS,
   migrateScene,
   type OverlayScene,
   type PxRect,
@@ -967,5 +969,136 @@ describe("overlay controller — edits from the overlay (v1.55.0)", () => {
     await flush();
     expect(h.pushes).toEqual([]);
     expect(liveElements(h.c.overlayScene())).toEqual([]);
+  });
+});
+
+describe("overlay controller — timer faces (v1.59.0)", () => {
+  async function opened(scene?: OverlayScene) {
+    const h = harness({ stored: { ...prefs(), ...(scene ? { [SCENE]: scene } : {}) } });
+    await flush();
+    await h.c.openOverlay();
+    await flush();
+    return h;
+  }
+
+  /** A face for `timer`, of the migrated 480 scene. */
+  function face(id: string, timer: string, more: Record<string, unknown> = {}): SceneElement {
+    return { id, type: "timer", x: 0.35, y: 0.08, w: 0.3, h: 0.1, z: 1, timer, ...more };
+  }
+
+  const faces = (s: OverlayScene) => s.elements.filter((e) => e.type === "timer");
+
+  it("addOverlayTimer adds one face per timer where defaultTimerRect says, saves and pushes it", async () => {
+    const h = await opened();
+    const before = h.pushes.length;
+    const at = defaultTimerRect(h.c.overlayScene(), V480);
+    h.c.addOverlayTimer("timer-1");
+    await flush();
+    expect(faces(h.c.overlayScene())).toEqual([{ id: "c-00000000", type: "timer", ...at, z: 1, timer: "timer-1" }]);
+    expect(h.c.overlayHasTimer("timer-1")).toBe(true);
+    expect(faces(h.loaded(SCENE))).toHaveLength(1);
+    expect(h.pushes.length).toBe(before + 1);
+    expect(faces(h.pushes.at(-1)!.scene)).toHaveLength(1);
+    expect(h.toasts).toEqual([]);
+
+    // Once per timer.
+    h.c.addOverlayTimer("timer-1");
+    await flush();
+    expect(faces(h.c.overlayScene())).toHaveLength(1);
+    expect(h.pushes.length).toBe(before + 1);
+
+    // Another timer's face goes 6 % lower.
+    h.c.addOverlayTimer("timer-2");
+    const [one, two] = faces(h.c.overlayScene()) as [SceneElement, SceneElement];
+    expect(two.timer).toBe("timer-2");
+    expect((two.y as number) - (one.y as number)).toBeCloseTo(0.06, 6);
+    expect(h.c.overlayHasTimer("timer-2")).toBe(true);
+    expect(h.c.overlayHasTimer("timer-3")).toBe(false);
+  });
+
+  it("a face is sized for the window, not for a scene grown bigger than it", async () => {
+    const big = { ...migrateScene({ w: 1200, h: 1200, scale: 1 }), designSize: { w: 1200, h: 1200 } };
+    const h = await opened(big);
+    h.c.addOverlayTimer("timer-1");
+    const f = faces(h.c.overlayScene())[0]!;
+    // 12 % of the window's 480, not of the scene's 1200.
+    expect((f.h as number) * 1200).toBeCloseTo(57.6, 3);
+  });
+
+  it("an id that isn't a timer's adds nothing", async () => {
+    const h = await opened();
+    const scene = h.c.overlayScene();
+    for (const id of ["Timer-1", "con", "", "tm:timer-1:toggle"]) h.c.addOverlayTimer(id);
+    expect(h.c.overlayScene()).toBe(scene);
+    expect(h.toasts).toEqual([]);
+  });
+
+  it("at 64 stored elements, says the overlay is full", async () => {
+    const stored = Array.from({ length: MAX_ELEMENTS - 1 }, (_, i) => ({ id: `t${i}`, type: "future" }));
+    const h = await opened(sceneWith(...stored));
+    h.c.addOverlayTimer("timer-1");
+    expect(h.c.overlayHasTimer("timer-1")).toBe(false);
+    expect(h.toasts).toEqual([{ text: "The overlay is full. Remove something to add another.", tone: "error" }]);
+  });
+
+  it("a stored face with unusable geometry doesn't count: the toggle reads off, and on adds a live one", async () => {
+    const h = await opened(sceneWith(face("flat", "timer-1", { h: 0 })));
+    expect(h.c.overlayHasTimer("timer-1")).toBe(false);
+    h.c.addOverlayTimer("timer-1");
+    expect(h.c.overlayHasTimer("timer-1")).toBe(true);
+    expect(faces(h.c.overlayScene()).map((e) => e.id)).toEqual(["flat", "c-00000000"]);
+  });
+
+  it("removeOverlayTimer removes every face for that timer, inert ones included, in one push", async () => {
+    const h = await opened(
+      sceneWith(
+        face("a", "timer-1"),
+        picture("P", "0123456789abcdef.png"),
+        face("b", "timer-2"),
+        face("c", "timer-1", { y: 0.2 }),
+        face("flat", "timer-1", { w: 0 }),
+        { id: "s", type: "sticker", timer: "timer-1" },
+      ),
+    );
+    const before = h.pushes.length;
+    h.c.removeOverlayTimer("timer-1");
+    await flush();
+    expect(h.c.overlayScene().elements.map((e) => e.id)).toEqual([CIRCLE_ID, "P", "b", "s"]);
+    expect(h.loaded(SCENE).elements.map((e) => e.id)).toEqual([CIRCLE_ID, "P", "b", "s"]);
+    expect(h.pushes.length).toBe(before + 1);
+    expect(h.c.overlayHasTimer("timer-1")).toBe(false);
+    expect(h.c.overlayHasTimer("timer-2")).toBe(true);
+
+    // Nothing left of it: nothing saved, nothing pushed.
+    const saves = h.saves(SCENE);
+    h.c.removeOverlayTimer("timer-1");
+    await flush();
+    expect(h.saves(SCENE)).toBe(saves);
+    expect(h.pushes.length).toBe(before + 1);
+  });
+
+  it("overlayHasTimer follows an Arrange delete, reactively", async () => {
+    const h = await opened();
+    h.c.addOverlayTimer("timer-1");
+    const seen: boolean[] = [];
+    createRoot((dispose) => {
+      disposers.push(dispose);
+      createEffect(() => seen.push(h.c.overlayHasTimer("timer-1")));
+    });
+    expect(seen).toEqual([true]);
+    const id = faces(h.c.overlayScene())[0]!.id;
+    // The overlay's Delete key, as its edit reaches main.
+    h.edit({ instance: 1, seq: 0, op: { kind: "remove", id } });
+    await flush();
+    expect(seen).toEqual([true, false]);
+    // Moving another charm changes the scene, not the answer: no re-run.
+    const scene = h.c.overlayScene();
+    h.edit({ instance: 1, seq: 1, op: { kind: "place", id: CIRCLE_ID, rect: { x: 10, y: 10, w: 440, h: 440 }, viewport: V480 } });
+    await flush();
+    expect(h.c.overlayScene()).not.toBe(scene);
+    expect(seen).toEqual([true, false]);
+    // Show on overlay again.
+    h.c.addOverlayTimer("timer-1");
+    expect(seen).toEqual([true, false, true]);
   });
 });

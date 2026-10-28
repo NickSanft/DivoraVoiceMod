@@ -3660,7 +3660,7 @@ pub fn run() {
                 timers_dir.clone(),
             );
             let timer_texts = Arc::new(TextSlot::new());
-            spawn_text_writer(timer_texts.clone(), TextFiles::new(timers_dir));
+            spawn_text_writer(&timer_texts, TextFiles::new(timers_dir));
             spawn_timer_thread(
                 timers.clone(),
                 ChannelWaiter(timer_wake),

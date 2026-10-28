@@ -18,6 +18,8 @@
 //   __E2E_PTM__ : { state, word, hotkey } — push-to-modulate's engine word
 //                     (v1.58.0; see mockPtm, pressPtmHotkey, emitLevels,
 //                     delayPtmModeAnswers)
+//   __E2E_LISTENERS__ : Map<event, handler ids> — every `listen` so far
+//                     (v1.59.0; see listenCount)
 //
 // v1.57.0: a model download stays open until the spec ends it
 // (emitDownloadProgress, endDownload), and the backend's download slot lives
@@ -26,10 +28,16 @@
 // v1.55.0: each page also knows which window it is (`metadata`, as Tauri
 // injects it): `overlay` on /overlay.html, `main` everywhere else, so
 // `getCurrentWindow()` works and its calls are recorded with that label.
+//
+// v1.59.0: Hourglass's commands answer null, as no snapshot: the specs send
+// every timer state with emitTimers, so each step shows the page taking the
+// one they sent.
 
 import { test as base, expect, type Page } from "@playwright/test";
 import wire from "../src/overlay/wire.fixture.json" with { type: "json" };
+import timerWire from "../src/overlay/timer.fixture.json" with { type: "json" };
 import type { OverlayStatus } from "../src/overlay/status";
+import type { TimerSnapshot } from "../src/overlay/timerState";
 
 export const MOCK_INPUTS = [
   { name: "Mock Mic", isDefault: true, defaultSampleRate: 48000, channels: 1 },
@@ -102,6 +110,15 @@ export const OVERLAY_STATUS_SAMPLES = wire.statusSamples as Record<
 export const OVERLAY_STATUS_KEYS: readonly string[] = wire.statusKeys;
 export const IMPORTED_ASSET_SAMPLE = wire.importedAssetSample;
 
+/** v1.59.0: Hourglass's wire samples (src/overlay/timer.fixture.json), the
+ *  file both unit suites and the backend's tests read: BRB (`timer-1`, a
+ *  5:00 countdown) and Uptime (`timer-2`, a count-up), idle (seq 1),
+ *  running (seq 2) and BRB done (seq 3). */
+export const TIMER_SAMPLES = timerWire.samples as Record<
+  keyof typeof timerWire.samples,
+  TimerSnapshot
+>;
+
 export interface MockOptions {
   /** Seed `divora.wizardSeen=true` so the app lands on the Mixer, not the
    *  first-run wizard. Default true; the wizard spec passes false. */
@@ -145,6 +162,8 @@ export async function installTauriMock(
 
       const callbacks = new Map<number, (e: unknown) => void>();
       const listeners = new Map<string, number[]>();
+      // v1.59.0: read by listenCount.
+      (window as unknown as { __E2E_LISTENERS__: unknown }).__E2E_LISTENERS__ = listeners;
       let nextId = 1;
 
       const engineStatus = {
@@ -334,6 +353,13 @@ export async function installTauriMock(
         return new Promise((resolve, reject) => {
           download.answer = (error) => (error === null ? resolve(null) : reject(error));
         });
+      };
+
+      // v1.59.0: a labelled timer command's `id`, checked as Tauri checks a
+      // `String` argument. The answer is null (see emitTimers).
+      const timerArgs = (cmd: string, a: any): null => {
+        if (typeof a?.id !== "string") throw `invalid args \`id\` for command \`${cmd}\``;
+        return null;
       };
 
       const NOT_OPEN = "The overlay isn't open.";
@@ -630,6 +656,24 @@ export async function installTauriMock(
         overlay_alive: () => null,
         import_overlay_asset: () => ({ ...data.importedAsset }),
         delete_overlay_asset: () => null,
+        // v1.59.0: Hourglass's commands. The seven that answer a snapshot in
+        // the app answer null here, which the page reads as none, so the
+        // cards say "Starting…" until a spec sends one with emitTimers.
+        // Arguments are refused as Tauri refuses them.
+        sync_timers: (a: any) => {
+          if (!Array.isArray(a?.timers)) throw "invalid args `timers` for command `sync_timers`";
+          return null;
+        },
+        arm_timer: (a: any) => timerArgs("arm_timer", a),
+        pause_timer: (a: any) => timerArgs("pause_timer", a),
+        resume_timer: (a: any) => timerArgs("resume_timer", a),
+        reset_timer: (a: any) => timerArgs("reset_timer", a),
+        adjust_timer: (a: any) => {
+          if (typeof a?.deltaMs !== "number") throw "invalid args `deltaMs` for command `adjust_timer`";
+          return timerArgs("adjust_timer", a);
+        },
+        timer_status: () => null,
+        timers_dir: () => "C:/mock/timers",
       };
       // Plugin calls answer null, except where null would mean something:
       // the main window's toasts wait while `isVisible()` is false. A spec
@@ -776,6 +820,40 @@ export async function emitOverlayStatus(
     w.__E2E_EMIT__("overlay:status", w.__E2E_OVERLAY__.status);
     return w.__E2E_OVERLAY__.status as unknown as OverlayStatus;
   }, partial);
+}
+
+/** `what`'s keys against the wire's: each one missing or extra. */
+function keyProblems(what: string, o: object, keys: readonly string[]): string[] {
+  const have = Object.keys(o);
+  return [
+    ...keys.filter((k) => !have.includes(k)).map((k) => `${what} lacks ${k}`),
+    ...have.filter((k) => !keys.includes(k)).map((k) => `${what} has ${k}`),
+  ];
+}
+
+/** v1.59.0: fire `timer-state` with `snapshot`, as the backend's timer
+ *  thread does after every change. A snapshot is the whole set, so nothing
+ *  is merged. The mock's timer commands answer null, so every timer state a
+ *  page holds is one a spec sent here. A snapshot or a timer whose keys
+ *  aren't exactly the wire's (timer.fixture.json), or a phase or kind it
+ *  doesn't have, is refused, so a typo can't pass for a field and a timer
+ *  the page drops can't pass for one it ignored. */
+export async function emitTimers(page: Page, snapshot: TimerSnapshot): Promise<void> {
+  const problems = keyProblems("the snapshot", snapshot, timerWire.snapshotKeys);
+  (snapshot.timers ?? []).forEach((t, i) => {
+    problems.push(...keyProblems(`timers[${i}]`, t, timerWire.stateKeys));
+    if (!timerWire.phases.includes(t.phase)) problems.push(`timers[${i}] has phase ${t.phase}`);
+    if (!timerWire.kinds.includes(t.kind)) problems.push(`timers[${i}] has kind ${t.kind}`);
+  });
+  if (problems.length > 0) throw new Error(`not a TimerSnapshot: ${problems.join(", ")}`);
+  await page.evaluate(
+    ([event, s]) => {
+      (
+        window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
+      ).__E2E_EMIT__(event as string, s);
+    },
+    [timerWire.events.state, snapshot] as const,
+  );
 }
 
 /** v1.56.0: the mute as the mock engine holds it (sessionStorage
@@ -981,6 +1059,19 @@ export function invokesOf(
         .filter((i) => c === null || i.cmd === c)
         .map((i) => ({ cmd: i.cmd, args: i.args ?? {} })),
     cmd ?? null,
+  );
+}
+
+/** v1.59.0: how many listeners this page has registered for `event`
+ *  (`__E2E_LISTENERS__`); an unlisten doesn't count one down. */
+export function listenCount(page: Page, event: string): Promise<number> {
+  return page.evaluate(
+    (e) =>
+      (
+        (window as unknown as { __E2E_LISTENERS__: Map<string, number[]> }).__E2E_LISTENERS__.get(e) ??
+        []
+      ).length,
+    event,
   );
 }
 

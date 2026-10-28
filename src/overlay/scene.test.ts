@@ -114,10 +114,12 @@ function inertSet(): SceneElement[] {
       return e;
     })(),
     picture("srcnum", { x: 0.6, y: 0.3, w: 0.1, h: 0.1 }, { src: 5 }),
+    // v1.59.0: a timer face whose ref fails the id grammar.
+    { id: "badref", type: "timer", x: 0.3, y: 0.6, w: 0.3, h: 0.1, z: 3, timer: "Timer-1" },
   ];
 }
 
-const INERT_IDS = ["future", "avif", "w0", "wneg", "nox", "circle2", "nosrc", "srcnum"];
+const INERT_IDS = ["future", "avif", "w0", "wneg", "nox", "circle2", "nosrc", "srcnum", "badref"];
 
 function mixedScene(): OverlayScene {
   return sceneOf(
@@ -1199,5 +1201,104 @@ describe("timer elements (v1.59.0)", () => {
     for (const from of ["main", "overlay"] as const) {
       expect(readOp({ kind: "add", element: face() }, from)).toBeNull();
     }
+  });
+
+  it("a face is live whether or not its timer exists; a bad ref keeps it inert, as stored", () => {
+    const s = sceneOf([
+      circle(),
+      face({ id: "brb" }),
+      face({ id: "gone", timer: "timer-9" }),
+      face({ id: "bad", timer: "timer:1" }),
+      face({ id: "flat", h: 0 }),
+    ]);
+    expect(liveElements(s).map((e) => e.id)).toEqual(["circle", "brb", "gone"]);
+    expect(layoutScene(s, D480).map((r) => r.el.id)).toEqual(["circle", "brb", "gone"]);
+    expect(isLive(s, "bad")).toBe(false);
+    expect(isLive(s, "flat")).toBe(false);
+    // Faces aren't pictures.
+    expect(pictureCount(s)).toBe(0);
+    // Kept as stored through an edit of another element.
+    const next = applyOp(s, { kind: "place", id: "brb", rect: { x: 10, y: 10, w: 144, h: 48 }, viewport: D480 });
+    expect(next).not.toBe(s);
+    expect(next.elements.find((e) => e.id === "bad")).toBe(s.elements.find((e) => e.id === "bad"));
+    expect(applyOp(s, { kind: "place", id: "bad", rect: { x: 10, y: 10, w: 144, h: 48 }, viewport: D480 })).toBe(s);
+  });
+
+  it("add puts a face in front; only a taken id, 64 stored elements or a face that wouldn't be live refuse it", () => {
+    const sixteen = Array.from({ length: 16 }, (_, i) =>
+      picture(`p${i}`, { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { src: `${i.toString(16).padStart(16, "0")}.png`, nw: 10, nh: 10 }),
+    );
+    const sixtyFour = Array.from({ length: MAX_ELEMENTS }, (_, i) => ({ id: `t${i}`, type: "future" }));
+    const overBudget = [picture("huge", { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { bytes: 300_000_000 })];
+    const full = sceneOf([circle(), ...sixteen]);
+    const add = (more: Record<string, unknown> = {}) => face({ id: "N", ...more }) as unknown as KnownElement;
+    const cases: Array<[string, OverlayScene, KnownElement, string | null]> = [
+      ["beside a circle and 16 pictures", full, add(), null],
+      ["a scene already over the picture budget", sceneOf(overBudget), add(), null],
+      ["a second face for the same timer (the controller keeps one)", sceneOf([face()]), add(), null],
+      ["a face for a timer that doesn't exist", sceneOf([]), add({ timer: "timer-9" }), null],
+      ["a taken id", sceneOf([face({ id: "N" })]), add(), "exists"],
+      ["64 stored elements", sceneOf(sixtyFour), add(), "elements"],
+      ["a ref that fails the grammar", sceneOf([]), add({ timer: "Timer-1" }), "invalid"],
+      ["a device name for a ref", sceneOf([]), add({ timer: "nul" }), "invalid"],
+      ["no ref", sceneOf([]), add({ timer: undefined }), "invalid"],
+      ["a zero height", sceneOf([]), add({ h: 0 }), "invalid"],
+    ];
+    for (const [name, s, e, why] of cases) {
+      expect(addRefusal(s, e), name).toBe(why);
+      const next = applyOp(s, { kind: "add", element: e });
+      if (why === null) expect(next.elements.at(-1), name).toMatchObject({ id: "N", type: "timer", timer: e.timer });
+      else expect(next, name).toBe(s);
+    }
+    const next = applyOp(full, { kind: "add", element: add() });
+    expect(layoutScene(next, D480).at(-1)!.el.id).toBe("N");
+    expect(isLive(next, "N")).toBe(true);
+  });
+
+  it("place, order, remove and reframe treat a face as they treat a picture", () => {
+    const s = sceneOf([circle(), picture("A", { x: 0.1, y: 0.6, w: 0.2, h: 0.1 }, { z: 1 }), face({ z: 2 })]);
+    const id = "c-0a1b2c3d";
+    // Moved: the same size, its centre where it was dropped.
+    const moved = applyOp(s, { kind: "place", id, rect: { x: 10, y: 300, w: 144, h: 48 }, viewport: D480 });
+    expectRectNear(rectOf(moved, id, D480), { x: 10, y: 300, w: 144, h: 48 }, 1e-3);
+    // Resized from a square rect: its stored 3:1 shape wins.
+    const sized = applyOp(s, { kind: "place", id, rect: { x: 100, y: 100, w: 240, h: 240 }, viewport: D480 });
+    const r = rectOf(sized, id, D480);
+    expect(r.w).toBeCloseTo(240, 3);
+    expect(r.w / r.h).toBeCloseTo(3, 4);
+    // Restacked.
+    expect(layoutScene(applyOp(s, { kind: "order", id, to: "back" }), D480).map((x) => x.el.id)).toEqual([id, CIRCLE_ID, "A"]);
+    // Removed.
+    expect(applyOp(s, { kind: "remove", id }).elements.map((e) => e.id)).toEqual([CIRCLE_ID, "A"]);
+    // Fit on: nothing moves on screen.
+    const win = { x: 100, y: 50, w: 480, h: 480 };
+    const mon = { x: 0, y: 0, w: 1920, h: 1080 };
+    const fitted = applyOp(s, { kind: "reframe", from: win, to: mon, frame: "monitor" });
+    const was = rectOf(s, id, D480);
+    expectRectNear(rectOf(fitted, id, { w: 1920, h: 1080 }), { ...was, x: was.x + win.x, y: was.y + win.y }, 2e-3);
+  });
+
+  it("charmLabels names faces by their timers, numbering repeats with the rest", () => {
+    const names: Record<string, string> = { "timer-1": "BRB", "timer-2": "BRB", "timer-3": "Uptime" };
+    const s = sceneOf([
+      circle(),
+      picture("A", { x: 0, y: 0, w: 0.1, h: 0.1 }, { name: "BRB" }),
+      face({ id: "f1" }),
+      face({ id: "f2", timer: "timer-2" }),
+      face({ id: "f3", timer: "timer-3" }),
+      face({ id: "f4", timer: "timer-9" }),
+      face({ id: "f5", timer: "timer-8" }),
+    ]);
+    expect([...charmLabels(s, (t) => names[t])]).toEqual([
+      ["circle", "Spell circle"],
+      ["A", "BRB"],
+      ["f1", "BRB (2)"],
+      ["f2", "BRB (3)"],
+      ["f3", "Uptime"],
+      ["f4", "Timer"],
+      ["f5", "Timer (2)"],
+    ]);
+    // Without names (as before v1.59.0's callers pass them), every face is "Timer".
+    expect(charmLabels(s).get("f3")).toBe("Timer (3)");
   });
 });

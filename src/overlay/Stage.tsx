@@ -9,6 +9,11 @@
 // Locked, the window is click-through, so no press arrives; the keys that
 // still might are blocked (shouldPreventKey). In Arrange the chrome's beats
 // keep the backend's lease (D21): no beat, and the backend locks again.
+//
+// v1.59.0: a third kind of charm, an Hourglass timer's face: the text the
+// backend formats, in white Space Mono Bold with a dark outline, sized in
+// JS to fit its box. Nothing about it is animated by CSS, so Functional
+// motion can't freeze it; its text node changes only when the text does.
 
 import {
   batch,
@@ -53,6 +58,7 @@ import {
 } from "./scene";
 import { OVERLAY_BG_COLOR, type OverlayBg, type OverlayState } from "./state";
 import { requestLock, sendAlive, type OverlayStatus } from "./status";
+import { fitTimerFont, type TimerSnapshot, type TimerState } from "./timerState";
 
 /** How often an arranging page tells the backend it is alive. */
 export const BEAT_MS = 500;
@@ -74,6 +80,11 @@ export interface StageProps {
   viewport: Size;
   /** What sits behind the charms. */
   background: OverlayBg | undefined;
+  /** v1.59.0: the backend's latest timers; null until its first snapshot,
+   *  and no timer face draws before one. */
+  timers: TimerSnapshot | null;
+  /** v1.59.0: the face's font has loaded, or the page stopped waiting. */
+  fontReady: boolean;
   /** One finished edit: a drag, a nudge run, Delete or a restack. */
   onEdit: (op: SceneOp) => void;
 }
@@ -84,6 +95,12 @@ function px(n: number): string {
 
 function sameStrings(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+function sameNames(a: Map<string, string>, b: Map<string, string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) if (b.get(k) !== v) return false;
+  return true;
 }
 
 /** Run `cb` two animation frames from now; returns a cancel. */
@@ -136,6 +153,40 @@ const PILL: JSX.CSSProperties = {
   "pointer-events": "auto",
 };
 
+/** A charm's Arrange-only "missing" badge, over the charm. */
+const MISSING: JSX.CSSProperties = {
+  position: "absolute",
+  inset: "0",
+  display: "flex",
+  "align-items": "center",
+  "justify-content": "center",
+  gap: "4px",
+  overflow: "hidden",
+  color: "var(--warning)",
+  background: "var(--scrim)",
+  "font-size": "var(--t-xs)",
+  "white-space": "nowrap",
+  "pointer-events": "none",
+};
+
+/** v1.59.0: a timer's face, less its font size. White with a dark outline
+ *  reads over any game and isn't keyed out by the green or magenta
+ *  backgrounds. No animation and no transition: only JS changes it. */
+const TIMER_FACE: JSX.CSSProperties = {
+  position: "absolute",
+  inset: "0",
+  display: "flex",
+  "align-items": "center",
+  "justify-content": "center",
+  "font-family": "var(--font-mono)",
+  "font-weight": "700",
+  "line-height": "1",
+  color: "#fff",
+  "text-shadow": "0 0 0.06em #000, 0 0 0.12em rgba(0, 0, 0, 0.85), 0 0.04em 0.1em rgba(0, 0, 0, 0.6)",
+  "white-space": "nowrap",
+  "pointer-events": "none",
+};
+
 /** The Arrange lease's beats: two frames after the chrome mounts, then
  *  every BEAT_MS until it unmounts (a lock, or the page going away). */
 function Beats(props: { instance: number; gen: () => number }): JSX.Element {
@@ -171,7 +222,16 @@ export function Stage(props: StageProps): JSX.Element {
     { equals: sameStrings },
   );
   const rank = createMemo(() => new Map(layout().map((r, i) => [r.el.id, i])));
-  const labels = createMemo(() => (props.scene ? charmLabels(props.scene) : new Map<string, string>()));
+  // Each timer's name by id. Changes only when a name does, so a running
+  // timer's snapshot every second relabels nothing.
+  const timerNames = createMemo(
+    () => new Map((props.timers?.timers ?? []).map((t) => [t.id, t.name])),
+    new Map<string, string>(),
+    { equals: sameNames },
+  );
+  const labels = createMemo(() =>
+    props.scene ? charmLabels(props.scene, (timer) => timerNames().get(timer)) : new Map<string, string>(),
+  );
 
   const [selected, setSelected] = createSignal<string | null>(null);
   const [gesture, setGesture] = createSignal<Gesture | null>(null);
@@ -417,6 +477,7 @@ export function Stage(props: StageProps): JSX.Element {
     };
     const isSelected = () => arrange() && current() === id;
     const label = () => {
+      if (kind() === "timer") return `Timer: ${labels().get(id) ?? "Timer"}`;
       const name = labels().get(id) ?? "Picture";
       return circle() ? name : `Picture: ${name}`;
     };
@@ -426,6 +487,22 @@ export function Stage(props: StageProps): JSX.Element {
     };
     const [missing, setMissing] = createSignal(false);
     createEffect(on(src, () => setMissing(false), { defer: true }));
+
+    // v1.59.0: a timer face's timer, in the latest snapshot.
+    const timerOf = (): TimerState | undefined => {
+      const el = entry()?.el;
+      return el && el.type === "timer" ? props.timers?.timers.find((t) => t.id === el.timer) : undefined;
+    };
+    // A memo, so the text node is written only when the text changes.
+    const text = createMemo(() => timerOf()?.text ?? "");
+    const showFace = () => props.fontReady && timerOf() !== undefined;
+    // Only once the backend has answered: before that, every timer is
+    // "missing", and Arrange is visible to recordings.
+    const timerMissing = () => arrange() && props.timers !== null && timerOf() === undefined;
+    const faceStyle = (): JSX.CSSProperties => {
+      const r = rect();
+      return { ...TIMER_FACE, "font-size": px(r ? fitTimerFont(r.w, r.h, text().length) : 0) };
+    };
 
     const box = (): JSX.CSSProperties => {
       const r = rect();
@@ -518,25 +595,25 @@ export function Stage(props: StageProps): JSX.Element {
             onLoad={() => setMissing(false)}
           />
           <Show when={missing() && arrange()}>
-            <div
-              data-missing
-              style={{
-                position: "absolute",
-                inset: "0",
-                display: "flex",
-                "align-items": "center",
-                "justify-content": "center",
-                gap: "4px",
-                overflow: "hidden",
-                color: "var(--warning)",
-                background: "var(--scrim)",
-                "font-size": "var(--t-xs)",
-                "white-space": "nowrap",
-                "pointer-events": "none",
-              }}
-            >
+            <div data-missing style={MISSING}>
               <Sigil name="image" size={14} />
               <span>Picture missing</span>
+            </div>
+          </Show>
+        </Show>
+        <Show when={kind() === "timer"}>
+          <Show
+            when={showFace()}
+            fallback={
+              <Show when={timerMissing()}>
+                <div data-missing style={MISSING}>
+                  <span>Timer missing</span>
+                </div>
+              </Show>
+            }
+          >
+            <div data-timer-face aria-hidden="true" style={faceStyle()}>
+              {text()}
             </div>
           </Show>
         </Show>

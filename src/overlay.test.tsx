@@ -15,9 +15,11 @@ const listenMock = vi.fn(async (event: string, h: Handler): Promise<() => void> 
   set.add(h);
   return () => set.delete(h);
 });
+/** What `timer_status` answers; the e2e mock's null by default. */
+let timerStatus: () => Promise<unknown> = async () => null;
 const invokeMock = vi.fn(async (cmd: string, args?: unknown): Promise<unknown> => {
   log.push(`invoke ${cmd} ${JSON.stringify(args)}`);
-  return null;
+  return cmd === "timer_status" ? timerStatus() : null;
 });
 vi.mock("@tauri-apps/api/event", () => ({
   emit: (event: string, payload?: unknown) => emitMock(event, payload),
@@ -27,16 +29,19 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
 }));
 
-import { OverlayApp, pageInstance } from "./overlay";
+import { FONT_WAIT_MS, OverlayApp, pageInstance } from "./overlay";
 import { HOLD_MS } from "./overlay/mirror";
 import { applyOp, type OverlayScene, type SceneOp } from "./overlay/scene";
 import type { OverlayState, SceneEdit, ScenePush } from "./overlay/state";
 import { NO_READY_GLOBAL, type OverlayStatus } from "./overlay/status";
+import timerFixture from "./overlay/timer.fixture.json";
+import type { TimerSnapshot } from "./overlay/timerState";
 import fixture from "./overlay/wire.fixture.json";
 
 const PIC = "a1b2c3d4e5f60718.gif";
 const READY = 'invoke overlay_handshake {"instance":3,"stage":"ready"}';
 const PAINTED = 'invoke overlay_handshake {"instance":3,"stage":"painted"}';
+const PULL = "invoke timer_status undefined";
 
 const STATE: OverlayState = {
   chain: [],
@@ -107,6 +112,7 @@ function drag(el: Element, from: [number, number], to: [number, number]): void {
 beforeEach(() => {
   handlers.clear();
   log.length = 0;
+  timerStatus = async () => null;
   emitMock.mockClear();
   listenMock.mockClear();
   invokeMock.mockClear();
@@ -116,6 +122,8 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   delete (window as unknown as Record<string, unknown>)[NO_READY_GLOBAL];
+  // A test's stand-in for the font loader.
+  delete (document as unknown as Record<string, unknown>).fonts;
 });
 
 describe("pageInstance", () => {
@@ -136,12 +144,17 @@ describe("the overlay page's handshake (v1.55.0)", () => {
   it("listens first, then broadcasts ready, then tells the backend with its instance", async () => {
     await open();
     await vi.waitFor(() => expect(log).toContain(READY));
+    await vi.waitFor(() => expect(log).toContain(PULL));
     expect(log).toEqual([
       "listen overlay:state",
       "listen overlay:scene",
       "listen overlay:status",
+      // v1.59.0: before ready, so no change after it is missed…
+      "listen timer-state",
       "emit overlay:ready",
       READY,
+      // …and the timers as they are, once, after the handshake.
+      PULL,
     ]);
   });
 
@@ -151,6 +164,8 @@ describe("the overlay page's handshake (v1.55.0)", () => {
     await settle();
     expect(log).toContain("emit overlay:ready");
     expect(log.filter((l) => l.includes("overlay_handshake"))).toEqual([]);
+    // The timers are still read.
+    expect(log.filter((l) => l === PULL)).toHaveLength(1);
   });
 
   it("says painted two frames after the first shown status for its own window, once", async () => {
@@ -188,7 +203,7 @@ describe("the overlay page's handshake (v1.55.0)", () => {
 
   it("stops listening when it goes away", async () => {
     const { unmount } = await open();
-    expect([...handlers.values()].reduce((n, s) => n + s.size, 0)).toBe(3);
+    expect([...handlers.values()].reduce((n, s) => n + s.size, 0)).toBe(4);
     unmount();
     expect([...handlers.values()].reduce((n, s) => n + s.size, 0)).toBe(0);
   });
@@ -328,5 +343,125 @@ describe("the overlay page's look", () => {
     expect(r.getAttribute("data-theme")).toBe("light");
     expect(r.getAttribute("data-motion")).toBe("functional");
     expect(r.getAttribute("data-mystical")).toBe("rich");
+  });
+});
+
+describe("the overlay page's timers (v1.59.0)", () => {
+  const SAMPLES = timerFixture.samples as Record<"idle" | "running" | "done", TimerSnapshot>;
+
+  /** The scene and a 384×96 face for `timer-1`, in front. */
+  function timerScene(): OverlayScene {
+    const s = scene();
+    s.elements.push({ id: "face", type: "timer", x: 0.25, y: 0.1, w: 0.375, h: 0.125, z: 2, timer: "timer-1" });
+    return s;
+  }
+
+  // vi.waitFor moves fake timers on while it polls, which would run out the
+  // font wait before a test could look; these polls use the real clock.
+  const realTimeout = globalThis.setTimeout.bind(globalThis);
+  async function until(check: () => boolean): Promise<void> {
+    for (let i = 0; i < 400 && !check(); i += 1) await new Promise((r) => realTimeout(r, 5));
+    expect(check()).toBe(true);
+  }
+
+  /** Open, with main's state and the scene drawn. */
+  async function shown() {
+    const r = render(() => <OverlayApp />);
+    await until(() => log.includes("emit overlay:ready"));
+    const q = (sel: string): HTMLElement | null => r.container.querySelector<HTMLElement>(sel);
+    fire("overlay:state", STATE);
+    fire("overlay:scene", push(timerScene(), 1));
+    expect(q('[data-id="face"]')).not.toBeNull();
+    return { ...r, q, face: () => q('[data-id="face"] [data-timer-face]') };
+  }
+
+  function stubFonts(load: (font: string) => Promise<unknown>): ReturnType<typeof vi.fn> {
+    const spy = vi.fn(load);
+    Object.defineProperty(document, "fonts", { value: { load: spy }, configurable: true });
+    return spy;
+  }
+
+  it("hears timer-state itself and keeps the snapshot with the largest seq", async () => {
+    const { face } = await shown();
+    await vi.waitFor(() => expect(log).toContain(PULL));
+    // The pull answered null (no timers yet): nothing drawn.
+    expect(face()).toBeNull();
+    fire("timer-state", SAMPLES.running);
+    expect(face()!.textContent).toBe("04:59");
+    fire("timer-state", SAMPLES.idle);
+    expect(face()!.textContent).toBe("04:59");
+    fire("timer-state", SAMPLES.done);
+    expect(face()!.textContent).toBe("00:00");
+    fire("timer-state", { seq: 9, timers: "none" });
+    fire("timer-state", null);
+    expect(face()!.textContent).toBe("00:00");
+    // Never through main.
+    expect(emitMock.mock.calls.map((c) => c[0])).not.toContain("timer-state");
+  });
+
+  it("a paused timer's face comes from timer_status alone", async () => {
+    timerStatus = async () => SAMPLES.idle;
+    const { face } = await shown();
+    await vi.waitFor(() => expect(face()?.textContent).toBe("05:00"));
+  });
+
+  it("a late timer_status answer with a lower seq doesn't replace an event", async () => {
+    let answer!: (v: unknown) => void;
+    timerStatus = () => new Promise((r) => (answer = r));
+    const { face } = await shown();
+    await vi.waitFor(() => expect(log).toContain(PULL));
+    fire("timer-state", SAMPLES.running);
+    answer(SAMPLES.idle);
+    await settle();
+    expect(face()!.textContent).toBe("04:59");
+    // A newer one still wins.
+    fire("timer-state", SAMPLES.done);
+    expect(face()!.textContent).toBe("00:00");
+  });
+
+  it("a failed timer_status leaves the events to tell", async () => {
+    timerStatus = async () => {
+      throw new Error("not under Tauri");
+    };
+    const { face } = await shown();
+    await vi.waitFor(() => expect(log).toContain(PULL));
+    await settle();
+    fire("timer-state", SAMPLES.running);
+    expect(face()!.textContent).toBe("04:59");
+  });
+
+  it("waits for Space Mono Bold before the first face, at most FONT_WAIT_MS", async () => {
+    const load = stubFonts(() => new Promise(() => undefined));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { face } = await shown();
+    fire("timer-state", SAMPLES.running);
+    expect(load).toHaveBeenCalledWith('700 1em "Space Mono"');
+    expect(FONT_WAIT_MS).toBe(1000);
+    await vi.advanceTimersByTimeAsync(FONT_WAIT_MS - 1);
+    expect(face()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(face()!.textContent).toBe("04:59");
+  });
+
+  it.each([
+    ["loads", true],
+    ["fails to load", false],
+  ])("a font that %s lets the face draw at once", async (_name, ok) => {
+    let done!: () => void;
+    stubFonts(() => new Promise<void>((res, rej) => (done = ok ? res : () => rej(new Error("no font")))));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { face } = await shown();
+    fire("timer-state", SAMPLES.running);
+    expect(face()).toBeNull();
+    done();
+    await settle();
+    expect(face()!.textContent).toBe("04:59");
+  });
+
+  it("where the page can't wait for fonts, the face draws at once", async () => {
+    expect((document as { fonts?: unknown }).fonts).toBeUndefined();
+    const { face } = await shown();
+    fire("timer-state", SAMPLES.running);
+    expect(face()!.textContent).toBe("04:59");
   });
 });

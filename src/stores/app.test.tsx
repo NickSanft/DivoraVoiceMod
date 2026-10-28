@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@solidjs/testing-library";
 import { makeTemplate } from "../data/unistroke";
+import type { StoredTimer, StoredTimers, TimerDefWire } from "../data/timers";
+import type { TimerSnapshot, TimerState } from "../overlay/timerState";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -4948,6 +4950,652 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       expect(ptmCalls()).toEqual([]);
       result.handleMidiMessage(cc(20, 70));
       expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+    });
+  });
+});
+
+// v1.59.0: Hourglass. Rust keeps the time; the store keeps `divora.timers`
+// and a mirror of Rust's snapshot by `seq`. These drive the real store
+// against a fake backend that answers as Rust does: every answer and event
+// is the whole set, a sync seeds a timer from its `resume` only for an id it
+// has never accepted, and an event reaches only a listener already in.
+describe("app store — Hourglass (v1.59.0)", () => {
+  type Handler = (e: { payload: unknown }) => void;
+  const handlers = new Map<string, Handler[]>();
+  /** Every command and listen the page made, in order. */
+  const log: string[] = [];
+  /** Every command with its arguments and `divora.timers` as it stood when
+   *  the command went out. */
+  const calls: Array<{ cmd: string; args: unknown; stored: string | null }> = [];
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+
+  const KEY = "divora.timers";
+  const ENDS = 1_793_217_900_000;
+
+  /** A stored countdown "BRB" of 5:00 unless `more` says otherwise. */
+  const entry = (id: string, more: Record<string, unknown> = {}) => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    durationMs: 300_000,
+    ...more,
+  });
+  const store = (...timers: unknown[]) =>
+    window.localStorage.setItem(KEY, JSON.stringify({ version: 1, timers }));
+  const saved = (): StoredTimer[] => {
+    const raw = window.localStorage.getItem(KEY);
+    return raw === null ? [] : (JSON.parse(raw) as StoredTimers).timers;
+  };
+  const savedRun = (id: string) => saved().find((t) => t.id === id)?.run;
+  /** A timer as a snapshot has it: an idle 5:00 countdown "BRB" unless
+   *  `more` says otherwise. */
+  const timer = (id: string, more: Partial<TimerState> = {}): TimerState => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    phase: "idle",
+    ms: 300_000,
+    totalMs: 300_000,
+    text: "05:00",
+    anchorMs: null,
+    fires: 0,
+    ...more,
+  });
+  /** The calls that are Hourglass's. */
+  const timerLog = () =>
+    log.filter(
+      (c) =>
+        c === "listen timer-state" ||
+        c === "sync_timers" ||
+        c === "timer_status" ||
+        c === "timers_dir" ||
+        c.endsWith("_timer"),
+    );
+  const argsOf = (cmd: string) => calls.filter((c) => c.cmd === cmd).map((c) => c.args);
+  const synced = () => argsOf("sync_timers").map((a) => (a as { timers: TimerDefWire[] }).timers);
+  const keyCalls = () =>
+    calls
+      .filter((c) => c.cmd.endsWith("register_global_shortcut"))
+      .map((c) => [c.cmd, c.args]);
+
+  /** Rust's side. A command changes the set when it arrives; `hold(cmd)`
+   *  keeps its answer back until `release(cmd)`. `elsewhere` is a change
+   *  made in Rust (a hotkey, a fire), emitted as the timer thread does: it
+   *  reaches only listeners already registered. */
+  function backend() {
+    let seq = 0;
+    let timers: TimerState[] = [];
+    const seen = new Set<string>();
+    const held = new Map<string, Array<() => void>>();
+    const snapshot = (): TimerSnapshot => ({ seq: ++seq, timers: timers.map((t) => ({ ...t })) });
+    const emit = (s: TimerSnapshot): void => {
+      for (const h of handlers.get("timer-state") ?? []) h({ payload: s });
+    };
+    const seed = (d: TimerDefWire, first: boolean): TimerState => {
+      const countdown = d.kind === "countdown";
+      const r = first ? d.resume : undefined;
+      const total = countdown ? (r?.totalMs ?? d.durationMs) : 0;
+      return {
+        id: d.id,
+        name: d.name,
+        kind: d.kind as TimerState["kind"],
+        phase: r?.phase ?? "idle",
+        ms: r?.phase === "paused" ? r.ms! : countdown ? total : 0,
+        totalMs: total,
+        text: "05:00",
+        anchorMs: r?.phase === "running" ? r.anchorMs! : null,
+        fires: 0,
+      };
+    };
+    const change = (id: string, patch: Partial<TimerState>): void => {
+      if (!timers.some((t) => t.id === id)) throw new Error("no such timer");
+      timers = timers.map((t) => (t.id === id ? { ...t, ...patch } : t));
+    };
+    invokeMock.mockImplementation(async (cmd: string, a?: Record<string, unknown>) => {
+      log.push(cmd);
+      calls.push({ cmd, args: a, stored: window.localStorage.getItem(KEY) });
+      let answer: unknown = null;
+      const id = a?.id as string;
+      switch (cmd) {
+        case "sync_timers": {
+          const defs = (a!.timers as TimerDefWire[]).filter(
+            (d) => d.kind === "countdown" || d.kind === "countup",
+          );
+          timers = defs.slice(0, 16).map((d) => {
+            const known = timers.find((t) => t.id === d.id);
+            const first = !seen.has(d.id);
+            seen.add(d.id);
+            return known ? { ...known, name: d.name } : seed(d, first);
+          });
+          answer = snapshot();
+          break;
+        }
+        case "timer_status":
+          answer = snapshot();
+          break;
+        case "arm_timer":
+          change(id, { phase: "running", anchorMs: ENDS + seq, text: "05:00" });
+          answer = snapshot();
+          break;
+        case "pause_timer":
+          change(id, { phase: "paused", ms: 200_000, anchorMs: null, text: "03:20" });
+          answer = snapshot();
+          break;
+        case "resume_timer":
+          change(id, { phase: "running", anchorMs: ENDS + seq });
+          answer = snapshot();
+          break;
+        case "reset_timer":
+          change(id, { phase: "idle", ms: 300_000, anchorMs: null, text: "05:00" });
+          answer = snapshot();
+          break;
+        case "adjust_timer":
+          change(id, { ms: 170_000, text: "02:50" });
+          answer = snapshot();
+          break;
+        case "timers_dir":
+          answer = "C:\\Users\\me\\AppData\\Roaming\\com.divora.voice\\timers";
+          break;
+      }
+      const gate = held.get(cmd);
+      if (gate) await new Promise<void>((r) => gate.push(r));
+      return answer;
+    });
+    return {
+      state: (id: string) => timers.find((t) => t.id === id),
+      hold: (cmd: string) => held.set(cmd, []),
+      release: (cmd: string) => {
+        for (const r of held.get(cmd) ?? []) r();
+        held.delete(cmd);
+      },
+      /** A change made in Rust, then the thread's emit. */
+      elsewhere: (id: string, patch: Partial<TimerState>): TimerSnapshot => {
+        change(id, patch);
+        const s = snapshot();
+        emit(s);
+        return s;
+      },
+    };
+  }
+
+  /** Tauri's listen: with `holdTimerListen`, `timer-state`'s registers only
+   *  when the test lets it; every other one at once. */
+  let holdTimerListen = false;
+  const pendingListens: Array<() => void> = [];
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    handlers.clear();
+    log.length = 0;
+    calls.length = 0;
+    holdTimerListen = false;
+    pendingListens.length = 0;
+    vi.mocked(listen).mockImplementation(((event: string, handler: Handler) => {
+      log.push(`listen ${event}`);
+      const register = () => {
+        handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        return () => handlers.set(event, (handlers.get(event) ?? []).filter((h) => h !== handler));
+      };
+      if (event === "timer-state" && holdTimerListen) {
+        return new Promise((resolve) => pendingListens.push(() => resolve(register())));
+      }
+      return Promise.resolve(register());
+    }) as unknown as typeof listen);
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    vi.mocked(listen).mockImplementation((async () => () => {}) as unknown as typeof listen);
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+  });
+
+  describe("the boot", () => {
+    it("without divora.timers: no timer command, no listener, and the key stays absent", async () => {
+      backend();
+      const { result } = setupApp();
+      await settle();
+      expect(timerLog()).toEqual([]);
+      expect(result.timerStore().timers).toEqual([]);
+      expect(result.timerSnapshot()).toBeNull();
+      expect(window.localStorage.getItem(KEY)).toBeNull();
+    });
+
+    it("with it: sync_timers with each run as resume at creation, then the listener, then timer_status", async () => {
+      const run = { phase: "running", totalMs: 300_000, anchorMs: ENDS };
+      store(entry("timer-1", { run }), entry("timer-2", { name: "Uptime", kind: "countup" }));
+      backend();
+      const { result } = setupApp();
+      // Sent while the store is created: nothing has been awaited yet.
+      expect(timerLog()).toEqual(["sync_timers", "listen timer-state"]);
+      expect(synced()).toEqual([
+        [
+          { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000, resume: run },
+          { id: "timer-2", name: "Uptime", kind: "countup", durationMs: 300_000 },
+        ],
+      ]);
+      await settle();
+      expect(timerLog()).toEqual(["sync_timers", "listen timer-state", "timer_status"]);
+      // Both answers adopted by seq: the pull's is the newer.
+      expect(result.timerSnapshot()?.seq).toBe(2);
+      expect(result.timerSnapshot()?.timers.map((t) => [t.id, t.phase])).toEqual([
+        ["timer-1", "running"],
+        ["timer-2", "idle"],
+      ]);
+      // The run Rust seeded is the one stored, so nothing was rewritten.
+      expect(savedRun("timer-1")).toEqual(run);
+    });
+
+    it("a done emitted before the listener is in still lands, adopted and saved, through timer_status", async () => {
+      store(entry("timer-1", { run: { phase: "running", totalMs: 300_000, anchorMs: ENDS } }));
+      const be = backend();
+      holdTimerListen = true;
+      const { result } = setupApp();
+      await settle();
+      expect(result.timerSnapshot()?.timers[0]?.phase).toBe("running");
+      // The restored countdown runs out while the listen is still on its way:
+      // the event reaches nobody.
+      be.elsewhere("timer-1", { phase: "done", ms: 0, text: "00:00", anchorMs: null, fires: 1 });
+      expect(result.timerSnapshot()?.timers[0]?.phase).toBe("running");
+      expect(timerLog()).toEqual(["sync_timers", "listen timer-state"]);
+      pendingListens.shift()!();
+      await settle();
+      expect(timerLog()).toEqual(["sync_timers", "listen timer-state", "timer_status"]);
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({ phase: "done", fires: 1 });
+      expect(savedRun("timer-1")).toEqual({ phase: "done", totalMs: 300_000 });
+    });
+  });
+
+  describe("the mirror and the stored runs", () => {
+    it("an answer older than an event already adopted is ignored", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      expect(result.timerSnapshot()?.timers[0]?.phase).toBe("running");
+      // Pause lands in Rust (its answer built), then the hotkey resumes it in
+      // Rust and the thread emits; the pause's answer arrives last.
+      be.hold("pause_timer");
+      const pause = result.pauseTimer("timer-1");
+      await settle();
+      const resumed = be.elsewhere("timer-1", { phase: "running", anchorMs: ENDS + 99 });
+      expect(result.timerSnapshot()).toEqual(resumed);
+      be.release("pause_timer");
+      await pause;
+      expect(result.timerSnapshot()).toEqual(resumed);
+      expect(savedRun("timer-1")).toEqual({ phase: "running", totalMs: 300_000, anchorMs: ENDS + 99 });
+    });
+
+    it("divora.timers is written on a transition, never for a text-only snapshot", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+      const writes = () => setItem.mock.calls.filter((c) => c[0] === KEY).length;
+
+      await result.startTimer("timer-1");
+      expect(writes()).toBe(1);
+      const anchor = be.state("timer-1")!.anchorMs!;
+      expect(savedRun("timer-1")).toEqual({ phase: "running", totalMs: 300_000, anchorMs: anchor });
+
+      // Five seconds of a running countdown: the text changes, the run doesn't.
+      for (let s = 1; s <= 5; s++) {
+        be.elsewhere("timer-1", { ms: 300_000 - s * 1000, text: `04:${String(60 - s).padStart(2, "0")}` });
+      }
+      expect(result.timerSnapshot()?.timers[0]?.text).toBe("04:55");
+      expect(writes()).toBe(1);
+
+      await result.pauseTimer("timer-1");
+      expect(writes()).toBe(2);
+      expect(savedRun("timer-1")).toEqual({ phase: "paused", ms: 200_000, totalMs: 300_000 });
+      await result.resetTimer("timer-1");
+      expect(writes()).toBe(3);
+      expect(saved()[0]).not.toHaveProperty("run");
+      // An idle timer's snapshot again: nothing to write.
+      await result.resetTimer("timer-1");
+      expect(writes()).toBe(3);
+    });
+
+    it("a late snapshot never writes a deleted timer back", async () => {
+      store(entry("timer-1"), entry("timer-2", { name: "Intro" }));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      await result.deleteTimer("timer-1");
+      expect(saved().map((t) => t.id)).toEqual(["timer-2"]);
+      // A snapshot that still has timer-1 running, newer than anything held.
+      const running = { phase: "running", ms: 299_000, text: "04:59", anchorMs: ENDS } as const;
+      const late = {
+        seq: result.timerSnapshot()!.seq + 1,
+        timers: [timer("timer-1", running), timer("timer-2", { ...running, name: "Intro" })],
+      };
+      result.adoptTimerSnapshot(late);
+      expect(result.timerSnapshot()?.seq).toBe(late.seq);
+      expect(saved().map((t) => [t.id, t.run?.phase])).toEqual([["timer-2", "running"]]);
+      expect(result.timerStore().timers.map((t) => t.id)).toEqual(["timer-2"]);
+    });
+  });
+
+  describe("adding, renaming, lengths, deleting", () => {
+    it("add: the lowest free timer-<n>, a default name, saved and synced; the first add starts the listener", async () => {
+      backend();
+      const { result } = setupApp();
+      await settle();
+      expect(timerLog()).toEqual([]);
+
+      expect(await result.addTimer("countdown")).toBe("timer-1");
+      await settle();
+      expect(timerLog()).toEqual(["sync_timers", "listen timer-state", "timer_status"]);
+      expect(saved()).toEqual([
+        { id: "timer-1", name: "Countdown", kind: "countdown", durationMs: 300_000, hotkeys: {} },
+      ]);
+      expect(result.timerSnapshot()?.timers.map((t) => [t.id, t.phase])).toEqual([["timer-1", "idle"]]);
+
+      expect(await result.addTimer("countup")).toBe("timer-2");
+      expect(await result.addTimer("countdown")).toBe("timer-3");
+      await result.deleteTimer("timer-1");
+      expect(await result.addTimer("countdown")).toBe("timer-1");
+      await settle();
+      expect(saved().map((t) => [t.id, t.name])).toEqual([
+        ["timer-2", "Count-up"],
+        ["timer-3", "Countdown 2"],
+        ["timer-1", "Countdown"],
+      ]);
+      // One listener for the page, however many adds.
+      expect(log.filter((c) => c === "listen timer-state")).toHaveLength(1);
+      expect(log.filter((c) => c === "timer_status")).toHaveLength(1);
+      expect(synced().at(-1)?.map((d) => d.id)).toEqual(["timer-2", "timer-3", "timer-1"]);
+    });
+
+    it("refuses a 17th stored timer, a newer kind's counted too", async () => {
+      store(
+        ...Array.from({ length: 15 }, (_, i) => entry(`timer-${i + 1}`, { name: `T${i + 1}` })),
+        entry("timer-16", { name: "Later", kind: "interval" }),
+      );
+      backend();
+      const { result } = setupApp();
+      await settle();
+      const before = window.localStorage.getItem(KEY);
+      log.length = 0;
+      expect(await result.addTimer("countdown")).toBeNull();
+      expect(timerLog()).toEqual([]);
+      expect(window.localStorage.getItem(KEY)).toBe(before);
+      expect(result.timerStore().timers).toHaveLength(16);
+    });
+
+    it("rename and a new length sync every stored run as resume; an unchanged commit sends nothing", async () => {
+      const run = { phase: "running", totalMs: 300_000, anchorMs: ENDS };
+      store(
+        entry("timer-1", { run }),
+        entry("timer-2", { name: "Intro", durationMs: 60_000 }),
+        entry("timer-3", { name: "Uptime", kind: "countup" }),
+      );
+      backend();
+      const { result } = setupApp();
+      await settle();
+      calls.length = 0;
+
+      await result.renameTimer("timer-2", "  Starting soon ");
+      expect(synced()).toHaveLength(1);
+      expect(synced()[0]![0]).toEqual({
+        id: "timer-1",
+        name: "BRB",
+        kind: "countdown",
+        durationMs: 300_000,
+        resume: run,
+      });
+      expect(synced()[0]![1]).toEqual({
+        id: "timer-2",
+        name: "Starting soon",
+        kind: "countdown",
+        durationMs: 60_000,
+      });
+      await result.renameTimer("timer-2", "Starting soon");
+      await result.renameTimer("timer-2", "   ");
+      await result.renameTimer("timer-9", "Nobody");
+      expect(synced()).toHaveLength(1);
+
+      await result.setTimerLength("timer-2", 600_000);
+      expect(synced()).toHaveLength(2);
+      expect(synced()[1]![1]).toMatchObject({ id: "timer-2", durationMs: 600_000 });
+      expect(saved()[1]).toMatchObject({ name: "Starting soon", durationMs: 600_000 });
+      // The same length again, a count-up, lengths no field gives: nothing.
+      await result.setTimerLength("timer-2", 600_000);
+      await result.setTimerLength("timer-3", 600_000);
+      await result.setTimerLength("timer-2", 0);
+      await result.setTimerLength("timer-2", 1500.5);
+      await result.setTimerLength("timer-2", 86_400_001);
+      expect(synced()).toHaveLength(2);
+    });
+
+    it("delete unregisters both keys first, then syncs without the timer", async () => {
+      store(entry("timer-1", { hotkeys: { toggle: "F9" } }), entry("timer-2", { name: "Intro" }));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      calls.length = 0;
+      await result.deleteTimer("timer-1");
+      expect(calls.map((c) => [c.cmd, c.args])).toEqual([
+        ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:reset" }],
+        [
+          "sync_timers",
+          { timers: [{ id: "timer-2", name: "Intro", kind: "countdown", durationMs: 300_000 }] },
+        ],
+      ]);
+      expect(saved().map((t) => t.id)).toEqual(["timer-2"]);
+      expect(result.timerSnapshot()?.timers.map((t) => t.id)).toEqual(["timer-2"]);
+    });
+
+    // Needs track D's controller bodies (the scene's timer elements).
+    it("delete takes the timer off the overlay", async () => {
+      store(entry("timer-1"), entry("timer-2", { name: "Intro" }));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      result.setTimerOnOverlay("timer-1", true);
+      result.setTimerOnOverlay("timer-2", true);
+      expect(result.timerOnOverlay("timer-1")).toBe(true);
+      await result.deleteTimer("timer-1");
+      expect(result.timerOnOverlay("timer-1")).toBe(false);
+      expect(result.timerOnOverlay("timer-2")).toBe(true);
+      const faces = result.overlayScene().elements.filter((e) => e.type === "timer");
+      expect(faces.map((e) => e.timer)).toEqual(["timer-2"]);
+    });
+
+    // Needs track D's controller bodies: the scene is the toggle's only record.
+    it("Show on overlay follows an Arrange delete", async () => {
+      store(entry("timer-1"));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      result.setTimerOnOverlay("timer-1", true);
+      expect(result.timerOnOverlay("timer-1")).toBe(true);
+      const face = result.overlayScene().elements.find((e) => e.type === "timer")!;
+      for (const h of handlers.get("overlay:edit") ?? []) {
+        h({ payload: { instance: 1, seq: 0, op: { kind: "remove", id: face.id } } });
+      }
+      expect(result.timerOnOverlay("timer-1")).toBe(false);
+      result.setTimerOnOverlay("timer-1", true);
+      expect(result.timerOnOverlay("timer-1")).toBe(true);
+      result.setTimerOnOverlay("timer-1", false);
+      expect(result.timerOnOverlay("timer-1")).toBe(false);
+      expect(result.overlayScene().elements.filter((e) => e.type === "timer")).toEqual([]);
+    });
+  });
+
+  describe("the buttons", () => {
+    it("Start sends what its label says, from the mirror; nothing without state", async () => {
+      invokeMock.mockResolvedValue(null);
+      const { result } = setupApp();
+      await settle();
+      invokeMock.mockClear();
+      await result.startTimer("timer-1");
+      expect(invokeMock).not.toHaveBeenCalled();
+      const sent: unknown[] = [];
+      let seq = 0;
+      for (const phase of ["idle", "running", "paused", "done", "expired"] as const) {
+        result.adoptTimerSnapshot({
+          seq: ++seq,
+          timers: [timer("timer-1", { phase, anchorMs: phase === "running" ? ENDS : null })],
+        });
+        invokeMock.mockClear();
+        await result.startTimer("timer-1");
+        sent.push(...invokeMock.mock.calls);
+      }
+      expect(sent).toEqual([
+        ["arm_timer", { id: "timer-1" }],
+        ["pause_timer", { id: "timer-1" }],
+        ["resume_timer", { id: "timer-1" }],
+        ["arm_timer", { id: "timer-1" }],
+        ["arm_timer", { id: "timer-1" }],
+      ]);
+    });
+
+    it("Pause, Reset and ±30 s send their commands and adopt the answers", async () => {
+      store(entry("timer-1"));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      calls.length = 0;
+      await result.startTimer("timer-1");
+      await result.pauseTimer("timer-1");
+      await result.adjustTimer("timer-1", -30_000);
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({
+        phase: "paused",
+        ms: 170_000,
+        text: "02:50",
+      });
+      await result.adjustTimer("timer-1", 30_000);
+      await result.resetTimer("timer-1");
+      expect(calls.map((c) => [c.cmd, c.args])).toEqual([
+        ["arm_timer", { id: "timer-1" }],
+        ["pause_timer", { id: "timer-1" }],
+        ["adjust_timer", { id: "timer-1", deltaMs: -30_000 }],
+        ["adjust_timer", { id: "timer-1", deltaMs: 30_000 }],
+        ["reset_timer", { id: "timer-1" }],
+      ]);
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({ phase: "idle", text: "05:00" });
+    });
+
+    it("a refused command warns and changes nothing", async () => {
+      store(entry("timer-1"));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      const held = result.timerSnapshot();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await result.pauseTimer("timer-9");
+      expect(warn).toHaveBeenCalledWith("[hourglass] pause_timer failed:", expect.any(Error));
+      expect(result.timerSnapshot()).toBe(held);
+    });
+
+    it("timersDir asks once, then remembers the folder", async () => {
+      backend();
+      const { result } = setupApp();
+      const want = "C:\\Users\\me\\AppData\\Roaming\\com.divora.voice\\timers";
+      expect(await result.timersDir()).toBe(want);
+      expect(await result.timersDir()).toBe(want);
+      expect(timerLog()).toEqual(["timers_dir"]);
+    });
+
+    it("timersDir is null when the folder can't be had, and asks again next time", async () => {
+      invokeMock.mockImplementation(async (cmd: string) => {
+        log.push(cmd);
+        if (cmd === "timers_dir") throw new Error("no app data");
+        return null;
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { result } = setupApp();
+      expect(await result.timersDir()).toBeNull();
+      expect(await result.timersDir()).toBeNull();
+      expect(timerLog()).toEqual(["timers_dir", "timers_dir"]);
+      expect(warn).toHaveBeenCalledWith("[hourglass] timers_dir failed:", expect.any(Error));
+    });
+  });
+
+  describe("hotkeys", () => {
+    it("a bind saves its verb first, then registers tm:<id>:<verb>; a clear saves, then unregisters; other verbs stay", async () => {
+      store(entry("timer-1", { hotkeys: { finish: "F10" } }));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      calls.length = 0;
+      /** The timer's keys as stored when the i-th call went out. */
+      const storedAt = (i: number) =>
+        (JSON.parse(calls[i]!.stored!) as StoredTimers).timers[0]!.hotkeys;
+
+      await result.bindTimerHotkey("timer-1", "toggle", "Ctrl+Alt+F13");
+      expect(storedAt(0)).toEqual({ finish: "F10", toggle: "Ctrl+Alt+F13" });
+      await result.bindTimerHotkey("timer-1", "reset", "Win+F14");
+      expect(saved()[0]!.hotkeys).toEqual({
+        finish: "F10",
+        toggle: "Ctrl+Alt+F13",
+        reset: "Super+F14",
+      });
+      expect(keyCalls()).toEqual([
+        ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "Ctrl+Alt+F13" }],
+        ["register_global_shortcut", { id: "tm:timer-1:reset", accelerator: "Super+F14" }],
+      ]);
+
+      calls.length = 0;
+      await result.bindTimerHotkey("timer-1", "toggle", "");
+      expect(saved()[0]!.hotkeys).toEqual({ finish: "F10", reset: "Super+F14" });
+      expect(keyCalls()).toEqual([["unregister_global_shortcut", { id: "tm:timer-1:toggle" }]]);
+      expect(storedAt(0)).toEqual({ finish: "F10", reset: "Super+F14" });
+      // A bind syncs nothing: the backend's set has no keys in it.
+      expect(synced()).toEqual([]);
+    });
+
+    it("a bind for a timer no longer stored, or one the backend doesn't run, saves and sends nothing", async () => {
+      // timer-1 and 16 more countdowns: after the delete, the 17th known one
+      // (timer-19) is still over the limit.
+      store(
+        entry("timer-1"),
+        entry("timer-2", { name: "Later", kind: "interval" }),
+        ...Array.from({ length: 17 }, (_, i) => entry(`timer-${i + 3}`, { name: `T${i + 3}` })),
+      );
+      backend();
+      const { result } = setupApp();
+      await settle();
+      await result.deleteTimer("timer-1");
+      expect(result.timerRoles().get("timer-2")).toBe("newer");
+      expect(result.timerRoles().get("timer-19")).toBe("over");
+      const before = window.localStorage.getItem(KEY);
+      calls.length = 0;
+      await result.bindTimerHotkey("timer-1", "toggle", "F9");
+      await result.bindTimerHotkey("timer-2", "toggle", "F9");
+      await result.bindTimerHotkey("timer-19", "reset", "F9");
+      await result.bindTimerHotkey("timer-99", "toggle", "F9");
+      expect(calls).toEqual([]);
+      expect(window.localStorage.getItem(KEY)).toBe(before);
+    });
+
+    it("syncHotkeyBindings registers the timers the backend runs after the actions and tiles; never a newer kind's, one over the limit, or finish", async () => {
+      window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ panic: "F1" }));
+      window.localStorage.setItem("divora.tileHotkeys", JSON.stringify({ "clip-a": ["F2"] }));
+      store(
+        entry("timer-1", { hotkeys: { toggle: "F9", reset: "F10", finish: "F11" } }),
+        entry("timer-2", { name: "Later", kind: "interval", hotkeys: { toggle: "F12" } }),
+        ...Array.from({ length: 15 }, (_, i) => entry(`timer-${i + 3}`, { name: `T${i + 3}` })),
+        entry("timer-18", { name: "Over", hotkeys: { toggle: "F13" } }),
+        entry("timer-19", { name: "Uptime", kind: "countup", hotkeys: { reset: "" } }),
+      );
+      backend();
+      const { result } = setupApp();
+      await settle();
+      calls.length = 0;
+      await result.syncHotkeyBindings();
+      expect(keyCalls()).toEqual([
+        ["register_global_shortcut", { id: "panic", accelerator: "F1" }],
+        ["register_global_shortcut", { id: "sb:clip-a", accelerator: "F2" }],
+        ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F9" }],
+        ["register_global_shortcut", { id: "tm:timer-1:reset", accelerator: "F10" }],
+      ]);
     });
   });
 });

@@ -17,6 +17,8 @@ import { applyOp, layoutScene, type OverlayScene, type PxRect, type SceneOp, typ
 import { BEAT_MS, circleFit, Stage } from "./Stage";
 import type { OverlayBg, OverlayState } from "./state";
 import type { OverlayStatus } from "./status";
+import timerFixture from "./timer.fixture.json";
+import { fitTimerFont, type TimerSnapshot } from "./timerState";
 import fixture from "./wire.fixture.json";
 
 const PIC = "a1b2c3d4e5f60718.gif";
@@ -63,6 +65,8 @@ interface Mount {
   background?: OverlayBg;
   /** Apply each edit to the scene, as the overlay's mirror does. */
   apply?: boolean;
+  timers?: TimerSnapshot | null;
+  fontReady?: boolean;
 }
 
 function mount(o: Mount = {}) {
@@ -70,6 +74,8 @@ function mount(o: Mount = {}) {
   const [status, setStatus] = createSignal<OverlayStatus>(o.status ?? arranging());
   const [viewport, setViewport] = createSignal<Size>(o.viewport ?? V480);
   const [state, setState] = createSignal<OverlayState | null>(o.state === undefined ? STATE : o.state);
+  const [timers, setTimers] = createSignal<TimerSnapshot | null>(o.timers ?? null);
+  const [fontReady, setFontReady] = createSignal(o.fontReady ?? true);
   const edits: SceneOp[] = [];
   const onEdit = (op: SceneOp): void => {
     edits.push(op);
@@ -83,13 +89,15 @@ function mount(o: Mount = {}) {
       status={status()}
       viewport={viewport()}
       background={o.background}
+      timers={timers()}
+      fontReady={fontReady()}
       onEdit={onEdit}
     />
   ));
   const q = (sel: string): HTMLElement | null => r.container.querySelector<HTMLElement>(sel);
   const charm = (id: string): HTMLElement => q(`[data-charm][data-id="${id}"]`)!;
   const hitOf = (id: string): HTMLElement => charm(id).querySelector<HTMLElement>("[data-hit]")!;
-  return { ...r, q, charm, hitOf, edits, scene, setScene, setStatus, setViewport, setState };
+  return { ...r, q, charm, hitOf, edits, scene, setScene, setStatus, setViewport, setState, setTimers, setFontReady };
 }
 
 function rectOf(el: HTMLElement): PxRect {
@@ -871,5 +879,155 @@ describe("Stage: keys", () => {
       vi.advanceTimersByTime(NUDGE_FLUSH_MS);
       expect(m.edits).toEqual([]);
     });
+  });
+});
+
+describe("Stage: a timer's face (v1.59.0)", () => {
+  const SAMPLES = timerFixture.samples as Record<"idle" | "running" | "done", TimerSnapshot>;
+  const [BRB, UPTIME] = SAMPLES.running.timers as [TimerSnapshot["timers"][number], TimerSnapshot["timers"][number]];
+
+  /** The base scene and a 300×100 face for `timer-1` at (90, 30), in front. */
+  function timerScene(more: Record<string, unknown> = {}): OverlayScene {
+    const s = baseScene();
+    s.elements.push({ id: "face", type: "timer", x: 90 / 480, y: 30 / 480, w: 300 / 480, h: 100 / 480, z: 2, timer: "timer-1", ...more });
+    return s;
+  }
+
+  /** BRB showing `text`, and Uptime showing `other`. */
+  function snap(seq: number, text: string, other = UPTIME.text): TimerSnapshot {
+    return { seq, timers: [{ ...BRB, text }, { ...UPTIME, text: other }] };
+  }
+
+  const faceOf = (m: ReturnType<typeof mount>): HTMLElement | null =>
+    m.charm("face").querySelector<HTMLElement>("[data-timer-face]");
+
+  it("draws nothing before the backend's first snapshot, then the timer's text", () => {
+    const m = mount({ scene: timerScene(), status: locked() });
+    // Live, and placed, before any snapshot.
+    expectNear(rectOf(m.charm("face")), { x: 90, y: 30, w: 300, h: 100 }, 1e-9);
+    expect(faceOf(m)).toBeNull();
+    expect(m.charm("face").textContent).toBe("");
+    m.setTimers(SAMPLES.running);
+    expect(faceOf(m)!.textContent).toBe("04:59");
+    expect(faceOf(m)!.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("waits for its font: no face until fontReady, and no badge meanwhile", () => {
+    const m = mount({ scene: timerScene(), timers: SAMPLES.running, fontReady: false });
+    expect(faceOf(m)).toBeNull();
+    expect(m.charm("face").textContent).toBe("");
+    m.setFontReady(true);
+    expect(faceOf(m)!.textContent).toBe("04:59");
+  });
+
+  it("Locked, a timer the snapshot lacks draws nothing; Arrange says it's missing", () => {
+    const m = mount({ scene: timerScene({ timer: "timer-9" }), status: locked(), timers: SAMPLES.running });
+    expect(m.charm("face").textContent).toBe("");
+    m.setStatus(arranging());
+    expect(m.charm("face").querySelector("[data-missing]")!.textContent).toBe("Timer missing");
+    // The timer arrives: the badge goes and the face draws.
+    m.setTimers({ seq: 9, timers: [{ ...BRB, id: "timer-9" }] });
+    expect(m.charm("face").querySelector("[data-missing]")).toBeNull();
+    expect(faceOf(m)!.textContent).toBe("04:59");
+    // And goes (the timer deleted): Locked, nothing at all.
+    m.setStatus(locked());
+    m.setTimers({ seq: 10, timers: [] });
+    expect(faceOf(m)).toBeNull();
+    expect(m.charm("face").textContent).toBe("");
+  });
+
+  it("Arrange before any snapshot shows no badge, and still arranges the face", () => {
+    const m = mount({ scene: timerScene() });
+    expect(m.container.textContent).not.toContain("Timer missing");
+    expect(m.charm("face").querySelector("[data-outline]")).not.toBeNull();
+    expect(m.charm("face").tabIndex).toBe(0);
+    // The backend's first answer, without this timer.
+    m.setTimers({ seq: 1, timers: [] });
+    expect(m.container.textContent).toContain("Timer missing");
+  });
+
+  it("the text node is the same node across updates, and is written only when the text changes", () => {
+    const m = mount({ scene: timerScene(), status: locked(), timers: snap(1, "05:00") });
+    const face = faceOf(m)!;
+    const node = face.firstChild!;
+    expect(node.nodeType).toBe(Node.TEXT_NODE);
+    const seen = new MutationObserver(() => undefined);
+    seen.observe(m.charm("face"), { subtree: true, childList: true, characterData: true, attributes: true });
+    for (const [seq, text] of [
+      [2, "04:59"],
+      [3, "04:58"],
+      [4, "04:57"],
+    ] as const) {
+      m.setTimers(snap(seq, text));
+      expect(faceOf(m)).toBe(face);
+      expect(face.firstChild).toBe(node);
+      expect(node.textContent).toBe(text);
+    }
+    expect(seen.takeRecords().map((r) => [r.type, r.target])).toEqual([
+      ["characterData", node],
+      ["characterData", node],
+      ["characterData", node],
+    ]);
+    // Another timer's second: nothing here is written.
+    m.setTimers(snap(5, "04:57", "1:02:04"));
+    expect(seen.takeRecords()).toEqual([]);
+    seen.disconnect();
+  });
+
+  it("sizes its text to the box: 59:59 turning into 1:00:00 shrinks the font, not the box", () => {
+    const m = mount({ scene: timerScene(), status: locked(), timers: snap(1, "59:59") });
+    const r = rectOf(m.charm("face"));
+    expect(parseFloat(faceOf(m)!.style.fontSize)).toBeCloseTo(fitTimerFont(r.w, r.h, 5), 9);
+    m.setTimers(snap(2, "1:00:00"));
+    expect(parseFloat(faceOf(m)!.style.fontSize)).toBeCloseTo(fitTimerFont(r.w, r.h, 7), 9);
+    expect(fitTimerFont(r.w, r.h, 7)).toBeLessThan(fitTimerFont(r.w, r.h, 5));
+    expectNear(rectOf(m.charm("face")), r, 1e-9);
+  });
+
+  it("is white Space Mono Bold with an outline, centred, with no animation, transition or title", () => {
+    const m = mount({ scene: timerScene(), timers: SAMPLES.running });
+    const face = faceOf(m)!;
+    expect(face.style.fontFamily).toBe("var(--font-mono)");
+    expect(face.style.fontWeight).toBe("700");
+    expect(face.style.color).toBe("rgb(255, 255, 255)");
+    expect(face.style.textShadow).not.toBe("");
+    expect(face.style.whiteSpace).toBe("nowrap");
+    expect(face.style.justifyContent).toBe("center");
+    expect(face.style.alignItems).toBe("center");
+    expect(face.getAttribute("style")).not.toMatch(/animation|transition/);
+    expect(face.hasAttribute("class")).toBe(false);
+    expect(m.container.querySelectorAll("[title]")).toHaveLength(0);
+  });
+
+  it("its label names the timer and follows a rename", () => {
+    const m = mount({ scene: timerScene(), timers: SAMPLES.running });
+    expect(m.charm("face").getAttribute("role")).toBe("img");
+    expect(m.charm("face").getAttribute("aria-label")).toBe("Timer: BRB");
+    m.setTimers({ seq: 7, timers: [{ ...BRB, name: "Be right back" }] });
+    expect(m.charm("face").getAttribute("aria-label")).toBe("Timer: Be right back");
+    // The other charms keep theirs.
+    expect(m.charm("pic").getAttribute("aria-label")).toBe("Picture: wave.gif");
+  });
+
+  it("arranges like a picture: a drag is one place, a resize keeps its 3:1 shape, Delete removes it", () => {
+    const m = mount({ scene: timerScene(), timers: SAMPLES.running });
+    down(m.hitOf("face"), 240, 80);
+    move(250, 90);
+    up(250, 90);
+    expect(m.edits).toHaveLength(1);
+    const drag = m.edits[0] as Extract<SceneOp, { kind: "place" }>;
+    expect(drag).toMatchObject({ kind: "place", id: "face", viewport: V480 });
+    expectNear(drag.rect, { x: 100, y: 40, w: 300, h: 100 }, 1e-9);
+    const se =m.charm("face").querySelector<HTMLElement>('[data-handle][data-corner="se"]')!;
+    down(se, 400, 140);
+    move(430, 150);
+    up(430, 150);
+    const op = m.edits[1] as Extract<SceneOp, { kind: "place" }>;
+    expect(op.kind).toBe("place");
+    expect(op.rect.w).toBeGreaterThan(300);
+    // Its stored shape, to the 6 decimals the scene keeps.
+    expect(op.rect.w / op.rect.h).toBeCloseTo(3, 4);
+    key("Delete");
+    expect(m.edits.at(-1)).toEqual({ kind: "remove", id: "face" });
   });
 });

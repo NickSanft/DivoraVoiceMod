@@ -7,7 +7,10 @@
 //! clock once under the core's lock, checks that reading for a sleep, and
 //! hands both in; nothing here reads a clock, waits, touches a file or calls
 //! Tauri, so every rule is tested on any machine. `timer_thread.rs` is the
-//! shell around it.
+//! shell around it. What happens to a timer (a fire, an expiry, a sleep
+//! pause, a seed) is collected as a [`Transition`] for the timer thread to
+//! drain and log; the core itself logs only its rare clock decisions — a
+//! sleep handled, a wall-clock step followed — and a duplicate id.
 //!
 //! The clock is a `Duration` since a process origin (monotonic). Wall time
 //! (Unix ms) only sets the anchors a restart seeds from, and checks a sleep
@@ -21,6 +24,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use divora_capture::sleep::Discontinuities;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -44,6 +48,10 @@ pub const CLOCK_SLACK: Duration = Duration::from_secs(2);
 /// D5: no (b) check this soon after an (a): that sleep was counted, and a
 /// clock resync after the resume isn't another one.
 pub const RECENT_SLEEP: Duration = Duration::from_secs(60);
+
+/// D5 (a): a sleep signal whose reading is more than this past the reading
+/// before it means the clock counted the sleep. The sleep check's own bar.
+const CLOCK_SLEEP: Duration = Discontinuities::THRESHOLD;
 
 /// D3: a wall-clock step this big (wall − monotonic, in ms) …
 pub const ANCHOR_SLACK_MS: i64 = 1_000;
@@ -412,6 +420,69 @@ pub fn adjust_delta(delta_ms: f64) -> Result<i64, String> {
     Ok(delta)
 }
 
+/// What a stored run seeds (§7.8): the phase, the value (a countdown's left
+/// or a count-up's elapsed) and a countdown's total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seed {
+    phase: TimerPhase,
+    ms: u64,
+    total_ms: u64,
+}
+
+/// §7.8, D11: what `run` seeds, at `wall_ms`, for a timer of `kind` and
+/// length `length_ms` that the core has never accepted. Time passed while
+/// Divora was closed: a running countdown has `anchorMs − now` left (at most
+/// its total and 24 h, so a clock set back can't add time), or is `expired`
+/// if that is 0 or less; a running count-up has `now − anchorMs` (0 to
+/// 10 000 h). Paused, done and expired come back as they were.
+///
+/// `None` — the timer starts idle, its definition kept (D35) — for a run
+/// that can't be one: a running or paused countdown without `totalMs` (a
+/// running one with a total of 0), a paused countdown outside 1 ms .. 24 h, a
+/// paused count-up without `ms`, a count-up done or expired. A done or
+/// expired countdown needs no total: it takes its length's.
+///
+/// One helper, so v1.61.0's `SetElapsed` can reuse the arithmetic (D33).
+fn seed(kind: TimerKind, length_ms: u64, run: &TimerRun, wall_ms: i64) -> Option<Seed> {
+    let (phase, ms, total_ms) = match (kind, run.phase) {
+        (TimerKind::Countdown, TimerPhase::Running) => {
+            let total = run.total_ms.filter(|&total| total > 0)?;
+            let left = i128::from(run.anchor_ms?) - i128::from(wall_ms);
+            if left <= 0 {
+                (TimerPhase::Expired, 0, total)
+            } else {
+                let left = u64::try_from(left).unwrap_or(u64::MAX);
+                (
+                    TimerPhase::Running,
+                    left.min(total).min(MAX_LENGTH_MS),
+                    total,
+                )
+            }
+        }
+        (TimerKind::Countdown, TimerPhase::Paused) => {
+            let ms = run.ms.filter(|ms| (1..=MAX_LENGTH_MS).contains(ms))?;
+            (TimerPhase::Paused, ms, run.total_ms?.max(ms))
+        }
+        (TimerKind::Countdown, TimerPhase::Done | TimerPhase::Expired) => {
+            (run.phase, 0, run.total_ms.unwrap_or(length_ms))
+        }
+        (TimerKind::Countup, TimerPhase::Running) => {
+            let elapsed = i128::from(wall_ms) - i128::from(run.anchor_ms?);
+            let elapsed = u64::try_from(elapsed.max(0)).unwrap_or(u64::MAX);
+            (TimerPhase::Running, elapsed.min(MAX_SEED_ELAPSED_MS), 0)
+        }
+        (TimerKind::Countup, TimerPhase::Paused) => {
+            (TimerPhase::Paused, run.ms?.min(MAX_SEED_ELAPSED_MS), 0)
+        }
+        _ => return None,
+    };
+    Some(Seed {
+        phase,
+        ms,
+        total_ms,
+    })
+}
+
 /// One timer the core runs.
 ///
 /// A running timer holds `since` (the clock reading its run was last set
@@ -420,13 +491,13 @@ pub fn adjust_delta(delta_ms: f64) -> Result<i64, String> {
 /// negative `Duration`; a countdown's deadline is `since + base_ms`. Paused,
 /// `base_ms` is the value it stopped at; idle, a countdown's length or a
 /// count-up's 0; done or expired, 0.
-#[allow(dead_code)] // S1: built by track A's `sync`; until then the set stays empty
 #[derive(Debug)]
 struct Timer {
     id: String,
     name: String,
     kind: TimerKind,
-    /// The definition's length (a countdown's).
+    /// The definition's length (a countdown's), [`MIN_LENGTH_MS`] to
+    /// [`MAX_LENGTH_MS`].
     length_ms: u64,
     phase: TimerPhase,
     since: Duration,
@@ -440,6 +511,9 @@ struct Timer {
     /// `wall − clock` in ms when the anchor was set: a held wall step moves
     /// both (§7.2).
     anchor_offset_ms: i64,
+    /// When a wall step past [`ANCHOR_SLACK_MS`] was first seen, while it
+    /// lasts.
+    step_since: Option<Duration>,
     fires: u32,
     /// The text as last computed: every transition recomputes it, and a
     /// running timer's at each tick and snapshot.
@@ -447,6 +521,28 @@ struct Timer {
 }
 
 impl Timer {
+    /// Idle, as `def` defines it, with `fires` from 0: its id just entered
+    /// the set.
+    fn new(def: &TimerDef) -> Self {
+        let mut timer = Self {
+            id: def.id.clone(),
+            name: def.name.clone(),
+            kind: def.kind,
+            length_ms: def.duration_ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS),
+            phase: TimerPhase::Idle,
+            since: Duration::ZERO,
+            base_ms: 0,
+            total_ms: 0,
+            anchor_ms: None,
+            anchor_offset_ms: 0,
+            step_since: None,
+            fires: 0,
+            text: String::new(),
+        };
+        timer.reset(Duration::ZERO);
+        timer
+    }
+
     /// Its `ms` at `now` (D22): a running countdown's left rounded up, a
     /// running count-up's elapsed rounded down; otherwise `base_ms`.
     fn ms_at(&self, now: Duration) -> u64 {
@@ -465,6 +561,212 @@ impl Timer {
     fn deadline(&self) -> Duration {
         self.since
             .saturating_add(Duration::from_millis(self.base_ms))
+    }
+
+    /// Recomputes its text at `now`; whether it changed.
+    fn retext(&mut self, now: Duration) -> bool {
+        let text = timer_text(self.kind, self.ms_at(now));
+        let changed = text != self.text;
+        self.text = text;
+        changed
+    }
+
+    /// Running from `ms` (a countdown's left, a count-up's elapsed) at
+    /// `now`, with a new anchor: the wall ms a countdown ends at, or a
+    /// count-up effectively started at (D3).
+    fn run_from(&mut self, ms: u64, now: Duration, wall_ms: i64) {
+        self.phase = TimerPhase::Running;
+        self.since = now;
+        self.base_ms = ms;
+        self.anchor_ms = Some(match self.kind {
+            TimerKind::Countdown => wall_ms.saturating_add(signed(ms)),
+            TimerKind::Countup => wall_ms.saturating_sub(signed(ms)),
+        });
+        self.anchor_offset_ms = wall_ms.saturating_sub(clock_ms(now));
+        self.step_since = None;
+        self.retext(now);
+    }
+
+    /// Stopped at `ms` in `phase` (idle, paused, done, expired): no anchor.
+    fn stop(&mut self, phase: TimerPhase, ms: u64, now: Duration) {
+        self.phase = phase;
+        self.base_ms = ms;
+        self.anchor_ms = None;
+        self.step_since = None;
+        self.retext(now);
+    }
+
+    /// Idle: a countdown at its length, which is its total too; a count-up
+    /// at 0.
+    fn reset(&mut self, now: Duration) {
+        let ms = match self.kind {
+            TimerKind::Countdown => self.length_ms,
+            TimerKind::Countup => 0,
+        };
+        self.total_ms = ms;
+        self.stop(TimerPhase::Idle, ms, now);
+    }
+
+    /// D4: the one way a countdown gets to `done` — running, found at or
+    /// past its deadline, however late. `fires` + 1. A v1.60.0 Finish calls
+    /// it too, so "fires once" covers both.
+    fn fire(&mut self, now: Duration) -> Transition {
+        let late_ms = floor_ms(now.saturating_sub(self.deadline()));
+        self.fires = self.fires.saturating_add(1);
+        self.stop(TimerPhase::Done, 0, now);
+        Transition::Fired {
+            id: self.id.clone(),
+            fires: self.fires,
+            late_ms,
+        }
+    }
+
+    /// D2, D5: a countdown that ran out while the PC slept: `expired`, not
+    /// fired.
+    fn expire(&mut self, now: Duration) -> Transition {
+        self.stop(TimerPhase::Expired, 0, now);
+        Transition::Expired {
+            id: self.id.clone(),
+        }
+    }
+
+    /// D5, Q2: a count-up paused at `before`, the last reading before the PC
+    /// slept.
+    fn sleep_pause(&mut self, before: Duration, now: Duration) -> Transition {
+        let ms = self.ms_at(before);
+        self.stop(TimerPhase::Paused, ms, now);
+        Transition::SleepPaused {
+            id: self.id.clone(),
+        }
+    }
+
+    /// The seed of a stored run (§7.8).
+    fn take_seed(&mut self, seed: Seed, now: Duration, wall_ms: i64) {
+        self.total_ms = seed.total_ms;
+        if seed.phase == TimerPhase::Running {
+            self.run_from(seed.ms, now, wall_ms);
+        } else {
+            self.stop(seed.phase, seed.ms, now);
+        }
+    }
+
+    /// D15: a sync's definition for a timer the core already runs. A new
+    /// name or length changes only what it names — an idle countdown shows
+    /// its new length; one that runs, is paused or has ended keeps its run
+    /// until it starts again — and a new kind makes it idle.
+    fn redefine(&mut self, def: &TimerDef, now: Duration) {
+        self.name.clone_from(&def.name);
+        self.length_ms = def.duration_ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS);
+        if def.kind != self.kind || self.phase == TimerPhase::Idle {
+            self.kind = def.kind;
+            self.reset(now);
+        }
+    }
+
+    /// D6 (§7.1): `op` at `now`, after the tick. Labelled ops do only what
+    /// they name; Toggle decides from the phase. Whether anything changed.
+    fn apply(&mut self, op: TimerOp, now: Duration, wall_ms: i64) -> bool {
+        use TimerPhase::{Done, Expired, Idle, Paused, Running};
+        let op = match (op, self.phase) {
+            (TimerOp::Toggle, Idle | Done | Expired) => TimerOp::Arm,
+            (TimerOp::Toggle, Running) => TimerOp::Pause,
+            (TimerOp::Toggle, Paused) => TimerOp::Resume,
+            (op, _) => op,
+        };
+        match (op, self.phase) {
+            (TimerOp::Arm, Idle | Done | Expired) => {
+                // From the full length (a count-up from 0), its total reset.
+                self.reset(now);
+                self.run_from(self.base_ms, now, wall_ms);
+            }
+            (TimerOp::Pause, Running) => {
+                let ms = self.ms_at(now);
+                self.stop(Paused, ms, now);
+            }
+            (TimerOp::Resume, Paused) => self.run_from(self.base_ms, now, wall_ms),
+            (TimerOp::Reset, Running | Paused | Done | Expired) => self.reset(now),
+            (TimerOp::Adjust(delta_ms), Running | Paused) => {
+                return self.adjust(delta_ms, now, wall_ms);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// D7 (§7.3): a running or paused timer moved by `delta_ms`. A countdown
+    /// keeps at most 24 h left and, going down, at least 1 s — a left
+    /// already under 1 s stays as it is — so −30 s never ends one (End now
+    /// is v1.60.0's deliberate way); its total moves by what its left moved,
+    /// so it can pass 24 h. A count-up stops at 0. A running timer runs on
+    /// from the new value, rounded as D22 says, with a new anchor. Whether
+    /// anything changed.
+    fn adjust(&mut self, delta_ms: i64, now: Duration, wall_ms: i64) -> bool {
+        let ms = self.ms_at(now);
+        let by = delta_ms.unsigned_abs();
+        let next = match (self.kind, delta_ms >= 0) {
+            // Never lower than it was, whatever the cap.
+            (TimerKind::Countdown, true) => ms.saturating_add(by).min(MAX_LENGTH_MS).max(ms),
+            // The shortest length is the floor; under it already, no lower.
+            (TimerKind::Countdown, false) => ms.saturating_sub(by).max(ms.min(MIN_LENGTH_MS)),
+            (TimerKind::Countup, true) => ms.saturating_add(by),
+            (TimerKind::Countup, false) => ms.saturating_sub(by),
+        };
+        if next == ms {
+            return false;
+        }
+        if self.kind == TimerKind::Countdown {
+            self.total_ms = if next > ms {
+                self.total_ms.saturating_add(next - ms)
+            } else {
+                self.total_ms.saturating_sub(ms - next)
+            };
+        }
+        if self.phase == TimerPhase::Running {
+            self.run_from(next, now, wall_ms);
+        } else {
+            self.base_ms = next;
+            self.retext(now);
+        }
+        true
+    }
+
+    /// §7.2, D3: a wall-clock step past [`ANCHOR_SLACK_MS`] — the wall less
+    /// the clock, against what it was when the anchor was set — that still
+    /// holds [`ANCHOR_HOLD`] after it was first seen moves the anchor by the
+    /// step, so a restart doesn't move the timer by a step taken while it ran
+    /// (a resync after a resume, the user setting the clock). The hold lets
+    /// a late sleep signal's (b) go first. A step that goes back within the
+    /// slack is forgotten. The live time runs on the clock and doesn't move.
+    /// Whether the anchor moved.
+    fn follow_wall(&mut self, now: Duration, wall_ms: i64) -> bool {
+        let (TimerPhase::Running, Some(anchor)) = (self.phase, self.anchor_ms) else {
+            return false;
+        };
+        let step = wall_ms
+            .saturating_sub(clock_ms(now))
+            .saturating_sub(self.anchor_offset_ms);
+        if step.unsigned_abs() <= ANCHOR_SLACK_MS.unsigned_abs() {
+            self.step_since = None;
+            return false;
+        }
+        match self.step_since {
+            None => {
+                self.step_since = Some(now);
+                false
+            }
+            Some(seen) if now.saturating_sub(seen) >= ANCHOR_HOLD => {
+                self.anchor_ms = Some(anchor.saturating_add(step));
+                self.anchor_offset_ms = self.anchor_offset_ms.saturating_add(step);
+                self.step_since = None;
+                tracing::info!(
+                    id = %self.id,
+                    step_ms = step,
+                    "timers: the wall clock moved; the anchor follows"
+                );
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     /// §7.5: how long until a running timer's text next changes — a
@@ -512,18 +814,32 @@ fn floor_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// `ms` as a signed count, saturating.
+fn signed(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+/// The clock in whole ms, to set against the wall's.
+fn clock_ms(now: Duration) -> i64 {
+    signed(floor_ms(now))
+}
+
+/// `d` in ns, signed, for the (b) comparisons.
+fn nanos(d: Duration) -> i128 {
+    i128::try_from(d.as_nanos()).unwrap_or(i128::MAX)
+}
+
 /// The timers and every deadline (D4-D11, D34-D36).
 ///
 /// Every entry point runs [`TimerCore::tick`] first, with the one clock
 /// reading and the sleep check its caller took under the core's lock:
 /// `now` (the monotonic clock), `wall_ms` (Unix ms) and `slept_from`
 /// (`Some(before)` when the PC slept since the last reader: `before` is the
-/// last reading anyone took awake). Every arithmetic step saturates: a panic
-/// aborts the app.
-///
-/// S1: the bodies an empty core needs — the timer thread ticks one from
-/// startup until the page's first sync — are real; [`TimerCore::sync`],
-/// and `tick` and `apply` on a timer, are track A's.
+/// last reading anyone took awake). The sleep check reports each sleep once,
+/// to whichever reader comes first, and the core acts on it then — with no
+/// timers, only noting it for [`RECENT_SLEEP`] — so a sleep never reaches a
+/// timer added after it. Every arithmetic step saturates: a panic aborts the
+/// app.
 #[derive(Debug)]
 pub struct TimerCore {
     /// In sync order.
@@ -531,7 +847,6 @@ pub struct TimerCore {
     /// Ids of entries kept, not run (D36): their files stay.
     kept: Vec<String>,
     /// Ids accepted this process: only these ignore a stored run (D10).
-    #[allow(dead_code)] // S1: track A's `sync` reads it
     seen: HashSet<String>,
     transitions: Vec<Transition>,
     seq: u64,
@@ -539,7 +854,6 @@ pub struct TimerCore {
     synced: bool,
     /// When a clock-counted sleep (D5 (a)) was last handled: no (b) for
     /// [`RECENT_SLEEP`] after it.
-    #[allow(dead_code)] // S1: track A's `tick` reads it
     last_clock_sleep: Option<Duration>,
 }
 
@@ -559,27 +873,153 @@ impl TimerCore {
 
     /// D5, D3, D4 (§7.2), for running timers, in order: the sleep rule
     /// ((a) a clock-counted sleep, (b) a signal the clock missed, checked
-    /// against the wall anchors), held wall steps, settle (fires each due
-    /// countdown once, however late, `fires` +1, [`Transition::Fired`]),
-    /// then texts (dirty when one changed). With nothing running there is
-    /// nothing to do.
-    #[allow(unused_variables)] // S1: track A's body uses them
+    /// against the wall anchors), held wall steps (only with no sleep),
+    /// settle (fires each due countdown once, however late, `fires` +1,
+    /// [`Transition::Fired`]), then texts (dirty when one changed). With no
+    /// timers it still notes an (a), so the 60 s rule covers timers added
+    /// soon after.
     pub fn tick(&mut self, now: Duration, wall_ms: i64, slept_from: Option<Duration>) {
-        if self.timers.is_empty() {
-            return;
+        match slept_from {
+            Some(before) if now.saturating_sub(before) > CLOCK_SLEEP => {
+                self.clock_slept(now, before);
+            }
+            Some(before) => {
+                // Within a minute of an (a), that sleep was counted, and a
+                // clock resync after the resume isn't another one.
+                if self
+                    .last_clock_sleep
+                    .is_none_or(|at| now.saturating_sub(at) >= RECENT_SLEEP)
+                {
+                    self.wall_slept(now, wall_ms, before);
+                }
+            }
+            None => {
+                for t in &mut self.timers {
+                    if t.follow_wall(now, wall_ms) {
+                        self.dirty = true;
+                    }
+                }
+            }
         }
-        todo!("track A: §7.2")
+        for t in &mut self.timers {
+            if t.phase != TimerPhase::Running {
+                continue;
+            }
+            if t.kind == TimerKind::Countdown && t.deadline() <= now {
+                self.transitions.push(t.fire(now));
+                self.dirty = true;
+            } else if t.retext(now) {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// D5 (a): the PC slept from `before`, and the clock counted it. A
+    /// countdown whose deadline fell in the sleep expires, unfired (the
+    /// check at `before` would have fired one due by then); one still ahead
+    /// keeps running, the sleep counted; a count-up pauses at `before` (Q2).
+    fn clock_slept(&mut self, now: Duration, before: Duration) {
+        self.last_clock_sleep = Some(now);
+        let (mut running, mut expired, mut paused) = (0_usize, 0_usize, 0_usize);
+        for t in &mut self.timers {
+            if t.phase != TimerPhase::Running {
+                continue;
+            }
+            running += 1;
+            let ended = match t.kind {
+                TimerKind::Countdown if t.deadline() <= now => {
+                    expired += 1;
+                    t.expire(now)
+                }
+                TimerKind::Countdown => continue,
+                TimerKind::Countup => {
+                    paused += 1;
+                    t.sleep_pause(before, now)
+                }
+            };
+            self.transitions.push(ended);
+            self.dirty = true;
+        }
+        if running > 0 {
+            tracing::info!(
+                slept_ms = floor_ms(now.saturating_sub(before)),
+                running,
+                expired,
+                paused,
+                "timers: the PC slept, and the clock counted it"
+            );
+        }
+    }
+
+    /// D5 (b): a sleep signal with no clock jump — Windows' notification
+    /// arriving late, or a clock that didn't count the sleep. Each running
+    /// timer is checked against its wall anchor. A countdown with more than
+    /// [`CLOCK_SLACK`] more left on the clock than on the wall missed the
+    /// sleep: `expired` if the wall says it has ended, else running on with
+    /// the wall's left. A count-up the wall says has counted more than
+    /// [`CLOCK_SLACK`] beyond the clock pauses at `before`. Agreement changes
+    /// nothing.
+    fn wall_slept(&mut self, now: Duration, wall_ms: i64, before: Duration) {
+        const NS_PER_MS: i128 = 1_000_000;
+        let slack = nanos(CLOCK_SLACK);
+        let (mut running, mut corrected, mut expired, mut paused) =
+            (0_usize, 0_usize, 0_usize, 0_usize);
+        for t in &mut self.timers {
+            let (TimerPhase::Running, Some(anchor)) = (t.phase, t.anchor_ms) else {
+                continue;
+            };
+            running += 1;
+            match t.kind {
+                TimerKind::Countdown => {
+                    let clock_left = nanos(t.deadline()) - nanos(now);
+                    let wall_left_ms = i128::from(anchor) - i128::from(wall_ms);
+                    if clock_left - wall_left_ms * NS_PER_MS <= slack {
+                        continue;
+                    }
+                    if wall_left_ms <= 0 {
+                        expired += 1;
+                        self.transitions.push(t.expire(now));
+                    } else {
+                        corrected += 1;
+                        let left = u64::try_from(wall_left_ms).unwrap_or(u64::MAX);
+                        t.run_from(left, now, wall_ms);
+                    }
+                }
+                TimerKind::Countup => {
+                    let clock_elapsed = nanos(
+                        Duration::from_millis(t.base_ms)
+                            .saturating_add(now.saturating_sub(t.since)),
+                    );
+                    let wall_elapsed = (i128::from(wall_ms) - i128::from(anchor)) * NS_PER_MS;
+                    if wall_elapsed - clock_elapsed <= slack {
+                        continue;
+                    }
+                    paused += 1;
+                    self.transitions.push(t.sleep_pause(before, now));
+                }
+            }
+            self.dirty = true;
+        }
+        if running > 0 {
+            tracing::info!(
+                running,
+                corrected,
+                expired,
+                paused,
+                "timers: a sleep signal with no clock jump; checked against the wall clock"
+            );
+        }
     }
 
     /// D15, D35, D36: the set becomes `entries`, in order. `tick` first. The
     /// first [`MAX_TIMERS`] definitions run; the rest, and every
     /// [`WireEntry::Kept`], are kept, not run; duplicates after the first are
-    /// skipped. A timer the core already runs keeps its run (a rename or a
-    /// new length changes only what it names; a kind change makes it idle);
-    /// an id it has never accepted is seeded from its `resume` (§7.8,
-    /// [`Transition::Seeded`]). Marks dirty and synced. Returns the ids that
-    /// left.
-    #[allow(unused_variables, clippy::unused_self)] // S1: track A's body
+    /// skipped and logged. A timer the core already runs keeps its run (a
+    /// rename or a new length changes only what it names; a kind change
+    /// makes it idle); an id it doesn't run starts idle with `fires` 0, or —
+    /// if the core has never accepted that id in this process — from its
+    /// `resume` (§7.8, [`Transition::Seeded`]). Marks dirty and synced.
+    /// Returns the ids that left, in their old order.
     pub fn sync(
         &mut self,
         entries: Vec<WireEntry>,
@@ -587,13 +1027,70 @@ impl TimerCore {
         wall_ms: i64,
         slept_from: Option<Duration>,
     ) -> Vec<String> {
-        todo!("track A: D15, D35, D36, §7.8")
+        self.tick(now, wall_ms, slept_from);
+        let mut before = std::mem::take(&mut self.timers);
+        let mut ids = HashSet::new();
+        self.kept.clear();
+        for entry in entries {
+            let id = match &entry {
+                WireEntry::Def(def) => &def.id,
+                WireEntry::Kept(id) => id,
+            };
+            if !ids.insert(id.clone()) {
+                tracing::warn!(id = %id, "sync_timers: a duplicate id skipped");
+                continue;
+            }
+            let def = match entry {
+                WireEntry::Def(def) if self.timers.len() < MAX_TIMERS => def,
+                // Past the 16th: kept, and not accepted, so its stored run
+                // still seeds it if it comes to run.
+                WireEntry::Def(TimerDef { id, .. }) | WireEntry::Kept(id) => {
+                    self.kept.push(id);
+                    continue;
+                }
+            };
+            let timer = match before.iter().position(|t| t.id == def.id) {
+                Some(i) => {
+                    let mut timer = before.remove(i);
+                    timer.redefine(&def, now);
+                    timer
+                }
+                None => self.accept(&def, now, wall_ms),
+            };
+            self.timers.push(timer);
+        }
+        self.dirty = true;
+        self.synced = true;
+        before.into_iter().map(|t| t.id).collect()
+    }
+
+    /// A definition whose id the set didn't have: idle with `fires` 0 (D33:
+    /// fires count per definition), unless this is the core's first
+    /// acceptance of the id in this process and it carries a stored run that
+    /// seeds one (D10). An id accepted before — deleted and added again —
+    /// ignores its run: Rust wins.
+    fn accept(&mut self, def: &TimerDef, now: Duration, wall_ms: i64) -> Timer {
+        let mut timer = Timer::new(def);
+        let first = self.seen.insert(def.id.clone());
+        let seeded = def
+            .resume
+            .as_ref()
+            .filter(|_| first)
+            .and_then(|run| seed(timer.kind, timer.length_ms, run, wall_ms));
+        if let Some(seeded) = seeded {
+            timer.take_seed(seeded, now, wall_ms);
+            self.transitions.push(Transition::Seeded {
+                id: timer.id.clone(),
+                phase: timer.phase,
+            });
+        }
+        timer
     }
 
     /// D6, D7 (§7.1, §7.3): `op` on the timer `id`. `tick` first, so a due
-    /// countdown fires before the op. A labelled op that doesn't fit the
-    /// phase changes nothing. `Err` for an id the core doesn't run.
-    #[allow(unused_variables)] // S1: track A's body uses them
+    /// countdown fires before the op (a Toggle then starts it again), and a
+    /// sleep is handled before anything starts. A labelled op that doesn't
+    /// fit the phase changes nothing. `Err` for an id the core doesn't run.
     pub fn apply(
         &mut self,
         id: &str,
@@ -603,10 +1100,11 @@ impl TimerCore {
         slept_from: Option<Duration>,
     ) -> Result<(), NoTimer> {
         self.tick(now, wall_ms, slept_from);
-        let Some(timer) = self.timers.iter_mut().find(|t| t.id == id) else {
-            return Err(NoTimer);
-        };
-        todo!("track A: §7.1, §7.3")
+        let timer = self.timers.iter_mut().find(|t| t.id == id).ok_or(NoTimer)?;
+        if timer.apply(op, now, wall_ms) {
+            self.dirty = true;
+        }
+        Ok(())
     }
 
     /// `seq` + 1, then the set at `now`. A running timer's text is
@@ -694,12 +1192,13 @@ impl Default for TimerCore {
 
 #[cfg(test)]
 mod tests {
+    use super::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use super::{
         adjust_delta, entry_from_wire, hotkey_timer_request, is_timer_id, run_from_wire,
         timer_text, NoTimer, TextUpdate, TimerCore, TimerDef, TimerKind, TimerOp, TimerPhase,
-        TimerRun, TimerSnapshot, TimerState, WireEntry, DEFAULT_LENGTH_MS, MAX_ID_CHARS,
-        MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_SYNC_ENTRIES, MAX_TIMERS, MIN_LENGTH_MS, TICK,
-        TIMER_STATE_EVENT,
+        TimerRun, TimerSnapshot, TimerState, Transition, WireEntry, DEFAULT_LENGTH_MS,
+        MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_SEED_ELAPSED_MS, MAX_SYNC_ENTRIES,
+        MAX_TIMERS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
     };
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -929,8 +1428,10 @@ mod tests {
     }
 
     /// §7.14, an entry at a time: what is skipped (and why), what is kept
-    /// unrun, and a name that falls back. (Track A adds the sync of them
-    /// all.)
+    /// unrun, and a name that falls back; then one sync of every kind of bad
+    /// entry beside a good one, read the way `sync_timers` reads them. The
+    /// call answers the whole set: the good timer running, each bad field
+    /// fallen back, the unknown kind kept and the unreadable ones skipped.
     #[test]
     fn entry_from_wire_table() {
         let skipped = |why: &str| Err(why.to_string());
@@ -976,6 +1477,52 @@ mod tests {
         ] {
             assert_eq!(entry_from_wire(&entry), want, "{entry}");
         }
+
+        let sent = [
+            json!({"id": 5, "kind": "countdown"}),
+            json!({"id": "timer-2", "name": null, "kind": "countdown", "durationMs": 60_000}),
+            json!({"id": "timer-3", "name": "Below", "kind": "countdown", "durationMs": -1}),
+            json!({"id": "timer-4", "name": "Half", "kind": "countdown", "durationMs": 1.5}),
+            json!({"id": "timer-5", "name": "Text", "kind": "countdown", "durationMs": "300000"}),
+            json!({"id": "timer-6", "name": "Empty", "kind": "countdown", "durationMs": 60_000,
+                   "resume": {}}),
+            json!({"id": "timer-7", "name": "Bad", "kind": "countdown", "durationMs": 60_000,
+                   "resume": {"phase": "running", "anchorMs": "x"}}),
+            json!({"id": "timer-8", "name": "Later", "kind": "interval"}),
+            json!({"id": "timer-9", "name": "No kind"}),
+            json!({"id": "timer-1", "name": "BRB", "kind": "countdown", "durationMs": 300_000,
+                   "resume": {"phase": "running", "totalMs": 300_000,
+                              "anchorMs": WALL0 + 120_000}}),
+        ];
+        let mut core = TimerCore::new();
+        let read = sent
+            .iter()
+            .filter_map(|v| entry_from_wire(v).ok())
+            .collect();
+        core.sync(read, Duration::ZERO, WALL0, None);
+        let shown: Vec<(String, String, TimerPhase, String)> = core
+            .snapshot(Duration::ZERO)
+            .timers
+            .into_iter()
+            .map(|t| (t.id, t.name, t.phase, t.text))
+            .collect();
+        let row = |id: &str, name: &str, phase, text: &str| {
+            (id.to_string(), name.to_string(), phase, text.to_string())
+        };
+        assert_eq!(
+            shown,
+            vec![
+                row("timer-2", "Countdown", Idle, "01:00"),
+                row("timer-3", "Below", Idle, "00:01"),
+                row("timer-4", "Half", Idle, "00:01"),
+                row("timer-5", "Text", Idle, "05:00"),
+                row("timer-6", "Empty", Idle, "01:00"),
+                row("timer-7", "Bad", Idle, "01:00"),
+                row("timer-1", "BRB", Running, "02:00"),
+            ]
+        );
+        let keep = core.text_update().keep;
+        assert!(keep.contains(&"timer-8".to_string()) && !keep.contains(&"timer-9".to_string()));
     }
 
     /// §7.14 again: a bad length or a bad `resume` falls back without failing
@@ -1125,9 +1672,10 @@ mod tests {
         }
     }
 
-    /// S1's promise to the timer thread: an empty core — every launch, until
-    /// the page's first sync — ticks, snapshots, drains and answers without
-    /// reaching track A's bodies, and asks for a wait of `cap`.
+    /// The timer thread's every launch: an empty core — until the page's
+    /// first sync, or for good with no `divora.timers` — ticks (a sleep
+    /// included), snapshots, drains and answers quietly, and asks for a wait
+    /// of `cap`.
     #[test]
     fn an_empty_core_is_quiet() {
         let mut core = TimerCore::default();
@@ -1147,5 +1695,1672 @@ mod tests {
         assert_eq!(first.timers, Vec::new());
         assert!(second.seq > first.seq);
         assert_eq!(NoTimer.to_string(), "no such timer");
+    }
+
+    // ---- The core (§10.1). Times are on the core's clock; the wall is
+    // ---- `WALL0` at clock 0 and keeps step with it unless a test says.
+
+    /// The fixture's T0: the wall clock when the core's clock reads 0.
+    const WALL0: i64 = 1_793_217_600_000;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// The wall clock of an awake PC nobody set: in step with the core's.
+    fn wall(now: Duration) -> i64 {
+        WALL0 + i64::try_from(now.as_millis()).unwrap()
+    }
+
+    /// A countdown sync entry named after its id.
+    fn countdown(id: &str, length_ms: u64) -> WireEntry {
+        WireEntry::Def(TimerDef {
+            id: id.into(),
+            name: id.into(),
+            kind: TimerKind::Countdown,
+            duration_ms: length_ms,
+            resume: None,
+        })
+    }
+
+    /// A count-up sync entry named after its id.
+    fn countup(id: &str) -> WireEntry {
+        WireEntry::Def(TimerDef {
+            id: id.into(),
+            name: id.into(),
+            kind: TimerKind::Countup,
+            duration_ms: DEFAULT_LENGTH_MS,
+            resume: None,
+        })
+    }
+
+    /// `entry`, its definition changed.
+    fn edit(entry: WireEntry, change: impl FnOnce(&mut TimerDef)) -> WireEntry {
+        let WireEntry::Def(mut def) = entry else {
+            panic!("a definition");
+        };
+        change(&mut def);
+        WireEntry::Def(def)
+    }
+
+    /// A stored run.
+    fn stored(
+        phase: TimerPhase,
+        ms: Option<u64>,
+        total: Option<u64>,
+        anchor: Option<i64>,
+    ) -> TimerRun {
+        TimerRun {
+            phase,
+            ms,
+            total_ms: total,
+            anchor_ms: anchor,
+        }
+    }
+
+    /// A core running `entries`, synced at 0, the sync's dirt and seeds
+    /// already taken.
+    fn core_with(entries: Vec<WireEntry>) -> TimerCore {
+        let mut core = TimerCore::new();
+        core.sync(entries, Duration::ZERO, WALL0, None);
+        core.take_dirty();
+        core.take_transitions();
+        core
+    }
+
+    /// An awake reader's tick at `now`.
+    fn tick(core: &mut TimerCore, now: Duration) {
+        core.tick(now, wall(now), None);
+    }
+
+    /// An awake reader's `op` at `now` on a timer the core runs.
+    fn op(core: &mut TimerCore, id: &str, op: TimerOp, now: Duration) {
+        core.apply(id, op, now, wall(now), None).unwrap();
+    }
+
+    /// `id` as a snapshot at `now` shows it.
+    fn state(core: &mut TimerCore, now: Duration, id: &str) -> TimerState {
+        core.snapshot(now)
+            .timers
+            .into_iter()
+            .find(|t| t.id == id)
+            .unwrap_or_else(|| panic!("{id} runs"))
+    }
+
+    /// `id`'s phase, `ms` and text at `now`.
+    fn shown(core: &mut TimerCore, now: Duration, id: &str) -> (TimerPhase, u64, String) {
+        let s = state(core, now, id);
+        (s.phase, s.ms, s.text)
+    }
+
+    fn fired(id: &str, fires: u32, late_ms: u64) -> Transition {
+        Transition::Fired {
+            id: id.into(),
+            fires,
+            late_ms,
+        }
+    }
+
+    /// D4: armed for 5 s and ticked every 10 ms to 20 s, a countdown fires
+    /// once — done, `fires` 1, one `Fired` — and never again.
+    #[test]
+    fn fires_exactly_once() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        let mut now = Duration::ZERO;
+        while now < secs(20) {
+            now += ms(10);
+            tick(&mut core, now);
+        }
+        let s = state(&mut core, now, "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.fires),
+            (Done, 0, "00:00", 1)
+        );
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 0)]);
+    }
+
+    /// D4, D22: a nanosecond before its deadline a countdown runs with 1 ms
+    /// left and shows `00:01`; at the deadline it is done and shows `00:00`.
+    #[test]
+    fn never_fires_early() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, secs(1));
+        let almost = secs(6).saturating_sub(Duration::from_nanos(1));
+        tick(&mut core, almost);
+        assert_eq!(
+            shown(&mut core, almost, "timer-1"),
+            (Running, 1, "00:01".into())
+        );
+        assert_eq!(core.take_transitions(), vec![]);
+        tick(&mut core, secs(6));
+        assert_eq!(
+            shown(&mut core, secs(6), "timer-1"),
+            (Done, 0, "00:00".into())
+        );
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 0)]);
+    }
+
+    /// D4: each Arm allows one fire; a countdown started again from `done`
+    /// fires again, once.
+    #[test]
+    fn a_rearmed_countdown_fires_again_once() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(5));
+        op(&mut core, "timer-1", TimerOp::Arm, secs(6));
+        assert_eq!(
+            shown(&mut core, secs(6), "timer-1"),
+            (Running, 5_000, "00:05".into())
+        );
+        for t in 7..=20 {
+            tick(&mut core, secs(t));
+        }
+        let s = state(&mut core, secs(20), "timer-1");
+        assert_eq!((s.phase, s.fires), (Done, 2));
+        assert_eq!(
+            core.take_transitions(),
+            vec![fired("timer-1", 1, 0), fired("timer-1", 2, 0)]
+        );
+    }
+
+    /// D34: a fire an op's own tick takes — a Pause 1.5 s past the deadline
+    /// with no tick between — is recorded where it happens and reported once,
+    /// at the next drain. The Pause then finds the timer done and changes
+    /// nothing, so nothing ever pauses at 0.
+    #[test]
+    fn a_fire_taken_by_an_op_is_reported_once() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-1", TimerOp::Pause, ms(6_500));
+        let s = state(&mut core, ms(6_500), "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.fires),
+            (Done, 0, "00:00", 1)
+        );
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 1_500)]);
+        tick(&mut core, secs(7));
+        op(&mut core, "timer-1", TimerOp::Pause, secs(8));
+        assert_eq!(core.take_transitions(), vec![]);
+    }
+
+    /// D6: a Toggle that finds its countdown due fires it first, then starts
+    /// it again from its length: `fires` + 1, running, one `Fired`.
+    #[test]
+    fn a_toggle_at_the_deadline_fires_then_rearms() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-1", TimerOp::Toggle, ms(5_001));
+        let s = state(&mut core, ms(5_001), "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.fires),
+            (Running, 5_000, "00:05", 1)
+        );
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 1)]);
+    }
+
+    /// D5 (a): a countdown whose deadline fell inside a sleep the clock
+    /// counted is `expired` at the first reading after it, never fired.
+    #[test]
+    fn a_countdown_that_ran_out_asleep_expires_unfired() {
+        let mut core = core_with(vec![countdown("timer-1", 60_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(30));
+        // Down after the reading at 30 s; back ten minutes later.
+        let back = secs(30 + 600);
+        core.tick(back, wall(back), Some(secs(30)));
+        let s = state(&mut core, back, "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.fires, s.anchor_ms),
+            (Expired, 0, "00:00", 0, None)
+        );
+        tick(&mut core, back + secs(1));
+        assert_eq!(
+            core.take_transitions(),
+            vec![Transition::Expired {
+                id: "timer-1".into()
+            }]
+        );
+    }
+
+    /// D5 (a): a countdown due after the resume keeps running, and the sleep
+    /// counts: 120 s, 10.1 s awake and 60 s asleep leave 49.9 s.
+    #[test]
+    fn a_countdown_counts_the_sleep() {
+        let mut core = core_with(vec![countdown("timer-1", 120_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(10));
+        let back = ms(70_100);
+        core.tick(back, wall(back), Some(secs(10)));
+        assert_eq!(
+            shown(&mut core, back, "timer-1"),
+            (Running, 49_900, "00:50".into())
+        );
+        assert_eq!(core.take_transitions(), vec![]);
+    }
+
+    /// D5 (a), Q2: a count-up pauses at the last reading before the sleep,
+    /// and stays there.
+    #[test]
+    fn a_countup_pauses_where_the_pc_slept() {
+        let mut core = core_with(vec![countup("timer-2")]);
+        op(&mut core, "timer-2", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, ms(10_250));
+        let back = ms(10_250) + secs(3_600);
+        core.tick(back, wall(back), Some(ms(10_250)));
+        assert_eq!(
+            shown(&mut core, back, "timer-2"),
+            (Paused, 10_250, "00:10".into())
+        );
+        let later = back + secs(5);
+        tick(&mut core, later);
+        assert_eq!(
+            shown(&mut core, later, "timer-2"),
+            (Paused, 10_250, "00:10".into())
+        );
+        assert_eq!(
+            core.take_transitions(),
+            vec![Transition::SleepPaused {
+                id: "timer-2".into()
+            }]
+        );
+    }
+
+    /// D5, Q9: held up for 10 s with the PC awake (a debugger, a starved
+    /// CPU), a countdown due 5 s ago fires late, its lateness reported.
+    #[test]
+    fn a_late_countdown_fires_late_when_awake() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(10));
+        let s = state(&mut core, secs(10), "timer-1");
+        assert_eq!((s.phase, s.fires), (Done, 1));
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 5_000)]);
+    }
+
+    /// D5, WF5: Windows' notification can come more than 5 s after the jump
+    /// the sleep check already reported, as a second signal with `before`
+    /// one reading old. After an (a): a count-up running again, and a
+    /// countdown due between the last two readings. The count-up runs on and
+    /// the countdown fires; nothing expires or pauses.
+    #[test]
+    fn a_late_second_signal_changes_nothing() {
+        let mut core = core_with(vec![countup("timer-1"), countdown("timer-2", 3_050)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(1));
+        let back = secs(1 + 3_600);
+        core.tick(back, wall(back), Some(secs(1)));
+        assert_eq!(state(&mut core, back, "timer-1").phase, Paused);
+        core.take_transitions();
+        op(&mut core, "timer-1", TimerOp::Resume, back + secs(3));
+        op(&mut core, "timer-2", TimerOp::Arm, back + secs(3));
+        let mut now = back + secs(3);
+        while now < back + secs(6) {
+            now += ms(100);
+            tick(&mut core, now);
+        }
+        let late = back + ms(6_100);
+        core.tick(late, wall(late), Some(now));
+        assert_eq!(
+            shown(&mut core, late, "timer-1"),
+            (Running, 4_100, "00:04".into())
+        );
+        let s = state(&mut core, late, "timer-2");
+        assert_eq!((s.phase, s.fires), (Done, 1));
+        assert_eq!(core.take_transitions(), vec![fired("timer-2", 1, 50)]);
+    }
+
+    /// D5 (b), K2: the clock stood still through a 10-minute sleep while the
+    /// wall moved on, and the signal came three readings late with a 100 ms
+    /// gap. Each running timer's wall anchor decides: the countdown due
+    /// inside the sleep expires, the one due after it gets the wall's left,
+    /// the count-up pauses at its reading before the signal.
+    #[test]
+    fn a_clock_that_missed_the_sleep_is_caught_by_the_wall() {
+        let mut core = core_with(vec![
+            countdown("timer-1", 300_000),
+            countdown("timer-2", 900_000),
+            countup("timer-3"),
+        ]);
+        for id in ["timer-1", "timer-2", "timer-3"] {
+            op(&mut core, id, TimerOp::Arm, Duration::ZERO);
+        }
+        let mut now = Duration::ZERO;
+        while now < secs(10) {
+            now += ms(100);
+            tick(&mut core, now);
+        }
+        let woke = |now: Duration| wall(now) + 600_000;
+        for _ in 0..3 {
+            now += ms(100);
+            core.tick(now, woke(now), None);
+        }
+        let before = now;
+        now += ms(100);
+        core.tick(now, woke(now), Some(before));
+        let s1 = state(&mut core, now, "timer-1");
+        assert_eq!(
+            (s1.phase, s1.fires, s1.text.as_str()),
+            (Expired, 0, "00:00")
+        );
+        // The wall's left: 15:00 − 10:10.4.
+        let s2 = state(&mut core, now, "timer-2");
+        assert_eq!(
+            (s2.phase, s2.ms, s2.text.as_str(), s2.anchor_ms),
+            (Running, 289_600, "04:50", Some(WALL0 + 900_000))
+        );
+        assert_eq!(
+            shown(&mut core, now, "timer-3"),
+            (Paused, 10_300, "00:10".into())
+        );
+        assert_eq!(
+            core.take_transitions(),
+            vec![
+                Transition::Expired {
+                    id: "timer-1".into()
+                },
+                Transition::SleepPaused {
+                    id: "timer-3".into()
+                }
+            ]
+        );
+        // From there it runs on the clock, its anchor where it was.
+        let later = now + secs(10);
+        core.tick(later, woke(later), None);
+        let s2 = state(&mut core, later, "timer-2");
+        assert_eq!((s2.ms, s2.anchor_ms), (279_600, Some(WALL0 + 900_000)));
+    }
+
+    /// D5: the same sleep with the clock counting it is (a)'s, at the first
+    /// reading. Windows then resyncs the wall by +3 s, and its notification
+    /// lands 6 s after the jump: skipped by the 60 s rule, so the countdown
+    /// keeps the clock's time and isn't shortened by the resync.
+    #[test]
+    fn instant_counted_the_sleep_is_left_to_a() {
+        let mut core = core_with(vec![countdown("timer-1", 900_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        let mut now = Duration::ZERO;
+        while now < secs(10) {
+            now += ms(100);
+            tick(&mut core, now);
+        }
+        let resumed = now + secs(600) + ms(100);
+        core.tick(resumed, wall(resumed), Some(now));
+        assert_eq!(state(&mut core, resumed, "timer-1").ms, 289_900);
+        let resynced = |now: Duration| {
+            if now >= resumed + secs(3) {
+                wall(now) + 3_000
+            } else {
+                wall(now)
+            }
+        };
+        now = resumed;
+        while now < resumed + ms(5_900) {
+            now += ms(100);
+            core.tick(now, resynced(now), None);
+        }
+        let signal = now + ms(100);
+        core.tick(signal, resynced(signal), Some(now));
+        let s = state(&mut core, signal, "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.anchor_ms),
+            (Running, 283_900, Some(WALL0 + 900_000))
+        );
+        assert_eq!(core.take_transitions(), vec![]);
+    }
+
+    /// D5 (b): a signal with no jump and no earlier (a), the wall agreeing
+    /// with the clock: nothing pauses or expires, and a countdown due in the
+    /// 100 ms since the last reading fires.
+    #[test]
+    fn a_signal_without_a_jump_changes_nothing_when_the_clocks_agree() {
+        let mut core = core_with(vec![
+            countdown("timer-1", 5_000),
+            countup("timer-2"),
+            countdown("timer-3", 60_000),
+        ]);
+        for id in ["timer-1", "timer-2", "timer-3"] {
+            op(&mut core, id, TimerOp::Arm, Duration::ZERO);
+        }
+        let mut now = Duration::ZERO;
+        while now < ms(4_950) {
+            now += ms(50);
+            tick(&mut core, now);
+        }
+        let signal = now + ms(100);
+        core.tick(signal, wall(signal), Some(now));
+        let s1 = state(&mut core, signal, "timer-1");
+        assert_eq!((s1.phase, s1.fires), (Done, 1));
+        assert_eq!(
+            shown(&mut core, signal, "timer-2"),
+            (Running, 5_050, "00:05".into())
+        );
+        assert_eq!(
+            shown(&mut core, signal, "timer-3"),
+            (Running, 54_950, "00:55".into())
+        );
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 50)]);
+    }
+
+    /// D5: a count-up started by the last reader before the sleep (its
+    /// `since` is that reading) pauses there: at 0.
+    #[test]
+    fn an_op_just_before_a_sleep_pauses_the_countup_at_its_reading() {
+        let mut core = core_with(vec![countup("timer-2")]);
+        tick(&mut core, secs(5));
+        op(&mut core, "timer-2", TimerOp::Arm, secs(7));
+        let back = secs(7 + 3_600);
+        core.tick(back, wall(back), Some(secs(7)));
+        assert_eq!(
+            shown(&mut core, back, "timer-2"),
+            (Paused, 0, "00:00".into())
+        );
+        assert_eq!(
+            core.take_transitions(),
+            vec![Transition::SleepPaused {
+                id: "timer-2".into()
+            }]
+        );
+    }
+
+    /// D5, D16: a command that is the first reader after a resume sees the
+    /// sleep itself: a countdown due inside it expires (not fired), and the
+    /// Pause then changes nothing.
+    #[test]
+    fn a_command_after_a_resume_sees_the_sleep() {
+        let mut core = core_with(vec![countdown("timer-1", 60_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(30));
+        let back = secs(30 + 600);
+        core.apply("timer-1", TimerOp::Pause, back, wall(back), Some(secs(30)))
+            .unwrap();
+        let s = state(&mut core, back, "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.fires),
+            (Expired, 0, "00:00", 0)
+        );
+        assert_eq!(
+            core.take_transitions(),
+            vec![Transition::Expired {
+                id: "timer-1".into()
+            }]
+        );
+    }
+
+    /// D5: an Arm that is the first reader after a resume handles the sleep
+    /// first, so the count-up it starts runs on from the Arm.
+    #[test]
+    fn a_countup_started_after_the_resume_runs_on() {
+        let mut core = core_with(vec![countup("timer-2")]);
+        tick(&mut core, secs(5));
+        let back = secs(5 + 3_600);
+        core.apply("timer-2", TimerOp::Arm, back, wall(back), Some(secs(5)))
+            .unwrap();
+        let later = back + secs(2);
+        tick(&mut core, later);
+        assert_eq!(
+            shown(&mut core, later, "timer-2"),
+            (Running, 2_000, "00:02".into())
+        );
+        assert_eq!(core.take_transitions(), vec![]);
+    }
+
+    /// The sleep check reports a sleep once, to whichever reader comes
+    /// first — often the thread, with no timers yet. An empty core spends it
+    /// then: a count-up added after the resume runs on, and the 60 s rule
+    /// still covers a second signal 20 s after the jump, landing 5 s into a
+    /// +3 s wall resync (before the anchors follow it).
+    #[test]
+    fn a_sleep_seen_with_no_timers_still_counts() {
+        let mut core = TimerCore::new();
+        tick(&mut core, secs(10));
+        let back = secs(10 + 600);
+        core.tick(back, wall(back), Some(secs(10)));
+        let added = back + secs(1);
+        core.sync(
+            vec![countup("timer-1"), countdown("timer-2", 900_000)],
+            added,
+            wall(added),
+            None,
+        );
+        op(&mut core, "timer-1", TimerOp::Arm, added);
+        op(&mut core, "timer-2", TimerOp::Arm, added);
+        let resynced = |now: Duration| {
+            if now >= back + secs(15) {
+                wall(now) + 3_000
+            } else {
+                wall(now)
+            }
+        };
+        let mut now = added;
+        while now < back + ms(19_900) {
+            now += ms(100);
+            core.tick(now, resynced(now), None);
+        }
+        let signal = now + ms(100);
+        core.tick(signal, resynced(signal), Some(now));
+        assert_eq!(
+            shown(&mut core, signal, "timer-1"),
+            (Running, 19_000, "00:19".into())
+        );
+        assert_eq!(state(&mut core, signal, "timer-2").ms, 881_000);
+        assert_eq!(core.take_transitions(), vec![]);
+    }
+
+    /// D3, §7.2: a +5 s wall step while a countdown runs leaves its anchor
+    /// for 9.9 s, then moves it by exactly the step, once, and marks dirty
+    /// (the page stores the new anchor). The live time never moves. A step
+    /// that goes back within 10 s moves nothing.
+    #[test]
+    fn a_wall_step_moves_the_anchor_after_10_s() {
+        let armed = Some(WALL0 + 3_600_050);
+        let stepped = |now: Duration| {
+            if now >= secs(5) {
+                wall(now) + 5_000
+            } else {
+                wall(now)
+            }
+        };
+        let mut core = core_with(vec![countdown("timer-1", 3_600_000)]);
+        // Off the 100 ms grid, so no second boundary falls on a tick.
+        op(&mut core, "timer-1", TimerOp::Arm, ms(50));
+        let mut now = Duration::ZERO;
+        while now < ms(14_900) {
+            now += ms(100);
+            core.tick(now, stepped(now), None);
+            assert_eq!(state(&mut core, now, "timer-1").anchor_ms, armed, "{now:?}");
+        }
+        core.take_dirty();
+        now += ms(100);
+        core.tick(now, stepped(now), None);
+        assert!(core.take_dirty());
+        assert_eq!(
+            state(&mut core, now, "timer-1").anchor_ms,
+            Some(WALL0 + 3_605_050)
+        );
+        while now < secs(30) {
+            now += ms(100);
+            core.tick(now, stepped(now), None);
+        }
+        let s = state(&mut core, now, "timer-1");
+        assert_eq!((s.anchor_ms, s.ms), (Some(WALL0 + 3_605_050), 3_570_050));
+
+        let undone = |now: Duration| {
+            if (secs(5)..secs(12)).contains(&now) {
+                wall(now) + 5_000
+            } else {
+                wall(now)
+            }
+        };
+        let mut core = core_with(vec![countdown("timer-1", 3_600_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, ms(50));
+        let mut now = Duration::ZERO;
+        while now < secs(30) {
+            now += ms(100);
+            core.tick(now, undone(now), None);
+            assert_eq!(state(&mut core, now, "timer-1").anchor_ms, armed, "{now:?}");
+        }
+    }
+
+    /// D3, D10: an anchor is set at the transition that sets the run, not
+    /// recomputed after: with the wall drifting 1 ms ahead of the clock at
+    /// each tick (50 ms in all, under the step bar) every snapshot has the
+    /// same anchors. An Adjust and a Resume set new ones.
+    #[test]
+    fn the_anchor_is_set_at_transitions() {
+        let mut core = core_with(vec![countdown("timer-1", 300_000), countup("timer-2")]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-2", TimerOp::Arm, Duration::ZERO);
+        let anchors = |core: &mut TimerCore, now: Duration| -> Vec<Option<i64>> {
+            core.snapshot(now)
+                .timers
+                .iter()
+                .map(|t| t.anchor_ms)
+                .collect()
+        };
+        let armed = anchors(&mut core, Duration::ZERO);
+        assert_eq!(armed, vec![Some(WALL0 + 300_000), Some(WALL0)]);
+        let mut now = Duration::ZERO;
+        for drift in 1..=50 {
+            now += ms(100);
+            core.tick(now, wall(now) + drift, None);
+            assert_eq!(anchors(&mut core, now), armed, "tick {drift}");
+        }
+        let at_adjust = wall(now) + 50;
+        core.apply("timer-1", TimerOp::Adjust(30_000), now, at_adjust, None)
+            .unwrap();
+        core.apply("timer-2", TimerOp::Pause, now, at_adjust, None)
+            .unwrap();
+        let resumed = now + secs(1);
+        let at_resume = wall(resumed) + 50;
+        core.apply("timer-2", TimerOp::Resume, resumed, at_resume, None)
+            .unwrap();
+        // 4:55 left + 30 s; 5 s counted.
+        assert_eq!(
+            anchors(&mut core, resumed),
+            vec![Some(at_adjust + 325_000), Some(at_resume - 5_000)]
+        );
+    }
+
+    /// A core with `timer-1` — a 5:00 countdown or a count-up — brought to
+    /// `phase`, and the time to act at. Running: armed at 1 s, acted on at
+    /// 11.5 s (4:49.5 left, 10.5 s counted). Paused: paused there, acted on
+    /// at 20 s. Done: fired at 301 s. Expired: ran out in a sleep from 200 s
+    /// to 400 s.
+    fn in_phase(kind: TimerKind, phase: TimerPhase) -> (TimerCore, Duration) {
+        let entry = match kind {
+            TimerKind::Countdown => countdown("timer-1", 300_000),
+            TimerKind::Countup => countup("timer-1"),
+        };
+        let mut core = core_with(vec![entry]);
+        if phase != Idle {
+            op(&mut core, "timer-1", TimerOp::Arm, secs(1));
+        }
+        let at = match phase {
+            Idle => secs(1),
+            Running => ms(11_500),
+            Paused => {
+                op(&mut core, "timer-1", TimerOp::Pause, ms(11_500));
+                secs(20)
+            }
+            Done => {
+                tick(&mut core, secs(301));
+                secs(310)
+            }
+            Expired => {
+                tick(&mut core, secs(200));
+                core.tick(secs(400), wall(secs(400)), Some(secs(200)));
+                secs(410)
+            }
+        };
+        assert_eq!(state(&mut core, at, "timer-1").phase, phase);
+        core.take_dirty();
+        core.take_transitions();
+        (core, at)
+    }
+
+    /// §7.1: every op on every phase of both kinds, by `ms`, text and total.
+    /// A row with no result changes nothing: the answer shows the timer as
+    /// it was, and nothing is marked dirty.
+    #[test]
+    #[allow(clippy::too_many_lines)] // §7.1 in one table, a row per cell
+    fn op_table() {
+        use TimerKind::{Countdown, Countup};
+        use TimerOp::{Adjust, Arm, Pause, Reset, Resume};
+        type Want = Option<(TimerPhase, u64, &'static str, u64)>;
+        let up = Adjust(30_000);
+        let rows: [(TimerKind, TimerPhase, TimerOp, Want); 40] = [
+            (
+                Countdown,
+                Idle,
+                Arm,
+                Some((Running, 300_000, "05:00", 300_000)),
+            ),
+            (Countdown, Idle, Pause, None),
+            (Countdown, Idle, Resume, None),
+            (Countdown, Idle, Reset, None),
+            (Countdown, Idle, up, None),
+            (Countdown, Running, Arm, None),
+            (
+                Countdown,
+                Running,
+                Pause,
+                Some((Paused, 289_500, "04:50", 300_000)),
+            ),
+            (Countdown, Running, Resume, None),
+            (
+                Countdown,
+                Running,
+                Reset,
+                Some((Idle, 300_000, "05:00", 300_000)),
+            ),
+            (
+                Countdown,
+                Running,
+                up,
+                Some((Running, 319_500, "05:20", 330_000)),
+            ),
+            (Countdown, Paused, Arm, None),
+            (Countdown, Paused, Pause, None),
+            (
+                Countdown,
+                Paused,
+                Resume,
+                Some((Running, 289_500, "04:50", 300_000)),
+            ),
+            (
+                Countdown,
+                Paused,
+                Reset,
+                Some((Idle, 300_000, "05:00", 300_000)),
+            ),
+            (
+                Countdown,
+                Paused,
+                up,
+                Some((Paused, 319_500, "05:20", 330_000)),
+            ),
+            (
+                Countdown,
+                Done,
+                Arm,
+                Some((Running, 300_000, "05:00", 300_000)),
+            ),
+            (Countdown, Done, Pause, None),
+            (Countdown, Done, Resume, None),
+            (
+                Countdown,
+                Done,
+                Reset,
+                Some((Idle, 300_000, "05:00", 300_000)),
+            ),
+            (Countdown, Done, up, None),
+            (
+                Countdown,
+                Expired,
+                Arm,
+                Some((Running, 300_000, "05:00", 300_000)),
+            ),
+            (Countdown, Expired, Pause, None),
+            (Countdown, Expired, Resume, None),
+            (
+                Countdown,
+                Expired,
+                Reset,
+                Some((Idle, 300_000, "05:00", 300_000)),
+            ),
+            (Countdown, Expired, up, None),
+            (Countup, Idle, Arm, Some((Running, 0, "00:00", 0))),
+            (Countup, Idle, Pause, None),
+            (Countup, Idle, Resume, None),
+            (Countup, Idle, Reset, None),
+            (Countup, Idle, up, None),
+            (Countup, Running, Arm, None),
+            (Countup, Running, Pause, Some((Paused, 10_500, "00:10", 0))),
+            (Countup, Running, Resume, None),
+            (Countup, Running, Reset, Some((Idle, 0, "00:00", 0))),
+            (Countup, Running, up, Some((Running, 40_500, "00:40", 0))),
+            (Countup, Paused, Arm, None),
+            (Countup, Paused, Pause, None),
+            (Countup, Paused, Resume, Some((Running, 10_500, "00:10", 0))),
+            (Countup, Paused, Reset, Some((Idle, 0, "00:00", 0))),
+            (Countup, Paused, up, Some((Paused, 40_500, "00:40", 0))),
+        ];
+        for (kind, phase, top, want) in rows {
+            let what = format!("{kind:?} {phase:?} {top:?}");
+            let (mut core, at) = in_phase(kind, phase);
+            let before = state(&mut core, at, "timer-1");
+            core.take_dirty();
+            op(&mut core, "timer-1", top, at);
+            let after = state(&mut core, at, "timer-1");
+            let Some((phase, value, text, total)) = want else {
+                assert_eq!(after, before, "{what}");
+                assert!(!core.is_dirty(), "{what}");
+                continue;
+            };
+            assert_eq!(
+                (after.phase, after.ms, after.text.as_str(), after.total_ms),
+                (phase, value, text, total),
+                "{what}"
+            );
+            assert_eq!(after.anchor_ms.is_some(), phase == Running, "{what}");
+            assert_eq!(after.fires, before.fires, "{what}");
+            assert!(core.is_dirty(), "{what}");
+        }
+    }
+
+    /// §7.1's Toggle column (the hotkey's): idle, done or expired → Arm;
+    /// running → Pause; paused → Resume.
+    #[test]
+    fn toggle_table() {
+        use TimerKind::{Countdown, Countup};
+        for (kind, phase, want) in [
+            (Countdown, Idle, (Running, 300_000, "05:00")),
+            (Countdown, Running, (Paused, 289_500, "04:50")),
+            (Countdown, Paused, (Running, 289_500, "04:50")),
+            (Countdown, Done, (Running, 300_000, "05:00")),
+            (Countdown, Expired, (Running, 300_000, "05:00")),
+            (Countup, Idle, (Running, 0, "00:00")),
+            (Countup, Running, (Paused, 10_500, "00:10")),
+            (Countup, Paused, (Running, 10_500, "00:10")),
+        ] {
+            let (mut core, at) = in_phase(kind, phase);
+            op(&mut core, "timer-1", TimerOp::Toggle, at);
+            assert_eq!(
+                shown(&mut core, at, "timer-1"),
+                (want.0, want.1, want.2.to_string()),
+                "{kind:?} {phase:?}"
+            );
+        }
+    }
+
+    /// §7.3, D7: ±δ on running and paused timers, with text and total; −30 s
+    /// stops at 1 s and keeps a left already under it; idle, done and
+    /// expired don't move.
+    #[test]
+    #[allow(clippy::too_many_lines)] // §7.3's rows, then the phases that don't move
+    fn adjust_table() {
+        use TimerOp::{Arm, Pause};
+        // (timer, ops before as (op, at ms), δ, at ms) → (phase, ms, text,
+        // total, changed).
+        type Row = (WireEntry, &'static [(TimerOp, u64)], i64, u64);
+        type Want = (TimerPhase, u64, &'static str, u64, bool);
+        let rows: [(Row, Want); 10] = [
+            // 5:00 +30 → 5:30.
+            (
+                (countdown("timer-1", 300_000), &[(Arm, 0)], 30_000, 0),
+                (Running, 330_000, "05:30", 330_000, true),
+            ),
+            // 23:59:50 +30 → 24:00:00.
+            (
+                (
+                    countdown("timer-1", 86_400_000),
+                    &[(Arm, 0), (Pause, 10_000)],
+                    30_000,
+                    20_000,
+                ),
+                (Paused, 86_400_000, "24:00:00", 86_410_000, true),
+            ),
+            // A 24 h countdown run 1 h, +30: left 23:00:30, total 24:00:30.
+            (
+                (
+                    countdown("timer-1", 86_400_000),
+                    &[(Arm, 0)],
+                    30_000,
+                    3_600_000,
+                ),
+                (Running, 82_830_000, "23:00:30", 86_430_000, true),
+            ),
+            // 0:12 −30 → 0:01.
+            (
+                (countdown("timer-1", 60_000), &[(Arm, 0)], -30_000, 48_000),
+                (Running, 1_000, "00:01", 49_000, true),
+            ),
+            // 0:00.4 −30 → 0:00.4: it stays, paused or running.
+            (
+                (
+                    countdown("timer-1", 1_000),
+                    &[(Arm, 0), (Pause, 600)],
+                    -30_000,
+                    700,
+                ),
+                (Paused, 400, "00:01", 1_000, false),
+            ),
+            (
+                (countdown("timer-1", 1_000), &[(Arm, 0)], -30_000, 600),
+                (Running, 400, "00:01", 1_000, false),
+            ),
+            // 5:00 −30 → 4:30.
+            (
+                (
+                    countdown("timer-1", 300_000),
+                    &[(Arm, 0), (Pause, 0)],
+                    -30_000,
+                    0,
+                ),
+                (Paused, 270_000, "04:30", 270_000, true),
+            ),
+            // A count-up: 0:10 −30 → 0:00; 1:00 +30 → 1:30.
+            (
+                (countup("timer-1"), &[(Arm, 0)], -30_000, 10_000),
+                (Running, 0, "00:00", 0, true),
+            ),
+            (
+                (
+                    countup("timer-1"),
+                    &[(Arm, 0), (Pause, 60_000)],
+                    30_000,
+                    61_000,
+                ),
+                (Paused, 90_000, "01:30", 0, true),
+            ),
+            // Idle: nothing.
+            (
+                (countdown("timer-1", 300_000), &[], -30_000, 0),
+                (Idle, 300_000, "05:00", 300_000, false),
+            ),
+        ];
+        for ((entry, steps, delta, at), (phase, want_ms, text, total, changed)) in rows {
+            let what = format!("{steps:?} {delta} at {at}");
+            let mut core = core_with(vec![entry]);
+            for &(step, step_at) in steps {
+                op(&mut core, "timer-1", step, ms(step_at));
+            }
+            let at = ms(at);
+            tick(&mut core, at);
+            let before = state(&mut core, at, "timer-1");
+            core.take_dirty();
+            op(&mut core, "timer-1", TimerOp::Adjust(delta), at);
+            let after = state(&mut core, at, "timer-1");
+            assert_eq!(
+                (after.phase, after.ms, after.text.as_str(), after.total_ms),
+                (phase, want_ms, text, total),
+                "{what}"
+            );
+            assert_eq!(core.is_dirty(), changed, "{what}");
+            if !changed {
+                assert_eq!(after, before, "{what}");
+            } else if phase == Running {
+                // Running on from the new value, with a new anchor.
+                let anchor = match after.kind {
+                    TimerKind::Countdown => wall(at) + i64::try_from(want_ms).unwrap(),
+                    TimerKind::Countup => wall(at) - i64::try_from(want_ms).unwrap(),
+                };
+                assert_eq!(after.anchor_ms, Some(anchor), "{what}");
+            }
+        }
+        // A sub-second left kept running still ends on its old deadline.
+        let mut core = core_with(vec![countdown("timer-1", 1_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-1", TimerOp::Adjust(-30_000), ms(600));
+        tick(&mut core, ms(1_000));
+        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 0)]);
+        // Done and expired don't move either.
+        for phase in [Done, Expired] {
+            let (mut core, at) = in_phase(TimerKind::Countdown, phase);
+            let before = state(&mut core, at, "timer-1");
+            op(&mut core, "timer-1", TimerOp::Adjust(-30_000), at);
+            assert_eq!(state(&mut core, at, "timer-1"), before, "{phase:?}");
+        }
+    }
+
+    /// §5.2: every transition recomputes its timer's text and marks dirty —
+    /// a Reset, an Adjust on a paused timer, a fire, a seed — so a stopped
+    /// timer's snapshot never shows a stale text.
+    #[test]
+    fn texts_follow_every_transition() {
+        let check = |core: &mut TimerCore, now: Duration, id: &str, text: &str| {
+            assert!(core.take_dirty(), "{id} {text}");
+            let s = state(core, now, id);
+            assert_eq!(
+                (s.text.as_str(), timer_text(s.kind, s.ms).as_str()),
+                (text, text)
+            );
+        };
+        let mut core = core_with(vec![
+            countdown("timer-1", 300_000),
+            countdown("timer-2", 300_000),
+        ]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(11));
+        core.take_dirty();
+        op(&mut core, "timer-1", TimerOp::Reset, secs(11));
+        check(&mut core, secs(11), "timer-1", "05:00");
+
+        op(&mut core, "timer-2", TimerOp::Arm, secs(11));
+        op(&mut core, "timer-2", TimerOp::Pause, secs(20));
+        assert_eq!(state(&mut core, secs(20), "timer-2").text, "04:51");
+        core.take_dirty();
+        op(&mut core, "timer-2", TimerOp::Adjust(30_000), secs(25));
+        check(&mut core, secs(25), "timer-2", "05:21");
+
+        op(&mut core, "timer-1", TimerOp::Arm, secs(30));
+        tick(&mut core, ms(329_900));
+        core.take_dirty();
+        tick(&mut core, secs(330));
+        check(&mut core, secs(330), "timer-1", "00:00");
+
+        let resumed = edit(countdown("timer-3", 120_000), |d| {
+            d.resume = Some(stored(Paused, Some(61_000), Some(120_000), None));
+        });
+        let now = secs(331);
+        core.sync(
+            vec![
+                countdown("timer-1", 300_000),
+                countdown("timer-2", 300_000),
+                resumed,
+            ],
+            now,
+            wall(now),
+            None,
+        );
+        check(&mut core, now, "timer-3", "01:01");
+    }
+
+    /// A fresh core's seed of `run` for `id`, a `kind` timer of `length_ms`,
+    /// at `wall_ms`: the state it comes back in, and what was recorded.
+    fn seeded(
+        id: &str,
+        kind: TimerKind,
+        length_ms: u64,
+        run: TimerRun,
+        wall_ms: i64,
+    ) -> (TimerState, Vec<Transition>) {
+        let mut core = TimerCore::new();
+        let now = secs(3);
+        let def = TimerDef {
+            id: id.into(),
+            name: "Seeded".into(),
+            kind,
+            duration_ms: length_ms,
+            resume: Some(run),
+        };
+        core.sync(vec![WireEntry::Def(def)], now, wall_ms, None);
+        (state(&mut core, now, id), core.take_transitions())
+    }
+
+    /// §7.8, D11, K3: every fixture `runSample` seeds its `seededPhase` and
+    /// `seededMs` at its `nowWallMs` (the page's `runOf` test reads the same
+    /// rows); then the rules beyond the fixture, and the runs that can't
+    /// seed one and start idle. A pause 0.3 ms before the deadline stores
+    /// `ms` 1 and comes back paused at 1 ms.
+    #[test]
+    #[allow(clippy::too_many_lines)] // the fixture's rows, then §7.8's own
+    fn seed_table() {
+        use TimerKind::{Countdown, Countup};
+        for row in fixture()["runSamples"].as_array().unwrap() {
+            let name = row_name(row);
+            let s: TimerState = serde_json::from_value(row["state"].clone()).unwrap();
+            let run = run_from_wire(&row["run"]).unwrap_or_else(|| panic!("{name}"));
+            let length = match s.kind {
+                Countdown => s.total_ms.min(MAX_LENGTH_MS),
+                Countup => DEFAULT_LENGTH_MS,
+            };
+            let want: TimerPhase = serde_json::from_value(row["seededPhase"].clone()).unwrap();
+            let want_ms = row["seededMs"].as_u64().unwrap();
+            let wall_ms = row["nowWallMs"].as_i64().unwrap();
+            let (got, recorded) = seeded(&s.id, s.kind, length, run, wall_ms);
+            assert_eq!((got.phase, got.ms), (want, want_ms), "{name}");
+            assert_eq!(got.text, timer_text(s.kind, want_ms), "{name}");
+            assert_eq!((got.fires, got.total_ms), (0, s.total_ms), "{name}");
+            assert_eq!(
+                recorded,
+                vec![Transition::Seeded {
+                    id: s.id.clone(),
+                    phase: want
+                }],
+                "{name}"
+            );
+        }
+
+        let at = WALL0;
+        for (what, kind, run, want) in [
+            (
+                "a clock set back: no more than the total",
+                Countdown,
+                stored(Running, None, Some(300_000), Some(at + 400_000)),
+                Some((Running, 300_000, 300_000)),
+            ),
+            (
+                "… and no more than 24 h",
+                Countdown,
+                stored(Running, None, Some(90_000_000), Some(at + 90_000_000)),
+                Some((Running, MAX_LENGTH_MS, 90_000_000)),
+            ),
+            (
+                "a clock set forward: expired",
+                Countdown,
+                stored(Running, None, Some(300_000), Some(at - 1)),
+                Some((Expired, 0, 300_000)),
+            ),
+            (
+                "paused, a total under its left",
+                Countdown,
+                stored(Paused, Some(60_000), Some(30_000), None),
+                Some((Paused, 60_000, 60_000)),
+            ),
+            (
+                "paused, a total past 24 h",
+                Countdown,
+                stored(Paused, Some(82_830_000), Some(86_430_000), None),
+                Some((Paused, 82_830_000, 86_430_000)),
+            ),
+            (
+                "done with no total: its length's",
+                Countdown,
+                stored(Done, None, None, None),
+                Some((Done, 0, 120_000)),
+            ),
+            (
+                "expired with no total: its length's",
+                Countdown,
+                stored(Expired, None, None, None),
+                Some((Expired, 0, 120_000)),
+            ),
+            (
+                "a count-up closed past 10 000 h",
+                Countup,
+                stored(Running, None, None, Some(at - 36_000_000_001)),
+                Some((Running, MAX_SEED_ELAPSED_MS, 0)),
+            ),
+            (
+                "a count-up started after now",
+                Countup,
+                stored(Running, None, None, Some(at + 5_000)),
+                Some((Running, 0, 0)),
+            ),
+            (
+                "a count-up paused past 10 000 h",
+                Countup,
+                stored(Paused, Some(u64::MAX), None, None),
+                Some((Paused, MAX_SEED_ELAPSED_MS, 0)),
+            ),
+            // Runs that can't be one: idle, the definition kept (D35).
+            (
+                "running, no anchor",
+                Countdown,
+                stored(Running, None, Some(300_000), None),
+                None,
+            ),
+            (
+                "running, no total",
+                Countdown,
+                stored(Running, None, None, Some(at + 60_000)),
+                None,
+            ),
+            (
+                "running, a total of 0",
+                Countdown,
+                stored(Running, None, Some(0), Some(at + 60_000)),
+                None,
+            ),
+            (
+                "paused, no total",
+                Countdown,
+                stored(Paused, Some(60_000), None, None),
+                None,
+            ),
+            (
+                "paused, no ms",
+                Countdown,
+                stored(Paused, None, Some(300_000), None),
+                None,
+            ),
+            (
+                "paused at 0",
+                Countdown,
+                stored(Paused, Some(0), Some(300_000), None),
+                None,
+            ),
+            (
+                "paused past 24 h",
+                Countdown,
+                stored(Paused, Some(86_400_001), Some(90_000_000), None),
+                None,
+            ),
+            (
+                "a count-up paused, no ms",
+                Countup,
+                stored(Paused, None, None, None),
+                None,
+            ),
+            (
+                "a count-up done",
+                Countup,
+                stored(Done, None, Some(1), None),
+                None,
+            ),
+            (
+                "a count-up expired",
+                Countup,
+                stored(Expired, None, None, None),
+                None,
+            ),
+        ] {
+            let (got, recorded) = seeded("timer-1", kind, 120_000, run, at);
+            let Some((phase, value, total)) = want else {
+                let idle = if kind == Countdown { 120_000 } else { 0 };
+                assert_eq!(
+                    (got.phase, got.ms, got.total_ms),
+                    (Idle, idle, idle),
+                    "{what}"
+                );
+                assert_eq!(recorded, vec![], "{what}");
+                continue;
+            };
+            assert_eq!(
+                (got.phase, got.ms, got.total_ms),
+                (phase, value, total),
+                "{what}"
+            );
+            assert_eq!(got.text, timer_text(kind, value), "{what}");
+            assert_eq!(
+                recorded,
+                vec![Transition::Seeded {
+                    id: "timer-1".into(),
+                    phase
+                }],
+                "{what}"
+            );
+        }
+
+        // The pause at deadline − 0.3 ms, stored as the page's `runOf`
+        // stores it, and seeded after a restart.
+        let mut core = core_with(vec![countdown("timer-1", 300_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        let paused_at = secs(300).saturating_sub(Duration::from_micros(300));
+        op(&mut core, "timer-1", TimerOp::Pause, paused_at);
+        let s = state(&mut core, paused_at, "timer-1");
+        assert_eq!((s.phase, s.ms, s.text.as_str()), (Paused, 1, "00:01"));
+        let run = stored(Paused, Some(s.ms), Some(s.total_ms), None);
+        let (back, _) = seeded("timer-1", Countdown, 300_000, run, WALL0 + 3_600_000);
+        assert_eq!(
+            (back.phase, back.ms, back.text.as_str()),
+            (Paused, 1, "00:01")
+        );
+    }
+
+    /// D10: a stored run seeds an id only at the core's first acceptance of
+    /// it in this process. A reload's sync with another run changes nothing;
+    /// a timer deleted and added again is a new definition: idle, `fires`
+    /// from 0, its run ignored.
+    #[test]
+    fn rust_wins_while_it_knows_a_timer() {
+        let running = |anchor: i64| stored(Running, None, Some(300_000), Some(anchor));
+        let brb = |anchor: i64| {
+            edit(countdown("timer-1", 300_000), |d| {
+                d.resume = Some(running(anchor));
+            })
+        };
+        let mut core = TimerCore::new();
+        core.sync(
+            vec![brb(WALL0 + 120_000), countup("timer-2")],
+            Duration::ZERO,
+            WALL0,
+            None,
+        );
+        assert_eq!(
+            shown(&mut core, Duration::ZERO, "timer-1"),
+            (Running, 120_000, "02:00".into())
+        );
+        let now = secs(1);
+        core.sync(
+            vec![brb(WALL0 + 60_000), countup("timer-2")],
+            now,
+            wall(now),
+            None,
+        );
+        assert_eq!(state(&mut core, now, "timer-1").ms, 119_000);
+        tick(&mut core, secs(120));
+        assert_eq!(state(&mut core, secs(120), "timer-1").fires, 1);
+
+        let now = secs(121);
+        let left = core.sync(vec![countup("timer-2")], now, wall(now), None);
+        assert_eq!(left, vec!["timer-1".to_string()]);
+        let now = secs(122);
+        core.sync(
+            vec![countup("timer-2"), brb(wall(now) + 30_000)],
+            now,
+            wall(now),
+            None,
+        );
+        let s = state(&mut core, now, "timer-1");
+        assert_eq!((s.phase, s.ms, s.fires), (Idle, 300_000, 0));
+        assert_eq!(
+            core.take_transitions(),
+            vec![
+                Transition::Seeded {
+                    id: "timer-1".into(),
+                    phase: Running
+                },
+                fired("timer-1", 1, 0)
+            ]
+        );
+    }
+
+    /// D15, D36: what a sync changes — an add, a rename, a new length while
+    /// idle (its text follows) and while running (its run stands until it
+    /// starts again), a new kind (idle), a removal (returned), a duplicate
+    /// (the first stands) — and what it keeps without running: an unknown
+    /// kind and every known one past the 16th, whose files stay. A kept
+    /// 17th was never accepted, so once it runs its stored run seeds it.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one story, a step per kind of change
+    fn sync_table() {
+        let named = |entry: WireEntry, name: &str| edit(entry, |d| d.name = name.into());
+        let ids = |core: &mut TimerCore, now: Duration| -> Vec<String> {
+            core.snapshot(now)
+                .timers
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        };
+        let mut core = TimerCore::new();
+        let sync = |core: &mut TimerCore, entries: Vec<WireEntry>, now: Duration| {
+            let left = core.sync(entries, now, wall(now), None);
+            assert!(core.take_dirty() && core.synced());
+            left
+        };
+        assert!(!core.synced());
+        let left = sync(&mut core, vec![countdown("timer-1", 300_000)], secs(0));
+        assert_eq!(left, Vec::<String>::new());
+        assert_eq!(
+            shown(&mut core, secs(0), "timer-1"),
+            (Idle, 300_000, "05:00".into())
+        );
+
+        sync(
+            &mut core,
+            vec![
+                named(countdown("timer-1", 300_000), "BRB"),
+                countup("timer-2"),
+            ],
+            secs(1),
+        );
+        let titles: Vec<String> = core
+            .snapshot(secs(1))
+            .timers
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(titles, vec!["BRB", "timer-2"]);
+
+        sync(
+            &mut core,
+            vec![
+                named(countdown("timer-1", 600_000), "BRB"),
+                countup("timer-2"),
+            ],
+            secs(2),
+        );
+        let s = state(&mut core, secs(2), "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.total_ms),
+            (Idle, 600_000, "10:00", 600_000)
+        );
+
+        op(&mut core, "timer-1", TimerOp::Arm, secs(3));
+        sync(
+            &mut core,
+            vec![
+                named(countdown("timer-1", 120_000), "BRB"),
+                countup("timer-2"),
+            ],
+            secs(4),
+        );
+        let s = state(&mut core, secs(4), "timer-1");
+        assert_eq!((s.phase, s.ms, s.total_ms), (Running, 599_000, 600_000));
+        op(&mut core, "timer-1", TimerOp::Reset, secs(5));
+        assert_eq!(
+            shown(&mut core, secs(5), "timer-1"),
+            (Idle, 120_000, "02:00".into())
+        );
+        op(&mut core, "timer-1", TimerOp::Arm, secs(5));
+
+        sync(
+            &mut core,
+            vec![countup("timer-1"), countup("timer-2")],
+            secs(6),
+        );
+        let s = state(&mut core, secs(6), "timer-1");
+        assert_eq!(
+            (
+                s.kind,
+                s.phase,
+                s.ms,
+                s.text.as_str(),
+                s.total_ms,
+                s.anchor_ms
+            ),
+            (TimerKind::Countup, Idle, 0, "00:00", 0, None)
+        );
+
+        let left = sync(&mut core, vec![countup("timer-2")], secs(7));
+        assert_eq!(left, vec!["timer-1".to_string()]);
+        assert_eq!(ids(&mut core, secs(7)), vec!["timer-2"]);
+
+        sync(
+            &mut core,
+            vec![
+                named(countup("timer-2"), "A"),
+                named(countup("timer-2"), "B"),
+                countdown("timer-3", 60_000),
+            ],
+            secs(8),
+        );
+        assert_eq!(ids(&mut core, secs(8)), vec!["timer-2", "timer-3"]);
+        assert_eq!(state(&mut core, secs(8), "timer-2").name, "A");
+
+        // Kept, not run.
+        let later = stored(Running, None, Some(60_000), Some(WALL0 + 30_000));
+        let seventeenth = || {
+            edit(countdown("timer-17", 60_000), |d| {
+                d.resume = Some(later.clone());
+            })
+        };
+        let mut entries = vec![WireEntry::Kept("brb".into())];
+        entries.extend((1..=16).map(|n| countdown(&format!("timer-{n}"), 60_000)));
+        entries.push(seventeenth());
+        let mut core = TimerCore::new();
+        core.sync(entries, Duration::ZERO, WALL0, None);
+        let run = ids(&mut core, Duration::ZERO);
+        assert_eq!(run.len(), MAX_TIMERS);
+        assert!(!run.contains(&"timer-17".to_string()));
+        let update = core.text_update();
+        assert_eq!(update.texts.len(), MAX_TIMERS);
+        assert_eq!(update.keep.len(), MAX_TIMERS + 2);
+        assert!(["brb", "timer-17"]
+            .iter()
+            .all(|id| update.keep.contains(&(*id).to_string())));
+        assert_eq!(core.take_transitions(), vec![]);
+
+        let mut entries: Vec<WireEntry> = (2..=16)
+            .map(|n| countdown(&format!("timer-{n}"), 60_000))
+            .collect();
+        entries.push(seventeenth());
+        let now = secs(1);
+        let left = core.sync(entries, now, wall(now), None);
+        assert_eq!(left, vec!["timer-1".to_string()]);
+        assert_eq!(
+            shown(&mut core, now, "timer-17"),
+            (Running, 29_000, "00:29".into())
+        );
+        assert_eq!(core.text_update().keep.len(), MAX_TIMERS);
+    }
+
+    /// D17: every snapshot's `seq` is larger than the one before, whoever
+    /// builds it: the thread after a change, a command's answer, a status
+    /// read that changed nothing.
+    #[test]
+    fn snapshots_count_up() {
+        let mut core = core_with(vec![countdown("timer-1", 10_000)]);
+        let mut last = 0;
+        let mut next = |snapshot: TimerSnapshot, what: &str| {
+            assert!(snapshot.seq > last, "{what}: {} after {last}", snapshot.seq);
+            last = snapshot.seq;
+        };
+        for i in 1..=40 {
+            let now = ms(250 * i);
+            core.tick(now, wall(now), None);
+            if core.take_dirty() {
+                next(core.snapshot(now), "the thread's");
+            }
+            if i % 3 == 0 {
+                op(&mut core, "timer-1", TimerOp::Toggle, now);
+                next(core.snapshot(now), "an answer");
+            }
+            if i % 5 == 0 {
+                core.tick(now, wall(now), None);
+                next(core.snapshot(now), "a status read");
+            }
+        }
+    }
+
+    /// D18: the thread emits on change only. A tick inside one second
+    /// changes nothing; one that crosses a boundary does; a snapshot that
+    /// crosses one marks dirty too (the thread still emits that second); a
+    /// paused timer and an op that changes nothing never do.
+    #[test]
+    fn dirty_only_on_change() {
+        let mut core = core_with(vec![countdown("timer-1", 10_000), countup("timer-2")]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-2", TimerOp::Arm, Duration::ZERO);
+        assert!(core.take_dirty());
+        for t in [100, 400, 999] {
+            tick(&mut core, ms(t));
+            assert!(!core.take_dirty(), "{t}");
+        }
+        tick(&mut core, secs(1));
+        assert!(core.take_dirty());
+        tick(&mut core, ms(1_500));
+        assert!(!core.take_dirty());
+        core.snapshot(secs(2));
+        assert!(core.take_dirty());
+        core.snapshot(ms(2_100));
+        assert!(!core.take_dirty());
+        op(&mut core, "timer-1", TimerOp::Pause, ms(2_500));
+        op(&mut core, "timer-2", TimerOp::Pause, ms(2_500));
+        assert!(core.take_dirty());
+        tick(&mut core, secs(10));
+        op(&mut core, "timer-1", TimerOp::Pause, secs(11));
+        assert!(!core.take_dirty());
+    }
+
+    /// §7.5: the wait to the next text change, in ns from the tick's own
+    /// reading, uncapped and capped at [`TICK`]; the deadline is a
+    /// countdown's last boundary.
+    #[test]
+    fn next_wake_table() {
+        let countdown_left = |left: Duration| {
+            let mut core = core_with(vec![countdown("timer-1", 10_000)]);
+            op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+            (core, secs(10).saturating_sub(left))
+        };
+        let countup_at = |elapsed: Duration| {
+            let mut core = core_with(vec![countup("timer-2")]);
+            op(&mut core, "timer-2", TimerOp::Arm, Duration::ZERO);
+            (core, elapsed)
+        };
+        let micros = Duration::from_micros;
+        for (what, (core, now), wake) in [
+            ("countdown, 4 500 left", countdown_left(ms(4_500)), ms(500)),
+            (
+                "countdown, 4 000 left",
+                countdown_left(ms(4_000)),
+                ms(1_000),
+            ),
+            ("countdown, 800 left", countdown_left(ms(800)), ms(800)),
+            ("countdown, 30 left", countdown_left(ms(30)), ms(30)),
+            (
+                "countdown, 0.3 left",
+                countdown_left(micros(300)),
+                micros(300),
+            ),
+            (
+                "countdown, due, unfired",
+                countdown_left(Duration::ZERO),
+                Duration::ZERO,
+            ),
+            ("count-up, 2 300 counted", countup_at(ms(2_300)), ms(700)),
+            ("count-up, 2 970 counted", countup_at(ms(2_970)), ms(30)),
+        ] {
+            assert_eq!(core.next_wake(now, secs(5)), wake, "{what}");
+            assert_eq!(core.next_wake(now, TICK), wake.min(TICK), "{what}");
+        }
+        // Nothing running: the cap, so sleep checks keep their cadence.
+        let core = core_with(vec![countdown("timer-1", 10_000), countup("timer-2")]);
+        assert_eq!(core.next_wake(secs(1), TICK), TICK);
+        // Two running: the nearer change.
+        let mut core = core_with(vec![countdown("timer-1", 10_000), countup("timer-2")]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-2", TimerOp::Arm, ms(2_530));
+        assert_eq!(core.next_wake(ms(5_500), secs(5)), ms(30));
+    }
+
+    /// D33: fields a later release sends (`obsText`, `followObs`, actions of
+    /// a kind this build doesn't know) don't stop a definition: it runs.
+    #[test]
+    fn later_fields_are_ignored() {
+        let sent = json!({
+            "id": "timer-1", "name": "BRB", "kind": "countdown", "durationMs": 300_000,
+            "obsText": "BRB text", "followObs": true,
+            "onStart": [{"kind": "setMuted", "muted": true}],
+            "onFire": [{"kind": "somethingNew", "x": 1}, {"kind": "speak", "text": "back"}],
+        });
+        let mut core = TimerCore::new();
+        core.sync(
+            vec![entry_from_wire(&sent).unwrap()],
+            Duration::ZERO,
+            WALL0,
+            None,
+        );
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        assert_eq!(
+            shown(&mut core, Duration::ZERO, "timer-1"),
+            (Running, 300_000, "05:00".into())
+        );
+    }
+
+    /// Every arithmetic step saturates (a panic aborts the app): the largest
+    /// deltas through Adjust, lengths of 0 and `u64::MAX`, clocks and walls
+    /// at their extremes, and seeds from anchors at `i64::MIN` / `i64::MAX`.
+    #[test]
+    fn nothing_panics_at_the_edges() {
+        use TimerKind::{Countdown, Countup};
+        let edge = |id: &str, kind, duration_ms| {
+            WireEntry::Def(TimerDef {
+                id: id.into(),
+                name: id.into(),
+                kind,
+                duration_ms,
+                resume: None,
+            })
+        };
+        let clocks = [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            secs(u64::MAX / 2),
+            Duration::MAX,
+        ];
+        let walls = [i64::MIN, -1, 0, WALL0, i64::MAX];
+        let ops = [
+            TimerOp::Arm,
+            TimerOp::Adjust(i64::MAX),
+            TimerOp::Adjust(i64::MIN),
+            TimerOp::Pause,
+            TimerOp::Adjust(i64::MIN),
+            TimerOp::Adjust(i64::MAX),
+            TimerOp::Resume,
+            TimerOp::Toggle,
+            TimerOp::Reset,
+            TimerOp::Toggle,
+        ];
+        let ids = ["timer-1", "timer-2", "timer-3"];
+        for wall_ms in walls {
+            let mut core = TimerCore::new();
+            core.sync(
+                vec![
+                    edge("timer-1", Countdown, 0),
+                    edge("timer-2", Countdown, u64::MAX),
+                    edge("timer-3", Countup, u64::MAX),
+                ],
+                Duration::ZERO,
+                wall_ms,
+                None,
+            );
+            for now in clocks {
+                for other_wall in walls {
+                    for id in ids {
+                        for top in ops {
+                            core.apply(id, top, now, other_wall, None).unwrap();
+                            core.apply(id, top, now, other_wall, Some(Duration::ZERO))
+                                .unwrap();
+                            core.apply(id, top, now, other_wall, Some(now)).unwrap();
+                        }
+                        core.apply(id, TimerOp::Arm, now, other_wall, None).unwrap();
+                    }
+                    core.tick(now, other_wall, None);
+                    core.tick(now, wall_ms, None);
+                    core.tick(now, other_wall, Some(Duration::ZERO));
+                    core.tick(now, other_wall, Some(now));
+                    let _ = core.snapshot(now);
+                    let _ = core.next_wake(now, TICK);
+                    let _ = core.text_update();
+                }
+            }
+            for anchor in [i64::MIN, -1, 0, i64::MAX] {
+                for phase in [Running, Paused, Done, Expired] {
+                    for kind in [Countdown, Countup] {
+                        let run = stored(phase, Some(u64::MAX), Some(u64::MAX), Some(anchor));
+                        let (s, _) = seeded("timer-1", kind, u64::MAX, run, wall_ms);
+                        assert_eq!(s.text, timer_text(kind, s.ms));
+                    }
+                }
+            }
+        }
     }
 }

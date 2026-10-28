@@ -328,7 +328,14 @@ function liveEntries(s: OverlayScene): Array<{ el: KnownElement; index: number }
       return;
     }
     const img = asImage(e);
-    if (img) out.push({ el: img, index });
+    if (img) {
+      out.push({ el: img, index });
+      return;
+    }
+    // v1.59.0: live whether or not its timer exists; the overlay draws a
+    // face only for a timer the backend reports.
+    const timer = asTimer(e);
+    if (timer) out.push({ el: timer, index });
   });
   return out;
 }
@@ -622,11 +629,13 @@ export function readOp(raw: unknown, from: "overlay" | "main"): SceneOp | null {
 }
 
 /** Why `add` would refuse `e`, or null. In order: the id is taken; 64
- *  elements are stored; a live circle exists; 16 live pictures; it wouldn't
- *  be live, or a picture lacks its pixel size; the scene budget. */
+ *  elements are stored; a timer face that wouldn't be live (v1.59.0: no
+ *  other limit applies to one); a live circle exists; 16 live pictures; it
+ *  wouldn't be live, or a picture lacks its pixel size; the scene budget. */
 export function addRefusal(s: OverlayScene, e: KnownElement): AddRefusal | null {
   if (s.elements.some((x) => x.id === e.id)) return "exists";
   if (s.elements.length >= MAX_ELEMENTS) return "elements";
+  if (e.type === "timer") return asTimer(e) ? null : "invalid";
   const live = liveElements(s);
   if (e.type === "spellcircle" && live.some((x) => x.type === "spellcircle")) return "circle";
   if (e.type === "image" && live.filter((x) => x.type === "image").length >= MAX_PICTURES) return "pictures";

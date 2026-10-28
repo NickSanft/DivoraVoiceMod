@@ -46,6 +46,24 @@ describe("Sigil", () => {
     }
   });
 
+  it("includes Hourglass's sigils, and they draw (v1.59.0)", () => {
+    for (const name of ["hourglass", "pause"] as const) {
+      expect(SIGIL_NAMES).toContain(name);
+      const { container } = render(() => <Sigil name={name} size={15} />);
+      const svg = container.querySelector("svg")!;
+      expect(svg.getAttribute("width")).toBe("15");
+      expect(svg.querySelectorAll("path, rect").length).toBeGreaterThan(0);
+    }
+    // The hourglass is stroked; pause is two filled bars, as play and stop
+    // are filled.
+    const glass = render(() => <Sigil name="hourglass" />).container.querySelector("svg > g")!;
+    expect(glass.getAttribute("fill")).toBe("none");
+    expect(glass.getAttribute("stroke")).toBe("currentColor");
+    const bars = render(() => <Sigil name="pause" />).container.querySelectorAll("svg rect");
+    expect(bars).toHaveLength(2);
+    for (const bar of bars) expect(bar.closest("[fill]")?.getAttribute("fill")).toBe("currentColor");
+  });
+
   it("includes every nav name in the catalog", () => {
     for (const name of ["mixer", "soundboard", "presets", "settings"] as const) {
       expect(SIGIL_NAMES).toContain(name);

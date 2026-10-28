@@ -117,6 +117,15 @@ import {
   pickImageFile,
   subscribeOverlayStatus,
   subscribeOverlayEdit,
+  syncTimersCmd,
+  armTimerCmd,
+  pauseTimerCmd,
+  resumeTimerCmd,
+  resetTimerCmd,
+  adjustTimerCmd,
+  timerStatusCmd,
+  timersDirCmd,
+  subscribeTimerState,
   type CaptureMonitor,
   type CaptureStatus,
   type DesktopAudioSource,
@@ -225,8 +234,23 @@ import {
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
 import {
+  DEFAULT_LENGTH_MS,
+  defaultName,
+  defsForSync,
+  MAX_LENGTH_MS,
+  MAX_TIMERS,
+  MIN_LENGTH_MS,
+  nextTimerId,
+  readTimerName,
   readTimers,
+  runOf,
+  sameRun,
+  timerAction,
+  timerHotkeyId,
   timerRoles as rolesOf,
+  timersForSave,
+  TIMER_VERBS,
+  type StoredTimer,
   type StoredTimers,
   type TimerRole,
   type TimerVerb,
@@ -1112,12 +1136,14 @@ export interface AppState {
    *  timers. */
   addTimer: (kind: TimerKind) => Promise<string | null>;
   /** Called on commit only (Enter, or leaving the field), with a name that
-   *  passes `readTimerName`. */
+   *  passes `readTimerName`. Sends nothing when the name is the one stored,
+   *  or the timer isn't one the backend runs. */
   renameTimer: (id: string, name: string) => Promise<void>;
-  /** Called on commit only, with a length `parseLength` gave. */
+  /** Called on commit only, with a length `parseLength` gave. Sends nothing
+   *  for the length stored, a count-up, or a timer the backend doesn't run. */
   setTimerLength: (id: string, ms: number) => Promise<void>;
-  /** Unregisters its two keys, takes it off the overlay, then saves and
-   *  syncs without it. */
+  /** Unregisters its two keys, takes it off the overlay, then syncs
+   *  without it. */
   deleteTimer: (id: string) => Promise<void>;
   /** Settings' main button: arm, pause or resume, by `timerAction` on the
    *  mirror's state; nothing without one. */
@@ -2135,28 +2161,241 @@ export function createAppState(): AppState {
   onCleanup(() => clearTimeout(ptmKnownTimer));
 
   // v1.59.0: Hourglass. Rust keeps the time (src-tauri/src/timers.rs); the
-  // page keeps the stored timers and a read-only mirror of Rust's snapshot,
-  // ordered by `seq` as the mute's is. The contract only, for now: the
-  // actions below do nothing yet, and nothing is sent at boot.
-  const [timerStore] = createSignal<StoredTimers>(
+  // page keeps the stored timers (`divora.timers`) and a read-only mirror of
+  // Rust's snapshot, ordered by `seq` as the mute's is. The page never
+  // decides a timer's state: every answer and every `timer-state` event is
+  // the whole set, and the newest one wins.
+  const [timerStore, setTimerStore] = createSignal<StoredTimers>(
     readTimers(loadJson<unknown>(STORAGE_KEYS.timers, null)),
   );
+  // A user who never added a timer has no key, and boot sends nothing new.
+  const hourglassUsed = loadRaw(STORAGE_KEYS.timers) !== null;
   const timerRoles = createMemo(() => rolesOf(timerStore()));
   const [timerSnapshot, setTimerSnapshot] = createSignal<TimerSnapshot | null>(null);
-  const adoptTimerSnapshot = (raw: unknown): void => {
-    const next = adoptTimers(timerSnapshot(), readTimerSnapshot(raw));
-    if (next !== timerSnapshot()) setTimerSnapshot(next);
+  // Set when the provider goes: a late answer or event then changes nothing,
+  // and never writes storage.
+  let timersDisposed = false;
+  let timerUnlisten: (() => void) | null = null;
+  onCleanup(() => {
+    timersDisposed = true;
+    if (timerUnlisten) timerUnlisten();
+    timerUnlisten = null;
+  });
+
+  const saveTimers = (next: StoredTimers): void => {
+    setTimerStore(next);
+    saveJson(STORAGE_KEYS.timers, timersForSave(next));
   };
-  const addTimer: AppState["addTimer"] = async () => null;
-  const renameTimer: AppState["renameTimer"] = async () => {};
-  const setTimerLength: AppState["setTimerLength"] = async () => {};
-  const deleteTimer: AppState["deleteTimer"] = async () => {};
-  const startTimer: AppState["startTimer"] = async () => {};
-  const pauseTimer: AppState["pauseTimer"] = async () => {};
-  const resetTimer: AppState["resetTimer"] = async () => {};
-  const adjustTimer: AppState["adjustTimer"] = async () => {};
-  const bindTimerHotkey: AppState["bindTimerHotkey"] = async () => {};
-  const timersDir: AppState["timersDir"] = async () => null;
+  /** The stored timers with `id`'s entry replaced; every other entry keeps
+   *  its object, so a card for it isn't rebuilt. */
+  const withTimer = (s: StoredTimers, id: string, next: StoredTimer): StoredTimers => ({
+    ...s,
+    timers: s.timers.map((t) => (t.id === id ? next : t)),
+  });
+  /** A stored timer the backend runs, or undefined. */
+  const runTimer = (id: string): StoredTimer | undefined =>
+    timerRoles().get(id) === "run" ? timerStore().timers.find((t) => t.id === id) : undefined;
+
+  // Each run is saved only when it changes in an adopted snapshot: a start,
+  // a pause, a resume, an adjust, a fire, a reset. A running timer's text
+  // changes every second, and that alone writes nothing (its anchor holds
+  // still). Only timers still stored are written: a late snapshot never
+  // brings back a deleted one.
+  const persistRuns = (snap: TimerSnapshot): void => {
+    const s = timerStore();
+    const byId = new Map(snap.timers.map((t) => [t.id, t]));
+    let changed = false;
+    const timers = s.timers.map((t) => {
+      const state = byId.get(t.id);
+      if (!state) return t;
+      const run = runOf(state);
+      if (sameRun(t.run, run)) return t;
+      changed = true;
+      const next: StoredTimer = { ...t };
+      if (run) next.run = run;
+      else delete next.run;
+      return next;
+    });
+    if (changed) saveTimers({ ...s, timers });
+  };
+  const adoptTimerSnapshot = (raw: unknown): void => {
+    if (timersDisposed) return;
+    const prev = timerSnapshot();
+    const next = adoptTimers(prev, readTimerSnapshot(raw));
+    if (next === prev || next === null) return;
+    setTimerSnapshot(next);
+    persistRuns(next);
+  };
+
+  // Every stored timer, in list order, with its run as `resume`: the backend
+  // seeds a timer from it only for an id it hasn't accepted since it started
+  // (a restart); after a page reload it knows them all and keeps its own.
+  const sendTimerSync = async (): Promise<void> => {
+    try {
+      adoptTimerSnapshot(await syncTimersCmd(defsForSync(timerStore())));
+    } catch (e) {
+      console.warn("[hourglass] sync_timers failed:", e);
+    }
+  };
+
+  // The page hears `timer-state` from here on. `listen` is itself a command,
+  // and an event reaches only a listener already registered, so a change
+  // made before it was (a restored countdown running out) would reach
+  // nobody, and a paused or done timer sends nothing more: once listening,
+  // one `timer_status` closes that gap. Once per page.
+  let timersSubscribed = false;
+  const subscribeTimers = async (): Promise<void> => {
+    if (timersSubscribed) return;
+    timersSubscribed = true;
+    try {
+      const un = await subscribeTimerState(adoptTimerSnapshot);
+      if (timersDisposed) un();
+      else timerUnlisten = un;
+    } catch (e) {
+      console.warn("[hourglass] listening to timer-state failed:", e);
+    }
+    try {
+      adoptTimerSnapshot(await timerStatusCmd());
+    } catch (e) {
+      console.warn("[hourglass] timer_status failed:", e);
+    }
+  };
+
+  // The boot sync. Sent here, at creation, beside the mute's read and the
+  // push-to-modulate restore, so it goes out before App's onMount
+  // enumerates devices (sync commands that hold the main thread) and before
+  // App registers the hotkeys: the backend knows every timer before any of
+  // their keys works.
+  if (hourglassUsed) {
+    void sendTimerSync();
+    void subscribeTimers();
+  }
+
+  const addTimer: AppState["addTimer"] = async (kind) => {
+    const s = timerStore();
+    // Every stored timer counts, a newer kind's too, so each one counted has
+    // a card with Delete.
+    if (s.timers.length >= MAX_TIMERS) return null;
+    const id = nextTimerId(s);
+    const timer: StoredTimer = {
+      id,
+      name: defaultName(s, kind),
+      kind,
+      durationMs: DEFAULT_LENGTH_MS,
+      hotkeys: {},
+    };
+    saveTimers({ ...s, timers: [...s.timers, timer] });
+    const synced = sendTimerSync();
+    void subscribeTimers();
+    await synced;
+    return id;
+  };
+
+  const renameTimer: AppState["renameTimer"] = async (id, raw) => {
+    const name = readTimerName(raw);
+    const t = runTimer(id);
+    if (name === null || !t || t.name === name) return;
+    saveTimers(withTimer(timerStore(), id, { ...t, name }));
+    await sendTimerSync();
+  };
+
+  const setTimerLength: AppState["setTimerLength"] = async (id, ms) => {
+    if (!Number.isSafeInteger(ms) || ms < MIN_LENGTH_MS || ms > MAX_LENGTH_MS) return;
+    const t = runTimer(id);
+    if (!t || t.kind !== "countdown" || t.durationMs === ms) return;
+    saveTimers(withTimer(timerStore(), id, { ...t, durationMs: ms }));
+    await sendTimerSync();
+  };
+
+  const deleteTimer: AppState["deleteTimer"] = async (id) => {
+    const s = timerStore();
+    if (!s.timers.some((t) => t.id === id)) return;
+    // The card goes at once, so a capture still open can't bind its keys
+    // again (`bindTimerHotkey` needs a stored timer). Then its keys, before
+    // the sync: one left registered would start whatever timer takes this id
+    // next. Both are asked at once; the backend runs them in order.
+    saveTimers({ ...s, timers: s.timers.filter((t) => t.id !== id) });
+    await Promise.all(
+      TIMER_VERBS.map((verb) =>
+        unregisterGlobalShortcutCmd(timerHotkeyId(id, verb)).catch((err: unknown) => {
+          console.warn("[hourglass] unregister hotkey failed", err);
+        }),
+      ),
+    );
+    overlay.removeOverlayTimer(id);
+    await sendTimerSync();
+  };
+
+  /** A timer command; its answer is a whole snapshot like any event. */
+  const sendTimerOp = async (what: string, send: () => Promise<unknown>): Promise<void> => {
+    try {
+      adoptTimerSnapshot(await send());
+    } catch (e) {
+      console.warn(`[hourglass] ${what} failed:`, e);
+    }
+  };
+  // Settings' main button sends what its label says, from the mirror the
+  // label was drawn from; without state from the backend there is no
+  // button, and nothing is sent.
+  const startTimer: AppState["startTimer"] = async (id) => {
+    const state = timerSnapshot()?.timers.find((t) => t.id === id);
+    if (!state) return;
+    const { cmd } = timerAction(state);
+    if (cmd === "arm") await sendTimerOp("arm_timer", () => armTimerCmd(id));
+    else if (cmd === "pause") await sendTimerOp("pause_timer", () => pauseTimerCmd(id));
+    else await sendTimerOp("resume_timer", () => resumeTimerCmd(id));
+  };
+  const pauseTimer: AppState["pauseTimer"] = (id) =>
+    sendTimerOp("pause_timer", () => pauseTimerCmd(id));
+  const resetTimer: AppState["resetTimer"] = (id) =>
+    sendTimerOp("reset_timer", () => resetTimerCmd(id));
+  const adjustTimer: AppState["adjustTimer"] = (id, deltaMs) =>
+    sendTimerOp("adjust_timer", () => adjustTimerCmd(id, deltaMs));
+
+  // Each timer's keys live in its own entry, by verb. v1.59.0 registers
+  // `toggle` and `reset`; any other verb (a later build's `finish`) is kept
+  // and written back as it is. Saved first, then registered, as
+  // `setHotkeyBinding` does; a bind changes only its own verb.
+  const bindTimerHotkey: AppState["bindTimerHotkey"] = async (id, verb, raw) => {
+    // A capture can outlive its card: a key for a timer no longer stored
+    // (or one the backend doesn't run) would be one nothing shows, and the
+    // next timer to take that id would answer to it.
+    const t = runTimer(id);
+    if (!t || !TIMER_VERBS.includes(verb)) return;
+    const accelerator = normalizeAccelerator(raw);
+    const hotkeys = { ...t.hotkeys };
+    if (accelerator) hotkeys[verb] = accelerator;
+    else delete hotkeys[verb];
+    saveTimers(withTimer(timerStore(), id, { ...t, hotkeys }));
+    const hotkeyId = timerHotkeyId(id, verb);
+    if (!accelerator) {
+      try {
+        await unregisterGlobalShortcutCmd(hotkeyId);
+      } catch (err) {
+        console.warn("[hourglass] unregister hotkey failed", err);
+      }
+      return;
+    }
+    try {
+      await registerGlobalShortcutCmd(hotkeyId, accelerator);
+    } catch (err) {
+      console.warn("[hourglass] register hotkey failed", err);
+    }
+  };
+
+  // Asked once, then remembered: the command creates the folder, and the
+  // file writer makes it again if it goes.
+  let timersDirPath: string | null = null;
+  const timersDir: AppState["timersDir"] = async () => {
+    if (timersDirPath !== null) return timersDirPath;
+    try {
+      const dir = await timersDirCmd();
+      if (typeof dir === "string" && dir !== "") timersDirPath = dir;
+    } catch (e) {
+      console.warn("[hourglass] timers_dir failed:", e);
+    }
+    return timersDirPath;
+  };
   const timerOnOverlay = (id: string): boolean => overlay.overlayHasTimer(id);
   const setTimerOnOverlay = (id: string, on: boolean): void => {
     if (on) overlay.addOverlayTimer(id);
@@ -2991,7 +3230,8 @@ export function createAppState(): AppState {
    * Per-tile hotkey id used when talking to `tauri-plugin-global-
    * shortcut`. The plugin's id namespace is shared between PTM /
    * panic / monitor and every tile, so we prefix tiles to keep them
-   * out of the action namespace.
+   * out of the action namespace. v1.59.0: Hourglass's timers use
+   * `tm:<id>:<verb>` the same way (`timerHotkeyId`, data/timers.ts).
    */
   const tileHotkeyId = (clipId: string): string => `sb:${clipId}`;
 
@@ -3118,6 +3358,23 @@ export function createAppState(): AppState {
         await registerGlobalShortcutCmd(tileHotkeyId(clipId), accelerator);
       } catch (err) {
         console.warn(`[soundboard] sync tile hotkey failed for ${clipId}`, err);
+      }
+    }
+    // v1.59.0: then Hourglass's timers, from `divora.timers`. Only timers the
+    // backend runs, and only the verbs this build acts on: a newer kind's
+    // keys, a timer past the 16th and a later verb (`finish`) are kept in
+    // storage and never registered. Each key is read just before it goes
+    // out, so a delete or a bind that landed meanwhile is the one that
+    // counts.
+    for (const { id } of timerStore().timers) {
+      for (const verb of TIMER_VERBS) {
+        const accelerator = runTimer(id)?.hotkeys?.[verb];
+        if (!accelerator) continue;
+        try {
+          await registerGlobalShortcutCmd(timerHotkeyId(id, verb), accelerator);
+        } catch (err) {
+          console.warn(`[hourglass] sync hotkey failed for ${id} ${verb}`, err);
+        }
       }
     }
   };

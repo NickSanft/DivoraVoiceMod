@@ -666,3 +666,76 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     expect(states().every((s) => s === "modulated")).toBe(true);
   });
 });
+
+// v1.59.0: Hourglass in the shell — the boot sync's order, and the timer
+// keys the backend owns.
+describe("App shell — Hourglass (v1.59.0)", () => {
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  const stored = {
+    version: 1,
+    timers: [
+      { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300000, hotkeys: { toggle: "F9", reset: "F10" } },
+    ],
+  };
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    invokeOverrides.clear();
+  });
+  afterEach(() => {
+    invokeOverrides.clear();
+    emitted.length = 0;
+    window.localStorage.clear();
+  });
+
+  it("sends the stored timers before the boot enumerates devices, and before any timer key registers", async () => {
+    window.localStorage.setItem("divora.timers", JSON.stringify(stored));
+    invokeCalls.length = 0;
+    render(() => <App />);
+    await settle();
+    await settle();
+    const cmds = invokeCalls.map((c) => c.cmd);
+    const sync = cmds.indexOf("sync_timers");
+    expect(sync).toBeGreaterThanOrEqual(0);
+    expect(sync).toBeLessThan(cmds.indexOf("list_audio_input_devices"));
+    const keys = invokeCalls
+      .map((c, i) => [i, c] as const)
+      .filter(([, c]) => c.cmd === "register_global_shortcut")
+      .map(([i, c]) => [i, (c.args as { id: string }).id] as const);
+    expect(keys.map(([, id]) => id)).toEqual(["tm:timer-1:toggle", "tm:timer-1:reset"]);
+    expect(keys.every(([i]) => i > sync)).toBe(true);
+  });
+
+  it("a fresh profile sends no timer command", async () => {
+    invokeCalls.length = 0;
+    render(() => <App />);
+    await settle();
+    await settle();
+    const cmds = invokeCalls.map((c) => c.cmd);
+    expect(cmds.filter((c) => c === "sync_timers" || c === "timer_status" || c.endsWith("_timer"))).toEqual([]);
+  });
+
+  it("a timer hotkey press or release invokes nothing (the backend already acted)", async () => {
+    window.localStorage.setItem("divora.timers", JSON.stringify(stored));
+    const { result } = renderHook(() => useApp(), { wrapper: AppProvider });
+    await settle();
+    // A mirror the page could act from, were it to act.
+    result.adoptTimerSnapshot({
+      seq: 1,
+      timers: [
+        { id: "timer-1", name: "BRB", kind: "countdown", phase: "idle", ms: 300000, totalMs: 300000, text: "05:00", anchorMs: null, fires: 0 },
+      ],
+    });
+    invokeCalls.length = 0;
+    for (const id of ["tm:timer-1:toggle", "tm:timer-1:reset", "tm:timer-1:finish"]) {
+      dispatchGlobalShortcut(result, { id, accelerator: "F9", state: "pressed" });
+      dispatchGlobalShortcut(result, { id, accelerator: "F9", state: "released" });
+    }
+    await settle();
+    expect(invokeCalls).toEqual([]);
+    expect(result.timerSnapshot()?.timers[0]?.phase).toBe("idle");
+  });
+});

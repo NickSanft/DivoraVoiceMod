@@ -11,11 +11,14 @@ import {
   emitReplay,
   emitReplaySaved,
   emitsOf,
+  emitTimers,
   invokesOf,
+  listenCount,
   mockMute,
   mockPtm,
   pressMuteHotkey,
   pressPtmHotkey,
+  TIMER_SAMPLES,
 } from "./tauri-mock";
 
 const nav = (page: import("@playwright/test").Page, label: string) =>
@@ -195,14 +198,16 @@ test.describe("what's new (v1.49)", () => {
 
     // No banner off Tauri: there is no app version to compare against. (The
     // shell's toast is a status region too, always mounted since v1.54.0, and
-    // so is the titlebar's mute announcer since v1.56.0; both are empty.)
+    // so are the titlebar's mute announcer since v1.56.0 and Settings →
+    // Hourglass's since v1.59.0; all are empty.)
     await expect(
       page.locator(
-        '[role="status"]:not([data-testid="toast"]):not([data-testid="mute-announcer"])',
+        '[role="status"]:not([data-testid="toast"]):not([data-testid="mute-announcer"]):not([data-testid="hourglass-announcer"])',
       ),
     ).toHaveCount(0);
     await expect(page.getByTestId("toast")).toHaveText("");
     await expect(page.getByTestId("mute-announcer")).toHaveText("");
+    await expect(page.getByTestId("hourglass-announcer")).toHaveText("");
 
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
@@ -1964,6 +1969,264 @@ test.describe("push-to-modulate (v1.58)", () => {
     await expect.poll(lastStatus).toBe("clean");
     await page.waitForTimeout(300);
     expect(await statuses()).not.toContain("modulated");
+  });
+});
+
+// The backend keeps the time; the page keeps the stored timers and a mirror
+// of the backend's newest snapshot. The mock's timer commands answer null, so
+// every state a card shows is one these specs sent with emitTimers.
+test.describe("Hourglass (v1.59)", () => {
+  type Page = import("@playwright/test").Page;
+  type Snapshot = typeof TIMER_SAMPLES.idle;
+
+  const TIMER_CMDS = [
+    "sync_timers",
+    "arm_timer",
+    "pause_timer",
+    "resume_timer",
+    "reset_timer",
+    "adjust_timer",
+    "timer_status",
+    "timers_dir",
+  ];
+  /** The timer commands this page has sent, in order. */
+  const timerCalls = async (page: Page) =>
+    (await invokesOf(page)).filter((i) => TIMER_CMDS.includes(i.cmd));
+  const SYNC = (timers: unknown[]) => ({ cmd: "sync_timers", args: { timers } });
+  const STATUS = { cmd: "timer_status", args: {} };
+  /** What Add countdown stores and sends, and the same timer renamed. */
+  const COUNTDOWN = { id: "timer-1", name: "Countdown", kind: "countdown", durationMs: 300_000 };
+  const BRB = { ...COUNTDOWN, name: "BRB" };
+
+  /** BRB (`timer-1`) alone, from one of the fixture's snapshots. */
+  const brb = (s: Snapshot): Snapshot => ({ seq: s.seq, timers: s.timers.filter((t) => t.id === "timer-1") });
+  const RUNNING = TIMER_SAMPLES.running.timers.find((t) => t.id === "timer-1")!;
+  /** BRB paused where the running sample left it, as a later snapshot. */
+  const PAUSED: Snapshot = { seq: 4, timers: [{ ...RUNNING, phase: "paused", anchorMs: null }] };
+  /** The run the page keeps for the running sample (runOf). */
+  const RUN = { phase: "running", totalMs: 300_000, anchorMs: RUNNING.anchorMs };
+
+  /** `divora.timers`, as the page saved it. */
+  const stored = (page: Page) =>
+    page.evaluate(() => JSON.parse(localStorage.getItem("divora.timers") ?? "null") as unknown);
+  const section = (page: Page) =>
+    page.locator("section", { has: page.locator(".eyebrow", { hasText: /^Hourglass$/ }) });
+  const card = (page: Page) => page.locator('[data-timer-card="timer-1"]');
+
+  /** Settings → Add countdown, then Rename it BRB, as a user does: a sync for
+   *  each, and the page listening from the first. */
+  async function addBrb(page: Page): Promise<void> {
+    await nav(page, "Settings").click();
+    await section(page).getByRole("button", { name: "Add countdown" }).click();
+    await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS]);
+    await card(page).getByRole("button", { name: "Rename Countdown" }).click();
+    const field = card(page).getByRole("textbox", { name: "Name of Countdown" });
+    await field.fill("BRB");
+    await field.press("Enter");
+    await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS, SYNC([BRB])]);
+  }
+
+  test("a profile without timers sends no timer command and doesn't listen for them", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Settings").click();
+    await expect(section(page)).toContainText("No timers yet — add one below.");
+    // Through the rest of the boot: the enumeration and the hotkey sync.
+    await expect.poll(async () => (await invokesOf(page, "list_audio_input_devices")).length).toBeGreaterThan(0);
+    await page.waitForTimeout(300);
+    expect(await timerCalls(page)).toEqual([]);
+    expect(await listenCount(page, "timer-state")).toBe(0);
+    expect(await stored(page)).toBeNull();
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("Add countdown syncs it; its card waits for the backend, takes only newer snapshots, and Pause sends pause", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await nav(page, "Settings").click();
+    await section(page).getByRole("button", { name: "Add countdown" }).click();
+    // The backend hears of it, and the page listens from now on.
+    await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS]);
+    expect(await listenCount(page, "timer-state")).toBe(1);
+    expect(await stored(page)).toEqual({ version: 1, timers: [{ ...COUNTDOWN, hotkeys: {} }] });
+    // No state from the backend yet (the mock answered null): no controls
+    // but Rename and Delete.
+    await expect(card(page)).toContainText("Countdown · 5:00");
+    await expect(card(page)).toContainText("Starting…");
+    await expect(card(page).getByRole("button")).toHaveText(["Rename", "Delete"]);
+    await expect(section(page)).not.toHaveAttribute("data-timer-seq");
+
+    await card(page).getByRole("button", { name: "Rename Countdown" }).click();
+    const field = card(page).getByRole("textbox", { name: "Name of Countdown" });
+    await field.fill("BRB");
+    await field.press("Enter");
+    await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS, SYNC([BRB])]);
+
+    // The backend says it runs.
+    await emitTimers(page, brb(TIMER_SAMPLES.running));
+    await expect(card(page)).toContainText("04:59");
+    await expect(card(page)).toContainText("Running");
+    await expect(section(page)).toHaveAttribute("data-timer-seq", "2");
+    const pause = card(page).getByRole("button", { name: "Pause BRB" });
+    await expect(pause).toHaveText("Pause");
+    // Its run is kept, so a restart can pick it up.
+    expect(await stored(page)).toMatchObject({ timers: [{ id: "timer-1", run: RUN }] });
+
+    await pause.click();
+    await expect
+      .poll(async () => (await timerCalls(page)).at(-1))
+      .toEqual({ cmd: "pause_timer", args: { id: "timer-1" } });
+
+    // An older snapshot, arriving late, changes nothing.
+    await emitTimers(page, brb(TIMER_SAMPLES.idle));
+    await page.waitForTimeout(300);
+    await expect(card(page)).toContainText("04:59");
+    await expect(card(page)).toContainText("Running");
+    await expect(pause).toBeVisible();
+    await expect(section(page)).toHaveAttribute("data-timer-seq", "2");
+    expect(await stored(page)).toMatchObject({ timers: [{ id: "timer-1", run: RUN }] });
+
+    // A newer one is taken.
+    await emitTimers(page, PAUSED);
+    await expect(card(page)).toContainText("Paused");
+    await expect(card(page).getByRole("button", { name: "Resume BRB" })).toHaveText("Resume");
+    await expect(section(page)).toHaveAttribute("data-timer-seq", "4");
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("a bound key registers as tm:<id>:<verb>, and a reload syncs the run first, then registers exactly the keys it runs", async ({
+    page,
+  }) => {
+    await addBrb(page);
+    // The hotkey rows come with the backend's state.
+    await emitTimers(page, brb(TIMER_SAMPLES.running));
+    await card(page).getByRole("button", { name: "BRB start or pause hotkey: not set" }).click();
+    await page.keyboard.press("F9");
+    const bound = {
+      cmd: "register_global_shortcut",
+      args: { id: "tm:timer-1:toggle", accelerator: "F9" },
+    };
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    await expect(card(page).getByRole("button", { name: "BRB start or pause hotkey: F9" })).toBeVisible();
+    await expect(card(page).getByRole("button", { name: "Clear BRB start or pause hotkey" })).toBeVisible();
+    expect(await stored(page)).toMatchObject({ timers: [{ id: "timer-1", hotkeys: { toggle: "F9" } }] });
+
+    // Kept in storage and never registered by this build: a later verb, and
+    // a later kind's key.
+    const LAP = { id: "timer-2", name: "Lap", kind: "lap", durationMs: 60_000 };
+    await page.evaluate((lap) => {
+      const s = JSON.parse(localStorage.getItem("divora.timers")!);
+      s.timers[0].hotkeys.finish = "F10";
+      s.timers.push({ ...lap, hotkeys: { toggle: "F11" } });
+      localStorage.setItem("divora.timers", JSON.stringify(s));
+    }, LAP);
+
+    await page.reload();
+    await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+    // Every stored timer goes to the backend, BRB with the run it had, so a
+    // backend that restarted picks it up where it was.
+    await expect.poll(() => invokesOf(page, "sync_timers")).toEqual([SYNC([{ ...BRB, resume: RUN }, LAP])]);
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    await page.waitForTimeout(300);
+    expect(await invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    // Sent at creation: before the boot's device enumeration (which holds
+    // the main thread), and before any of its keys can work.
+    const cmds = (await invokesOf(page)).map((i) => i.cmd);
+    expect(cmds.indexOf("sync_timers")).toBeLessThan(cmds.indexOf("list_audio_input_devices"));
+    expect(cmds.indexOf("sync_timers")).toBeLessThan(cmds.indexOf("register_global_shortcut"));
+    // Both are still stored as they were.
+    expect(await stored(page)).toMatchObject({
+      timers: [
+        { id: "timer-1", hotkeys: { toggle: "F9", finish: "F10" }, run: RUN },
+        { id: "timer-2", kind: "lap", hotkeys: { toggle: "F11" } },
+      ],
+    });
+  });
+
+  test("a timer's hotkey is the backend's: the page sends nothing for it, and the next snapshot brings it", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await addBrb(page);
+    await emitTimers(page, brb(TIMER_SAMPLES.running));
+    await expect(card(page).getByRole("button", { name: "Pause BRB" })).toBeVisible();
+    const before = await timerCalls(page);
+
+    // The backend paused it on the press and still sends the event. The page
+    // must not act on it as well: that would pause it and start it again.
+    await page.evaluate(() => {
+      const emit = (window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void })
+        .__E2E_EMIT__;
+      for (const verb of ["toggle", "reset"]) {
+        for (const state of ["pressed", "released"]) {
+          emit("global-shortcut", { id: `tm:timer-1:${verb}`, accelerator: "F9", state });
+        }
+      }
+    });
+    await page.waitForTimeout(300);
+    expect(await timerCalls(page)).toEqual(before);
+    await expect(card(page)).toContainText("Running");
+
+    await emitTimers(page, PAUSED);
+    await expect(card(page)).toContainText("Paused");
+    expect(await timerCalls(page)).toEqual(before);
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  test("Delete asks twice, then unregisters both keys, syncs without the timer and takes its face off the overlay", async ({
+    page,
+    consoleErrors,
+  }) => {
+    await addBrb(page);
+    await emitTimers(page, brb(TIMER_SAMPLES.idle));
+    const charmRows = page.getByTestId("overlay-charms").locator("[data-charm-row]");
+    const charmRow = charmRows.filter({ hasText: "Timer · BRB" });
+    // The overlay's scene as saved: its timer faces' timers.
+    const faces = () =>
+      page.evaluate(() =>
+        (
+          (JSON.parse(localStorage.getItem("divora.overlayScene") ?? "null") as {
+            elements: Array<{ type?: unknown; timer?: unknown }>;
+          } | null)?.elements ?? []
+        )
+          .filter((e) => e.type === "timer")
+          .map((e) => e.timer),
+      );
+    const rowsBefore = await charmRows.count();
+    await card(page).getByRole("switch", { name: "Show BRB on the overlay" }).click();
+    await expect(charmRow).toHaveCount(1);
+    await expect(charmRows).toHaveCount(rowsBefore + 1);
+    expect(await faces()).toEqual(["timer-1"]);
+    const before = await timerCalls(page);
+
+    // The first click only asks.
+    await card(page).getByRole("button", { name: "Delete BRB" }).click();
+    const confirm = card(page).getByRole("button", { name: "Click again to delete BRB" });
+    await expect(confirm).toHaveText("Confirm?");
+    await page.waitForTimeout(300);
+    expect(await invokesOf(page, "unregister_global_shortcut")).toEqual([]);
+    expect(await timerCalls(page)).toEqual(before);
+    await expect(charmRow).toHaveCount(1);
+
+    await confirm.click();
+    // Both keys, set or not, so none is left to start whatever timer takes
+    // this id next; then the backend drops it.
+    await expect.poll(() => invokesOf(page, "unregister_global_shortcut")).toEqual([
+      { cmd: "unregister_global_shortcut", args: { id: "tm:timer-1:toggle" } },
+      { cmd: "unregister_global_shortcut", args: { id: "tm:timer-1:reset" } },
+    ]);
+    await expect.poll(() => timerCalls(page)).toEqual([...before, SYNC([])]);
+    // Its face goes too, not just its name: a face left behind would read
+    // "Timer" here and draw nothing on the overlay.
+    await expect(charmRows).toHaveCount(rowsBefore);
+    await expect(charmRow).toHaveCount(0);
+    expect(await faces()).toEqual([]);
+    await expect(card(page)).toHaveCount(0);
+    await expect(section(page)).toContainText("No timers yet — add one below.");
+    expect(await stored(page)).toMatchObject({ timers: [] });
+    expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
 });
 

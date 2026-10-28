@@ -10,8 +10,21 @@
 //     grain / vignette new in Phase 6)
 //   • About (DMark + version + license + GitHub + three pillar cards +
 //     Replay setup button that re-opens the first-run wizard)
+//   • v1.59.0: Hourglass (countdowns and count-ups the backend keeps, after
+//     Stream overlay)
 
-import { createMemo, createSignal, For, onMount, Show, type JSX } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  createUniqueId,
+  For,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+  type JSX,
+} from "solid-js";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -26,6 +39,7 @@ import { Slider } from "../components/Slider";
 import { Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
+import { blurOnPointer } from "../components/blurOnPointer";
 import { clearWizardSeenFlag } from "../components/Wizard";
 import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
@@ -51,6 +65,21 @@ import type {
 } from "../types";
 
 import { acceleratorToKeys, keysToAccelerator } from "../data/hotkeys";
+import {
+  lengthText,
+  MAX_NAME,
+  MAX_TIMERS,
+  parseLength,
+  phaseWord,
+  readTimerName,
+  sameKey,
+  timerAction,
+  timerAnnouncement,
+  type StoredTimer,
+  type TimerEdges,
+  type TimerVerb,
+} from "../data/timers";
+import type { TimerPhase, TimerState } from "../overlay/timerState";
 import {
   MAX_AV_OFFSET_MS,
   MAX_DESKTOP_GAIN_DB,
@@ -172,6 +201,8 @@ export function SettingsScreen(): JSX.Element {
       <AppearanceSection motionLabel={motionLabel} />
 
       <StreamOverlaySection />
+
+      <HourglassSection />
 
       <AboutSection />
     </div>
@@ -1649,9 +1680,10 @@ function ControlSurfacesSection(): JSX.Element {
               action to a button and set it to the same key you bound under{" "}
               <strong>Settings → Hotkeys</strong> (for example{" "}
               <strong>Mute your voice</strong>, panic or a recorder) or to a
-              per-tile soundboard hotkey. The button then fires DivoraVoice's
-              existing global shortcut — even while a game or Discord is
-              focused.
+              per-tile soundboard hotkey or a timer's keys in{" "}
+              <strong>Settings → Hourglass</strong>. The button then fires
+              DivoraVoice's existing global shortcut — even while a game or
+              Discord is focused.
             </p>
           </div>
         </Card>
@@ -2248,7 +2280,10 @@ function OverlayArrangeButton(): JSX.Element {
 function OverlayCharmRows(): JSX.Element {
   const app = useApp();
   const scene = () => app.overlayScene();
-  const labels = createMemo(() => charmLabels(scene()));
+  // v1.59.0: a timer's row is named for the timer it shows.
+  const timerName = (id: string): string | undefined =>
+    app.timerStore().timers.find((t) => t.id === id)?.name;
+  const labels = createMemo(() => charmLabels(scene(), timerName));
   // `layoutScene` draws back to front; the list reads front to back.
   const charms = createMemo(() =>
     layoutScene(scene(), scene().designSize)
@@ -2292,11 +2327,18 @@ function OverlayCharmRows(): JSX.Element {
                   color: "var(--text-mid)",
                 }}
               >
-                <Sigil name={el.type === "spellcircle" ? "modulated" : "image"} size={16} />
+                <Sigil
+                  name={
+                    el.type === "spellcircle" ? "modulated" : el.type === "timer" ? "hourglass" : "image"
+                  }
+                  size={16}
+                />
                 <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
                   {el.type === "image"
                     ? `${label()} · ${el.nw}×${el.nh}${el.anim === true ? " · animated" : ""}`
-                    : label()}
+                    : el.type === "timer" && timerName(el.timer) !== undefined
+                      ? `Timer · ${label()}`
+                      : label()}
                 </span>
               </span>
               <Button
@@ -2433,6 +2475,662 @@ function StreamOverlaySection(): JSX.Element {
         </div>
       </div>
     </section>
+  );
+}
+
+// ---------- Hourglass (v1.59.0) ----------
+//
+// Countdowns and count-ups. The backend keeps the time (src-tauri/src/
+// timers.rs): this section never decides a timer's state. It shows the
+// store's mirror of the backend's newest snapshot and sends what a control
+// says. The cards are the stored timers (`divora.timers`) in list order,
+// keyed by id, so a storage write (a run saved at a transition, a rename)
+// never rebuilds a card mid-edit; each is joined by id with the snapshot.
+
+/** Each timer's two hotkeys, as their rows and names say them. */
+const TIMER_KEY_ROWS: Array<{ verb: TimerVerb; label: string; desc: string; spoken: string }> = [
+  {
+    verb: "toggle",
+    label: "Start or pause",
+    desc: "Starts it, pauses it, or starts it again once it's done.",
+    spoken: "start or pause",
+  },
+  { verb: "reset", label: "Reset", desc: "Back to the start, stopped.", spoken: "reset" },
+];
+
+const LENGTH_REASON = "Enter minutes, m:ss or h:mm:ss, from 1 second to 24 hours.";
+
+const PHASE_TONE: Record<TimerPhase, "" | "accent" | "success" | "warning"> = {
+  idle: "",
+  running: "accent",
+  paused: "warning",
+  done: "success",
+  expired: "warning",
+};
+
+/** "a", "a and b", "a, b and c". */
+function listed(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? "";
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** A file in a folder the backend named, with the folder's own separator. */
+function inFolder(dir: string, file: string): string {
+  if (dir.endsWith("\\") || dir.endsWith("/")) return dir + file;
+  return `${dir}${dir.includes("\\") ? "\\" : "/"}${file}`;
+}
+
+const fieldStyle: JSX.CSSProperties = {
+  height: "30px",
+  padding: "0 var(--s2)",
+  "border-radius": "var(--r-sm)",
+  border: "1px solid var(--line-strong)",
+  background: "var(--surface-1)",
+  color: "var(--text-hi)",
+  "font-size": "var(--t-sm)",
+};
+
+function HourglassSection(): JSX.Element {
+  const app = useApp();
+  // By id, not by entry: a new entry object for the same id keeps its card.
+  const ids = createMemo(() => app.timerStore().timers.map((t) => t.id));
+  const full = () => app.timerStore().timers.length >= MAX_TIMERS;
+
+  // The live region speaks edges only, never a time (a clock in a live
+  // region would talk every second): a timer done, or one that ran out
+  // while away. It is cleared at the next adopted snapshot, so a second
+  // "BRB is done." is spoken again. Nothing for the first snapshot after the
+  // section mounts.
+  const [said, setSaid] = createSignal("");
+  let held: TimerEdges | null = null;
+  createEffect(
+    on(app.timerSnapshot, (snap) => {
+      if (!snap) return;
+      const next = timerAnnouncement(held, snap);
+      held = next.held;
+      setSaid(next.text);
+    }),
+  );
+
+  const openFolder = async (): Promise<void> => {
+    const dir = await app.timersDir();
+    if (dir) await openExternal(dir);
+  };
+
+  return (
+    <section data-timer-seq={app.timerSnapshot()?.seq}>
+      <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
+        Hourglass
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s4)",
+        }}
+      >
+        <p style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", margin: 0 }}>
+          Countdowns and count-ups that keep time while Divora is in the tray. Start, pause and
+          reset them here or with their own hotkeys, and show them on your overlay or in OBS. If
+          your PC sleeps, a count-up pauses, and a countdown that runs out meanwhile says so
+          instead of finishing late.
+        </p>
+        {/* Always mounted: a region inserted together with its text is
+            commonly missed. */}
+        <span class="sr-only" role="status" aria-live="polite" data-testid="hourglass-announcer">
+          {said()}
+        </span>
+        <Show when={ids().length === 0}>
+          <EmptyHint>No timers yet — add one below.</EmptyHint>
+        </Show>
+        <For each={ids()}>{(id) => <TimerCard id={id} />}</For>
+        <div style={{ display: "flex", gap: "var(--s3)", "flex-wrap": "wrap" }}>
+          <Button
+            size="sm"
+            icon="plus"
+            disabled={full()}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void app.addTimer("countdown");
+            }}
+          >
+            Add countdown
+          </Button>
+          <Button
+            size="sm"
+            icon="plus"
+            disabled={full()}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void app.addTimer("countup");
+            }}
+          >
+            Add count-up
+          </Button>
+        </div>
+        <Show when={full()}>
+          <div style={reasonStyle}>Hourglass holds up to 16 timers. Delete one to add another.</div>
+        </Show>
+        <div
+          data-testid="hourglass-hotkey-note"
+          style={{
+            ...helpStyle,
+            "padding-top": "var(--s2)",
+            "border-top": "1px dashed var(--line)",
+          }}
+        >
+          Keys you set here work in every app, and the app you're in doesn't get them while Divora
+          runs: set to Space, you can't type a space anywhere. Pick keys you don't otherwise use,
+          such as F13–F24 from a Stream Deck, or Ctrl+Alt with a letter. A key works only with
+          exactly its modifiers: set to F9, pressing it while you hold Shift or Ctrl does nothing.
+          A key that's already set in Divora runs what it's set for and can't be picked here; clear
+          it there first. Some keys can't be set, and Divora doesn't say so: to check one, press it
+          with Divora in the tray, then look at the timer here.
+        </div>
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "var(--s4)",
+            "border-top": "1px solid var(--line)",
+            "padding-top": "var(--s4)",
+          }}
+        >
+          <div style={{ "min-width": 0 }}>
+            <div class="eyebrow" style={{ "margin-bottom": "4px" }}>
+              Timer files for OBS
+            </div>
+            <div style={helpStyle}>
+              In OBS, add a <strong>Text (GDI+)</strong> source, tick{" "}
+              <strong>Read from file</strong> and pick a timer's file from this folder. OBS checks
+              the file about once a second, so its text can run up to 2 seconds behind the overlay.
+              While Divora is closed, a file keeps the last time it showed.
+            </div>
+          </div>
+          {/* Named apart from Recordings' "Open folder" on the same page. */}
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="folder"
+            aria-label="Open the timer files folder"
+            style={{ "flex-shrink": 0 }}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void openFolder();
+            }}
+          >
+            Open folder
+          </Button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** Delete asks twice: the first click turns it into "Confirm?" for 3 s
+ *  (the Presets screen's rule). A delete stops a timer that may be on
+ *  stream and blanks its OBS source. */
+function TimerDeleteButton(props: { id: string; name: string }): JSX.Element {
+  const app = useApp();
+  const [confirming, setConfirming] = createSignal(false);
+  let reset: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(reset));
+  return (
+    <Button
+      variant="danger"
+      size="sm"
+      icon="trash"
+      aria-label={confirming() ? `Click again to delete ${props.name}` : `Delete ${props.name}`}
+      onClick={(e) => {
+        blurOnPointer(e);
+        clearTimeout(reset);
+        if (confirming()) {
+          setConfirming(false);
+          void app.deleteTimer(props.id);
+          return;
+        }
+        setConfirming(true);
+        reset = setTimeout(() => setConfirming(false), 3000);
+      }}
+    >
+      {confirming() ? "Confirm?" : "Delete"}
+    </Button>
+  );
+}
+
+function TimerCard(props: { id: string }): JSX.Element {
+  const app = useApp();
+  // The entry as stored (the last one seen while the card is going).
+  const stored = createMemo<StoredTimer | undefined>(
+    (prev) => app.timerStore().timers.find((t) => t.id === props.id) ?? prev,
+    undefined,
+  );
+  const name = () => stored()?.name ?? "";
+  const role = () => app.timerRoles().get(props.id) ?? "run";
+  const state = () => app.timerSnapshot()?.timers.find((t) => t.id === props.id);
+  const kindLine = () =>
+    stored()?.kind === "countdown" ? `Countdown · ${lengthText(stored()?.durationMs ?? 0)}` : "Count-up";
+
+  // Rename: Enter or leaving the field keeps it, Esc cancels, and a name
+  // that trims to nothing puts the old one back.
+  const [renaming, setRenaming] = createSignal(false);
+  const [nameDraft, setNameDraft] = createSignal("");
+  const commitRename = (): void => {
+    if (!renaming()) return;
+    setRenaming(false);
+    const next = readTimerName(nameDraft());
+    if (next !== null && next !== name()) void app.renameTimer(props.id, next);
+  };
+
+  return (
+    <Card
+      data-timer-card={props.id}
+      style={{ padding: "var(--s4)", display: "flex", "flex-direction": "column", gap: "var(--s3)" }}
+    >
+      <Show
+        when={role() === "run"}
+        fallback={
+          // A timer this build doesn't run: kept as it is, with Delete only.
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              "justify-content": "space-between",
+              gap: "var(--s4)",
+            }}
+          >
+            <div style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", "min-width": 0 }}>
+              <span style={{ "font-weight": 600, color: "var(--text-hi)" }}>{name()}</span>
+              {role() === "newer"
+                ? " · Made by a newer Divora. Delete it here, or use it in that version."
+                : " · Over the 16-timer limit: Divora runs the first 16."}
+            </div>
+            <TimerDeleteButton id={props.id} name={name()} />
+          </div>
+        }
+      >
+        <div
+          style={{
+            display: "flex",
+            "align-items": "flex-start",
+            "justify-content": "space-between",
+            gap: "var(--s4)",
+          }}
+        >
+          <div style={{ "min-width": 0, flex: 1 }}>
+            <Show
+              when={renaming()}
+              fallback={
+                <div style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}>
+                  {name()}
+                </div>
+              }
+            >
+              <input
+                type="text"
+                value={nameDraft()}
+                maxlength={MAX_NAME}
+                aria-label={`Name of ${name()}`}
+                onInput={(e) => setNameDraft(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitRename();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    setRenaming(false);
+                  }
+                }}
+                onBlur={commitRename}
+                ref={(el) => {
+                  // Focus and select, so typing replaces the old name.
+                  queueMicrotask(() => {
+                    el.focus();
+                    el.select();
+                  });
+                }}
+                style={{ ...fieldStyle, width: "100%", "max-width": "260px" }}
+              />
+            </Show>
+            <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "margin-top": "2px" }}>
+              {kindLine()}
+            </div>
+          </div>
+          <div style={{ display: "flex", "align-items": "center", gap: "var(--s3)", "flex-shrink": 0 }}>
+            {/* The time is never in a live region: it changes every second. */}
+            <Show when={state()}>
+              {(s) => (
+                <span
+                  class="mono tnum"
+                  style={{ "font-size": "var(--t-h2)", "font-weight": 700, color: "var(--text-hi)" }}
+                >
+                  {s().text}
+                </span>
+              )}
+            </Show>
+            <Badge tone={PHASE_TONE[state()?.phase ?? "idle"]}>{phaseWord(state()?.phase ?? null)}</Badge>
+          </div>
+        </div>
+        <Show when={state()}>
+          {(s) => <TimerControls id={props.id} name={name()} timer={stored()!} state={s()} />}
+        </Show>
+        <div style={{ display: "flex", gap: "var(--s2)", "justify-content": "flex-end" }}>
+          <Show when={!renaming()}>
+            <Button
+              variant="ghost"
+              size="sm"
+              icon="pencil"
+              aria-label={`Rename ${name()}`}
+              onClick={() => {
+                setNameDraft(name());
+                setRenaming(true);
+              }}
+            >
+              Rename
+            </Button>
+          </Show>
+          <TimerDeleteButton id={props.id} name={name()} />
+        </div>
+      </Show>
+    </Card>
+  );
+}
+
+/** A timer the backend runs, once it has said how it is: the buttons, the
+ *  Length, the two hotkeys, the overlay toggle and the file. */
+function TimerControls(props: {
+  id: string;
+  name: string;
+  timer: StoredTimer;
+  state: TimerState;
+}): JSX.Element {
+  const app = useApp();
+  const action = () => timerAction(props.state);
+  // ±30 s changes a running or paused timer only; Length is for the rest.
+  const adjustable = () => props.state.phase === "running" || props.state.phase === "paused";
+
+  // Length: the draft while typing (null shows the length stored). It is
+  // applied on Enter or on leaving the field, never per keystroke, which
+  // would put every prefix of "1:30:00" on stream and in storage. Esc puts
+  // the stored one back; an entry that can't be read stays, marked, and
+  // nothing is sent.
+  const [lengthDraft, setLengthDraft] = createSignal<string | null>(null);
+  const [lengthBad, setLengthBad] = createSignal(false);
+  const reasonId = `timer-length-reason-${createUniqueId()}`;
+  const nextStartId = `timer-length-next-${createUniqueId()}`;
+  const commitLength = (): void => {
+    const draft = lengthDraft();
+    if (draft === null) return;
+    const ms = parseLength(draft);
+    if (ms === null) {
+      setLengthBad(true);
+      return;
+    }
+    void app.setTimerLength(props.id, ms);
+    setLengthBad(false);
+    setLengthDraft(null);
+  };
+  const describedBy = () =>
+    [lengthBad() ? reasonId : "", adjustable() ? nextStartId : ""].filter(Boolean).join(" ") ||
+    undefined;
+
+  const onOverlay = () => app.timerOnOverlay(props.id);
+
+  const copyPath = async (): Promise<void> => {
+    const dir = await app.timersDir();
+    try {
+      if (!dir || !navigator.clipboard?.writeText) throw new Error("no folder or no clipboard");
+      await navigator.clipboard.writeText(inFolder(dir, `${props.id}.txt`));
+      app.showToast("Copied the file's path.", "success");
+    } catch (err) {
+      console.warn("[hourglass] copying the file's path failed", err);
+      app.showToast("Couldn't copy. Open the folder instead.", "error");
+    }
+  };
+
+  return (
+    <>
+      <Show when={props.state.phase === "expired"}>
+        <div style={helpStyle}>
+          It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.
+        </div>
+      </Show>
+      <div style={{ display: "flex", gap: "var(--s2)", "flex-wrap": "wrap" }}>
+        <Button
+          variant="primary"
+          size="sm"
+          icon={action().cmd === "pause" ? "pause" : "play"}
+          aria-label={`${action().label} ${props.name}`}
+          onClick={(e) => {
+            blurOnPointer(e);
+            void app.startTimer(props.id);
+          }}
+        >
+          {action().label}
+        </Button>
+        <Button
+          size="sm"
+          icon="refresh"
+          aria-label={`Reset ${props.name}`}
+          onClick={(e) => {
+            blurOnPointer(e);
+            void app.resetTimer(props.id);
+          }}
+        >
+          Reset
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={!adjustable()}
+          aria-label={`Take 30 seconds off ${props.name}`}
+          onClick={(e) => {
+            blurOnPointer(e);
+            void app.adjustTimer(props.id, -30_000);
+          }}
+        >
+          −30 s
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={!adjustable()}
+          aria-label={`Add 30 seconds to ${props.name}`}
+          onClick={(e) => {
+            blurOnPointer(e);
+            void app.adjustTimer(props.id, 30_000);
+          }}
+        >
+          +30 s
+        </Button>
+      </div>
+
+      <Show when={props.timer.kind === "countdown"}>
+        <FieldRow label="Length">
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+            <input
+              type="text"
+              class="mono tnum"
+              value={lengthDraft() ?? lengthText(props.timer.durationMs)}
+              placeholder="5:00"
+              aria-label={`Length of ${props.name}`}
+              aria-invalid={lengthBad() ? "true" : undefined}
+              aria-describedby={describedBy()}
+              onInput={(e) => {
+                setLengthDraft(e.currentTarget.value);
+                setLengthBad(false);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitLength();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  setLengthDraft(null);
+                  setLengthBad(false);
+                }
+              }}
+              onBlur={commitLength}
+              style={{
+                ...fieldStyle,
+                width: "110px",
+                "border-color": lengthBad() ? "var(--warning)" : "var(--line-strong)",
+              }}
+            />
+            <Show when={lengthBad()}>
+              <div id={reasonId} style={reasonStyle}>
+                {LENGTH_REASON}
+              </div>
+            </Show>
+            <Show when={adjustable()}>
+              <div id={nextStartId} style={helpStyle}>
+                A new length counts from the next start.
+              </div>
+            </Show>
+          </div>
+        </FieldRow>
+      </Show>
+
+      <For each={TIMER_KEY_ROWS}>
+        {(row) => <TimerHotkeyRow id={props.id} name={props.name} timer={props.timer} row={row} />}
+      </For>
+
+      <Row label="Show on overlay">
+        <Toggle
+          on={onOverlay()}
+          onChange={(v) => app.setTimerOnOverlay(props.id, v)}
+          ariaLabel={`Show ${props.name} on the overlay`}
+          blurOnPointer
+        />
+      </Row>
+      <Show when={onOverlay()}>
+        <div style={helpStyle}>
+          Move and resize it in Arrange, like a picture. It shows while the overlay is open.
+        </div>
+        <Show when={app.overlayStatus().hideAvailable && app.overlayHide()}>
+          <div style={helpStyle}>
+            Hide from recordings is on: while Divora records or Replay is on, OBS, Discord and
+            recordings may not show the overlay, this timer included. Its text file shows it in OBS
+            either way.
+          </div>
+        </Show>
+      </Show>
+
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "space-between",
+          gap: "var(--s4)",
+        }}
+      >
+        <span style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)", "min-width": 0 }}>
+          OBS text file: <span class="mono">{props.id}.txt</span>
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon="copy"
+          aria-label={`Copy the path of ${props.name}'s file`}
+          onClick={(e) => {
+            blurOnPointer(e);
+            void copyPath();
+          }}
+        >
+          Copy path
+        </Button>
+      </div>
+    </>
+  );
+}
+
+/** One of a timer's two hotkeys: the capture, Clear while it's set, and a
+ *  line when another stored binding has the same key. A key Divora has
+ *  registered never reaches the capture (Windows hands it to Divora), so a
+ *  shared key comes from storage or from one that didn't register; which of
+ *  the two then runs isn't promised, so the line says only that it's
+ *  shared. */
+function TimerHotkeyRow(props: {
+  id: string;
+  name: string;
+  timer: StoredTimer;
+  row: (typeof TIMER_KEY_ROWS)[number];
+}): JSX.Element {
+  const app = useApp();
+  const accelerator = () => props.timer.hotkeys?.[props.row.verb] ?? "";
+  const keys = () => acceleratorToKeys(accelerator());
+  const spoken = () => `${props.name} ${props.row.spoken} hotkey`;
+  const others = createMemo(() => {
+    const key = accelerator();
+    if (!key) return "";
+    const names = new Set<string>();
+    for (const row of HOTKEY_ROWS) {
+      if (sameKey(app.hotkeyBindings[row.action] ?? "", key)) names.add(row.label);
+    }
+    for (const [clipId, chips] of Object.entries(app.tileHotkeys)) {
+      if (!chips || chips.length === 0 || !sameKey(keysToAccelerator(chips), key)) continue;
+      // Tile names come from the folder scanned now.
+      names.add(app.soundboardTiles().find((t) => t.id === clipId)?.label ?? "a soundboard tile");
+    }
+    for (const t of app.timerStore().timers) {
+      if (app.timerRoles().get(t.id) !== "run") continue;
+      for (const row of TIMER_KEY_ROWS) {
+        if (t.id === props.id && row.verb === props.row.verb) continue;
+        if (sameKey(t.hotkeys?.[row.verb] ?? "", key)) names.add(`${t.name} ${row.spoken}`);
+      }
+    }
+    return listed([...names]);
+  });
+  return (
+    <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          gap: "var(--s4)",
+          "justify-content": "space-between",
+        }}
+      >
+        <div style={{ "min-width": 0 }}>
+          <div style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}>
+            {props.row.label}
+          </div>
+          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>{props.row.desc}</div>
+        </div>
+        <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)", "flex-shrink": 0 }}>
+          <HotkeyCapture
+            value={keys()}
+            onChange={(next) =>
+              void app.bindTimerHotkey(props.id, props.row.verb, keysToAccelerator(next))
+            }
+            ariaLabel={(s) =>
+              s === "set"
+                ? `${spoken()}: ${keys().join(" ")}`
+                : s === "unset"
+                  ? `${spoken()}: not set`
+                  : `${spoken()}: press a key, Esc to cancel`
+            }
+          />
+          <Show when={accelerator()}>
+            <Button
+              variant="ghost"
+              size="sm"
+              icon="x"
+              aria-label={`Clear ${spoken()}`}
+              onClick={() => void app.bindTimerHotkey(props.id, props.row.verb, "")}
+            >
+              Clear
+            </Button>
+          </Show>
+        </div>
+      </div>
+      <Show when={others()}>
+        <div style={reasonStyle}>Also set for {others()}.</div>
+      </Show>
+    </div>
   );
 }
 
