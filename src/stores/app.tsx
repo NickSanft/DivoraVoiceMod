@@ -2310,12 +2310,23 @@ export function createAppState(): AppState {
   const deleteTimer: AppState["deleteTimer"] = async (id) => {
     const s = timerStore();
     if (!s.timers.some((t) => t.id === id)) return;
+    const after: StoredTimers = { ...s, timers: s.timers.filter((t) => t.id !== id) };
+    // A delete can move a timer that was over the limit up to "run" (D36):
+    // the backend runs it from this sync on, so its stored keys go out too.
+    const before = rolesOf(s);
+    const promoted = [...rolesOf(after)]
+      .filter(([tid, role]) => role === "run" && before.get(tid) !== "run")
+      .map(([tid]) => tid);
     // The card goes at once, so a capture still open can't bind its keys
     // again (`bindTimerHotkey` needs a stored timer). Then its keys, before
     // the sync: one left registered would start whatever timer takes this id
-    // next. Both are asked at once; the backend runs them in order.
-    saveTimers({ ...s, timers: s.timers.filter((t) => t.id !== id) });
-    await Promise.all(
+    // next. All of it is asked in this one turn, the sync without the id
+    // included; the backend runs them in order. Awaiting the keys before
+    // sending the sync would free the id meanwhile: an Add in that gap takes
+    // it, its sync reaches the backend first, and the backend, never having
+    // seen the id go, hands the new timer the deleted one's run.
+    saveTimers(after);
+    const keys = Promise.all(
       TIMER_VERBS.map((verb) =>
         unregisterGlobalShortcutCmd(timerHotkeyId(id, verb)).catch((err: unknown) => {
           console.warn("[hourglass] unregister hotkey failed", err);
@@ -2323,7 +2334,18 @@ export function createAppState(): AppState {
       ),
     );
     overlay.removeOverlayTimer(id);
-    await sendTimerSync();
+    const synced = sendTimerSync();
+    // After the sync, so the backend runs the timer before its keys work.
+    const registered = promoted.flatMap((tid) =>
+      TIMER_VERBS.map((verb) => {
+        const accelerator = runTimer(tid)?.hotkeys?.[verb];
+        if (!accelerator) return Promise.resolve();
+        return registerGlobalShortcutCmd(timerHotkeyId(tid, verb), accelerator).catch((err: unknown) => {
+          console.warn(`[hourglass] register hotkey failed for ${tid} ${verb}`, err);
+        });
+      }),
+    );
+    await Promise.all([keys, synced, ...registered]);
   };
 
   /** A timer command; its answer is a whole snapshot like any event. */

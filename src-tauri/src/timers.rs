@@ -5,12 +5,13 @@
 //! how a sync entry is read, and [`TimerCore`], which owns every deadline.
 //! Every reader — the timer thread, a command, a `tm:` press — reads the
 //! clock once under the core's lock, checks that reading for a sleep, and
-//! hands both in; nothing here reads a clock, waits, touches a file or calls
-//! Tauri, so every rule is tested on any machine. `timer_thread.rs` is the
-//! shell around it. What happens to a timer (a fire, an expiry, a sleep
-//! pause, a seed) is collected as a [`Transition`] for the timer thread to
-//! drain and log; the core itself logs only its rare clock decisions — a
-//! sleep handled, a wall-clock step followed — and a duplicate id.
+//! hands both in; nothing here reads a clock, waits, touches a file, logs or
+//! calls Tauri, so every rule is tested on any machine. `timer_thread.rs` is
+//! the shell around it. What happens to a timer (a fire, an expiry, a sleep
+//! pause, a seed) is collected as a [`Transition`], and the core's rare
+//! decisions — a sleep handled, a wall-clock step followed, a duplicate id —
+//! as a [`Note`], for the timer thread to drain and log once it has let go
+//! of the lock (§8.1).
 //!
 //! The clock is a `Duration` since a process origin (monotonic). Wall time
 //! (Unix ms) only sets the anchors a restart seeds from, and checks a sleep
@@ -46,7 +47,10 @@ pub const TICK: Duration = Duration::from_millis(100);
 pub const CLOCK_SLACK: Duration = Duration::from_secs(2);
 
 /// D5: no (b) check this soon after an (a): that sleep was counted, and a
-/// clock resync after the resume isn't another one.
+/// clock resync after the resume isn't another one. Nor, this soon after
+/// one, does a gap of [`Discontinuities::COALESCE`] or less make another
+/// (a): that is Windows' late notification meeting readers held up past
+/// [`Discontinuities::THRESHOLD`], not a second sleep.
 pub const RECENT_SLEEP: Duration = Duration::from_secs(60);
 
 /// D5 (a): a sleep signal whose reading is more than this past the reading
@@ -233,6 +237,47 @@ pub enum Transition {
     SleepPaused { id: String },
     /// A timer the core had never accepted, seeded from its stored run.
     Seeded { id: String, phase: TimerPhase },
+}
+
+/// One of the core's rare decisions, for the log. Collected by the core and
+/// drained only by the timer thread, which logs it once it has let go of
+/// the lock — so no reader, a `tm:` press inside `WM_HOTKEY` included,
+/// writes the log file under it (§8.1, D34's way).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// D5 (a), with timers running: the PC slept `slept_ms` by the clock,
+    /// which counted it; `expired` countdowns ran out in it and `paused`
+    /// count-ups paused.
+    ClockSlept {
+        slept_ms: u64,
+        running: usize,
+        expired: usize,
+        paused: usize,
+    },
+    /// D5 (b), with timers running: a sleep signal with no clock jump,
+    /// each checked against the wall clock; `corrected` countdowns took the
+    /// wall's left.
+    WallChecked {
+        running: usize,
+        corrected: usize,
+        expired: usize,
+        paused: usize,
+    },
+    /// D3: a held wall-clock step of `step_ms` moved `id`'s anchor.
+    AnchorFollowed { id: String, step_ms: i64 },
+    /// D35: a sync entry whose id an earlier one had, skipped.
+    DuplicateId { id: String },
+}
+
+/// Notes held for the timer thread at most; more are dropped. Only a thread
+/// that never started leaves them there.
+pub const MAX_NOTES: usize = 64;
+
+/// `n` onto `notes`, unless [`MAX_NOTES`] are waiting.
+fn push_note(notes: &mut Vec<Note>, n: Note) {
+    if notes.len() < MAX_NOTES {
+        notes.push(n);
+    }
 }
 
 /// What the file writer needs: each run timer's text, in list order, and
@@ -737,35 +782,30 @@ impl Timer {
     /// (a resync after a resume, the user setting the clock). The hold lets
     /// a late sleep signal's (b) go first. A step that goes back within the
     /// slack is forgotten. The live time runs on the clock and doesn't move.
-    /// Whether the anchor moved.
-    fn follow_wall(&mut self, now: Duration, wall_ms: i64) -> bool {
+    /// The step the anchor moved by, if it moved.
+    fn follow_wall(&mut self, now: Duration, wall_ms: i64) -> Option<i64> {
         let (TimerPhase::Running, Some(anchor)) = (self.phase, self.anchor_ms) else {
-            return false;
+            return None;
         };
         let step = wall_ms
             .saturating_sub(clock_ms(now))
             .saturating_sub(self.anchor_offset_ms);
         if step.unsigned_abs() <= ANCHOR_SLACK_MS.unsigned_abs() {
             self.step_since = None;
-            return false;
+            return None;
         }
         match self.step_since {
             None => {
                 self.step_since = Some(now);
-                false
+                None
             }
             Some(seen) if now.saturating_sub(seen) >= ANCHOR_HOLD => {
                 self.anchor_ms = Some(anchor.saturating_add(step));
                 self.anchor_offset_ms = self.anchor_offset_ms.saturating_add(step);
                 self.step_since = None;
-                tracing::info!(
-                    id = %self.id,
-                    step_ms = step,
-                    "timers: the wall clock moved; the anchor follows"
-                );
-                true
+                Some(step)
             }
-            Some(_) => false,
+            Some(_) => None,
         }
     }
 
@@ -849,10 +889,13 @@ pub struct TimerCore {
     /// Ids accepted this process: only these ignore a stored run (D10).
     seen: HashSet<String>,
     transitions: Vec<Transition>,
+    /// At most [`MAX_NOTES`].
+    notes: Vec<Note>,
     seq: u64,
     dirty: bool,
     synced: bool,
-    /// When a clock-counted sleep (D5 (a)) was last handled: no (b) for
+    /// When a clock-counted sleep (D5 (a)) was last handled: no (b), and no
+    /// (a) from a gap of [`Discontinuities::COALESCE`] or less, for
     /// [`RECENT_SLEEP`] after it.
     last_clock_sleep: Option<Duration>,
 }
@@ -864,6 +907,7 @@ impl TimerCore {
             kept: Vec::new(),
             seen: HashSet::new(),
             transitions: Vec::new(),
+            notes: Vec::new(),
             seq: 0,
             dirty: false,
             synced: false,
@@ -880,7 +924,7 @@ impl TimerCore {
     /// soon after.
     pub fn tick(&mut self, now: Duration, wall_ms: i64, slept_from: Option<Duration>) {
         match slept_from {
-            Some(before) if now.saturating_sub(before) > CLOCK_SLEEP => {
+            Some(before) if self.clock_counted(now, before) => {
                 self.clock_slept(now, before);
             }
             Some(before) => {
@@ -895,8 +939,10 @@ impl TimerCore {
             }
             None => {
                 for t in &mut self.timers {
-                    if t.follow_wall(now, wall_ms) {
+                    if let Some(step_ms) = t.follow_wall(now, wall_ms) {
                         self.dirty = true;
+                        let id = t.id.clone();
+                        push_note(&mut self.notes, Note::AnchorFollowed { id, step_ms });
                     }
                 }
             }
@@ -912,6 +958,24 @@ impl TimerCore {
                 self.dirty = true;
             }
         }
+    }
+
+    /// D5 (a): whether a sleep signal at `now`, whose reading before was
+    /// `before`, means the clock counted a sleep: a gap past
+    /// [`CLOCK_SLEEP`], except — within [`RECENT_SLEEP`] of the last (a) —
+    /// one of [`Discontinuities::COALESCE`] or less. Windows' notification
+    /// can come more than 5 s after the jump the sleep check reported, as a
+    /// second signal; if the readers were held up past [`CLOCK_SLEEP`] just
+    /// then (a PC busy after its resume), the gap is that hold, not a sleep,
+    /// and taking it for one would expire countdowns and pause count-ups
+    /// with the PC awake. A real second sleep that short counts as awake
+    /// time instead: its countdowns fire late, its count-ups count it.
+    fn clock_counted(&self, now: Duration, before: Duration) -> bool {
+        let gap = now.saturating_sub(before);
+        gap > CLOCK_SLEEP
+            && self.last_clock_sleep.is_none_or(|at| {
+                now.saturating_sub(at) >= RECENT_SLEEP || gap > Discontinuities::COALESCE
+            })
     }
 
     /// D5 (a): the PC slept from `before`, and the clock counted it. A
@@ -941,12 +1005,15 @@ impl TimerCore {
             self.dirty = true;
         }
         if running > 0 {
-            tracing::info!(
-                slept_ms = floor_ms(now.saturating_sub(before)),
-                running,
-                expired,
-                paused,
-                "timers: the PC slept, and the clock counted it"
+            let slept_ms = floor_ms(now.saturating_sub(before));
+            push_note(
+                &mut self.notes,
+                Note::ClockSlept {
+                    slept_ms,
+                    running,
+                    expired,
+                    paused,
+                },
             );
         }
     }
@@ -1001,12 +1068,14 @@ impl TimerCore {
             self.dirty = true;
         }
         if running > 0 {
-            tracing::info!(
-                running,
-                corrected,
-                expired,
-                paused,
-                "timers: a sleep signal with no clock jump; checked against the wall clock"
+            push_note(
+                &mut self.notes,
+                Note::WallChecked {
+                    running,
+                    corrected,
+                    expired,
+                    paused,
+                },
             );
         }
     }
@@ -1014,9 +1083,10 @@ impl TimerCore {
     /// D15, D35, D36: the set becomes `entries`, in order. `tick` first. The
     /// first [`MAX_TIMERS`] definitions run; the rest, and every
     /// [`WireEntry::Kept`], are kept, not run; duplicates after the first are
-    /// skipped and logged. A timer the core already runs keeps its run (a
-    /// rename or a new length changes only what it names; a kind change
-    /// makes it idle); an id it doesn't run starts idle with `fires` 0, or —
+    /// skipped, each with a [`Note::DuplicateId`]. A timer the core already
+    /// runs keeps its run (a rename or a new length changes only what it
+    /// names; a kind change makes it idle); an id it doesn't run starts idle
+    /// with `fires` 0, or —
     /// if the core has never accepted that id in this process — from its
     /// `resume` (§7.8, [`Transition::Seeded`]). Marks dirty and synced.
     /// Returns the ids that left, in their old order.
@@ -1037,7 +1107,8 @@ impl TimerCore {
                 WireEntry::Kept(id) => id,
             };
             if !ids.insert(id.clone()) {
-                tracing::warn!(id = %id, "sync_timers: a duplicate id skipped");
+                let id = id.clone();
+                push_note(&mut self.notes, Note::DuplicateId { id });
                 continue;
             }
             let def = match entry {
@@ -1148,6 +1219,12 @@ impl TimerCore {
         std::mem::take(&mut self.transitions)
     }
 
+    /// Every note since the last call (up to [`MAX_NOTES`]), in order. Only
+    /// the timer thread calls it, and logs them unlocked.
+    pub fn take_notes(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.notes)
+    }
+
     /// Whether a sync has happened in this process. Until then the set of
     /// timers is unknown, so the writer neither writes nor sweeps.
     pub fn synced(&self) -> bool {
@@ -1195,10 +1272,10 @@ mod tests {
     use super::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use super::{
         adjust_delta, entry_from_wire, hotkey_timer_request, is_timer_id, run_from_wire,
-        timer_text, NoTimer, TextUpdate, TimerCore, TimerDef, TimerKind, TimerOp, TimerPhase,
+        timer_text, NoTimer, Note, TextUpdate, TimerCore, TimerDef, TimerKind, TimerOp, TimerPhase,
         TimerRun, TimerSnapshot, TimerState, Transition, WireEntry, DEFAULT_LENGTH_MS,
-        MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_SEED_ELAPSED_MS, MAX_SYNC_ENTRIES,
-        MAX_TIMERS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
+        MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_NOTES, MAX_SEED_ELAPSED_MS,
+        MAX_SYNC_ENTRIES, MAX_TIMERS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
     };
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -1428,10 +1505,9 @@ mod tests {
     }
 
     /// §7.14, an entry at a time: what is skipped (and why), what is kept
-    /// unrun, and a name that falls back; then one sync of every kind of bad
-    /// entry beside a good one, read the way `sync_timers` reads them. The
-    /// call answers the whole set: the good timer running, each bad field
-    /// fallen back, the unknown kind kept and the unreadable ones skipped.
+    /// unrun, and a name that falls back. One sync of every kind of bad
+    /// entry beside a good one, through `sync_timers`'s own reader, is
+    /// `timer_thread`'s `sync_skips_bad_entries_and_stops_at_64`.
     #[test]
     fn entry_from_wire_table() {
         let skipped = |why: &str| Err(why.to_string());
@@ -1477,52 +1553,6 @@ mod tests {
         ] {
             assert_eq!(entry_from_wire(&entry), want, "{entry}");
         }
-
-        let sent = [
-            json!({"id": 5, "kind": "countdown"}),
-            json!({"id": "timer-2", "name": null, "kind": "countdown", "durationMs": 60_000}),
-            json!({"id": "timer-3", "name": "Below", "kind": "countdown", "durationMs": -1}),
-            json!({"id": "timer-4", "name": "Half", "kind": "countdown", "durationMs": 1.5}),
-            json!({"id": "timer-5", "name": "Text", "kind": "countdown", "durationMs": "300000"}),
-            json!({"id": "timer-6", "name": "Empty", "kind": "countdown", "durationMs": 60_000,
-                   "resume": {}}),
-            json!({"id": "timer-7", "name": "Bad", "kind": "countdown", "durationMs": 60_000,
-                   "resume": {"phase": "running", "anchorMs": "x"}}),
-            json!({"id": "timer-8", "name": "Later", "kind": "interval"}),
-            json!({"id": "timer-9", "name": "No kind"}),
-            json!({"id": "timer-1", "name": "BRB", "kind": "countdown", "durationMs": 300_000,
-                   "resume": {"phase": "running", "totalMs": 300_000,
-                              "anchorMs": WALL0 + 120_000}}),
-        ];
-        let mut core = TimerCore::new();
-        let read = sent
-            .iter()
-            .filter_map(|v| entry_from_wire(v).ok())
-            .collect();
-        core.sync(read, Duration::ZERO, WALL0, None);
-        let shown: Vec<(String, String, TimerPhase, String)> = core
-            .snapshot(Duration::ZERO)
-            .timers
-            .into_iter()
-            .map(|t| (t.id, t.name, t.phase, t.text))
-            .collect();
-        let row = |id: &str, name: &str, phase, text: &str| {
-            (id.to_string(), name.to_string(), phase, text.to_string())
-        };
-        assert_eq!(
-            shown,
-            vec![
-                row("timer-2", "Countdown", Idle, "01:00"),
-                row("timer-3", "Below", Idle, "00:01"),
-                row("timer-4", "Half", Idle, "00:01"),
-                row("timer-5", "Text", Idle, "05:00"),
-                row("timer-6", "Empty", Idle, "01:00"),
-                row("timer-7", "Bad", Idle, "01:00"),
-                row("timer-1", "BRB", Running, "02:00"),
-            ]
-        );
-        let keep = core.text_update().keep;
-        assert!(keep.contains(&"timer-8".to_string()) && !keep.contains(&"timer-9".to_string()));
     }
 
     /// §7.14 again: a bad length or a bad `resume` falls back without failing
@@ -1904,7 +1934,8 @@ mod tests {
     }
 
     /// D5 (a): a countdown whose deadline fell inside a sleep the clock
-    /// counted is `expired` at the first reading after it, never fired.
+    /// counted is `expired` at the first reading after it, never fired. The
+    /// core notes which clock decided, for the thread to log.
     #[test]
     fn a_countdown_that_ran_out_asleep_expires_unfired() {
         let mut core = core_with(vec![countdown("timer-1", 60_000)]);
@@ -1923,6 +1954,15 @@ mod tests {
             core.take_transitions(),
             vec![Transition::Expired {
                 id: "timer-1".into()
+            }]
+        );
+        assert_eq!(
+            core.take_notes(),
+            vec![Note::ClockSlept {
+                slept_ms: 600_000,
+                running: 1,
+                expired: 1,
+                paused: 0
             }]
         );
     }
@@ -2014,6 +2054,87 @@ mod tests {
         assert_eq!(core.take_transitions(), vec![fired("timer-2", 1, 50)]);
     }
 
+    /// D5, WF5: the same late second signal, met by readers held up 600 ms
+    /// (past (a)'s 500 ms bar; a busy PC just after its resume). The PC
+    /// never slept in that gap, so the count-up runs on and the countdown
+    /// due in it fires late; nothing expires, pauses or is noted. A real
+    /// second sleep longer than 5 s within the minute is still an (a).
+    #[test]
+    fn a_late_second_signal_after_a_stall_changes_nothing() {
+        let mut core = core_with(vec![countup("timer-1"), countdown("timer-2", 3_050)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        tick(&mut core, secs(1));
+        let back = secs(1 + 3_600);
+        core.tick(back, wall(back), Some(secs(1)));
+        assert_eq!(state(&mut core, back, "timer-1").phase, Paused);
+        core.take_transitions();
+        assert_eq!(
+            core.take_notes(),
+            vec![Note::ClockSlept {
+                slept_ms: 3_600_000,
+                running: 1,
+                expired: 0,
+                paused: 1
+            }]
+        );
+        op(&mut core, "timer-1", TimerOp::Resume, back + secs(3));
+        op(&mut core, "timer-2", TimerOp::Arm, back + secs(3));
+        let mut now = back + secs(3);
+        while now < back + secs(6) {
+            now += ms(100);
+            tick(&mut core, now);
+        }
+        let late = now + ms(600);
+        core.tick(late, wall(late), Some(now));
+        assert_eq!(
+            shown(&mut core, late, "timer-1"),
+            (Running, 4_600, "00:04".into())
+        );
+        let s = state(&mut core, late, "timer-2");
+        assert_eq!((s.phase, s.fires), (Done, 1));
+        assert_eq!(core.take_transitions(), vec![fired("timer-2", 1, 550)]);
+        assert_eq!(core.take_notes(), vec![]);
+
+        // 20 s after the first, the PC sleeps 30 s more.
+        let down = back + secs(20);
+        tick(&mut core, down);
+        let again = down + secs(30);
+        core.tick(again, wall(again), Some(down));
+        assert_eq!(
+            shown(&mut core, again, "timer-1"),
+            (Paused, 18_000, "00:18".into())
+        );
+        assert_eq!(
+            core.take_transitions(),
+            vec![Transition::SleepPaused {
+                id: "timer-1".into()
+            }]
+        );
+    }
+
+    /// The thread drains the notes; until it does — one that never started
+    /// — they stop at [`MAX_NOTES`].
+    #[test]
+    fn notes_wait_for_the_thread_up_to_a_cap() {
+        let mut core = TimerCore::new();
+        for k in 0..100 {
+            let now = ms(k);
+            core.sync(
+                vec![countdown("timer-1", 60_000), countdown("timer-1", 60_000)],
+                now,
+                wall(now),
+                None,
+            );
+        }
+        let notes = core.take_notes();
+        assert_eq!(notes.len(), MAX_NOTES);
+        assert!(notes.iter().all(|n| *n
+            == Note::DuplicateId {
+                id: "timer-1".into()
+            }));
+        assert_eq!(core.take_notes(), vec![]);
+    }
+
     /// D5 (b), K2: the clock stood still through a 10-minute sleep while the
     /// wall moved on, and the signal came three readings late with a 100 ms
     /// gap. Each running timer's wall anchor decides: the countdown due
@@ -2067,6 +2188,15 @@ mod tests {
                     id: "timer-3".into()
                 }
             ]
+        );
+        assert_eq!(
+            core.take_notes(),
+            vec![Note::WallChecked {
+                running: 3,
+                corrected: 1,
+                expired: 1,
+                paused: 1
+            }]
         );
         // From there it runs on the clock, its anchor where it was.
         let later = now + secs(10);
@@ -2274,6 +2404,7 @@ mod tests {
             core.tick(now, stepped(now), None);
             assert_eq!(state(&mut core, now, "timer-1").anchor_ms, armed, "{now:?}");
         }
+        assert_eq!(core.take_notes(), vec![]);
         core.take_dirty();
         now += ms(100);
         core.tick(now, stepped(now), None);
@@ -2281,6 +2412,13 @@ mod tests {
         assert_eq!(
             state(&mut core, now, "timer-1").anchor_ms,
             Some(WALL0 + 3_605_050)
+        );
+        assert_eq!(
+            core.take_notes(),
+            vec![Note::AnchorFollowed {
+                id: "timer-1".into(),
+                step_ms: 5_000
+            }]
         );
         while now < secs(30) {
             now += ms(100);
@@ -2304,6 +2442,7 @@ mod tests {
             core.tick(now, undone(now), None);
             assert_eq!(state(&mut core, now, "timer-1").anchor_ms, armed, "{now:?}");
         }
+        assert_eq!(core.take_notes(), vec![]);
     }
 
     /// D3, D10: an anchor is set at the transition that sets the run, not
@@ -3114,6 +3253,12 @@ mod tests {
         );
         assert_eq!(ids(&mut core, secs(8)), vec!["timer-2", "timer-3"]);
         assert_eq!(state(&mut core, secs(8), "timer-2").name, "A");
+        assert_eq!(
+            core.take_notes(),
+            vec![Note::DuplicateId {
+                id: "timer-2".into()
+            }]
+        );
 
         // Kept, not run.
         let later = stored(Running, None, Some(60_000), Some(WALL0 + 30_000));

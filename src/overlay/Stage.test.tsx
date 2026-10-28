@@ -925,6 +925,8 @@ describe("Stage: a timer's face (v1.59.0)", () => {
     expect(m.charm("face").textContent).toBe("");
     m.setStatus(arranging());
     expect(m.charm("face").querySelector("[data-missing]")!.textContent).toBe("Timer missing");
+    // With its sigil, as Picture missing has its own.
+    expect(m.charm("face").querySelector("[data-missing] svg.sigil")).not.toBeNull();
     // The timer arrives: the badge goes and the face draws.
     m.setTimers({ seq: 9, timers: [{ ...BRB, id: "timer-9" }] });
     expect(m.charm("face").querySelector("[data-missing]")).toBeNull();

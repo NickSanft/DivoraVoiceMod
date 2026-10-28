@@ -87,7 +87,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 import { Sigil } from "../components/Sigil";
 import { muteCcStep } from "../data/mute";
 import { AppProvider, useApp } from "../stores/app";
-import { SettingsScreen } from "./SettingsScreen";
+import { HOURGLASS_SAID_MS, SettingsScreen } from "./SettingsScreen";
 
 /** Mount Settings with a real store but mocked IPC. */
 function mount() {
@@ -1153,43 +1153,105 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     const region = announcer(view);
     expect(region).toHaveAttribute("aria-live", "polite");
     expect(region).toHaveTextContent("");
-    const heard: string[] = [];
-    const step = async (seq: number, ...timers: unknown[]) => {
-      await emit(seq, ...timers);
-      heard.push(region.textContent ?? "");
-      // The same node throughout: a region inserted with its text is missed.
-      expect(announcer(view)).toBe(region);
-    };
-    const run = (id: string, more: Record<string, unknown> = {}) =>
-      state(id, { phase: "running", ms: 1_000, text: "00:01", anchorMs: ENDS, ...more });
-    const done = (id: string, fires: number, more: Record<string, unknown> = {}) =>
-      state(id, { phase: "done", ms: 0, text: "00:00", fires, ...more });
-    const intro = { name: "Intro" };
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+    try {
+      const heard: string[] = [];
+      const now = (): string => region.textContent ?? "";
+      /** A snapshot from the backend, adopted at once; no frame drawn yet. */
+      const step = async (seq: number, ...timers: unknown[]) => {
+        for (const h of eventHandlers.get("timer-state") ?? []) h({ payload: { seq, timers } });
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        heard.push(now());
+        // The same node throughout: a region inserted with its text is missed.
+        expect(announcer(view)).toBe(region);
+      };
+      /** The next frame is drawn: what it shows is what a screen reader gets. */
+      const frame = (): string => {
+        vi.advanceTimersToNextFrame();
+        heard.push(now());
+        return now();
+      };
+      const run = (id: string, more: Record<string, unknown> = {}) =>
+        state(id, { phase: "running", ms: 1_000, text: "00:01", anchorMs: ENDS, ...more });
+      const done = (id: string, fires: number, more: Record<string, unknown> = {}) =>
+        state(id, { phase: "done", ms: 0, text: "00:00", fires, ...more });
+      const intro = { name: "Intro" };
 
-    // The first snapshot after mount says nothing, though BRB is done in it.
-    await step(1, done("timer-1", 1), run("timer-2", intro));
-    expect(heard.at(-1)).toBe("");
-    await step(2, run("timer-1", { fires: 1 }), run("timer-2", intro));
-    expect(heard.at(-1)).toBe("");
-    await step(3, done("timer-1", 2), run("timer-2", intro));
-    expect(heard.at(-1)).toBe("BRB is done.");
-    // Cleared at the next snapshot, so a second fire is spoken again.
-    await step(4, run("timer-1", { fires: 2, text: "04:59" }), run("timer-2", intro));
-    expect(heard.at(-1)).toBe("");
-    // A press that fires and re-arms in one go: no snapshot shows done.
-    await step(5, run("timer-1", { fires: 3, text: "05:00" }), run("timer-2", intro));
-    expect(heard.at(-1)).toBe("BRB is done.");
-    // An older snapshot isn't adopted, and changes nothing.
-    await step(4, run("timer-1", { fires: 2 }), run("timer-2", intro));
-    expect(heard.at(-1)).toBe("BRB is done.");
-    await step(6, done("timer-1", 4), state("timer-2", { ...intro, phase: "expired", ms: 0, text: "00:00" }));
-    expect(heard.at(-1)).toBe("BRB is done. Intro ran out while away.");
-    await step(7, done("timer-1", 4), state("timer-2", { ...intro, phase: "expired", ms: 0, text: "00:00" }));
-    expect(heard.at(-1)).toBe("");
-    for (const text of heard) expect(text).not.toMatch(/\d+:\d\d/);
+      // The first snapshot after mount says nothing, though BRB is done in it.
+      await step(1, done("timer-1", 1), run("timer-2", intro));
+      expect(frame()).toBe("");
+      await step(2, run("timer-1", { fires: 1 }), run("timer-2", intro));
+      expect(frame()).toBe("");
+      await step(3, done("timer-1", 2), run("timer-2", intro));
+      // Intro's next second lands a millisecond later, before the frame: the
+      // words still reach it, and stay after it.
+      vi.advanceTimersByTime(1);
+      await step(4, done("timer-1", 2), run("timer-2", { ...intro, text: "00:00" }));
+      expect(frame()).toBe("BRB is done.");
+      expect(frame()).toBe("BRB is done.");
+      // A press that fires and re-arms in one go, while the words are still
+      // up: no snapshot shows done. Emptied, then the same words again on the
+      // next frame, so they are spoken again.
+      await step(5, run("timer-1", { fires: 3, text: "05:00" }), run("timer-2", intro));
+      expect(now()).toBe("");
+      expect(frame()).toBe("BRB is done.");
+      // An older snapshot isn't adopted, and changes nothing.
+      await step(4, run("timer-1", { fires: 2 }), run("timer-2", intro));
+      expect(frame()).toBe("BRB is done.");
+      // Emptied once HOURGLASS_SAID_MS has gone by (the next test times it).
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS);
+      expect(now()).toBe("");
+      await step(6, done("timer-1", 4), state("timer-2", { ...intro, phase: "expired", ms: 0, text: "00:00" }));
+      expect(frame()).toBe("BRB is done. Intro ran out while away.");
+      await step(7, done("timer-1", 4), state("timer-2", { ...intro, phase: "expired", ms: 0, text: "00:00" }));
+      expect(frame()).toBe("BRB is done. Intro ran out while away.");
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS);
+      expect(now()).toBe("");
+      // Two edges in two snapshots before one frame: both said, once each.
+      await step(8, done("timer-1", 5), state("timer-2", { ...intro, phase: "idle" }));
+      await step(9, done("timer-1", 5), state("timer-2", { ...intro, phase: "done", ms: 0, text: "00:00", fires: 1 }));
+      expect(frame()).toBe("BRB is done. Intro is done.");
+      for (const text of heard) expect(text).not.toMatch(/\d+:\d\d/);
+    } finally {
+      vi.useRealTimers();
+    }
     // The time itself is on the card, outside any live region.
     const time = within(card("timer-1")).getByText("00:00");
     expect(time.closest("[aria-live]")).toBeNull();
+  });
+
+  it("the live region holds its words for HOURGLASS_SAID_MS, then empties; a section gone meanwhile leaves nothing pending", async () => {
+    store(entry("timer-1"));
+    const view = mount();
+    await flush();
+    const region = announcer(view);
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+    try {
+      const fire = async (seq: number, fires: number) => {
+        for (const h of eventHandlers.get("timer-state") ?? []) {
+          h({ payload: { seq, timers: [state("timer-1", { phase: "done", ms: 0, text: "00:00", fires })] } });
+        }
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      };
+      await fire(1, 0);
+      await fire(2, 1);
+      vi.advanceTimersToNextFrame();
+      expect(region).toHaveTextContent("BRB is done.");
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS - 1);
+      expect(region).toHaveTextContent("BRB is done.");
+      vi.advanceTimersByTime(1);
+      expect(region).toHaveTextContent("");
+      // An edge, then the section goes before its frame: nothing is left to run.
+      await fire(3, 2);
+      view.unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("data-timer-seq on the section follows the adopted seq", async () => {

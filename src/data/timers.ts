@@ -478,8 +478,8 @@ export type TimerEdges = Map<string, { fires: number; phase: TimerPhase }>;
  *  Nothing for the first snapshot after the section mounts (`held` null) or
  *  for an id seen for the first time; a `fires` that dropped (the id was
  *  deleted and added again) is remembered, not spoken. Edges in one
- *  snapshot are joined. No edge gives "", which clears the region, so the
- *  next repeat is spoken. Never a time. */
+ *  snapshot are joined. No edge gives "": nothing to say, and Settings
+ *  leaves the region's words as they are. Never a time. */
 export function timerAnnouncement(
   held: TimerEdges | null,
   next: TimerSnapshot,

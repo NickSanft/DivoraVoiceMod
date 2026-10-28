@@ -607,6 +607,7 @@ export function Stage(props: StageProps): JSX.Element {
             fallback={
               <Show when={timerMissing()}>
                 <div data-missing style={MISSING}>
+                  <Sigil name="hourglass" size={14} />
                   <span>Timer missing</span>
                 </div>
               </Show>

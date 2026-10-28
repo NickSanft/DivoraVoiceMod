@@ -21,7 +21,8 @@
 // through main, and reads `timer_status` once after the handshake, since a
 // paused timer sends nothing more. It keeps the snapshot with the largest
 // `seq`. A timer face waits for Space Mono Bold, at most FONT_WAIT_MS, so a
-// first frame never swaps fonts on stream.
+// first frame doesn't swap fonts on stream unless the font takes longer
+// than that.
 
 import "@fontsource-variable/bricolage-grotesque";
 import "@fontsource-variable/space-grotesk";

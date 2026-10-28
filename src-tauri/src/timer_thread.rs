@@ -7,9 +7,10 @@
 //! Every reader — the thread, a command, a `tm:` press — takes the core's
 //! lock, reads the clock once, asks the one [`SleepCheck`] about that
 //! reading, then acts (D5). The lock is a leaf: nothing else is locked while
-//! it is held, and nothing slow happens under it. Emits and the hand-off to
-//! the writer happen after it is released, and only the writer touches the
-//! disk, so no disk wait can delay a deadline (D13, D21).
+//! it is held, and nothing slow happens under it. The core never logs: the
+//! thread logs its transitions and notes after letting go, then emits and
+//! hands the texts to the writer, and only the writer touches the timers'
+//! files, so no disk wait can delay a deadline (D13, D21).
 //!
 //! Neither thread is joined or stopped: Divora has no exit hook, and both
 //! run for the process (D14).
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::timers::{
-    entry_from_wire, hotkey_timer_request, TextUpdate, TimerCore, TimerOp, TimerSnapshot,
+    entry_from_wire, hotkey_timer_request, Note, TextUpdate, TimerCore, TimerOp, TimerSnapshot,
     Transition, LATE_LOG, MAX_SYNC_ENTRIES,
 };
 
@@ -306,7 +307,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `tm:<id>:reset` acts on that timer; a release, any other id, or an id the
 /// core doesn't run does nothing. Runs inside `WM_HOTKEY` on the main
 /// thread, so it only takes the core's lock for microseconds: it never
-/// registers, unregisters, writes or emits (the timer thread emits).
+/// registers, unregisters, writes, logs or emits (the timer thread logs and
+/// emits).
 pub fn timer_on_hotkey(shared: &TimerShared, id: &str, pressed: bool) {
     let Some((timer, op)) = hotkey_timer_request(id, pressed) else {
         return;
@@ -321,9 +323,13 @@ pub fn timer_on_hotkey(shared: &TimerShared, id: &str, pressed: bool) {
 /// reader's wake), then under the lock read the clock once, check for a
 /// sleep, tick, build a snapshot if anything changed, take the texts (once
 /// a sync has said which timers exist), compute the next wake instant from
-/// that same reading, and drain the transitions; then, unlocked, log the
-/// transitions, emit, and hand the texts on. Returns when the waiter reports
-/// [`Woke::Closed`]. Tests run it on their own thread with fakes.
+/// that same reading, and drain the transitions and notes — any reader's,
+/// so one a command or a press left is logged within a [`TICK`] at most;
+/// then, unlocked, log them, emit, and hand the texts on. Returns when the
+/// waiter reports [`Woke::Closed`]. Tests run it on their own thread with
+/// fakes.
+///
+/// [`TICK`]: crate::timers::TICK
 #[doc(hidden)]
 pub fn run_timer_loop(
     shared: &TimerShared,
@@ -337,13 +343,17 @@ pub fn run_timer_loop(
         if waiter.wait(wake_at.saturating_sub(shared.clock.now())) == Woke::Closed {
             return;
         }
-        let (snapshot, update, transitions) = shared.with_core(|core, now, wall_ms, slept_from| {
-            core.tick(now, wall_ms, slept_from);
-            let snapshot = core.take_dirty().then(|| core.snapshot(now));
-            let update = (snapshot.is_some() && core.synced()).then(|| core.text_update());
-            wake_at = now.saturating_add(core.next_wake(now, cap));
-            (snapshot, update, core.take_transitions())
-        });
+        let (snapshot, update, transitions, notes) =
+            shared.with_core(|core, now, wall_ms, slept_from| {
+                core.tick(now, wall_ms, slept_from);
+                let snapshot = core.take_dirty().then(|| core.snapshot(now));
+                let update = (snapshot.is_some() && core.synced()).then(|| core.text_update());
+                wake_at = now.saturating_add(core.next_wake(now, cap));
+                (snapshot, update, core.take_transitions(), core.take_notes())
+            });
+        for n in &notes {
+            log_note(n);
+        }
         for t in &transitions {
             log_transition(t);
         }
@@ -375,6 +385,45 @@ fn log_transition(t: &Transition) {
         }
         Transition::Seeded { id, phase } => {
             tracing::info!(id = %id, ?phase, "a timer picked up its stored run");
+        }
+    }
+}
+
+/// One line per note: the clock that decided a sleep (D5), a held wall
+/// step followed (D3), a duplicate id skipped (D35).
+fn log_note(n: &Note) {
+    match n {
+        Note::ClockSlept {
+            slept_ms,
+            running,
+            expired,
+            paused,
+        } => tracing::info!(
+            slept_ms,
+            running,
+            expired,
+            paused,
+            "timers: the PC slept, and the clock counted it"
+        ),
+        Note::WallChecked {
+            running,
+            corrected,
+            expired,
+            paused,
+        } => tracing::info!(
+            running,
+            corrected,
+            expired,
+            paused,
+            "timers: a sleep signal with no clock jump; checked against the wall clock"
+        ),
+        Note::AnchorFollowed { id, step_ms } => tracing::info!(
+            id = %id,
+            step_ms,
+            "timers: the wall clock moved; the anchor follows"
+        ),
+        Note::DuplicateId { id } => {
+            tracing::warn!(id = %id, "sync_timers: a duplicate id skipped");
         }
     }
 }
@@ -510,6 +559,10 @@ pub struct TextFiles {
     /// Ids whose file is to be removed: their timer left, or the sweep found
     /// a `timer-<n>.txt` no timer has. An id that comes back leaves.
     gone: BTreeSet<String>,
+    /// The last set's `keep`: an id that leaves it lost its timer, run or
+    /// kept (D36) — a kept one's file was never written here, so neither
+    /// `want` nor `written` has it.
+    kept: HashSet<String>,
     failing: HashMap<String, Failing>,
     swept: bool,
     last_repair: Option<Instant>,
@@ -530,6 +583,7 @@ impl TextFiles {
             want: Vec::new(),
             written: HashMap::new(),
             gone: BTreeSet::new(),
+            kept: HashSet::new(),
             failing: HashMap::new(),
             swept: false,
             last_repair: None,
@@ -558,13 +612,14 @@ impl TextFiles {
             self.swept = true;
             self.sweep(&keep);
         }
-        // A file this writer wrote, or meant to, whose timer left goes. An
-        // id back in the set keeps its file.
+        // A file this writer wrote, or meant to, or that the last set kept,
+        // whose timer left goes. An id back in the set keeps its file.
         let left: Vec<String> = self
             .want
             .iter()
             .map(|(id, _)| id)
             .chain(self.written.keys())
+            .chain(&self.kept)
             .filter(|id| !keep.contains(*id))
             .cloned()
             .collect();
@@ -585,6 +640,7 @@ impl TextFiles {
         let (want, gone) = (&self.want, &self.gone);
         self.failing
             .retain(|id, _| gone.contains(id) || want.iter().any(|(w, _)| w == id));
+        self.kept = keep;
     }
 
     /// The one sweep, at the first set after the first sync (D21): every
@@ -959,7 +1015,10 @@ mod tests {
         REPAIR_EVERY, RETRY_WAIT,
     };
     use crate::timers::TimerPhase::{Done, Expired, Idle, Paused, Running};
-    use crate::timers::{timer_text, TextUpdate, TimerKind, TimerOp, TimerSnapshot, TICK};
+    use crate::timers::{
+        timer_text, TextUpdate, TimerKind, TimerOp, TimerPhase, TimerSnapshot, MAX_SYNC_ENTRIES,
+        TICK,
+    };
     use serde_json::{json, Value};
     use std::collections::{HashSet, VecDeque};
     use std::io;
@@ -1276,6 +1335,40 @@ mod tests {
             if let Some(gate) = gate {
                 gate.pass();
             }
+        }
+    }
+
+    /// A log file whose first line containing `at` is held at a gate, as a
+    /// disk that is still waking up would hold it.
+    struct GatedLog {
+        at: &'static str,
+        gate: Arc<Mutex<Option<Gate>>>,
+    }
+
+    impl io::Write for GatedLog {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if String::from_utf8_lossy(bytes).contains(self.at) {
+                let gate = self.gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.pass();
+                }
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// v1.54.0's backstop: a reading more than 500 ms past the one before
+    /// is a sleep the clock counted, reported as that reading before.
+    struct Backstop(Option<Duration>);
+
+    impl SleepCheck for Backstop {
+        fn jumped(&mut self, clock: Duration) -> Option<Duration> {
+            let before = self.0.replace(clock)?;
+            (clock.saturating_sub(before) > ms(500)).then_some(before)
         }
     }
 
@@ -1700,6 +1793,59 @@ mod tests {
             "{log}"
         );
         assert_eq!(lines(&log, "", "a timer finished"), 0, "{log}");
+        // The core's note of the clock that decided, logged by the thread.
+        assert_eq!(lines(&log, "", "the clock counted it"), 1, "{log}");
+        assert_eq!(
+            lines(&log, "INFO", "running=2 expired=1 paused=1"),
+            1,
+            "{log}"
+        );
+    }
+
+    /// §8.1, D34: the core never logs under its lock; the thread logs its
+    /// notes after letting go. The PC sleeps an hour with a count-up
+    /// running, and the thread is the first reader after it: while its
+    /// "the PC slept" line is stuck in the log file's write, a command and a
+    /// `tm:` press from another thread each return within a second.
+    #[test]
+    fn a_slow_log_write_never_holds_the_core() {
+        let (shared, clock, woken) = fake_with(Box::new(Backstop(None)));
+        shared.sync(vec![countup("timer-1")]);
+        shared.apply("timer-1", TimerOp::Arm).unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (gate, go) = Gate::new("log", &entered_tx);
+        let gate = Arc::new(Mutex::new(Some(gate)));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || GatedLog {
+                at: "the clock counted it",
+                gate: gate.clone(),
+            })
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        std::thread::scope(|s| {
+            let mut waiter = Until::new(woken, ms(3_000));
+            let looped = &shared;
+            s.spawn(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    let (events, mut sink) = (Heard::default(), Handed::default());
+                    run_timer_loop(looped, &mut waiter, &events, &mut sink, TICK);
+                });
+            });
+            clock.set(secs(3_600));
+            let at = entered
+                .recv_timeout(secs(2))
+                .expect("the thread logged the sleep");
+            let core = &shared;
+            let readers = (
+                returns_within(s, move || core.apply("timer-1", TimerOp::Toggle)),
+                returns_within(s, move || timer_on_hotkey(core, "tm:timer-1:toggle", true)),
+            );
+            go.send(()).unwrap();
+            // (true, true): both returned while the line was being written.
+            assert_eq!((at, readers), ("log", (true, true)));
+        });
     }
 
     /// D13: a command wakes the thread at once. With nothing running and a
@@ -2287,6 +2433,95 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// D21, D36: a kept timer's file — a kind this build doesn't run, its id
+    /// `timer-<n>` or not — stays while a sync keeps it, and goes when a
+    /// sync deletes it, as a run timer's does.
+    #[test]
+    fn a_deleted_kept_timers_file_goes() {
+        let dir = scratch("deleted-kept");
+        put(&dir, "timer-7.txt", "12:34");
+        put(&dir, "brb.txt", "1:02:03");
+        let (shared, clock, _woken) = fake();
+        let mut files = TextFiles::new(dir.clone());
+        let t0 = Instant::now();
+        let laps = |id: &str| json!({"id": id, "name": "Laps", "kind": "interval"});
+        let all = vec![countdown("timer-1", 300_000), laps("timer-7"), laps("brb")];
+        assert_eq!(sync_and_write(&shared, &clock, &mut files, all, t0), None);
+        assert_eq!(read(&dir, "timer-7.txt").as_deref(), Some("12:34"));
+        assert_eq!(read(&dir, "brb.txt").as_deref(), Some("1:02:03"));
+        let one = vec![countdown("timer-1", 300_000)];
+        assert_eq!(
+            sync_and_write(&shared, &clock, &mut files, one, t0 + ms(10)),
+            None
+        );
+        assert_eq!(read(&dir, "timer-7.txt"), None);
+        assert_eq!(read(&dir, "brb.txt"), None);
+        assert_eq!(read(&dir, "timer-1.txt").as_deref(), Some("05:00"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D35, §7.14 through `sync_timers`'s own reader: one sync of every kind
+    /// of bad entry beside a good one answers the whole set — the good timer
+    /// running from its stored run, each bad field fallen back, the unknown
+    /// kind kept, the unreadable ones skipped (not the whole sync). Then
+    /// entries past the 64th aren't read: a countdown 65th, after 64 kept
+    /// ones, neither runs nor keeps a file, as the page's `timerRoles`
+    /// shows it (`src/data/timers.ts`).
+    #[test]
+    fn sync_skips_bad_entries_and_stops_at_64() {
+        let (shared, clock, _woken) = fake();
+        let wall0 = clock.wall_ms();
+        let sent = vec![
+            json!({"id": 5, "kind": "countdown"}),
+            json!({"id": "timer-2", "name": null, "kind": "countdown", "durationMs": 60_000}),
+            json!({"id": "timer-3", "name": "Below", "kind": "countdown", "durationMs": -1}),
+            json!({"id": "timer-4", "name": "Half", "kind": "countdown", "durationMs": 1.5}),
+            json!({"id": "timer-5", "name": "Text", "kind": "countdown", "durationMs": "300000"}),
+            json!({"id": "timer-6", "name": "Empty", "kind": "countdown", "durationMs": 60_000,
+                   "resume": {}}),
+            json!({"id": "timer-7", "name": "Bad", "kind": "countdown", "durationMs": 60_000,
+                   "resume": {"phase": "running", "anchorMs": "x"}}),
+            json!({"id": "timer-8", "name": "Later", "kind": "interval"}),
+            json!({"id": "timer-9", "name": "No kind"}),
+            json!({"id": "timer-1", "name": "BRB", "kind": "countdown", "durationMs": 300_000,
+                   "resume": {"phase": "running", "totalMs": 300_000,
+                              "anchorMs": wall0 + 120_000}}),
+        ];
+        let shown: Vec<(String, String, TimerPhase, String)> = shared
+            .sync(sent)
+            .timers
+            .into_iter()
+            .map(|t| (t.id, t.name, t.phase, t.text))
+            .collect();
+        let row = |id: &str, name: &str, phase, text: &str| {
+            (id.to_string(), name.to_string(), phase, text.to_string())
+        };
+        assert_eq!(
+            shown,
+            vec![
+                row("timer-2", "Countdown", Idle, "01:00"),
+                row("timer-3", "Below", Idle, "00:01"),
+                row("timer-4", "Half", Idle, "00:01"),
+                row("timer-5", "Text", Idle, "05:00"),
+                row("timer-6", "Empty", Idle, "01:00"),
+                row("timer-7", "Bad", Idle, "01:00"),
+                row("timer-1", "BRB", Running, "02:00"),
+            ]
+        );
+        let keep = one_pass(&shared, &clock).expect("the sync's texts").keep;
+        assert!(keep.contains(&"timer-8".to_string()) && !keep.contains(&"timer-9".to_string()));
+
+        let mut many: Vec<Value> = (2..=65)
+            .map(|n| json!({"id": format!("timer-{n}"), "kind": "interval"}))
+            .collect();
+        many.push(countdown("timer-1", 300_000));
+        let answer = shared.sync(many);
+        assert_eq!(answer.timers, Vec::new(), "the 65th entry ran");
+        let keep = one_pass(&shared, &clock).expect("the sync's texts").keep;
+        assert_eq!(keep.len(), MAX_SYNC_ENTRIES);
+        assert!(!keep.contains(&"timer-1".to_string()));
+    }
+
     /// Records each pass (whether it brought a set) and asks for the waits
     /// in `waits`; sits 500 ms on every set after the first.
     struct Asks {
@@ -2328,11 +2563,14 @@ mod tests {
         slot.put(TextUpdate::default());
         drop(slot);
         assert_eq!(passed.recv_timeout(secs(1)), Ok(true));
-        // At once when the drop lands inside that set's 500 ms; within its
-        // REPAIR_EVERY wait if the test thread was held up longer.
-        assert_eq!(
-            passed.recv_timeout(REPAIR_EVERY + secs(2)),
-            Err(RecvTimeoutError::Disconnected)
-        );
+        // At once when the drop lands inside that set's 500 ms. If the test
+        // thread was held up longer, the writer is already in its
+        // REPAIR_EVERY wait holding the slot: that wait ends in one empty
+        // pass, and then the thread ends.
+        let mut end = passed.recv_timeout(REPAIR_EVERY + secs(2));
+        if end == Ok(false) {
+            end = passed.recv_timeout(secs(1));
+        }
+        assert_eq!(end, Err(RecvTimeoutError::Disconnected));
     }
 }

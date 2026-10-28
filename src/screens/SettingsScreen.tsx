@@ -2500,6 +2500,10 @@ const TIMER_KEY_ROWS: Array<{ verb: TimerVerb; label: string; desc: string; spok
 
 const LENGTH_REASON = "Enter minutes, m:ss or h:mm:ss, from 1 second to 24 hours.";
 
+/** How long Hourglass's live region holds an edge's words before it is
+ *  emptied again. */
+export const HOURGLASS_SAID_MS = 2_000;
+
 const PHASE_TONE: Record<TimerPhase, "" | "accent" | "success" | "warning"> = {
   idle: "",
   running: "accent",
@@ -2538,17 +2542,41 @@ function HourglassSection(): JSX.Element {
 
   // The live region speaks edges only, never a time (a clock in a live
   // region would talk every second): a timer done, or one that ran out
-  // while away. It is cleared at the next adopted snapshot, so a second
-  // "BRB is done." is spoken again. Nothing for the first snapshot after the
-  // section mounts.
+  // while away. Nothing for the first snapshot after the section mounts.
+  // A snapshot without an edge leaves the words alone: another timer's
+  // tick, or the thread's emit right after a command's answer, often lands
+  // within milliseconds, and words set and cleared inside one frame never
+  // reach a screen reader. So an edge empties the region and puts its words
+  // up on the next frame, as the toast does (the same words again are
+  // spoken again); edges before that frame are joined; and the words are
+  // emptied HOURGLASS_SAID_MS later.
   const [said, setSaid] = createSignal("");
   let held: TimerEdges | null = null;
+  let waiting: string[] = [];
+  let frame: number | undefined;
+  let emptyLater: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => {
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    clearTimeout(emptyLater);
+  });
   createEffect(
     on(app.timerSnapshot, (snap) => {
       if (!snap) return;
       const next = timerAnnouncement(held, snap);
       held = next.held;
-      setSaid(next.text);
+      if (next.text === "") return;
+      // Each words once: a frame held back (a window not drawn) can't
+      // pile up repeats.
+      if (!waiting.includes(next.text)) waiting.push(next.text);
+      if (frame !== undefined) return;
+      clearTimeout(emptyLater);
+      setSaid("");
+      frame = requestAnimationFrame(() => {
+        frame = undefined;
+        setSaid(waiting.join(" "));
+        waiting = [];
+        emptyLater = setTimeout(() => setSaid(""), HOURGLASS_SAID_MS);
+      });
     }),
   );
 

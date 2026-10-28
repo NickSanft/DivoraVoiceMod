@@ -4,7 +4,9 @@
 //
 // v1.59.0: the window `keydown` listener a click arms is held here, in the
 // component, and removed however the capture ends: a key, Esc, a second
-// click on the field, or the field going away while armed. Before, the
+// click on the field, the focus leaving the field (a click elsewhere on the
+// page, a Tab into a text field, another capture armed), or the field going
+// away while armed. Before, the
 // cleanup was registered inside the click handler, where Solid has no owner
 // and drops it, so a field removed while armed (or clicked again to cancel)
 // left its listener behind, and the next key went to it. Hourglass puts up
@@ -99,6 +101,15 @@ export function HotkeyCapture(props: HotkeyCaptureProps): JSX.Element {
       class={`hotkey-capture ${capturing() ? "is-capturing" : ""}`}
       aria-label={props.ariaLabel?.(state())}
       onClick={onArm}
+      onBlur={() => {
+        // The focus went elsewhere (a click on the page, a Tab, another
+        // capture): the key typed there is not this field's. `end` clears
+        // `active` before its own blur, so this doesn't run twice.
+        if (active) {
+          disarm();
+          setCapturing(false);
+        }
+      }}
     >
       <Show
         when={capturing()}

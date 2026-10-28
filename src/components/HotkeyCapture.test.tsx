@@ -134,6 +134,51 @@ describe("HotkeyCapture (v1.59.0)", () => {
     expect(document.activeElement).toBe(button);
   });
 
+  it("the focus leaving the armed field cancels it: a key typed in a text field is the field's", () => {
+    const onChange = vi.fn();
+    const view = render(() => (
+      <>
+        <HotkeyCapture value={null} onChange={onChange} ariaLabel={named} />
+        <input aria-label="Length" />
+      </>
+    ));
+    const button = view.getByRole("button");
+    const field = view.getByRole("textbox", { name: "Length" });
+    // Armed by a mouse click, which in WebView2 focuses the button.
+    button.focus();
+    click(button, 1);
+    expect(button).toHaveAccessibleName("BRB start or pause hotkey: press a key, Esc to cancel");
+    // Then a click into Length, and "1" typed there.
+    field.focus();
+    expect(button).toHaveAccessibleName("BRB start or pause hotkey: not set");
+    const e = new KeyboardEvent("keydown", { key: "1", cancelable: true, bubbles: true });
+    field.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(false);
+    expect(press(" ")).toBe(false);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("arming a second capture cancels the first: one key binds one field", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const view = render(() => (
+      <>
+        <HotkeyCapture value={null} onChange={first} />
+        <HotkeyCapture value={null} onChange={second} />
+      </>
+    ));
+    const [a, b] = view.getAllByRole("button");
+    a!.focus();
+    click(a!, 1);
+    b!.focus();
+    click(b!, 1);
+    expect(a).toHaveTextContent("Click to set");
+    expect(b).toHaveTextContent("Press a key… (Esc to cancel)");
+    expect(press("F9")).toBe(true);
+    expect(first).not.toHaveBeenCalled();
+    expect(second.mock.calls).toEqual([[["F9"]]]);
+  });
+
   it("a pointer-armed capture cancelled by Escape gives the focus back too", () => {
     const view = render(() => <HotkeyCapture value={null} onChange={() => {}} />);
     const button = view.getByRole("button");

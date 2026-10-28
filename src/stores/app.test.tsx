@@ -5391,6 +5391,83 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(result.timerSnapshot()?.timers.map((t) => t.id)).toEqual(["timer-2"]);
     });
 
+    it("an Add while the delete's keys are still on their way takes the id fresh: idle, fires 0, no run, its face kept", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      be.elsewhere("timer-1", { fires: 2, text: "03:12" });
+      expect(savedRun("timer-1")?.phase).toBe("running");
+      // The main thread is busy (a device enumeration): the unregisters'
+      // answers wait. The user clicks Add countdown meanwhile.
+      be.hold("unregister_global_shortcut");
+      calls.length = 0;
+      const deleted = result.deleteTimer("timer-1");
+      await settle();
+      const added = result.addTimer("countdown");
+      await settle();
+      result.setTimerOnOverlay("timer-1", true);
+      be.release("unregister_global_shortcut");
+      await deleted;
+      expect(await added).toBe("timer-1");
+      await settle();
+      // The backend saw timer-1 go before the new one came.
+      expect(calls.map((c) => c.cmd)).toEqual([
+        "unregister_global_shortcut",
+        "unregister_global_shortcut",
+        "sync_timers",
+        "sync_timers",
+      ]);
+      expect(synced()).toEqual([
+        [],
+        [{ id: "timer-1", name: "Countdown", kind: "countdown", durationMs: 300_000 }],
+      ]);
+      expect(result.timerSnapshot()?.timers).toEqual([
+        expect.objectContaining({ id: "timer-1", name: "Countdown", phase: "idle", anchorMs: null, fires: 0 }),
+      ]);
+      expect(saved()).toEqual([
+        { id: "timer-1", name: "Countdown", kind: "countdown", durationMs: 300_000, hotkeys: {} },
+      ]);
+      // The face turned on for the new timer meanwhile stays.
+      expect(result.timerOnOverlay("timer-1")).toBe(true);
+    });
+
+    it("a delete that brings a timer under the limit registers its stored keys, after the sync", async () => {
+      store(
+        ...Array.from({ length: 16 }, (_, i) => entry(`timer-${i + 1}`, { name: `T${i + 1}` })),
+        entry("timer-17", { name: "Over", hotkeys: { toggle: "F13", reset: "", finish: "F14" } }),
+      );
+      backend();
+      const { result } = setupApp();
+      await settle();
+      await result.syncHotkeyBindings();
+      expect(result.timerRoles().get("timer-17")).toBe("over");
+      expect(keyCalls()).toEqual([]);
+      calls.length = 0;
+      await result.deleteTimer("timer-1");
+      expect(result.timerRoles().get("timer-17")).toBe("run");
+      expect(calls.map((c) => c.cmd)).toEqual([
+        "unregister_global_shortcut",
+        "unregister_global_shortcut",
+        "sync_timers",
+        "register_global_shortcut",
+      ]);
+      expect(keyCalls()).toEqual([
+        ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:reset" }],
+        ["register_global_shortcut", { id: "tm:timer-17:toggle", accelerator: "F13" }],
+      ]);
+      expect(synced()[0]!.map((d) => d.id)).toContain("timer-17");
+      // A timer that already ran registers nothing again.
+      calls.length = 0;
+      await result.deleteTimer("timer-2");
+      expect(keyCalls()).toEqual([
+        ["unregister_global_shortcut", { id: "tm:timer-2:toggle" }],
+        ["unregister_global_shortcut", { id: "tm:timer-2:reset" }],
+      ]);
+    });
+
     // Needs track D's controller bodies (the scene's timer elements).
     it("delete takes the timer off the overlay", async () => {
       store(entry("timer-1"), entry("timer-2", { name: "Intro" }));
