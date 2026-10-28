@@ -6,9 +6,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { TimerDefWire } from "../data/timers";
 import type { Rect } from "../overlay/geometry";
 import { OVERLAY_EDIT_EVENT, OVERLAY_STATUS_EVENT } from "../overlay/state";
 import { SET_OVERLAY_MODE_CMD, type OverlayModeRequest } from "../overlay/status";
+import { TIMER_STATE_EVENT, TIMER_STATUS_CMD } from "../overlay/timerState";
 
 /** A single audio device, as enumerated by cpal on the backend. */
 export interface DeviceInfo {
@@ -1325,6 +1327,73 @@ export async function subscribeOverlayStatus(handler: (raw: unknown) => void): P
 
 export async function subscribeOverlayEdit(handler: (raw: unknown) => void): Promise<UnlistenFn> {
   return listen<unknown>(OVERLAY_EDIT_EVENT, (e) => handler(e.payload));
+}
+
+// ---- Hourglass (v1.59.0) ----
+// Rust keeps the time (src-tauri/src/timers.rs). Every command is sync in
+// the backend, so quick clicks land in order, and each answers the whole
+// `TimerSnapshot`, read with `readTimerSnapshot` (overlay/timerState.ts),
+// like every `timer-state` event: keep the one with the largest `seq`. A
+// labelled command that doesn't fit the timer's phase changes nothing; one
+// for an id the backend doesn't run rejects with "no such timer". The
+// `tm:<id>:<verb>` hotkeys are acted on by the backend and need nothing
+// here.
+
+export type { TimerKind, TimerPhase, TimerSnapshot, TimerState } from "../overlay/timerState";
+export type { TimerDefWire, TimerRun } from "../data/timers";
+
+/** Replaces the definitions with `timers` (every stored one, in list
+ *  order); the backend runs the first 16 of a known kind and keeps the rest.
+ *  It reads each entry on its own and never fails: an entry it can't read
+ *  is skipped. Each `resume` is used only for an id the backend hasn't
+ *  accepted since it started. */
+export async function syncTimersCmd(timers: TimerDefWire[]): Promise<unknown> {
+  return invoke<unknown>("sync_timers", { timers });
+}
+
+/** Idle, done or ran out → running from the full length. */
+export async function armTimerCmd(id: string): Promise<unknown> {
+  return invoke<unknown>("arm_timer", { id });
+}
+
+/** Running → paused. */
+export async function pauseTimerCmd(id: string): Promise<unknown> {
+  return invoke<unknown>("pause_timer", { id });
+}
+
+/** Paused → running. */
+export async function resumeTimerCmd(id: string): Promise<unknown> {
+  return invoke<unknown>("resume_timer", { id });
+}
+
+/** Anything → idle. */
+export async function resetTimerCmd(id: string): Promise<unknown> {
+  return invoke<unknown>("reset_timer", { id });
+}
+
+/** ±time on a running or paused timer: a countdown's left stays within
+ *  1 second..24 hours (−30 s never ends it), a count-up's elapsed never goes
+ *  below 0. `deltaMs` is a whole number within ±24 hours, or the command
+ *  rejects. */
+export async function adjustTimerCmd(id: string, deltaMs: number): Promise<unknown> {
+  return invoke<unknown>("adjust_timer", { id, deltaMs });
+}
+
+/** The current snapshot: read once the `timer-state` listener is up, since
+ *  a paused timer sends nothing more. */
+export async function timerStatusCmd(): Promise<unknown> {
+  return invoke<unknown>(TIMER_STATUS_CMD);
+}
+
+/** The folder of the timers' text files for OBS, created if missing. */
+export async function timersDirCmd(): Promise<string> {
+  return invoke<string>("timers_dir");
+}
+
+/** Listens to `timer-state`. Resolves once the listener is registered, so a
+ *  `timer_status` sent after it can't miss a change made in between. */
+export async function subscribeTimerState(handler: (raw: unknown) => void): Promise<UnlistenFn> {
+  return listen<unknown>(TIMER_STATE_EVENT, (e) => handler(e.payload));
 }
 
 // ---- Soundboard ----

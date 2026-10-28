@@ -8,6 +8,11 @@ import { Kbd } from "./Kbd";
 export interface HotkeyCaptureProps {
   value: string[] | null;
   onChange: (next: string[]) => void;
+  /** v1.59.0: the capture's accessible name in each state, for a row with
+   *  many captures ("BRB start or pause hotkey: Ctrl Alt F13", "… not set",
+   *  "… press a key, Esc to cancel"). Without it the name is the content,
+   *  "Click to set" when unset, as before. */
+  ariaLabel?: (state: "set" | "unset" | "capturing") => string;
 }
 
 const MODIFIER_KEYS = new Set(["Control", "Alt", "Shift", "Meta"]);

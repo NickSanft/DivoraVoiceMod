@@ -40,6 +40,8 @@ pub mod overlay_machine;
 mod overlay_windows;
 pub mod replay;
 mod screen;
+pub mod timer_thread;
+pub mod timers;
 use midi::{
     list_inputs as list_midi_inputs_core, open_input as open_midi_input_core, MidiInputInfo,
 };
@@ -58,6 +60,11 @@ use screen::{
     sanitize_fps, screen_recording_path, ArmRequest, CaptureStatusDto, DesktopSourceDto,
     MonitorDto, Quality, ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
+use timer_thread::{
+    spawn_text_writer, spawn_timer_thread, ChannelWaiter, RealClock, TextFiles, TextSlot,
+    TimerEvents, TimerShared,
+};
+use timers::{adjust_delta, TimerOp, TimerSnapshot, TICK, TIMER_STATE_EVENT};
 
 /// Payload of the periodic `audio-levels` event. Frontend listens with
 /// `tauri.event.listen("audio-levels", …)`.
@@ -291,6 +298,10 @@ struct AppState {
     /// (`%APPDATA%/com.divora.voicemod/overlay/assets/`; `assets-dev/` for
     /// development builds). Created at startup.
     overlay_assets_dir: PathBuf,
+    /// v1.59.0: Hourglass's timers — the core and its clock, the timer
+    /// thread's wake, and the timers' folder (`timers/`, `timers-dev/` for
+    /// development builds). Shared with the `divora-timers` thread.
+    timers: Arc<TimerShared>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -2978,6 +2989,93 @@ fn close_midi_input(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// ---- v1.59.0: Hourglass ----
+//
+// Every timer command is sync (D16): sync commands run one at a time on the
+// main thread, in order with `WM_HOTKEY`, so a quick Pause then Resume can't
+// land reversed. Each holds the core's lock for microseconds; the timer
+// thread emits what changed. Each answers the whole `TimerSnapshot`: of two,
+// the larger `seq` is newer.
+
+/// v1.59.0: the timer definitions become `timers` (every stored timer, in
+/// list order) and the answer is the whole set. Never fails: each entry is
+/// read on its own, and one that can't be is skipped (D35). A stored run
+/// (`resume`) seeds only an id not seen since Divora started (D10).
+#[tauri::command]
+fn sync_timers(state: State<'_, AppState>, timers: Vec<serde_json::Value>) -> TimerSnapshot {
+    state.timers.sync(timers)
+}
+
+/// v1.59.0: start a timer from its full length: idle, done or ran out →
+/// running. Otherwise unchanged.
+#[tauri::command]
+fn arm_timer(state: State<'_, AppState>, id: String) -> Result<TimerSnapshot, String> {
+    state.timers.apply(&id, TimerOp::Arm)
+}
+
+/// v1.59.0: running → paused. Otherwise unchanged.
+#[tauri::command]
+fn pause_timer(state: State<'_, AppState>, id: String) -> Result<TimerSnapshot, String> {
+    state.timers.apply(&id, TimerOp::Pause)
+}
+
+/// v1.59.0: paused → running. Otherwise unchanged.
+#[tauri::command]
+fn resume_timer(state: State<'_, AppState>, id: String) -> Result<TimerSnapshot, String> {
+    state.timers.apply(&id, TimerOp::Resume)
+}
+
+/// v1.59.0: anything → idle.
+#[tauri::command]
+fn reset_timer(state: State<'_, AppState>, id: String) -> Result<TimerSnapshot, String> {
+    state.timers.apply(&id, TimerOp::Reset)
+}
+
+/// v1.59.0: ± `deltaMs` on a running or paused timer (§7.3: a countdown
+/// never ends this way). An error for a delta that isn't a whole number of
+/// ms within ±24 h.
+#[tauri::command]
+fn adjust_timer(
+    state: State<'_, AppState>,
+    id: String,
+    delta_ms: f64,
+) -> Result<TimerSnapshot, String> {
+    let delta = adjust_delta(delta_ms)?;
+    state.timers.apply(&id, TimerOp::Adjust(delta))
+}
+
+/// v1.59.0: the whole set now. The overlay page and the main page read it
+/// once after they start listening to `timer-state` (D25, D32).
+#[tauri::command]
+fn timer_status(state: State<'_, AppState>) -> TimerSnapshot {
+    state.timers.status()
+}
+
+/// v1.59.0: absolute path of the timers' folder, for Open folder and Copy
+/// path. Created here (`open_external` opens only folders that exist); the
+/// writer creates it too, at its first write.
+#[tauri::command]
+fn timers_dir(state: State<'_, AppState>) -> Result<String, String> {
+    let dir = state.timers.dir();
+    std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create the timers folder: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+/// v1.59.0: the timer thread's `timer-state` emits. From a std thread an
+/// emit posts to the event loop and returns, so it never waits on the main
+/// thread. Only the first failure is logged: the next change sends the whole
+/// set again.
+impl TimerEvents for AppHandle {
+    fn timer_state(&self, s: &TimerSnapshot) {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if let Err(e) = self.emit(TIMER_STATE_EVENT, s) {
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(error = %e, "timer-state emit failed");
+            }
+        }
+    }
+}
+
 /// Decode a clip on first play; subsequent plays reuse the cached
 /// `Arc<Vec<f32>>` so a hot soundboard doesn't decode anything twice.
 /// v1.39.0: cap on the decoded-clip cache — bounds accumulated PCM for a very
@@ -3086,6 +3184,11 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
         // v1.58.0: and push-to-modulate's, press and release, for the same
         // reasons. The frontend does nothing with the event either.
         ptm_on_hotkey(&state.engine, &id, event.state == ShortcutState::Pressed);
+        // v1.59.0: and an Hourglass timer's `tm:<id>:toggle` / `tm:<id>:reset`,
+        // press only, so they work while the page is hidden or reloading and
+        // decide from the core's state. The frontend does nothing with the
+        // event; the timer thread emits what changed.
+        timer_thread::timer_on_hotkey(&state.timers, &id, event.state == ShortcutState::Pressed);
         let state_str = match event.state {
             ShortcutState::Pressed => "pressed",
             ShortcutState::Released => "released",
@@ -3536,6 +3639,36 @@ pub fn run() {
             }
             tracing::info!(path = %overlay_assets_dir.display(), "overlay assets dir ready");
 
+            // v1.59.0: Hourglass. `divora-timers` keeps the time and emits
+            // `timer-state`; `divora-timer-files` puts each timer's text in
+            // `timers/<id>.txt` for OBS, so no disk wait reaches the timer
+            // thread. The folder isn't created here: the writer makes it at
+            // its first write, so someone who never adds a timer gets none.
+            // `tauri dev` builds keep their own timers, so their own files.
+            let timers_name = timer_thread::timers_dir_name(tauri::is_dev());
+            let timers_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join(timers_name),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; falling back to temp for timers");
+                    std::env::temp_dir().join("DivoraVoice").join(timers_name)
+                }
+            };
+            tracing::info!(path = %timers_dir.display(), "timers dir resolved");
+            let (timers, timer_wake) = TimerShared::new(
+                Arc::new(RealClock::new()),
+                Box::new(divora_capture::SleepWatch::new()),
+                timers_dir.clone(),
+            );
+            let timer_texts = Arc::new(TextSlot::new());
+            spawn_text_writer(timer_texts.clone(), TextFiles::new(timers_dir));
+            spawn_timer_thread(
+                timers.clone(),
+                ChannelWaiter(timer_wake),
+                app.handle().clone(),
+                timer_texts,
+                TICK,
+            );
+
             // Phase 12.4: discover bundled voice assets shipped in the
             // installer's resource dir (onnxruntime.dll + voices/*.onnx).
             // Two things to wire:
@@ -3643,6 +3776,7 @@ pub fn run() {
                 voxcpm_engine: Mutex::new(None),
                 screen: Arc::new(ScreenRecorder::default()),
                 overlay_assets_dir,
+                timers,
             });
             overlay_windows::init(app);
 
@@ -3757,6 +3891,14 @@ pub fn run() {
             list_midi_inputs,
             open_midi_input,
             close_midi_input,
+            sync_timers,
+            arm_timer,
+            pause_timer,
+            resume_timer,
+            reset_timer,
+            adjust_timer,
+            timer_status,
+            timers_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");
@@ -5834,5 +5976,128 @@ mod tests {
         let infos = list_cloned_voice_infos(&cloned_voices_dir(&voices));
         assert_eq!(infos[0].engine, "voxcpm");
         fs::remove_dir_all(&voices).ok();
+    }
+
+    // ---- v1.59.0: Hourglass's commands, hotkey step and threads ----------
+
+    /// v1.59.0: the eight timer commands, by the names the frontend calls.
+    const TIMER_COMMANDS: [&str; 8] = [
+        "sync_timers",
+        "arm_timer",
+        "pause_timer",
+        "resume_timer",
+        "reset_timer",
+        "adjust_timer",
+        "timer_status",
+        "timers_dir",
+    ];
+
+    /// lib.rs above its tests.
+    fn production_source() -> String {
+        let file = include_str!("lib.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        file[..tests_at].to_string()
+    }
+
+    /// v1.59.0 (D16): every timer command stays sync. Sync commands run in
+    /// order on the main thread with `WM_HOTKEY`, so a quick Pause then
+    /// Resume can't land reversed, and a press can't overtake a click. The
+    /// commands need an `AppHandle`, so this reads the source.
+    #[test]
+    fn timer_commands_stay_sync() {
+        let prod = production_source();
+        for name in TIMER_COMMANDS {
+            assert!(
+                !prod.contains(&format!("async fn {name}(")),
+                "{name} must stay a sync command (D16): an async one runs on a \
+                 tokio worker, in any order, and two quick clicks could land \
+                 reversed"
+            );
+            assert!(
+                prod.contains(&format!("#[tauri::command]\nfn {name}(")),
+                "{name} is not a sync command"
+            );
+        }
+    }
+
+    /// v1.59.0: the eight are registered once each, after the MIDI commands
+    /// (so the needles on the list's earlier lines keep their neighbours), and
+    /// the fixture's status command is one of them.
+    #[test]
+    fn the_timer_commands_are_registered() {
+        let prod = production_source();
+        let handler = &prod[prod.find("tauri::generate_handler![").expect("the handler")..];
+        let handler = &handler[..handler.find(']').expect("its end")];
+        let midi = handler
+            .find("\n            close_midi_input,\n")
+            .expect("close_midi_input");
+        for name in TIMER_COMMANDS {
+            let line = format!("\n            {name},\n");
+            assert_eq!(handler.matches(&line).count(), 1, "{name}");
+            assert!(handler.find(&line).unwrap() > midi, "{name}");
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/overlay/timer.fixture.json")).unwrap();
+        let status = fixture["commands"]["status"].as_str().unwrap();
+        assert!(TIMER_COMMANDS.contains(&status), "{status}");
+    }
+
+    /// v1.59.0 (D19): the handler passes the event's real press state to the
+    /// timer step once, and doesn't act on a timer any other way. The handler
+    /// needs an `AppHandle`, so this reads the source. (It already locks the
+    /// shortcut map, so a bare lock needle would fail on correct code.)
+    #[test]
+    fn the_shortcut_handler_runs_the_timer_hotkey() {
+        let prod = production_source();
+        let handler = body_of(&prod, concat!("fn global_shortcut", "_handler("));
+        let call = concat!(
+            "timer_thread::timer_on_hotkey(&state.timers, &id, ",
+            "event.state == ShortcutState::Pressed);"
+        );
+        assert_eq!(
+            handler.matches(call).count(),
+            1,
+            "the handler must run the timer step once, with the press state"
+        );
+        for other in [
+            concat!("timers", ".apply("),
+            concat!("timers", ".sync("),
+            concat!("TimerOp", "::"),
+        ] {
+            assert!(!handler.contains(other), "the handler calls {other}");
+        }
+    }
+
+    /// v1.59.0: `adjust_timer` checks `deltaMs` with `adjust_delta` before the
+    /// core sees it: a fraction, NaN or more than 24 hours either way is an
+    /// error; −30 s is fine.
+    #[test]
+    fn adjust_timer_rejects_bad_deltas() {
+        use super::adjust_delta;
+        for bad in [1.5, f64::NAN, 86_400_001.0, -86_400_001.0] {
+            assert!(adjust_delta(bad).is_err(), "{bad}");
+        }
+        assert_eq!(adjust_delta(-30_000.0), Ok(-30_000));
+        let prod = production_source();
+        let command = body_of(&prod, "fn adjust_timer(");
+        assert!(command.contains(concat!("adjust_delta(", "delta_ms)?;")));
+    }
+
+    /// v1.59.0: the setup starts both timer threads, the writer on the
+    /// folder `tauri dev` keeps apart, and the app keeps the shared core.
+    #[test]
+    fn the_setup_spawns_the_timer_threads() {
+        let prod = production_source();
+        let setup = body_of(&prod, concat!(".setup(", "|app|"));
+        for needle in [
+            concat!("spawn_timer", "_thread("),
+            concat!("spawn_text", "_writer("),
+            concat!("timers_dir_name(", "tauri::is_dev())"),
+            concat!("divora_capture::SleepWatch", "::new()"),
+        ] {
+            assert_eq!(setup.matches(needle).count(), 1, "{needle}");
+        }
     }
 }

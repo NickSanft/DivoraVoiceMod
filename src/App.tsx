@@ -49,10 +49,10 @@ function applyRootAttr(name: string, value: string | null) {
 // Global hotkeys. The backend emits `global-shortcut` events with the
 // binding's id and pressed/released state; this turns them into store
 // actions. It is the path every id takes, except that `overlay:arrange`
-// (v1.55.0), `mute` (v1.56.0) and `ptm` (v1.58.0) are acted on by the
-// backend; here the first only shows a notice while the overlay is off or
-// starting, and the other two do nothing. It runs while the window is
-// hidden to the tray too:
+// (v1.55.0), `mute` (v1.56.0), `ptm` (v1.58.0) and the `tm:` timer keys
+// (v1.59.0) are acted on by the backend; here the first only shows a notice
+// while the overlay is off or starting, and the others do nothing. It runs
+// while the window is hidden to the tray too:
 //   ptm             → nothing: the backend holds push-to-modulate on the
 //                     press and lets go on the release; acting here would
 //                     do it twice (v1.58.0)
@@ -70,6 +70,9 @@ function applyRootAttr(name: string, value: string | null) {
 //                     or the press would toggle twice (v1.55.0)
 //   mute            → nothing: the backend already flipped the mute on the
 //                     press; acting here would flip it twice (v1.56.0)
+//   tm:<id>:<verb>  → nothing: the backend already started, paused, resumed
+//                     or reset the Hourglass timer on the press; acting here
+//                     would do it twice (v1.59.0)
 //   sb:<clip>       → play that soundboard tile
 export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent): void {
   if (event.id === "ptm") {
@@ -95,6 +98,9 @@ export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent
   } else if (event.id === "mute") {
     // The backend already flipped it (v1.56.0); acting here would flip it
     // twice. The next level tick brings the new state.
+  } else if (event.id.startsWith("tm:")) {
+    // An Hourglass timer's key: the backend already acted on it (v1.59.0).
+    // The next `timer-state` brings the new state.
   } else if (event.id.startsWith("sb:")) {
     // Per-tile hotkey: `sb:<clipId>` — fire the clip if the
     // current scan still has it.

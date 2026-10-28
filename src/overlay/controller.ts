@@ -159,6 +159,15 @@ export interface OverlayController {
   addOverlayPicture(): Promise<void>;
   removeOverlayElement(id: string): Promise<void>;
   addSpellCircle(): void;
+  /** v1.59.0: Show on overlay for an Hourglass timer. Adds one `timer`
+   *  element for it, unless the scene has one. The scene is the only record
+   *  of the toggle, so an Arrange delete turns it off. */
+  addOverlayTimer(timerId: string): void;
+  /** v1.59.0: removes every `timer` element for this timer (the toggle
+   *  off, or the timer deleted). */
+  removeOverlayTimer(timerId: string): void;
+  /** v1.59.0: the scene has a `timer` element for this timer. Reactive. */
+  overlayHasTimer(timerId: string): boolean;
 }
 
 /** Tasks run one at a time, in order. One failing never stops the rest. */
@@ -698,6 +707,12 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
       }
       if (commit({ kind: "add", element })) publish();
     },
+
+    // v1.59.0: the contract only, for now; timer elements stay inert until
+    // the scene draws them.
+    addOverlayTimer: () => undefined,
+    removeOverlayTimer: () => undefined,
+    overlayHasTimer: () => false,
   };
 }
 

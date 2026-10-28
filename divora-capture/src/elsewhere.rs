@@ -172,3 +172,31 @@ pub fn can_take_foreground(_window: isize) -> bool {
 pub fn make_layered_opaque(_window: isize) -> bool {
     false
 }
+
+// v1.59.0: Hourglass's sleep check. Nothing here reports a sleep, so the
+// timers' wall-clock anchors are the only check.
+
+/// See the Windows build's. Never sees a sleep.
+pub struct SleepWatch;
+
+#[allow(clippy::unused_self)] // the Windows build's signatures
+impl SleepWatch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Never a sleep here.
+    pub fn jumped(&mut self, _clock: Duration) -> Option<Duration> {
+        None
+    }
+
+    /// Nothing to move.
+    pub fn restart(&mut self, _clock: Duration) {}
+}
+
+impl Default for SleepWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -68,6 +68,12 @@ pub use native::{
     },
 };
 
+/// v1.59.0: Hourglass's timers keep one of their own, asked under their
+/// core's lock. The resume count is process-wide, so it sits beside the
+/// pipeline's.
+#[cfg(windows)]
+pub use native::power::SleepWatch;
+
 /// The real writer, for `tests/encoder_smoke.rs` to drive without a screen.
 /// Not part of the API: hidden, and nothing outside the tests should call it.
 #[cfg(windows)]
@@ -95,5 +101,6 @@ pub use elsewhere::{
     foreground_window, free_bytes, list_monitors, list_playback_devices, local_time,
     make_layered_opaque, mark_non_rude, open_outside_tree, process_loopback_available,
     record_monitor, record_monitor_direct, spawn_pipeline, total_physical_memory, try_foreground,
-    unmark_non_rude, Show, MIN_CONTRACT, PRETEND_FREE_ENV, PRETEND_NO_CAPTURE_EXCLUSION_ENV,
+    unmark_non_rude, Show, SleepWatch, MIN_CONTRACT, PRETEND_FREE_ENV,
+    PRETEND_NO_CAPTURE_EXCLUSION_ENV,
 };

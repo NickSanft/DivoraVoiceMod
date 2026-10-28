@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   addRefusal,
   applyOp,
+  asTimer,
+  aspectOf,
   assetRefCount,
   assetRefs,
   ASSET_ID_RE,
@@ -12,6 +14,7 @@ import {
   CIRCLE_PX,
   defaultImageRect,
   defaultScene,
+  defaultTimerRect,
   frameOf,
   handleRects,
   hitPart,
@@ -35,6 +38,7 @@ import {
   type SceneElement,
   type SceneOp,
   type Size,
+  type TimerElement,
 } from "./scene";
 import { SPELL_CIRCLE_PX } from "../components/SpellCircle";
 import fixture from "./wire.fixture.json";
@@ -94,7 +98,7 @@ function expectRectNear(a: PxRect, b: PxRect, tol: number): void {
 /** Every kind of element this version keeps but doesn't show (§3.2). */
 function inertSet(): SceneElement[] {
   return [
-    { id: "timer", type: "timer", x: 0.1, y: 0.1, w: 0.2, h: 0.1, z: 2, future: { a: [1, 2], b: "x" } },
+    { id: "future", type: "future", x: 0.1, y: 0.1, w: 0.2, h: 0.1, z: 2, future: { a: [1, 2], b: "x" } },
     picture("avif", { x: 0.5, y: 0.5, w: 0.1, h: 0.1 }, { src: "0123456789abcdef.avif", future: { keep: true } }),
     picture("w0", { x: 0.2, y: 0.2, w: 0, h: 0.1 }),
     picture("wneg", { x: 0.2, y: 0.2, w: -0.2, h: 0.1 }),
@@ -113,7 +117,7 @@ function inertSet(): SceneElement[] {
   ];
 }
 
-const INERT_IDS = ["timer", "avif", "w0", "wneg", "nox", "circle2", "nosrc", "srcnum"];
+const INERT_IDS = ["future", "avif", "w0", "wneg", "nox", "circle2", "nosrc", "srcnum"];
 
 function mixedScene(): OverlayScene {
   return sceneOf(
@@ -407,11 +411,11 @@ describe("applyOp add", () => {
     const sixteen = Array.from({ length: 16 }, (_, i) =>
       picture(`p${i}`, { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { src: `${i.toString(16).padStart(16, "0")}.png`, nw: 10, nh: 10 }),
     );
-    const sixtyFour = Array.from({ length: MAX_ELEMENTS }, (_, i) => ({ id: `t${i}`, type: "timer" }));
+    const sixtyFour = Array.from({ length: MAX_ELEMENTS }, (_, i) => ({ id: `t${i}`, type: "future" }));
     const base = mixedScene();
     const cases: Array<[string, OverlayScene, KnownElement, string]> = [
       ["the id of a live element", base, newPic("A"), "exists"],
-      ["the id of an inert element", base, newPic("timer"), "exists"],
+      ["the id of an inert element", base, newPic("future"), "exists"],
       ["64 stored elements", sceneOf(sixtyFour), newPic("N"), "elements"],
       ["a second circle", base, circle("c2", { x: 0.1, y: 0.1, w: 0.2, h: 0.2 }) as unknown as KnownElement, "circle"],
       ["a 17th picture", sceneOf(sixteen), newPic("N"), "pictures"],
@@ -422,7 +426,7 @@ describe("applyOp add", () => {
       ["a path for src", base, newPic("N", { src: "C:/x.png" }), "invalid"],
       ["w 0", base, newPic("N", { w: 0 }), "invalid"],
       ["an id over 64", base, newPic("x".repeat(65)), "invalid"],
-      ["an unknown type", base, { ...newPic("N"), type: "timer" } as unknown as KnownElement, "invalid"],
+      ["an unknown type", base, { ...newPic("N"), type: "future" } as unknown as KnownElement, "invalid"],
       ["over the byte budget", sceneOf([]), newPic("N", { bytes: 200_000_001 }), "budget"],
     ];
     for (const [name, s, e, why] of cases) {
@@ -432,7 +436,7 @@ describe("applyOp add", () => {
   });
 
   it("70 stored elements are all kept, and add refuses", () => {
-    const raw = { elements: Array.from({ length: 70 }, (_, i) => ({ id: `t${i}`, type: "timer", x: 0, y: 0, w: 0.1, h: 0.1 })) };
+    const raw = { elements: Array.from({ length: 70 }, (_, i) => ({ id: `t${i}`, type: "future", x: 0, y: 0, w: 0.1, h: 0.1 })) };
     const s = readScene(raw, defaultScene());
     expect(s.elements).toHaveLength(70);
     expect(applyOp(s, { kind: "add", element: newPic("N") })).toBe(s);
@@ -520,8 +524,8 @@ describe("applyOp place", () => {
       expectRectNear(rectOf(next, CIRCLE_ID, vp), before(vp), 2e-6 * Math.max(vp.w, vp.h, 800));
     }
     // An inert element keeps its centre fraction and designed px size too.
-    const t0 = s.elements.find((e) => e.id === "timer")!;
-    const t1 = next.elements.find((e) => e.id === "timer")!;
+    const t0 = s.elements.find((e) => e.id === "future")!;
+    const t1 = next.elements.find((e) => e.id === "future")!;
     const n = (e: SceneElement, k: "x" | "y" | "w" | "h") => e[k] as number;
     expect(n(t1, "w") * 600).toBeCloseTo(n(t0, "w") * 480, 3);
     expect(n(t1, "h") * 800).toBeCloseTo(n(t0, "h") * 480, 3);
@@ -614,12 +618,12 @@ describe("applyOp place", () => {
 });
 
 describe("applyOp order", () => {
-  // [circle 0, A 1, timer 2 (inert), B 3]
+  // [circle 0, A 1, future 2 (an inert type), B 3]
   const base = (): OverlayScene =>
     sceneOf([
       circle(),
       picture("A", { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { z: 1 }),
-      { id: "timer", type: "timer", x: 0.1, y: 0.1, w: 0.1, h: 0.1, z: 2, future: { k: [1] } },
+      { id: "future", type: "future", x: 0.1, y: 0.1, w: 0.1, h: 0.1, z: 2, future: { k: [1] } },
       picture("B", { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { z: 3 }),
     ]);
   const zs = (s: OverlayScene) => Object.fromEntries(s.elements.map((e) => [e.id, e.z]));
@@ -628,8 +632,8 @@ describe("applyOp order", () => {
   it("forward steps over an inert neighbour, past the next live one", () => {
     const next = applyOp(base(), { kind: "order", id: "A", to: "forward" });
     expect(drawn(next)).toEqual(["circle", "B", "A"]);
-    expect(zs(next)).toEqual({ circle: 0, timer: 1, B: 2, A: 3 });
-    // The timer is still below B, and keeps everything else.
+    expect(zs(next)).toEqual({ circle: 0, future: 1, B: 2, A: 3 });
+    // The inert one is still below B, and keeps everything else.
     expect(next.elements[2]).toEqual({ ...base().elements[2], z: 1 });
   });
 
@@ -637,16 +641,16 @@ describe("applyOp order", () => {
     const fwd = applyOp(base(), { kind: "order", id: "A", to: "forward" });
     const back = applyOp(fwd, { kind: "order", id: "A", to: "backward" });
     expect(drawn(back)).toEqual(["circle", "A", "B"]);
-    expect(zs(back)).toEqual({ circle: 0, timer: 1, A: 2, B: 3 });
+    expect(zs(back)).toEqual({ circle: 0, future: 1, A: 2, B: 3 });
   });
 
   it("backward steps over an inert neighbour, past the next live one", () => {
     const next = applyOp(base(), { kind: "order", id: "B", to: "backward" });
     expect(drawn(next)).toEqual(["circle", "B", "A"]);
-    expect(zs(next)).toEqual({ circle: 0, B: 1, A: 2, timer: 3 });
+    expect(zs(next)).toEqual({ circle: 0, B: 1, A: 2, future: 3 });
     // Only inert elements below: nothing to step behind.
     const s = sceneOf([
-      { id: "timer", type: "timer", z: 0 },
+      { id: "future", type: "future", z: 0 },
       circle(CIRCLE_ID, undefined, 1),
       picture("A", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 2 }),
     ]);
@@ -654,7 +658,7 @@ describe("applyOp order", () => {
   });
 
   it("forward on the top drawn element with only an inert one above is the identical scene", () => {
-    const s = sceneOf([circle(), picture("A", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 1 }), { id: "timer", type: "timer", z: 2 }]);
+    const s = sceneOf([circle(), picture("A", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 1 }), { id: "future", type: "future", z: 2 }]);
     const next = applyOp(s, { kind: "order", id: "A", to: "forward" });
     expect(next).toBe(s);
     expect(json(next)).toBe(json(s));
@@ -680,11 +684,11 @@ describe("applyOp order", () => {
     const s = sceneOf([
       circle(),
       picture("A", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 1 }),
-      { id: "t1", type: "timer", z: 2 },
+      { id: "t1", type: "future", z: 2 },
       picture("B", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 3 }),
       picture("bad", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 4, src: "x.avif" }),
       picture("C", { x: 0, y: 0, w: 0.1, h: 0.1 }, { z: 5 }),
-      { id: "t2", type: "timer", z: 6 },
+      { id: "t2", type: "future", z: 6 },
     ]);
     const rank = (sc: OverlayScene) =>
       [...sc.elements].sort((a, b) => (a.z as number) - (b.z as number)).map((e) => e.id);
@@ -699,7 +703,7 @@ describe("applyOp order", () => {
 
   it("an inert or unknown target, or an unknown direction, changes nothing", () => {
     const s = base();
-    expect(applyOp(s, { kind: "order", id: "timer", to: "front" })).toBe(s);
+    expect(applyOp(s, { kind: "order", id: "future", to: "front" })).toBe(s);
     expect(applyOp(s, { kind: "order", id: "nope", to: "front" })).toBe(s);
     expect(applyOp(s, { kind: "order", id: "A", to: "up" as "front" })).toBe(s);
   });
@@ -842,7 +846,7 @@ describe("readOp", () => {
     ["an unknown order", { kind: "order", id: "A", to: "up" }],
     ["an inherited order name", { kind: "order", id: "A", to: "toString" }],
     ["a bad frame", { kind: "reframe", from: place.rect, to: place.rect, frame: "desk" }],
-    ["an add of an unknown type", { kind: "add", element: { id: "N", type: "timer" } }],
+    ["an add of an unknown type", { kind: "add", element: { id: "N", type: "future" } }],
   ])("refuses %s", (_name, raw) => {
     expect(readOp(raw, "main")).toBeNull();
     expect(readOp(raw, "overlay")).toBeNull();
@@ -1100,5 +1104,100 @@ describe("charmLabels", () => {
   it("long names are cut to 120 characters", () => {
     const labels = charmLabels(sceneOf([named("a", "x".repeat(300))]));
     expect(labels.get("a")).toHaveLength(120);
+  });
+});
+
+// v1.59.0: Hourglass's timer faces. The scene's `"future"` fixtures above
+// stand in for a type this version doesn't know, as `"timer"` did before.
+describe("timer elements (v1.59.0)", () => {
+  const face = (more: Record<string, unknown> = {}): SceneElement => ({
+    id: "c-0a1b2c3d",
+    type: "timer",
+    x: 0.35,
+    y: 0.08,
+    w: 0.3,
+    h: 0.1,
+    z: 1,
+    timer: "timer-1",
+    ...more,
+  });
+
+  it("asTimer takes usable geometry and a timer id, whether or not that timer exists", () => {
+    const e = face();
+    expect(asTimer(e)).toBe(e);
+    expect(asTimer(face({ timer: "brb", future: { k: 1 } }))).not.toBeNull();
+  });
+
+  it.each([
+    ["a timer ref that fails the grammar", { timer: "Timer-1" }],
+    ["a device name for a ref", { timer: "con" }],
+    ["no ref", { timer: undefined }],
+    ["a number for a ref", { timer: 1 }],
+    ["a zero width", { w: 0 }],
+    ["no x", { x: undefined }],
+    ["an id over 64", { id: "x".repeat(65) }],
+    ["another type", { type: "image" }],
+  ])("asTimer refuses %s", (_name, more) => {
+    expect(asTimer(face(more))).toBeNull();
+  });
+
+  it("aspectOf keeps a timer's stored shape", () => {
+    expect(aspectOf(face() as unknown as TimerElement, D480)).toBeCloseTo(3, 9);
+    expect(aspectOf(face({ w: 0.2, h: 0.2 }) as unknown as TimerElement, { w: 960, h: 480 })).toBeCloseTo(2, 9);
+  });
+
+  it("defaultTimerRect is 3:1, centred across, its height 12 % of the window's short side", () => {
+    const r = defaultTimerRect(sceneOf([circle()]), { w: 480, h: 480 });
+    const pw = r.w * 480;
+    const ph = r.h * 480;
+    expect(ph).toBeCloseTo(57.6, 3);
+    expect(pw / ph).toBeCloseTo(3, 3);
+    expect(r.x + r.w / 2).toBeCloseTo(0.5, 5);
+    expect(r.y).toBeCloseTo(0.08, 6);
+  });
+
+  it("its height stays within 32 to 160 px", () => {
+    const small = defaultTimerRect(sceneOf([]), { w: 120, h: 120 });
+    expect(small.h * 480).toBeCloseTo(32, 3);
+    const big = defaultTimerRect(sceneOf([], { w: 3840, h: 2160 }), { w: 3840, h: 2160 });
+    expect(big.h * 2160).toBeCloseTo(160, 3);
+  });
+
+  it("each timer face already there puts the next 6 % lower, five places round", () => {
+    const tops: number[] = [];
+    const elements: SceneElement[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const r = defaultTimerRect(sceneOf(elements), D480);
+      tops.push(r.y);
+      elements.push(face({ id: `c-${i}`, ...r }));
+    }
+    expect(tops.map((y) => Math.round(y * 100))).toEqual([8, 14, 20, 26, 32, 8]);
+    // A face that isn't usable doesn't count.
+    expect(defaultTimerRect(sceneOf([face({ w: 0 })]), D480).y).toBeCloseTo(0.08, 6);
+  });
+
+  it("stays inside the scene, even in a viewport larger than its design", () => {
+    for (const view of [
+      { w: 4000, h: 4000 },
+      { w: 30, h: 30 },
+      { w: 2000, h: 200 },
+    ]) {
+      const r = defaultTimerRect(sceneOf([]), view);
+      expect(r.x).toBeGreaterThanOrEqual(0);
+      expect(r.y).toBeGreaterThanOrEqual(0);
+      expect(r.x + r.w).toBeLessThanOrEqual(1 + 1e-6);
+      expect(r.y + r.h).toBeLessThanOrEqual(1 + 1e-6);
+    }
+  });
+
+  it("charmLabels takes a timer's name and labels the rest as before", () => {
+    const s = sceneOf([circle(), picture("A", { x: 0, y: 0, w: 0.1, h: 0.1 }, { name: "wave.gif" })]);
+    expect(charmLabels(s, () => "BRB")).toEqual(charmLabels(s));
+  });
+
+  it("readOp still refuses a timer add: main adds one locally, the overlay never can", () => {
+    for (const from of ["main", "overlay"] as const) {
+      expect(readOp({ kind: "add", element: face() }, from)).toBeNull();
+    }
   });
 });

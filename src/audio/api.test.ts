@@ -106,6 +106,15 @@ import {
   pickImageFile,
   subscribeOverlayStatus,
   subscribeOverlayEdit,
+  syncTimersCmd,
+  armTimerCmd,
+  pauseTimerCmd,
+  resumeTimerCmd,
+  resetTimerCmd,
+  adjustTimerCmd,
+  timerStatusCmd,
+  timersDirCmd,
+  subscribeTimerState,
 } from "./api";
 
 describe("audio api", () => {
@@ -1156,5 +1165,90 @@ describe("model downloads api (v1.57.0)", () => {
       "clone-model-download-done",
     ]);
     expect(seen).toEqual([{ from: "clone-model-download" }, { from: "clone-model-download-done" }]);
+  });
+});
+
+// v1.59.0: Hourglass. Literals on purpose: these are the backend's names
+// (lib.rs), and `adjust_timer`'s argument is `deltaMs`, which Tauri maps to
+// the command's `delta_ms`.
+describe("hourglass api (v1.59.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+  });
+
+  it("each command goes by its name, with flat args", async () => {
+    invokeMock.mockResolvedValue(null);
+    const timers = [
+      { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000 },
+      {
+        id: "timer-2",
+        name: "Uptime",
+        kind: "countup",
+        durationMs: 300_000,
+        resume: { phase: "running" as const, anchorMs: 1_793_213_878_100 },
+      },
+    ];
+    await syncTimersCmd(timers);
+    expect(invokeMock).toHaveBeenLastCalledWith("sync_timers", { timers });
+    await armTimerCmd("timer-1");
+    expect(invokeMock).toHaveBeenLastCalledWith("arm_timer", { id: "timer-1" });
+    await pauseTimerCmd("timer-1");
+    expect(invokeMock).toHaveBeenLastCalledWith("pause_timer", { id: "timer-1" });
+    await resumeTimerCmd("timer-1");
+    expect(invokeMock).toHaveBeenLastCalledWith("resume_timer", { id: "timer-1" });
+    await resetTimerCmd("timer-1");
+    expect(invokeMock).toHaveBeenLastCalledWith("reset_timer", { id: "timer-1" });
+    await adjustTimerCmd("timer-1", -30_000);
+    expect(invokeMock).toHaveBeenLastCalledWith("adjust_timer", { id: "timer-1", deltaMs: -30_000 });
+    await timerStatusCmd();
+    expect(invokeMock).toHaveBeenLastCalledWith("timer_status");
+    invokeMock.mockResolvedValueOnce("C:/Users/x/AppData/Roaming/divora/timers");
+    expect(await timersDirCmd()).toBe("C:/Users/x/AppData/Roaming/divora/timers");
+    expect(invokeMock).toHaveBeenLastCalledWith("timers_dir");
+    expect(invokeMock).toHaveBeenCalledTimes(8);
+  });
+
+  it("answers the backend's snapshot as it came", async () => {
+    const snapshot = { seq: 7, timers: [] };
+    invokeMock.mockResolvedValueOnce(snapshot);
+    expect(await armTimerCmd("timer-1")).toBe(snapshot);
+  });
+
+  it("a refused command rejects with the backend's words", async () => {
+    invokeMock.mockRejectedValueOnce("no such timer");
+    await expect(pauseTimerCmd("timer-9")).rejects.toBe("no such timer");
+  });
+
+  it("listens to timer-state and forwards the payloads", async () => {
+    const seen: unknown[] = [];
+    listenMock.mockImplementation(async (event: string, handler: (e: { payload: unknown }) => void) => {
+      handler({ payload: { from: event } });
+      return () => {};
+    });
+    await subscribeTimerState((s) => seen.push(s));
+    expect(listenMock.mock.calls.map((c) => c[0])).toEqual(["timer-state"]);
+    expect(seen).toEqual([{ from: "timer-state" }]);
+  });
+
+  it("subscribeTimerState resolves only once the listener is registered", async () => {
+    let registered!: (un: () => void) => void;
+    listenMock.mockImplementation(
+      () =>
+        new Promise<() => void>((resolve) => {
+          registered = resolve;
+        }),
+    );
+    const un = () => {};
+    let settled = false;
+    const subscribing = subscribeTimerState(() => {}).then((u) => {
+      settled = true;
+      return u;
+    });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(settled).toBe(false);
+    registered(un);
+    expect(await subscribing).toBe(un);
+    expect(settled).toBe(true);
   });
 });

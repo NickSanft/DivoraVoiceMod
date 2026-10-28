@@ -1,0 +1,412 @@
+{
+  "about": "v1.59.0: Hourglass's wire contract, read by both test suites (src-tauri/src/timers.rs; src/overlay/timerState.test.ts and src/data/timers.test.ts) and by e2e/tauri-mock.ts. Production code never imports it. Each runSamples row pairs a TimerState with the run the page stores for it (runOf) and what the backend seeds from that run at nowWallMs (seededPhase, seededMs).",
+  "events": {
+    "state": "timer-state"
+  },
+  "commands": {
+    "status": "timer_status"
+  },
+  "snapshotKeys": ["seq", "timers"],
+  "stateKeys": ["anchorMs", "fires", "id", "kind", "ms", "name", "phase", "text", "totalMs"],
+  "runKeys": ["anchorMs", "ms", "phase", "totalMs"],
+  "defKeys": ["durationMs", "id", "kind", "name", "resume"],
+  "phases": ["idle", "running", "paused", "done", "expired"],
+  "kinds": ["countdown", "countup"],
+  "limits": {
+    "maxTimers": 16,
+    "minLengthMs": 1000,
+    "maxLengthMs": 86400000,
+    "defaultLengthMs": 300000,
+    "maxName": 40,
+    "maxIdChars": 32,
+    "maxSyncEntries": 64
+  },
+  "ids": {
+    "valid": [
+      "timer-1",
+      "timer-16",
+      "brb",
+      "a",
+      "9",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "console",
+      "com10",
+      "nul-1"
+    ],
+    "invalid": [
+      "",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "Timer-1",
+      "timer_1",
+      "timer.1",
+      "timer:1",
+      "-a",
+      "a-",
+      "a b",
+      "ä",
+      "con",
+      "nul",
+      "com1",
+      "lpt9",
+      "aux",
+      "prn",
+      "com0",
+      "lpt0"
+    ]
+  },
+  "hotkeyIds": [
+    { "id": "tm:timer-1:toggle", "timer": "timer-1", "verb": "toggle" },
+    { "id": "tm:timer-1:reset", "timer": "timer-1", "verb": "reset" },
+    { "id": "tm:brb:reset", "timer": "brb", "verb": "reset" },
+    { "id": "tm:timer-1:finish", "timer": null },
+    { "id": "tm:timer-1:Toggle", "timer": null },
+    { "id": "TM:timer-1:toggle", "timer": null },
+    { "id": "tm:Timer-1:toggle", "timer": null },
+    { "id": "tm::toggle", "timer": null },
+    { "id": "tm:timer-1", "timer": null },
+    { "id": "tm:a:b:toggle", "timer": null },
+    { "id": "tm:timer-1:toggle ", "timer": null },
+    { "id": "tm:con:toggle", "timer": null },
+    { "id": "mute", "timer": null },
+    { "id": "ptm", "timer": null },
+    { "id": "sb:timer-1", "timer": null },
+    { "id": "overlay:arrange", "timer": null }
+  ],
+  "samples": {
+    "idle": {
+      "seq": 1,
+      "timers": [
+        {
+          "id": "timer-1",
+          "name": "BRB",
+          "kind": "countdown",
+          "phase": "idle",
+          "ms": 300000,
+          "totalMs": 300000,
+          "text": "05:00",
+          "anchorMs": null,
+          "fires": 0
+        },
+        {
+          "id": "timer-2",
+          "name": "Uptime",
+          "kind": "countup",
+          "phase": "idle",
+          "ms": 0,
+          "totalMs": 0,
+          "text": "00:00",
+          "anchorMs": null,
+          "fires": 0
+        }
+      ]
+    },
+    "running": {
+      "seq": 2,
+      "timers": [
+        {
+          "id": "timer-1",
+          "name": "BRB",
+          "kind": "countdown",
+          "phase": "running",
+          "ms": 298400,
+          "totalMs": 300000,
+          "text": "04:59",
+          "anchorMs": 1793217900000,
+          "fires": 0
+        },
+        {
+          "id": "timer-2",
+          "name": "Uptime",
+          "kind": "countup",
+          "phase": "running",
+          "ms": 3723500,
+          "totalMs": 0,
+          "text": "1:02:03",
+          "anchorMs": 1793213878100,
+          "fires": 0
+        }
+      ]
+    },
+    "done": {
+      "seq": 3,
+      "timers": [
+        {
+          "id": "timer-1",
+          "name": "BRB",
+          "kind": "countdown",
+          "phase": "done",
+          "ms": 0,
+          "totalMs": 300000,
+          "text": "00:00",
+          "anchorMs": null,
+          "fires": 1
+        },
+        {
+          "id": "timer-2",
+          "name": "Uptime",
+          "kind": "countup",
+          "phase": "running",
+          "ms": 4021900,
+          "totalMs": 0,
+          "text": "1:07:01",
+          "anchorMs": 1793213878100,
+          "fires": 0
+        }
+      ]
+    }
+  },
+  "runSamples": [
+    {
+      "name": "running countdown",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "running",
+        "ms": 298400,
+        "totalMs": 300000,
+        "text": "04:59",
+        "anchorMs": 1793217900000,
+        "fires": 0
+      },
+      "run": { "phase": "running", "totalMs": 300000, "anchorMs": 1793217900000 },
+      "nowWallMs": 1793217779750,
+      "seededPhase": "running",
+      "seededMs": 120250
+    },
+    {
+      "name": "running countdown, back 1 ms before its end",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "running",
+        "ms": 298400,
+        "totalMs": 300000,
+        "text": "04:59",
+        "anchorMs": 1793217900000,
+        "fires": 0
+      },
+      "run": { "phase": "running", "totalMs": 300000, "anchorMs": 1793217900000 },
+      "nowWallMs": 1793217899999,
+      "seededPhase": "running",
+      "seededMs": 1
+    },
+    {
+      "name": "running countdown, back exactly at its end",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "running",
+        "ms": 298400,
+        "totalMs": 300000,
+        "text": "04:59",
+        "anchorMs": 1793217900000,
+        "fires": 0
+      },
+      "run": { "phase": "running", "totalMs": 300000, "anchorMs": 1793217900000 },
+      "nowWallMs": 1793217900000,
+      "seededPhase": "expired",
+      "seededMs": 0
+    },
+    {
+      "name": "running countdown, back after its end",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "running",
+        "ms": 298400,
+        "totalMs": 300000,
+        "text": "04:59",
+        "anchorMs": 1793217900000,
+        "fires": 0
+      },
+      "run": { "phase": "running", "totalMs": 300000, "anchorMs": 1793217900000 },
+      "nowWallMs": 1793217965000,
+      "seededPhase": "expired",
+      "seededMs": 0
+    },
+    {
+      "name": "running countdown, wall clock set back while closed",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "running",
+        "ms": 298400,
+        "totalMs": 300000,
+        "text": "04:59",
+        "anchorMs": 1793217900000,
+        "fires": 0
+      },
+      "run": { "phase": "running", "totalMs": 300000, "anchorMs": 1793217900000 },
+      "nowWallMs": 1793217540000,
+      "seededPhase": "running",
+      "seededMs": 300000
+    },
+    {
+      "name": "running count-up",
+      "state": {
+        "id": "timer-2",
+        "name": "Uptime",
+        "kind": "countup",
+        "phase": "running",
+        "ms": 3723500,
+        "totalMs": 0,
+        "text": "1:02:03",
+        "anchorMs": 1793213878100,
+        "fires": 0
+      },
+      "run": { "phase": "running", "anchorMs": 1793213878100 },
+      "nowWallMs": 1793217878350,
+      "seededPhase": "running",
+      "seededMs": 4000250
+    },
+    {
+      "name": "running count-up, wall clock set back before its start",
+      "state": {
+        "id": "timer-2",
+        "name": "Uptime",
+        "kind": "countup",
+        "phase": "running",
+        "ms": 3723500,
+        "totalMs": 0,
+        "text": "1:02:03",
+        "anchorMs": 1793213878100,
+        "fires": 0
+      },
+      "run": { "phase": "running", "anchorMs": 1793213878100 },
+      "nowWallMs": 1793213848100,
+      "seededPhase": "running",
+      "seededMs": 0
+    },
+    {
+      "name": "running count-up, closed for over 10 000 hours",
+      "state": {
+        "id": "timer-2",
+        "name": "Uptime",
+        "kind": "countup",
+        "phase": "running",
+        "ms": 3723500,
+        "totalMs": 0,
+        "text": "1:02:03",
+        "anchorMs": 1793213878100,
+        "fires": 0
+      },
+      "run": { "phase": "running", "anchorMs": 1793213878100 },
+      "nowWallMs": 1829213878101,
+      "seededPhase": "running",
+      "seededMs": 36000000000
+    },
+    {
+      "name": "paused countdown",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "paused",
+        "ms": 154001,
+        "totalMs": 300000,
+        "text": "02:35",
+        "anchorMs": null,
+        "fires": 0
+      },
+      "run": { "phase": "paused", "ms": 154001, "totalMs": 300000 },
+      "nowWallMs": 1793304000000,
+      "seededPhase": "paused",
+      "seededMs": 154001
+    },
+    {
+      "name": "paused countdown, paused 0.3 ms before its deadline",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "paused",
+        "ms": 1,
+        "totalMs": 300000,
+        "text": "00:01",
+        "anchorMs": null,
+        "fires": 0
+      },
+      "run": { "phase": "paused", "ms": 1, "totalMs": 300000 },
+      "nowWallMs": 1793217960000,
+      "seededPhase": "paused",
+      "seededMs": 1
+    },
+    {
+      "name": "paused countdown, total past 24 hours",
+      "state": {
+        "id": "timer-3",
+        "name": "Marathon",
+        "kind": "countdown",
+        "phase": "paused",
+        "ms": 82830000,
+        "totalMs": 86430000,
+        "text": "23:00:30",
+        "anchorMs": null,
+        "fires": 0
+      },
+      "run": { "phase": "paused", "ms": 82830000, "totalMs": 86430000 },
+      "nowWallMs": 1793304000000,
+      "seededPhase": "paused",
+      "seededMs": 82830000
+    },
+    {
+      "name": "paused count-up",
+      "state": {
+        "id": "timer-2",
+        "name": "Uptime",
+        "kind": "countup",
+        "phase": "paused",
+        "ms": 754321,
+        "totalMs": 0,
+        "text": "12:34",
+        "anchorMs": null,
+        "fires": 0
+      },
+      "run": { "phase": "paused", "ms": 754321 },
+      "nowWallMs": 1793304000000,
+      "seededPhase": "paused",
+      "seededMs": 754321
+    },
+    {
+      "name": "done countdown",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "done",
+        "ms": 0,
+        "totalMs": 300000,
+        "text": "00:00",
+        "anchorMs": null,
+        "fires": 1
+      },
+      "run": { "phase": "done", "totalMs": 300000 },
+      "nowWallMs": 1793304000000,
+      "seededPhase": "done",
+      "seededMs": 0
+    },
+    {
+      "name": "expired countdown",
+      "state": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "phase": "expired",
+        "ms": 0,
+        "totalMs": 300000,
+        "text": "00:00",
+        "anchorMs": null,
+        "fires": 0
+      },
+      "run": { "phase": "expired", "totalMs": 300000 },
+      "nowWallMs": 1793304000000,
+      "seededPhase": "expired",
+      "seededMs": 0
+    }
+  ]
+}

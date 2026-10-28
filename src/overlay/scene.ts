@@ -10,6 +10,8 @@
 // can't recognise, a second circle) is kept as stored and written back
 // unchanged. Pure: no DOM, no Tauri, and no component imports.
 
+import { isTimerId } from "./timerState";
+
 export const SCENE_VERSION = 1;
 
 /** The migrated spell circle's id. */
@@ -105,8 +107,24 @@ export interface ImageElement {
   [k: string]: unknown;
 }
 
+/** v1.59.0: an Hourglass timer's face. `timer` names the timer, which may
+ *  not exist (yet, or any more): the element is still kept and placed.
+ *  Kept inert since v1.55.0 under this type. */
+export interface TimerElement {
+  id: string;
+  type: "timer";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  z: number;
+  /** A timer id (`isTimerId`), never a name. */
+  timer: string;
+  [k: string]: unknown;
+}
+
 /** An element this version shows and edits. */
-export type KnownElement = CircleElement | ImageElement;
+export type KnownElement = CircleElement | ImageElement | TimerElement;
 
 /** An element as stored: shown or not, every key kept. */
 export type SceneElement = { id: string; type?: unknown } & Record<string, unknown>;
@@ -290,6 +308,14 @@ export function asImage(e: SceneElement): ImageElement | null {
   return e as unknown as ImageElement;
 }
 
+/** v1.59.0: a timer face this version could draw: usable geometry and a
+ *  `timer` that passes the id grammar, whether or not that timer exists. */
+export function asTimer(e: SceneElement): TimerElement | null {
+  if (!isObject(e) || e.type !== "timer" || !validId(e.id) || !usable(e)) return null;
+  if (!isTimerId(e.timer)) return null;
+  return e as unknown as TimerElement;
+}
+
 function liveEntries(s: OverlayScene): Array<{ el: KnownElement; index: number }> {
   const out: Array<{ el: KnownElement; index: number }> = [];
   let circle = false;
@@ -336,10 +362,11 @@ export function designedSize(e: KnownElement, design: Size): Size {
 }
 
 /** Width over height, as the reducer keeps it: the picture's own pixels
- *  (its stored shape when those are missing), and 1 for the circle. */
+ *  (its stored shape when those are missing), 1 for the circle, and a
+ *  timer's stored shape. */
 export function aspectOf(e: KnownElement, design: Size): number {
   if (e.type === "spellcircle") return 1;
-  if (pixelCount(e.nw) && pixelCount(e.nh)) return e.nw / e.nh;
+  if (e.type === "image" && pixelCount(e.nw) && pixelCount(e.nh)) return e.nw / e.nh;
   const d = designedSize(e, design);
   return d.w / d.h;
 }
@@ -717,6 +744,29 @@ export function defaultImageRect(s: OverlayScene, nw: number, nh: number, view?:
   };
 }
 
+/** v1.59.0: where a new timer face goes, as fractions of the scene's
+ *  `designSize`: 3:1, its height 12 % of the window's short side (32 to
+ *  160 px), centred across, its top at 8 % of the height and 6 % lower for
+ *  each of the next four, then round again. `view` is the window's CSS
+ *  size. */
+export function defaultTimerRect(s: OverlayScene, view?: Size): FracRect {
+  const d = s.designSize;
+  const v = view && positive(view.w) && positive(view.h) ? view : d;
+  const tall = clamp(0.12 * Math.min(v.w, v.h), 32, 160);
+  const fitted = fitSize(3 * tall, tall, v, MIN_ELEMENT_PX);
+  const k = Math.min(1, d.w / fitted.w, d.h / fitted.h);
+  const w = fitted.w * k;
+  const h = fitted.h * k;
+  const timers = s.elements.filter((e) => asTimer(e) !== null).length;
+  const top = clamp((0.08 + 0.06 * (timers % 5)) * d.h, 0, d.h - h);
+  return {
+    x: round6((d.w - w) / 2 / d.w),
+    y: round6(top / d.h),
+    w: round6(w / d.w),
+    h: round6(h / d.h),
+  };
+}
+
 // ---- hit testing ----
 
 /** An element's hit box: at least `min` a side (or the viewport's side),
@@ -790,14 +840,22 @@ export function assetRefCount(s: OverlayScene, id: string): number {
 }
 
 /** Each live element's name in Settings and the overlay's labels: "Spell
- *  circle", or the picture's name ("Picture" without one). Repeats are
- *  numbered " (2)", " (3)"… in array order, so adding a copy never renames
- *  the ones before it, and a suffix another picture's own name already
- *  uses is skipped. */
-export function charmLabels(s: OverlayScene): Map<string, string> {
+ *  circle", the picture's name ("Picture" without one), or the timer's name
+ *  as `timerName` gives it ("Timer" when it gives none: no such timer, or
+ *  no `timerName`). Repeats are numbered " (2)", " (3)"… in array order, so
+ *  adding a copy never renames the ones before it, and a suffix another
+ *  element's own name already uses is skipped. */
+export function charmLabels(
+  s: OverlayScene,
+  timerName?: (timerId: string) => string | undefined,
+): Map<string, string> {
   const live = liveElements(s);
   const base = (e: KnownElement): string => {
     if (e.type === "spellcircle") return "Spell circle";
+    if (e.type === "timer") {
+      const name = timerName?.(e.timer);
+      return typeof name === "string" && name.trim().length > 0 ? name.slice(0, MAX_NAME) : "Timer";
+    }
     return typeof e.name === "string" && e.name.trim().length > 0 ? e.name.slice(0, MAX_NAME) : "Picture";
   };
   const names = new Set(live.map(base));

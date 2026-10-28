@@ -205,6 +205,12 @@ import type { OverlayBg, ScenePush } from "../overlay/state";
 import type { OverlayScene } from "../overlay/scene";
 import type { OverlayStatus } from "../overlay/status";
 import {
+  adoptTimers,
+  readTimerSnapshot,
+  type TimerKind,
+  type TimerSnapshot,
+} from "../overlay/timerState";
+import {
   createOverlayController,
   OVERLAY_PREFS_KEY,
   OVERLAY_SCENE_KEY,
@@ -218,6 +224,13 @@ import {
 } from "../data/hotkeys";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
+import {
+  readTimers,
+  timerRoles as rolesOf,
+  type StoredTimers,
+  type TimerRole,
+  type TimerVerb,
+} from "../data/timers";
 import {
   adoptPtm,
   ptmModeOf,
@@ -385,6 +398,12 @@ const STORAGE_KEYS = {
   // answer to `set_ptm_mode`. Never a hold: what holds it lives in the engine
   // and in memory.
   ptm: "divora.ptm",
+  // v1.59.0: Hourglass's timers — `{version, timers: [{id, name, kind,
+  // durationMs, hotkeys?, run?}]}` (data/timers.ts). Each `run` is the last
+  // running, paused, done or ran-out state the page saw, with wall-clock
+  // anchors, so a restart can pick it up. Absent: boot sends no timer
+  // command.
+  timers: "divora.timers",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -1073,6 +1092,51 @@ export interface AppState {
   /** The mirror's only writer: takes `incoming` only if it is newer. Never
    *  touches `ptmKnown`. */
   applyPtmState: (incoming: PtmState | null) => void;
+
+  // Hourglass (v1.59.0). Rust keeps the time; the store keeps the stored
+  // timers (`divora.timers`) and a read-only mirror of Rust's snapshot,
+  // ordered by `seq`. Settings' cards are the stored timers, joined by id
+  // with the mirror.
+  /** The stored timers, read by `readTimers`: every one, in list order. */
+  timerStore: () => StoredTimers;
+  /** Each stored timer's role: the first 16 of a known kind run; the rest
+   *  are kept, shown with Delete only, and never registered. */
+  timerRoles: () => Map<string, TimerRole>;
+  /** The mirror: the newest snapshot seen (largest `seq`), or null before
+   *  the first answer or event. */
+  timerSnapshot: () => TimerSnapshot | null;
+  /** The mirror's only writer: an answer or a `timer-state` payload, taken
+   *  only if it is newer. Saves a stored timer's run when it changed. */
+  adoptTimerSnapshot: (raw: unknown) => void;
+  /** Adds a countdown or a count-up and syncs; its id, or null at 16 stored
+   *  timers. */
+  addTimer: (kind: TimerKind) => Promise<string | null>;
+  /** Called on commit only (Enter, or leaving the field), with a name that
+   *  passes `readTimerName`. */
+  renameTimer: (id: string, name: string) => Promise<void>;
+  /** Called on commit only, with a length `parseLength` gave. */
+  setTimerLength: (id: string, ms: number) => Promise<void>;
+  /** Unregisters its two keys, takes it off the overlay, then saves and
+   *  syncs without it. */
+  deleteTimer: (id: string) => Promise<void>;
+  /** Settings' main button: arm, pause or resume, by `timerAction` on the
+   *  mirror's state; nothing without one. */
+  startTimer: (id: string) => Promise<void>;
+  pauseTimer: (id: string) => Promise<void>;
+  resetTimer: (id: string) => Promise<void>;
+  adjustTimer: (id: string, deltaMs: number) => Promise<void>;
+  /** Saves (`""` clears that verb) and registers or unregisters
+   *  `tm:<id>:<verb>`. Does nothing for an id that isn't a stored timer the
+   *  backend runs. */
+  bindTimerHotkey: (id: string, verb: TimerVerb, accelerator: string) => Promise<void>;
+  /** The timers' folder for OBS (asked once, then remembered); null when it
+   *  can't be had. */
+  timersDir: () => Promise<string | null>;
+  /** Whether the scene has a `timer` element for this timer. */
+  timerOnOverlay: (id: string) => boolean;
+  /** Show on overlay: adds the timer's element, or removes every element
+   *  for it. */
+  setTimerOnOverlay: (id: string, on: boolean) => void;
 
   // Derived
   hasEnabled: () => boolean;
@@ -2069,6 +2133,35 @@ export function createAppState(): AppState {
     }
   })();
   onCleanup(() => clearTimeout(ptmKnownTimer));
+
+  // v1.59.0: Hourglass. Rust keeps the time (src-tauri/src/timers.rs); the
+  // page keeps the stored timers and a read-only mirror of Rust's snapshot,
+  // ordered by `seq` as the mute's is. The contract only, for now: the
+  // actions below do nothing yet, and nothing is sent at boot.
+  const [timerStore] = createSignal<StoredTimers>(
+    readTimers(loadJson<unknown>(STORAGE_KEYS.timers, null)),
+  );
+  const timerRoles = createMemo(() => rolesOf(timerStore()));
+  const [timerSnapshot, setTimerSnapshot] = createSignal<TimerSnapshot | null>(null);
+  const adoptTimerSnapshot = (raw: unknown): void => {
+    const next = adoptTimers(timerSnapshot(), readTimerSnapshot(raw));
+    if (next !== timerSnapshot()) setTimerSnapshot(next);
+  };
+  const addTimer: AppState["addTimer"] = async () => null;
+  const renameTimer: AppState["renameTimer"] = async () => {};
+  const setTimerLength: AppState["setTimerLength"] = async () => {};
+  const deleteTimer: AppState["deleteTimer"] = async () => {};
+  const startTimer: AppState["startTimer"] = async () => {};
+  const pauseTimer: AppState["pauseTimer"] = async () => {};
+  const resetTimer: AppState["resetTimer"] = async () => {};
+  const adjustTimer: AppState["adjustTimer"] = async () => {};
+  const bindTimerHotkey: AppState["bindTimerHotkey"] = async () => {};
+  const timersDir: AppState["timersDir"] = async () => null;
+  const timerOnOverlay = (id: string): boolean => overlay.overlayHasTimer(id);
+  const setTimerOnOverlay = (id: string, on: boolean): void => {
+    if (on) overlay.addOverlayTimer(id);
+    else overlay.removeOverlayTimer(id);
+  };
 
   const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
   // v1.58.0: the status says what happens to what you say from now on. Push
@@ -4231,6 +4324,23 @@ export function createAppState(): AppState {
     ptmDown,
     ptmUp,
     applyPtmState,
+
+    timerStore,
+    timerRoles,
+    timerSnapshot,
+    adoptTimerSnapshot,
+    addTimer,
+    renameTimer,
+    setTimerLength,
+    deleteTimer,
+    startTimer,
+    pauseTimer,
+    resetTimer,
+    adjustTimer,
+    bindTimerHotkey,
+    timersDir,
+    timerOnOverlay,
+    setTimerOnOverlay,
 
     hasEnabled,
     status,
