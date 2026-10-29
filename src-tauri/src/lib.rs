@@ -409,8 +409,14 @@ fn input_mute(state: State<'_, AppState>) -> InputMute {
 /// included, which must then be pressed again. With `restore: true` (the main
 /// window, once at each page load, with the saved mode) it lets go of the
 /// page's holds and keeps a held global key, so a reload doesn't drop it.
-/// Sync on purpose (D23): sync commands run in order on the main thread, so
-/// a press can't overtake its release. Idempotent.
+/// Sync on purpose (D23): it runs on the main thread, one at a time with
+/// the other sync commands and `WM_HOTKEY`, in the order they reach it.
+/// That doesn't order what the page sends: invokes in flight at the same
+/// time can reach Rust out of send order (measured in the real app on this
+/// PC with 40 sent at once). So the page sends every push-to-modulate
+/// command through one queue (`src/data/inOrder.ts`), each only once the
+/// one before it answered, and a release can't reach Rust before its press.
+/// Idempotent.
 #[tauri::command]
 fn set_ptm_mode(state: State<'_, AppState>, mode: PtmMode, restore: Option<bool>) -> PtmState {
     ptm_mode_command(&state.engine, mode, restore)
@@ -429,8 +435,9 @@ fn ptm_mode_command(engine: &AudioEngine, mode: PtmMode, restore: Option<bool>) 
 
 /// v1.58.0: one page source's hold on push-to-modulate (the in-app key, the
 /// Mixer's button, MIDI), by level; answers the state after. `"hotkey"` is
-/// refused (only the backend holds that one). Sync for the same reason as
-/// [`set_ptm_mode`]. Idempotent.
+/// refused (only the backend holds that one). Sync (D23), and sent through
+/// the page's push-to-modulate queue with [`set_ptm_mode`]; see there for
+/// what orders them. Idempotent.
 #[tauri::command]
 fn set_ptm_held(state: State<'_, AppState>, source: PtmPageSource, held: bool) -> PtmState {
     state.engine.set_ptm_held(source.into(), held).after
@@ -2991,11 +2998,18 @@ fn close_midi_input(state: State<'_, AppState>) -> Result<(), String> {
 
 // ---- v1.59.0: Hourglass ----
 //
-// Every timer command is sync (D16): sync commands run one at a time on the
-// main thread, in order with `WM_HOTKEY`, so a quick Pause then Resume can't
-// land reversed. Each holds the core's lock for microseconds; the timer
-// thread emits what changed. Each answers the whole `TimerSnapshot`: of two,
-// the larger `seq` is newer.
+// Every timer command is sync (D16): it runs on the main thread, one at a
+// time with the other sync commands and `WM_HOTKEY` (where a timer's key
+// acts), in the order they reach it. That doesn't order what the page
+// sends: invokes in flight at the same time can reach Rust out of send
+// order (measured in the real app on this PC with 40 sent at once). So the
+// page sends every command that changes Hourglass (the syncs, the labelled
+// commands, the `tm:` keys' registers and unregisters) through one queue
+// (`src/data/inOrder.ts`), each only once the one before it answered;
+// `timer_status` and `timers_dir`, which change no timer, stay out. Every
+// timer command but `timers_dir` (a path) holds the core's lock for
+// microseconds and answers the whole `TimerSnapshot`: of two, the larger
+// `seq` is newer. The timer thread emits what changed.
 
 /// v1.59.0: the timer definitions become `timers` (every stored timer, in
 /// list order) and the answer is the whole set. Never fails: each entry is
@@ -5323,10 +5337,11 @@ mod tests {
         for name in ["set_ptm_mode", "set_ptm_held"] {
             assert!(
                 !prod.contains(&format!("async fn {name}(")),
-                "{name} must stay a sync command (D23): sync commands run in \
-                 order on the main thread, so a press can't overtake its \
-                 release. An async one runs on a tokio worker, in any order, \
-                 and a quick tap could land release-then-press: stuck held"
+                "{name} must stay a sync command (D23): it runs on the main \
+                 thread, one at a time with the other sync commands and \
+                 WM_HOTKEY; an async one would run on a tokio worker, beside \
+                 them. Sync doesn't order the page's sends in flight \
+                 together; the page's queue does (src/data/inOrder.ts)"
             );
             assert!(
                 prod.contains(&format!("#[tauri::command]\nfn {name}(")),
@@ -6001,9 +6016,10 @@ mod tests {
         file[..tests_at].to_string()
     }
 
-    /// v1.59.0 (D16): every timer command stays sync. Sync commands run in
-    /// order on the main thread with `WM_HOTKEY`, so a quick Pause then
-    /// Resume can't land reversed, and a press can't overtake a click. The
+    /// v1.59.0 (D16): every timer command stays sync: it runs on the main
+    /// thread, one at a time with the other sync commands and `WM_HOTKEY`
+    /// (where a timer's key acts). Sync doesn't order the page's sends in
+    /// flight together; the page's queue does (`src/data/inOrder.ts`). The
     /// commands need an `AppHandle`, so this reads the source.
     #[test]
     fn timer_commands_stay_sync() {
@@ -6011,9 +6027,10 @@ mod tests {
         for name in TIMER_COMMANDS {
             assert!(
                 !prod.contains(&format!("async fn {name}(")),
-                "{name} must stay a sync command (D16): an async one runs on a \
-                 tokio worker, in any order, and two quick clicks could land \
-                 reversed"
+                "{name} must stay a sync command (D16): it runs on the main \
+                 thread, one at a time with the other sync commands and \
+                 WM_HOTKEY; an async one would run on a tokio worker, beside \
+                 them"
             );
             assert!(
                 prod.contains(&format!("#[tauri::command]\nfn {name}(")),

@@ -38,6 +38,7 @@ accidental break fails CI before it ships:
 - `TimerSnapshot` / `TimerState` / `TimerRun` / `TimerDefWire` keys, the phase and kind strings, the timer id grammar, the `tm:` hotkey-id table, the timer limits, the run samples (what the page stores for a state, and what the backend seeds from it), and the `timer-state` event and `timer_status` command names — `src/overlay/timer.fixture.json`, read by `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`, `timer_id_table`, `hotkey_timer_request_table`, `seed_table`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/overlay/timerState.test.ts` / `src/data/timers.test.ts` (v1.59.0).
 - The `tm:` hotkey ids: a press of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id acts on that timer; a release, `tm:<id>:finish` and any other spelling don't — `src-tauri/src/timers.rs` (`hotkey_timer_request_table`), and `src-tauri/src/lib.rs` (`the_shortcut_handler_runs_the_timer_hotkey`; v1.59.0).
 - The eight Hourglass commands stay sync — `src-tauri/src/lib.rs` (`timer_commands_stay_sync`; v1.59.0).
+- The main window sends each feature's state-changing commands one at a time, each once the one before it has answered: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands and `tm:` key registers and unregisters; the reads (`input_mute`, `timer_status`) aren't held back — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" tests; v1.59.0). Being sync orders only commands that aren't in flight together.
 - `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`).
 - Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, and the Hourglass ones since v1.59.0).
 
@@ -79,7 +80,10 @@ set with the engine stopped, it outlives Stop, Start and device-loss rebuilds,
 and it is never stored; every launch starts unmuted. Every change adds 1 to
 `seq`. The three commands are sync (they run on the main thread, in turn with
 each other and with the hotkey), and each is one atomic operation;
-`LevelUpdate` carries the same state on every tick.
+`LevelUpdate` carries the same state on every tick. Being sync doesn't order
+commands in flight together (§1 "Hourglass"), so since v1.59.0 the main
+window sends its sets and toggles one at a time, each once the one before it
+has answered.
 
 Push-to-modulate (v1.58.0) switches your effects off and on for everything the
 mute covers, and in the same place: the call, the headphone monitor and
@@ -94,9 +98,12 @@ Engine-wide: it can be set with the engine stopped, and it outlives Stop,
 Start and device-loss rebuilds, holds included. The backend never stores it:
 every launch of the app starts at `"always"`, nothing held, `seq` 0, and the
 page restores the mode it saved. Every change adds 1 to `seq`. Both commands
-are sync on purpose: sync commands run in order on the main thread, so a press
-can't overtake its release. Each is one atomic operation; `LevelUpdate`
-carries the same state on every tick.
+are sync: each runs to completion on the main thread, one at a time. That
+doesn't order commands in flight together, which can reach Rust out of send
+order (§1 "Hourglass"), so the main window sends both one at a time, each
+once the one before it has answered (v1.59.0): that is what keeps a press from
+overtaking its release. Each is one atomic operation; `LevelUpdate` carries
+the same state on every tick.
 
 ### DSP chain
 
@@ -333,10 +340,16 @@ position or size, which the backend does.
 
 ### Hourglass (v1.59.0)
 
-Countdowns and count-ups the backend keeps. All eight commands are sync, on
-purpose: sync commands run one at a time on the main thread, in the order they
-were sent and in turn with the `tm:` hotkeys, so a quick Pause then Resume
-can't land reversed. Every one but `timers_dir` answers the whole
+Countdowns and count-ups the backend keeps. All eight commands are sync: each
+runs to completion on the main thread, one at a time and in turn with the
+`tm:` hotkeys. Being sync doesn't keep commands in the order they were sent:
+Tauri sends each invoke as its own request, and commands in flight together
+can reach Rust out of send order (measured in the real app on this PC with 40
+sent at once). A caller that needs order sends each command only
+once the one before it has answered; the main window does, through one queue
+for every command that changes the timers (`timer_status` stays out) and the
+`tm:` keys' registers and unregisters, so a quick Pause then Resume can't land
+reversed. Every one but `timers_dir` answers the whole
 `TimerSnapshot`; of two snapshots, the larger `seq` is newer, and the
 `timer-state` events (§2) carry the same shape. Each of those brings the
 timers up to date before it acts — a countdown already due finishes, a sleep since the

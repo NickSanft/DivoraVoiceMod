@@ -2992,8 +2992,12 @@ information, never "unmuted".
 
 **The boot read.** The store sends `input_mute` once, when it is created:
 before `App`'s `onMount` enumerates devices with two sync commands that hold
-the main thread, so a reload during a hotkey mute shows Muted after one round
-trip rather than after the enumeration. Ticks still start after it (the boot
+the main thread, so a reload during a hotkey mute needn't wait for the
+enumeration to show Muted. Sent first isn't run first while both are in
+flight (see Hourglass's "Command order"), so the read can still land after
+the enumeration (possible from the code, not seen); the mirror keeps the
+newer state by `seq` either way. It isn't queued: it changes nothing. Ticks
+still start after it (the boot
 comment in `App.tsx` says why). The boot sends no mute of its own, so a reload
 never unmutes the call. `muteKnown` comes true when the read settles (an
 answer or a failure), when any state is adopted, or after 500 ms; until the
@@ -3010,7 +3014,12 @@ Mute or Unmute, is read from the same mirror the cast reads) and a MIDI CC.
 When the label is stale — the mirror lags a hotkey mute by a tick — a click is
 an idempotent no-op whose answer corrects the label, never the opposite of
 what it says. A trigger with no label toggles in Rust, so a quick double press
-is two flips: the hotkey, and a MIDI pad (`toggle_input_muted`). After a
+is two flips: the hotkey, and a MIDI pad (`toggle_input_muted`). Since
+v1.59.0 the page sends its sets and toggles through one queue, each once the
+one before it has answered: commands in flight together can reach Rust out of
+send order (measured in the real app with 40 sent at once; see Hourglass's
+"Command order"), and two sets landing reversed would leave the opposite of
+the last click. After a
 pointer click (`detail > 0`) the Mixer button gives focus back to the page,
 because a focused button takes Space, the in-app push-to-modulate key; from
 the keyboard it keeps focus.
@@ -3386,12 +3395,18 @@ each make one of those calls and answer the `PtmState` after. Only
 `ptm_mode_command`, so `set_ptm_mode_restores_only_when_asked` runs the real
 choice). `set_ptm_held` takes a `PtmPageSource`, which has no `hotkey`, so
 Tauri refuses `"hotkey"`: only the backend holds that bit. Both commands are
-sync on purpose (`ptm_commands_stay_sync`). Tauri runs sync commands on the
-main thread in the order they were sent, so a press can't overtake its
-release; async commands run on tokio workers in any order, and a quick tap
-could land release-then-press and stay held. The cost is that a press waits
-behind any sync command already holding the main thread (see "Threads and
-latency" below).
+sync (`ptm_commands_stay_sync`), chosen for order: Tauri runs a sync command
+to completion on the main thread, one at a time, where async commands run on
+tokio workers in any order. That orders a press and its release only when
+the release is sent after the press has answered. Commands in flight together
+can reach Rust out of send order (measured for v1.59.0 with 40 sent at once;
+see Hourglass's "Command order"), so a quick tap could land release-then-press
+and stay held.
+Since v1.59.0 the store sends every push-to-modulate command through one
+queue, each once the one before it has answered: that is what keeps a press
+from overtaking its release. The cost is that a press waits behind any sync
+command already holding the main thread, and a release behind its press's
+answer (see "Threads and latency" below).
 
 ### Where it sits
 
@@ -3671,8 +3686,10 @@ wasn't tried in the app).
 **Every source.** Setting the mode from the card — turning it on or off, or
 picking a hold, even the one already picked — lets go of every hold, the
 global key's included. The store forgets the page's own holds and which pads
-are down before the call goes out: commands land in order, so a press made
-while it is in flight lands after it and holds again. It keeps each CC's
+are down before the call is queued. A press made while it is in flight is
+queued behind it and sent only once it has answered (v1.59.0; until then this
+rested on being sync, which doesn't keep the order), so the press lands after
+it and holds again. It keeps each CC's
 side, so a CC left up holds again only after it comes down and back up. A
 key, pad or button still down must be pressed again: the global key doesn't
 repeat (global-hotkey registers every key with `MOD_NOREPEAT`), a pad sends
@@ -3681,7 +3698,7 @@ one note-on, and the in-app listener and the button ignore autorepeat.
 **Edges only.** The store keeps what the page holds, so a second down, an
 autorepeat or a stray up sends nothing, and when two releases race (the DOM's
 `blur` and Tauri's focus event both fire as the window loses the focus) the
-second sends nothing. The flag is set before the invoke goes out. MIDI sends
+second sends nothing. The flag is set before the command is queued. MIDI sends
 only when the set of mappings down turns empty or non-empty.
 
 **The global key and the in-app key** are two sources, not two routes to one
@@ -3736,7 +3753,9 @@ lands. Holds are never saved.
 **The boot restore.** The store sends `set_ptm_mode {mode, restore: true}`
 once, when it is created, beside the mute's read and before `App`'s `onMount`
 enumerates devices, with the saved mode (`hold` while on; `always` while off
-or with nothing saved). Its answer is the boot read. `ptmKnown` comes true
+or with nothing saved). Its answer is the boot read. It is the first on
+push-to-modulate's queue (v1.59.0), so a press made before its answer is sent
+after it, and the restore can't let go of that press. `ptmKnown` comes true
 when the call settles (an answer or a failure) or after 500 ms, never from a
 tick: the restore changes the word (it lets go of the page's holds), so a tick
 that lands before its answer may carry the previous page's holds. The overlay
@@ -3858,7 +3877,9 @@ through".
   8 holds by `SendInput` (which doesn't repeat), the tick that showed it let go came 12 to 76 ms after
   the key-up, an upper bound on the poller plus the tick's wait.
 - **The in-app key, the button, MIDI:** an IPC round trip, plus any sync
-  command ahead of it; then as above.
+  command ahead of it on the main thread, plus, since v1.59.0, any
+  push-to-modulate command the page sent before it that hasn't answered;
+  then as above.
 - **The pill:** the next tick (up to about 33 ms) after a change the backend
   made; the answer after one the page made.
 
@@ -4033,6 +4054,8 @@ Where it lives:
   both sides (below).
 - `src/data/timers.ts`: the page's pure rules — reading `divora.timers`, what
   a sync sends, roles, ids, runs, the Length field, the live region's words.
+- `src/data/inOrder.ts`: the queue the store sends the timers', the mute's
+  and push-to-modulate's commands through, one at a time ("Command order").
 - The store (`src/stores/app.tsx`), the overlay page (`src/overlay.tsx`,
   `Stage.tsx`, `scene.ts`, `controller.ts`), `HourglassSection` in
   `src/screens/SettingsScreen.tsx`, `HotkeyCapture`, and two new sigils,
@@ -4147,8 +4170,10 @@ within 1 s is forgotten. So a restart doesn't move a timer by a clock change
 made while it ran (a resync after a resume, or the user setting the clock).
 The live time doesn't move: it runs on the clock
 (`a_wall_step_moves_the_anchor_after_10_s`). How far the two drift apart over
-an hour wasn't measured: `[S2: H1 drift over the run]`; owner check O5 runs
-an hour against a phone's stopwatch.
+an hour wasn't measured. Over S2's 4-minute run (H1, below), the overlay's
+changes drifted against their wall-clock boundaries by +0.66 and −0.38 ms a
+minute for its two timers; owner check O5 runs an hour against a phone's
+stopwatch.
 
 ### Sleep
 
@@ -4430,22 +4455,34 @@ in so the tests drive time):
 after the one that saw it change; Text (FreeType 2) does the same on its own
 1 s timer. The mtime it reads is in whole seconds, and a rename keeps the
 temp's write time (measured here). So OBS's text is up to about 2 s behind
-the overlay after a quiet spell, and about 0 to 1 s behind while it changes
-every second: the plan's ±2 s. A GDI+ read that lands inside a rename fails
-to open and shows nothing until the next change, about 1 to 2 s of blank,
+the overlay after a quiet spell, and mostly 0 to 1 s behind while it changes
+every second. A simulation of that rule on the mtimes of S2's 5-minute run
+(H2, below), at 40 poll phases, put OBS a median 563 ms behind, p95 1016 ms,
+worst 2108 ms, and over 2 s in 16 of 23,760 samples (0.07 %), with every
+write 37-87 ms after its boundary. So the plan's ±2 s is down to OBS's own
+polling, which went past it in those samples with no write late. A GDI+ read
+that lands inside a rename fails to open and shows nothing until the next
+change, about 1 to 2 s of blank,
 rarely; FreeType 2 keeps its old text instead. Owner checks O1 (GDI+) and O2
 (FreeType 2) put OBS beside the overlay for 5 minutes.
 
 ### The commands
 
-Eight, all sync (`timer_commands_stay_sync`): Tauri runs sync commands one at
-a time on the main thread, in the order they were sent and in turn with
-`WM_HOTKEY`, so a quick Pause then Resume can't land reversed, and a key press
-can't overtake a click. Each locks, reads the clocks, checks for a sleep,
-ticks, acts, builds its answer, unlocks and wakes the thread. The cost: a
-click waits behind any sync command already holding the main thread, such as
-the device enumeration that runs when Divora's window gains the focus (see
-"Long commands off the main thread").
+Eight, all sync (`timer_commands_stay_sync`): Tauri runs each sync command to
+completion on the main thread, one at a time and in turn with `WM_HOTKEY`, so
+no two commands, and no command and key press, act on the timers at the same
+moment. Being sync doesn't keep commands in the order they were sent, though:
+commands in flight together reached Rust out of send order in the real app,
+measured with 40 sent at once (see "Command order", below). So the page sends the commands that change its
+timers one at a time, each once the one before it has answered. A key press
+is Rust's own and in no queue: one that comes while a click's command is on
+its way can run first (from the code), and a labelled op that no longer fits
+the phase then changes nothing (above). Each command locks, reads the
+clocks, checks for a sleep, ticks, acts, builds its answer, unlocks and wakes
+the thread. The cost: a click waits behind any sync command already holding
+the main thread, such as the device enumeration that runs when Divora's
+window gains the focus (see "Long commands off the main thread"), and behind
+any timer command the page sent before it that hasn't answered.
 
 | Command | Does |
 |---|---|
@@ -4459,6 +4496,73 @@ Every answer but `timers_dir`'s is the whole `TimerSnapshot`. A refused op
 still ran its tick, so it wakes the thread too. The overlay page calls
 `timer_status`; `overlay.json`'s description now names it among the commands
 the overlay would need granted if an app manifest is ever added.
+
+### Command order
+
+S2's H6 sent 40 `pause_timer` / `resume_timer` invokes from the main page
+at once, without awaiting. Every answer was right for its command, but
+Rust ran them out of send order: on `de6d8ab` the 29th to 40th ran before the
+2nd to 28th, and on `f22eb17` 21 of 40 were out of order (raw invokes, which
+bypass the queue below). The cause: Tauri 2.11.2's `ipc-protocol.js` sends
+every invoke as its own `fetch` to `http://ipc.localhost/<command>` (from its
+code), and WebView2 handles requests in flight together in parallel and
+doesn't hand them to the app in the order they were made (the run above). A
+sync command still runs to completion on the main thread, one at a time, and
+a command sent only after the one before it answered runs after it. Being
+sync doesn't order commands in flight together; v1.56.0's mute, v1.58.0's
+push-to-modulate and Hourglass before `f22eb17` relied on it doing so. Only
+the burst was measured: whether two commands sent tens of milliseconds apart,
+with the main thread busy, can swap wasn't.
+
+**The queue** (`src/data/inOrder.ts`). `inOrder()` makes one. A send queued
+while nothing is in flight goes out in the caller's turn; any other goes once
+every send queued before it has answered or failed. A failure doesn't hold
+the rest back, and each caller gets its own answer or error. The store keeps
+one queue per feature, and the queues don't wait on each other:
+
+- **The mute:** `set_input_muted` and `toggle_input_muted`. Two labelled sets
+  landing reversed would leave the opposite of the last click.
+- **Push-to-modulate:** every `set_ptm_held` the page sends (the in-app key,
+  Hold to switch, MIDI), the card's `set_ptm_mode` and the boot restore. A
+  release applied before its press would leave the hold on until the next
+  edge. The restore is the queue's first, so a press made before its answer
+  goes after it.
+- **Hourglass:** `sync_timers`, the labelled commands (`arm_timer`,
+  `pause_timer`, `resume_timer`, `reset_timer`, `adjust_timer`) and every
+  register and unregister of a `tm:` key: a bind, a clear, a delete's, the
+  boot's. A sync carries the timers as they stood when it was queued, so a
+  delete's sync reaches Rust before a later Add's, and a key bound for a
+  timer that took a deleted id registers after the delete's unregisters.
+
+**Reads stay out.** `input_mute` and `timer_status` change nothing, and their
+answers are adopted by `seq` wherever they land, so they don't wait in the
+page behind a slow command.
+
+**A send that never answers** holds back every send queued after it on that
+feature's queue until the page reloads, which makes a new store (from the
+code). Every queued command is sync and answers once the main thread has run
+it; one held up there holds up every sync command sent after it anyway,
+queued or not. What the queue adds is a round trip: a send behind another
+goes only once that one's answer is back.
+
+**Measured on `f22eb17`** (H6, through the store): a burst of 20 clicks on
+Settings' Pause button, all in one task, went out one at a time (no two in
+flight together), with the answers' `seq` strictly increasing and the final
+phase the one the clicks imply; 10 press / release pairs through the Mixer's
+Hold to switch (pointer events, no keys) went out one at a time, each pair
+reached Rust in order, and the last answer and the engine's tick said not
+held. The mute's queue wasn't driven in the real app; it rests on the tests
+(`inOrder.test.ts`, and the store's "one command at a time" tests for each
+feature, which drive the real store over a mock wire that lands whatever is
+in flight together reversed).
+
+**Not queued yet:** any other command the page sends without waiting for the
+one before it to answer. For example, a slider drag sends `set_effect_param`
+at each step, so an older value could land last and the engine keep it while
+the slider shows the newer (from the code; not seen). The chain's
+`set_effect_chain` and the binds in Settings → Hotkeys are in the same
+position. To check a command: if two sends of it can be in flight together
+and the later must win, it needs a queue. Queuing those is a follow-up.
 
 ### The keys
 
@@ -4481,8 +4585,11 @@ verb), not in `divora.hotkeyBindings`, whose action list is closed. v1.59.0
 registers `toggle` and `reset`; any other verb, such as v1.60.0's `finish`, is
 kept, written back unchanged and never registered. `syncHotkeyBindings`
 registers them after the fixed actions and the tiles, for timers the backend
-runs only, reading each key just before it goes out. A bind saves, then
-registers, and changes only its own verb; a clear saves, then unregisters. A
+runs only, reading each key just before it is queued. Every register and
+unregister of a `tm:` key goes through the timers' queue ("Command order"),
+so the boot's go after the boot sync, and a bind made after a delete goes
+after the delete's unregisters. A bind saves, then registers, and changes
+only its own verb; a clear saves, then unregisters. A
 bind for a timer that isn't stored, or isn't run, does nothing: a capture can
 outlive its card, and the next timer to take that id would otherwise answer
 to a key nothing shows. Every key is unbound until the user sets it.
@@ -4492,8 +4599,10 @@ to a key nothing shows. Every key is unbound until the user sets it.
 - **Boot.** The store reads `divora.timers` when it is created. If the key
   exists, it sends `sync_timers` with every stored timer and its run, right
   after the mute's read and push-to-modulate's restore, so it goes out before
-  `App`'s `onMount` enumerates devices and registers hotkeys: the backend
-  knows every timer before any of their keys works. Then it awaits
+  `App`'s `onMount` enumerates devices and registers hotkeys. Going out first
+  doesn't make it run first ("Command order"); what makes the backend know
+  every timer before any of their keys works is the timers' queue: the sync
+  is its first, and the keys `App` registers are queued after it. Then it awaits
   `listen("timer-state")` and calls `timer_status` once, because an emit
   reaches only a listener already registered (a seeded countdown running out
   in between would reach nobody) and a paused or done timer sends nothing
@@ -4514,19 +4623,22 @@ to a key nothing shows. Every key is unbound until the user sets it.
   counted, so each counted timer has a card with Delete. Rename and length act
   only on timers the backend runs, and an unchanged commit sends nothing.
 - **Delete** saves first, so a capture still open can't bind the timer's keys
-  again. Then, in the same turn, it sends the two unregisters, takes the
-  timer's faces off the overlay and sends the sync without it; the backend
-  runs them in that order. Awaiting the unregisters before sending the sync
-  would free the id meanwhile: an Add in that gap would take it, its sync
-  would reach the backend first, and the new timer would inherit the deleted
-  one's run (step R). A delete can bring a timer that was over the limit under
-  it; that timer's stored keys are registered after the sync, in the same turn
-  (step R). Deleting the last timer leaves the key (`{version, timers: []}`),
-  so the next boot still syncs an empty list and listens.
+  again. Then, in the same turn, it queues the two unregisters, takes the
+  timer's faces off the overlay and queues the sync without it; the timers'
+  queue sends them in that order, each once the one before has answered
+  ("Command order"). Until `f22eb17` they were sent together, and their order
+  rested on being sync, which doesn't keep it. Awaiting the unregisters before
+  queuing the sync would free the id meanwhile: an Add in that gap would take
+  it, its sync would be queued first, and the new timer would inherit the
+  deleted one's run (step R). A delete can bring a timer that was over the
+  limit under it; that timer's stored keys are queued after the sync, in the
+  same turn (step R). Deleting the last timer leaves the key
+  (`{version, timers: []}`), so the next boot still syncs an empty list and
+  listens.
 - **Buttons.** Start sends `arm_timer`, `pause_timer` or `resume_timer` by the
   mirror's phase, the label it drew (`timerAction`); with no state yet there
-  is no button. Pause, Reset and ±30 s send their commands. Each adopts its
-  answer.
+  is no button. Pause, Reset and ±30 s send their commands. All go through
+  the timers' queue, and each adopts its answer.
 
 ### The overlay face
 
@@ -4669,7 +4781,8 @@ path of BRB's file").
 | the hand-off | `divora-timers`, unlocked | the slot's lock, for a swap | waiting on the writer |
 | writes, removals, the sweep, repair | `divora-timer-files` | nothing | the core lock |
 
-**Latency**, from the code, with the real-app figures still to come from S2:
+**Latency**, from the code, with S2's figures from the real app on this PC
+(debug builds; the setup is under "Tests"):
 
 - **A boundary to the thread's pass:** the wait ends at or after its wake time.
   `recv_timeout` parks through `WaitOnAddress`, which wakes on the system
@@ -4680,23 +4793,35 @@ path of BRB's file").
   event loop and is delivered when that thread services it, normally within a
   frame; then the overlay page sets the text. A sync command holding the main
   thread delays it by that command's length. Hidden to the tray, in the real
-  app: `[S2: H1 worst face change against its boundary]`; around five
-  `list_audio_input_devices` calls: `[S2: H1b face lag around the calls]`.
+  app over 4 minutes: every face change came 16 ms or less after its second
+  boundary outside the busy moments below (median 7 and 8 ms, p95 14 and
+  15 ms, for a countdown and a count-up). Around five
+  `list_audio_input_devices` calls, which took 11-21 ms each, the lag was at
+  most 18 ms.
 - **The pass to the file:** a swap, then the writer's create, write, close and
   rename. While a reader holds the file, the rename is tried again about every
   system timer tick until the hold ends. The file never waits on the main
-  thread. In the real app: `[S2: H2 worst file change after its boundary,
-  collided seconds included]`.
-- **The file to OBS:** up to about 2 s (above; from OBS's code). A simulated
-  OBS reading H2's file: `[S2: H2 simulated OBS worst lag]`; OBS itself is
-  owner check O1.
+  thread. In the real app, with a holder colliding with every boundary for
+  5 minutes: each change landed 37-87 ms after its boundary (median 47 ms).
+  With nothing holding it, during the 4 minutes above, all 248 changes landed
+  within 100 ms of their boundary, the ones near the device calls 11-21 ms
+  after it.
+- **The file to OBS:** up to about 2 s (above; from OBS's code). OBS's rule
+  simulated on that 5-minute file: median 563 ms, p95 1016 ms, worst
+  2108 ms. OBS itself is owner checks O1 and O2.
 - **A key to the timer:** the main thread's queue (normally empty), the step
-  under the lock, then the thread's emit. In the real app: `[S2: H3 key-down
-  to timer-state in the hidden page, or "not run: owner check O4"]`.
-- **A click:** an IPC round trip, plus any sync command ahead of it.
+  under the lock, then the thread's emit. In the real app, by `SendInput`
+  with the main window hidden: the hidden page's next `timer-state` came
+  0.8 to 1.9 ms after each of 5 key-downs. A Stream Deck wasn't tried (O4).
+- **A click:** an IPC round trip, plus any sync command ahead of it on the
+  main thread, plus any timer command the page sent before it that hasn't
+  answered ("Command order").
 
 The plan's bars: the overlay within ±1 s of a stopwatch, an OBS text source
-within ±2 s.
+within ±2 s. Against the wall clock rather than a stopwatch, the overlay's
+worst in the 4-minute run was 18 ms. The OBS bar is OBS's own: by the
+simulation above, its polling went past 2 s in 0.07 % of samples with every
+write 37-87 ms after its boundary.
 
 ### Two Divoras share `timers/`
 
@@ -4774,7 +4899,19 @@ running.
 - **Counts at `de6d8ab`:** `divora-app`'s lib 253 passed, 1 ignored (176 at
   v1.58.0); `divora-core` 560 and `divora-capture` 181, unchanged; the
   workspace 1,018 passed, 24 ignored. Vitest 1,671 in 56 files (1,376 in 53
-  at v1.58.0); E2E 62 (56 at v1.58.0).
+  at v1.58.0); E2E 62 (56 at v1.58.0). At `f22eb17`, Vitest 1,696 in 57
+  files (the queues' tests); Rust and E2E unchanged.
+- **The queues** (`f22eb17`): `inOrder.test.ts` (7: a send goes in the
+  caller's turn when nothing is in flight, otherwise after every earlier one
+  has settled; a failure or a throw holds nothing back; a burst answered
+  newest first keeps send order; two queues don't wait on each other); and
+  the store's "one command at a time" tests for the mute, push-to-modulate
+  and Hourglass, over a mock wire that lands whatever is in flight together
+  reversed (20 alternating sets, presses and releases, or resumes and
+  pauses, taken in send order; a press made during the card's set or before
+  the boot restore's answer landing after it; a delete, an Add and a bind
+  queued behind a slow command, in that order; the boot's keys after the
+  boot sync, with `timer_status` not waiting).
 - **Vitest:** `timerState.test.ts` (the fixture's names, keys, phases, kinds
   and limits; `readTimerSnapshot`; `adoptTimers`; `isTimerId`;
   `fitTimerFont`); `data/timers.test.ts` (`readTimers`; `defsForSync` against
@@ -4804,7 +4941,7 @@ running.
   the overlay's face (nothing before a snapshot, no badge in Arrange, newer
   `seq` only, updates under Functional motion, "Timer missing" in Arrange).
   The mock answers every timer command `null`, so the e2e never runs Rust's
-  rules; the store's unit tests and S2 cover real answers.
+  rules; the store's unit tests and S2 (below) cover real answers.
 - **Mutations.** Every row of the design's mutation table was put back by
   the track that owns it and seen failing its named test, then restored, each
   file checked byte for byte; the Rust ones in a copy of the workspace, so no
@@ -4819,34 +4956,84 @@ running.
   cleared before a screen reader could speak them, a test that copied the
   sync's reader instead of driving it, and a writer-thread test that could
   flake. The overlay's comment about fonts was corrected (no behaviour).
-- **In the real app:** `[S2: build commit, machine and engine route]`.
-  - H1, hidden to the tray, a 3:00 countdown and a count-up on the overlay
-    for 4 min: `[S2: H1 worst face change against its boundary, values
-    skipped, divora.timers writes per transition, drift over the run]`.
-  - H1b, five `list_audio_input_devices` calls during H1: `[S2: H1b face lag
-    around the calls; the file's change times]`.
-  - H2, a count-up's file for 5 min, read every 10 ms, held 40 ms once a
-    second: `[S2: H2 every second once and in order, worst change after its
-    boundary, the collision line's N and longest wait, simulated OBS worst
-    lag]`.
-  - H3, the keys by `SendInput` with the window hidden: `[S2: H3 result, or
-    "not run: owner check O4"]`.
-  - H4, a reload mid-countdown: `[S2: H4 the IPC order, anchorMs before and
-    after, the face never blank]`.
-  - H5, Quit and relaunch after 40 s: `[S2: H5 the countdowns' left and phase,
-    the count-up's elapsed, files rewritten]`.
-  - H6, 20 Pause / Resume pairs unawaited, ±30 s, 20 clicks: `[S2: H6 seq
-    order, adjust answers, data-timer-seq never decreasing]`.
-  - H7, a delete while the file is held 3 s: `[S2: H7 removal after the hold
-    ended]`.
+- **In the real app** (S2, 2026-10-29): debug builds of `de6d8ab` (H1-H7)
+  and `f22eb17` (H6's rerun, with the queues), on this PC (Windows 11),
+  driven over CDP. The engine ran Focusrite "Analogue 1 + 2" in to
+  "Speakers (Realtek USB Audio)" out, no monitor device, Monitor off, and
+  nothing played. The owner's saved keys were off during the runs, and
+  everything was restored after each. For H1-H3 the main window was hidden
+  with the titlebar's Close (`IsWindowVisible` false).
+  - H1, a 3:00 countdown and a count-up on the overlay, Locked, for 4 min,
+    each face change measured against its second boundary from `anchorMs`.
+    The countdown: 180 changes, 177 outside H1b's calls, median 7 ms, p95
+    14, max 16 ms. The count-up: 239 changes, 234 outside, median 8, p95 15,
+    max 16 ms. In H1b's busy moments, at most 14 and 18 ms. No value
+    skipped, never blank once drawn. The countdown finished once (`fires` 1;
+    the app's fire line 1 ms after the deadline). `divora.timers` was written
+    3 times, once per transition (two starts and the done), not per second.
+    Drift over the run: +0.66 and −0.38 ms a minute. The ±1 s bar passed
+    with a worst of 18 ms.
+  - H1b, five `list_audio_input_devices` calls during H1, 11-21 ms each: the
+    face's lag around them at most 18 ms; the file's changes near them
+    11-21 ms after their boundary; all 248 file changes during H1 within
+    100 ms of their boundary.
+  - H2, a count-up's file for 5 min: a native reader opening as OBS does
+    (`_wfopen "rb"`) every 10 ms, and a holder keeping the file open without
+    delete-sharing for 40 ms each second, timed to collide with every
+    boundary. 29,953 reads, none empty, none partial, and the file never
+    missing once it existed; 5 opens failed with error 32, where the read hit
+    the rename itself. Every second's text appeared once, in order: 299
+    changes, every one collided, each 37-87 ms after its boundary (median
+    47 ms). The writer's info line: about 60 writes a minute waited for a
+    reader, the longest wait 62 ms. A simulated OBS (its two-poll rule on the
+    logged mtimes, 40 random poll phases at 1000 and 1016.7 ms): median
+    563 ms, p95 1016 ms, worst 2108 ms; over 2 s in 16 of 23,760 samples
+    (0.07 %), from OBS's polling, not a late write. The design's line had
+    been ≤ 2 s; the run's line was two polls + 100 ms.
+  - H3, with the owner's consent: Ctrl+Alt+Shift+F23 bound through Settings
+    to a test timer's Start or pause and Ctrl+Alt+Shift+F22 to its Reset;
+    5 presses by `SendInput` (4 toggles, 1 reset), at least 1 s apart. Each
+    reached the hidden page's next `timer-state` 0.8 to 1.9 ms after the
+    key-down, through idle, running, paused, running, paused, idle. The page
+    sent no timer command (Rust acted), and both keys were unregistered
+    afterwards. `SendInput` doesn't autorepeat; a Stream Deck wasn't tried
+    (O4).
+  - H4, a reload mid-countdown: the boot sent `sync_timers` with the timer's
+    `resume` (the same `anchorMs`), then `timer_status`. The answer kept
+    Rust's run (`anchorMs` equal before and after), and the overlay's face
+    was never blank and kept counting, no value skipped.
+  - H5, closed twice: once by closing the process after a 12 s wait, once
+    by Quit from the tray through UIA, with the owner's consent; closed
+    40.5 s and 40.7 s. The 3:00 countdown came back with `anchorMs` − now
+    left, within 1.8 and 2.2 ms; the 0:20 one came back `expired`, `fires` 0,
+    `00:00`; the count-up's elapsed included the time closed, within 2 ms;
+    each file was rewritten 7-14 ms after the first sync.
+  - H6, the raw half: 40 `pause_timer` / `resume_timer` invokes sent at once
+    without awaiting, plus adjusts. Every answer was right for its
+    command, but Rust ran them out of send order: on `de6d8ab` the 29th to
+    40th before the 2nd to 28th, and on `f22eb17` (raw invokes bypass the
+    queues) 21 of 40. This is the finding behind "Command order". On
+    `f22eb17` through the store: 20 clicks on Pause in one task went out one
+    at a time, the answers' `seq` strictly increasing and the final phase the
+    one the clicks imply; 10 push-to-modulate press / release pairs through
+    Hold to switch went out one at a time, each pair reached Rust in order,
+    and the last answer and the engine's tick said not held. The click half,
+    20 Settings clicks on both builds: `data-timer-seq` never decreased, and
+    the page's state equalled `timer_status` after each batch.
+  - H7, a timer deleted while a reader held its file 3 s: the file stayed
+    while held. Deleted 0.5 s before the hold ended, it was removed 20 ms
+    after the hold ended; deleted 0.2 s into the hold, 242 ms after, since
+    after 1 s of failures the writer retries once a second. "A restart sweeps
+    any left" wasn't measured: nothing was left.
 - **Owner checks** (`MANUAL_TESTS.md`, "Hourglass (v1.59.0)"; not run): O1
   and O2 OBS's two text sources beside the overlay, O3 a real sleep, O4 a
   Stream Deck, O5 an hour against a stopwatch, O6 End task and relaunch, O7 a
   key shared through `divora.timers`.
 - **Not tried here:** a real sleep (this PC sleeps in S3 only, and can't
-  hibernate), a clock that doesn't count sleep, OBS itself, a Stream Deck,
-  Windows 10, the overlay on a second monitor, two Divoras running together,
-  a screen reader, and the stub for other platforms compiled.
+  hibernate), Modern Standby, a clock that doesn't count sleep, OBS itself, a
+  Stream Deck, an hour-long run, End task, one key on two timers, Windows 10,
+  the overlay on a second monitor, two Divoras running together, a screen
+  reader, and the stub for other platforms compiled.
 
 ### Kill switches
 
