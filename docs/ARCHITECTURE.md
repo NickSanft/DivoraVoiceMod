@@ -4742,9 +4742,11 @@ with the mirror.
   while Divora runs; it works only with exactly its modifiers; a key already
   set in Divora can't be picked here; and some keys can't be set, without
   Divora saying so, though the row still shows the key: one Windows or
-  another app already holds, or Shift with a number or symbol key (Shift+1
-  shows as !). The note gives the check for that: press it with Divora in the
-  tray, then look at the timer.
+  another app already holds, Shift with a number or symbol key (Shift+1
+  shows as !), or, on some keyboards other than US English, Ctrl+Alt with
+  some letters (the capture records the character typed). The note gives the
+  check for that: start the timer, press the key with Divora in the tray,
+  then look at the timer (a Reset on a Ready timer changes nothing).
 - **The live region.** The time is never in a live region: it changes every
   second. One polite region, present from the first render, speaks edges only
   (`timerAnnouncement`): "{name} is done." when a timer's `fires` rises — so a
