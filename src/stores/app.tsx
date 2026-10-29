@@ -2056,12 +2056,13 @@ export function createAppState(): AppState {
       console.warn("[mute] toggle_input_muted failed:", e);
     }
   };
-  // The boot read. Sent here, at creation, so it goes out before App's
-  // onMount enumerates devices (sync commands that hold the main thread),
-  // and a reload during a mute shows it in one round trip. It only reads:
-  // a reload must never unmute the call. `muteKnown` comes true when it
-  // settles, or after 500 ms if it never does. Not queued: it changes
-  // nothing, and its answer is adopted by `seq` wherever it lands.
+  // The boot read. Sent here, at creation, so it is sent, though not
+  // necessarily run, before App's onMount enumerates devices (sync commands
+  // that hold the main thread), and a reload during a mute shows it in one
+  // round trip. It only reads: a reload must never unmute the call.
+  // `muteKnown` comes true when it settles, or after 500 ms if it never
+  // does. Not queued: it changes nothing, and its answer is adopted by `seq`
+  // wherever it lands.
   const muteKnownTimer = setTimeout(() => setMuteKnown(true), 500);
   void (async () => {
     try {
@@ -2162,13 +2163,13 @@ export function createAppState(): AppState {
   const setPtmHold = (hold: PtmHold): Promise<void> =>
     setPtmTo({ ...ptmSetting(), hold }, hold);
   // The boot restore. Sent here, at creation, beside the mute's read, so it
-  // goes out before App's onMount enumerates devices. It restores the saved
-  // mode and lets go of the page's holds (a new page holds nothing) but
-  // keeps a global key that is still held: a reload must not drop it. Its
-  // answer is the boot read. `ptmKnown` comes true when it settles, or
-  // after 500 ms if it never does. It is the queue's first, so it goes out
-  // at once, and a press made before its answer goes after it: the restore
-  // can't let go of that press.
+  // is sent, though not necessarily run, before App's onMount enumerates
+  // devices. It restores the saved mode and lets go of the page's holds (a
+  // new page holds nothing) but keeps a global key that is still held: a
+  // reload must not drop it. Its answer is the boot read. `ptmKnown` comes
+  // true when it settles, or after 500 ms if it never does. It is the
+  // queue's first, so it goes out at once, and a press made before its
+  // answer goes after it: the restore can't let go of that press.
   const ptmKnownTimer = setTimeout(() => setPtmKnown(true), 500);
   void (async () => {
     const mode = ptmModeOf(ptmSetting());
@@ -2253,11 +2254,12 @@ export function createAppState(): AppState {
   // one queue, each sent only once the one before it answered: the syncs,
   // the labelled commands, and the `tm:<id>:<verb>` keys' registers and
   // unregisters. Invokes in flight together can reach Rust out of send order
-  // (measured in the real app with 40 sent at once), so a pause and a resume
-  // clicked quickly could land reversed, and a delete's unregister could
-  // land after a key bound for the timer that took its id. `timer_status`
-  // isn't queued: it changes nothing, and its answer is adopted by `seq`
-  // wherever it lands, so it needn't wait behind a slow command.
+  // (measured in the real app with 40 sent at once), so a Start and a Reset
+  // clicked quickly could land reversed and leave the timer as the first
+  // click left it, and a delete's unregister could land after a key bound
+  // for the timer that took its id. `timer_status` isn't queued: it changes
+  // nothing, and its answer is adopted by `seq` wherever it lands, so it
+  // needn't wait behind a slow command.
   const timerQueue = inOrder();
 
   // Every stored timer, in list order, with its run as `resume`: the backend
@@ -2298,10 +2300,11 @@ export function createAppState(): AppState {
   };
 
   // The boot sync. Sent here, at creation, beside the mute's read and the
-  // push-to-modulate restore, so it goes out before App's onMount
-  // enumerates devices (sync commands that hold the main thread). It is the
-  // queue's first, and the timers' keys App registers go through the queue
-  // after it: the backend knows every timer before any of their keys works.
+  // push-to-modulate restore, so it is sent, though not necessarily run,
+  // before App's onMount enumerates devices (sync commands that hold the
+  // main thread). It is the queue's first, and the timers' keys App
+  // registers go through the queue after it: the backend knows every timer
+  // before any of their keys works.
   if (hourglassUsed) {
     void sendTimerSync();
     void subscribeTimers();
@@ -2446,7 +2449,8 @@ export function createAppState(): AppState {
   };
 
   // Asked once, then remembered: the command creates the folder, and the
-  // file writer makes it again if it goes.
+  // file writer makes it again at its next write (within about 5 s while a
+  // timer has a file; with no timer, nothing does).
   let timersDirPath: string | null = null;
   const timersDir: AppState["timersDir"] = async () => {
     if (timersDirPath !== null) return timersDirPath;

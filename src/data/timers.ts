@@ -27,9 +27,11 @@ import { normalizeAccelerator } from "./hotkeys";
  *  never lowered. */
 export const TIMERS_VERSION = 1;
 
-/** The backend's limits, pinned by timer.fixture.json. Hourglass holds up to
- *  16 timers in all; a countdown runs from 1 second to 24 hours, 5:00 when
- *  its length can't be read; a name is 1-40 characters. */
+/** The backend's limits, pinned by timer.fixture.json. Hourglass runs up to
+ *  16 timers, and the page adds no more (more come only from a hand edit, or
+ *  from a newer Divora after a downgrade: kept, not run); a countdown runs
+ *  from 1 second to 24 hours, 5:00 when its length can't be read; a name is
+ *  1-40 characters. */
 export const MAX_TIMERS = 16;
 export const MIN_LENGTH_MS = 1_000;
 export const MAX_LENGTH_MS = 86_400_000;

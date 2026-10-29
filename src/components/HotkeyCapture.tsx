@@ -1,19 +1,19 @@
 // HotkeyCapture — dashed field that captures the next keychord into
-// Kbd chips. Click to arm; Esc cancels. Used by Settings → Hotkeys and,
-// v1.59.0, each timer's two keys in Settings → Hourglass.
+// Kbd chips. Click to arm; Esc cancels. Used by Settings → Hotkeys, the
+// Soundboard's tile hotkeys and, v1.59.0, each timer's two keys in
+// Settings → Hourglass.
 //
 // v1.59.0: the window `keydown` listener a click arms is held here, in the
 // component, and removed however the capture ends: a key, Esc, a second
 // click on the field, the focus leaving the field (a click elsewhere on the
-// page, a Tab into a text field, another capture armed), or the field going
-// away while armed. Before, the
-// cleanup was registered inside the click handler, where Solid has no owner
-// and drops it, so a field removed while armed (or clicked again to cancel)
-// left its listener behind, and the next key went to it. Hourglass puts up
-// to 32 of these on one screen, each beside a Delete. A capture armed by a
-// pointer gives the focus back to the page once it ends, so Space reaches
-// push-to-modulate again (`blurOnPointer`'s rule); armed from the keyboard,
-// the focus stays.
+// page, or another capture armed; a Tab is captured as the key), or the
+// field going away while armed. Before, the cleanup was registered inside
+// the click handler, where Solid has no owner and drops it, so a field
+// removed while armed (or clicked again to cancel) left its listener
+// behind, and the next key went to it. Hourglass puts up to 32 of these on
+// one screen, each beside a Delete. A capture armed by a pointer gives the
+// focus back to the page once it ends, so Space reaches push-to-modulate
+// again (`blurOnPointer`'s rule); armed from the keyboard, the focus stays.
 
 import type { JSX } from "solid-js";
 import { createSignal, For, onCleanup, Show } from "solid-js";
@@ -102,9 +102,10 @@ export function HotkeyCapture(props: HotkeyCaptureProps): JSX.Element {
       aria-label={props.ariaLabel?.(state())}
       onClick={onArm}
       onBlur={() => {
-        // The focus went elsewhere (a click on the page, a Tab, another
-        // capture): the key typed there is not this field's. `end` clears
-        // `active` before its own blur, so this doesn't run twice.
+        // The focus went elsewhere (a click on the page, another capture; a
+        // Tab doesn't move it, being captured as the key): the key typed
+        // there is not this field's. `end` clears `active` before its own
+        // blur, so this doesn't run twice.
         if (active) {
           disarm();
           setCapturing(false);

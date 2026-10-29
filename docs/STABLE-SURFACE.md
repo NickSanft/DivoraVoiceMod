@@ -38,7 +38,7 @@ accidental break fails CI before it ships:
 - `TimerSnapshot` / `TimerState` / `TimerRun` / `TimerDefWire` keys, the phase and kind strings, the timer id grammar, the `tm:` hotkey-id table, the timer limits, the run samples (what the page stores for a state, and what the backend seeds from it), and the `timer-state` event and `timer_status` command names — `src/overlay/timer.fixture.json`, read by `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`, `timer_id_table`, `hotkey_timer_request_table`, `seed_table`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/overlay/timerState.test.ts` / `src/data/timers.test.ts` (v1.59.0).
 - The `tm:` hotkey ids: a press of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id acts on that timer; a release, `tm:<id>:finish` and any other spelling don't — `src-tauri/src/timers.rs` (`hotkey_timer_request_table`), and `src-tauri/src/lib.rs` (`the_shortcut_handler_runs_the_timer_hotkey`; v1.59.0).
 - The eight Hourglass commands stay sync — `src-tauri/src/lib.rs` (`timer_commands_stay_sync`; v1.59.0).
-- The main window sends each feature's state-changing commands one at a time, each once the one before it has answered: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands and `tm:` key registers and unregisters; the reads (`input_mute`, `timer_status`) aren't held back — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" tests; v1.59.0). Being sync orders only commands that aren't in flight together.
+- The main window sends three features' state-changing commands one at a time, one queue per feature, each once the one before it in that queue has answered or failed: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands and `tm:` key registers and unregisters; the reads (`input_mute`, `timer_status`) aren't held back, and no other command the page sends goes through these queues (the stream overlay's controller has kept its own since v1.55.0, for opening, closing, Fit, the background and pictures) — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" and "one mute command at a time" tests; v1.59.0). Being sync orders only commands that aren't in flight together.
 - `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`).
 - Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, and the Hourglass ones since v1.59.0).
 
@@ -273,7 +273,7 @@ explainer has been seen. The tray has no item that turns Replay on.
 | `replay:<action>` | Replay (prefix reserved) — v1.54.0. Defined: `replay:save` (save the replay), `replay:toggle` (turn Replay on / off; it works once Replay has been turned on from the Record screen card). Both unbound by default |
 | `overlay:<action>` | the stream overlay (prefix reserved) — v1.55.0. Defined: `overlay:arrange`, which switches the open overlay between Arrange and Locked. It is acted on by the backend when pressed; the frontend only shows a notice while the overlay is off or starting. Unbound by default. A different namespace from the `overlay:state` / `overlay:*` **event** names, despite the shared spelling |
 | `mute` | mute or unmute your voice (a toggle) — v1.56.0. Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. Unbound by default. The prefix `mute:` is reserved for later variants |
-| `tm:<timerId>:<verb>` | an Hourglass timer (prefix reserved) — v1.59.0. Defined: `toggle` (idle, done or ran out → start from the full length; running → pause; paused → resume) and `reset` (back to idle). Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. A press for a timer the backend doesn't run does nothing. Unbound by default; the keys are stored with each timer in `divora.timers`, not in `divora.hotkeyBindings`. `tm:<timerId>:finish` is reserved for v1.60.0 (it does nothing in v1.59.0); any other verb or spelling does nothing. A timer id is 1-32 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit, never a Windows device name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so never contains `:` |
+| `tm:<timerId>:<verb>` | an Hourglass timer (prefix reserved) — v1.59.0. Defined: `toggle` (idle, done or ran out → start from the full length, a count-up from 0; running → pause; paused → resume) and `reset` (back to idle). Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. A press for a timer the backend doesn't run does nothing. Unbound by default; the keys are stored with each timer in `divora.timers`, not in `divora.hotkeyBindings`. `tm:<timerId>:finish` is reserved for v1.60.0 (it does nothing in v1.59.0); any other verb or spelling does nothing. A timer id is 1-32 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit, never a Windows device name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so never contains `:` |
 
 ### Stream overlay (v1.55.0)
 
@@ -616,8 +616,10 @@ TimerState        { id, name,
                       countdown ends at, or a count-up effectively started
                       at; set when the run is set or a held wall-clock
                       change moves it, not per snapshot; null otherwise),
-                    fires (how often this timer has finished since its id
-                      was added; a deleted and re-added id starts at 0) }
+                    fires (how often this timer has finished since the
+                      backend began running its id in this run of Divora;
+                      it isn't stored, so a restart, or a deleted and
+                      re-added id, starts at 0) }
                                                      // v1.59.0
 TimerRun          { phase: "running" | "paused" | "done" | "expired",
                     ms?, totalMs?, anchorMs? }       // v1.59.0: whole numbers
@@ -636,7 +638,15 @@ TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun }
 - `done`: a countdown reached zero while the PC was awake and Divora was
   running, and finished — late, if Divora was held up. `expired`: it reached
   zero while the PC slept or Divora was closed, and didn't finish. Both show
-  `00:00`. A count-up is only ever `idle`, `running` or `paused`.
+  `00:00`. A count-up is only ever `idle`, `running` or `paused`. (From the
+  code and fake-clock tests; no real sleep was tried. Two edge cases differ,
+  both from the code: a second sleep of 5 s or less within a minute of one
+  Divora handled counts as awake time, so a countdown due in it ends `done`,
+  up to about 5 s late; and on a clock that doesn't count sleep, with no
+  counted sleep in the last minute, a resume signal that lands while Divora is
+  held up more than 500 ms makes countdowns due in that hold `expired` with
+  the PC awake, and ones due during the sleep itself end `done`, late by its
+  length.)
 - A countdown never finishes early, and finishes at most once until it is
   started again (`arm_timer`, or the hotkey's toggle from `done` or
   `expired`); each finish adds 1 to `fires`.
@@ -653,7 +663,8 @@ timer from its `resume` only the first time it accepts that id after it
 starts; otherwise its own state wins. Time passes while Divora is closed:
 
 - running countdown: time left = `anchorMs` − now, at most `totalMs` and 24 h,
-  so a clock set back adds no time; 0 or less → `expired`;
+  so a clock set back while Divora is closed can add back time that had
+  already run, never past `totalMs`; 0 or less → `expired`;
 - running count-up: time counted = now − `anchorMs`, from 0 to 10 000 h;
 - paused countdown: paused at `ms` when it is 1..86 400 000, its total the
   larger of `totalMs` and `ms`;
@@ -935,7 +946,8 @@ timers/<id>.txt          an Hourglass timer's text — v1.59.0: exactly what the
                          first, so the file is never missing, empty or
                          part-written (an open that lands inside a rename can
                          fail with a sharing violation; OBS's Text (GDI+) then
-                         shows nothing until the next change). Removed once
+                         shows nothing until the next change — from OBS's code;
+                         OBS itself wasn't run). Removed once
                          nothing holds it when its timer
                          leaves the sync (deleted); written again if it goes missing.
                          Kept, with its last text, while Divora is closed. Named by

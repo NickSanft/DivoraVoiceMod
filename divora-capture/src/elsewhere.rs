@@ -174,7 +174,8 @@ pub fn make_layered_opaque(_window: isize) -> bool {
 }
 
 // v1.59.0: Hourglass's sleep check. Nothing here reports a sleep, so the
-// timers' wall-clock anchors are the only check.
+// timers never see one: the wall check (D5 (b)) runs only on a sleep signal,
+// and a sleep the clock didn't count is followed as a wall-clock step (D3).
 
 /// See the Windows build's. Never sees a sleep.
 pub struct SleepWatch;

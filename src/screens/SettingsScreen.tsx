@@ -1680,7 +1680,7 @@ function ControlSurfacesSection(): JSX.Element {
               action to a button and set it to the same key you bound under{" "}
               <strong>Settings → Hotkeys</strong> (for example{" "}
               <strong>Mute your voice</strong>, panic or a recorder) or to a
-              per-tile soundboard hotkey or a timer's keys in{" "}
+              per-tile soundboard hotkey, or to one of a timer's keys in{" "}
               <strong>Settings → Hourglass</strong>. The button then fires
               DivoraVoice's existing global shortcut — even while a game or
               Discord is focused.
@@ -2492,13 +2492,13 @@ const TIMER_KEY_ROWS: Array<{ verb: TimerVerb; label: string; desc: string; spok
   {
     verb: "toggle",
     label: "Start or pause",
-    desc: "Starts it, pauses it, or starts it again once it's done.",
+    desc: "Starts it, pauses it, resumes it, or starts it again once it's done or has run out.",
     spoken: "start or pause",
   },
   { verb: "reset", label: "Reset", desc: "Back to the start, stopped.", spoken: "reset" },
 ];
 
-const LENGTH_REASON = "Enter minutes, m:ss or h:mm:ss, from 1 second to 24 hours.";
+const LENGTH_REASON = "Enter whole minutes, m:ss or h:mm:ss, from 1 second to 24 hours.";
 
 /** How long Hourglass's live region holds an edge's words before it is
  *  emptied again. */
@@ -2654,8 +2654,10 @@ function HourglassSection(): JSX.Element {
           such as F13–F24 from a Stream Deck, or Ctrl+Alt with a letter. A key works only with
           exactly its modifiers: set to F9, pressing it while you hold Shift or Ctrl does nothing.
           A key that's already set in Divora runs what it's set for and can't be picked here; clear
-          it there first. Some keys can't be set, and Divora doesn't say so: to check one, press it
-          with Divora in the tray, then look at the timer here.
+          it there first. Some keys can't be set, and Divora doesn't say so: the row still shows
+          the key. A key Windows or another app already holds is one; Shift with a number or
+          symbol key is another (Shift+1 shows as !). To check one, press it with Divora in the
+          tray, then look at the timer here.
         </div>
         <div
           style={{
@@ -2674,8 +2676,9 @@ function HourglassSection(): JSX.Element {
             <div style={helpStyle}>
               In OBS, add a <strong>Text (GDI+)</strong> source, tick{" "}
               <strong>Read from file</strong> and pick a timer's file from this folder. OBS checks
-              the file about once a second, so its text can run up to 2 seconds behind the overlay.
-              While Divora is closed, a file keeps the last time it showed.
+              the file about once a second, so its text can run up to about 2 seconds behind the
+              overlay, and now and then it may show nothing for a second or two. While Divora is
+              closed, a file keeps the last time it showed.
             </div>
           </div>
           {/* Named apart from Recordings' "Open folder" on the same page. */}
@@ -3040,9 +3043,9 @@ function TimerControls(props: {
         </div>
         <Show when={app.overlayStatus().hideAvailable && app.overlayHide()}>
           <div style={helpStyle}>
-            Hide from recordings is on: while Divora records or Replay is on, OBS, Discord and
-            recordings may not show the overlay, this timer included. Its text file shows it in OBS
-            either way.
+            Hide from recordings is on: while Divora records any screen or Replay is on, OBS,
+            Discord and recordings may not show the overlay, this timer included. Its text file
+            shows it in OBS either way.
           </div>
         </Show>
       </Show>

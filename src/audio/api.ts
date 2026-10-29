@@ -1357,7 +1357,7 @@ export async function syncTimersCmd(timers: TimerDefWire[]): Promise<unknown> {
   return invoke<unknown>("sync_timers", { timers });
 }
 
-/** Idle, done or ran out → running from the full length. */
+/** Idle, done or ran out → running from the full length (a count-up from 0). */
 export async function armTimerCmd(id: string): Promise<unknown> {
   return invoke<unknown>("arm_timer", { id });
 }
@@ -1378,9 +1378,9 @@ export async function resetTimerCmd(id: string): Promise<unknown> {
 }
 
 /** ±time on a running or paused timer: a countdown's left stays within
- *  1 second..24 hours (−30 s never ends it), a count-up's elapsed never goes
- *  below 0. `deltaMs` is a whole number within ±24 hours, or the command
- *  rejects. */
+ *  1 second..24 hours, or as it is if already under 1 second (−30 s never
+ *  ends it), a count-up's elapsed never goes below 0. `deltaMs` is a whole
+ *  number within ±24 hours, or the command rejects. */
 export async function adjustTimerCmd(id: string, deltaMs: number): Promise<unknown> {
   return invoke<unknown>("adjust_timer", { id, deltaMs });
 }

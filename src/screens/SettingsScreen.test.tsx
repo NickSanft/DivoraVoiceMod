@@ -703,11 +703,11 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     expect(view.getByRole("button", { name: "Add countdown" })).not.toBeDisabled();
     expect(view.getByRole("button", { name: "Add count-up" })).not.toBeDisabled();
     expect(squash(view.getByTestId("hourglass-hotkey-note").textContent)).toBe(
-      "Keys you set here work in every app, and the app you're in doesn't get them while Divora runs: set to Space, you can't type a space anywhere. Pick keys you don't otherwise use, such as F13–F24 from a Stream Deck, or Ctrl+Alt with a letter. A key works only with exactly its modifiers: set to F9, pressing it while you hold Shift or Ctrl does nothing. A key that's already set in Divora runs what it's set for and can't be picked here; clear it there first. Some keys can't be set, and Divora doesn't say so: to check one, press it with Divora in the tray, then look at the timer here.",
+      "Keys you set here work in every app, and the app you're in doesn't get them while Divora runs: set to Space, you can't type a space anywhere. Pick keys you don't otherwise use, such as F13–F24 from a Stream Deck, or Ctrl+Alt with a letter. A key works only with exactly its modifiers: set to F9, pressing it while you hold Shift or Ctrl does nothing. A key that's already set in Divora runs what it's set for and can't be picked here; clear it there first. Some keys can't be set, and Divora doesn't say so: the row still shows the key. A key Windows or another app already holds is one; Shift with a number or symbol key is another (Shift+1 shows as !). To check one, press it with Divora in the tray, then look at the timer here.",
     );
     expect(view.getByText("Timer files for OBS")).toBeInTheDocument();
     expect(squash(view.getByText(/pick a timer's file from this folder/).textContent)).toBe(
-      "In OBS, add a Text (GDI+) source, tick Read from file and pick a timer's file from this folder. OBS checks the file about once a second, so its text can run up to 2 seconds behind the overlay. While Divora is closed, a file keeps the last time it showed.",
+      "In OBS, add a Text (GDI+) source, tick Read from file and pick a timer's file from this folder. OBS checks the file about once a second, so its text can run up to about 2 seconds behind the overlay, and now and then it may show nothing for a second or two. While Divora is closed, a file keeps the last time it showed.",
     );
     // A fresh profile asks the backend nothing about timers, Settings open
     // or not.
@@ -873,7 +873,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await flush();
     expect(field.value).toBe("1:2");
     expect(field).toHaveAttribute("aria-invalid", "true");
-    const reason = view.getByText("Enter minutes, m:ss or h:mm:ss, from 1 second to 24 hours.");
+    const reason = view.getByText("Enter whole minutes, m:ss or h:mm:ss, from 1 second to 24 hours.");
     expect(field.getAttribute("aria-describedby")?.split(" ")).toContain(reason.id);
     fireEvent.blur(field);
     await flush();
@@ -885,7 +885,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await flush();
     expect(field.value).toBe("10:00");
     expect(field).not.toHaveAttribute("aria-invalid");
-    expect(view.queryByText("Enter minutes, m:ss or h:mm:ss, from 1 second to 24 hours.")).toBeNull();
+    expect(view.queryByText("Enter whole minutes, m:ss or h:mm:ss, from 1 second to 24 hours.")).toBeNull();
     expect(sent("sync_timers")).toEqual([]);
 
     // Leaving the field applies it too.
@@ -954,7 +954,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await emit(1, state("timer-1"));
     const c = card("timer-1");
     expect(within(c).getByText("Start or pause")).toBeInTheDocument();
-    expect(within(c).getByText("Starts it, pauses it, or starts it again once it's done.")).toBeInTheDocument();
+    expect(within(c).getByText("Starts it, pauses it, resumes it, or starts it again once it's done or has run out.")).toBeInTheDocument();
     expect(within(c).getByText("Back to the start, stopped.")).toBeInTheDocument();
     expect(view.getByRole("button", { name: "BRB start or pause hotkey: Ctrl Alt F13" })).toBeInTheDocument();
     const reset = view.getByRole("button", { name: "BRB reset hotkey: not set" });
@@ -1026,7 +1026,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     first.unmount();
 
     const LINE =
-      "Hide from recordings is on: while Divora records or Replay is on, OBS, Discord and recordings may not show the overlay, this timer included. Its text file shows it in OBS either way.";
+      "Hide from recordings is on: while Divora records any screen or Replay is on, OBS, Discord and recordings may not show the overlay, this timer included. Its text file shows it in OBS either way.";
     for (const [available, on, shown] of [
       [true, true, true],
       [true, false, false],
@@ -1364,7 +1364,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await flush();
     const card = view.getByText("Using a Stream Deck").closest(".card");
     expect(squash(card!.textContent)).toContain(
-      "or to a per-tile soundboard hotkey or a timer's keys in Settings → Hourglass. The button then fires",
+      "or to a per-tile soundboard hotkey, or to one of a timer's keys in Settings → Hourglass. The button then fires",
     );
   });
 });

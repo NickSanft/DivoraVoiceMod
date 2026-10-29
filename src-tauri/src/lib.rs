@@ -3020,8 +3020,8 @@ fn sync_timers(state: State<'_, AppState>, timers: Vec<serde_json::Value>) -> Ti
     state.timers.sync(timers)
 }
 
-/// v1.59.0: start a timer from its full length: idle, done or ran out →
-/// running. Otherwise unchanged.
+/// v1.59.0: start a timer from its full length (a count-up from 0): idle,
+/// done or ran out → running. Otherwise unchanged.
 #[tauri::command]
 fn arm_timer(state: State<'_, AppState>, id: String) -> Result<TimerSnapshot, String> {
     state.timers.apply(&id, TimerOp::Arm)
@@ -3657,7 +3657,9 @@ pub fn run() {
             // `timer-state`; `divora-timer-files` puts each timer's text in
             // `timers/<id>.txt` for OBS, so no disk wait reaches the timer
             // thread. The folder isn't created here: the writer makes it at
-            // its first write, so someone who never adds a timer gets none.
+            // its first write and `timers_dir` for Open folder and Copy path,
+            // so someone who never adds a timer gets none unless they press
+            // Open folder.
             // `tauri dev` builds keep their own timers, so their own files.
             let timers_name = timer_thread::timers_dir_name(tauri::is_dev());
             let timers_dir = match app.path().app_data_dir() {

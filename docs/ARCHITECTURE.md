@@ -3305,14 +3305,16 @@ status of its kind before clearing, so the button doesn't flash back.
 **Left on the main thread, on purpose or for later.** The three shortcut
 commands must stay sync: global-hotkey registers on its window's thread, and
 the plugin holds its own lock while it runs our handler. Mute, chain edits
-and other atomic or channel-send commands stay sync: they are fast and rely
-on arriving in order. Deferred, each needing more than a move:
+and other atomic or channel-send commands stay sync: they are fast. Being sync
+doesn't keep commands in flight together in order (Hourglass's "Command
+order"): the mute's are queued since v1.59.0, chain edits not yet. Deferred,
+each needing more than a move:
 `start_audio_engine` (roughly 150–450 ms here, added up from parts timed
 separately rather than end to end; likely seconds with a Bluetooth headset
-mic and unbounded if a driver hangs, neither tested; an async Start loses its
-place in IPC order, so it needs a two-step split); device enumeration
-(`list_audio_*`, `detect_virtual_mic`; about 0.1–0.2 s here, more with many
-endpoints; cpal leaves its thread in an STA and owns a process-wide
+mic and unbounded if a driver hangs, neither tested; an async Start would run
+beside the commands sent after it, so it needs a two-step split); device
+enumeration (`list_audio_*`, `detect_virtual_mic`; about 0.1–0.2 s here, more
+with many endpoints; cpal leaves its thread in an STA and owns a process-wide
 enumerator, so it needs one long-lived thread); `play_soundboard_clip` on a
 cache miss (150–500 ms for a ten-minute file; a later Stop must still win);
 `scan_soundboard_folder` (only a network folder is slow; a slow scan of the
@@ -4080,7 +4082,11 @@ running or paused.
   didn't finish.
 
 Both show `00:00`. They differ on the wire so that v1.60.0, which runs
-actions at zero, can tell a finish from a timer that ran out unseen.
+actions at zero, can tell a finish from a timer that ran out unseen. Two edge
+cases break the split (under "Sleep", from the code): a countdown due in a
+second sleep of 5 s or less within a minute of one handled ends `done`, and on
+a clock that doesn't count sleep, a resume signal during a hold-up past
+500 ms ends what came due in the hold-up `expired` with the PC awake.
 
 **A running timer** holds `since` (the clock reading its run was last set at)
 and `base_ms` (a countdown's time left at `since`, rounded up to whole ms; a
@@ -4111,9 +4117,10 @@ already under 1 s stays as it is. Its total moves by what its left moved, so
 the total can pass 24 h. A count-up moves by the whole delta and stops at 0. A
 running timer runs on from the new value, with a new anchor.
 
-**Fires once, never early.** The only way into `done` is `Timer::fire`, which
-`tick`'s settle step calls for a running countdown whose deadline is at or
-before `now`. Every entry point runs `tick` first, so a due countdown fires
+**Fires once, never early.** The only way a running countdown gets to `done`
+is `Timer::fire` (a restart's seed only puts a stored `done` back, `fires` 0),
+which `tick`'s settle step calls for a running countdown whose deadline is at
+or before `now`. Every entry point runs `tick` first, so a due countdown fires
 before any op: Pause can't freeze a timer at 0, and a Toggle that finds its
 countdown due fires it, then arms it again (`fires` + 1, running). `fires`
 counts per definition: 0 when an id enters the set, so a deleted and re-added
@@ -4124,9 +4131,9 @@ the overlay, in the file and in Settings. Under an hour it is `MM:SS`
 (`05:00`, `00:07`); from an hour `H:MM:SS` (`1:00:00`, `24:00:00`,
 `100:00:00`). A countdown rounds up to whole seconds and a count-up down: a
 5:00 countdown shows `05:00` for its first second and `00:01` for its last,
-and `00:00` only once it has fired. Its `ms` is rounded up to whole ms the
-same way, so 1 ns before its deadline it is 1 and the text `00:01`
-(`never_fires_early`). Paused shows the digits as they stopped; there is no
+and `00:00` only once it has fired or expired. Its `ms` is rounded up to
+whole ms the same way, so 1 ns before its deadline it is 1 and the text
+`00:01` (`never_fires_early`). Paused shows the digits as they stopped; there is no
 minus sign and no overtime. The app's other clocks floor (the take timer, the
 screen recorder's), which would read `04:59` as a 5:00 countdown starts. Every
 transition recomputes its timer's text, and `tick` and `snapshot` recompute
@@ -4181,11 +4188,11 @@ stopwatch.
 `unsafe`), and the timers keep one of their own beside the core, under the
 same lock. `jumped(now)` answers `Some(before)` once per sleep, to whichever
 reader comes first, `before` being the last reading anyone took awake (the
-`LoopSleep` rule; see Replay's "Sleep"). It is an atomic load and two clock
-reads, so it is safe inside `WM_HOTKEY`. Windows' resume count is
-process-wide, so this watcher and the capture pipeline's coexist. Other
-platforms get a stub whose `jumped` never reports a sleep; no CI job compiles
-it, since every job runs on Windows.
+`LoopSleep` rule; see Replay's "Sleep"). It takes no lock and never waits (an
+atomic load and three clock reads), so it is safe inside `WM_HOTKEY`. Windows'
+resume count is process-wide, so this watcher and the capture pipeline's
+coexist. Other platforms get a stub whose `jumped` never reports a sleep; no
+CI job compiles it, since every job runs on Windows.
 
 With `Some(before)`, `tick` takes one of two cases:
 
@@ -4222,8 +4229,9 @@ the rule covers timers added soon after
 
 **A stall isn't a sleep.** With no sleep signal, a countdown found past its
 deadline finishes, however late (a debugger, a starved CPU), and the thread
-logs by how much. Only a sleep or a closed Divora expires a countdown, so in
-v1.60.0 a break's unmute will run late rather than not at all.
+logs by how much. Only a sleep or a closed Divora expires a countdown, but for
+the limit below, so in v1.60.0 a break's unmute will run late rather than not
+at all.
 
 **A limit, on a clock that doesn't count sleep.** With no (a) in the last
 minute, a resume signal that arrives while the readers are held up past
@@ -4270,8 +4278,9 @@ reuse its arithmetic):
 | done or expired countdown | the same phase; its total `totalMs`, or its length |
 | anything else: a running or paused countdown with no `totalMs` (or a running one with 0), a count-up done or expired, a run that can't be read | idle; the definition is kept |
 
-A wall clock set back while Divora was closed can't add time to a countdown
-(it is held to its total); one set forward expires it. A count-up comes back
+A wall clock set back while Divora was closed adds that much to a countdown,
+never past its total; one set forward takes that much off, and expires it if
+that reaches past its end. A count-up comes back
 with the time Divora was closed included, which is right after a crash
 mid-stream and wrong after a night closed: Reset fixes that. `fires` is never
 seeded. A seed is a `Seeded` transition. A known-kind timer past the 16th is
@@ -4362,8 +4371,10 @@ is a `Waiter` trait: `ChannelWaiter` in the app, a fake in the tests.
 **Ordering.** `seq` is taken under the lock every time a snapshot is built,
 by a command's answer on the main thread or by the thread, so all snapshots
 fall in one order. Only the thread emits, so events leave in `seq` order. A
-command builds its answer, leaves the core marked changed and wakes the
-thread, which emits a newer snapshot; transitions the op caused wait in the
+command whose op or tick changes something builds its answer, leaves the core
+marked changed and wakes the thread, which emits a newer snapshot (a labelled
+op that changes nothing, such as a Pause of a paused timer, wakes it too, and
+nothing is emitted); transitions the op caused wait in the
 core until the thread drains them. The answer can land after that event, as
 the overlay's status answers can (see the stream overlay's "Lifecycle"), so
 the page and the overlay keep whichever snapshot has the larger `seq`
@@ -4378,8 +4389,9 @@ anchor, and each whole-second change of a running timer's text — and never
 on a schedule beyond that. A paused or idle set sends nothing, which is why a
 page that starts listening reads `timer_status` once (below). The plan asked
 for 4 Hz while anything runs; emitting at each boundary instead puts each
-second's change within a timer tick of it (from the code) and sends a quarter
-as many.
+second's change within a timer tick of it (from the code) and sends one a
+second per running timer, fewer when their seconds line up: a quarter as many
+with one, more than the plan's with five started at different moments.
 
 **`divora-timer-files`** (`spawn_text_writer`) takes the latest texts from a
 `TextSlot`, a `Mutex<Option<TextUpdate>>` with a `Condvar`: a newer set
@@ -4428,8 +4440,9 @@ in so the tests drive time):
   counted and logged at most once a minute: "timer files: N writes waited for
   a reader (longest M ms)".
 - **Removal.** A file whose timer left the sync, run or kept, is removed once
-  nothing holds it: removing a file held as OBS holds it fails with raw 32
-  (measured here) and is retried. An id that comes back first keeps its file.
+  nothing holds it: removing a file held by a reader that opens it as OBS
+  does (`_wfopen "rb"`; OBS itself wasn't run) fails with raw 32 (measured
+  here) and is retried. An id that comes back first keeps its file.
   The writer remembers the last keep list, so a deleted kept timer's file goes
   too (step R).
 - **Repair.** Every 5 s (`REPAIR_EVERY`) the writer checks that each file it
@@ -4501,8 +4514,9 @@ the overlay would need granted if an app manifest is ever added.
 
 S2's H6 sent 40 `pause_timer` / `resume_timer` invokes from the main page
 at once, without awaiting. Every answer was right for its command, but
-Rust ran them out of send order: on `de6d8ab` the 29th to 40th ran before the
-2nd to 28th, and on `f22eb17` 21 of 40 were out of order (raw invokes, which
+Rust ran them out of send order: on `de6d8ab` 12 of 40 were out of order
+(the 29th ran second, and the 29th to 40th, mixed in with the 2nd to 9th,
+all ran before the 10th to 28th); on `f22eb17` 21 of 40 (raw invokes, which
 bypass the queue below). The cause: Tauri 2.11.2's `ipc-protocol.js` sends
 every invoke as its own `fetch` to `http://ipc.localhost/<command>` (from its
 code), and WebView2 handles requests in flight together in parallel and
@@ -4561,8 +4575,9 @@ one before it to answer. For example, a slider drag sends `set_effect_param`
 at each step, so an older value could land last and the engine keep it while
 the slider shows the newer (from the code; not seen). The chain's
 `set_effect_chain` and the binds in Settings → Hotkeys are in the same
-position. To check a command: if two sends of it can be in flight together
-and the later must win, it needs a queue. Queuing those is a follow-up.
+position. To check: if two sends, of one command or of two, can be in flight
+together and the order they land in matters, they need one queue. Queuing
+those is a follow-up.
 
 ### The keys
 
@@ -4637,7 +4652,7 @@ to a key nothing shows. Every key is unbound until the user sets it.
   listens.
 - **Buttons.** Start sends `arm_timer`, `pause_timer` or `resume_timer` by the
   mirror's phase, the label it drew (`timerAction`); with no state yet there
-  is no button. Pause, Reset and ±30 s send their commands. All go through
+  is no button. Reset and ±30 s send their commands. All go through
   the timers' queue, and each adopts its answer.
 
 ### The overlay face
@@ -4684,8 +4699,8 @@ to a key nothing shows. Every key is unbound until the user sets it.
   Timer" while the snapshot lacks it); "Timer · {name}" with the hourglass
   sigil in Settings' Charms list, from the stored name.
 - **Hide from recordings** hides the face with the rest of the overlay while
-  Divora records or Replay is on. The timer's text file reaches OBS either
-  way, and the Show on overlay help says so while both are on.
+  Divora records any screen or Replay is on. The timer's text file reaches OBS
+  either way, and the Show on overlay help says so while both are on.
 
 ### Settings → Hourglass
 
@@ -4708,10 +4723,10 @@ with the mirror.
 - **Length and Name** apply on Enter or on leaving the field, never per
   keystroke, which would put every prefix of `1:30:00` on stream and in
   storage. Esc puts the stored value back. A Length that can't be read
-  (`parseLength`: minutes, `m:ss` or `h:mm:ss`, from 1 s to 24 h) stays in the
-  field, marked with `aria-invalid` and its reason, and nothing is sent; after
-  a commit the field shows the length in its usual form (`lengthText`). A
-  name that trims to nothing puts the old one back.
+  (`parseLength`: whole minutes, `m:ss` or `h:mm:ss`, from 1 s to 24 h) stays
+  in the field, marked with `aria-invalid` and its reason, and nothing is
+  sent; after a commit the field shows the length in its usual form
+  (`lengthText`). A name that trims to nothing puts the old one back.
 - **Delete asks twice:** the first click turns it into "Confirm?" for 3 s, as
   deleting a preset does, since a delete stops a timer that may be on stream
   and blanks its OBS source.
@@ -4726,7 +4741,9 @@ with the mirror.
   their cause, each with an example: a key set here is taken from every app
   while Divora runs; it works only with exactly its modifiers; a key already
   set in Divora can't be picked here; and some keys can't be set, without
-  Divora saying so — with the check for that: press it with Divora in the
+  Divora saying so, though the row still shows the key: one Windows or
+  another app already holds, or Shift with a number or symbol key (Shift+1
+  shows as !). The note gives the check for that: press it with Divora in the
   tray, then look at the timer.
 - **The live region.** The time is never in a live region: it changes every
   second. One polite region, present from the first render, speaks edges only
@@ -4750,11 +4767,12 @@ with the mirror.
   hands the focus back to the page (`blurOnPointer`), because a focused button
   takes Space, push-to-modulate's in-app key: after Add, each Space would add
   a timer. From the keyboard they keep it.
-- **`HotkeyCapture`**, shared with Settings → Hotkeys, now holds its `keydown`
-  listener in the component and removes it however the capture ends: a key,
-  Esc, a second click on the field, the focus leaving it (step R: a click
-  elsewhere, a Tab into a text field, another capture armed), or the field
-  going away while armed. Until v1.59.0 the cleanup sat inside the click
+- **`HotkeyCapture`**, shared with Settings → Hotkeys and the Soundboard's
+  tile hotkeys, now holds its `keydown` listener in the component and removes
+  it however the capture ends: a key, Esc, a second click on the field, the
+  focus leaving it (step R: a click elsewhere, another capture armed; a Tab
+  is captured as the key, so it can't move the focus), or the field going
+  away while armed. Until v1.59.0 the cleanup sat inside the click
   handler, where Solid has no owner and drops it, so a field removed while
   armed, or clicked again to cancel, left its listener behind and the next key
   went to it. A capture armed by a pointer gives the focus back when it ends.
@@ -4762,7 +4780,8 @@ with the mirror.
   hotkey: Ctrl Alt F13", "… not set", "… press a key, Esc to cancel"); without
   it the name is still its content, "Click to set".
 - **The folder footer** names Text (GDI+) and Read from file, and says OBS's
-  text can run up to 2 s behind the overlay. Open folder (named "Open the
+  text can run up to about 2 s behind the overlay and now and then show
+  nothing for a second or two. Open folder (named "Open the
   timer files folder", apart from Recordings' Open folder on the same page) and
   Copy path ask for `timers_dir` when clicked, never on mount, so opening
   Settings creates no folder.
@@ -4800,10 +4819,12 @@ path of BRB's file").
   most 18 ms.
 - **The pass to the file:** a swap, then the writer's create, write, close and
   rename. While a reader holds the file, the rename is tried again about every
-  system timer tick until the hold ends. The file never waits on the main
+  system timer tick for the first second, then once a second (or at once on a
+  new text), until the hold ends. The file never waits on the main
   thread. In the real app, with a holder colliding with every boundary for
   5 minutes: each change landed 37-87 ms after its boundary (median 47 ms).
-  With nothing holding it, during the 4 minutes above, all 248 changes landed
+  With no holder, only an OBS-style reader opening the count-up's file every
+  10 ms, during the 4 minutes above, all 248 changes landed
   within 100 ms of their boundary, the ones near the device calls 11-21 ms
   after it.
 - **The file to OBS:** up to about 2 s (above; from OBS's code). OBS's rule
@@ -5002,24 +5023,26 @@ running.
     `resume` (the same `anchorMs`), then `timer_status`. The answer kept
     Rust's run (`anchorMs` equal before and after), and the overlay's face
     was never blank and kept counting, no value skipped.
-  - H5, closed twice: once by closing the process after a 12 s wait, once
-    by Quit from the tray through UIA, with the owner's consent; closed
-    40.5 s and 40.7 s. The 3:00 countdown came back with `anchorMs` − now
-    left, within 1.8 and 2.2 ms; the 0:20 one came back `expired`, `fires` 0,
-    `00:00`; the count-up's elapsed included the time closed, within 2 ms;
-    each file was rewritten 7-14 ms after the first sync.
+  - H5, closed twice: once by killing the process (`taskkill /F`) 12 s after
+    the last start, once by Quit from the tray through UIA, with the owner's
+    consent; closed 40.5 s and 40.7 s. The 3:00 countdown came back with
+    `anchorMs` − now left, within 1.8 and 2.2 ms; the 0:20 one came back
+    `expired`, `fires` 0, `00:00`; the count-up's elapsed included the time
+    closed, within 1.8 and 2.2 ms; each file was rewritten 7-14 ms after the
+    first sync.
   - H6, the raw half: 40 `pause_timer` / `resume_timer` invokes sent at once
-    without awaiting, plus adjusts. Every answer was right for its
-    command, but Rust ran them out of send order: on `de6d8ab` the 29th to
-    40th before the 2nd to 28th, and on `f22eb17` (raw invokes bypass the
-    queues) 21 of 40. This is the finding behind "Command order". On
-    `f22eb17` through the store: 20 clicks on Pause in one task went out one
-    at a time, the answers' `seq` strictly increasing and the final phase the
-    one the clicks imply; 10 push-to-modulate press / release pairs through
-    Hold to switch went out one at a time, each pair reached Rust in order,
-    and the last answer and the engine's tick said not held. The click half,
-    20 Settings clicks on both builds: `data-timer-seq` never decreased, and
-    the page's state equalled `timer_status` after each batch.
+    without awaiting, plus adjusts. Every answer was right for its command,
+    but Rust ran them out of send order: on `de6d8ab` 12 of 40 out of order
+    (the 29th ran second, and the 29th to 40th, mixed in with the 2nd to 9th,
+    all ran before the 10th to 28th), and on `f22eb17` (raw invokes bypass the
+    queues) 21 of 40. This is the finding behind "Command order". On `f22eb17`
+    through the store: 20 clicks on Pause in one task went out one at a time,
+    the answers' `seq` strictly increasing and the final phase the one the
+    clicks imply; 10 push-to-modulate press / release pairs through Hold to
+    switch went out one at a time, each pair reached Rust in order, and the
+    last answer and the engine's tick said not held. The click half, 20
+    Settings clicks on both builds: `data-timer-seq` never decreased, and the
+    page's state equalled `timer_status` after each batch.
   - H7, a timer deleted while a reader held its file 3 s: the file stayed
     while held. Deleted 0.5 s before the hold ended, it was removed 20 ms
     after the hold ended; deleted 0.2 s into the hold, 242 ms after, since
@@ -5027,11 +5050,12 @@ running.
     any left" wasn't measured: nothing was left.
 - **Owner checks** (`MANUAL_TESTS.md`, "Hourglass (v1.59.0)"; not run): O1
   and O2 OBS's two text sources beside the overlay, O3 a real sleep, O4 a
-  Stream Deck, O5 an hour against a stopwatch, O6 End task and relaunch, O7 a
-  key shared through `divora.timers`.
+  Stream Deck, O5 an hour against a stopwatch, O6 End task and relaunch (once
+  right after a change), O7 a key shared through `divora.timers`.
 - **Not tried here:** a real sleep (this PC sleeps in S3 only, and can't
   hibernate), Modern Standby, a clock that doesn't count sleep, OBS itself, a
-  Stream Deck, an hour-long run, End task, one key on two timers, Windows 10,
+  Stream Deck, an hour-long run, End task right after a change (H5's forced
+  end came 12 s after the last start), one key on two timers, Windows 10,
   the overlay on a second monitor, two Divoras running together, a screen
   reader, and the stub for other platforms compiled.
 
@@ -5041,15 +5065,18 @@ running.
   starting, so no timer file is written, removed or swept. The overlay and
   Settings don't depend on the files.
 - Without the handler's line, `tm:` keys do nothing.
-- `asTimer` answering null makes `timer` elements inert again, kept as stored,
-  as v1.55.0 to v1.58.0 kept them.
+- `asTimer` answering null makes `timer` elements inert again (kept as stored,
+  never drawn or listed), though not quite as v1.55.0 to v1.58.0 kept them:
+  deleting a timer in Settings still removes its faces, and Show on overlay is
+  refused with the damaged-picture toast.
 - **The safety net:** with no `divora.timers`, boot sends no timer command and
   the store doesn't listen. The thread ticks an empty core every 100 ms,
   emits nothing and hands the writer nothing
   (`an_empty_core_keeps_the_loop_quiet`), and the writer writes nothing and
   makes no folder (`a_writer_with_nothing_handed_over_waits`). The only timer
-  command is the overlay page's one `timer_status` after its handshake, which
-  answers an empty set.
+  commands are the overlay page's one `timer_status` after its handshake,
+  which answers an empty set, and `timers_dir` if Open folder is pressed,
+  which makes the folder.
 
 ### Not in this release
 

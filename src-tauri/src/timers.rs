@@ -67,7 +67,8 @@ pub const ANCHOR_HOLD: Duration = Duration::from_secs(10);
 pub const LATE_LOG: Duration = Duration::from_secs(1);
 
 /// Timers the core runs: the first this many known-kind entries of a sync,
-/// in list order (D36). The page stores no more (D8).
+/// in list order (D36). The page adds no more (D8); more come only from a
+/// hand edit or a newer Divora (after a downgrade), kept, not run (D36).
 pub const MAX_TIMERS: usize = 16;
 
 /// Entries of one `sync_timers` call that are read; the rest are skipped.
@@ -104,7 +105,11 @@ pub enum TimerKind {
 /// Where a timer is. `Done`: a countdown reached zero while the PC was awake
 /// and Divora running, and fired (late, if Divora was held up). `Expired`: it
 /// reached zero while the PC slept or Divora was closed, and did not fire. A
-/// count-up is only ever idle, running or paused (D2).
+/// count-up is only ever idle, running or paused (D2). Two edge cases break
+/// the split (D5): a countdown due in a second sleep of 5 s or less within a
+/// minute of one handled ends `Done`, and on a clock that doesn't count
+/// sleep, a resume signal during a hold-up past 500 ms ends what came due in
+/// the hold-up `Expired` with the PC awake.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum TimerPhase {
@@ -477,9 +482,10 @@ struct Seed {
 /// §7.8, D11: what `run` seeds, at `wall_ms`, for a timer of `kind` and
 /// length `length_ms` that the core has never accepted. Time passed while
 /// Divora was closed: a running countdown has `anchorMs − now` left (at most
-/// its total and 24 h, so a clock set back can't add time), or is `expired`
-/// if that is 0 or less; a running count-up has `now − anchorMs` (0 to
-/// 10 000 h). Paused, done and expired come back as they were.
+/// its total and 24 h, so a clock set back adds time, never past the total),
+/// or is `expired` if that is 0 or less; a running count-up has
+/// `now − anchorMs` (0 to 10 000 h). Paused, done and expired come back as
+/// they were.
 ///
 /// `None` — the timer starts idle, its definition kept (D35) — for a run
 /// that can't be one: a running or paused countdown without `totalMs` (a
@@ -652,9 +658,10 @@ impl Timer {
         self.stop(TimerPhase::Idle, ms, now);
     }
 
-    /// D4: the one way a countdown gets to `done` — running, found at or
-    /// past its deadline, however late. `fires` + 1. A v1.60.0 Finish calls
-    /// it too, so "fires once" covers both.
+    /// D4: the one way a running countdown gets to `done` (a seed only puts
+    /// a stored `done` back, `fires` 0) — found at or past its deadline,
+    /// however late. `fires` + 1. A v1.60.0 Finish calls it too, so "fires
+    /// once" covers both.
     fn fire(&mut self, now: Duration) -> Transition {
         let late_ms = floor_ms(now.saturating_sub(self.deadline()));
         self.fires = self.fires.saturating_add(1);

@@ -1540,7 +1540,7 @@ mod tests {
     }
 
     /// A writer that was never handed a set has nothing pending, and makes
-    /// no folder: someone who never adds a timer gets none.
+    /// no folder: the writer makes none for someone who never adds a timer.
     #[test]
     fn a_writer_with_nothing_handed_over_waits() {
         let dir = scratch("idle");

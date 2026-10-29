@@ -1,21 +1,25 @@
 // v1.59.0: Hourglass's timers as the backend reports them.
 //
 // Rust keeps the time (src-tauri/src/timers.rs) and sends the whole set on
-// `timer-state` after every change; every timer command answers the same
-// shape. Main's store and the overlay page both read it from here, and each
-// keeps the snapshot with the largest `seq`: an answer can land after the
-// events its command caused. The overlay page never imports
-// src/audio/api.ts, so the event and the one command it calls are named
-// here too. Pure: no DOM, no Tauri. The names, keys, phases, kinds and the
-// id grammar are frozen in timer.fixture.json, which the backend's tests
-// read as well.
+// `timer-state` after every change; every timer command but `timers_dir` (a
+// path) answers the same shape. Main's store and the overlay page both read
+// it from here, and each keeps the snapshot with the largest `seq`: an
+// answer can land after the events its command caused. The overlay page
+// never imports src/audio/api.ts, so the event and the one command it calls
+// are named here too. Pure: no DOM, no Tauri. The names, keys, phases,
+// kinds and the id grammar are frozen in timer.fixture.json, which the
+// backend's tests read as well.
 
 export type TimerKind = "countdown" | "countup";
 
 /** `done`: a countdown reached zero while the PC was awake and Divora ran,
  *  and fired (late, if Divora was held up). `expired`: it reached zero while
  *  the PC slept or Divora was closed, and didn't fire. A count-up is only
- *  ever idle, running or paused. */
+ *  ever idle, running or paused. Two edge cases break the split (from the
+ *  backend's code): a countdown due in a second sleep of 5 s or less within
+ *  a minute of one it handled ends `done`, and on a clock that doesn't count
+ *  sleep, a resume signal during a hold-up past 500 ms ends what came due in
+ *  the hold-up `expired` with the PC awake. */
 export type TimerPhase = "idle" | "running" | "paused" | "done" | "expired";
 
 /** One timer the backend runs. Its keys are frozen in timer.fixture.json. */
@@ -35,7 +39,9 @@ export interface TimerState {
   /** A running countdown: the wall-clock ms it ends. A running count-up: the
    *  wall-clock ms it effectively started. Otherwise null. */
   anchorMs: number | null;
-  /** How often this timer has fired since its id was added. */
+  /** How often this timer has fired since its id entered the backend's set:
+   *  0 again after Divora restarts, or when the id is deleted and added
+   *  again. */
   fires: number;
 }
 
