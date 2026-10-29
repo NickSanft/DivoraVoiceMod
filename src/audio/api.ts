@@ -367,12 +367,15 @@ export interface PtmState {
 }
 
 /** v1.58.0: set push-to-modulate's mode; answers the state after. Sync in
- *  the backend, so a press can't overtake its release. Without `restore`
- *  (the Mixer card) it lets go of every hold, the global key's included,
- *  which must then be pressed again. `restore: true` is the page's boot,
- *  with the saved mode: it lets go of the page's holds (key, button, MIDI)
- *  and keeps a global key that is still held. Idempotent: nothing to change
- *  moves nothing, `seq` included. */
+ *  the backend. v1.59.0: invokes in flight together can reach Rust out of
+ *  send order (measured in the real app with 40 sent at once), so the store
+ *  sends this and `setPtmHeld` one at a time, each once the one before it
+ *  answered; that is what keeps a press from overtaking its release.
+ *  Without `restore` (the Mixer card) it lets go of every hold, the global
+ *  key's included, which must then be pressed again. `restore: true` is the
+ *  page's boot, with the saved mode: it lets go of the page's holds (key,
+ *  button, MIDI) and keeps a global key that is still held. Idempotent:
+ *  nothing to change moves nothing, `seq` included. */
 export async function setPtmMode(mode: PtmMode, restore = false): Promise<PtmState> {
   return invoke<PtmState>("set_ptm_mode", { mode, restore });
 }
@@ -1331,13 +1334,16 @@ export async function subscribeOverlayEdit(handler: (raw: unknown) => void): Pro
 
 // ---- Hourglass (v1.59.0) ----
 // Rust keeps the time (src-tauri/src/timers.rs). Every command is sync in
-// the backend, so quick clicks land in order, and each answers the whole
-// `TimerSnapshot`, read with `readTimerSnapshot` (overlay/timerState.ts),
-// like every `timer-state` event: keep the one with the largest `seq`. A
-// labelled command that doesn't fit the timer's phase changes nothing; one
-// for an id the backend doesn't run rejects with "no such timer". The
-// `tm:<id>:<verb>` hotkeys are acted on by the backend and need nothing
-// here.
+// the backend, but invokes in flight together can reach Rust out of send
+// order (measured in the real app with 40 sent at once), so the store sends
+// the ones that change state one at a time, each once the one before it
+// answered: that is what makes quick clicks land in order. Each answers
+// the whole `TimerSnapshot`, read with `readTimerSnapshot`
+// (overlay/timerState.ts), like every `timer-state` event: keep the one
+// with the largest `seq`. A labelled command that doesn't fit the timer's
+// phase changes nothing; one for an id the backend doesn't run rejects with
+// "no such timer". The `tm:<id>:<verb>` hotkeys are acted on by the backend
+// and need nothing here.
 
 export type { TimerKind, TimerPhase, TimerSnapshot, TimerState } from "../overlay/timerState";
 export type { TimerDefWire, TimerRun } from "../data/timers";

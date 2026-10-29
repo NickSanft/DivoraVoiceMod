@@ -233,6 +233,7 @@ import {
 } from "../data/hotkeys";
 import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
+import { inOrder } from "../data/inOrder";
 import {
   DEFAULT_LENGTH_MS,
   defaultName,
@@ -1078,14 +1079,16 @@ export interface AppState {
   /** The mirror's only writer: takes `incoming` only if it is newer. */
   applyMuteState: (incoming: InputMute | null) => void;
   /** Sends `set_input_muted` and adopts the answer. For controls with a
-   *  label: they send what the label says. */
+   *  label: they send what the label says. v1.59.0: sent only once the mute
+   *  command before it has answered, as `toggleMuted`'s is. */
   setMuted: (on: boolean) => Promise<void>;
   /** Sends `toggle_input_muted` and adopts the answer. For triggers with no
    *  label (a MIDI pad). */
   toggleMuted: () => Promise<void>;
 
   // Push-to-modulate (v1.58.0). The engine owns it; the store keeps a
-  // read-only mirror, ordered by `seq`, as the mute's.
+  // read-only mirror, ordered by `seq`, as the mute's. v1.59.0: the page's
+  // commands go one at a time, each once the one before it has answered.
   /** The mirror: the newest state seen (largest `seq`), or null before any. */
   ptmState: () => PtmState | null;
   /** True once the boot restore settled (answer or failure) or 500 ms
@@ -2033,17 +2036,22 @@ export function createAppState(): AppState {
     if (next !== null) setMuteKnown(true);
   };
   // Neither command can fail in the app; outside Tauri (or a mock without
-  // them) the click changes nothing.
+  // them) the click changes nothing. v1.59.0: both go through one queue
+  // (data/inOrder.ts), each sent only once the one before it answered:
+  // invokes in flight together can reach Rust out of send order (measured
+  // in the real app with 40 sent at once), and two labelled sets landing
+  // reversed would leave the opposite of the last click.
+  const muteQueue = inOrder();
   const setMuted = async (on: boolean): Promise<void> => {
     try {
-      applyMuteState(readInputMute(await setInputMutedCmd(on)));
+      applyMuteState(readInputMute(await muteQueue(() => setInputMutedCmd(on))));
     } catch (e) {
       console.warn("[mute] set_input_muted failed:", e);
     }
   };
   const toggleMuted = async (): Promise<void> => {
     try {
-      applyMuteState(readInputMute(await toggleInputMutedCmd()));
+      applyMuteState(readInputMute(await muteQueue(() => toggleInputMutedCmd())));
     } catch (e) {
       console.warn("[mute] toggle_input_muted failed:", e);
     }
@@ -2052,7 +2060,8 @@ export function createAppState(): AppState {
   // onMount enumerates devices (sync commands that hold the main thread),
   // and a reload during a mute shows it in one round trip. It only reads:
   // a reload must never unmute the call. `muteKnown` comes true when it
-  // settles, or after 500 ms if it never does.
+  // settles, or after 500 ms if it never does. Not queued: it changes
+  // nothing, and its answer is adopted by `seq` wherever it lands.
   const muteKnownTimer = setTimeout(() => setMuteKnown(true), 500);
   void (async () => {
     try {
@@ -2086,15 +2095,23 @@ export function createAppState(): AppState {
   const ptmPageHeld = { key: false, button: false };
   const ptmMidiDown = new Set<string>();
   const ptmCcSides = new Map<string, boolean>();
+  // v1.59.0: every `set_ptm_held` and `set_ptm_mode` the page sends, the
+  // boot restore's included, goes through this one queue: each is sent only
+  // once the one before it answered. Invokes in flight together can reach
+  // Rust out of send order (measured in the real app with 40 sent at once),
+  // and a release applied before its press would leave the hold on until
+  // the next edge.
+  const ptmQueue = inOrder();
   const sendPtmHeld = async (source: PtmPageSource, held: boolean): Promise<void> => {
     try {
-      applyPtmState(readPtmState(await setPtmHeldCmd(source, held)));
+      applyPtmState(readPtmState(await ptmQueue(() => setPtmHeldCmd(source, held))));
     } catch (e) {
       console.warn("[ptm] set_ptm_held failed:", e);
     }
   };
-  // The flag is set before the invoke goes out, and both commands are sync
-  // in the backend, so a press can't overtake its release.
+  // The flag is set before the command is queued, and the queue sends a
+  // release only once its press has answered, so a press can't overtake its
+  // release.
   const ptmDown = (source: "key" | "button"): void => {
     if (ptmPageHeld[source]) return;
     ptmPageHeld[source] = true;
@@ -2114,8 +2131,9 @@ export function createAppState(): AppState {
     if (after !== before) void sendPtmHeld("midi", after);
   };
   // The card's set. This very call lets go of every hold in the engine, and
-  // the commands land in order, so the page forgets its own holds now: a
-  // press made while it is in flight lands after it and holds again. The CC
+  // the queue sends a press made while it is in flight only after its
+  // answer, so the page forgets its own holds now: that press lands after
+  // it and holds again. The CC
   // sides are kept, so a CC left up must come down and back up to hold.
   // Saved only from the answer: on failure the setting and the card stay.
   // What is saved builds on the setting as it stands when the answer lands,
@@ -2128,7 +2146,8 @@ export function createAppState(): AppState {
     ptmPageHeld.button = false;
     ptmMidiDown.clear();
     try {
-      const answer = readPtmState(await setPtmModeCmd(ptmModeOf(want)));
+      const mode = ptmModeOf(want);
+      const answer = readPtmState(await ptmQueue(() => setPtmModeCmd(mode)));
       if (answer === null) return;
       applyPtmState(answer);
       const now = ptmSetting();
@@ -2147,11 +2166,14 @@ export function createAppState(): AppState {
   // mode and lets go of the page's holds (a new page holds nothing) but
   // keeps a global key that is still held: a reload must not drop it. Its
   // answer is the boot read. `ptmKnown` comes true when it settles, or
-  // after 500 ms if it never does.
+  // after 500 ms if it never does. It is the queue's first, so it goes out
+  // at once, and a press made before its answer goes after it: the restore
+  // can't let go of that press.
   const ptmKnownTimer = setTimeout(() => setPtmKnown(true), 500);
   void (async () => {
+    const mode = ptmModeOf(ptmSetting());
     try {
-      applyPtmState(readPtmState(await setPtmModeCmd(ptmModeOf(ptmSetting()), true)));
+      applyPtmState(readPtmState(await ptmQueue(() => setPtmModeCmd(mode, true))));
     } catch (err) {
       console.warn("[ptm] boot restore failed", err);
     } finally {
@@ -2227,12 +2249,26 @@ export function createAppState(): AppState {
     persistRuns(next);
   };
 
+  // Every command that changes Hourglass in the backend goes through this
+  // one queue, each sent only once the one before it answered: the syncs,
+  // the labelled commands, and the `tm:<id>:<verb>` keys' registers and
+  // unregisters. Invokes in flight together can reach Rust out of send order
+  // (measured in the real app with 40 sent at once), so a pause and a resume
+  // clicked quickly could land reversed, and a delete's unregister could
+  // land after a key bound for the timer that took its id. `timer_status`
+  // isn't queued: it changes nothing, and its answer is adopted by `seq`
+  // wherever it lands, so it needn't wait behind a slow command.
+  const timerQueue = inOrder();
+
   // Every stored timer, in list order, with its run as `resume`: the backend
   // seeds a timer from it only for an id it hasn't accepted since it started
   // (a restart); after a page reload it knows them all and keeps its own.
+  // The set is read when the sync is queued, not when it goes, so each sync
+  // carries the timers as the change that sent it left them.
   const sendTimerSync = async (): Promise<void> => {
+    const defs = defsForSync(timerStore());
     try {
-      adoptTimerSnapshot(await syncTimersCmd(defsForSync(timerStore())));
+      adoptTimerSnapshot(await timerQueue(() => syncTimersCmd(defs)));
     } catch (e) {
       console.warn("[hourglass] sync_timers failed:", e);
     }
@@ -2263,9 +2299,9 @@ export function createAppState(): AppState {
 
   // The boot sync. Sent here, at creation, beside the mute's read and the
   // push-to-modulate restore, so it goes out before App's onMount
-  // enumerates devices (sync commands that hold the main thread) and before
-  // App registers the hotkeys: the backend knows every timer before any of
-  // their keys works.
+  // enumerates devices (sync commands that hold the main thread). It is the
+  // queue's first, and the timers' keys App registers go through the queue
+  // after it: the backend knows every timer before any of their keys works.
   if (hourglassUsed) {
     void sendTimerSync();
     void subscribeTimers();
@@ -2320,18 +2356,17 @@ export function createAppState(): AppState {
     // The card goes at once, so a capture still open can't bind its keys
     // again (`bindTimerHotkey` needs a stored timer). Then its keys, before
     // the sync: one left registered would start whatever timer takes this id
-    // next. All of it is asked in this one turn, the sync without the id
-    // included; the backend runs them in order. Awaiting the keys before
-    // sending the sync would free the id meanwhile: an Add in that gap takes
-    // it, its sync reaches the backend first, and the backend, never having
-    // seen the id go, hands the new timer the deleted one's run.
+    // next. All of it is queued in this one call, the sync carrying the
+    // timers without the id. An Add made before these have gone takes the
+    // id, but its sync is queued after this one, so the backend sees the id
+    // go before it comes back and never hands the new timer the deleted
+    // one's run; a key bound for the new timer is registered after these
+    // unregisters.
     saveTimers(after);
-    const keys = Promise.all(
-      TIMER_VERBS.map((verb) =>
-        unregisterGlobalShortcutCmd(timerHotkeyId(id, verb)).catch((err: unknown) => {
-          console.warn("[hourglass] unregister hotkey failed", err);
-        }),
-      ),
+    const keys = TIMER_VERBS.map((verb) =>
+      timerQueue(() => unregisterGlobalShortcutCmd(timerHotkeyId(id, verb))).catch((err: unknown) => {
+        console.warn("[hourglass] unregister hotkey failed", err);
+      }),
     );
     overlay.removeOverlayTimer(id);
     const synced = sendTimerSync();
@@ -2340,18 +2375,21 @@ export function createAppState(): AppState {
       TIMER_VERBS.map((verb) => {
         const accelerator = runTimer(tid)?.hotkeys?.[verb];
         if (!accelerator) return Promise.resolve();
-        return registerGlobalShortcutCmd(timerHotkeyId(tid, verb), accelerator).catch((err: unknown) => {
-          console.warn(`[hourglass] register hotkey failed for ${tid} ${verb}`, err);
-        });
+        return timerQueue(() => registerGlobalShortcutCmd(timerHotkeyId(tid, verb), accelerator)).catch(
+          (err: unknown) => {
+            console.warn(`[hourglass] register hotkey failed for ${tid} ${verb}`, err);
+          },
+        );
       }),
     );
-    await Promise.all([keys, synced, ...registered]);
+    await Promise.all([...keys, synced, ...registered]);
   };
 
-  /** A timer command; its answer is a whole snapshot like any event. */
+  /** A timer command, through the queue; its answer is a whole snapshot
+   *  like any event. */
   const sendTimerOp = async (what: string, send: () => Promise<unknown>): Promise<void> => {
     try {
-      adoptTimerSnapshot(await send());
+      adoptTimerSnapshot(await timerQueue(send));
     } catch (e) {
       console.warn(`[hourglass] ${what} failed:`, e);
     }
@@ -2377,7 +2415,9 @@ export function createAppState(): AppState {
   // Each timer's keys live in its own entry, by verb. v1.59.0 registers
   // `toggle` and `reset`; any other verb (a later build's `finish`) is kept
   // and written back as it is. Saved first, then registered, as
-  // `setHotkeyBinding` does; a bind changes only its own verb.
+  // `setHotkeyBinding` does; a bind changes only its own verb. Through the
+  // timers' queue, so binds land in the order they were made, and after a
+  // delete's unregisters of an id an Add took again.
   const bindTimerHotkey: AppState["bindTimerHotkey"] = async (id, verb, raw) => {
     // A capture can outlive its card: a key for a timer no longer stored
     // (or one the backend doesn't run) would be one nothing shows, and the
@@ -2392,14 +2432,14 @@ export function createAppState(): AppState {
     const hotkeyId = timerHotkeyId(id, verb);
     if (!accelerator) {
       try {
-        await unregisterGlobalShortcutCmd(hotkeyId);
+        await timerQueue(() => unregisterGlobalShortcutCmd(hotkeyId));
       } catch (err) {
         console.warn("[hourglass] unregister hotkey failed", err);
       }
       return;
     }
     try {
-      await registerGlobalShortcutCmd(hotkeyId, accelerator);
+      await timerQueue(() => registerGlobalShortcutCmd(hotkeyId, accelerator));
     } catch (err) {
       console.warn("[hourglass] register hotkey failed", err);
     }
@@ -3385,15 +3425,16 @@ export function createAppState(): AppState {
     // v1.59.0: then Hourglass's timers, from `divora.timers`. Only timers the
     // backend runs, and only the verbs this build acts on: a newer kind's
     // keys, a timer past the 16th and a later verb (`finish`) are kept in
-    // storage and never registered. Each key is read just before it goes
-    // out, so a delete or a bind that landed meanwhile is the one that
-    // counts.
+    // storage and never registered. Each key is read just before it is
+    // queued, so a delete or a bind made before is the one that counts. The
+    // timers' queue sends it after the boot sync, and a delete or a bind
+    // made after it is queued after it.
     for (const { id } of timerStore().timers) {
       for (const verb of TIMER_VERBS) {
         const accelerator = runTimer(id)?.hotkeys?.[verb];
         if (!accelerator) continue;
         try {
-          await registerGlobalShortcutCmd(timerHotkeyId(id, verb), accelerator);
+          await timerQueue(() => registerGlobalShortcutCmd(timerHotkeyId(id, verb), accelerator));
         } catch (err) {
           console.warn(`[hourglass] sync hotkey failed for ${id} ${verb}`, err);
         }

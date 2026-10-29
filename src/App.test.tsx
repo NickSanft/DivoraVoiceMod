@@ -446,6 +446,8 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     expect(ptmCalls()).toEqual([heldCall("key", true)]);
     expect(engine.held()).toEqual(["key"]);
     key("keyup", space);
+    // v1.59.0: the release goes once the press has answered.
+    await settle();
     expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
     // A keyup with nothing held sends nothing.
     key("keyup", space);
@@ -481,6 +483,8 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     invokeCalls.length = 0;
     key("keydown", space);
     window.dispatchEvent(new Event("blur"));
+    // v1.59.0: the release goes once the press has answered.
+    await settle();
     expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
     // Nothing held: a blur sends nothing.
     window.dispatchEvent(new Event("blur"));
@@ -492,6 +496,7 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     renderShell();
     await settle();
     key("keydown", space);
+    await settle();
     invokeCalls.length = 0;
     setVisibility("visible");
     document.dispatchEvent(new Event("visibilitychange"));
@@ -507,6 +512,7 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     await settle();
     expect(onFocusChangedListeners.length).toBeGreaterThanOrEqual(1);
     key("keydown", space);
+    await settle();
     invokeCalls.length = 0;
     onFocusChangedListeners.forEach((cb) => cb({ payload: false }));
     expect(ptmCalls()).toEqual([heldCall("key", false)]);
@@ -534,6 +540,7 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     app.setNav("presets");
     await settle();
     app.ptmDown("button");
+    await settle();
     invokeCalls.length = 0;
     lose();
     expect(ptmCalls()).toEqual([heldCall("button", false)]);
@@ -559,6 +566,7 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
     expect(ptmCalls()).toEqual([heldCall("key", true)]);
     // Ctrl and Shift let go first: M's keyup alone still lets go.
     key("keyup", { key: "m", code: "KeyM" });
+    await settle();
     expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
   });
 
@@ -596,9 +604,11 @@ describe("App shell — push-to-modulate (v1.58.0)", () => {
       key("keyup", { key: "2", code: "Digit2" });
       expect(ptmCalls()).toEqual([heldCall("key", true)]);
       key("keyup", release);
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
       // And it holds again on the next press.
       key("keydown", press);
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false), heldCall("key", true)]);
     },
   );

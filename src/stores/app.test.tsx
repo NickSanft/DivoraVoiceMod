@@ -22,6 +22,50 @@ function setupApp() {
   return renderHook(() => useApp(), { wrapper: AppProvider });
 }
 
+/** v1.59.0: invokes in flight at the same time can reach Rust out of send
+ *  order (measured in the real app with 40 sent at once). Over this wire,
+ *  each invoke of `cmds` stays in flight until `drain`, which hands the
+ *  newest one in flight to the fake backend (the mock as it was) first, so
+ *  what the page sends together lands reversed. `sent` is the page's order,
+ *  `landed` the backend's; `peak` is the most in flight at once. */
+function reversingWire(cmds: readonly string[]) {
+  const backend = invokeMock.getMockImplementation()!;
+  const inFlight: Array<() => void> = [];
+  const sent: Array<[string, unknown]> = [];
+  const landed: Array<[string, unknown]> = [];
+  let peak = 0;
+  invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+    if (!cmds.includes(cmd)) return backend(cmd, args);
+    sent.push([cmd, args]);
+    return new Promise((resolve, reject) => {
+      inFlight.push(() => {
+        landed.push([cmd, args]);
+        Promise.resolve()
+          .then(() => backend(cmd, args))
+          .then(resolve, reject);
+      });
+      peak = Math.max(peak, inFlight.length);
+    });
+  });
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  return {
+    sent,
+    landed,
+    peak: () => peak,
+    /** Lands what is in flight, newest first, and whatever the page sends
+     *  as each answers, until nothing is left in flight. */
+    async drain() {
+      while (inFlight.length > 0) {
+        inFlight.pop()!();
+        await settle();
+      }
+    },
+  };
+}
+
 describe("app store — Phase 1", () => {
   beforeEach(() => {
     invokeMock.mockReset();
@@ -4018,6 +4062,99 @@ describe("app store — the mute (v1.56.0)", () => {
     );
   });
 
+  describe("v1.59.0: one mute command at a time", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** engineWord, with each set's and toggle's answer held until the test
+     *  lets it go (`go`, and only then does the engine change) or refuses
+     *  it. */
+    function heldWord() {
+      const word = engineWord();
+      const real = invokeMock.getMockImplementation()!;
+      const held: Array<{ go: () => void; refuse: (e: Error) => void }> = [];
+      invokeMock.mockImplementation((cmd: string, a?: unknown) => {
+        if (cmd !== "set_input_muted" && cmd !== "toggle_input_muted") return real(cmd, a);
+        return new Promise((resolve, reject) => {
+          held.push({ go: () => resolve(real(cmd, a)), refuse: reject });
+        });
+      });
+      return { word, held };
+    }
+
+    it("a labelled set sent while one is slow to answer goes out only after it; the engine ends at the last", async () => {
+      const { word, held } = heldWord();
+      const { result } = setupApp();
+      await settle();
+      const on = result.setMuted(true);
+      const off = result.setMuted(false);
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      held.shift()!.go();
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }, { muted: false }]);
+      expect(result.muted()).toBe(true);
+      held.shift()!.go();
+      await Promise.all([on, off]);
+      expect(word.get()).toEqual({ muted: false, seq: 2 });
+      expect(result.muteState()).toEqual({ muted: false, seq: 2 });
+    });
+
+    it("a toggle in flight holds a set back too: both go through one queue", async () => {
+      const { word, held } = heldWord();
+      const { result } = setupApp();
+      await settle();
+      const toggle = result.toggleMuted();
+      const off = result.setMuted(false);
+      await settle();
+      expect(muteCalls()).toEqual(["toggle_input_muted"]);
+      held.shift()!.go();
+      await settle();
+      expect(muteCalls()).toEqual(["toggle_input_muted", { muted: false }]);
+      held.shift()!.go();
+      await Promise.all([toggle, off]);
+      expect(word.get()).toEqual({ muted: false, seq: 2 });
+      expect(result.muted()).toBe(false);
+    });
+
+    it("a set that fails doesn't hold back the next; each caller gets its own outcome", async () => {
+      const { word, held } = heldWord();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { result } = setupApp();
+      await settle();
+      const refused = result.setMuted(true);
+      const next = result.setMuted(true);
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }]);
+      held.shift()!.refuse(new Error("refused"));
+      await settle();
+      expect(muteCalls()).toEqual([{ muted: true }, { muted: true }]);
+      held.shift()!.go();
+      await Promise.all([refused, next]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith("[mute] set_input_muted failed:", expect.any(Error));
+      expect(word.get()).toEqual({ muted: true, seq: 1 });
+      expect(result.muteState()).toEqual({ muted: true, seq: 1 });
+    });
+
+    it("20 labelled sets, alternating, over a wire that lands what is in flight together reversed: the engine takes them in send order", async () => {
+      const word = engineWord();
+      const { result } = setupApp();
+      await settle();
+      const wire = reversingWire(["set_input_muted", "toggle_input_muted"]);
+      const done = Array.from({ length: 20 }, (_, i) => result.setMuted(i % 2 === 0));
+      await wire.drain();
+      await Promise.all(done);
+      const want = Array.from({ length: 20 }, (_, i) => ["set_input_muted", { muted: i % 2 === 0 }]);
+      expect(wire.sent).toEqual(want);
+      expect(wire.landed).toEqual(want);
+      expect(wire.peak()).toBe(1);
+      expect(word.get()).toEqual({ muted: false, seq: 20 });
+      expect(result.muteState()).toEqual({ muted: false, seq: 20 });
+    });
+  });
+
   it("Test my setup names the mute when it is why no voice reached the output", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "input_mute") return { muted: true, seq: 1 };
@@ -4709,7 +4846,8 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
 
     it("an off sent while a hold pick is in flight keeps the pick", async () => {
       // The card still shows the old hold until bypass's answer lands, so
-      // the off goes out built from Hold to apply.
+      // the off is built from Hold to apply. v1.59.0: it goes out only once
+      // the pick has answered.
       const engine = ptmEngine();
       const { result } = setupApp();
       await settle();
@@ -4719,9 +4857,10 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       const pick = result.setPtmHold("bypass");
       const off = result.setPtmOn(false);
       await settle();
-      expect(ptmCalls()).toEqual([modeCall("bypass"), modeCall("always")]);
+      expect(ptmCalls()).toEqual([modeCall("bypass")]);
       engine.ctl.gate.shift()!();
       await settle();
+      expect(ptmCalls()).toEqual([modeCall("bypass"), modeCall("always")]);
       expect(result.ptmSetting()).toEqual({ on: true, hold: "bypass" });
       engine.ctl.gate.shift()!();
       await Promise.all([pick, off]);
@@ -4796,8 +4935,9 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       expect(ptmCalls()).toEqual([heldCall("key", true)]);
       result.ptmUp("key");
       result.ptmUp("key");
-      expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+      // v1.59.0: the release goes once the press has answered.
       await settle();
+      expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
       expect(engine.held()).toEqual([]);
     });
 
@@ -4877,6 +5017,7 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       for (const v of [63, 64, 62, 64, 60, 63]) result.handleMidiMessage(cc(20, v));
       expect(ptmCalls()).toEqual([heldCall("midi", true)]);
       result.handleMidiMessage(cc(20, 59));
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
     });
 
@@ -4887,6 +5028,7 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       const { result, engine } = await withMappings({ kind: "note", data1: 36 });
       result.handleMidiMessage(noteOn(36));
       await result.selectMidiInput(pick);
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
       expect(engine.held()).toEqual([]);
       // The old port's note-off, if it ever came, sends nothing.
@@ -4902,6 +5044,7 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       result.handleMidiMessage(noteOn(36));
       // Learn on mapping Y; learn swallows pad X's note-off.
       result.setMidiLearnId(ids[1]!);
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
       result.handleMidiMessage(noteOff(36));
       expect(result.midiLearnId()).toBeNull();
@@ -4910,6 +5053,7 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       // Cancelling learn lets go of nothing more.
       result.handleMidiMessage(noteOn(36));
       result.setMidiLearnId(null);
+      await settle();
       expect(ptmCalls()).toEqual([
         heldCall("midi", true),
         heldCall("midi", false),
@@ -4924,13 +5068,16 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       );
       result.handleMidiMessage(noteOn(36));
       result.updateMidiMapping(ids[1]!, { trigger: { kind: "note", data1: 38, channel: 0 } });
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("midi", true)]);
       result.updateMidiMapping(ids[0]!, { trigger: { kind: "note", data1: 40, channel: 0 } });
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
 
       invokeMock.mockClear();
       result.handleMidiMessage(noteOn(40));
       result.removeMidiMapping(ids[0]!);
+      await settle();
       expect(ptmCalls()).toEqual([heldCall("midi", true), heldCall("midi", false)]);
     });
 
@@ -4950,6 +5097,139 @@ describe("app store — push-to-modulate (v1.58.0)", () => {
       expect(ptmCalls()).toEqual([]);
       result.handleMidiMessage(cc(20, 70));
       expect(ptmCalls()).toEqual([heldCall("midi", true)]);
+    });
+  });
+
+  describe("v1.59.0: one command at a time", () => {
+    const noteOn = (n: number) => ({ channel: 0, kind: "note-on" as const, data1: n, data2: 100 });
+    const noteOff = (n: number) => ({ channel: 0, kind: "note-off" as const, data1: n, data2: 0 });
+
+    it.each(["key", "button", "midi"] as const)(
+      "%s: a release sent while its press is slow to answer goes out only after it",
+      async (source) => {
+        const engine = ptmEngine();
+        const { result } = setupApp();
+        await settle();
+        await result.setPtmOn(true);
+        result.addMidiMapping({ action: "ptm", trigger: { kind: "note", data1: 36, channel: 0 } });
+        const press = () =>
+          source === "midi" ? result.handleMidiMessage(noteOn(36)) : result.ptmDown(source);
+        const release = () =>
+          source === "midi" ? result.handleMidiMessage(noteOff(36)) : result.ptmUp(source);
+        invokeMock.mockClear();
+        engine.ctl.gate = [];
+        press();
+        release();
+        await settle();
+        expect(ptmCalls()).toEqual([heldCall(source, true)]);
+        engine.ctl.gate.shift()!();
+        await settle();
+        expect(ptmCalls()).toEqual([heldCall(source, true), heldCall(source, false)]);
+        engine.ctl.gate.shift()!();
+        await settle();
+        expect(engine.held()).toEqual([]);
+        expect(result.ptmState()).toMatchObject({ held: false, bypassed: true });
+      },
+    );
+
+    it("a press that fails doesn't hold back its release", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      const real = invokeMock.getMockImplementation()!;
+      let refuse = true;
+      invokeMock.mockImplementation(async (cmd: string, a?: Record<string, unknown>) => {
+        if (cmd === "set_ptm_held" && refuse) {
+          refuse = false;
+          throw new Error("refused");
+        }
+        return real(cmd, a);
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      invokeMock.mockClear();
+      result.ptmDown("key");
+      result.ptmUp("key");
+      expect(ptmCalls()).toEqual([heldCall("key", true)]);
+      await settle();
+      expect(ptmCalls()).toEqual([heldCall("key", true), heldCall("key", false)]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith("[ptm] set_ptm_held failed:", expect.any(Error));
+      expect(engine.held()).toEqual([]);
+    });
+
+    it("a press made while the card's set is in flight goes after it, so the set can't let go of it", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      invokeMock.mockClear();
+      engine.ctl.gate = [];
+      const on = result.setPtmOn(true);
+      result.ptmDown("key");
+      await settle();
+      expect(ptmCalls()).toEqual([modeCall("apply")]);
+      engine.ctl.gate.shift()!();
+      await settle();
+      expect(ptmCalls()).toEqual([modeCall("apply"), heldCall("key", true)]);
+      engine.ctl.gate.shift()!();
+      await on;
+      await settle();
+      expect(engine.held()).toEqual(["key"]);
+      expect(result.status()).toBe("modulated");
+    });
+
+    it("a press made before the boot restore answers lands after it, over a wire that lands what is in flight together reversed", async () => {
+      const engine = ptmEngine({ mode: "apply", seq: 3 });
+      window.localStorage.setItem("divora.ptm", JSON.stringify({ on: true, hold: "apply" }));
+      const wire = reversingWire(["set_ptm_mode", "set_ptm_held"]);
+      const { result } = setupApp();
+      result.ptmDown("key");
+      expect(wire.sent).toEqual([modeCall("apply", true)]);
+      await wire.drain();
+      expect(wire.landed).toEqual([modeCall("apply", true), heldCall("key", true)]);
+      expect(wire.peak()).toBe(1);
+      // The restore let go of nothing the page holds now.
+      expect(engine.held()).toEqual(["key"]);
+      expect(result.ptmKnown()).toBe(true);
+      expect(result.status()).toBe("modulated");
+    });
+
+    it("20 presses and releases, alternating, over a wire that lands what is in flight together reversed: the engine takes them in send order", async () => {
+      const engine = ptmEngine();
+      const { result } = setupApp();
+      await settle();
+      await result.setPtmOn(true);
+      const wire = reversingWire(["set_ptm_mode", "set_ptm_held"]);
+      for (let i = 0; i < 20; i++) {
+        if (i % 2 === 0) result.ptmDown("button");
+        else result.ptmUp("button");
+      }
+      await wire.drain();
+      const want = Array.from({ length: 20 }, (_, i) => heldCall("button", i % 2 === 0));
+      expect(wire.sent).toEqual(want);
+      expect(wire.landed).toEqual(want);
+      expect(wire.peak()).toBe(1);
+      expect(engine.held()).toEqual([]);
+      expect(result.ptmState()).toMatchObject({ held: false, bypassed: true });
+    });
+
+    it("each feature has its own queue: a press goes out at once while a mute and a timer command go unanswered, and so does each of them", async () => {
+      const engine = ptmEngine();
+      const real = invokeMock.getMockImplementation()!;
+      invokeMock.mockImplementation((cmd: string, a?: Record<string, unknown>) =>
+        cmd === "set_input_muted" || cmd === "pause_timer" ? new Promise(() => {}) : real(cmd, a),
+      );
+      const { result } = setupApp();
+      await settle();
+      invokeMock.mockClear();
+      engine.ctl.hang = true;
+      const sent = () => invokeMock.mock.calls.map((c) => c[0]);
+      // Each in the caller's own turn, with the ones before it unanswered.
+      result.ptmDown("key");
+      expect(sent()).toEqual(["set_ptm_held"]);
+      void result.setMuted(true);
+      expect(sent()).toEqual(["set_ptm_held", "set_input_muted"]);
+      void result.pauseTimer("timer-1");
+      expect(sent()).toEqual(["set_ptm_held", "set_input_muted", "pause_timer"]);
     });
   });
 });
@@ -5673,6 +5953,146 @@ describe("app store — Hourglass (v1.59.0)", () => {
         ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F9" }],
         ["register_global_shortcut", { id: "tm:timer-1:reset", accelerator: "F10" }],
       ]);
+    });
+  });
+
+  describe("v1.59.0: one command at a time", () => {
+    const ONE = { id: "timer-1" };
+
+    it("a command sent while another is slow to answer goes out only after it", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      calls.length = 0;
+      be.hold("pause_timer");
+      const pause = result.pauseTimer("timer-1");
+      const adjust = result.adjustTimer("timer-1", 30_000);
+      await settle();
+      expect(calls.map((c) => c.cmd)).toEqual(["pause_timer"]);
+      be.release("pause_timer");
+      await Promise.all([pause, adjust]);
+      expect(calls.map((c) => [c.cmd, c.args])).toEqual([
+        ["pause_timer", ONE],
+        ["adjust_timer", { ...ONE, deltaMs: 30_000 }],
+      ]);
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({ phase: "paused", ms: 170_000 });
+    });
+
+    it("a refused command doesn't hold back the next; each caller gets its own outcome", async () => {
+      store(entry("timer-1"));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      calls.length = 0;
+      const refused = result.pauseTimer("timer-9");
+      const next = result.adjustTimer("timer-1", -30_000);
+      expect(calls.map((c) => c.cmd)).toEqual(["pause_timer"]);
+      await Promise.all([refused, next]);
+      expect(calls.map((c) => c.cmd)).toEqual(["pause_timer", "adjust_timer"]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith("[hourglass] pause_timer failed:", expect.any(Error));
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({ ms: 170_000, text: "02:50" });
+    });
+
+    it("20 resumes and pauses, alternating, through the store's actions over a wire that lands what is in flight together reversed: Rust takes them in send order", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      // Paused in the mirror, so Start sends resume_timer.
+      await result.pauseTimer("timer-1");
+      const wire = reversingWire(["pause_timer", "resume_timer"]);
+      const done = Array.from({ length: 20 }, (_, i) =>
+        i % 2 === 0 ? result.startTimer("timer-1") : result.pauseTimer("timer-1"),
+      );
+      await wire.drain();
+      await Promise.all(done);
+      const want = Array.from({ length: 20 }, (_, i) => [i % 2 === 0 ? "resume_timer" : "pause_timer", ONE]);
+      expect(wire.sent).toEqual(want);
+      expect(wire.landed).toEqual(want);
+      expect(wire.peak()).toBe(1);
+      expect(be.state("timer-1")?.phase).toBe("paused");
+      expect(result.timerSnapshot()?.timers[0]?.phase).toBe("paused");
+      expect(savedRun("timer-1")?.phase).toBe("paused");
+    });
+
+    it("a delete, an Add and a bind made while a command is slow to answer go after it, in that order", async () => {
+      store(entry("timer-1", { hotkeys: { toggle: "F9" } }));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      calls.length = 0;
+      be.hold("pause_timer");
+      const pause = result.pauseTimer("timer-1");
+      const deleted = result.deleteTimer("timer-1");
+      const added = result.addTimer("countdown");
+      // The Add took the id; a key bound for it must outlive the delete's
+      // unregister.
+      const bound = result.bindTimerHotkey("timer-1", "toggle", "F10");
+      await settle();
+      expect(calls.map((c) => c.cmd)).toEqual(["pause_timer"]);
+      be.release("pause_timer");
+      await Promise.all([pause, deleted, added, bound]);
+      await settle();
+      expect(calls.map((c) => [c.cmd, c.args])).toEqual([
+        ["pause_timer", ONE],
+        ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:reset" }],
+        ["sync_timers", { timers: [] }],
+        ["sync_timers", { timers: [{ ...ONE, name: "Countdown", kind: "countdown", durationMs: 300_000 }] }],
+        ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F10" }],
+      ]);
+      // The backend saw the id go before it came back: the new timer is
+      // fresh.
+      expect(result.timerSnapshot()?.timers).toEqual([
+        expect.objectContaining({ ...ONE, name: "Countdown", phase: "idle", anchorMs: null, fires: 0 }),
+      ]);
+      expect(saved()).toEqual([
+        { ...ONE, name: "Countdown", kind: "countdown", durationMs: 300_000, hotkeys: { toggle: "F10" } },
+      ]);
+    });
+
+    it("a key cleared while its register is slow to answer is unregistered only after it", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      calls.length = 0;
+      be.hold("register_global_shortcut");
+      const bound = result.bindTimerHotkey("timer-1", "toggle", "F10");
+      const cleared = result.bindTimerHotkey("timer-1", "toggle", "");
+      await settle();
+      expect(keyCalls()).toEqual([["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F10" }]]);
+      be.release("register_global_shortcut");
+      await Promise.all([bound, cleared]);
+      // Landing first, the unregister would leave F10 registered for a
+      // timer whose card shows no key.
+      expect(keyCalls()).toEqual([
+        ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F10" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
+      ]);
+      expect(saved()[0]?.hotkeys?.toggle).toBeUndefined();
+    });
+
+    it("the timers' keys App registers go after the boot sync; timer_status doesn't wait for it", async () => {
+      store(entry("timer-1", { hotkeys: { toggle: "F9" } }));
+      const be = backend();
+      be.hold("sync_timers");
+      const { result } = setupApp();
+      const keys = result.syncHotkeyBindings();
+      await settle();
+      // The catch-up read isn't queued: it went while the sync is held.
+      expect(timerLog()).toEqual(["sync_timers", "listen timer-state", "timer_status"]);
+      const timerKeys = () => keyCalls().filter((c) => (c[1] as { id: string }).id.startsWith("tm:"));
+      expect(timerKeys()).toEqual([]);
+      be.release("sync_timers");
+      await keys;
+      expect(timerKeys()).toEqual([["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F9" }]]);
     });
   });
 });
