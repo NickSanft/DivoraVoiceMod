@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.59.0] — 2026-10-29 — Hourglass: countdowns and stream clocks on a hotkey
+
 Hourglass adds countdowns and count-ups that keep time while Divora is in the tray: a BRB countdown you start from a Stream Deck button, say, or how long you've been live. Start, pause and reset them in the new **Settings → Hourglass** or with their own hotkeys, and show them on your stream overlay, or in OBS through a text file (OBS and a Stream Deck weren't tried). At zero a countdown shows 00:00, and its card in Settings says **Done**; there's no sound or pop-up yet.
 
 ### Added
