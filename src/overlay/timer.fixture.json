@@ -9,7 +9,7 @@
   "snapshotKeys": ["seq", "timers"],
   "stateKeys": ["anchorMs", "fires", "id", "kind", "ms", "name", "phase", "text", "totalMs"],
   "runKeys": ["anchorMs", "ms", "phase", "totalMs"],
-  "defKeys": ["durationMs", "id", "kind", "name", "resume"],
+  "defKeys": ["durationMs", "id", "kind", "name", "onFire", "onStart", "resume"],
   "phases": ["idle", "running", "paused", "done", "expired"],
   "kinds": ["countdown", "countup"],
   "limits": {
@@ -58,7 +58,7 @@
     { "id": "tm:timer-1:toggle", "timer": "timer-1", "verb": "toggle" },
     { "id": "tm:timer-1:reset", "timer": "timer-1", "verb": "reset" },
     { "id": "tm:brb:reset", "timer": "brb", "verb": "reset" },
-    { "id": "tm:timer-1:finish", "timer": null },
+    { "id": "tm:timer-1:finish", "timer": "timer-1", "verb": "finish" },
     { "id": "tm:timer-1:Toggle", "timer": null },
     { "id": "TM:timer-1:toggle", "timer": null },
     { "id": "tm:Timer-1:toggle", "timer": null },
@@ -407,6 +407,607 @@
       "nowWallMs": 1793304000000,
       "seededPhase": "expired",
       "seededMs": 0
+    }
+  ],
+  "actionWire": {
+    "events": { "actions": "timer-actions", "soundboardStopped": "soundboard-stopped" },
+    "commands": { "finish": "finish_timer" }
+  },
+  "actionsEventKeys": ["actions", "hook", "id", "lateMs", "seq", "why"],
+  "whys": ["armed", "zero", "endNow", "late", "ranOut", "reset", "deleted"],
+  "hooks": ["start", "end"],
+  "actionKinds": [
+    { "kind": "preset", "fields": ["presetId"], "runsIn": "page", "at": ["start", "zero"] },
+    { "kind": "randomPreset", "fields": [], "runsIn": "page", "at": ["start", "zero"] },
+    { "kind": "revertPreset", "fields": [], "runsIn": "page", "at": ["zero"] },
+    { "kind": "tile", "fields": ["tileId"], "runsIn": "page", "at": ["start", "zero"] },
+    { "kind": "speak", "fields": ["text", "voiceId"], "runsIn": "backend", "at": ["start", "zero"] },
+    { "kind": "saveReplay", "fields": [], "runsIn": "backend", "at": ["start", "zero"] },
+    { "kind": "setMuted", "fields": ["muted"], "runsIn": "backend", "at": ["start", "zero"] },
+    { "kind": "panic", "fields": [], "runsIn": "backend", "at": ["start", "zero"] }
+  ],
+  "actionLimits": { "maxActions": 8, "maxLineChars": 200, "maxTargetChars": 128, "lateOneShotsMs": 30000 },
+  "actionSamples": {
+    "valid": [
+      {
+        "name": "preset",
+        "action": { "kind": "preset", "presetId": "villager" },
+        "read": { "kind": "preset", "presetId": "villager" },
+        "runsIn": "page",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "preset, a 200-character presetId (no length cap)",
+        "action": {
+          "kind": "preset",
+          "presetId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "read": {
+          "kind": "preset",
+          "presetId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "runsIn": "page",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "randomPreset",
+        "action": { "kind": "randomPreset" },
+        "read": { "kind": "randomPreset" },
+        "runsIn": "page",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "revertPreset",
+        "action": { "kind": "revertPreset" },
+        "read": { "kind": "revertPreset" },
+        "runsIn": "page",
+        "restores": true,
+        "reapplies": false
+      },
+      {
+        "name": "tile",
+        "action": { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+        "read": { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+        "runsIn": "page",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "tile, a 128-character tileId",
+        "action": {
+          "kind": "tile",
+          "tileId": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "read": {
+          "kind": "tile",
+          "tileId": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "runsIn": "page",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "speak",
+        "action": { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" },
+        "read": { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "speak, the line trimmed",
+        "action": { "kind": "speak", "text": "\t Be right back. \n", "voiceId": "af_heart" },
+        "read": { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "speak, 200 characters after trimming",
+        "action": {
+          "kind": "speak",
+          "text": "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ",
+          "voiceId": "af_heart"
+        },
+        "read": {
+          "kind": "speak",
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "voiceId": "af_heart"
+        },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "speak, 200 code points (201 UTF-16 units)",
+        "action": {
+          "kind": "speak",
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa🙂",
+          "voiceId": "af_heart"
+        },
+        "read": {
+          "kind": "speak",
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa🙂",
+          "voiceId": "af_heart"
+        },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "speak, a 128-character voiceId",
+        "action": {
+          "kind": "speak",
+          "text": "I'm back.",
+          "voiceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "read": {
+          "kind": "speak",
+          "text": "I'm back.",
+          "voiceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "saveReplay",
+        "action": { "kind": "saveReplay" },
+        "read": { "kind": "saveReplay" },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "setMuted true",
+        "action": { "kind": "setMuted", "muted": true },
+        "read": { "kind": "setMuted", "muted": true },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": true
+      },
+      {
+        "name": "setMuted false",
+        "action": { "kind": "setMuted", "muted": false },
+        "read": { "kind": "setMuted", "muted": false },
+        "runsIn": "backend",
+        "restores": true,
+        "reapplies": true
+      },
+      {
+        "name": "panic",
+        "action": { "kind": "panic" },
+        "read": { "kind": "panic" },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "extra keys are ignored",
+        "action": { "kind": "setMuted", "muted": true, "label": "Mute", "at": "start" },
+        "read": { "kind": "setMuted", "muted": true },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": true
+      },
+      {
+        "name": "another kind's field is ignored",
+        "action": { "kind": "randomPreset", "presetId": "villager" },
+        "read": { "kind": "randomPreset" },
+        "runsIn": "page",
+        "restores": false,
+        "reapplies": false
+      }
+    ],
+    "skipped": [
+      { "name": "not an object: a string", "action": "preset" },
+      { "name": "not an object: null", "action": null },
+      { "name": "not an object: a number", "action": 5 },
+      { "name": "not an object: a list", "action": [{ "kind": "panic" }] },
+      { "name": "kind missing", "action": { "presetId": "villager" } },
+      { "name": "kind not a string", "action": { "kind": 3 } },
+      { "name": "kind null", "action": { "kind": null } },
+      { "name": "kind unknown: monitor (a glyph toggle)", "action": { "kind": "monitor" } },
+      { "name": "kind unknown: mute (a glyph toggle)", "action": { "kind": "mute" } },
+      { "name": "kind unknown: obs (v1.61.0's)", "action": { "kind": "obs", "op": "sceneBack" } },
+      { "name": "kind spelled in another case", "action": { "kind": "Panic" } },
+      { "name": "preset without presetId", "action": { "kind": "preset" } },
+      { "name": "preset, presetId empty", "action": { "kind": "preset", "presetId": "" } },
+      { "name": "preset, presetId not a string", "action": { "kind": "preset", "presetId": 5 } },
+      { "name": "tile without tileId", "action": { "kind": "tile" } },
+      { "name": "tile, tileId empty", "action": { "kind": "tile", "tileId": "" } },
+      { "name": "tile, tileId null", "action": { "kind": "tile", "tileId": null } },
+      {
+        "name": "tile, a 129-character tileId",
+        "action": {
+          "kind": "tile",
+          "tileId": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      { "name": "speak without text", "action": { "kind": "speak", "voiceId": "af_heart" } },
+      { "name": "speak without voiceId", "action": { "kind": "speak", "text": "I'm back." } },
+      {
+        "name": "speak, text not a string",
+        "action": { "kind": "speak", "text": ["I'm back."], "voiceId": "af_heart" }
+      },
+      { "name": "speak, voiceId not a string", "action": { "kind": "speak", "text": "I'm back.", "voiceId": 7 } },
+      { "name": "speak, text empty", "action": { "kind": "speak", "text": "", "voiceId": "af_heart" } },
+      { "name": "speak, text only whitespace", "action": { "kind": "speak", "text": " \t ", "voiceId": "af_heart" } },
+      {
+        "name": "speak, 201 characters",
+        "action": {
+          "kind": "speak",
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "voiceId": "af_heart"
+        }
+      },
+      { "name": "speak, voiceId empty", "action": { "kind": "speak", "text": "I'm back.", "voiceId": "" } },
+      {
+        "name": "speak, a 129-character voiceId",
+        "action": {
+          "kind": "speak",
+          "text": "I'm back.",
+          "voiceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      { "name": "setMuted without muted", "action": { "kind": "setMuted" } },
+      { "name": "setMuted, muted a string", "action": { "kind": "setMuted", "muted": "true" } },
+      { "name": "setMuted, muted a number", "action": { "kind": "setMuted", "muted": 0 } },
+      { "name": "setMuted, muted null", "action": { "kind": "setMuted", "muted": null } },
+      {
+        "name": "speak, a lone surrogate in the line (page only: JSON can't hold one, so the test appends \\uD800 to text; Rust never receives one, serde_json refuses the whole invoke)",
+        "pageOnly": true,
+        "appendLoneSurrogate": "text",
+        "action": { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" }
+      }
+    ]
+  },
+  "listSamples": [
+    {
+      "name": "no lists (a v1.59.0 timer): nothing read, nothing sent",
+      "entry": { "id": "timer-1", "name": "BRB", "kind": "countdown", "durationMs": 300000 },
+      "read": { "onStart": [], "onFire": [] },
+      "sent": {},
+      "rows": { "onStart": [], "onFire": [] }
+    },
+    {
+      "name": "a countdown's lists are sent as read: validated fields only, the line trimmed",
+      "entry": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "durationMs": 300000,
+        "onStart": [
+          { "kind": "setMuted", "muted": true, "label": "Mute" },
+          { "kind": "speak", "text": "  Be right back.  ", "voiceId": "af_heart" }
+        ],
+        "onFire": [{ "kind": "setMuted", "muted": false }, { "kind": "revertPreset" }]
+      },
+      "read": {
+        "onStart": [
+          { "kind": "setMuted", "muted": true },
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" }
+        ],
+        "onFire": [{ "kind": "setMuted", "muted": false }, { "kind": "revertPreset" }]
+      },
+      "sent": {
+        "onStart": [
+          { "kind": "setMuted", "muted": true },
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" }
+        ],
+        "onFire": [{ "kind": "setMuted", "muted": false }, { "kind": "revertPreset" }]
+      },
+      "rows": {
+        "onStart": [
+          { "index": 0, "runs": true, "action": { "kind": "setMuted", "muted": true } },
+          { "index": 1, "runs": true, "action": { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" } }
+        ],
+        "onFire": [
+          { "index": 0, "runs": true, "action": { "kind": "setMuted", "muted": false } },
+          { "index": 1, "runs": true, "action": { "kind": "revertPreset" } }
+        ]
+      }
+    },
+    {
+      "name": "ten entries, the third an unknown kind: only the first eight are read, so seven run; an empty list isn't sent",
+      "entry": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "durationMs": 300000,
+        "onStart": [],
+        "onFire": [
+          { "kind": "setMuted", "muted": true },
+          { "kind": "preset", "presetId": "villager" },
+          { "kind": "obs", "op": "sceneBack" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+          { "kind": "saveReplay" },
+          { "kind": "randomPreset" },
+          { "kind": "panic" },
+          { "kind": "mute" },
+          { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" }
+        ]
+      },
+      "read": {
+        "onStart": [],
+        "onFire": [
+          { "kind": "setMuted", "muted": true },
+          { "kind": "preset", "presetId": "villager" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+          { "kind": "saveReplay" },
+          { "kind": "randomPreset" },
+          { "kind": "panic" }
+        ]
+      },
+      "sent": {
+        "onFire": [
+          { "kind": "setMuted", "muted": true },
+          { "kind": "preset", "presetId": "villager" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+          { "kind": "saveReplay" },
+          { "kind": "randomPreset" },
+          { "kind": "panic" }
+        ]
+      },
+      "rows": {
+        "onStart": [],
+        "onFire": [
+          { "index": 0, "runs": true, "action": { "kind": "setMuted", "muted": true } },
+          { "index": 1, "runs": true, "action": { "kind": "preset", "presetId": "villager" } },
+          { "index": 2, "runs": false, "action": null, "why": "unreadable" },
+          { "index": 3, "runs": true, "action": { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" } },
+          { "index": 4, "runs": true, "action": { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" } },
+          { "index": 5, "runs": true, "action": { "kind": "saveReplay" } },
+          { "index": 6, "runs": true, "action": { "kind": "randomPreset" } },
+          { "index": 7, "runs": true, "action": { "kind": "panic" } },
+          { "index": 8, "runs": false, "action": null, "why": "pastEight" },
+          {
+            "index": 9,
+            "runs": false,
+            "action": { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" },
+            "why": "pastEight"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a second line: only a list's first readable line runs",
+      "entry": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "durationMs": 300000,
+        "onStart": [
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+          { "kind": "setMuted", "muted": true },
+          { "kind": "speak", "text": "Back soon.", "voiceId": "af_heart" }
+        ],
+        "onFire": [
+          { "kind": "speak", "text": "   ", "voiceId": "af_heart" },
+          { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" },
+          { "kind": "speak", "text": "Welcome back.", "voiceId": "af_heart" }
+        ]
+      },
+      "read": {
+        "onStart": [
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+          { "kind": "setMuted", "muted": true }
+        ],
+        "onFire": [{ "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" }]
+      },
+      "sent": {
+        "onStart": [
+          { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
+          { "kind": "setMuted", "muted": true }
+        ],
+        "onFire": [{ "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" }]
+      },
+      "rows": {
+        "onStart": [
+          { "index": 0, "runs": true, "action": { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" } },
+          { "index": 1, "runs": true, "action": { "kind": "setMuted", "muted": true } },
+          {
+            "index": 2,
+            "runs": false,
+            "action": { "kind": "speak", "text": "Back soon.", "voiceId": "af_heart" },
+            "why": "secondLine"
+          }
+        ],
+        "onFire": [
+          { "index": 0, "runs": false, "action": null, "why": "unreadable" },
+          { "index": 1, "runs": true, "action": { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" } },
+          {
+            "index": 2,
+            "runs": false,
+            "action": { "kind": "speak", "text": "Welcome back.", "voiceId": "af_heart" },
+            "why": "secondLine"
+          }
+        ]
+      }
+    },
+    {
+      "name": "not an array: read as empty, kept as written",
+      "entry": {
+        "id": "timer-1",
+        "name": "BRB",
+        "kind": "countdown",
+        "durationMs": 300000,
+        "onStart": {},
+        "onFire": 5
+      },
+      "read": { "onStart": [], "onFire": [] },
+      "sent": {},
+      "rows": { "onStart": [], "onFire": [] }
+    },
+    {
+      "name": "a count-up: each list reads on its own, but a count-up's lists are never sent or run",
+      "entry": {
+        "id": "timer-2",
+        "name": "Uptime",
+        "kind": "countup",
+        "durationMs": 300000,
+        "onStart": [{ "kind": "setMuted", "muted": true }],
+        "onFire": [{ "kind": "setMuted", "muted": false }]
+      },
+      "read": {
+        "onStart": [{ "kind": "setMuted", "muted": true }],
+        "onFire": [{ "kind": "setMuted", "muted": false }]
+      },
+      "sent": {},
+      "rows": {
+        "onStart": [{ "index": 0, "runs": true, "action": { "kind": "setMuted", "muted": true } }],
+        "onFire": [{ "index": 0, "runs": true, "action": { "kind": "setMuted", "muted": false } }]
+      }
+    }
+  ],
+  "actionsEventSamples": [
+    {
+      "name": "armed: Start (Started) runs At start; the event carries the page half only, its preset and tile in list order (the mute runs in the backend; revertPreset never runs at a start)",
+      "transition": { "variant": "Started", "id": "timer-1", "fires": 0 },
+      "lists": {
+        "onStart": [
+          { "kind": "setMuted", "muted": true },
+          { "kind": "preset", "presetId": "villager" },
+          { "kind": "revertPreset" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }
+        ],
+        "onFire": [{ "kind": "setMuted", "muted": false }, { "kind": "revertPreset" }]
+      },
+      "seq": 1,
+      "event": {
+        "seq": 1,
+        "id": "timer-1",
+        "hook": "start",
+        "why": "armed",
+        "lateMs": 0,
+        "actions": [{ "kind": "preset", "presetId": "villager" }, { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }]
+      }
+    },
+    {
+      "name": "zero: reached 00:00 30 000 ms late (lateOneShotsMs, the most that still runs all of At zero); the page half holds all four page kinds, in list order",
+      "transition": { "variant": "Fired", "id": "timer-1", "fires": 1, "lateMs": 30000, "finished": false },
+      "lists": {
+        "onStart": [],
+        "onFire": [
+          { "kind": "setMuted", "muted": false },
+          { "kind": "preset", "presetId": "villager" },
+          { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" },
+          { "kind": "randomPreset" },
+          { "kind": "panic" },
+          { "kind": "revertPreset" },
+          { "kind": "saveReplay" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }
+        ]
+      },
+      "seq": 2,
+      "event": {
+        "seq": 2,
+        "id": "timer-1",
+        "hook": "end",
+        "why": "zero",
+        "lateMs": 30000,
+        "actions": [
+          { "kind": "preset", "presetId": "villager" },
+          { "kind": "randomPreset" },
+          { "kind": "revertPreset" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }
+        ]
+      }
+    },
+    {
+      "name": "endNow: End now (Fired, finished) runs all of At zero, one-shots included; lateMs is 0",
+      "transition": { "variant": "Fired", "id": "timer-1", "fires": 1, "lateMs": 0, "finished": true },
+      "lists": {
+        "onStart": [{ "kind": "setMuted", "muted": true }],
+        "onFire": [
+          { "kind": "setMuted", "muted": false },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+          { "kind": "revertPreset" }
+        ]
+      },
+      "seq": 3,
+      "event": {
+        "seq": 3,
+        "id": "timer-1",
+        "hook": "end",
+        "why": "endNow",
+        "lateMs": 0,
+        "actions": [{ "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }, { "kind": "revertPreset" }]
+      }
+    },
+    {
+      "name": "late: found due 30 001 ms late, past lateOneShotsMs, so only At zero's restoring actions run; the clip and the switch are one-shots",
+      "transition": { "variant": "Fired", "id": "timer-1", "fires": 1, "lateMs": 30001, "finished": false },
+      "lists": {
+        "onStart": [{ "kind": "setMuted", "muted": true }, { "kind": "preset", "presetId": "villager" }],
+        "onFire": [
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
+          { "kind": "setMuted", "muted": false },
+          { "kind": "preset", "presetId": "hollow-king" },
+          { "kind": "revertPreset" },
+          { "kind": "speak", "text": "I'm back.", "voiceId": "af_heart" }
+        ]
+      },
+      "seq": 4,
+      "event": {
+        "seq": 4,
+        "id": "timer-1",
+        "hook": "end",
+        "why": "late",
+        "lateMs": 30001,
+        "actions": [{ "kind": "revertPreset" }]
+      }
+    },
+    {
+      "name": "ranOut: ran out while the PC slept (Expired); only restoring actions run and the unmute runs in the backend, so the page half is empty and the event still goes",
+      "transition": { "variant": "Expired", "id": "timer-1" },
+      "lists": {
+        "onStart": [{ "kind": "setMuted", "muted": true }],
+        "onFire": [{ "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }, { "kind": "setMuted", "muted": false }]
+      },
+      "seq": 5,
+      "event": { "seq": 5, "id": "timer-1", "hook": "end", "why": "ranOut", "lateMs": 0, "actions": [] }
+    },
+    {
+      "name": "reset: Reset mid-run (Cancelled reset) undoes its start: revertPreset; the clip is a one-shot (the unmute runs in the backend, as At start muted)",
+      "transition": { "variant": "Cancelled", "id": "timer-1", "why": "reset" },
+      "lists": {
+        "onStart": [{ "kind": "setMuted", "muted": true }, { "kind": "preset", "presetId": "villager" }],
+        "onFire": [
+          { "kind": "setMuted", "muted": false },
+          { "kind": "revertPreset" },
+          { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" }
+        ]
+      },
+      "seq": 6,
+      "event": {
+        "seq": 6,
+        "id": "timer-1",
+        "hook": "end",
+        "why": "reset",
+        "lateMs": 0,
+        "actions": [{ "kind": "revertPreset" }]
+      }
+    },
+    {
+      "name": "deleted: deleted mid-run (Cancelled removed); revertPreset always reaches the page (its return guards it); its start muted nothing, so the backend doesn't unmute",
+      "transition": { "variant": "Cancelled", "id": "timer-1", "why": "removed" },
+      "lists": { "onStart": [], "onFire": [{ "kind": "setMuted", "muted": false }, { "kind": "revertPreset" }] },
+      "seq": 7,
+      "event": {
+        "seq": 7,
+        "id": "timer-1",
+        "hook": "end",
+        "why": "deleted",
+        "lateMs": 0,
+        "actions": [{ "kind": "revertPreset" }]
+      }
     }
   ]
 }

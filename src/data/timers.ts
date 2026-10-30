@@ -22,6 +22,7 @@ import {
   type TimerState,
 } from "../overlay/timerState";
 import { normalizeAccelerator } from "./hotkeys";
+import { actionsForSync, type TimerAction } from "./timerActions";
 
 /** `divora.timers`' version now. A larger one is read with these rules and
  *  never lowered. */
@@ -41,10 +42,11 @@ export const MAX_NAME = 40;
 /** The most entries `sync_timers` reads; Rust skips the rest. */
 export const MAX_SYNC_ENTRIES = 64;
 
-/** The hotkey verbs v1.59.0 registers. A stored timer may hold others (a
- *  later build's `finish`): they are kept and never registered. */
-export type TimerVerb = "toggle" | "reset";
-export const TIMER_VERBS: readonly TimerVerb[] = ["toggle", "reset"];
+/** The hotkey verbs this build registers: start or pause, reset and (since
+ *  v1.60.0) End now. A stored timer may hold others (a later build's): they
+ *  are kept and never registered. */
+export type TimerVerb = "toggle" | "reset" | "finish";
+export const TIMER_VERBS: readonly TimerVerb[] = ["toggle", "reset", "finish"];
 
 /** A timer's last run as the page saw it, stored and sent as `resume`.
  *  Integers. A running countdown: `totalMs` and `anchorMs` (when it ends). A
@@ -59,7 +61,11 @@ export interface TimerRun {
 
 /** One entry of `divora.timers`. `kind` is any string: a kind this build
  *  doesn't know is kept and not run. `hotkeys` holds accelerators by verb.
- *  Every other key is kept. */
+ *  v1.60.0: `onStart` and `onFire` are a countdown's At start and At zero
+ *  lists, kept as written and read only through data/timerActions.ts
+ *  (`readStoredActions`, `actionsForSync`), which take a non-array as
+ *  empty: nothing checks them on the way in, so they are `unknown`. Every
+ *  other key is kept. */
 export interface StoredTimer {
   id: string;
   name: string;
@@ -67,23 +73,31 @@ export interface StoredTimer {
   durationMs: number;
   hotkeys?: Record<string, string>;
   run?: TimerRun;
+  onStart?: unknown;
+  onFire?: unknown;
   [k: string]: unknown;
 }
 
-/** `divora.timers`. Unknown keys are kept. */
+/** `divora.timers`. v1.60.0: `presetReturns` is where each timer's start
+ *  switched the preset from, read only through `readReturns`
+ *  (data/timerActions.ts). Unknown keys are kept. */
 export interface StoredTimers {
   version: number;
   timers: StoredTimer[];
+  presetReturns?: unknown;
   [k: string]: unknown;
 }
 
-/** What `sync_timers` takes for each timer: validated fields only. */
+/** What `sync_timers` takes for each timer: validated fields only. v1.60.0:
+ *  a countdown's lists, each only when it has an action that runs. */
 export interface TimerDefWire {
   id: string;
   name: string;
   kind: string;
   durationMs: number;
   resume?: TimerRun;
+  onStart?: TimerAction[];
+  onFire?: TimerAction[];
 }
 
 /** "run": the backend runs it. "newer": a kind this build doesn't know.
@@ -219,12 +233,21 @@ export function timersForSave(s: StoredTimers): StoredTimers {
 
 /** What `sync_timers` sends: every stored timer, in list order, kinds this
  *  build doesn't run included (so the backend keeps their files), built
- *  from validated fields only, with its run as `resume`. No other key is
- *  sent. */
+ *  from validated fields only, with its run as `resume`. v1.60.0: a
+ *  countdown's `onStart` and `onFire`, each only when `actionsForSync`
+ *  gives it an action (as `resume` goes only with a run), so a timer
+ *  without actions sends what v1.59.0 sent; a count-up's lists never go
+ *  (it never reaches zero). No other key is sent. */
 export function defsForSync(s: StoredTimers): TimerDefWire[] {
   return readTimers(s).timers.map((t) => {
     const def: TimerDefWire = { id: t.id, name: t.name, kind: t.kind, durationMs: t.durationMs };
     if (t.run) def.resume = t.run;
+    if (t.kind === "countdown") {
+      const onStart = actionsForSync(t.onStart);
+      const onFire = actionsForSync(t.onFire);
+      if (onStart.length > 0) def.onStart = onStart;
+      if (onFire.length > 0) def.onFire = onFire;
+    }
     return def;
   });
 }
@@ -302,9 +325,9 @@ export function timerHotkeyId(id: string, verb: TimerVerb): string {
 }
 
 /** A `tm:` hotkey id → its timer and verb, or null: exactly `tm:`, an id
- *  that passes the grammar, `:` and `toggle` or `reset`, spelled exactly.
- *  The backend's `hotkey_timer_request` reads the same table, and also
- *  ignores a release; this one doesn't look at presses. */
+ *  that passes the grammar, `:` and `toggle`, `reset` or `finish`, spelled
+ *  exactly. The backend's `hotkey_timer_request` reads the same table, and
+ *  also ignores a release; this one doesn't look at presses. */
 export function parseTimerHotkeyId(s: string): { id: string; verb: TimerVerb } | null {
   if (typeof s !== "string" || !s.startsWith(HOTKEY_PREFIX)) return null;
   const parts = s.slice(HOTKEY_PREFIX.length).split(":");

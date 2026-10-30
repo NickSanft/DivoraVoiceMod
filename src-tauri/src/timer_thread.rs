@@ -14,20 +14,26 @@
 //!
 //! Neither thread is joined or stopped: Divora has no exit hook, and both
 //! run for the process (D14).
+//!
+//! v1.60.0: a hook run's backend half goes to `divora-timer-actions`, the
+//! action worker, by a send that never waits ([`hand_off`]); the worker runs
+//! each batch in order against an [`ActionHost`], so nothing that can wait
+//! runs on `divora-timers` (D13, D14).
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::timer_actions::{route, Action, ActionBatch, Hook, Planned, TimerActionsEvent};
 use crate::timers::{
-    entry_from_wire, hotkey_timer_request, Note, TextUpdate, TimerCore, TimerOp, TimerSnapshot,
-    Transition, LATE_LOG, MAX_SYNC_ENTRIES,
+    entry_from_wire, hotkey_timer_request, CancelWhy, Note, TextUpdate, TimerCore, TimerOp,
+    TimerSnapshot, Transition, LATE_LOG, MAX_SYNC_ENTRIES,
 };
 
 /// The clocks every reader takes one reading of.
@@ -84,11 +90,126 @@ impl SleepCheck for divora_capture::SleepWatch {
 }
 
 /// Where the timer thread sends each snapshot it builds: `timer-state`, to
-/// every window.
+/// every window; and (v1.60.0) each hook run it plans.
 pub trait TimerEvents: Send + 'static {
     /// Never blocks. (Not `state`: `tauri::Manager::state` on the same
     /// `AppHandle` would then be ambiguous wherever this trait is in scope.)
     fn timer_state(&self, s: &TimerSnapshot);
+    /// v1.60.0: one hook run, numbered `seq`. Never blocks: hands the
+    /// backend half to the action worker, then emits the page's half
+    /// (`timer-actions`) — in production, one [`hand_off`].
+    fn timer_actions(&self, p: &Planned, seq: u64);
+}
+
+/// v1.60.0: batches waiting for the action worker at most. A batch past it
+/// is dropped and warned (K3): the worker's own work never waits, so only a
+/// stalled one falls this far behind.
+pub const ACTION_QUEUE: usize = 32;
+
+/// v1.60.0: what the action worker runs a batch against (D14). Every method
+/// returns at once: the mute is an atomic op, Stop all a send that never
+/// waits, a replay save goes to the blocking pool and a line to the line
+/// thread.
+pub trait ActionHost: Send + 'static {
+    /// `SetMuted`: a plain set, never a toggle (D24).
+    fn set_muted(&self, muted: bool);
+    /// `Panic`: stop every clip and line, and tell the page (D23).
+    fn stop_all(&self);
+    /// `SaveReplay`: save the seconds up to `at` (D22).
+    fn save_replay(&self, at: Instant);
+    /// `Speak`: put `timer`'s line in the line slot, newest wins (D21).
+    fn speak(&self, timer: &str, text: &str, voice_id: &str);
+    /// Every end batch, before its actions: `timer`'s start line, waiting or
+    /// being prepared, is stale (D21).
+    fn end_run(&self, timer: &str);
+}
+
+/// v1.60.0: `b` to the action worker without waiting. `false` when it was
+/// dropped — the queue full or the worker gone — warned once per 10 s at
+/// most.
+pub fn hand_batch(tx: &SyncSender<ActionBatch>, b: ActionBatch) -> bool {
+    const WARN_EVERY: Duration = Duration::from_secs(10);
+    static WARNED: Mutex<Option<Instant>> = Mutex::new(None);
+    let (why, id) = match tx.try_send(b) {
+        Ok(()) => return true,
+        Err(TrySendError::Full(b)) => ("the action worker is behind", b.id),
+        Err(TrySendError::Disconnected(b)) => ("the action worker isn't running", b.id),
+    };
+    let now = Instant::now();
+    let warn = {
+        let mut warned = lock(&WARNED);
+        let due = warned.is_none_or(|at| now.saturating_duration_since(at) >= WARN_EVERY);
+        if due {
+            *warned = Some(now);
+        }
+        due
+    };
+    if warn {
+        tracing::warn!(id = %id, "a timer's actions were dropped: {why}");
+    }
+    false
+}
+
+/// v1.60.0 (D13): one hook run's hand-off, in this order: [`route`], the
+/// batch to the worker ([`hand_batch`]), then `emit` with the page's event —
+/// so the batch never waits for the emit. `drained` is when the timer thread
+/// drained the transition. A restart's re-mute hands a batch and emits
+/// nothing.
+#[doc(hidden)]
+pub fn hand_off(
+    p: &Planned,
+    seq: u64,
+    drained: Instant,
+    tx: &SyncSender<ActionBatch>,
+    emit: impl FnOnce(&TimerActionsEvent),
+) {
+    let (batch, event) = route(p, seq, drained);
+    if let Some(b) = batch {
+        hand_batch(tx, b);
+    }
+    if let Some(ev) = event {
+        emit(&ev);
+    }
+}
+
+/// v1.60.0 (D14): the `divora-timer-actions` loop. Each batch, in the order
+/// handed: an end first retires its timer's start line (`end_run`), then
+/// each action in list order (`panic` already first), then one log line —
+/// after the actions, so a disk stall can't delay a mute. The page's kinds
+/// never reach a batch. Returns once every sender is gone.
+#[doc(hidden)]
+pub fn run_action_worker(rx: Receiver<ActionBatch>, host: &dyn ActionHost) {
+    for b in rx {
+        if b.hook == Hook::End {
+            host.end_run(&b.id);
+        }
+        for a in &b.actions {
+            match a {
+                Action::SetMuted { muted } => host.set_muted(*muted),
+                Action::Panic => host.stop_all(),
+                Action::SaveReplay => host.save_replay(b.at),
+                Action::Speak { text, voice_id } => host.speak(&b.id, text, voice_id),
+                Action::Preset { .. }
+                | Action::RandomPreset
+                | Action::RevertPreset
+                | Action::Tile { .. } => {}
+            }
+        }
+        let kinds: Vec<&str> = b.actions.iter().map(Action::kind).collect();
+        tracing::info!(id = %b.id, hook = ?b.hook, why = ?b.why, ?kinds, "timer actions ran");
+    }
+}
+
+/// v1.60.0: starts `divora-timer-actions` running [`run_action_worker`]. A
+/// failed spawn is logged, and a timer's backend actions then never run
+/// (each batch is dropped and warned).
+pub fn spawn_action_worker(rx: Receiver<ActionBatch>, host: impl ActionHost) {
+    let spawned = std::thread::Builder::new()
+        .name("divora-timer-actions".into())
+        .spawn(move || run_action_worker(rx, &host));
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "couldn't start the timer action worker; timers' actions won't run");
+    }
 }
 
 /// Why a [`Waiter`] returned.
@@ -303,12 +424,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// D19: the shortcut handler's timer step. A press of `tm:<id>:toggle` or
-/// `tm:<id>:reset` acts on that timer; a release, any other id, or an id the
-/// core doesn't run does nothing. Runs inside `WM_HOTKEY` on the main
-/// thread, so it only takes the core's lock for microseconds: it never
-/// registers, unregisters, writes, logs or emits (the timer thread logs and
-/// emits).
+/// D19: the shortcut handler's timer step. A press of `tm:<id>:toggle`,
+/// `tm:<id>:reset` or (v1.60.0, End now) `tm:<id>:finish` acts on that
+/// timer; a release, any other id, or an id the core doesn't run does
+/// nothing. Runs inside `WM_HOTKEY` on the main thread, so it only takes
+/// the core's lock for microseconds: it never registers, unregisters,
+/// writes, logs or emits (the timer thread logs and emits).
 pub fn timer_on_hotkey(shared: &TimerShared, id: &str, pressed: bool) {
     let Some((timer, op)) = hotkey_timer_request(id, pressed) else {
         return;
@@ -370,22 +491,41 @@ pub fn run_timer_loop(
 /// to act from.
 fn log_transition(t: &Transition) {
     match t {
-        Transition::Fired { id, fires, late_ms } => {
+        Transition::Fired {
+            id,
+            fires,
+            finished: true,
+            ..
+        } => {
+            tracing::info!(id = %id, fires, "a timer was ended now");
+        }
+        Transition::Fired {
+            id, fires, late_ms, ..
+        } => {
             if Duration::from_millis(*late_ms) > LATE_LOG {
                 tracing::warn!(id = %id, fires, late_ms, "a timer finished late");
             } else {
                 tracing::info!(id = %id, fires, late_ms, "a timer finished");
             }
         }
-        Transition::Expired { id } => {
+        Transition::Expired { id, .. } => {
             tracing::info!(id = %id, "a timer ran out while the PC slept; not finished");
         }
         Transition::SleepPaused { id } => {
             tracing::info!(id = %id, "a count-up paused where the PC slept");
         }
-        Transition::Seeded { id, phase } => {
-            tracing::info!(id = %id, ?phase, "a timer picked up its stored run");
+        Transition::Seeded {
+            id, phase, from, ..
+        } => {
+            tracing::info!(id = %id, ?phase, ?from, "a timer picked up its stored run");
         }
+        Transition::Started { id, fires, .. } => {
+            tracing::info!(id = %id, fires, "a timer started");
+        }
+        Transition::Cancelled { id, why, .. } => match why {
+            CancelWhy::Reset => tracing::info!(id = %id, "a running timer was reset"),
+            CancelWhy::Removed => tracing::info!(id = %id, "a running timer was deleted"),
+        },
     }
 }
 
@@ -1014,6 +1154,7 @@ mod tests {
         TextWriter, TimerClock, TimerEvents, TimerShared, Waiter, Woke, BACKOFF_AFTER,
         REPAIR_EVERY, RETRY_WAIT,
     };
+    use crate::timer_actions::Planned;
     use crate::timers::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use crate::timers::{
         timer_text, TextUpdate, TimerKind, TimerOp, TimerPhase, TimerSnapshot, MAX_SYNC_ENTRIES,
@@ -1181,6 +1322,8 @@ mod tests {
                 .unwrap()
                 .push((self.clock.now(), s.clone()));
         }
+
+        fn timer_actions(&self, _p: &Planned, _seq: u64) {}
     }
 
     /// Every set handed to the writer.
@@ -1267,6 +1410,8 @@ mod tests {
         fn timer_state(&self, s: &TimerSnapshot) {
             self.0.lock().unwrap().push((Instant::now(), s.clone()));
         }
+
+        fn timer_actions(&self, _p: &Planned, _seq: u64) {}
     }
 
     impl Heard {
@@ -1326,15 +1471,26 @@ mod tests {
         }
     }
 
-    /// Blocks its first emit at a gate.
+    /// Blocks its first emit — a snapshot or (v1.60.0) a hook run — at a
+    /// gate.
     struct GatedEvents(Mutex<Option<Gate>>);
 
-    impl TimerEvents for GatedEvents {
-        fn timer_state(&self, _s: &TimerSnapshot) {
+    impl GatedEvents {
+        fn pass(&self) {
             let gate = self.0.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.pass();
             }
+        }
+    }
+
+    impl TimerEvents for GatedEvents {
+        fn timer_state(&self, _s: &TimerSnapshot) {
+            self.pass();
+        }
+
+        fn timer_actions(&self, _p: &Planned, _seq: u64) {
+            self.pass();
         }
     }
 
@@ -1989,8 +2145,8 @@ mod tests {
     /// D19, seam 3: the handler's step through the real core. A press of
     /// `tm:timer-1:toggle` starts it and wakes the thread; another pauses
     /// it where it is; a release does nothing (and wakes nothing); reset
-    /// makes it idle; an id the core doesn't run, `finish` and other keys do
-    /// nothing.
+    /// makes it idle; an id the core doesn't run, other keys and (v1.60.0)
+    /// `finish` on an idle timer, which has nothing to end, do nothing.
     #[test]
     fn the_timer_hotkey_toggles_through_the_core() {
         let (shared, clock, woken) = fake();

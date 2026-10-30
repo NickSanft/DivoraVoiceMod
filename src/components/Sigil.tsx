@@ -21,6 +21,7 @@ export type SigilName =
   | "mixer" | "soundboard" | "presets" | "settings"
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
   | "lock" | "unlock" | "panic" | "play" | "stop" | "pause" | "hourglass" | "record" | "screen" | "replay"
+  | "endNow" | "shuffle" | "undo"
   | "image" | "expand"
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
@@ -256,6 +257,29 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
       <path d="M7.5 3.5 V6.5 C7.5 9.5 12 10.5 12 12 C12 13.5 7.5 14.5 7.5 17.5 V20.5" />
       <path d="M16.5 3.5 V6.5 C16.5 9.5 12 10.5 12 12 C12 13.5 16.5 14.5 16.5 17.5 V20.5" />
       <path d="M10 18.5 Q12 16.6 14 18.5" />
+    </g>
+  ),
+  // v1.60.0: timers that change your voice. End now is filled like play: a
+  // triangle run up against a bar, the end. Random preset is two paths that
+  // cross, each arrowed on; Back to the preset before is an arrow that turns
+  // back on itself. Both stroked, as the hourglass is.
+  endNow: () => (
+    <g fill="currentColor">
+      <path d="M5.5 5.5 L14.5 12 L5.5 18.5 Z" />
+      <rect x="15.5" y="5.5" width="3" height="13" rx="1.1" />
+    </g>
+  ),
+  shuffle: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 7 H7.5 C11 7 13 17 16.5 17 H20" />
+      <path d="M4 17 H7.5 C11 17 13 7 16.5 7 H20" />
+      <path d="M17.5 4.5 L20 7 L17.5 9.5 M17.5 14.5 L20 17 L17.5 19.5" />
+    </g>
+  ),
+  undo: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 5 L5 9 L9 13" />
+      <path d="M5 9 H14 A5 5 0 0 1 14 19 H10" />
     </g>
   ),
   chevronR: () => <path d="M9.5 6 L15.5 12 L9.5 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />,

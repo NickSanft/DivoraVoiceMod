@@ -64,6 +64,25 @@ describe("Sigil", () => {
     for (const bar of bars) expect(bar.closest("[fill]")?.getAttribute("fill")).toBe("currentColor");
   });
 
+  it("includes the timer actions' sigils, and they draw (v1.60.0)", () => {
+    for (const name of ["endNow", "shuffle", "undo"] as const) {
+      expect(SIGIL_NAMES).toContain(name);
+      const { container } = render(() => <Sigil name={name} size={15} />);
+      const svg = container.querySelector("svg")!;
+      expect(svg.getAttribute("width")).toBe("15");
+      expect(svg.querySelectorAll("path, rect").length).toBeGreaterThan(0);
+    }
+    // End now is filled, as play is; the other two are stroked, as the
+    // hourglass is.
+    const end = render(() => <Sigil name="endNow" />).container.querySelector("svg > g")!;
+    expect(end.getAttribute("fill")).toBe("currentColor");
+    for (const name of ["shuffle", "undo"] as const) {
+      const g = render(() => <Sigil name={name} />).container.querySelector("svg > g")!;
+      expect(g.getAttribute("fill")).toBe("none");
+      expect(g.getAttribute("stroke")).toBe("currentColor");
+    }
+  });
+
   it("includes every nav name in the catalog", () => {
     for (const name of ["mixer", "soundboard", "presets", "settings"] as const) {
       expect(SIGIL_NAMES).toContain(name);

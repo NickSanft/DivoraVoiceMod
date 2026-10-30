@@ -66,11 +66,23 @@ impl Phonemizer {
     ///
     /// Returns [`PhonemizeError::NotInstalled`] without spawning anything when
     /// the binary is absent (so it can never hang waiting on a missing tool).
+    ///
+    /// v1.60.0 (D35): on Windows the child starts with no console window.
+    /// `espeak-ng.exe` is a console program, and an installed Divora is a GUI
+    /// process with no console of its own to share, so each spawn — one per
+    /// chunk of a line — could open a window of its own, over a game, when a
+    /// timer's line fires unattended.
     pub fn phonemize(&self, text: &str, lang: &str) -> Result<String, PhonemizeError> {
         if !self.is_available() {
             return Err(PhonemizeError::NotInstalled(self.bin.clone()));
         }
         let mut cmd = Command::new(&self.bin);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW.
+            cmd.creation_flags(0x0800_0000);
+        }
         cmd.args(espeak_args(lang, self.data.as_deref(), text));
         let output = cmd.output()?;
         if !output.status.success() {
@@ -191,5 +203,31 @@ mod tests {
     #[test]
     fn clean_ipa_empty_is_empty() {
         assert_eq!(clean_ipa("   \n  "), "");
+    }
+
+    /// v1.60.0 (D35): `espeak-ng` starts with `CREATE_NO_WINDOW` on Windows,
+    /// so a timer's line never opens a console over a game. Whether a window
+    /// shows depends on how the app was started (a debug build shares its
+    /// console), so this reads the source: the flag is set under
+    /// `cfg(windows)` in `phonemize`, before the child is spawned. Needles
+    /// are split by `concat!` so they can't match themselves.
+    #[test]
+    fn phonemize_never_opens_a_console() {
+        let file = include_str!("phonemize.rs").replace('\r', "");
+        let tests_at = file
+            .find(concat!("#[cfg(test)]\nmod ", "tests {"))
+            .expect("the tests module");
+        let prod = &file[..tests_at];
+        let start = prod
+            .find(concat!("pub fn ", "phonemize("))
+            .expect("phonemize");
+        let body = &prod[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let cfg = at(concat!("#[cfg(", "windows)]"));
+        let flag = at(concat!("cmd.creation_flags(", "0x0800_0000);"));
+        let spawn = at(concat!("cmd.", "output()"));
+        assert!(cfg < flag && flag < spawn);
+        assert_eq!(prod.matches(concat!("creation_", "flags(")).count(), 1);
     }
 }

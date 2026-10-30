@@ -5376,6 +5376,16 @@ describe("app store — Hourglass (v1.59.0)", () => {
           change(id, { ms: 170_000, text: "02:50" });
           answer = snapshot();
           break;
+        case "finish_timer": {
+          const t = timers.find((x) => x.id === id);
+          if (t?.kind === "countdown" && (t.phase === "running" || t.phase === "paused")) {
+            change(id, { phase: "done", ms: 0, anchorMs: null, text: "00:00", fires: t.fires + 1 });
+          } else {
+            change(id, {});
+          }
+          answer = snapshot();
+          break;
+        }
         case "timers_dir":
           answer = "C:\\Users\\me\\AppData\\Roaming\\com.divora.voice\\timers";
           break;
@@ -5652,7 +5662,8 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(synced()).toHaveLength(2);
     });
 
-    it("delete unregisters both keys first, then syncs without the timer", async () => {
+    // v1.60.0: three keys, End now's included.
+    it("delete unregisters its three keys first, then syncs without the timer", async () => {
       store(entry("timer-1", { hotkeys: { toggle: "F9" } }), entry("timer-2", { name: "Intro" }));
       backend();
       const { result } = setupApp();
@@ -5662,6 +5673,7 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(calls.map((c) => [c.cmd, c.args])).toEqual([
         ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
         ["unregister_global_shortcut", { id: "tm:timer-1:reset" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:finish" }],
         [
           "sync_timers",
           { timers: [{ id: "timer-2", name: "Intro", kind: "countdown", durationMs: 300_000 }] },
@@ -5694,6 +5706,7 @@ describe("app store — Hourglass (v1.59.0)", () => {
       await settle();
       // The backend saw timer-1 go before the new one came.
       expect(calls.map((c) => c.cmd)).toEqual([
+        "unregister_global_shortcut",
         "unregister_global_shortcut",
         "unregister_global_shortcut",
         "sync_timers",
@@ -5730,13 +5743,18 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(calls.map((c) => c.cmd)).toEqual([
         "unregister_global_shortcut",
         "unregister_global_shortcut",
+        "unregister_global_shortcut",
         "sync_timers",
         "register_global_shortcut",
+        "register_global_shortcut",
       ]);
+      // v1.60.0: its End now key (`finish`) is registered too.
       expect(keyCalls()).toEqual([
         ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
         ["unregister_global_shortcut", { id: "tm:timer-1:reset" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:finish" }],
         ["register_global_shortcut", { id: "tm:timer-17:toggle", accelerator: "F13" }],
+        ["register_global_shortcut", { id: "tm:timer-17:finish", accelerator: "F14" }],
       ]);
       expect(synced()[0]!.map((d) => d.id)).toContain("timer-17");
       // A timer that already ran registers nothing again.
@@ -5745,6 +5763,7 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(keyCalls()).toEqual([
         ["unregister_global_shortcut", { id: "tm:timer-2:toggle" }],
         ["unregister_global_shortcut", { id: "tm:timer-2:reset" }],
+        ["unregister_global_shortcut", { id: "tm:timer-2:finish" }],
       ]);
     });
 
@@ -5932,7 +5951,8 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(window.localStorage.getItem(KEY)).toBe(before);
     });
 
-    it("syncHotkeyBindings registers the timers the backend runs after the actions and tiles; never a newer kind's, one over the limit, or finish", async () => {
+    // v1.60.0: End now's key (`finish`) is registered when bound.
+    it("syncHotkeyBindings registers the timers the backend runs after the actions and tiles, End now's key included; never a newer kind's or one over the limit", async () => {
       window.localStorage.setItem("divora.hotkeyBindings", JSON.stringify({ panic: "F1" }));
       window.localStorage.setItem("divora.tileHotkeys", JSON.stringify({ "clip-a": ["F2"] }));
       store(
@@ -5952,6 +5972,7 @@ describe("app store — Hourglass (v1.59.0)", () => {
         ["register_global_shortcut", { id: "sb:clip-a", accelerator: "F2" }],
         ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F9" }],
         ["register_global_shortcut", { id: "tm:timer-1:reset", accelerator: "F10" }],
+        ["register_global_shortcut", { id: "tm:timer-1:finish", accelerator: "F11" }],
       ]);
     });
   });
@@ -6043,6 +6064,7 @@ describe("app store — Hourglass (v1.59.0)", () => {
         ["pause_timer", ONE],
         ["unregister_global_shortcut", { id: "tm:timer-1:toggle" }],
         ["unregister_global_shortcut", { id: "tm:timer-1:reset" }],
+        ["unregister_global_shortcut", { id: "tm:timer-1:finish" }],
         ["sync_timers", { timers: [] }],
         ["sync_timers", { timers: [{ ...ONE, name: "Countdown", kind: "countdown", durationMs: 300_000 }] }],
         ["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F10" }],
@@ -6093,6 +6115,73 @@ describe("app store — Hourglass (v1.59.0)", () => {
       be.release("sync_timers");
       await keys;
       expect(timerKeys()).toEqual([["register_global_shortcut", { id: "tm:timer-1:toggle", accelerator: "F9" }]]);
+    });
+  });
+
+  // v1.60.0: End now (`finish_timer`) is one of the timers' commands.
+  describe("v1.60.0: End now", () => {
+    const ONE = { id: "timer-1" };
+
+    it("End now sends finish_timer and adopts the answer", async () => {
+      store(entry("timer-1"));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      calls.length = 0;
+      await result.finishTimer("timer-1");
+      expect(calls.map((c) => [c.cmd, c.args])).toEqual([["finish_timer", ONE]]);
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({ phase: "done", fires: 1, text: "00:00" });
+      expect(savedRun("timer-1")).toEqual({ phase: "done", totalMs: 300_000 });
+    });
+
+    it("an End now clicked while a Pause is slow to answer goes out only after it", async () => {
+      store(entry("timer-1"));
+      const be = backend();
+      const { result } = setupApp();
+      await settle();
+      await result.startTimer("timer-1");
+      calls.length = 0;
+      be.hold("pause_timer");
+      const pause = result.pauseTimer("timer-1");
+      const finish = result.finishTimer("timer-1");
+      await settle();
+      expect(calls.map((c) => c.cmd)).toEqual(["pause_timer"]);
+      be.release("pause_timer");
+      await Promise.all([pause, finish]);
+      expect(calls.map((c) => [c.cmd, c.args])).toEqual([
+        ["pause_timer", ONE],
+        ["finish_timer", ONE],
+      ]);
+      expect(result.timerSnapshot()?.timers[0]).toMatchObject({ phase: "done", fires: 1 });
+    });
+
+    it("a refused End now warns and changes nothing", async () => {
+      store(entry("timer-1"));
+      backend();
+      const { result } = setupApp();
+      await settle();
+      const held = result.timerSnapshot();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await result.finishTimer("timer-9");
+      expect(warn).toHaveBeenCalledWith("[hourglass] finish_timer failed:", expect.any(Error));
+      expect(result.timerSnapshot()).toBe(held);
+    });
+
+    it("timerReturn reads the stored return for a timer, and null without one", async () => {
+      window.localStorage.setItem(
+        KEY,
+        JSON.stringify({
+          version: 1,
+          timers: [entry("timer-1"), entry("timer-2", { name: "Intro" })],
+          presetReturns: [{ timer: "timer-1", from: "hollow-king", to: "villager" }, { timer: 5 }],
+        }),
+      );
+      backend();
+      const { result } = setupApp();
+      await settle();
+      expect(result.timerReturn("timer-1")).toEqual({ timer: "timer-1", from: "hollow-king", to: "villager" });
+      expect(result.timerReturn("timer-2")).toBeNull();
     });
   });
 });

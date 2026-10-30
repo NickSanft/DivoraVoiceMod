@@ -8,10 +8,11 @@
 //! hands both in; nothing here reads a clock, waits, touches a file, logs or
 //! calls Tauri, so every rule is tested on any machine. `timer_thread.rs` is
 //! the shell around it. What happens to a timer (a fire, an expiry, a sleep
-//! pause, a seed) is collected as a [`Transition`], and the core's rare
-//! decisions — a sleep handled, a wall-clock step followed, a duplicate id —
-//! as a [`Note`], for the timer thread to drain and log once it has let go
-//! of the lock (§8.1).
+//! pause, a seed; v1.60.0 adds a start and a cancel) is collected as a
+//! [`Transition`], carrying the timer's action lists (`timer_actions.rs`),
+//! and the core's rare decisions — a sleep handled, a wall-clock step
+//! followed, a duplicate id — as a [`Note`], for the timer thread to drain
+//! and log once it has let go of the lock (§8.1).
 //!
 //! The clock is a `Duration` since a process origin (monotonic). Wall time
 //! (Unix ms) only sets the anchors a restart seeds from, and checks a sleep
@@ -23,18 +24,22 @@
 //! other's tests.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use divora_capture::sleep::Discontinuities;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::timer_actions::{hooks_from_wire, Hooks};
+
 /// The event every change goes out as, to every window. Payload:
 /// [`TimerSnapshot`].
 pub const TIMER_STATE_EVENT: &str = "timer-state";
 
-/// The hotkey ids the backend acts on for timers: `tm:<id>:toggle` and
-/// `tm:<id>:reset`. The prefix is reserved (`tm:<id>:finish` is v1.60.0's).
+/// The hotkey ids the backend acts on for timers: `tm:<id>:toggle`,
+/// `tm:<id>:reset` and `tm:<id>:finish` (v1.60.0's End now). The prefix is
+/// reserved.
 pub const HOTKEY_TIMER_PREFIX: &str = "tm:";
 
 /// The timer thread's longest wait: sleep checks keep this cadence with
@@ -134,6 +139,10 @@ pub struct TimerDef {
     /// The run the page stored for it, read by [`run_from_wire`]: applied
     /// only to an id the core has never accepted in this process (D10).
     pub resume: Option<TimerRun>,
+    /// v1.60.0: a countdown's `onStart` and `onFire`, read by
+    /// [`hooks_from_wire`]; a count-up's are empty (D32). Shared with every
+    /// transition the timer records.
+    pub hooks: Arc<Hooks>,
 }
 
 /// What the page stores of a running, paused, done or ran-out timer, and
@@ -222,26 +231,77 @@ pub enum TimerOp {
     Toggle,
     /// Whole ms, within ±[`MAX_LENGTH_MS`] ([`adjust_delta`]).
     Adjust(i64),
+    /// v1.60.0's End now (D25): a running or paused countdown fires at once,
+    /// through the one [`Transition::Fired`], not late. Anything else —
+    /// idle, ended, a count-up — changes nothing.
+    Finish,
+}
+
+/// v1.60.0: why an active countdown stopped without firing (D6, D10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelWhy {
+    /// A Reset, or a sync that changed its kind.
+    Reset,
+    /// A sync without its id: deleted.
+    Removed,
 }
 
 /// Something that happened to a timer, wherever it happened: the thread's
 /// tick, an op's or a status read's tick on the main thread, a sync's seed.
 /// Collected by the core and drained only by the timer thread, so each is
-/// reported exactly once (D34).
+/// reported exactly once (D34). v1.60.0: each that can run a timer's actions
+/// carries its lists as they were when it happened (D6, D7), so a deleted
+/// timer's still reach the plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Transition {
     /// A countdown reached zero awake and fired; `late_ms` past its deadline.
+    /// v1.60.0: or End now ended it (`finished`, `late_ms` 0).
     Fired {
         id: String,
         fires: u32,
         late_ms: u64,
+        finished: bool,
+        hooks: Arc<Hooks>,
     },
     /// A countdown reached zero while the PC slept; not fired.
-    Expired { id: String },
+    Expired { id: String, hooks: Arc<Hooks> },
     /// A count-up paused where the PC went to sleep.
     SleepPaused { id: String },
     /// A timer the core had never accepted, seeded from its stored run.
-    Seeded { id: String, phase: TimerPhase },
+    /// v1.60.0: `from` is the stored run's phase, so a run that ran out
+    /// while Divora was closed (`running` → `expired`) is told from a stored
+    /// `expired` seeded again at every launch.
+    Seeded {
+        id: String,
+        phase: TimerPhase,
+        from: TimerPhase,
+        hooks: Arc<Hooks>,
+    },
+    /// v1.60.0: Arm took a countdown from idle, done or ran out to running
+    /// (a Toggle that arms included). `fires` as it stands, for the log.
+    Started {
+        id: String,
+        fires: u32,
+        hooks: Arc<Hooks>,
+    },
+    /// v1.60.0: a running or paused countdown stopped without firing. A
+    /// kind change's carries the lists from before the sync.
+    Cancelled {
+        id: String,
+        why: CancelWhy,
+        hooks: Arc<Hooks>,
+    },
+}
+
+/// v1.60.0: transitions held for the timer thread at most; more are dropped
+/// (K13). Only a thread that never started leaves them there.
+pub const MAX_TRANSITIONS: usize = 256;
+
+/// `t` onto `transitions`, unless [`MAX_TRANSITIONS`] are waiting.
+fn push_transition(transitions: &mut Vec<Transition>, t: Transition) {
+    if transitions.len() < MAX_TRANSITIONS {
+        transitions.push(t);
+    }
 }
 
 /// One of the core's rare decisions, for the log. Collected by the core and
@@ -297,7 +357,9 @@ pub struct TextUpdate {
 /// can't fail the call. `Err(reason)`: skipped, and the caller logs why (no
 /// valid id, or no kind). A bad name or length falls back; a bad `resume`
 /// becomes none (the timer starts idle). Unknown keys are ignored: later
-/// releases add fields (D33).
+/// releases add fields (D33). v1.60.0: a countdown's `onStart` and `onFire`
+/// are read by [`hooks_from_wire`], an action at a time (D4); a count-up's
+/// are dropped (D32).
 pub fn entry_from_wire(v: &Value) -> Result<WireEntry, String> {
     let Some(entry) = v.as_object() else {
         return Err("not an object".to_string());
@@ -321,12 +383,17 @@ pub fn entry_from_wire(v: &Value) -> Result<WireEntry, String> {
         .map(str::trim)
         .filter(|name| (1..=MAX_NAME_CHARS).contains(&name.chars().count()))
         .map_or_else(|| default_name(kind).to_string(), str::to_string);
+    let hooks = match kind {
+        TimerKind::Countdown => hooks_from_wire(entry),
+        TimerKind::Countup => Hooks::default(),
+    };
     Ok(WireEntry::Def(TimerDef {
         id: id.to_string(),
         name,
         kind,
         duration_ms: length_from_wire(entry.get("durationMs")),
         resume: entry.get("resume").and_then(run_from_wire),
+        hooks: Arc::new(hooks),
     }))
 }
 
@@ -421,9 +488,9 @@ fn is_device_name(id: &str) -> bool {
 }
 
 /// §7.7: what a shortcut event does to a timer. `Some((id, op))` for a press
-/// of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id; `None` for a
-/// release, `tm:<id>:finish` (v1.60.0's), any other spelling and any other
-/// id.
+/// of `tm:<id>:toggle`, `tm:<id>:reset` or (v1.60.0, End now)
+/// `tm:<id>:finish` with a valid id; `None` for a release, any other
+/// spelling and any other id.
 pub fn hotkey_timer_request(id: &str, pressed: bool) -> Option<(&str, TimerOp)> {
     if !pressed {
         return None;
@@ -432,6 +499,7 @@ pub fn hotkey_timer_request(id: &str, pressed: bool) -> Option<(&str, TimerOp)> 
     let op = match verb {
         "toggle" => TimerOp::Toggle,
         "reset" => TimerOp::Reset,
+        "finish" => TimerOp::Finish,
         _ => return None,
     };
     is_timer_id(timer).then_some((timer, op))
@@ -569,6 +637,9 @@ struct Timer {
     /// The text as last computed: every transition recomputes it, and a
     /// running timer's at each tick and snapshot.
     text: String,
+    /// v1.60.0: the definition's action lists, the latest sync's (D7); each
+    /// transition takes a share.
+    hooks: Arc<Hooks>,
 }
 
 impl Timer {
@@ -589,6 +660,7 @@ impl Timer {
             step_since: None,
             fires: 0,
             text: String::new(),
+            hooks: Arc::clone(&def.hooks),
         };
         timer.reset(Duration::ZERO);
         timer
@@ -658,18 +730,25 @@ impl Timer {
         self.stop(TimerPhase::Idle, ms, now);
     }
 
-    /// D4: the one way a running countdown gets to `done` (a seed only puts
-    /// a stored `done` back, `fires` 0) — found at or past its deadline,
-    /// however late. `fires` + 1. A v1.60.0 Finish calls it too, so "fires
-    /// once" covers both.
-    fn fire(&mut self, now: Duration) -> Transition {
-        let late_ms = floor_ms(now.saturating_sub(self.deadline()));
+    /// D4: the one way a countdown gets to `done` (a seed only puts a stored
+    /// `done` back, `fires` 0) — a running one found at or past its
+    /// deadline, however late, or (v1.60.0, D25) a running or paused one
+    /// `finished` by End now. `fires` + 1, so "fires once" covers both. A
+    /// finish is never late: a paused countdown's deadline is stale.
+    fn fire(&mut self, now: Duration, finished: bool) -> Transition {
+        let late_ms = if finished {
+            0
+        } else {
+            floor_ms(now.saturating_sub(self.deadline()))
+        };
         self.fires = self.fires.saturating_add(1);
         self.stop(TimerPhase::Done, 0, now);
         Transition::Fired {
             id: self.id.clone(),
             fires: self.fires,
             late_ms,
+            finished,
+            hooks: Arc::clone(&self.hooks),
         }
     }
 
@@ -679,6 +758,7 @@ impl Timer {
         self.stop(TimerPhase::Expired, 0, now);
         Transition::Expired {
             id: self.id.clone(),
+            hooks: Arc::clone(&self.hooks),
         }
     }
 
@@ -705,7 +785,9 @@ impl Timer {
     /// D15: a sync's definition for a timer the core already runs. A new
     /// name or length changes only what it names — an idle countdown shows
     /// its new length; one that runs, is paused or has ended keeps its run
-    /// until it starts again — and a new kind makes it idle.
+    /// until it starts again — and a new kind makes it idle. v1.60.0: the
+    /// lists are the definition's from now on, and a change to them keeps
+    /// the run too (D7).
     fn redefine(&mut self, def: &TimerDef, now: Duration) {
         self.name.clone_from(&def.name);
         self.length_ms = def.duration_ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS);
@@ -713,10 +795,12 @@ impl Timer {
             self.kind = def.kind;
             self.reset(now);
         }
+        self.hooks = Arc::clone(&def.hooks);
     }
 
     /// D6 (§7.1): `op` at `now`, after the tick. Labelled ops do only what
     /// they name; Toggle decides from the phase. Whether anything changed.
+    /// Never given `Finish`: the core fires it (D25).
     fn apply(&mut self, op: TimerOp, now: Duration, wall_ms: i64) -> bool {
         use TimerPhase::{Done, Expired, Idle, Paused, Running};
         let op = match (op, self.phase) {
@@ -959,7 +1043,7 @@ impl TimerCore {
                 continue;
             }
             if t.kind == TimerKind::Countdown && t.deadline() <= now {
-                self.transitions.push(t.fire(now));
+                push_transition(&mut self.transitions, t.fire(now, false));
                 self.dirty = true;
             } else if t.retext(now) {
                 self.dirty = true;
@@ -1008,7 +1092,7 @@ impl TimerCore {
                     t.sleep_pause(before, now)
                 }
             };
-            self.transitions.push(ended);
+            push_transition(&mut self.transitions, ended);
             self.dirty = true;
         }
         if running > 0 {
@@ -1052,7 +1136,7 @@ impl TimerCore {
                     }
                     if wall_left_ms <= 0 {
                         expired += 1;
-                        self.transitions.push(t.expire(now));
+                        push_transition(&mut self.transitions, t.expire(now));
                     } else {
                         corrected += 1;
                         let left = u64::try_from(wall_left_ms).unwrap_or(u64::MAX);
@@ -1069,7 +1153,7 @@ impl TimerCore {
                         continue;
                     }
                     paused += 1;
-                    self.transitions.push(t.sleep_pause(before, now));
+                    push_transition(&mut self.transitions, t.sleep_pause(before, now));
                 }
             }
             self.dirty = true;
@@ -1150,17 +1234,20 @@ impl TimerCore {
     fn accept(&mut self, def: &TimerDef, now: Duration, wall_ms: i64) -> Timer {
         let mut timer = Timer::new(def);
         let first = self.seen.insert(def.id.clone());
-        let seeded = def
-            .resume
-            .as_ref()
-            .filter(|_| first)
-            .and_then(|run| seed(timer.kind, timer.length_ms, run, wall_ms));
-        if let Some(seeded) = seeded {
+        let seeded = def.resume.as_ref().filter(|_| first).and_then(|run| {
+            seed(timer.kind, timer.length_ms, run, wall_ms).map(|seeded| (run.phase, seeded))
+        });
+        if let Some((from, seeded)) = seeded {
             timer.take_seed(seeded, now, wall_ms);
-            self.transitions.push(Transition::Seeded {
-                id: timer.id.clone(),
-                phase: timer.phase,
-            });
+            push_transition(
+                &mut self.transitions,
+                Transition::Seeded {
+                    id: timer.id.clone(),
+                    phase: timer.phase,
+                    from,
+                    hooks: Arc::clone(&timer.hooks),
+                },
+            );
         }
         timer
     }
@@ -1169,6 +1256,12 @@ impl TimerCore {
     /// countdown fires before the op (a Toggle then starts it again), and a
     /// sleep is handled before anything starts. A labelled op that doesn't
     /// fit the phase changes nothing. `Err` for an id the core doesn't run.
+    ///
+    /// v1.60.0 (D25): `Finish` fires a running or paused countdown through
+    /// the one `fire()`, `finished` and not late. The tick comes
+    /// first, so a Finish on one already past a deadline no reader saw
+    /// finds that fire taken — a plain `Fired` with its real lateness — and
+    /// adds nothing.
     pub fn apply(
         &mut self,
         id: &str,
@@ -1179,7 +1272,13 @@ impl TimerCore {
     ) -> Result<(), NoTimer> {
         self.tick(now, wall_ms, slept_from);
         let timer = self.timers.iter_mut().find(|t| t.id == id).ok_or(NoTimer)?;
-        if timer.apply(op, now, wall_ms) {
+        if op == TimerOp::Finish {
+            let active = matches!(timer.phase, TimerPhase::Running | TimerPhase::Paused);
+            if timer.kind == TimerKind::Countdown && active {
+                push_transition(&mut self.transitions, timer.fire(now, true));
+                self.dirty = true;
+            }
+        } else if timer.apply(op, now, wall_ms) {
             self.dirty = true;
         }
         Ok(())
@@ -1284,7 +1383,12 @@ mod tests {
         MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_NOTES, MAX_SEED_ELAPSED_MS,
         MAX_SYNC_ENTRIES, MAX_TIMERS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
     };
+    use crate::timer_actions::{
+        Action, Hook, Hooks, TimerActionsEvent, Why, LATE_ONE_SHOTS_MS, MAX_ACTIONS,
+        MAX_LINE_CHARS, MAX_TARGET_CHARS, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT,
+    };
     use serde_json::{json, Value};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn fixture() -> Value {
@@ -1315,8 +1419,10 @@ mod tests {
     /// other side's tests: the names, every key, the phases and kinds in
     /// order, the limits, and every sample — each snapshot and state reads
     /// into Rust's types and back unchanged, with its text, anchor and total
-    /// as the rules give them, and each run reads back unchanged.
+    /// as the rules give them, and each run reads back unchanged. v1.60.0's
+    /// names, keys and limits too.
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, every key
     fn timer_wire_fixture_matches_rust() {
         let f = fixture();
         assert_eq!(f["events"]["state"], TIMER_STATE_EVENT);
@@ -1371,6 +1477,53 @@ mod tests {
         assert_eq!(limits["maxName"], MAX_NAME_CHARS);
         assert_eq!(limits["maxIdChars"], MAX_ID_CHARS);
         assert_eq!(limits["maxSyncEntries"], MAX_SYNC_ENTRIES);
+
+        // v1.60.0's names, keys and limits, each under a key of its own so
+        // the v1.59.0 objects above stay as `timerState.test.ts` pins them.
+        // (`actionWire.commands.finish` is checked against the registered
+        // commands, beside `commands.status`.)
+        let wire = &f["actionWire"];
+        assert_eq!(wire["events"]["actions"], TIMER_ACTIONS_EVENT);
+        assert_eq!(
+            wire["events"]["soundboardStopped"],
+            SOUNDBOARD_STOPPED_EVENT
+        );
+        let event = TimerActionsEvent {
+            seq: 1,
+            id: "timer-1".into(),
+            hook: Hook::End,
+            why: Why::Zero,
+            late_ms: 0,
+            actions: vec![Action::RevertPreset.to_wire()],
+        };
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&event).unwrap()),
+            strings(&f["actionsEventKeys"])
+        );
+        // Every `why` the page can hear, in order; a restart's re-mute is
+        // never sent.
+        let whys = [
+            Why::Armed,
+            Why::Zero,
+            Why::EndNow,
+            Why::Late,
+            Why::RanOut,
+            Why::Reset,
+            Why::Deleted,
+        ]
+        .map(|w| serde_json::to_value(w).unwrap());
+        assert_eq!(Value::from(whys.to_vec()), f["whys"]);
+        assert!(!f["whys"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::to_value(Why::Restart).unwrap()));
+        let hooks = [Hook::Start, Hook::End].map(|h| serde_json::to_value(h).unwrap());
+        assert_eq!(Value::from(hooks.to_vec()), f["hooks"]);
+        let action_limits = &f["actionLimits"];
+        assert_eq!(action_limits["maxActions"], MAX_ACTIONS);
+        assert_eq!(action_limits["maxLineChars"], MAX_LINE_CHARS);
+        assert_eq!(action_limits["maxTargetChars"], MAX_TARGET_CHARS);
+        assert_eq!(action_limits["lateOneShotsMs"], LATE_ONE_SHOTS_MS);
 
         // A state as the rules shape it: its text from its ms, an anchor
         // only while running, no total for a count-up.
@@ -1454,6 +1607,7 @@ mod tests {
                 let op = match row["verb"].as_str() {
                     Some("toggle") => TimerOp::Toggle,
                     Some("reset") => TimerOp::Reset,
+                    Some("finish") => TimerOp::Finish,
                     other => panic!("{id}: verb {other:?}"),
                 };
                 (timer, op)
@@ -1461,6 +1615,12 @@ mod tests {
             assert_eq!(hotkey_timer_request(id, true), want, "{id:?} pressed");
             assert_eq!(hotkey_timer_request(id, false), None, "{id:?} released");
         }
+        // v1.60.0: End now's key is in the table, and acts.
+        assert!(f["hotkeyIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["verb"] == "finish"));
     }
 
     /// §7.4: rounding up for a countdown, down for a count-up, and the hour
@@ -1508,6 +1668,7 @@ mod tests {
             kind,
             duration_ms,
             resume: None,
+            hooks: Arc::default(),
         }))
     }
 
@@ -1624,15 +1785,19 @@ mod tests {
 
     /// The seam with the page's `defsForSync` (`timers.test.ts` reads the
     /// same `defKeys`): an entry spelled with exactly the fixture's keys has
-    /// every field read, none fallen back.
+    /// every field read, none fallen back. v1.60.0: a countdown, since only
+    /// a countdown's lists are sent and read (D32), with a backend action at
+    /// the start and a page action at zero.
     #[test]
     fn sync_entry_keys_are_the_fixtures() {
         let entry = json!({
             "id": "brb",
             "name": "Intro",
-            "kind": "countup",
+            "kind": "countdown",
             "durationMs": 90_000,
-            "resume": {"phase": "paused", "ms": 5_000},
+            "resume": {"phase": "paused", "ms": 5_000, "totalMs": 90_000},
+            "onStart": [{"kind": "setMuted", "muted": true}],
+            "onFire": [{"kind": "preset", "presetId": "x"}],
         });
         assert_eq!(sorted_keys(&entry), strings(&fixture()["defKeys"]));
         assert_eq!(
@@ -1640,13 +1805,19 @@ mod tests {
             Ok(WireEntry::Def(TimerDef {
                 id: "brb".into(),
                 name: "Intro".into(),
-                kind: TimerKind::Countup,
+                kind: TimerKind::Countdown,
                 duration_ms: 90_000,
                 resume: Some(TimerRun {
                     phase: TimerPhase::Paused,
                     ms: Some(5_000),
-                    total_ms: None,
+                    total_ms: Some(90_000),
                     anchor_ms: None,
+                }),
+                hooks: Arc::new(Hooks {
+                    on_start: vec![Action::SetMuted { muted: true }],
+                    on_fire: vec![Action::Preset {
+                        preset_id: "x".into()
+                    }],
                 }),
             }))
         );
@@ -1761,6 +1932,7 @@ mod tests {
             kind: TimerKind::Countdown,
             duration_ms: length_ms,
             resume: None,
+            hooks: Arc::default(),
         })
     }
 
@@ -1772,6 +1944,7 @@ mod tests {
             kind: TimerKind::Countup,
             duration_ms: DEFAULT_LENGTH_MS,
             resume: None,
+            hooks: Arc::default(),
         })
     }
 
@@ -1834,11 +2007,32 @@ mod tests {
         (s.phase, s.ms, s.text)
     }
 
+    /// A fire at a deadline (not End now) of a timer with no lists.
     fn fired(id: &str, fires: u32, late_ms: u64) -> Transition {
         Transition::Fired {
             id: id.into(),
             fires,
             late_ms,
+            finished: false,
+            hooks: Arc::default(),
+        }
+    }
+
+    /// An expiry of a timer with no lists.
+    fn expired(id: &str) -> Transition {
+        Transition::Expired {
+            id: id.into(),
+            hooks: Arc::default(),
+        }
+    }
+
+    /// A seed of a timer with no lists, from a stored run in `from`.
+    fn seeded_as(id: &str, phase: TimerPhase, from: TimerPhase) -> Transition {
+        Transition::Seeded {
+            id: id.into(),
+            phase,
+            from,
+            hooks: Arc::default(),
         }
     }
 
@@ -1940,6 +2134,100 @@ mod tests {
         assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 1)]);
     }
 
+    /// End now's fire, of a timer with no lists.
+    fn finished(id: &str, fires: u32) -> Transition {
+        Transition::Fired {
+            id: id.into(),
+            fires,
+            late_ms: 0,
+            finished: true,
+            hooks: Arc::default(),
+        }
+    }
+
+    /// v1.60.0 (D25): End now fires a running countdown once, through the
+    /// one `fire()` — done, `fires` 1, one `Fired {late 0, finished}` — and
+    /// a second Finish, or a tick past the old deadline, adds nothing.
+    #[test]
+    fn finish_fires_once() {
+        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-1", TimerOp::Finish, secs(2));
+        assert!(core.take_dirty());
+        let s = state(&mut core, secs(2), "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.text.as_str(), s.fires, s.anchor_ms),
+            (Done, 0, "00:00", 1, None)
+        );
+        assert_eq!(core.take_transitions(), vec![finished("timer-1", 1)]);
+        op(&mut core, "timer-1", TimerOp::Finish, secs(3));
+        assert!(!core.take_dirty());
+        tick(&mut core, secs(6));
+        assert_eq!(state(&mut core, secs(6), "timer-1").fires, 1);
+        assert_eq!(core.take_transitions(), vec![]);
+    }
+
+    /// v1.60.0 (D25): a paused countdown's deadline is stale — armed at 0
+    /// for 5:00 and paused at 100 s, it would read 300 s late at 500 s — so
+    /// End now is never late.
+    #[test]
+    fn finish_a_paused_countdown_is_not_late() {
+        let mut core = core_with(vec![countdown("timer-1", 300_000)]);
+        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        op(&mut core, "timer-1", TimerOp::Pause, secs(100));
+        op(&mut core, "timer-1", TimerOp::Finish, secs(500));
+        let s = state(&mut core, secs(500), "timer-1");
+        assert_eq!((s.phase, s.ms, s.fires), (Done, 0, 1));
+        assert_eq!(core.take_transitions(), vec![finished("timer-1", 1)]);
+    }
+
+    /// v1.60.0 (D25): End now on a countdown already past a deadline no
+    /// reader saw finds the fire taken by its own tick — the deadline's,
+    /// with its real lateness, not `finished` — and adds nothing. (What a
+    /// hook run makes of each lateness is the plan's.)
+    #[test]
+    fn finish_after_an_unticked_deadline_is_a_zero_fire() {
+        for (at, late_ms) in [(ms(5_500), 500), (secs(45), 40_000)] {
+            let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+            op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+            op(&mut core, "timer-1", TimerOp::Finish, at);
+            let s = state(&mut core, at, "timer-1");
+            assert_eq!((s.phase, s.fires), (Done, 1), "{at:?}");
+            assert_eq!(
+                core.take_transitions(),
+                vec![fired("timer-1", 1, late_ms)],
+                "{at:?}"
+            );
+        }
+    }
+
+    /// v1.60.0 (D25, D32): End now on an idle or ended countdown, or on a
+    /// count-up in any phase, changes nothing and records nothing.
+    #[test]
+    fn finish_leaves_idle_ended_and_countups() {
+        use TimerKind::{Countdown, Countup};
+        for (kind, phase) in [
+            (Countdown, Idle),
+            (Countdown, Done),
+            (Countdown, Expired),
+            (Countup, Idle),
+            (Countup, Running),
+            (Countup, Paused),
+        ] {
+            let (mut core, at) = in_phase(kind, phase);
+            let before = state(&mut core, at, "timer-1");
+            core.take_dirty();
+            op(&mut core, "timer-1", TimerOp::Finish, at);
+            assert!(!core.take_dirty(), "{kind:?} {phase:?}");
+            assert_eq!(
+                state(&mut core, at, "timer-1"),
+                before,
+                "{kind:?} {phase:?}"
+            );
+            assert_eq!(core.take_transitions(), vec![], "{kind:?} {phase:?}");
+        }
+    }
+
     /// D5 (a): a countdown whose deadline fell inside a sleep the clock
     /// counted is `expired` at the first reading after it, never fired. The
     /// core notes which clock decided, for the thread to log.
@@ -1957,12 +2245,7 @@ mod tests {
             (Expired, 0, "00:00", 0, None)
         );
         tick(&mut core, back + secs(1));
-        assert_eq!(
-            core.take_transitions(),
-            vec![Transition::Expired {
-                id: "timer-1".into()
-            }]
-        );
+        assert_eq!(core.take_transitions(), vec![expired("timer-1")]);
         assert_eq!(
             core.take_notes(),
             vec![Note::ClockSlept {
@@ -2188,9 +2471,7 @@ mod tests {
         assert_eq!(
             core.take_transitions(),
             vec![
-                Transition::Expired {
-                    id: "timer-1".into()
-                },
+                expired("timer-1"),
                 Transition::SleepPaused {
                     id: "timer-3".into()
                 }
@@ -2320,12 +2601,7 @@ mod tests {
             (s.phase, s.ms, s.text.as_str(), s.fires),
             (Expired, 0, "00:00", 0)
         );
-        assert_eq!(
-            core.take_transitions(),
-            vec![Transition::Expired {
-                id: "timer-1".into()
-            }]
-        );
+        assert_eq!(core.take_transitions(), vec![expired("timer-1")]);
     }
 
     /// D5: an Arm that is the first reader after a resume handles the sleep
@@ -2884,6 +3160,7 @@ mod tests {
             kind,
             duration_ms: length_ms,
             resume: Some(run),
+            hooks: Arc::default(),
         };
         core.sync(vec![WireEntry::Def(def)], now, wall_ms, None);
         (state(&mut core, now, id), core.take_transitions())
@@ -2909,18 +3186,12 @@ mod tests {
             let want: TimerPhase = serde_json::from_value(row["seededPhase"].clone()).unwrap();
             let want_ms = row["seededMs"].as_u64().unwrap();
             let wall_ms = row["nowWallMs"].as_i64().unwrap();
+            let from = run.phase;
             let (got, recorded) = seeded(&s.id, s.kind, length, run, wall_ms);
             assert_eq!((got.phase, got.ms), (want, want_ms), "{name}");
             assert_eq!(got.text, timer_text(s.kind, want_ms), "{name}");
             assert_eq!((got.fires, got.total_ms), (0, s.total_ms), "{name}");
-            assert_eq!(
-                recorded,
-                vec![Transition::Seeded {
-                    id: s.id.clone(),
-                    phase: want
-                }],
-                "{name}"
-            );
+            assert_eq!(recorded, vec![seeded_as(&s.id, want, from)], "{name}");
         }
 
         let at = WALL0;
@@ -3047,6 +3318,7 @@ mod tests {
                 None,
             ),
         ] {
+            let from = run.phase;
             let (got, recorded) = seeded("timer-1", kind, 120_000, run, at);
             let Some((phase, value, total)) = want else {
                 let idle = if kind == Countdown { 120_000 } else { 0 };
@@ -3064,14 +3336,7 @@ mod tests {
                 "{what}"
             );
             assert_eq!(got.text, timer_text(kind, value), "{what}");
-            assert_eq!(
-                recorded,
-                vec![Transition::Seeded {
-                    id: "timer-1".into(),
-                    phase
-                }],
-                "{what}"
-            );
+            assert_eq!(recorded, vec![seeded_as("timer-1", phase, from)], "{what}");
         }
 
         // The pause at deadline − 0.3 ms, stored as the page's `runOf`
@@ -3139,10 +3404,7 @@ mod tests {
         assert_eq!(
             core.take_transitions(),
             vec![
-                Transition::Seeded {
-                    id: "timer-1".into(),
-                    phase: Running
-                },
+                seeded_as("timer-1", Running, Running),
                 fired("timer-1", 1, 0)
             ]
         );
@@ -3450,6 +3712,7 @@ mod tests {
                 kind,
                 duration_ms,
                 resume: None,
+                hooks: Arc::default(),
             })
         };
         let clocks = [

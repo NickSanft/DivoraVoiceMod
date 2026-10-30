@@ -1064,7 +1064,8 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     expect(row.querySelector("svg")!.innerHTML).toBe(glass.innerHTML);
   });
 
-  it("Delete asks twice: one click sends nothing and reads Confirm?; the second unregisters both keys, then syncs without it", async () => {
+  // v1.60.0: three keys, End now's included.
+  it("Delete asks twice: one click sends nothing and reads Confirm?; the second unregisters its three keys, then syncs without it", async () => {
     store(entry("timer-1", { hotkeys: { toggle: "F9" } }), entry("timer-2", { name: "Intro" }));
     const view = mount();
     await flush();
@@ -1078,8 +1079,17 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     expect(card("timer-1")).toBeInTheDocument();
     fireEvent.click(confirm);
     await flush();
-    expect(timerCmds()).toEqual(["unregister_global_shortcut", "unregister_global_shortcut", "sync_timers"]);
-    expect(sent("unregister_global_shortcut")).toEqual([{ id: "tm:timer-1:toggle" }, { id: "tm:timer-1:reset" }]);
+    expect(timerCmds()).toEqual([
+      "unregister_global_shortcut",
+      "unregister_global_shortcut",
+      "unregister_global_shortcut",
+      "sync_timers",
+    ]);
+    expect(sent("unregister_global_shortcut")).toEqual([
+      { id: "tm:timer-1:toggle" },
+      { id: "tm:timer-1:reset" },
+      { id: "tm:timer-1:finish" },
+    ]);
     expect(sent("sync_timers")).toEqual([
       { timers: [{ id: "timer-2", name: "Intro", kind: "countdown", durationMs: 300_000 }] },
     ]);

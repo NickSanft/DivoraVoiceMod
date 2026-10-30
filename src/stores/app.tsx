@@ -126,6 +126,7 @@ import {
   timerStatusCmd,
   timersDirCmd,
   subscribeTimerState,
+  finishTimerCmd,
   type CaptureMonitor,
   type CaptureStatus,
   type DesktopAudioSource,
@@ -256,6 +257,12 @@ import {
   type TimerRole,
   type TimerVerb,
 } from "../data/timers";
+import {
+  readReturns,
+  type PresetReturn,
+  type TimerAction,
+  type TimerHook,
+} from "../data/timerActions";
 import {
   adoptPtm,
   ptmModeOf,
@@ -586,6 +593,12 @@ export interface AppState {
   ) => { color: string; label: string; action: GlyphAction } | null;
   /** Run a glyph's action against the live store. */
   dispatchGlyphAction: (action: GlyphAction) => void;
+  /** v1.60.0: the one dispatcher, for a glyph's action and a timer's page
+   *  half (`timer-actions`). A glyph's runs as `dispatchGlyphAction` always
+   *  has. A timer's runs only its page kinds (preset, random preset, back to
+   *  the preset before, a clip); the backend runs the rest and the page never
+   *  sends them. S1: a timer's does nothing yet (track C). */
+  dispatchAction: (action: GlyphAction | TimerAction, from: ActionSource) => void;
   /** Match a drawn path against the custom-glyph templates (built-ins use
    *  the geometric `detectShape`). */
   recognizeCustomGlyph: (
@@ -1136,8 +1149,10 @@ export interface AppState {
    *  only if it is newer. Saves a stored timer's run when it changed. */
   adoptTimerSnapshot: (raw: unknown) => void;
   /** Adds a countdown or a count-up and syncs; its id, or null at 16 stored
-   *  timers. */
-  addTimer: (kind: TimerKind) => Promise<string | null>;
+   *  timers. v1.60.0: `template` "break" adds Add break (BRB)'s countdown,
+   *  its lists included, in one sync (D26). S1: a template adds nothing yet
+   *  and answers null (track C). */
+  addTimer: (kind: TimerKind, template?: "break") => Promise<string | null>;
   /** Called on commit only (Enter, or leaving the field), with a name that
    *  passes `readTimerName`. Sends nothing when the name is the one stored,
    *  or the timer isn't one the backend runs. */
@@ -1145,8 +1160,8 @@ export interface AppState {
   /** Called on commit only, with a length `parseLength` gave. Sends nothing
    *  for the length stored, a count-up, or a timer the backend doesn't run. */
   setTimerLength: (id: string, ms: number) => Promise<void>;
-  /** Unregisters its two keys, takes it off the overlay, then syncs
-   *  without it. */
+  /** Unregisters its keys (every verb in `TIMER_VERBS`), takes it off the
+   *  overlay, then syncs without it. */
   deleteTimer: (id: string) => Promise<void>;
   /** Settings' main button: arm, pause or resume, by `timerAction` on the
    *  mirror's state; nothing without one. */
@@ -1154,6 +1169,20 @@ export interface AppState {
   pauseTimer: (id: string) => Promise<void>;
   resetTimer: (id: string) => Promise<void>;
   adjustTimer: (id: string, deltaMs: number) => Promise<void>;
+  /** v1.60.0: End now, through the timers' queue: a running or paused
+   *  countdown fires at once and runs its At zero list. */
+  finishTimer: (id: string) => Promise<void>;
+  /** v1.60.0: a countdown's At start (`onStart`) and At zero (`onFire`)
+   *  lists, edited by index into the stored array so an entry this build
+   *  can't read stays where it is (D27); each saves, then syncs. Add is
+   *  refused unless `canAddAction` says "ok". S1: they change nothing yet
+   *  (track C). */
+  addTimerAction: (id: string, hook: TimerHook, action: TimerAction) => Promise<void>;
+  setTimerAction: (id: string, hook: TimerHook, index: number, action: TimerAction) => Promise<void>;
+  removeTimerAction: (id: string, hook: TimerHook, index: number) => Promise<void>;
+  /** v1.60.0: where `id`'s start switched the preset from and to, while it
+   *  is stored (`presetReturns`); null without one. */
+  timerReturn: (id: string) => PresetReturn | null;
   /** Saves (`""` clears that verb) and registers or unregisters
    *  `tm:<id>:<verb>`. Does nothing for an id that isn't a stored timer the
    *  backend runs. */
@@ -1174,6 +1203,10 @@ export interface AppState {
    *  off; else "clean". */
   status: () => VoiceStatus;
 }
+
+/** v1.60.0: who an action came from: a glyph cast, or a timer's start or
+ *  end (`timer-actions`). */
+export type ActionSource = { kind: "glyph" } | { kind: "timer"; id: string; hook: "start" | "end" };
 
 export function createAppState(): AppState {
   const [nav, setNav] = createSignal<NavId>("mixer");
@@ -1259,7 +1292,13 @@ export function createAppState(): AppState {
     );
   };
 
-  const dispatchGlyphAction = (action: GlyphAction): void => {
+  // v1.60.0: the one dispatcher (D1). A glyph's five actions run as they
+  // always have. A timer's page half (preset, random preset, back to the
+  // preset before, a clip) is track C's; its backend kinds and the glyph's
+  // toggles never run from a timer.
+  const dispatchAction = (action: GlyphAction | TimerAction, from: ActionSource): void => {
+    // S1 stub: a timer's actions do nothing yet (track C).
+    if (from.kind !== "glyph") return;
     switch (action.kind) {
       case "preset":
         usePreset(action.presetId);
@@ -1280,6 +1319,7 @@ export function createAppState(): AppState {
         break;
     }
   };
+  const dispatchGlyphAction = (action: GlyphAction): void => dispatchAction(action, { kind: "glyph" });
 
   // Canvas-drawn omen colour for non-preset actions (a hex, since the
   // cast canvas can't resolve CSS vars).
@@ -2310,7 +2350,10 @@ export function createAppState(): AppState {
     void subscribeTimers();
   }
 
-  const addTimer: AppState["addTimer"] = async (kind) => {
+  const addTimer: AppState["addTimer"] = async (kind, template) => {
+    // S1 stub: the Break template (D26) is track C's; until then a template
+    // adds nothing.
+    if (template !== undefined) return null;
     const s = timerStore();
     // Every stored timer counts, a newer kind's too, so each one counted has
     // a card with Delete.
@@ -2414,13 +2457,27 @@ export function createAppState(): AppState {
     sendTimerOp("reset_timer", () => resetTimerCmd(id));
   const adjustTimer: AppState["adjustTimer"] = (id, deltaMs) =>
     sendTimerOp("adjust_timer", () => adjustTimerCmd(id, deltaMs));
+  // v1.60.0: End now goes through the same queue, so an End now clicked
+  // right after a Pause lands after it. Its answer is adopted like any
+  // other; what its At zero list does comes as a `timer-actions` event.
+  const finishTimer: AppState["finishTimer"] = (id) =>
+    sendTimerOp("finish_timer", () => finishTimerCmd(id));
 
-  // Each timer's keys live in its own entry, by verb. v1.59.0 registers
-  // `toggle` and `reset`; any other verb (a later build's `finish`) is kept
-  // and written back as it is. Saved first, then registered, as
-  // `setHotkeyBinding` does; a bind changes only its own verb. Through the
-  // timers' queue, so binds land in the order they were made, and after a
-  // delete's unregisters of an id an Add took again.
+  // v1.60.0: a countdown's two lists. S1 stubs: track C saves and syncs
+  // them (data/timerActions.ts `withAdded`, `withReplaced`, `withRemoved`);
+  // until then they change nothing.
+  const addTimerAction: AppState["addTimerAction"] = async () => {};
+  const setTimerAction: AppState["setTimerAction"] = async () => {};
+  const removeTimerAction: AppState["removeTimerAction"] = async () => {};
+  const timerReturn: AppState["timerReturn"] = (id) =>
+    readReturns(timerStore().presetReturns).find((r) => r.timer === id) ?? null;
+
+  // Each timer's keys live in its own entry, by verb. This build registers
+  // `toggle`, `reset` and (v1.60.0) `finish`; any other verb (a later
+  // build's) is kept and written back as it is. Saved first, then
+  // registered, as `setHotkeyBinding` does; a bind changes only its own
+  // verb. Through the timers' queue, so binds land in the order they were
+  // made, and after a delete's unregisters of an id an Add took again.
   const bindTimerHotkey: AppState["bindTimerHotkey"] = async (id, verb, raw) => {
     // A capture can outlive its card: a key for a timer no longer stored
     // (or one the backend doesn't run) would be one nothing shows, and the
@@ -2712,6 +2769,13 @@ export function createAppState(): AppState {
       setSelectedEffect(first);
     }, { defer: true }),
   );
+
+  // v1.60.0: the effect chain's commands, one at a time (D19), as the
+  // mute's and the timers' are: a timer's preset switch and a click on the
+  // same control could otherwise land reversed. S1 declares the queue;
+  // track C sends `set_effect_chain`, `set_effect_param`,
+  // `set_effect_enabled` and `set_voice_model` through it.
+  const chainQueue = inOrder();
 
   const chainToSpecs = (entries: ChainEntry[]): EffectSpec[] =>
     entries.map((e) => ({
@@ -3077,6 +3141,11 @@ export function createAppState(): AppState {
   const [soundboardLoading, setSoundboardLoading] = createSignal(false);
   const [soundboardError, setSoundboardError] = createSignal<string | null>(null);
   const [playingClips, setPlayingClips] = createStore<Record<string, PlayingClip>>({});
+  // v1.60.0: the soundboard's commands, one at a time (D19), so a timer's
+  // clip and a Panic land in the order they were sent. S1 declares the
+  // queue; track C sends `play_soundboard_clip`, `stop_soundboard_clip`,
+  // `stop_all_soundboard_clips` and Speak's play through it.
+  const soundboardQueue = inOrder();
   const [tileHotkeys, setTileHotkeys] = createStore<Record<string, string[]>>(
     loadJson<Record<string, string[]>>(STORAGE_KEYS.tileHotkeys, {}),
   );
@@ -3427,11 +3496,12 @@ export function createAppState(): AppState {
       }
     }
     // v1.59.0: then Hourglass's timers, from `divora.timers`. Only timers the
-    // backend runs, and only the verbs this build acts on: a newer kind's
-    // keys, a timer past the 16th and a later verb (`finish`) are kept in
-    // storage and never registered. Each key is read just before it is
-    // queued, so a delete or a bind made before is the one that counts. The
-    // timers' queue sends it after the boot sync, and a delete or a bind
+    // backend runs, and only the verbs this build acts on (`TIMER_VERBS`;
+    // v1.60.0 adds `finish`, End now's key, registered only when bound): a
+    // newer kind's keys, a timer past the 16th and a later build's verb are
+    // kept in storage and never registered. Each key is read just before it
+    // is queued, so a delete or a bind made before is the one that counts.
+    // The timers' queue sends it after the boot sync, and a delete or a bind
     // made after it is queued after it.
     for (const { id } of timerStore().timers) {
       for (const verb of TIMER_VERBS) {
@@ -4357,6 +4427,7 @@ export function createAppState(): AppState {
     setCustomGlyphAction,
     glyphOutcome,
     dispatchGlyphAction,
+    dispatchAction,
     recognizeCustomGlyph,
 
     overlayOpen: overlay.overlayOpen,
@@ -4661,6 +4732,11 @@ export function createAppState(): AppState {
     pauseTimer,
     resetTimer,
     adjustTimer,
+    finishTimer,
+    addTimerAction,
+    setTimerAction,
+    removeTimerAction,
+    timerReturn,
     bindTimerHotkey,
     timersDir,
     timerOnOverlay,

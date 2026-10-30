@@ -25,10 +25,12 @@ import {
   timerHotkeyId,
   timerRoles,
   timersForSave,
+  TIMER_VERBS,
   type StoredTimer,
   type StoredTimers,
   type TimerEdges,
   type TimerRun,
+  type TimerVerb,
 } from "./timers";
 
 const cd = (id: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -206,6 +208,35 @@ describe("readTimers", () => {
     }
   });
 
+  // v1.60.0: the lists and the returns are read only by data/timerActions.ts;
+  // storage keeps whatever is there, readable or not.
+  it("keeps onStart, onFire and presetReturns as written, whatever they hold", () => {
+    const raw = {
+      version: 1,
+      presetReturns: "x",
+      timers: [
+        cd("timer-1", { onStart: {}, onFire: 5 }),
+        cd("timer-2", { onStart: [{ kind: "obs", op: "scene" }, { kind: "setMuted", muted: true }], onFire: null }),
+      ],
+    };
+    const s = readTimers(raw);
+    expect(s.presetReturns).toBe("x");
+    expect(s.timers[0]).toMatchObject({ onStart: {}, onFire: 5 });
+    expect(s.timers[1]).toMatchObject({ onStart: raw.timers[1]!.onStart, onFire: null });
+    expect(readTimers(JSON.parse(JSON.stringify(timersForSave(s))))).toEqual(s);
+    // Nothing unreadable is sent; the readable mute is.
+    expect(defsForSync(s)).toEqual([
+      { id: "timer-1", name: "TIMER-1", kind: "countdown", durationMs: 300_000 },
+      {
+        id: "timer-2",
+        name: "TIMER-2",
+        kind: "countdown",
+        durationMs: 300_000,
+        onStart: [{ kind: "setMuted", muted: true }],
+      },
+    ]);
+  });
+
   it("keeps entries past the 64th (the backend skips them)", () => {
     const many = Array.from({ length: 70 }, (_, i) => cd(`timer-${i + 1}`));
     expect(stored(many).timers).toHaveLength(70);
@@ -223,10 +254,13 @@ describe("timersForSave", () => {
     const raw = {
       version: 2,
       later: [1],
+      presetReturns: [{ timer: "timer-1", from: "hollow-king", to: "villager" }, { timer: 5 }],
       timers: [
         cd("timer-1", {
           hotkeys: { toggle: "F13", finish: "F15" },
           run: { phase: "running", totalMs: 300_000, anchorMs: 5 },
+          onStart: [{ kind: "preset", presetId: "villager" }, { kind: "obs", op: "scene" }],
+          onFire: [{ kind: "revertPreset" }],
         }),
         { id: "timer-2", name: "Laps", kind: "interval", durationMs: 9, laps: [1] },
         cd("timer-3", { kind: "countup", run: { phase: "paused", ms: 754_321 } }),
@@ -275,12 +309,39 @@ describe("defsForSync", () => {
 
   // The seam with the backend's `entry_from_wire`, which reads these keys:
   // timers.rs `sync_entry_keys_are_the_fixtures` reads the same list.
-  it("sends exactly the fixture's defKeys, resume only with a run", () => {
-    const [withRun, withoutRun] = defsForSync(
-      stored([cd("timer-1", { run: { phase: "paused", ms: 5_000 }, colour: "red" }), cd("timer-2")]),
+  // v1.60.0: `onStart` and `onFire` go, like `resume`, only when there is
+  // something in them, and only for a countdown.
+  it("sends exactly the fixture's defKeys: resume only with a run, lists only for a countdown with some", () => {
+    const lists = {
+      onStart: [{ kind: "setMuted", muted: true }],
+      onFire: [{ kind: "preset", presetId: "x" }],
+    };
+    const [all, without, countup, empty] = defsForSync(
+      stored([
+        cd("timer-1", { run: { phase: "paused", ms: 5_000 }, colour: "red", ...lists }),
+        cd("timer-2"),
+        cd("timer-3", { kind: "countup", ...lists }),
+        cd("timer-4", { onStart: [], onFire: [{ kind: "mute" }] }),
+      ]),
     );
-    expect(Object.keys(withRun!).sort()).toEqual(fixture.defKeys);
-    expect(Object.keys(withoutRun!).sort()).toEqual(fixture.defKeys.filter((k) => k !== "resume"));
+    expect(Object.keys(all!).sort()).toEqual(fixture.defKeys);
+    expect(all).toMatchObject(lists);
+    const optional = ["onFire", "onStart", "resume"];
+    for (const def of [without, countup, empty]) {
+      expect(Object.keys(def!).sort()).toEqual(fixture.defKeys.filter((k) => !optional.includes(k)));
+    }
+  });
+
+  // The seam with the backend's `hooks_from_wire`: the same rows, read by
+  // timers.rs (`hooks_from_wire_reads_eight`) and here.
+  it("sends each fixture listSample's lists as the backend reads them", () => {
+    for (const row of fixture.listSamples) {
+      const [def] = defsForSync(stored([row.entry]));
+      const sent: Record<string, unknown> = {};
+      if (def?.onStart) sent.onStart = def.onStart;
+      if (def?.onFire) sent.onFire = def.onFire;
+      expect(sent, row.name).toEqual(row.sent);
+    }
   });
 });
 
@@ -396,7 +457,15 @@ describe("timer hotkey ids", () => {
     for (const row of fixture.hotkeyIds) {
       const want = row.timer === null ? null : { id: row.timer, verb: row.verb };
       expect(parseTimerHotkeyId(row.id), row.id).toEqual(want);
-      if (row.timer !== null) expect(timerHotkeyId(row.timer, row.verb as "toggle" | "reset")).toBe(row.id);
+      if (row.timer !== null) expect(timerHotkeyId(row.timer, row.verb as TimerVerb)).toBe(row.id);
+    }
+  });
+
+  it("registers three verbs since v1.60.0: start or pause, reset and End now", () => {
+    expect(TIMER_VERBS).toEqual(["toggle", "reset", "finish"]);
+    expect(parseTimerHotkeyId("tm:timer-1:finish")).toEqual({ id: "timer-1", verb: "finish" });
+    for (const id of ["tm:timer-1:Finish", "tm:timer-1:finish ", "tm:timer-1:end"]) {
+      expect(parseTimerHotkeyId(id), id).toBeNull();
     }
   });
 });

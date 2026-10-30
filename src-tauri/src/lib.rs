@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,8 @@ pub mod overlay_machine;
 mod overlay_windows;
 pub mod replay;
 mod screen;
+pub mod timer_actions;
+pub mod timer_lines;
 pub mod timer_thread;
 pub mod timers;
 use midi::{
@@ -60,9 +63,11 @@ use screen::{
     sanitize_fps, screen_recording_path, ArmRequest, CaptureStatusDto, DesktopSourceDto,
     MonitorDto, Quality, ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
+use timer_actions::{ActionBatch, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT};
+use timer_lines::{Line, TimerLines};
 use timer_thread::{
-    spawn_text_writer, spawn_timer_thread, ChannelWaiter, RealClock, TextFiles, TextSlot,
-    TimerEvents, TimerShared,
+    hand_off, spawn_action_worker, spawn_text_writer, spawn_timer_thread, ActionHost,
+    ChannelWaiter, RealClock, TextFiles, TextSlot, TimerEvents, TimerShared, ACTION_QUEUE,
 };
 use timers::{adjust_delta, TimerOp, TimerSnapshot, TICK, TIMER_STATE_EVENT};
 
@@ -302,6 +307,10 @@ struct AppState {
     /// thread's wake, and the timers' folder (`timers/`, `timers-dev/` for
     /// development builds). Shared with the `divora-timers` thread.
     timers: Arc<TimerShared>,
+    /// v1.60.0: a timer's spoken lines — the latest one and what makes it
+    /// stale (D21). The only one there is (D23): the timers' action worker
+    /// reaches it through `try_state`.
+    timer_lines: Arc<TimerLines>,
 }
 
 /// One installed voice model. `id` (and `name`) are the file stem; the
@@ -3065,6 +3074,15 @@ fn timer_status(state: State<'_, AppState>) -> TimerSnapshot {
     state.timers.status()
 }
 
+/// v1.60.0: End now (D25): a running or paused countdown fires at once —
+/// `fires` + 1, done — and its At zero list runs, as at 00:00. One already
+/// past a deadline no reader had seen fires as that deadline's (the op's
+/// tick takes it first). Anything else is unchanged.
+#[tauri::command]
+fn finish_timer(state: State<'_, AppState>, id: String) -> Result<TimerSnapshot, String> {
+    state.timers.apply(&id, TimerOp::Finish)
+}
+
 /// v1.59.0: absolute path of the timers' folder, for Open folder and Copy
 /// path. Created here (`open_external` opens only folders that exist); the
 /// writer creates it too, at its first write.
@@ -3075,19 +3093,113 @@ fn timers_dir(state: State<'_, AppState>) -> Result<String, String> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
-/// v1.59.0: the timer thread's `timer-state` emits. From a std thread an
-/// emit posts to the event loop and returns, so it never waits on the main
-/// thread. Only the first failure is logged: the next change sends the whole
-/// set again.
-impl TimerEvents for AppHandle {
+/// v1.60.0: what the timer thread hands on — its `timer-state` emits
+/// (v1.59.0's), and each hook run's two halves: the backend's to the action
+/// worker, the page's as `timer-actions` (D13).
+struct TimerOutputs {
+    app: AppHandle,
+    /// The action worker's queue ([`ACTION_QUEUE`] batches at most).
+    actions: SyncSender<ActionBatch>,
+}
+
+impl TimerEvents for TimerOutputs {
+    /// v1.59.0: from a std thread an emit posts to the event loop and
+    /// returns, so it never waits on the main thread. Only the first failure
+    /// is logged: the next change sends the whole set again.
     fn timer_state(&self, s: &TimerSnapshot) {
         static LOGGED: AtomicBool = AtomicBool::new(false);
-        if let Err(e) = self.emit(TIMER_STATE_EVENT, s) {
+        if let Err(e) = self.app.emit(TIMER_STATE_EVENT, s) {
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(error = %e, "timer-state emit failed");
             }
         }
     }
+
+    /// One hand-off: the batch first, without waiting, then the emit (which
+    /// posts and returns). Only the first failed emit is logged.
+    fn timer_actions(&self, p: &Planned, seq: u64) {
+        hand_off(p, seq, Instant::now(), &self.actions, |ev| {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if let Err(e) = self.app.emit(TIMER_ACTIONS_EVENT, ev) {
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = %e, "timer-actions emit failed");
+                }
+            }
+        });
+    }
+}
+
+/// v1.60.0: what the action worker runs a timer's backend actions against
+/// (D14, D21-D23). State made after the worker starts (the recorder, the
+/// recordings folder, the lines) comes from `try_state` when an action
+/// runs; before `AppState` is managed, no line can exist yet and no replay
+/// can be saved.
+struct AppHost {
+    engine: Arc<AudioEngine>,
+    app: AppHandle,
+}
+
+impl ActionHost for AppHost {
+    fn set_muted(&self, muted: bool) {
+        host_set_muted(&self.engine, muted);
+    }
+
+    fn stop_all(&self) {
+        let emit = || {
+            let _ = self.app.emit(SOUNDBOARD_STOPPED_EVENT, ());
+        };
+        if let Some(state) = self.app.try_state::<AppState>() {
+            host_stop_all(&self.engine, &state.timer_lines, emit);
+        } else {
+            self.engine.send_soundboard(SoundboardCommand::StopAll);
+            emit();
+        }
+    }
+
+    /// As the tray's Save: fire-and-forget on the blocking pool, where the
+    /// save may wait up to 90 s. Every outcome is a `replay-saved` event.
+    fn save_replay(&self, at: Instant) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            let recorder = Arc::clone(&state.screen);
+            let dir = state.recordings_dir.clone();
+            let app = self.app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = recorder.save_replay(&app, dir, at);
+            });
+        }
+    }
+
+    fn speak(&self, timer: &str, text: &str, voice_id: &str) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.timer_lines.put(Line {
+                timer: timer.to_string(),
+                text: text.to_string(),
+                voice_id: voice_id.to_string(),
+            });
+        }
+    }
+
+    fn end_run(&self, timer: &str) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.timer_lines.end_run(timer);
+        }
+    }
+}
+
+/// v1.60.0: a timer's `setMuted`: the engine's plain set (D24), an atomic op
+/// that takes effect on the next buffer, also while stopped. Split out as
+/// [`mute_on_hotkey`] is, so a test can run it against a real engine.
+fn host_set_muted(engine: &AudioEngine, muted: bool) {
+    engine.set_input_muted(muted);
+}
+
+/// v1.60.0: a timer's Stop all clips and lines (D23): the lines' epoch is
+/// bumped and `StopAll` sent under their lock, so no line checked before it
+/// plays after it; then `emit` tells the page (`soundboard-stopped`).
+#[doc(hidden)]
+pub fn host_stop_all(engine: &AudioEngine, lines: &TimerLines, emit: impl FnOnce()) {
+    lines.stop_all(|| engine.send_soundboard(SoundboardCommand::StopAll));
+    emit();
 }
 
 /// Decode a clip on first play; subsequent plays reuse the cached
@@ -3198,10 +3310,11 @@ fn global_shortcut_handler(app: &AppHandle, shortcut: &Shortcut, event: Shortcut
         // v1.58.0: and push-to-modulate's, press and release, for the same
         // reasons. The frontend does nothing with the event either.
         ptm_on_hotkey(&state.engine, &id, event.state == ShortcutState::Pressed);
-        // v1.59.0: and an Hourglass timer's `tm:<id>:toggle` / `tm:<id>:reset`,
-        // press only, so they work while the page is hidden or reloading and
-        // decide from the core's state. The frontend does nothing with the
-        // event; the timer thread emits what changed.
+        // v1.59.0: and an Hourglass timer's `tm:<id>:toggle` / `tm:<id>:reset`
+        // (v1.60.0: and End now's `tm:<id>:finish`), press only, so they work
+        // while the page is hidden or reloading and decide from the core's
+        // state. The frontend does nothing with the event; the timer thread
+        // emits what changed.
         timer_thread::timer_on_hotkey(&state.timers, &id, event.state == ShortcutState::Pressed);
         let state_str = match event.state {
             ShortcutState::Pressed => "pressed",
@@ -3677,10 +3790,25 @@ pub fn run() {
             );
             let timer_texts = Arc::new(TextSlot::new());
             spawn_text_writer(&timer_texts, TextFiles::new(timers_dir));
+            // v1.60.0: `divora-timer-actions` runs a timer's backend actions
+            // (the mute, Stop all, a replay save, a line) in order, off the
+            // timer thread, which hands each batch on without waiting (D13,
+            // D14). With nothing handed it waits on its queue.
+            let (timer_actions, timer_batches) = mpsc::sync_channel(ACTION_QUEUE);
+            spawn_action_worker(
+                timer_batches,
+                AppHost {
+                    engine: engine.clone(),
+                    app: app.handle().clone(),
+                },
+            );
             spawn_timer_thread(
                 timers.clone(),
                 ChannelWaiter(timer_wake),
-                app.handle().clone(),
+                TimerOutputs {
+                    app: app.handle().clone(),
+                    actions: timer_actions,
+                },
                 timer_texts,
                 TICK,
             );
@@ -3793,6 +3921,7 @@ pub fn run() {
                 screen: Arc::new(ScreenRecorder::default()),
                 overlay_assets_dir,
                 timers,
+                timer_lines: Arc::new(TimerLines::new()),
             });
             overlay_windows::init(app);
 
@@ -3915,6 +4044,7 @@ pub fn run() {
             adjust_timer,
             timer_status,
             timers_dir,
+            finish_timer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");
@@ -5997,8 +6127,9 @@ mod tests {
 
     // ---- v1.59.0: Hourglass's commands, hotkey step and threads ----------
 
-    /// v1.59.0: the eight timer commands, by the names the frontend calls.
-    const TIMER_COMMANDS: [&str; 8] = [
+    /// v1.59.0: the eight timer commands, by the names the frontend calls;
+    /// v1.60.0 adds `finish_timer`.
+    const TIMER_COMMANDS: [&str; 9] = [
         "sync_timers",
         "arm_timer",
         "pause_timer",
@@ -6007,6 +6138,7 @@ mod tests {
         "adjust_timer",
         "timer_status",
         "timers_dir",
+        "finish_timer",
     ];
 
     /// lib.rs above its tests.
@@ -6043,7 +6175,8 @@ mod tests {
 
     /// v1.59.0: the eight are registered once each, after the MIDI commands
     /// (so the needles on the list's earlier lines keep their neighbours), and
-    /// the fixture's status command is one of them.
+    /// the fixture's status command is one of them. v1.60.0: `finish_timer`
+    /// too, after them, and it is the fixture's End now.
     #[test]
     fn the_timer_commands_are_registered() {
         let prod = production_source();
@@ -6061,6 +6194,14 @@ mod tests {
             serde_json::from_str(include_str!("../../src/overlay/timer.fixture.json")).unwrap();
         let status = fixture["commands"]["status"].as_str().unwrap();
         assert!(TIMER_COMMANDS.contains(&status), "{status}");
+        let finish = fixture["actionWire"]["commands"]["finish"]
+            .as_str()
+            .unwrap();
+        assert!(TIMER_COMMANDS.contains(&finish), "{finish}");
+        assert!(
+            handler.find("\n            finish_timer,\n").unwrap()
+                > handler.find("\n            timers_dir,\n").unwrap()
+        );
     }
 
     /// v1.59.0 (D19): the handler passes the event's real press state to the

@@ -6,6 +6,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { FINISH_TIMER_CMD, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT } from "../data/timerActions";
 import type { TimerDefWire } from "../data/timers";
 import type { Rect } from "../overlay/geometry";
 import { OVERLAY_EDIT_EVENT, OVERLAY_STATUS_EVENT } from "../overlay/state";
@@ -1400,6 +1401,36 @@ export async function timersDirCmd(): Promise<string> {
  *  `timer_status` sent after it can't miss a change made in between. */
 export async function subscribeTimerState(handler: (raw: unknown) => void): Promise<UnlistenFn> {
   return listen<unknown>(TIMER_STATE_EVENT, (e) => handler(e.payload));
+}
+
+// ---- Timers that change your voice (v1.60.0) ----
+// Rust decides what a countdown's start and end run (timer_actions.rs
+// `plan`) and runs the backend's half itself: the mute, Stop all clips and
+// lines, a replay, a line. The page hears `timer-actions` for its half
+// (preset switches and clips) and `soundboard-stopped` when a timer stopped
+// every clip, read with data/timerActions.ts. Nothing here runs an action.
+
+export type { PresetReturn, TimerAction, TimerActionsEvent } from "../data/timerActions";
+
+/** End now: a running or paused countdown fires at once (`fires` +1, done)
+ *  and runs its At zero list; one already past a deadline nothing ticked
+ *  yet fires as at 00:00; anything else is unchanged. Sync, and answers
+ *  the whole snapshot like the other timer commands; "no such timer" for
+ *  an id the backend doesn't run. */
+export async function finishTimerCmd(id: string): Promise<unknown> {
+  return invoke<unknown>(FINISH_TIMER_CMD, { id });
+}
+
+/** Listens to `timer-actions`. Resolves once the listener is registered.
+ *  The payload is read with `readTimerActionsEvent`. */
+export async function subscribeTimerActions(handler: (raw: unknown) => void): Promise<UnlistenFn> {
+  return listen<unknown>(TIMER_ACTIONS_EVENT, (e) => handler(e.payload));
+}
+
+/** Listens to `soundboard-stopped` (payload null): a timer's Stop all clips
+ *  and lines stopped every clip. Resolves once the listener is registered. */
+export async function subscribeSoundboardStopped(handler: () => void): Promise<UnlistenFn> {
+  return listen<unknown>(SOUNDBOARD_STOPPED_EVENT, () => handler());
 }
 
 // ---- Soundboard ----

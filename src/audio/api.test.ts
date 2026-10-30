@@ -115,6 +115,9 @@ import {
   timerStatusCmd,
   timersDirCmd,
   subscribeTimerState,
+  finishTimerCmd,
+  subscribeTimerActions,
+  subscribeSoundboardStopped,
 } from "./api";
 
 describe("audio api", () => {
@@ -1242,6 +1245,62 @@ describe("hourglass api (v1.59.0)", () => {
     const un = () => {};
     let settled = false;
     const subscribing = subscribeTimerState(() => {}).then((u) => {
+      settled = true;
+      return u;
+    });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(settled).toBe(false);
+    registered(un);
+    expect(await subscribing).toBe(un);
+    expect(settled).toBe(true);
+  });
+});
+
+// v1.60.0: timers that change your voice. Literals on purpose, as above: the
+// backend's names (lib.rs, timer_actions.rs), which timer.fixture.json's
+// `actionWire` pins on both sides.
+describe("timer actions api (v1.60.0)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+  });
+
+  it("finish_timer goes by its name, with flat args, and answers the snapshot as it came", async () => {
+    const snapshot = { seq: 9, timers: [] };
+    invokeMock.mockResolvedValueOnce(snapshot);
+    expect(await finishTimerCmd("timer-1")).toBe(snapshot);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenLastCalledWith("finish_timer", { id: "timer-1" });
+    invokeMock.mockRejectedValueOnce("no such timer");
+    await expect(finishTimerCmd("timer-9")).rejects.toBe("no such timer");
+  });
+
+  it("listens to timer-actions and soundboard-stopped, and forwards them", async () => {
+    const seen: unknown[] = [];
+    listenMock.mockImplementation(async (event: string, handler: (e: { payload: unknown }) => void) => {
+      handler({ payload: event === "soundboard-stopped" ? null : { from: event } });
+      return () => {};
+    });
+    await subscribeTimerActions((raw) => seen.push(raw));
+    await subscribeSoundboardStopped(() => seen.push("stopped"));
+    expect(listenMock.mock.calls.map((c) => c[0])).toEqual(["timer-actions", "soundboard-stopped"]);
+    expect(seen).toEqual([{ from: "timer-actions" }, "stopped"]);
+  });
+
+  it.each([
+    ["subscribeTimerActions", (h: () => void) => subscribeTimerActions(h)],
+    ["subscribeSoundboardStopped", (h: () => void) => subscribeSoundboardStopped(h)],
+  ])("%s resolves only once the listener is registered", async (_name, subscribe) => {
+    let registered!: (un: () => void) => void;
+    listenMock.mockImplementation(
+      () =>
+        new Promise<() => void>((resolve) => {
+          registered = resolve;
+        }),
+    );
+    const un = () => {};
+    let settled = false;
+    const subscribing = subscribe(() => {}).then((u) => {
       settled = true;
       return u;
     });

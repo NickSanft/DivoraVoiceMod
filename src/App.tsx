@@ -71,8 +71,9 @@ function applyRootAttr(name: string, value: string | null) {
 //   mute            → nothing: the backend already flipped the mute on the
 //                     press; acting here would flip it twice (v1.56.0)
 //   tm:<id>:<verb>  → nothing: the backend already started, paused, resumed
-//                     or reset the Hourglass timer on the press; acting here
-//                     would do it twice (v1.59.0)
+//                     or reset the Hourglass timer on the press, or (v1.60.0,
+//                     `finish`) ended it; acting here would do it twice
+//                     (v1.59.0)
 //   sb:<clip>       → play that soundboard tile
 export function dispatchGlobalShortcut(app: AppState, event: GlobalShortcutEvent): void {
   if (event.id === "ptm") {
