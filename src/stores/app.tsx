@@ -976,6 +976,11 @@ export interface AppState {
   soundboardTiles: () => SoundboardTile[];
   setSoundboardTiles: Setter<SoundboardTile[]>;
   soundboardLoading: () => boolean;
+  /** v1.60.0: the current folder's clips are known: its scan has finished
+   *  (or failed), or there is no folder. Until then a clip missing from
+   *  `soundboardTiles` may only be not scanned yet (a launch's or a
+   *  reload's scan comes after the devices and the presets). */
+  soundboardScanned: () => boolean;
   soundboardError: () => string | null;
   setSoundboardError: Setter<string | null>;
   playingClips: Record<string, PlayingClip>;
@@ -3481,6 +3486,12 @@ export function createAppState(): AppState {
   };
   const [soundboardTiles, setSoundboardTiles] = createSignal<SoundboardTile[]>([]);
   const [soundboardLoading, setSoundboardLoading] = createSignal(false);
+  // v1.60.0: the folder whose last scan has finished (or failed).
+  const [soundboardScannedFolder, setSoundboardScannedFolder] = createSignal<string | null>(null);
+  const soundboardScanned = (): boolean => {
+    const folder = soundboardFolder();
+    return !folder || soundboardScannedFolder() === folder;
+  };
   const [soundboardError, setSoundboardError] = createSignal<string | null>(null);
   const [playingClips, setPlayingClips] = createStore<Record<string, PlayingClip>>({});
   // v1.60.0: the soundboard's commands, one at a time (D19): invokes in
@@ -3589,6 +3600,7 @@ export function createAppState(): AppState {
       setSoundboardTiles([]);
     } finally {
       setSoundboardLoading(false);
+      setSoundboardScannedFolder(folder);
     }
   };
 
@@ -4994,6 +5006,7 @@ export function createAppState(): AppState {
     soundboardTiles,
     setSoundboardTiles,
     soundboardLoading,
+    soundboardScanned,
     soundboardError,
     setSoundboardError,
     playingClips,

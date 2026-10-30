@@ -285,11 +285,15 @@ pub enum Transition {
         hooks: Arc<Hooks>,
     },
     /// v1.60.0: a running or paused countdown stopped without firing. A
-    /// kind change's carries the lists from before the sync.
+    /// kind change's carries the lists from before the sync. `started` is
+    /// the lists this run's start ran with — its Arm's, or the relaunch's
+    /// that picked it up (P7) — so the undo is judged against what the start
+    /// did, not an At start edited since (Q2, Q12).
     Cancelled {
         id: String,
         why: CancelWhy,
         hooks: Arc<Hooks>,
+        started: Arc<Hooks>,
     },
 }
 
@@ -640,6 +644,11 @@ struct Timer {
     /// v1.60.0: the definition's action lists, the latest sync's (D7); each
     /// transition takes a share.
     hooks: Arc<Hooks>,
+    /// v1.60.0: the lists this run started with — set by a countdown's Arm
+    /// and by a seed, kept by a sync — which a cancel's undo is judged
+    /// against (Q2: Reset and delete undo only what the start did). Empty
+    /// before any start.
+    started: Arc<Hooks>,
 }
 
 impl Timer {
@@ -661,6 +670,7 @@ impl Timer {
             fires: 0,
             text: String::new(),
             hooks: Arc::clone(&def.hooks),
+            started: Arc::default(),
         };
         timer.reset(Duration::ZERO);
         timer
@@ -772,8 +782,11 @@ impl Timer {
         }
     }
 
-    /// The seed of a stored run (§7.8).
+    /// The seed of a stored run (§7.8). v1.60.0: a run seeded running or
+    /// paused started, as far as this process goes, with the lists it has
+    /// now — the ones its restart re-applies (P7).
     fn take_seed(&mut self, seed: Seed, now: Duration, wall_ms: i64) {
+        self.started = Arc::clone(&self.hooks);
         self.total_ms = seed.total_ms;
         if seed.phase == TimerPhase::Running {
             self.run_from(seed.ms, now, wall_ms);
@@ -787,8 +800,9 @@ impl Timer {
     /// its new length; one that runs, is paused or has ended keeps its run
     /// until it starts again — and a new kind makes it idle. v1.60.0: the
     /// lists are the definition's from now on, and a change to them keeps
-    /// the run too (D7). A new kind on an active countdown cancels it as a
-    /// Reset does, with the lists it had before (D6): the new def's are a
+    /// the run too (D7) — and what the run started with, which a cancel
+    /// undoes. A new kind on an active countdown cancels it as a Reset
+    /// does, with the lists it had before (D6): the new def's are a
     /// count-up's, which has none (D32).
     fn redefine(&mut self, def: &TimerDef, now: Duration) -> Option<Transition> {
         self.name.clone_from(&def.name);
@@ -813,12 +827,13 @@ impl Timer {
     }
 
     /// v1.60.0: what stopping it without a fire records, with its lists as
-    /// they are.
+    /// they are and the ones its run started with.
     fn cancel(&self, why: CancelWhy) -> Transition {
         Transition::Cancelled {
             id: self.id.clone(),
             why,
             hooks: Arc::clone(&self.hooks),
+            started: Arc::clone(&self.started),
         }
     }
 
@@ -1211,7 +1226,8 @@ impl TimerCore {
     /// and a change to them records nothing (D7). An active countdown that
     /// stops running — its kind changed, or its id gone (deleted, or no
     /// longer among the first [`MAX_TIMERS`]) — records a
-    /// [`Transition::Cancelled`] with the lists it had (D6, D10).
+    /// [`Transition::Cancelled`] with the lists it had and the ones its run
+    /// started with (D6, D10).
     pub fn sync(
         &mut self,
         entries: Vec<WireEntry>,
@@ -1301,7 +1317,8 @@ impl TimerCore {
     ///
     /// v1.60.0 (D6, §7.8): a countdown armed from idle, done or ran out —
     /// Start, Start again, a Toggle that arms — records
-    /// [`Transition::Started`]; a Resume doesn't, since it isn't a start. A
+    /// [`Transition::Started`], and its lists are what this run started
+    /// with; a Resume doesn't, since it isn't a start. A
     /// Reset of a running or paused countdown records
     /// [`Transition::Cancelled`]; of an ended one, nothing (it already
     /// ended). A Toggle that finds its countdown due records the tick's
@@ -1333,11 +1350,14 @@ impl TimerCore {
             return Ok(());
         }
         let recorded = match (before, timer.phase) {
-            (Idle | Done | Expired, Running) => Some(Transition::Started {
-                id: timer.id.clone(),
-                fires: timer.fires,
-                hooks: Arc::clone(&timer.hooks),
-            }),
+            (Idle | Done | Expired, Running) => {
+                timer.started = Arc::clone(&timer.hooks);
+                Some(Transition::Started {
+                    id: timer.id.clone(),
+                    fires: timer.fires,
+                    hooks: Arc::clone(&timer.hooks),
+                })
+            }
             (Running | Paused, Idle) => Some(timer.cancel(CancelWhy::Reset)),
             _ => None,
         };
@@ -2138,12 +2158,13 @@ mod tests {
         started_with(id, fires, &Arc::default())
     }
 
-    /// A cancel, carrying `hooks`.
+    /// A cancel, carrying `hooks`, of a run that started with them.
     fn cancelled_with(id: &str, why: CancelWhy, hooks: &Arc<Hooks>) -> Transition {
         Transition::Cancelled {
             id: id.into(),
             why,
             hooks: hooks.clone(),
+            started: hooks.clone(),
         }
     }
 
@@ -4077,6 +4098,103 @@ mod tests {
             core.take_transitions(),
             vec![fired_with("timer-1", 1, 0, false, &newer)]
         );
+    }
+
+    /// Q2, Q12 (D7, D10): a Reset, a kind change and a delete undo what this
+    /// run's start did, not what At start says by then — an At start edit
+    /// counts from the next start. A break whose mute is edited out mid-run
+    /// still unmutes when cancelled; an "unmute me in 5 minutes" with a mute
+    /// edited in mid-run unmutes nothing. A Start again takes At start as it
+    /// is then, and a run picked up at a relaunch started with the lists
+    /// its restart re-applied (P7).
+    #[test]
+    fn a_cancel_undoes_what_its_start_did() {
+        let entry = |hooks: &Arc<Hooks>| with_hooks(countdown("timer-1", 300_000), hooks);
+        let brb = brb();
+        let unmute_later = lists(vec![], vec![UNMUTE]);
+        // What the recorded transitions run in the backend, and why.
+        let runs = |core: &mut TimerCore| -> Vec<(Why, Vec<Action>)> {
+            core.take_transitions()
+                .iter()
+                .filter_map(plan)
+                .map(|p| (p.why, p.backend))
+                .collect()
+        };
+        // (started with, At start edited to, what a cancel undoes)
+        let rows = [
+            (&brb, &unmute_later, vec![UNMUTE]),
+            (&unmute_later, &brb, vec![]),
+        ];
+        for (start, edited, undo) in &rows {
+            for how in ["Reset", "kind change", "deleted"] {
+                let mut core = core_with(vec![entry(start)]);
+                op(&mut core, "timer-1", TimerOp::Arm, secs(1));
+                assert_eq!(
+                    runs(&mut core),
+                    [(Why::Armed, start.on_start.clone())],
+                    "{how}"
+                );
+                core.sync(vec![entry(edited)], secs(2), wall(secs(2)), None);
+                assert_eq!(runs(&mut core), [], "{how}: an edit runs nothing");
+                let at = secs(3);
+                let why = match how {
+                    "Reset" => {
+                        op(&mut core, "timer-1", TimerOp::Reset, at);
+                        Why::Reset
+                    }
+                    "kind change" => {
+                        core.sync(vec![countup("timer-1")], at, wall(at), None);
+                        Why::Reset
+                    }
+                    _ => {
+                        core.sync(vec![], at, wall(at), None);
+                        Why::Deleted
+                    }
+                };
+                assert_eq!(runs(&mut core), [(why, undo.clone())], "{how}");
+            }
+        }
+
+        // Start again: a break run to zero, its mute edited out, started
+        // again by a Toggle, the mute edited back in, Reset: this run's
+        // start muted nothing.
+        let mut core = core_with(vec![entry(&brb)]);
+        op(&mut core, "timer-1", TimerOp::Arm, secs(1));
+        tick(&mut core, secs(301));
+        assert_eq!(
+            runs(&mut core),
+            [(Why::Armed, vec![MUTE]), (Why::Zero, vec![UNMUTE])]
+        );
+        core.sync(vec![entry(&unmute_later)], secs(302), wall(secs(302)), None);
+        op(&mut core, "timer-1", TimerOp::Toggle, secs(303));
+        core.sync(vec![entry(&brb)], secs(304), wall(secs(304)), None);
+        op(&mut core, "timer-1", TimerOp::Reset, secs(305));
+        assert_eq!(
+            runs(&mut core),
+            [(Why::Armed, vec![]), (Why::Reset, vec![])],
+            "Start again"
+        );
+
+        // A relaunch picks up a paused run with the lists it has then and
+        // re-applies their mute; an edit after it counts from the next start.
+        for (start, edited, undo) in &rows {
+            let mut core = TimerCore::new();
+            let paused = edit(entry(start), |d| {
+                d.resume = Some(stored(Paused, Some(120_000), Some(300_000), None));
+            });
+            core.sync(vec![paused], secs(1), wall(secs(1)), None);
+            let restart: Vec<Action> = start.on_start.clone();
+            let restarted = if restart.is_empty() {
+                vec![]
+            } else {
+                vec![(Why::Restart, restart)]
+            };
+            assert_eq!(runs(&mut core), restarted, "relaunch");
+            assert_eq!(state(&mut core, secs(1), "timer-1").phase, Paused);
+            core.sync(vec![entry(edited)], secs(2), wall(secs(2)), None);
+            op(&mut core, "timer-1", TimerOp::Reset, secs(3));
+            assert_eq!(runs(&mut core), [(Why::Reset, undo.clone())], "relaunch");
+        }
     }
 
     /// D17: every snapshot's `seq` is larger than the one before, whoever

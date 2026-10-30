@@ -27,6 +27,8 @@ let timerReply: (cmd: string, args: unknown) => unknown = () => null;
 // test says, so the bundled presets stand and nothing has loaded).
 let presetsReply: () => unknown = () => [];
 let ttsVoicesReply: () => unknown = () => [];
+// v1.60.0: what a soundboard folder's scan finds (nothing unless a test says).
+let scanReply: () => unknown = () => [];
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
@@ -47,6 +49,8 @@ vi.mock("@tauri-apps/api/core", () => ({
         return presetsReply();
       case "list_tts_voices":
         return ttsVoicesReply();
+      case "scan_soundboard_folder":
+        return scanReply();
       case "detect_virtual_mic":
         return { installed: false, name: null };
       case "list_voices":
@@ -1451,8 +1455,12 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     pastEight: "Only the first 8 actions in a list run. This one stays saved and doesn't run.",
     startRevert: "Back to the preset before runs only at zero. This one stays saved and doesn't run.",
   };
-  const RESET_UNDOES =
-    "Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: Unmute my voice if At start mutes you, and Back to the preset before.";
+  /** Reset's row on a countdown whose At zero puts something back: what
+   *  that list has, and nothing it hasn't. */
+  const RESET_UNDOES = (what: string) =>
+    `Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: ${what}.`;
+  const UNDO_UNMUTE = "Unmute my voice if At start mutes you";
+  const UNDO_REVERT = "Back to the preset before";
   const TOGGLE_DESC = "Starts it, pauses it, resumes it, or starts it again once it's done or has run out.";
   const LINE_REASON = "Type a line of up to 200 characters. A long line takes longer to prepare.";
   const LINE_HELP =
@@ -1552,6 +1560,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     timerReply = () => null;
     presetsReply = () => [];
     ttsVoicesReply = () => [];
+    scanReply = () => [];
     invokeCalls.length = 0;
     for (const ev of ["timer-state", "timer-actions", "soundboard-stopped"]) eventHandlers.delete(ev);
   });
@@ -1690,6 +1699,37 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     fireEvent.keyDown(zero, { key: "Tab" });
     expect(view.queryByRole("listbox")).toBeNull();
     expect(saved()[0]!.onFire).toEqual([line("I'm back.")]);
+  });
+
+  it("Add action's keys scroll the highlighted choice into view, the least it takes; a hover doesn't", async () => {
+    store([entry("timer-1")]);
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    // jsdom has no scrollIntoView: a spy that notes which choice it was
+    // asked of.
+    const scrolled: string[] = [];
+    const before = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+    Element.prototype.scrollIntoView = function (this: Element, arg?: boolean | ScrollIntoViewOptions) {
+      expect(arg).toEqual({ block: "nearest" });
+      scrolled.push(this.textContent ?? "");
+    };
+    try {
+      const add = view.getByRole("button", { name: "Add an action at zero of BRB" });
+      add.focus();
+      fireEvent.keyDown(add, { key: "Enter" });
+      expect(scrolled).toEqual(["Switch preset"]);
+      fireEvent.keyDown(add, { key: "End" });
+      fireEvent.keyDown(add, { key: "ArrowUp" });
+      fireEvent.keyDown(add, { key: "Home" });
+      fireEvent.keyDown(add, { key: "ArrowDown" });
+      expect(scrolled).toEqual(["Switch preset", "Stop all clips and lines", "Save a replay", "Switch preset", "Random preset"]);
+      fireEvent.pointerEnter(view.getByRole("option", { name: "Save a replay" }));
+      expect(scrolled).toHaveLength(5);
+    } finally {
+      if (before) Object.defineProperty(Element.prototype, "scrollIntoView", before);
+      else delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
   });
 
   it("Speak a line asks for the voices, then adds the list's line in the first installed Kokoro voice, else Critter Chatter's Bright", async () => {
@@ -1942,6 +1982,66 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(view.queryByText(GONE)).toBeNull();
   });
 
+  it("a clip isn't judged gone until its folder's scan has finished; Add action says why there's no clip to add", async () => {
+    let answer: (v: unknown) => void = () => {};
+    scanReply = () =>
+      new Promise((r) => {
+        answer = r;
+      });
+    window.localStorage.setItem("divora.soundboardFolder", JSON.stringify("C:/clips"));
+    store([entry("timer-1", { onFire: [{ kind: "tile", tileId: TILES[0]!.id }] })]);
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const GONE = "That clip isn't in your soundboard folder now, so nothing plays.";
+    const named = (name: string) => view.getByRole("button", { name });
+    /** Add action's clip choice at the start, and whether it can be added. */
+    const clipChoice = (): [string | null, boolean] => {
+      const add = view.getByRole("button", { name: "Add an action at the start of BRB" });
+      fireEvent.click(add, { detail: 0 });
+      const o = within(view.getByRole("listbox")).getAllByRole("option")[4]!;
+      const seen: [string | null, boolean] = [o.textContent, o.getAttribute("aria-disabled") !== "true"];
+      fireEvent.keyDown(add, { key: "Escape" });
+      return seen;
+    };
+    // Before the folder's scan (at a launch or a reload it comes after the
+    // devices and the presets): the clip isn't called gone.
+    expect(named("Clip BRB plays at zero: Loading clips…")).toHaveTextContent("Loading clips…");
+    expect(view.queryByText(GONE)).toBeNull();
+    expect(clipChoice()).toEqual(["Play a clip — loading your clips…", false]);
+
+    // The scan finds it.
+    const scan = app.scanCurrentSoundboardFolder();
+    await flush();
+    answer(TILES);
+    await scan;
+    await flush();
+    expect(named("Clip BRB plays at zero: Intro")).toBeInTheDocument();
+    expect(view.queryByText(GONE)).toBeNull();
+    expect(clipChoice()).toEqual(["Play a clip", true]);
+
+    // A scan that finds none: now it is gone, and the folder has no clips.
+    scanReply = () => [];
+    await app.scanCurrentSoundboardFolder();
+    await flush();
+    expect(named("Clip BRB plays at zero: Missing clip")).toHaveTextContent("Missing clip");
+    expect(view.getByText(GONE)).toBeInTheDocument();
+    expect(clipChoice()).toEqual(["Play a clip — no clips found in your soundboard folder", false]);
+
+    // Another folder, not scanned yet: loading again, until its scan ends.
+    app.setSoundboardFolder("D:/more");
+    await flush();
+    expect(named("Clip BRB plays at zero: Loading clips…")).toBeInTheDocument();
+    expect(view.queryByText(GONE)).toBeNull();
+    expect(clipChoice()).toEqual(["Play a clip — loading your clips…", false]);
+
+    // No folder at all: pick one first, as before.
+    app.setSoundboardFolder(null);
+    await flush();
+    expect(clipChoice()).toEqual(["Play a clip — pick a soundboard folder first", false]);
+    expect(view.getByText(GONE)).toBeInTheDocument();
+  });
+
   it("each kind's row: its words, its picker named with its value, and what it will and won't do", async () => {
     store([
       entry("timer-1", {
@@ -2053,15 +2153,23 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(view.queryByText(LIMIT)).toBeNull();
   });
 
-  it("a paused break says you stay muted; its key rows say what pausing and Reset do; a run-out says what ran", async () => {
+  it("a paused break says you stay muted; its key rows say what pausing and Reset do; a run-out says what such a run-out runs", async () => {
+    const SWITCH = { kind: "preset", presetId: "villager" };
     store([
       entry("timer-1", { onStart: [MUTE], onFire: [UNMUTE] }),
       entry("timer-2", { name: "Intro", onFire: [UNMUTE, { kind: "revertPreset" }] }),
       entry("timer-3", { name: "Plain" }),
+      entry("timer-4", { name: "Hush", onStart: [MUTE, SWITCH], onFire: [{ kind: "revertPreset" }] }),
+      entry("timer-5", { name: "Swap", onStart: [SWITCH], onFire: [UNMUTE] }),
     ]);
     const view = mount();
     await flush();
-    const others = [state("timer-2", { name: "Intro", ...EXPIRED }), state("timer-3", { name: "Plain", ...EXPIRED })];
+    const others = [
+      state("timer-2", { name: "Intro", ...EXPIRED }),
+      state("timer-3", { name: "Plain", ...EXPIRED }),
+      state("timer-4", { name: "Hush" }),
+      state("timer-5", { name: "Swap" }),
+    ];
     await emit(1, state("timer-1", PAUSED), ...others);
     const PAUSED_LINE = "BRB is paused, so you stay muted until you resume it and it reaches zero, or press End now or Reset.";
     // Only while you're muted.
@@ -2073,23 +2181,49 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(view.queryByText(PAUSED_LINE)).toBeNull();
 
     // BRB mutes at its start: start-or-pause says a press pauses the break;
-    // its At zero unmutes, so Reset says it undoes the start.
+    // its At zero unmutes, so Reset says it undoes the start with that, and
+    // only that.
     expect(within(card("timer-1")).getByText(`${TOGGLE_DESC} It pauses a break and doesn't end it; End now's key ends it.`)).toBeInTheDocument();
-    expect(within(card("timer-1")).getByText(RESET_UNDOES)).toBeInTheDocument();
-    // Intro doesn't mute at its start; its At zero puts things back.
+    expect(within(card("timer-1")).getByText(RESET_UNDOES(UNDO_UNMUTE))).toBeInTheDocument();
+    // Intro doesn't mute at its start; its At zero puts both back.
     expect(within(card("timer-2")).getByText(TOGGLE_DESC)).toBeInTheDocument();
-    expect(within(card("timer-2")).getByText(RESET_UNDOES)).toBeInTheDocument();
+    expect(within(card("timer-2")).getByText(RESET_UNDOES(`${UNDO_UNMUTE}, and ${UNDO_REVERT}`))).toBeInTheDocument();
     // Plain has nothing to undo: as v1.59.0.
     expect(within(card("timer-3")).getByText(TOGGLE_DESC)).toBeInTheDocument();
     expect(within(card("timer-3")).getByText("Back to the start, stopped.")).toBeInTheDocument();
+    // Hush mutes and switches at its start, and its At zero only switches
+    // back: Reset leaves you muted, so its row never says it unmutes.
+    const resetRow = (id: string): string =>
+      squash(within(card(id)).getByText(/^Back to the start, stopped\./).textContent);
+    expect(resetRow("timer-4")).toBe(RESET_UNDOES(UNDO_REVERT));
+    expect(resetRow("timer-4")).not.toContain("Unmute");
+    // Swap switches at its start and its At zero only unmutes: Reset leaves
+    // its preset on, so its row never says it switches back.
+    expect(resetRow("timer-5")).toBe(RESET_UNDOES(UNDO_UNMUTE));
+    expect(resetRow("timer-5")).not.toContain("Back to the preset before");
 
+    // A run-out names what such a run-out runs, from the list as it is: the
+    // card keeps no record of what ran.
     const HEAD = "It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.";
     expect(
-      within(card("timer-2")).getByText(`${HEAD} Of its At zero list, only Unmute my voice and Back to the preset before ran.`),
+      within(card("timer-2")).getByText(
+        `${HEAD} When it runs out like this, only Unmute my voice and Back to the preset before from its At zero list run.`,
+      ),
     ).toBeInTheDocument();
     expect(within(card("timer-3")).getByText(HEAD)).toBeInTheDocument();
     await emit(3, state("timer-1", EXPIRED), ...others);
-    expect(within(card("timer-1")).getByText(`${HEAD} Of its At zero list, only Unmute my voice ran.`)).toBeInTheDocument();
+    expect(
+      within(card("timer-1")).getByText(`${HEAD} When it runs out like this, only Unmute my voice from its At zero list runs.`),
+    ).toBeInTheDocument();
+    // Plain ran out with nothing in At zero; an Unmute added since never
+    // reads as having run.
+    await app.addTimerAction("timer-3", "onFire", { kind: "setMuted", muted: false });
+    await flush();
+    const plainLine = within(card("timer-3")).getByText((text) => text.startsWith(HEAD));
+    expect(squash(plainLine.textContent)).toBe(
+      `${HEAD} When it runs out like this, only Unmute my voice from its At zero list runs.`,
+    );
+    expect(plainLine.textContent).not.toMatch(/\bran\b/);
   });
 
   it("while its switch is the live preset, the card says which, whether it stays, and why the call may not hear it", async () => {
@@ -2221,5 +2355,87 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     await flush();
     const second = (sent("sync_timers")[0] as { timers: Array<{ name: string }> }).timers[1]!;
     expect(second.name).toBe("BRB 2");
+  });
+});
+
+describe("SettingsScreen — picking what a picker already has (v1.60.0)", () => {
+  // Select's keys (D28) made Enter to open and Enter again to close pick
+  // the highlighted option, the current one: that mustn't retarget a MIDI
+  // mapping or a glyph.
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+  const stored = (key: string): unknown => JSON.parse(window.localStorage.getItem(key) ?? "null");
+  /** Opens a picker and closes it again from the keyboard, by `key`. */
+  const reopen = async (trigger: HTMLElement, key: string): Promise<void> => {
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key });
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    fireEvent.keyDown(trigger, { key });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await flush();
+  };
+
+  it("MIDI: a mapping's own action, picked again, keeps its parameter and range; another action still resets them", async () => {
+    const PARAM = {
+      id: "m1",
+      action: "param",
+      effectIndex: 3,
+      paramKey: "shift",
+      min: -5,
+      max: 7,
+      trigger: { kind: "cc", data1: 7, channel: 0 },
+    };
+    window.localStorage.setItem("divora.midiMappings", JSON.stringify([PARAM]));
+    const view = mount();
+    await flush();
+    const section = view.getByText("Control surfaces").closest("section")!;
+    const action = (): HTMLElement => within(section).getByText("Sweep effect param").closest("button")!;
+    for (const key of ["Enter", " "]) {
+      await reopen(action(), key);
+      expect(stored("divora.midiMappings"), key).toEqual([PARAM]);
+    }
+    // A click on the chosen option, as well.
+    fireEvent.click(action(), { detail: 1 });
+    fireEvent.click(within(section).getByRole("option", { name: "Sweep effect param" }), { detail: 1 });
+    await flush();
+    expect(stored("divora.midiMappings")).toEqual([PARAM]);
+    // Another action: its own default target, as before.
+    fireEvent.click(action(), { detail: 1 });
+    fireEvent.click(within(section).getByRole("option", { name: "Mute your voice" }), { detail: 1 });
+    await flush();
+    const after = stored("divora.midiMappings") as Array<Record<string, unknown>>;
+    expect(after.map((m) => [m.action, m.effectIndex, m.paramKey, m.min, m.max])).toEqual([
+      ["mute", undefined, undefined, undefined, undefined],
+    ]);
+  });
+
+  it("Glyph casting: a glyph's own kind, picked again, keeps its preset", async () => {
+    const preset = FALLBACK_PRESETS[2]!.id;
+    expect(FALLBACK_PRESETS[0]!.id).not.toBe(preset);
+    window.localStorage.setItem("divora.glyphBindings", JSON.stringify({ triangle: { kind: "preset", presetId: preset } }));
+    const view = mount();
+    await flush();
+    const row = view.getByText("Triangle").closest("div")!.parentElement!;
+    const kind = (): HTMLElement => row.querySelectorAll<HTMLElement>("button.select")[0]!;
+    expect(kind()).toHaveTextContent("Preset");
+    for (const key of ["Enter", " "]) {
+      await reopen(kind(), key);
+      expect((stored("divora.glyphBindings") as Record<string, unknown>).triangle, key).toEqual({
+        kind: "preset",
+        presetId: preset,
+      });
+    }
+    // Another kind, then Preset again: the first preset, as before.
+    fireEvent.click(kind(), { detail: 1 });
+    fireEvent.click(within(row).getByRole("option", { name: "Monitor" }), { detail: 1 });
+    await flush();
+    fireEvent.click(kind(), { detail: 1 });
+    fireEvent.click(within(row).getByRole("option", { name: "Preset" }), { detail: 1 });
+    await flush();
+    expect((stored("divora.glyphBindings") as Record<string, unknown>).triangle).toEqual({
+      kind: "preset",
+      presetId: FALLBACK_PRESETS[0]!.id,
+    });
   });
 });

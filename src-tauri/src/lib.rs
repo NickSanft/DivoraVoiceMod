@@ -6397,6 +6397,44 @@ mod tests {
         assert!(!engine.is_running());
     }
 
+    /// v1.60.0 (D23, D24, seam 3): the worker's production host reaches the
+    /// tested helpers, as the v1.56.0 hotkey reaches `mute_on_hotkey`. Its
+    /// `setMuted` is [`host_set_muted`](super::host_set_muted) and nothing
+    /// else — no toggle, no other `_input_muted(` in the host; its Stop all
+    /// tells the page on both paths; End now's `end_run` reaches
+    /// `AppState`'s lines. The host needs an `AppHandle`, so this reads the
+    /// source.
+    #[test]
+    fn the_timer_host_reaches_the_engine_and_the_lines() {
+        let prod = production_source();
+        let host = body_of(&prod, concat!("impl ActionHost for ", "AppHost {"));
+        assert_eq!(
+            squashed(body_of(host, "fn set_muted(")),
+            concat!("{host_set_muted(", "&self.engine,muted);}")
+        );
+        assert_eq!(host.matches(concat!("host_set", "_muted(")).count(), 1);
+        assert!(!host.contains(concat!("_input", "_muted(")), "{host}");
+        assert_eq!(
+            squashed(body_of(host, "fn stop_all(")),
+            concat!(
+                "{letemit=||{let_=self.app.emit(",
+                "SOUNDBOARD_STOPPED_EVENT,());};",
+                "ifletSome(state)=self.app.try_state::<AppState>(){",
+                "host_stop_all(&self.engine,&state.timer_lines,emit);",
+                "}else{self.engine.send_soundboard(SoundboardCommand::StopAll);",
+                "emit();}}"
+            )
+        );
+        assert_eq!(
+            squashed(body_of(host, "fn end_run(")),
+            concat!(
+                "{ifletSome(state)=self.app.try_state::<AppState>(){",
+                "state.timer_lines.end_run(",
+                "timer);}}"
+            )
+        );
+    }
+
     /// v1.60.0 (D23, seam 3): a timer's Stop all against a real engine,
     /// stopped, so nothing plays: the lines' epoch rises by one, the line
     /// waiting is dropped, the one being prepared is stale, and the page is

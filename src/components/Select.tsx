@@ -14,7 +14,10 @@
 //   - Keys, by the active-descendant model: the focus stays on the trigger,
 //     which points `aria-activedescendant` at the highlighted option. Enter,
 //     Space or Down opens it on the chosen option; Up, Down, Home and End
-//     move; Enter or Space picks; Esc closes; Tab closes and moves on.
+//     move; Enter or Space picks; Esc closes; Tab closes and moves on. A
+//     key's open or move scrolls the highlight into view (`revealOption`):
+//     the focus never moves to it, so nothing else would, and a list longer
+//     than the window would be picked from blind.
 //   - `blurOnPointer` hands the focus back to the page after a mouse or
 //     touch click, so Space reaches push-to-modulate again; from the
 //     keyboard the focus stays (blurOnPointer.ts).
@@ -71,6 +74,15 @@ export function listboxStep(key: string, at: number, count: number): number {
 /** The keys an open listbox takes for its highlight. */
 export const LISTBOX_MOVES: readonly string[] = ["ArrowDown", "ArrowUp", "Home", "End"];
 
+/** v1.60.0: scrolls an open listbox's highlighted option (by its id) into
+ *  view, the least it takes. Only from a key's open or move: a pointer's
+ *  hover highlights too, and scrolling then would slide the next option
+ *  under a still pointer, which highlights it and scrolls again. Shared
+ *  with Settings → Hourglass's Add action. */
+export function revealOption(id: string): void {
+  document.getElementById(id)?.scrollIntoView?.({ block: "nearest" });
+}
+
 export function Select(props: SelectProps): JSX.Element {
   const [open, setOpen] = createSignal(false);
   // The highlighted option while open: where Enter or Space picks.
@@ -112,13 +124,17 @@ export function Select(props: SelectProps): JSX.Element {
       if (e.key === "Enter" || e.key === " " || e.key === "ArrowDown") {
         // Handled here, so the button's own click doesn't open it again.
         e.preventDefault();
-        if (props.options.length > 0) openList();
+        if (props.options.length > 0) {
+          openList();
+          revealOption(optionId(active()));
+        }
       }
       return;
     }
     if (LISTBOX_MOVES.includes(e.key)) {
       e.preventDefault();
       setActive(listboxStep(e.key, active(), props.options.length));
+      revealOption(optionId(active()));
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       pick(active());

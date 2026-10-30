@@ -6387,7 +6387,6 @@ describe("app store — Hourglass (v1.59.0)", () => {
         ["Save a replay (the backend's)", "end", [{ kind: "saveReplay" }], null, []],
         ["Stop all clips and lines (the backend's)", "end", [{ kind: "panic" }], null, []],
         ["the glyph's toggles, which aren't timer actions", "end", [{ kind: "monitor" }, { kind: "mute" }], null, []],
-        ["Back to the preset before at a start (never run there)", "start", [REVERT], null, []],
       ] as const)("%s", async (_name, hook, actions, queue, want) => {
         vi.spyOn(Math, "random").mockReturnValue(0);
         // Live on Villager with a return to Hollow King, so a revert has
@@ -6413,6 +6412,21 @@ describe("app store — Hourglass (v1.59.0)", () => {
         be.release("stop_soundboard_clip");
         await settle();
         expect(actionCmds()).toEqual([...first, ...want]);
+      });
+
+      // Not a row above: a start there has no return, so a revert run at it
+      // would send nothing either. Here it has one to go back to.
+      it("Back to the preset before at a start is never run, even with a return to go back to", async () => {
+        const { result } = await boot({
+          timers: [villagerTimer({ run: RUNNING })],
+          returns: [ret("timer-1", "hollow-king", "villager")],
+          live: "villager",
+        });
+        emitActions("timer-1", "start", "armed", [REVERT]);
+        await settle();
+        expect(actionCmds()).toEqual([]);
+        expect(result.presetId()).toBe("villager");
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
       });
 
       it("dispatchAction from a timer runs the same way; from a glyph, as it always has", async () => {

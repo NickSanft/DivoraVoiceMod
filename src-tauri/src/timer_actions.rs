@@ -323,15 +323,15 @@ impl Planned {
 
 /// Which of a list's actions a hook run takes (§7.1).
 #[derive(Clone, Copy)]
-enum Take {
+enum Take<'a> {
     /// Every one: a start, a fire on time, End now.
     All,
     /// onFire·R, those that put back what a start changed: a late fire, a
     /// run-out (D8, D9).
     Restoring,
-    /// onFire·U, those that put back what this start did: a Reset, a kind
-    /// change, a delete (D10).
-    Undoing,
+    /// onFire·U, those that put back what this start did — the onStart its
+    /// run started with: a Reset, a kind change, a delete (D10, Q2).
+    Undoing(&'a [Action]),
     /// onStart·A, those a restart mid-run runs again: the mute (D11).
     Reapplied,
 }
@@ -352,10 +352,11 @@ enum Take {
 /// - A restart mid-run (`Seeded {running|paused}`, P7): `onStart`'s mute
 ///   again, backend only (`restart`, never sent).
 /// - `Cancelled` (P9, P10): the restoring actions of `onFire` that undo
-///   what `onStart` does ([`Action::undoes`]), `reset` or `deleted`.
+///   what this run's start did ([`Action::undoes`] the `onStart` it started
+///   with, not one edited since), `reset` or `deleted`.
 ///
 /// Lists are the ones the transition carries: what they were when it
-/// happened (Q12). P1-P6, P9 and P10 plan even with nothing to run, so the
+/// happened (Q12), and a cancel's start what it was at its start. P1-P6, P9 and P10 plan even with nothing to run, so the
 /// page can settle a return and an end retires its start line. The backend
 /// half puts `panic` first, the rest in list order (D15); the page half
 /// keeps list order.
@@ -395,12 +396,18 @@ pub fn plan(t: &Transition) -> Option<Planned> {
         } => (id, hooks, Hook::Start, Why::Restart, 0, Take::Reapplied),
         // P8 (a stored ended run, seeded at every launch) and P11.
         Transition::Seeded { .. } | Transition::SleepPaused { .. } => return None,
-        Transition::Cancelled { id, why, hooks } => {
+        Transition::Cancelled {
+            id,
+            why,
+            hooks,
+            started,
+        } => {
             let why = match why {
                 CancelWhy::Reset => Why::Reset,
                 CancelWhy::Removed => Why::Deleted,
             };
-            (id, hooks, Hook::End, why, 0, Take::Undoing)
+            let undoing = Take::Undoing(&started.on_start);
+            (id, hooks, Hook::End, why, 0, undoing)
         }
     };
     let list = match hook {
@@ -414,7 +421,7 @@ pub fn plan(t: &Transition) -> Option<Planned> {
                 && match take {
                     Take::All => true,
                     Take::Restoring => a.restores(),
-                    Take::Undoing => a.undoes(&hooks.on_start),
+                    Take::Undoing(on_start) => a.undoes(on_start),
                     Take::Reapplied => a.reapplies(),
                 }
         })
@@ -801,6 +808,8 @@ mod tests {
                     Some("removed") => CancelWhy::Removed,
                     other => panic!("{name}: why {other:?}"),
                 },
+                // A run that started with the lists the row states.
+                started: Arc::clone(&hooks),
                 hooks,
             },
             other => panic!("{name}: variant {other}"),
@@ -1004,11 +1013,19 @@ mod tests {
         }
     }
 
+    /// A cancel of a run that started with the lists it has.
     fn cancelled(hooks: &Arc<Hooks>, why: CancelWhy) -> Transition {
+        cancelled_since(hooks, hooks, why)
+    }
+
+    /// A cancel with `hooks` now, of a run that started with `started`:
+    /// its lists were edited mid-run.
+    fn cancelled_since(hooks: &Arc<Hooks>, started: &Arc<Hooks>, why: CancelWhy) -> Transition {
         Transition::Cancelled {
             id: "timer-1".into(),
             why,
             hooks: hooks.clone(),
+            started: started.clone(),
         }
     }
 
@@ -1206,6 +1223,33 @@ mod tests {
                 "a mute edited in after the start, restart: the current lists",
                 seeded(&lists(vec![MUTE], vec![UNMUTE]), Running, Running),
                 planned(Start, Why::Restart, 0, vec![MUTE], vec![]),
+            ),
+            (
+                "a break, its start's mute edited out mid-run, Reset: its start muted",
+                cancelled_since(
+                    &lists(vec![], vec![UNMUTE]),
+                    &lists(vec![MUTE], vec![UNMUTE]),
+                    Reset,
+                ),
+                planned(End, Why::Reset, 0, vec![UNMUTE], vec![]),
+            ),
+            (
+                "unmute in 5 minutes, a mute edited in mid-run, deleted: its start muted nothing",
+                cancelled_since(
+                    &lists(vec![MUTE], vec![UNMUTE]),
+                    &lists(vec![], vec![UNMUTE]),
+                    Removed,
+                ),
+                planned(End, Why::Deleted, 0, vec![], vec![]),
+            ),
+            (
+                "a break, its unmute edited out mid-run, Reset: At zero as it is now",
+                cancelled_since(
+                    &lists(vec![MUTE], vec![]),
+                    &lists(vec![MUTE], vec![UNMUTE]),
+                    Reset,
+                ),
+                planned(End, Why::Reset, 0, vec![], vec![]),
             ),
             (
                 "a line, a clip and Stop all at zero: Stop all first",

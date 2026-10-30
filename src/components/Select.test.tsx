@@ -129,6 +129,51 @@ describe("Select (v1.60.0)", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it("a key's open and every move scroll the highlight into view, the least it takes; a pointer's hover doesn't", () => {
+    // jsdom has no scrollIntoView: a spy that notes which element it was
+    // asked of.
+    // The options it was asked of, each as the id the trigger pointed at.
+    const scrolled: string[] = [];
+    const before = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+    const spy = vi.fn(function (this: Element, arg?: unknown) {
+      expect(arg).toEqual({ block: "nearest" });
+      expect(this.getAttribute("role")).toBe("option");
+      scrolled.push(this.id);
+    });
+    Element.prototype.scrollIntoView = spy as unknown as Element["scrollIntoView"];
+    try {
+      const { view, trigger, highlighted } = mountSelect({ value: "seraph" });
+      const pointedAt = (): string => trigger.getAttribute("aria-activedescendant") ?? "";
+      trigger.focus();
+      // Opened on the chosen option, the last: shown at once.
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      expect(highlighted()).toContain("Seraph");
+      expect(scrolled).toEqual([pointedAt()]);
+      for (const [key, words] of [
+        ["Home", "Hollow King"],
+        ["ArrowDown", "Villager"],
+        ["End", "Seraph"],
+        ["ArrowUp", "Villager"],
+      ] as const) {
+        const n = scrolled.length;
+        fireEvent.keyDown(trigger, { key });
+        expect(highlighted(), key).toContain(words);
+        expect(scrolled.slice(n), key).toEqual([pointedAt()]);
+      }
+      // A hover highlights, and scrolls nothing.
+      fireEvent.pointerEnter(view.getByRole("option", { name: /Hollow King/ }));
+      expect(scrolled).toHaveLength(5);
+      // Nor does a pointer's open.
+      fireEvent.keyDown(trigger, { key: "Escape" });
+      fireEvent.click(trigger, { detail: 1 });
+      expect(view.getByRole("listbox")).toBeInTheDocument();
+      expect(scrolled).toHaveLength(5);
+    } finally {
+      if (before) Object.defineProperty(Element.prototype, "scrollIntoView", before);
+      else delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
   it("Esc closes without picking and keeps the focus; Tab closes", () => {
     const { view, trigger, onChange } = mountSelect();
     trigger.focus();

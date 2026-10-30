@@ -39,7 +39,7 @@ import { resamplingLegs } from "../audio/api";
 import { HMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
 import { Slider } from "../components/Slider";
-import { LISTBOX_MOVES, listboxStep, Select, type SelectOption } from "../components/Select";
+import { LISTBOX_MOVES, listboxStep, revealOption, Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { blurOnPointer } from "../components/blurOnPointer";
@@ -1458,8 +1458,12 @@ function ControlSurfacesSection(): JSX.Element {
   const learning = (id: string): boolean => app.midiLearnId() === id;
 
   // Switching a mapping's action resets the target fields to a sensible
-  // default for the new action (the store persists the result).
+  // default for the new action (the store persists the result). v1.60.0:
+  // picking the action it already has changes nothing: Enter to open the
+  // picker and Enter again to close it picks the highlighted, current one
+  // (Select's keys), and that mustn't retarget the mapping.
   const setAction = (m: MidiMapping, action: MidiActionKind): void => {
+    if (action === m.action) return;
     const patch: Partial<MidiMapping> = {
       action,
       presetId: undefined,
@@ -1805,7 +1809,10 @@ function GlyphActionPicker(props: {
   presetOptions: SelectOption[];
   tileOptions: SelectOption[];
 }): JSX.Element {
+  // v1.60.0: the kind it already has changes nothing (Enter, Enter from
+  // the keyboard picks the current one), so its preset or clip stays.
   const setKind = (k: GlyphAction["kind"]): void => {
+    if (k === props.action.kind) return;
     if (k === "preset") {
       props.onChange({ kind: "preset", presetId: props.presetOptions[0]?.value ?? "" });
     } else if (k === "tile") {
@@ -2535,9 +2542,15 @@ const LENGTH_REASON = "Enter whole minutes, m:ss or h:mm:ss, from 1 second to 24
 
 /** A start-or-pause press on a break pauses it (D12). */
 const BREAK_PAUSE_KEY = "It pauses a break and doesn't end it; End now's key ends it.";
-/** Reset's row on a countdown whose At zero puts something back (D10). */
-const RESET_UNDOES =
-  "Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: Unmute my voice if At start mutes you, and Back to the preset before.";
+/** Reset's row on a countdown whose At zero puts something back (D10),
+ *  naming only what its At zero has: the undo runs no other (§7.1 P9).
+ *  With both, §9's sentence as it was. */
+function resetUndoes(t: StoredTimer): string | null {
+  const parts = restoringNames(t).map((n) => (n === "Unmute my voice" ? `${n} if At start mutes you` : n));
+  return parts.length > 0
+    ? `Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: ${parts.join(", and ")}.`
+    : null;
+}
 
 /** The words for each list, in its title, its help and its controls' names. */
 const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; from: string; add: string }> = {
@@ -2645,11 +2658,12 @@ function restoringNames(t: StoredTimer): string[] {
 
 /** A key row's words on this timer's card. v1.60.0: on a countdown that
  *  mutes at its start, start-or-pause says it pauses a break; on one whose
- *  At zero puts something back, Reset says it undoes the start. */
+ *  At zero puts something back, Reset says it undoes the start with what
+ *  that list has. */
 function keyRowDesc(row: (typeof TIMER_KEY_ROWS)[number], t: StoredTimer): string {
   if (t.kind !== "countdown") return row.desc;
   if (row.verb === "toggle" && mutesAtStart(t)) return `${row.desc} ${BREAK_PAUSE_KEY}`;
-  if (row.verb === "reset" && restoringNames(t).length > 0) return RESET_UNDOES;
+  if (row.verb === "reset") return resetUndoes(t) ?? row.desc;
   return row.desc;
 }
 
@@ -3059,12 +3073,16 @@ function TimerControls(props: {
   const countdown = () => props.timer.kind === "countdown";
   const keyRows = () => TIMER_KEY_ROWS.filter((r) => r.verb !== "finish" || countdown());
 
-  // v1.60.0: what ran out while away ran (§7.1 P5, P6): At zero's
+  // v1.60.0: what a run-out while away runs (§7.1 P5, P6): At zero's
   // putting-back actions only, named; v1.59.0's line when there are none.
+  // Said of the list as it is now, never as what ran: the card keeps no
+  // record of that, and the list can be edited after it ran out (or it ran
+  // out before lists existed).
   const expiredLine = (): string => {
-    const ran = restoringNames(props.timer);
+    const runs = restoringNames(props.timer);
     const head = "It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.";
-    return countdown() && ran.length > 0 ? `${head} Of its At zero list, only ${listed(ran)} ran.` : head;
+    if (!countdown() || runs.length === 0) return head;
+    return `${head} When it runs out like this, only ${listed(runs)} from its At zero list ${runs.length > 1 ? "run" : "runs"}.`;
   };
   // A paused break keeps you muted (D12): the way out, said while it holds.
   const pausedBreak = (): boolean =>
@@ -3579,9 +3597,11 @@ function TimerActionRow(props: {
     const p = preset();
     return p !== null && app.presetsLoaded() && names.preset(p.presetId) === null;
   };
+  // The same for clips: until the folder's scan has finished, a clip in it
+  // isn't in the list yet.
   const tileGone = () => {
     const t = tile();
-    return t !== null && names.tile(t.tileId) === null;
+    return t !== null && app.soundboardScanned() && names.tile(t.tileId) === null;
   };
   const voice = () => {
     const l = line();
@@ -3641,7 +3661,7 @@ function TimerActionRow(props: {
                   options={tileOptions()}
                   onChange={(v) => set({ kind: "tile", tileId: v })}
                   ariaLabel={`Clip ${props.name} plays ${place().at}`}
-                  missing="Missing clip"
+                  missing={app.soundboardScanned() ? "Missing clip" : "Loading clips…"}
                   blurOnPointer
                 />
               </div>
@@ -3834,12 +3854,19 @@ function AddActionMenu(props: {
   const choices = createMemo(() => {
     const at = props.hook === "onStart" ? "start" : "zero";
     const noTiles = app.soundboardTiles().length === 0;
+    // Why there's no clip to add: no folder, its scan not finished yet, or
+    // none found in it (an empty folder, or one that couldn't be read).
+    const noTilesWhy = !app.soundboardFolder()
+      ? "Play a clip — pick a soundboard folder first"
+      : !app.soundboardScanned()
+        ? "Play a clip — loading your clips…"
+        : "Play a clip — no clips found in your soundboard folder";
     const hasLine = canAddAction(props.timer[props.hook], "speak") === "hasLine";
     return ADD_CHOICES.filter((c) => ACTION_KINDS[c.kind].at.includes(at)).map((c) => {
       const off = (c.choice === "tile" && noTiles) || (c.choice === "speak" && hasLine);
       const label =
         c.choice === "tile" && noTiles
-          ? "Play a clip — pick a soundboard folder first"
+          ? noTilesWhy
           : c.choice === "speak" && hasLine
             ? "Speak a line — this list already has one"
             : c.label;
@@ -3896,12 +3923,15 @@ function AddActionMenu(props: {
         e.preventDefault();
         setActive(0);
         setOpen(true);
+        revealOption(optionId(active()));
       }
       return;
     }
     if (LISTBOX_MOVES.includes(e.key)) {
       e.preventDefault();
       setActive(listboxStep(e.key, active(), choices().length));
+      // Into view from a key only, as Select's own (revealOption).
+      revealOption(optionId(active()));
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       void add(active());
