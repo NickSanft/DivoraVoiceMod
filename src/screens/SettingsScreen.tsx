@@ -11,7 +11,8 @@
 //   • About (DMark + version + license + GitHub + three pillar cards +
 //     Replay setup button that re-opens the first-run wizard)
 //   • v1.59.0: Hourglass (countdowns and count-ups the backend keeps, after
-//     Stream overlay)
+//     Stream overlay); v1.60.0: a countdown's At start and At zero lists,
+//     End now and Add break (BRB)
 
 import {
   createEffect,
@@ -19,10 +20,12 @@ import {
   createSignal,
   createUniqueId,
   For,
+  Index,
   on,
   onCleanup,
   onMount,
   Show,
+  untrack,
   type JSX,
 } from "solid-js";
 import { Badge } from "../components/Badge";
@@ -36,7 +39,7 @@ import { resamplingLegs } from "../audio/api";
 import { HMeter } from "../components/Meters";
 import { Segmented } from "../components/Segmented";
 import { Slider } from "../components/Slider";
-import { Select, type SelectOption } from "../components/Select";
+import { LISTBOX_MOVES, listboxStep, Select, type SelectOption } from "../components/Select";
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { blurOnPointer } from "../components/blurOnPointer";
@@ -80,6 +83,25 @@ import {
   type TimerVerb,
 } from "../data/timers";
 import type { TimerPhase, TimerState } from "../overlay/timerState";
+import {
+  ACTION_KINDS,
+  actionsForSync,
+  actionWords,
+  canAddAction,
+  pairingWarnings,
+  readAction,
+  readStoredActions,
+  restores,
+  revertsAtZero,
+  timerVoiceLine,
+  type ActionNames,
+  type ActionRow,
+  type PairingWarning,
+  type TimerAction,
+  type TimerActionKind,
+  type TimerHook,
+} from "../data/timerActions";
+import { transforms } from "../data/ptm";
 import {
   MAX_AV_OFFSET_MS,
   MAX_DESKTOP_GAIN_DB,
@@ -2487,7 +2509,8 @@ function StreamOverlaySection(): JSX.Element {
 // keyed by id, so a storage write (a run saved at a transition, a rename)
 // never rebuilds a card mid-edit; each is joined by id with the snapshot.
 
-/** Each timer's two hotkeys, as their rows and names say them. */
+/** Each timer's hotkeys, as their rows and names say them. v1.60.0: End
+ *  now's, a countdown's only (a count-up never reaches zero). */
 const TIMER_KEY_ROWS: Array<{ verb: TimerVerb; label: string; desc: string; spoken: string }> = [
   {
     verb: "toggle",
@@ -2496,9 +2519,139 @@ const TIMER_KEY_ROWS: Array<{ verb: TimerVerb; label: string; desc: string; spok
     spoken: "start or pause",
   },
   { verb: "reset", label: "Reset", desc: "Back to the start, stopped.", spoken: "reset" },
+  { verb: "finish", label: "End now", desc: "Ends it at once and runs what's set for zero.", spoken: "end now" },
 ];
 
 const LENGTH_REASON = "Enter whole minutes, m:ss or h:mm:ss, from 1 second to 24 hours.";
+
+// ---- v1.60.0: what a countdown does when it starts and at zero ----
+//
+// Rust decides what runs (timer_actions.rs `plan`); the card edits the two
+// stored lists and says, ahead of time, what each action will and won't do.
+// The lists are the stored arrays, shown entry by entry in stored order: an
+// entry this build can't run is a row of its own with its reason and Remove
+// only, and every edit goes through the store by index, so it stays where it
+// is (D27). Count-ups have no lists (D32).
+
+/** A start-or-pause press on a break pauses it (D12). */
+const BREAK_PAUSE_KEY = "It pauses a break and doesn't end it; End now's key ends it.";
+/** Reset's row on a countdown whose At zero puts something back (D10). */
+const RESET_UNDOES =
+  "Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: Unmute my voice if At start mutes you, and Back to the preset before.";
+
+/** The words for each list, in its title, its help and its controls' names. */
+const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; from: string; add: string }> = {
+  onStart: {
+    title: "At start",
+    help: "Runs when it starts from the beginning: Start, Start again, or its start-or-pause key. Pause and Resume don't run it again. A change here counts from its next start, and if Divora restarts while it's running or paused, its Mute my voice runs again.",
+    at: "at the start",
+    from: "from the start of",
+    add: "at the start of",
+  },
+  onFire: {
+    title: "At zero",
+    help: "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if At start mutes you. A change here counts for the run that's going on.",
+    at: "at zero",
+    from: "from zero of",
+    add: "at zero of",
+  },
+};
+
+/** Said once under a countdown's lists when either has an action: the one
+ *  general limit, with its cause, examples and a way to check (D37). */
+const ACTIONS_LIMIT =
+  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading. To try a list, give it a 0:05 countdown and watch the titlebar while it runs; a clip or a line in it plays on your call too.";
+
+const LIST_FULL = "Up to 8 actions here. Remove one to add another.";
+
+const PAIRING_WORDS: Record<PairingWarning, string> = {
+  muteNoUnmute:
+    "This mutes you when it starts, and nothing at zero unmutes you, so you stay muted after it ends, is reset or is deleted. Add Unmute my voice at zero.",
+  switchNoRevert:
+    "This switches your preset when it starts, and nothing at zero switches back, so you stay on that preset after it ends, is reset or is deleted. Add Back to the preset before at zero to switch back.",
+  revertNoSwitch: "The start doesn't switch preset, so there's nothing to go back to.",
+};
+
+/** Why a stored entry doesn't run, under its row. `startRevert`: Back to the
+ *  preset before stored in At start (a hand edit): Rust reads it and never
+ *  runs it there, so the card says so rather than show it as working. */
+const NOT_RUN_WORDS: Record<"unreadable" | "secondLine" | "pastEight" | "startRevert", string> = {
+  unreadable: "Made by a newer Divora, or can't be read here. It stays saved and doesn't run.",
+  secondLine: "Only the first line in a list is said. This one stays saved and isn't said.",
+  pastEight: "Only the first 8 actions in a list run. This one stays saved and doesn't run.",
+  startRevert: "Back to the preset before runs only at zero. This one stays saved and doesn't run.",
+};
+
+const LINE_REASON = "Type a line of up to 200 characters. A long line takes longer to prepare.";
+const LINE_HELP =
+  "Said on your call even while you're muted, at full volume (Speak's Volume slider doesn't change it), and not kept in Saved clips. One line per list. A newer line from any timer replaces one still being prepared or playing, and Stop all clips and lines stops it; Speak's Stop doesn't.";
+/** A new line's words (§9). */
+const NEW_LINE: Record<TimerHook, string> = { onStart: "Be right back.", onFire: "I'm back." };
+/** Always there: Critter Chatter needs no download. */
+const FALLBACK_VOICE = "babble:bright";
+
+/** Add action's choices, in the listbox's order; the kinds a list doesn't
+ *  offer (Back to the preset before at a start) are left out per list. */
+type AddChoice = "preset" | "randomPreset" | "revertPreset" | "mute" | "unmute" | "tile" | "speak" | "saveReplay" | "panic";
+const ADD_CHOICES: Array<{ choice: AddChoice; kind: TimerActionKind; label: string }> = [
+  { choice: "preset", kind: "preset", label: "Switch preset" },
+  { choice: "randomPreset", kind: "randomPreset", label: "Random preset" },
+  { choice: "revertPreset", kind: "revertPreset", label: "Back to the preset before" },
+  { choice: "mute", kind: "setMuted", label: "Mute my voice" },
+  { choice: "unmute", kind: "setMuted", label: "Unmute my voice" },
+  { choice: "tile", kind: "tile", label: "Play a clip" },
+  { choice: "speak", kind: "speak", label: "Speak a line" },
+  { choice: "saveReplay", kind: "saveReplay", label: "Save a replay" },
+  { choice: "panic", kind: "panic", label: "Stop all clips and lines" },
+];
+
+/** The sigil a row leads with. */
+function actionSigil(a: TimerAction): SigilName {
+  switch (a.kind) {
+    case "preset":
+      return "presets";
+    case "randomPreset":
+      return "shuffle";
+    case "revertPreset":
+      return "undo";
+    case "tile":
+      return "soundboard";
+    case "speak":
+      return "wave";
+    case "saveReplay":
+      return "replay";
+    case "setMuted":
+      return a.muted ? "muted" : "mic";
+    case "panic":
+      return "panic";
+  }
+}
+
+/** At start mutes you (its runnable actions, as Rust reads them). */
+const mutesAtStart = (t: StoredTimer): boolean =>
+  actionsForSync(t.onStart).some((a) => a.kind === "setMuted" && a.muted);
+/** At zero unmutes you. */
+const unmutesAtZero = (t: StoredTimer): boolean =>
+  actionsForSync(t.onFire).some((a) => a.kind === "setMuted" && !a.muted);
+/** At zero's putting-back actions, as the expired line names them: what a
+ *  run-out runs (§7.1 P5, P6). */
+function restoringNames(t: StoredTimer): string[] {
+  const kept = actionsForSync(t.onFire).filter(restores);
+  const names: string[] = [];
+  if (kept.some((a) => a.kind === "setMuted")) names.push("Unmute my voice");
+  if (kept.some((a) => a.kind === "revertPreset")) names.push("Back to the preset before");
+  return names;
+}
+
+/** A key row's words on this timer's card. v1.60.0: on a countdown that
+ *  mutes at its start, start-or-pause says it pauses a break; on one whose
+ *  At zero puts something back, Reset says it undoes the start. */
+function keyRowDesc(row: (typeof TIMER_KEY_ROWS)[number], t: StoredTimer): string {
+  if (t.kind !== "countdown") return row.desc;
+  if (row.verb === "toggle" && mutesAtStart(t)) return `${row.desc} ${BREAK_PAUSE_KEY}`;
+  if (row.verb === "reset" && restoringNames(t).length > 0) return RESET_UNDOES;
+  return row.desc;
+}
 
 /** How long Hourglass's live region holds an edge's words before it is
  *  emptied again. */
@@ -2601,9 +2754,11 @@ function HourglassSection(): JSX.Element {
       >
         <p style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", margin: 0 }}>
           Countdowns and count-ups that keep time while Divora is in the tray. Start, pause and
-          reset them here or with their own hotkeys, and show them on your overlay or in OBS. If
-          your PC sleeps, a count-up pauses, and a countdown that runs out meanwhile says so
-          instead of finishing late.
+          reset them here or with their own hotkeys, and show them on your overlay or in OBS. A
+          countdown can also do things when it starts and when it reaches zero: switch your
+          preset, mute you for a break, play a clip, speak a line or save a replay. If your PC
+          sleeps, a count-up pauses, and a countdown that runs out meanwhile says so instead of
+          finishing late.
         </p>
         {/* Always mounted: a region inserted together with its text is
             commonly missed. */}
@@ -2637,6 +2792,19 @@ function HourglassSection(): JSX.Element {
           >
             Add count-up
           </Button>
+          {/* v1.60.0: a 5:00 countdown "BRB" that mutes you at its start and
+              unmutes you at zero, in one save and one sync (D26). */}
+          <Button
+            size="sm"
+            icon="plus"
+            disabled={full()}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void app.addTimer("countdown", "break");
+            }}
+          >
+            Add break (BRB)
+          </Button>
         </div>
         <Show when={full()}>
           <div style={reasonStyle}>Hourglass holds up to 16 timers. Delete one to add another.</div>
@@ -2658,8 +2826,9 @@ function HourglassSection(): JSX.Element {
           it there first. Some keys can't be set, and Divora doesn't say so: the row still shows
           the key. A key Windows or another app already holds is one; Shift with a number or
           symbol key is another (Shift+1 shows as !), and so, on some keyboards other than US
-          English, is Ctrl+Alt with some letters. To check one, start its timer, press the key with
-          Divora in the tray, then look at the timer here.
+          English, is Ctrl+Alt with some letters. To check one, use a countdown with nothing in At
+          start or At zero: start it, press the key with Divora in the tray, then look at the timer
+          here.
         </div>
         <div
           style={{
@@ -2873,7 +3042,9 @@ function TimerCard(props: { id: string }): JSX.Element {
 }
 
 /** A timer the backend runs, once it has said how it is: the buttons, the
- *  Length, the two hotkeys, the overlay toggle and the file. */
+ *  Length, the hotkeys, the overlay toggle and the file. v1.60.0: on a
+ *  countdown, End now, its At start and At zero lists, a third hotkey (End
+ *  now's), and the lines that say what its lists did or are doing. */
 function TimerControls(props: {
   id: string;
   name: string;
@@ -2883,7 +3054,53 @@ function TimerControls(props: {
   const app = useApp();
   const action = () => timerAction(props.state);
   // ±30 s changes a running or paused timer only; Length is for the rest.
+  // v1.60.0: End now too, the backend's own rule (`TimerOp::Finish`).
   const adjustable = () => props.state.phase === "running" || props.state.phase === "paused";
+  const countdown = () => props.timer.kind === "countdown";
+  const keyRows = () => TIMER_KEY_ROWS.filter((r) => r.verb !== "finish" || countdown());
+
+  // v1.60.0: what ran out while away ran (§7.1 P5, P6): At zero's
+  // putting-back actions only, named; v1.59.0's line when there are none.
+  const expiredLine = (): string => {
+    const ran = restoringNames(props.timer);
+    const head = "It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.";
+    return countdown() && ran.length > 0 ? `${head} Of its At zero list, only ${listed(ran)} ran.` : head;
+  };
+  // A paused break keeps you muted (D12): the way out, said while it holds.
+  const pausedBreak = (): boolean =>
+    props.state.phase === "paused" &&
+    countdown() &&
+    mutesAtStart(props.timer) &&
+    unmutesAtZero(props.timer) &&
+    app.muted();
+  // While its switch is the live preset, what the call hears (§7.7, D29),
+  // from the facts the titlebar's status is made from, each on its own.
+  const voiceLine = (): string | null => {
+    if (!adjustable() || !countdown()) return null;
+    const setting = app.ptmSetting();
+    return timerVoiceLine(
+      app.timerReturn(props.id),
+      app.presetId(),
+      actionNames(app).preset,
+      revertsAtZero(props.timer),
+      {
+        muted: app.muted(),
+        transforms: transforms(app.chain()),
+        bypassed: app.ptmBypassed(),
+        mode: setting.on ? setting.hold : null,
+        key: acceleratorToKeys(app.ui.ptmKey).join("+") || "Space",
+        inCall: ptmInCall(),
+      },
+    );
+  };
+  // Where push-to-modulate's key works from a call: the Mixer card's rule
+  // (MixerScreen.tsx `PushToModulateCard`), so the two lines agree.
+  const ptmInCall = (): "key" | "midi" | null =>
+    app.hotkeyBindings.ptm !== ""
+      ? "key"
+      : !!app.selectedMidiInput() && app.midiMappings().some((m) => m.action === "ptm" && m.trigger !== null)
+        ? "midi"
+        : null;
 
   // Length: the draft while typing (null shows the length stored). It is
   // applied on Enter or on leaving the field, never per keystroke, which
@@ -2927,9 +3144,20 @@ function TimerControls(props: {
   return (
     <>
       <Show when={props.state.phase === "expired"}>
+        <div style={helpStyle}>{expiredLine()}</div>
+      </Show>
+      <Show when={pausedBreak()}>
         <div style={helpStyle}>
-          It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.
+          {props.name} is paused, so you stay muted until you resume it and it reaches zero, or
+          press End now or Reset.
         </div>
+      </Show>
+      <Show when={voiceLine()}>
+        {(line) => (
+          <div data-testid="timer-voice-line" style={helpStyle}>
+            {line()}
+          </div>
+        )}
       </Show>
       <div style={{ display: "flex", gap: "var(--s2)", "flex-wrap": "wrap" }}>
         <Button
@@ -2955,6 +3183,22 @@ function TimerControls(props: {
         >
           Reset
         </Button>
+        {/* v1.60.0: finishes it now and runs At zero; a count-up never
+            reaches zero, so it has none. */}
+        <Show when={countdown()}>
+          <Button
+            size="sm"
+            icon="endNow"
+            disabled={!adjustable()}
+            aria-label={`End ${props.name} now`}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void app.finishTimer(props.id);
+            }}
+          >
+            End now
+          </Button>
+        </Show>
         <Button
           variant="ghost"
           size="sm"
@@ -3025,9 +3269,10 @@ function TimerControls(props: {
             </Show>
           </div>
         </FieldRow>
+        <TimerActions id={props.id} name={props.name} timer={props.timer} />
       </Show>
 
-      <For each={TIMER_KEY_ROWS}>
+      <For each={keyRows()}>
         {(row) => <TimerHotkeyRow id={props.id} name={props.name} timer={props.timer} row={row} />}
       </For>
 
@@ -3080,7 +3325,7 @@ function TimerControls(props: {
   );
 }
 
-/** One of a timer's two hotkeys: the capture, Clear while it's set, and a
+/** One of a timer's hotkeys: the capture, Clear while it's set, and a
  *  line when another stored binding has the same key. A key Divora has
  *  registered never reaches the capture (Windows hands it to Divora), so a
  *  shared key comes from storage or from one that didn't register; which of
@@ -3131,7 +3376,9 @@ function TimerHotkeyRow(props: {
           <div style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}>
             {props.row.label}
           </div>
-          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>{props.row.desc}</div>
+          <div style={{ "font-size": "var(--t-xs)", color: "var(--text-lo)" }}>
+            {keyRowDesc(props.row, props.timer)}
+          </div>
         </div>
         <div style={{ display: "flex", "align-items": "center", gap: "var(--s2)", "flex-shrink": 0 }}>
           <HotkeyCapture
@@ -3162,6 +3409,575 @@ function TimerHotkeyRow(props: {
       </div>
       <Show when={others()}>
         <div style={reasonStyle}>Also set for {others()}.</div>
+      </Show>
+    </div>
+  );
+}
+
+/** v1.60.0: a countdown's At start and At zero lists, then what they say
+ *  together: the pairing warnings (§7.9) and, once either list has an
+ *  action, the one general limit (D37). */
+function TimerActions(props: { id: string; name: string; timer: StoredTimer }): JSX.Element {
+  const app = useApp();
+  const warnings = () => pairingWarnings(props.timer.onStart, props.timer.onFire);
+  const rows = () => [...readStoredActions(props.timer.onStart), ...readStoredActions(props.timer.onFire)];
+  // A line's voice picker needs the voices, which only Speak's screen asked
+  // for before. Asked once; Speak's own choice is left alone.
+  createEffect(() => {
+    if (rows().some((r) => r.action?.kind === "speak")) untrack(() => void app.ensureTtsVoices());
+  });
+  return (
+    <div
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+        "padding-top": "var(--s2)",
+        "border-top": "1px solid var(--line)",
+      }}
+    >
+      <TimerActionList id={props.id} name={props.name} timer={props.timer} hook="onStart" />
+      <TimerActionList id={props.id} name={props.name} timer={props.timer} hook="onFire" />
+      <For each={warnings()}>{(w) => <div style={reasonStyle}>{PAIRING_WORDS[w]}</div>}</For>
+      <Show when={rows().length > 0}>
+        <div style={helpStyle}>{ACTIONS_LIMIT}</div>
+      </Show>
+    </div>
+  );
+}
+
+/** How the card shows a stored entry: a row that runs, or why not. */
+type ShownRow =
+  | { index: number; runs: true; action: TimerAction }
+  | { index: number; runs: false; action: TimerAction | null; why: keyof typeof NOT_RUN_WORDS };
+
+function shownRow(row: ActionRow, hook: TimerHook): ShownRow {
+  if (row.runs && hook === "onStart" && !ACTION_KINDS[row.action.kind].at.includes("start")) {
+    return { index: row.index, runs: false, action: row.action, why: "startRevert" };
+  }
+  return row;
+}
+
+/** What keeps a row mounted: its kind while it runs, else why it doesn't. */
+const rowKey = (r: ShownRow): string => (r.runs ? `run:${r.action.kind}` : `not:${r.why}`);
+
+/** One list: its title and help, a row per stored entry, and Add action.
+ *  Rows are kept by place (`Index`) and rebuilt only when the kind at that
+ *  place changes, so a picker keeps the focus a key gave it while the store
+ *  saves its change, and a line being typed survives a snapshot that saves
+ *  a run. */
+function TimerActionList(props: { id: string; name: string; timer: StoredTimer; hook: TimerHook }): JSX.Element {
+  const words = () => LIST_WORDS[props.hook];
+  const rows = createMemo(() => readStoredActions(props.timer[props.hook]).map((r) => shownRow(r, props.hook)));
+  // Every stored entry counts toward the 8, one that doesn't run included.
+  const full = () => canAddAction(props.timer[props.hook], "panic") === "full";
+  return (
+    <div data-timer-list={props.hook} style={{ display: "flex", "flex-direction": "column", gap: "var(--s2)" }}>
+      <div>
+        <div style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}>
+          {words().title}
+        </div>
+        <div style={helpStyle}>{words().help}</div>
+      </div>
+      <Show when={rows().length > 0} fallback={<div style={helpStyle}>Nothing yet.</div>}>
+        <Index each={rows()}>
+          {(row) => (
+            <Show when={rowKey(row())} keyed>
+              {(key) =>
+                key.startsWith("run:") ? (
+                  <TimerActionRow
+                    id={props.id}
+                    name={props.name}
+                    hook={props.hook}
+                    index={row().index}
+                    action={row().action!}
+                  />
+                ) : (
+                  <TimerActionNotRun
+                    id={props.id}
+                    name={props.name}
+                    hook={props.hook}
+                    index={row().index}
+                    row={row()}
+                  />
+                )
+              }
+            </Show>
+          )}
+        </Index>
+      </Show>
+      <div>
+        <AddActionMenu id={props.id} name={props.name} hook={props.hook} timer={props.timer} disabled={full()} />
+      </div>
+      <Show when={full()}>
+        <div style={reasonStyle}>{LIST_FULL}</div>
+      </Show>
+    </div>
+  );
+}
+
+const rowTextStyle: JSX.CSSProperties = {
+  "font-size": "var(--t-sm)",
+  color: "var(--text-hi)",
+};
+const rowStyle: JSX.CSSProperties = {
+  display: "flex",
+  "flex-direction": "column",
+  gap: "var(--s1)",
+  padding: "var(--s2) 0",
+  "border-top": "1px dashed var(--line)",
+};
+const rowLineStyle: JSX.CSSProperties = {
+  display: "flex",
+  "align-items": "center",
+  gap: "var(--s2)",
+  "flex-wrap": "wrap",
+};
+const pickerBox: JSX.CSSProperties = { flex: "1 1 180px", "min-width": "160px", "max-width": "280px" };
+
+/** A target's name as the store has it now, or null when it matches
+ *  nothing: a preset in the list, a clip in the folder scanned, a voice
+ *  Speak lists. */
+function actionNames(app: ReturnType<typeof useApp>): ActionNames {
+  return {
+    preset: (id) => app.presets().find((p) => p.id === id)?.name ?? null,
+    tile: (id) => app.soundboardTiles().find((t) => t.id === id)?.label ?? null,
+    voice: (id) => app.ttsVoices().find((v) => v.id === id)?.name ?? null,
+  };
+}
+
+/** A row that runs: its sigil and words, the target's picker (a preset, a
+ *  clip, a voice and the line's text), Remove, and what it will and won't
+ *  do. A target that matches nothing says so (D18, UX8). */
+function TimerActionRow(props: {
+  id: string;
+  name: string;
+  hook: TimerHook;
+  index: number;
+  action: TimerAction;
+}): JSX.Element {
+  const app = useApp();
+  const place = () => LIST_WORDS[props.hook];
+  const names = actionNames(app);
+  const words = () => actionWords(props.action, names);
+  const set = (a: TimerAction): void => void app.setTimerAction(props.id, props.hook, props.index, a);
+
+  const preset = () => (props.action.kind === "preset" ? props.action : null);
+  const tile = () => (props.action.kind === "tile" ? props.action : null);
+  const line = () => (props.action.kind === "speak" ? props.action : null);
+  const presetOptions = (): SelectOption[] => app.presets().map((p) => ({ value: p.id, label: p.name, sub: p.tag }));
+  const tileOptions = (): SelectOption[] => app.soundboardTiles().map((t) => ({ value: t.id, label: t.label }));
+  const voiceOptions = (): SelectOption[] =>
+    app.ttsVoices().map((v) => ({
+      value: v.id,
+      label: v.name,
+      sub: v.engine === "babble" ? "Critter Chatter" : v.installed ? "Kokoro" : "Kokoro · not installed",
+    }));
+  // Judged against the real list only: until it loads, a preset of your own
+  // isn't in the bundled one and would read as gone (D16).
+  const presetGone = () => {
+    const p = preset();
+    return p !== null && app.presetsLoaded() && names.preset(p.presetId) === null;
+  };
+  const tileGone = () => {
+    const t = tile();
+    return t !== null && names.tile(t.tileId) === null;
+  };
+  const voice = () => {
+    const l = line();
+    return l ? app.ttsVoices().find((v) => v.id === l.voiceId) : undefined;
+  };
+
+  // The line: the draft while typing (null shows the line stored), kept on
+  // Enter or leaving the field, never per keystroke; Esc puts the stored one
+  // back; one that can't be read stays, marked, and nothing is sent.
+  const [draft, setDraft] = createSignal<string | null>(null);
+  const [bad, setBad] = createSignal(false);
+  const reasonId = `timer-line-reason-${createUniqueId()}`;
+  const commitLine = (): void => {
+    const d = draft();
+    const l = line();
+    if (d === null || l === null) return;
+    const next = readAction({ kind: "speak", text: d, voiceId: l.voiceId });
+    if (next === null) {
+      setBad(true);
+      return;
+    }
+    setBad(false);
+    setDraft(null);
+    if (next.kind === "speak" && next.text !== l.text) set(next);
+  };
+
+  return (
+    <div data-action-row={props.index} style={rowStyle}>
+      <div style={rowLineStyle}>
+        <Sigil name={actionSigil(props.action)} size={16} style={{ color: "var(--indigo)", "flex-shrink": 0 }} />
+        <Show when={preset()}>
+          {(p) => (
+            <>
+              <span style={rowTextStyle}>Switch to</span>
+              <div style={pickerBox}>
+                <Select
+                  icon="presets"
+                  value={p().presetId}
+                  options={presetOptions()}
+                  onChange={(v) => set({ kind: "preset", presetId: v })}
+                  ariaLabel={`Preset ${props.name} switches to ${place().at}`}
+                  missing={app.presetsLoaded() ? "Missing preset" : "Loading presets…"}
+                  blurOnPointer
+                />
+              </div>
+            </>
+          )}
+        </Show>
+        <Show when={tile()}>
+          {(t) => (
+            <>
+              <span style={rowTextStyle}>Play</span>
+              <div style={pickerBox}>
+                <Select
+                  icon="soundboard"
+                  value={t().tileId}
+                  options={tileOptions()}
+                  onChange={(v) => set({ kind: "tile", tileId: v })}
+                  ariaLabel={`Clip ${props.name} plays ${place().at}`}
+                  missing="Missing clip"
+                  blurOnPointer
+                />
+              </div>
+            </>
+          )}
+        </Show>
+        <Show when={line()}>
+          {(l) => (
+            <>
+              <span style={rowTextStyle}>Say</span>
+              <input
+                type="text"
+                value={draft() ?? l().text}
+                aria-label={`Line ${props.name} says ${place().at}`}
+                aria-invalid={bad() ? "true" : undefined}
+                aria-describedby={bad() ? reasonId : undefined}
+                onInput={(e) => {
+                  setDraft(e.currentTarget.value);
+                  setBad(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitLine();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    setDraft(null);
+                    setBad(false);
+                  }
+                }}
+                onBlur={commitLine}
+                style={{
+                  ...fieldStyle,
+                  flex: "1 1 200px",
+                  "min-width": "160px",
+                  "border-color": bad() ? "var(--warning)" : "var(--line-strong)",
+                }}
+              />
+              <span style={rowTextStyle}>in</span>
+              <div style={pickerBox}>
+                <Select
+                  icon="wave"
+                  value={l().voiceId}
+                  options={voiceOptions()}
+                  onChange={(v) => set({ kind: "speak", text: l().text, voiceId: v })}
+                  ariaLabel={`Voice of ${props.name}'s line ${place().at}`}
+                  missing={app.ttsVoicesLoaded() ? "Voice not available" : "Loading voices…"}
+                  blurOnPointer
+                />
+              </div>
+            </>
+          )}
+        </Show>
+        <Show when={!preset() && !tile() && !line()}>
+          <span style={rowTextStyle}>{words()}</span>
+        </Show>
+        <div style={{ "margin-left": "auto" }}>
+          <Button
+            variant="ghost"
+            size="sm"
+            icon="x"
+            aria-label={`Remove ${words()} ${place().from} ${props.name}`}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void app.removeTimerAction(props.id, props.hook, props.index);
+            }}
+          >
+            Remove
+          </Button>
+        </div>
+      </div>
+      <Show when={presetGone()}>
+        <div style={reasonStyle}>That preset is gone. Pick another, or remove this.</div>
+      </Show>
+      <Show when={tileGone()}>
+        <div style={reasonStyle}>That clip isn't in your soundboard folder now, so nothing plays.</div>
+      </Show>
+      <Show when={line()}>
+        <Show when={bad()}>
+          <div id={reasonId} style={reasonStyle}>
+            {LINE_REASON}
+          </div>
+        </Show>
+        <Show when={voice() && !voice()!.installed}>
+          <div style={reasonStyle}>
+            {voice()!.name} isn't installed in this build, so nothing is said. Pick a Critter Chatter voice.
+          </div>
+        </Show>
+        <div style={helpStyle}>{LINE_HELP}</div>
+      </Show>
+      <Show when={props.action.kind === "setMuted" && !props.action.muted}>
+        <div style={helpStyle}>
+          It unmutes you even if you muted yourself before or during the countdown, or another timer is
+          still muting you.
+        </div>
+      </Show>
+      <Show when={props.action.kind === "panic"}>
+        <div style={helpStyle}>
+          Runs first in its list: it stops what was playing before, and a line still being prepared.
+          This list's own clip and line play after it.
+        </div>
+      </Show>
+      <Show when={props.action.kind === "saveReplay"}>
+        <Show when={!replayOn(app.replayStatus())}>
+          <div style={reasonStyle}>
+            Replay is off right now, so this saves nothing. Turn it on from the Record screen card; it's
+            off after every launch.
+          </div>
+        </Show>
+        <div style={helpStyle}>
+          {props.hook === "onFire"
+            ? "Saves the seconds up to the moment it reached zero."
+            : "Saves the seconds up to the moment it started."}{" "}
+          If a replay is already being saved, this one is refused with a notice.
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/** A stored entry that doesn't run: its words when it can be read, why it
+ *  doesn't run, and Remove only. It stays saved and counts toward the 8
+ *  (UX15). */
+function TimerActionNotRun(props: {
+  id: string;
+  name: string;
+  hook: TimerHook;
+  index: number;
+  row: ShownRow;
+}): JSX.Element {
+  const app = useApp();
+  const names = actionNames(app);
+  const why = () => (props.row.runs ? "unreadable" : props.row.why);
+  return (
+    <div data-action-row={props.index} style={rowStyle}>
+      <div style={rowLineStyle}>
+        <Sigil name="warning" size={16} style={{ color: "var(--warning)", "flex-shrink": 0 }} />
+        <span style={{ ...rowTextStyle, color: "var(--text-mid)" }}>
+          {props.row.action ? actionWords(props.row.action, names) : "An action this build can't run"}
+        </span>
+        <div style={{ "margin-left": "auto" }}>
+          <Button
+            variant="ghost"
+            size="sm"
+            icon="x"
+            aria-label={`Remove an action that doesn't run ${LIST_WORDS[props.hook].from} ${props.name}`}
+            onClick={(e) => {
+              blurOnPointer(e);
+              void app.removeTimerAction(props.id, props.hook, props.index);
+            }}
+          >
+            Remove
+          </Button>
+        </div>
+      </div>
+      <div style={reasonStyle}>{NOT_RUN_WORDS[why()]}</div>
+    </div>
+  );
+}
+
+/** Add action: a button that opens a listbox of what this list offers
+ *  (UX7), by Select's keys (D28): Enter, Space or Down opens it, Up, Down,
+ *  Home and End move, Enter or Space adds, Esc closes and Tab closes and
+ *  moves on, all with the focus kept on Add action. An option that can't be
+ *  added now stays in the list, `aria-disabled`, its reason in its words. */
+function AddActionMenu(props: {
+  id: string;
+  name: string;
+  hook: TimerHook;
+  timer: StoredTimer;
+  disabled: boolean;
+}): JSX.Element {
+  const app = useApp();
+  const [open, setOpen] = createSignal(false);
+  const [active, setActive] = createSignal(0);
+  let rootRef: HTMLDivElement | undefined;
+  let trigger: HTMLButtonElement | undefined;
+  const uid = createUniqueId();
+  const listId = `add-action-${uid}`;
+  const optionId = (i: number): string => `add-action-${uid}-${i}`;
+
+  onMount(() => {
+    const handler = (e: PointerEvent) => {
+      if (rootRef && !rootRef.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", handler);
+    onCleanup(() => document.removeEventListener("pointerdown", handler));
+  });
+
+  const choices = createMemo(() => {
+    const at = props.hook === "onStart" ? "start" : "zero";
+    const noTiles = app.soundboardTiles().length === 0;
+    const hasLine = canAddAction(props.timer[props.hook], "speak") === "hasLine";
+    return ADD_CHOICES.filter((c) => ACTION_KINDS[c.kind].at.includes(at)).map((c) => {
+      const off = (c.choice === "tile" && noTiles) || (c.choice === "speak" && hasLine);
+      const label =
+        c.choice === "tile" && noTiles
+          ? "Play a clip — pick a soundboard folder first"
+          : c.choice === "speak" && hasLine
+            ? "Speak a line — this list already has one"
+            : c.label;
+      return { ...c, label, off };
+    });
+  });
+
+  /** The action a choice adds, with a first target the user can change. */
+  const actionFor = async (choice: AddChoice): Promise<TimerAction | null> => {
+    switch (choice) {
+      case "preset": {
+        // One other than the live preset, so it switches something.
+        const p = app.presets().find((x) => x.id !== app.presetId()) ?? app.presets()[0];
+        return p ? { kind: "preset", presetId: p.id } : null;
+      }
+      case "randomPreset":
+        return { kind: "randomPreset" };
+      case "revertPreset":
+        return { kind: "revertPreset" };
+      case "mute":
+        return { kind: "setMuted", muted: true };
+      case "unmute":
+        return { kind: "setMuted", muted: false };
+      case "tile": {
+        const t = app.soundboardTiles()[0];
+        return t ? { kind: "tile", tileId: t.id } : null;
+      }
+      case "speak": {
+        // The voice is chosen once the list has answered: the first
+        // installed Kokoro voice, else Critter Chatter's Bright.
+        await app.ensureTtsVoices();
+        const kokoro = app.ttsVoices().find((v) => v.engine !== "babble" && v.installed);
+        return { kind: "speak", text: NEW_LINE[props.hook], voiceId: kokoro?.id ?? FALLBACK_VOICE };
+      }
+      case "saveReplay":
+        return { kind: "saveReplay" };
+      case "panic":
+        return { kind: "panic" };
+    }
+  };
+
+  const add = async (i: number): Promise<void> => {
+    const c = choices()[i];
+    if (!c || c.off) return;
+    setOpen(false);
+    const a = await actionFor(c.choice);
+    if (a) await app.addTimerAction(props.id, props.hook, a);
+  };
+
+  const onKeyDown = (e: KeyboardEvent): void => {
+    if (!open()) {
+      if (e.key === "Enter" || e.key === " " || e.key === "ArrowDown") {
+        // Handled here, so the button's own click doesn't open it again.
+        e.preventDefault();
+        setActive(0);
+        setOpen(true);
+      }
+      return;
+    }
+    if (LISTBOX_MOVES.includes(e.key)) {
+      e.preventDefault();
+      setActive(listboxStep(e.key, active(), choices().length));
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      void add(active());
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setOpen(false);
+    } else if (e.key === "Tab") {
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div ref={rootRef} style={{ position: "relative", display: "inline-block" }}>
+      <button
+        ref={trigger}
+        type="button"
+        class="btn btn-secondary btn-sm"
+        disabled={props.disabled}
+        aria-label={`Add an action ${LIST_WORDS[props.hook].add} ${props.name}`}
+        aria-haspopup="listbox"
+        aria-expanded={open()}
+        aria-controls={open() ? listId : undefined}
+        aria-activedescendant={open() ? optionId(active()) : undefined}
+        onClick={(e) => {
+          blurOnPointer(e);
+          if (open()) {
+            setOpen(false);
+          } else {
+            setActive(0);
+            setOpen(true);
+          }
+        }}
+        onKeyDown={onKeyDown}
+        // A Space released on the button would click it once more.
+        onKeyUp={(e) => {
+          if (e.key === " ") e.preventDefault();
+        }}
+      >
+        <Sigil name="plus" size={15} />
+        Add action
+      </button>
+      <Show when={open() && !props.disabled}>
+        <div
+          id={listId}
+          class="dropdown"
+          role="listbox"
+          aria-label={`Actions to add ${LIST_WORDS[props.hook].add} ${props.name}`}
+          style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, "min-width": "300px", "z-index": 50 }}
+        >
+          <For each={choices()}>
+            {(c, i) => (
+              <div
+                id={optionId(i())}
+                class="dropdown-opt"
+                role="option"
+                aria-selected={false}
+                aria-disabled={c.off ? "true" : undefined}
+                style={{
+                  ...(i() === active() ? { outline: "1px solid var(--line-glow)", "outline-offset": "-1px" } : {}),
+                  ...(c.off ? { opacity: 0.55, cursor: "default" } : {}),
+                  "font-size": "var(--t-sm)",
+                  "font-weight": 600,
+                }}
+                onPointerEnter={() => setActive(i())}
+                onClick={(e) => {
+                  if (c.off) return;
+                  // A pointer's pick leaves the focus on the page.
+                  if (e.detail > 0) trigger?.blur();
+                  void add(i());
+                }}
+              >
+                {c.label}
+              </div>
+            )}
+          </For>
+        </div>
       </Show>
     </div>
   );

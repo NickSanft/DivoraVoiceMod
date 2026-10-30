@@ -96,6 +96,14 @@ const IN_APP_ONLY =
 const IN_APP_OR_MIDI =
   " in Divora's window, when no control in it has the keyboard, or with your MIDI control.";
 
+/** How a line about the key ends: "." when a global key works anywhere,
+ *  else where the key works and what reaches a call. v1.60.0: a timer's
+ *  card line (data/timerActions.ts `timerVoiceLine`) ends the same way, so
+ *  the two never disagree. */
+export function ptmKeyWhere(inCall: "key" | "midi" | null): string {
+  return inCall === "key" ? "." : inCall === "midi" ? IN_APP_OR_MIDI : IN_APP_ONLY;
+}
+
 /** The Mixer card's line under its switch. `key` is the in-app key as the
  *  card shows it, the global key when one is bound. `inCall`: what still
  *  works while a call has the focus. "key": a global push-to-modulate key is
@@ -110,7 +118,7 @@ export function ptmCardLine(
   inCall: "key" | "midi" | null,
 ): string {
   if (!s.on) return "Off · your effects are always on.";
-  const where = inCall === "key" ? "." : inCall === "midi" ? IN_APP_OR_MIDI : IN_APP_ONLY;
+  const where = ptmKeyWhere(inCall);
   return s.hold === "apply"
     ? `Your effects are on only while you hold ${key}${where}`
     : `Your effects are off while you hold ${key}${where}`;

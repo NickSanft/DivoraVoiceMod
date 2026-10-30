@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@solidjs/testing-library";
 import { makeTemplate } from "../data/unistroke";
+import { FALLBACK_PRESETS } from "../data/presets";
 import type { StoredTimer, StoredTimers, TimerDefWire } from "../data/timers";
 import type { TimerSnapshot, TimerState } from "../overlay/timerState";
 
@@ -1570,9 +1571,12 @@ describe("app store — Phase 3 DSP chain", () => {
     );
   });
 
-  it("setChainParam forwards to backend when engine is running", () => {
+  // v1.60.0: the engine's start sends the chain through the chain's queue
+  // (D19), and a param queued behind it goes once it has answered.
+  it("setChainParam forwards to backend when engine is running", async () => {
     const { result } = setupApp();
     result.setEngineRunning(true);
+    await new Promise<void>((r) => setTimeout(r, 0));
     invokeMock.mockClear();
     result.setChainParam(0, "thresh", -42);
     expect(invokeMock).toHaveBeenCalledWith("set_effect_param", {
@@ -1609,9 +1613,10 @@ describe("app store — Phase 3 DSP chain", () => {
     );
   });
 
-  it("syncChain sends SetChain when engine is running", () => {
+  it("syncChain sends SetChain when engine is running", async () => {
     const { result } = setupApp();
     result.setEngineRunning(true);
+    await new Promise<void>((r) => setTimeout(r, 0));
     invokeMock.mockClear();
     result.syncChain();
     expect(invokeMock).toHaveBeenCalledWith(
@@ -6183,5 +6188,897 @@ describe("app store — Hourglass (v1.59.0)", () => {
       expect(result.timerReturn("timer-1")).toEqual({ timer: "timer-1", from: "hollow-king", to: "villager" });
       expect(result.timerReturn("timer-2")).toBeNull();
     });
+  });
+
+  // ---- v1.60.0: timers that change your voice ----------------------------
+
+  describe("v1.60.0: what a countdown's start and end do on the page", () => {
+    const VILLAGER = { kind: "preset", presetId: "villager" } as const;
+    const ORACLE = { kind: "preset", presetId: "the-oracle" } as const;
+    const REVERT = { kind: "revertPreset" } as const;
+    const MUTE = { kind: "setMuted", muted: true } as const;
+    const UNMUTE = { kind: "setMuted", muted: false } as const;
+    const OBS = { kind: "obs", op: "sceneBack" };
+    const TILE = { id: "9f2c4e1a7b3d5f60", path: "C:\\sb\\intro.wav", label: "intro", extension: "wav", sizeBytes: 1 };
+    const PLAY_TILE = { kind: "tile", tileId: TILE.id } as const;
+    const LINE = (text: string) => ({ kind: "speak" as const, text, voiceId: "babble:bright" });
+    const RUNNING = { phase: "running", totalMs: 300_000, anchorMs: ENDS };
+    const VOICES = [
+      { id: "af_heart", name: "Heart", lang: "en-us", installed: true, engine: "kokoro" },
+      { id: "babble:bright", name: "Bright", lang: "en-us", installed: true, engine: "babble" },
+    ];
+    /** A user's own preset, with a chain no bundled one has. */
+    const MY_KING = {
+      id: "my-king",
+      name: "My King",
+      color: "#000000",
+      glyph: "crown",
+      tag: "User" as const,
+      desc: "",
+      chain: [
+        { id: "gate" as const, enabled: true, vals: { thresh: -50 } },
+        { id: "pitch" as const, enabled: true, vals: { shift: 9 } },
+      ],
+    };
+    const ALL = [...FALLBACK_PRESETS, MY_KING];
+    /** `list_presets`' answer: the bundled presets and My King. */
+    const wirePresets = () => ALL.map((p) => ({ ...p, chain: p.chain.map((c) => ({ ...c, vals: { ...c.vals } })) }));
+    const specsOf = (p: (typeof ALL)[number]) =>
+      JSON.stringify(p.chain.map((c) => ({ kind: c.id, enabled: c.enabled, params: { ...c.vals } })));
+    /** The preset each `set_effect_chain` sent, in order. */
+    const switches = () =>
+      argsOf("set_effect_chain").map((a) => {
+        const sent = JSON.stringify((a as { specs: unknown }).specs);
+        return ALL.find((p) => specsOf(p) === sent)?.id ?? "?";
+      });
+    /** Every command an action could send, as "cmd target". */
+    const ACTION_CMDS = [
+      "set_effect_chain",
+      "set_voice_model",
+      "play_soundboard_clip",
+      "stop_soundboard_clip",
+      "stop_all_soundboard_clips",
+      "set_input_muted",
+      "toggle_input_muted",
+      "speak",
+      "save_replay",
+      "set_audio_monitor",
+    ];
+    const actionCmds = () => {
+      let n = 0;
+      return calls
+        .filter((c) => ACTION_CMDS.includes(c.cmd))
+        .map((c) => {
+          if (c.cmd === "set_effect_chain") return `set_effect_chain ${switches()[n++]}`;
+          if (c.cmd === "play_soundboard_clip") return `play_soundboard_clip ${(c.args as { clipId: string }).clipId}`;
+          return c.cmd;
+        });
+    };
+    const returnsStored = () => {
+      const raw = window.localStorage.getItem(KEY);
+      return raw === null ? undefined : (JSON.parse(raw) as StoredTimers).presetReturns;
+    };
+    const ret = (timer: string, from: string, to: string) => ({ timer, from, to });
+    /** The Villager flow (§1.2 A): Villager at the start, back at zero. */
+    const villagerTimer = (more: Record<string, unknown> = {}) =>
+      entry("timer-1", { name: "Villager", onStart: [VILLAGER], onFire: [REVERT], ...more });
+
+    let seqN = 0;
+    /** The timer thread's `timer-actions`, to the listeners registered. */
+    const emitActions = (id: string, hook: "start" | "end", why: string, actions: unknown[]): void => {
+      seqN += 1;
+      const payload = { seq: seqN, id, hook, why, lateMs: 0, actions };
+      for (const h of handlers.get("timer-actions") ?? []) h({ payload });
+    };
+    beforeEach(() => {
+      seqN = 0;
+    });
+
+    /** Divora with `timers` (and `returns`) stored, live on `live`, the
+     *  engine running and a soundboard of one clip. The preset list loads at
+     *  once unless `holdPresets` (then `releasePresets`); `holdSync` keeps the
+     *  boot sync from reaching the backend until `releaseSync`, so the pull
+     *  lands first. The mute's word answers `muted`. Every command so far is
+     *  then forgotten. */
+    async function boot(
+      o: {
+        timers?: unknown[];
+        returns?: unknown;
+        live?: string;
+        holdPresets?: boolean;
+        holdSync?: boolean;
+        muted?: boolean;
+        noKey?: boolean;
+        voices?: () => unknown;
+        wait?: () => Promise<void>;
+      } = {},
+    ) {
+      const wait = o.wait ?? settle;
+      if (!o.noKey) {
+        const stored: Record<string, unknown> = { version: 1, timers: o.timers ?? [] };
+        if (o.returns !== undefined) stored.presetReturns = o.returns;
+        window.localStorage.setItem(KEY, JSON.stringify(stored));
+      }
+      window.localStorage.setItem("divora.activePreset", JSON.stringify(o.live ?? "hollow-king"));
+      const be = backend();
+      const real = invokeMock.getMockImplementation()!;
+      let openPresets: () => void = () => {};
+      const presetGate = o.holdPresets ? new Promise<void>((r) => (openPresets = r)) : null;
+      let openSync: () => void = () => {};
+      let syncGate = o.holdSync ? new Promise<void>((r) => (openSync = r)) : null;
+      let word = { muted: o.muted ?? false, seq: 1 };
+      invokeMock.mockImplementation(async (cmd: string, a?: Record<string, unknown>) => {
+        if (cmd === "sync_timers" && syncGate) {
+          const gate = syncGate;
+          syncGate = null;
+          await gate;
+        }
+        const answer = await real(cmd, a);
+        switch (cmd) {
+          case "list_presets":
+            if (presetGate) await presetGate;
+            return wirePresets();
+          case "input_mute":
+            return { ...word };
+          case "set_input_muted":
+            if (word.muted !== a!.muted) word = { muted: a!.muted as boolean, seq: word.seq + 1 };
+            return { ...word };
+          case "play_soundboard_clip":
+            return 3;
+          case "list_tts_voices":
+            return o.voices ? o.voices() : VOICES;
+          default:
+            return answer;
+        }
+      });
+      const { result } = setupApp();
+      result.setEngineRunning(true);
+      result.setSoundboardTiles([TILE]);
+      const loaded = result.refreshPresets();
+      await wait();
+      calls.length = 0;
+      log.length = 0;
+      return {
+        result,
+        be,
+        releasePresets: async () => {
+          openPresets();
+          await loaded;
+          await wait();
+        },
+        releaseSync: async () => {
+          openSync();
+          await wait();
+        },
+      };
+    }
+
+    it("a profile without timers listens to none of the three; the first add listens to all three, then pulls", async () => {
+      const { result } = await boot({ noKey: true });
+      const listens = () =>
+        log.filter((c) =>
+          ["listen timer-state", "listen timer-actions", "listen soundboard-stopped", "timer_status"].includes(c),
+        );
+      expect(listens()).toEqual([]);
+      await result.addTimer("countdown");
+      await settle();
+      expect(listens()).toEqual([
+        "listen timer-state",
+        "listen timer-actions",
+        "listen soundboard-stopped",
+        "timer_status",
+      ]);
+    });
+
+    describe("the dispatch table", () => {
+      // Each kind a timer's event can carry, at the hook Rust sends it from:
+      // what the page sends for it, and through which queue (a command of
+      // that queue in flight holds it back).
+      it.each([
+        ["Switch preset", "start", [VILLAGER], "chain", ["set_effect_chain villager"]],
+        ["Random preset (any that changes the voice but the live one)", "start", [{ kind: "randomPreset" }], "chain", [
+          "set_effect_chain static-wraith",
+        ]],
+        ["Back to the preset before, at an end", "end", [REVERT], "chain", ["set_effect_chain hollow-king"]],
+        ["Play a clip", "start", [PLAY_TILE], "board", [`play_soundboard_clip ${TILE.id}`]],
+        ["Mute my voice (the backend's)", "start", [MUTE], null, []],
+        ["Unmute my voice (the backend's)", "end", [UNMUTE], null, []],
+        ["Speak a line (the backend's)", "end", [LINE("I'm back.")], null, []],
+        ["Save a replay (the backend's)", "end", [{ kind: "saveReplay" }], null, []],
+        ["Stop all clips and lines (the backend's)", "end", [{ kind: "panic" }], null, []],
+        ["the glyph's toggles, which aren't timer actions", "end", [{ kind: "monitor" }, { kind: "mute" }], null, []],
+        ["Back to the preset before at a start (never run there)", "start", [REVERT], null, []],
+      ] as const)("%s", async (_name, hook, actions, queue, want) => {
+        vi.spyOn(Math, "random").mockReturnValue(0);
+        // Live on Villager with a return to Hollow King, so a revert has
+        // somewhere to go; a start's switches come from Hollow King.
+        const live = hook === "end" ? "villager" : "hollow-king";
+        const { result, be } = await boot({
+          timers: [villagerTimer({ run: RUNNING })],
+          returns: hook === "end" ? [ret("timer-1", "hollow-king", "villager")] : undefined,
+          live,
+        });
+        if (queue === "chain") {
+          be.hold("set_effect_param");
+          result.setChainParam(0, "thresh", -30);
+        } else if (queue === "board") {
+          be.hold("stop_soundboard_clip");
+          void result.stopClip("another");
+        }
+        emitActions("timer-1", hook, hook === "start" ? "armed" : "zero", [...actions]);
+        await settle();
+        const first = queue === "board" ? ["stop_soundboard_clip"] : [];
+        expect(actionCmds()).toEqual(first);
+        be.release("set_effect_param");
+        be.release("stop_soundboard_clip");
+        await settle();
+        expect(actionCmds()).toEqual([...first, ...want]);
+      });
+
+      it("dispatchAction from a timer runs the same way; from a glyph, as it always has", async () => {
+        const { result } = await boot({ timers: [villagerTimer({ run: RUNNING })] });
+        result.dispatchAction({ kind: "monitor" }, { kind: "timer", id: "timer-1", hook: "start" });
+        result.dispatchAction({ kind: "mute" }, { kind: "timer", id: "timer-1", hook: "start" });
+        result.dispatchAction({ kind: "panic" }, { kind: "timer", id: "timer-1", hook: "start" });
+        result.dispatchAction({ kind: "setMuted", muted: true }, { kind: "timer", id: "timer-1", hook: "start" });
+        await settle();
+        expect(actionCmds()).toEqual([]);
+        result.dispatchAction(VILLAGER, { kind: "timer", id: "timer-1", hook: "start" });
+        await settle();
+        expect(actionCmds()).toEqual(["set_effect_chain villager"]);
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+
+        // The glyph's five, unchanged (D1).
+        calls.length = 0;
+        result.dispatchGlyphAction({ kind: "preset", presetId: "clean" });
+        result.dispatchGlyphAction({ kind: "tile", tileId: TILE.id });
+        result.dispatchAction({ kind: "monitor" }, { kind: "glyph" });
+        result.dispatchAction({ kind: "mute" }, { kind: "glyph" });
+        result.dispatchAction({ kind: "panic" }, { kind: "glyph" });
+        await settle();
+        expect(actionCmds()).toEqual([
+          "set_effect_chain clean",
+          `play_soundboard_clip ${TILE.id}`,
+          "set_audio_monitor",
+          "set_input_muted",
+          "stop_all_soundboard_clips",
+        ]);
+        expect(argsOf("set_input_muted")).toEqual([{ muted: true }]);
+        // A glyph's switch notes no return.
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+      });
+    });
+
+    describe("switching preset and back (D17)", () => {
+      it("the Villager flow: the start switches and notes where from; zero switches back and forgets it", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        expect(switches()).toEqual(["villager"]);
+        expect(result.presetId()).toBe("villager");
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+        expect(result.timerReturn("timer-1")).toEqual(ret("timer-1", "hollow-king", "villager"));
+        emitActions("timer-1", "end", "zero", [REVERT]);
+        await settle();
+        expect(switches()).toEqual(["villager", "hollow-king"]);
+        expect(result.presetId()).toBe("hollow-king");
+        expect(returnsStored()).toBeUndefined();
+        expect(result.timerReturn("timer-1")).toBeNull();
+      });
+
+      it("you moved on: no switch back, and the return goes", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        result.usePreset("clean");
+        emitActions("timer-1", "end", "zero", [REVERT]);
+        await settle();
+        expect(switches()).toEqual(["villager", "clean"]);
+        expect(result.presetId()).toBe("clean");
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("an end with no Back to the preset before stays on the timer's preset and forgets the return", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        emitActions("timer-1", "end", "reset", []);
+        await settle();
+        expect(switches()).toEqual(["villager"]);
+        expect(result.presetId()).toBe("villager");
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("two timers that both switch back nest: the second to end goes back to before the first", async () => {
+        const { result } = await boot({
+          timers: [villagerTimer(), entry("timer-2", { name: "Oracle", onStart: [ORACLE], onFire: [REVERT] })],
+        });
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        emitActions("timer-2", "start", "armed", [ORACLE]);
+        await settle();
+        expect(returnsStored()).toEqual([
+          ret("timer-1", "hollow-king", "villager"),
+          ret("timer-2", "villager", "the-oracle"),
+        ]);
+        emitActions("timer-1", "end", "zero", [REVERT]);
+        await settle();
+        expect(result.presetId()).toBe("the-oracle");
+        expect(returnsStored()).toEqual([ret("timer-2", "hollow-king", "the-oracle")]);
+        emitActions("timer-2", "end", "zero", [REVERT]);
+        await settle();
+        expect(switches()).toEqual(["villager", "the-oracle", "hollow-king"]);
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("an event already seen does nothing again", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        // The same seq again, and an older one.
+        for (const h of handlers.get("timer-actions") ?? []) {
+          h({ payload: { seq: 1, id: "timer-1", hook: "start", why: "armed", lateMs: 0, actions: [ORACLE] } });
+          h({ payload: { seq: 0, id: "timer-1", hook: "end", why: "zero", lateMs: 0, actions: [REVERT] } });
+        }
+        await settle();
+        expect(switches()).toEqual(["villager"]);
+        expect(result.presetId()).toBe("villager");
+      });
+
+      it("on the Presets screen a timer's switch keeps the preset you are editing in view; elsewhere the view follows", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        result.setNav("presets");
+        result.viewPreset("clean");
+        result.setAbSlot("B");
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        expect(result.presetId()).toBe("villager");
+        expect(result.viewedId()).toBe("clean");
+        // Compare back on A, as for any switch (D18).
+        expect(result.ui.ab).toBe("A");
+        result.setNav("mixer");
+        expect(result.viewedId()).toBe("villager");
+        emitActions("timer-1", "end", "zero", [REVERT]);
+        await settle();
+        expect(result.presetId()).toBe("hollow-king");
+        expect(result.viewedId()).toBe("hollow-king");
+        // Your own Use on the Presets screen still shows what it made live.
+        result.setNav("presets");
+        result.usePreset("clean");
+        expect(result.viewedId()).toBe("clean");
+      });
+    });
+
+    describe("preset work waits for the real preset list (D16)", () => {
+      it("a revert that arrives before the list loads switches back to a user's preset once it has", async () => {
+        const { result, releasePresets } = await boot({
+          timers: [villagerTimer({ run: RUNNING })],
+          returns: [ret("timer-1", "my-king", "villager")],
+          live: "villager",
+          holdPresets: true,
+        });
+        // Ran out while Divora was closed (P6): its event reaches the page
+        // before the list does. Judged against the bundled list, My King
+        // would read as gone and the return would be dropped.
+        emitActions("timer-1", "end", "ranOut", [REVERT]);
+        await settle();
+        expect(switches()).toEqual([]);
+        expect(returnsStored()).toEqual([ret("timer-1", "my-king", "villager")]);
+        await releasePresets();
+        expect(switches()).toEqual(["my-king"]);
+        expect(result.presetId()).toBe("my-king");
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("reconcile waits for it too: a stored ended run's return is settled once it has loaded", async () => {
+        const { result, releasePresets } = await boot({
+          timers: [villagerTimer({ run: { phase: "done", totalMs: 300_000 } })],
+          returns: [ret("timer-1", "my-king", "villager")],
+          live: "villager",
+          holdPresets: true,
+        });
+        expect(result.timerSnapshot()?.timers[0]?.phase).toBe("done");
+        expect(switches()).toEqual([]);
+        expect(returnsStored()).toEqual([ret("timer-1", "my-king", "villager")]);
+        await releasePresets();
+        expect(switches()).toEqual(["my-king"]);
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("a clip in the same event plays at once; the switch waits, in the order it came", async () => {
+        const { result, releasePresets } = await boot({ timers: [villagerTimer()], holdPresets: true });
+        emitActions("timer-1", "start", "armed", [VILLAGER, PLAY_TILE]);
+        await settle();
+        expect(actionCmds()).toEqual([`play_soundboard_clip ${TILE.id}`]);
+        // The mirror hasn't caught up with the start (its `timer-state` is
+        // still on its way): the reconcile the list lets run must not read
+        // the timer as idle and undo the switch it just made.
+        expect(result.timerSnapshot()?.timers[0]?.phase).toBe("idle");
+        await releasePresets();
+        expect(actionCmds()).toEqual([`play_soundboard_clip ${TILE.id}`, "set_effect_chain villager"]);
+        expect(result.presetId()).toBe("villager");
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+      });
+    });
+
+    describe("reconcile (§7.6)", () => {
+      it("runs once, and only after the boot sync answered: a pull that lands first with no timers settles nothing", async () => {
+        const { result, be, releaseSync } = await boot({
+          timers: [villagerTimer({ run: RUNNING })],
+          returns: [ret("timer-1", "hollow-king", "villager")],
+          live: "villager",
+          holdSync: true,
+        });
+        // The pull reached the backend before the boot sync: no timers yet.
+        expect(result.timerSnapshot()?.timers).toEqual([]);
+        expect(result.presetsLoaded()).toBe(true);
+        expect(switches()).toEqual([]);
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+        await releaseSync();
+        // Running: kept for its end.
+        expect(result.timerSnapshot()?.timers[0]?.phase).toBe("running");
+        expect(switches()).toEqual([]);
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+        // Once per page: a later list and a later end with no event change
+        // nothing here.
+        be.elsewhere("timer-1", { phase: "done", ms: 0, text: "00:00", anchorMs: null, fires: 1 });
+        await result.refreshPresets();
+        await settle();
+        expect(switches()).toEqual([]);
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+      });
+
+      it("settles a deleted timer's return by switching back, and drops a newer kind's", async () => {
+        const { result } = await boot({
+          timers: [entry("timer-2", { name: "Later", kind: "interval" })],
+          returns: [ret("timer-1", "hollow-king", "villager"), ret("timer-2", "clean", "hollow-king")],
+          live: "villager",
+        });
+        // The deleted one's switch back makes Hollow King live, but the
+        // newer kind's return is dropped, never switched.
+        expect(result.presetId()).toBe("hollow-king");
+        expect(returnsStored()).toBeUndefined();
+      });
+    });
+
+    describe("End now (AT8)", () => {
+      it("an answer that lands before the end event settles nothing; the event does", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        await result.startTimer("timer-1");
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        await result.finishTimer("timer-1");
+        await settle();
+        expect(result.timerSnapshot()?.timers[0]).toMatchObject({ phase: "done", fires: 1 });
+        expect(result.presetId()).toBe("villager");
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+        emitActions("timer-1", "end", "endNow", [REVERT]);
+        await settle();
+        expect(switches()).toEqual(["villager", "hollow-king"]);
+        expect(returnsStored()).toBeUndefined();
+      });
+    });
+
+    describe("Add break (BRB) (D26)", () => {
+      it("BRB, 5:00, muting at the start and unmuting at zero: one save and one sync carrying both lists", async () => {
+        const { result } = await boot({ noKey: true });
+        expect(await result.addTimer("countdown", "break")).toBe("timer-1");
+        const brb = { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000 };
+        expect(synced()).toEqual([[{ ...brb, onStart: [MUTE], onFire: [UNMUTE] }]]);
+        expect(saved()).toEqual([{ ...brb, hotkeys: {}, onStart: [MUTE], onFire: [UNMUTE] }]);
+        expect(await result.addTimer("countdown", "break")).toBe("timer-2");
+        expect(saved()[1]).toMatchObject({ id: "timer-2", name: "BRB 2" });
+        expect(synced()).toHaveLength(2);
+        // A count-up has no lists: no break.
+        expect(await result.addTimer("countup", "break")).toBeNull();
+        expect(synced()).toHaveLength(2);
+      });
+    });
+
+    describe("editing the lists by index (D27)", () => {
+      const lists = () => synced().map((defs) => defs[0]?.onStart ?? null);
+
+      it("an action this build can't read survives adding and removing around it, and is never sent", async () => {
+        const { result } = await boot({ timers: [entry("timer-1", { onStart: [OBS, MUTE] })] });
+        await result.addTimerAction("timer-1", "onStart", PLAY_TILE);
+        expect(saved()[0]!.onStart).toEqual([OBS, MUTE, PLAY_TILE]);
+        await result.removeTimerAction("timer-1", "onStart", 1);
+        expect(saved()[0]!.onStart).toEqual([OBS, PLAY_TILE]);
+        expect(lists()).toEqual([[MUTE, PLAY_TILE], [PLAY_TILE]]);
+        // Removing the one it can't read takes only that one.
+        await result.removeTimerAction("timer-1", "onStart", 0);
+        expect(saved()[0]!.onStart).toEqual([PLAY_TILE]);
+      });
+
+      it("Add is refused at 8 stored entries, the one it can't read counted", async () => {
+        const seven = [UNMUTE, REVERT, PLAY_TILE, { kind: "saveReplay" }, { kind: "panic" }, LINE("Back."), VILLAGER];
+        const { result } = await boot({ timers: [entry("timer-1", { onFire: [...seven, OBS] })] });
+        const before = window.localStorage.getItem(KEY);
+        await result.addTimerAction("timer-1", "onFire", { kind: "randomPreset" });
+        expect(window.localStorage.getItem(KEY)).toBe(before);
+        expect(synced()).toEqual([]);
+      });
+
+      it("a second line in a list is refused; Stop all clips and lines goes to the top; each list offers its kinds", async () => {
+        const { result } = await boot({
+          timers: [entry("timer-1", { onFire: [LINE("I'm back.")] }), entry("timer-2", { kind: "countup" })],
+        });
+        await result.addTimerAction("timer-1", "onFire", LINE("Hello."));
+        expect(saved()[0]!.onFire).toEqual([LINE("I'm back.")]);
+        await result.addTimerAction("timer-1", "onFire", { kind: "panic" });
+        expect(saved()[0]!.onFire).toEqual([{ kind: "panic" }, LINE("I'm back.")]);
+        // Back to the preset before only at zero; a line that can't be
+        // read; a count-up.
+        await result.addTimerAction("timer-1", "onStart", REVERT);
+        await result.addTimerAction("timer-1", "onStart", LINE("   "));
+        await result.addTimerAction("timer-2", "onStart", MUTE);
+        expect(saved()[0]!.onStart).toBeUndefined();
+        expect(saved()[1]!.onStart).toBeUndefined();
+        expect(synced()).toHaveLength(1);
+        // A line is stored as read: trimmed.
+        await result.addTimerAction("timer-1", "onStart", LINE("  Be right back.  "));
+        expect(saved()[0]!.onStart).toEqual([LINE("Be right back.")]);
+      });
+
+      it("Set changes a running row's target or line, keeping the entry's other keys; never its kind or a row that doesn't run", async () => {
+        const { result } = await boot({
+          timers: [entry("timer-1", { onStart: [{ kind: "tile", tileId: "a", later: 1 }, OBS, LINE("Be right back.")] })],
+        });
+        await result.setTimerAction("timer-1", "onStart", 0, { kind: "tile", tileId: "b" });
+        await result.setTimerAction("timer-1", "onStart", 2, { kind: "speak", text: " Back soon. ", voiceId: "af_heart" });
+        expect(saved()[0]!.onStart).toEqual([
+          { kind: "tile", tileId: "b", later: 1 },
+          OBS,
+          { kind: "speak", text: "Back soon.", voiceId: "af_heart" },
+        ]);
+        expect(synced()).toHaveLength(2);
+        await result.setTimerAction("timer-1", "onStart", 0, { kind: "tile", tileId: "b" });
+        await result.setTimerAction("timer-1", "onStart", 0, MUTE);
+        await result.setTimerAction("timer-1", "onStart", 1, MUTE);
+        await result.setTimerAction("timer-1", "onStart", 3, MUTE);
+        expect(synced()).toHaveLength(2);
+      });
+    });
+
+    describe("deleting a timer with a return (D17)", () => {
+      it("running, switching back at zero: kept for the cancel's event, which switches back", async () => {
+        const { result } = await boot({ timers: [villagerTimer()] });
+        await result.startTimer("timer-1");
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        await result.deleteTimer("timer-1");
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+        expect(result.presetId()).toBe("villager");
+        emitActions("timer-1", "end", "deleted", [REVERT]);
+        await settle();
+        expect(switches()).toEqual(["villager", "hollow-king"]);
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("running, no switch back at zero: dropped at once, and you stay", async () => {
+        const { result } = await boot({ timers: [villagerTimer({ onFire: [] })] });
+        await result.startTimer("timer-1");
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        await result.deleteTimer("timer-1");
+        expect(returnsStored()).toBeUndefined();
+        expect(switches()).toEqual(["villager"]);
+        expect(result.presetId()).toBe("villager");
+      });
+
+      it("ended with its end unheard: settled at once, switching back only when its At zero does", async () => {
+        const { result, be } = await boot({
+          timers: [villagerTimer(), entry("timer-2", { name: "One way", onStart: [ORACLE] })],
+        });
+        await result.startTimer("timer-1");
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await result.startTimer("timer-2");
+        emitActions("timer-2", "start", "armed", [ORACLE]);
+        await settle();
+        // Both end while the page hears no `timer-actions` (a reload's gap).
+        be.elsewhere("timer-1", { phase: "done", ms: 0, text: "00:00", anchorMs: null, fires: 1 });
+        be.elsewhere("timer-2", { phase: "done", ms: 0, text: "00:00", anchorMs: null, fires: 1 });
+        expect(returnsStored()).toEqual([
+          ret("timer-1", "hollow-king", "villager"),
+          ret("timer-2", "villager", "the-oracle"),
+        ]);
+        await result.deleteTimer("timer-2");
+        expect(result.presetId()).toBe("the-oracle");
+        expect(returnsStored()).toEqual([ret("timer-1", "hollow-king", "villager")]);
+        // timer-1's Villager isn't live any more (the one-way timer left
+        // the Oracle on): you moved on, so nothing switches.
+        await result.deleteTimer("timer-1");
+        expect(result.presetId()).toBe("the-oracle");
+        expect(returnsStored()).toBeUndefined();
+      });
+
+      it("ended, switching back at zero, and still live: switches back at once", async () => {
+        const { result, be } = await boot({ timers: [villagerTimer()] });
+        await result.startTimer("timer-1");
+        emitActions("timer-1", "start", "armed", [VILLAGER]);
+        await settle();
+        be.elsewhere("timer-1", { phase: "done", ms: 0, text: "00:00", anchorMs: null, fires: 1 });
+        await result.deleteTimer("timer-1");
+        await settle();
+        expect(switches()).toEqual(["villager", "hollow-king"]);
+        expect(returnsStored()).toBeUndefined();
+      });
+    });
+
+    describe("the restart notice (D36)", () => {
+      const fsettle = async () => {
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      };
+      const brb = (run: unknown, onFire: unknown[] = [UNMUTE], id = "timer-1") =>
+        entry(id, { onStart: [MUTE], onFire, run });
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it("muted at launch by a running break: named once", async () => {
+        const { result } = await boot({ timers: [brb(RUNNING)], muted: true, wait: fsettle });
+        expect(result.toast()).toEqual({
+          id: expect.any(Number),
+          text: "BRB is running, so you're muted until it ends. Press End now or Reset to unmute.",
+          tone: "error",
+        });
+        const shown = result.toast();
+        await result.setMuted(false);
+        await result.setMuted(true);
+        await fsettle();
+        expect(result.toast()).toBe(shown);
+      });
+
+      it("a paused break, and one whose At zero doesn't unmute, each say so", async () => {
+        const paused = await boot({
+          timers: [brb({ phase: "paused", ms: 100_000, totalMs: 300_000 })],
+          muted: true,
+          wait: fsettle,
+        });
+        expect(paused.result.toast()?.text).toBe(
+          "BRB is paused, so you stay muted. Press End now or Reset to unmute.",
+        );
+      });
+
+      it("At zero that doesn't unmute: the notice says where to unmute", async () => {
+        const { result } = await boot({ timers: [brb(RUNNING, [])], muted: true, wait: fsettle });
+        expect(result.toast()?.text).toBe(
+          "BRB muted you when it started, and nothing at zero unmutes you. Unmute from the Mixer.",
+        );
+      });
+
+      it("a mute that comes within 3 s of the reconcile is named; one after isn't", async () => {
+        const late = await boot({ timers: [brb(RUNNING)], wait: fsettle });
+        expect(late.result.toast()).toBeNull();
+        await vi.advanceTimersByTimeAsync(2_000);
+        await late.result.setMuted(true);
+        await fsettle();
+        expect(late.result.toast()?.text).toBe(
+          "BRB is running, so you're muted until it ends. Press End now or Reset to unmute.",
+        );
+      });
+
+      it("after 3 s, a mute is yours: nothing is said", async () => {
+        const { result } = await boot({ timers: [brb(RUNNING)], wait: fsettle });
+        await vi.advanceTimersByTimeAsync(3_001);
+        await result.setMuted(true);
+        await fsettle();
+        expect(result.toast()).toBeNull();
+      });
+
+      it("muted with no muting countdown running: nothing is said", async () => {
+        const { result } = await boot({
+          timers: [
+            entry("timer-1", { onFire: [UNMUTE], run: RUNNING }),
+            brb({ phase: "done", totalMs: 300_000 }, [UNMUTE], "timer-2"),
+          ],
+          muted: true,
+          wait: fsettle,
+        });
+        expect(result.toast()).toBeNull();
+      });
+    });
+
+    it("soundboard-stopped: nothing shows as playing, and nothing is sent", async () => {
+      const { result } = await boot({ timers: [] });
+      await result.playClip(TILE);
+      expect(Object.keys(result.playingClips)).toEqual([TILE.id]);
+      for (const h of handlers.get("soundboard-stopped") ?? []) h({ payload: null });
+      expect(Object.keys(result.playingClips)).toEqual([]);
+      expect(log).not.toContain("stop_all_soundboard_clips");
+    });
+
+    describe("ensureTtsVoices", () => {
+      it("fills the voices once and leaves Speak's choice alone", async () => {
+        window.localStorage.setItem("divora.ttsVoice", JSON.stringify("clone-1"));
+        const { result } = await boot({ timers: [] });
+        expect(result.ttsVoicesLoaded()).toBe(false);
+        await Promise.all([result.ensureTtsVoices(), result.ensureTtsVoices()]);
+        await result.ensureTtsVoices();
+        expect(log.filter((c) => c === "list_tts_voices")).toHaveLength(1);
+        expect(result.ttsVoices().map((v) => v.id)).toEqual(["af_heart", "babble:bright"]);
+        expect(result.selectedTtsVoice()).toBe("clone-1");
+        expect(result.ttsVoicesLoaded()).toBe(true);
+      });
+
+      it("a list that fails still ends the loading, and the next call asks again", async () => {
+        let fail = true;
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const { result } = await boot({
+          timers: [],
+          voices: () => {
+            if (fail) throw new Error("no voices");
+            return VOICES;
+          },
+        });
+        await result.ensureTtsVoices();
+        expect(result.ttsVoicesLoaded()).toBe(true);
+        expect(result.ttsVoices()).toEqual([]);
+        expect(warn).toHaveBeenCalledWith("[tts] voice list for a timer failed", expect.any(Error));
+        fail = false;
+        await result.ensureTtsVoices();
+        expect(result.ttsVoices()).toHaveLength(2);
+      });
+    });
+  });
+});
+
+// ---- v1.60.0: the effect chain's and the soundboard's commands ----------
+
+describe("app store — one chain and one soundboard command at a time (v1.60.0)", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  const CHAIN = ["set_effect_chain", "set_effect_param", "set_effect_enabled", "set_voice_model"];
+  const BOARD = ["play_soundboard_clip", "stop_soundboard_clip", "stop_all_soundboard_clips"];
+  const TILE = { id: "a1b2c3d4e5f60718", path: "C:\\sb\\a.wav", label: "a", extension: "wav", sizeBytes: 1 };
+  const CLIP = { id: "c1", text: "Hi.", voice: "af_heart", createdAt: 0, durationSecs: 1, path: "C:\\speak\\c1.wav" };
+  /** Every chain and soundboard command, in the order invoked. */
+  let sent: string[] = [];
+  /** `holding`'s answers, each kept until the test lets it go or fails it. */
+  let held: Array<{ go: () => void; fail: (e: Error) => void }> = [];
+  let holding: string | null = null;
+
+  beforeEach(() => {
+    sent = [];
+    held = [];
+    holding = null;
+    invokeMock.mockReset();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (CHAIN.includes(cmd) || BOARD.includes(cmd)) sent.push(cmd);
+      const answer = cmd === "play_soundboard_clip" ? 2 : undefined;
+      if (cmd === holding) return new Promise((r, f) => held.push({ go: () => r(answer), fail: f }));
+      return Promise.resolve(answer);
+    });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+  });
+
+  /** A page live on `live` with the engine running, every send so far
+   *  answered and forgotten. */
+  async function page(live = "hollow-king") {
+    window.localStorage.setItem("divora.activePreset", JSON.stringify(live));
+    const { result } = setupApp();
+    result.setEngineRunning(true);
+    await settle();
+    sent = [];
+    return result;
+  }
+
+  type App = ReturnType<typeof useApp>;
+  // Every sender §8.4 names, with the command it sends: the first command
+  // of its queue is held, and it goes only once that one has answered; the
+  // other queue isn't held up meanwhile.
+  it.each<[string, "chain" | "board", string, string[], (a: App) => unknown]>([
+    ["setChainParam", "chain", "hollow-king", ["set_effect_param"], (a) => a.setChainParam(0, "thresh", -30)],
+    ["setChainEnabled", "chain", "hollow-king", ["set_effect_enabled"], (a) => a.setChainEnabled(0, false)],
+    ["setActiveVoice (applyActiveVoice)", "chain", "deep-narrator-ai", ["set_voice_model"], (a) => a.setActiveVoice(null)],
+    ["setAbSlot", "chain", "hollow-king", ["set_effect_chain"], (a) => a.setAbSlot("B")],
+    ["syncChain", "chain", "deep-narrator-ai", ["set_effect_chain", "set_voice_model"], (a) => a.syncChain()],
+    ["reorderChainEntries", "chain", "hollow-king", ["set_effect_chain"], (a) => a.reorderChainEntries(0, 1)],
+    ["the active preset's effect (a switch)", "chain", "hollow-king", ["set_effect_chain"], (a) => a.usePreset("villager")],
+    ["playClip", "board", "hollow-king", ["play_soundboard_clip"], (a) => a.playClip(TILE)],
+    ["stopClip", "board", "hollow-king", ["stop_soundboard_clip"], (a) => a.stopClip(TILE.id)],
+    ["panicSoundboard", "board", "hollow-king", ["stop_all_soundboard_clips"], (a) => a.panicSoundboard()],
+    ["playSpeakClip", "board", "hollow-king", ["play_soundboard_clip"], (a) => a.playSpeakClip(CLIP)],
+  ])("%s goes through the %s queue", async (_name, queue, live, cmds, send) => {
+    const app = await page(live);
+    // The queue's first command, slow to answer.
+    if (queue === "chain") {
+      holding = "set_effect_param";
+      app.setChainParam(1, "thresh", -31);
+    } else {
+      holding = "stop_soundboard_clip";
+      void app.stopClip("held");
+    }
+    const first = holding;
+    void send(app);
+    await settle();
+    expect(sent).toEqual([first]);
+    // The other queue goes at once.
+    if (queue === "chain") void app.playClip(TILE);
+    else app.setChainEnabled(1, false);
+    await settle();
+    const other = queue === "chain" ? "play_soundboard_clip" : "set_effect_enabled";
+    expect(sent).toEqual([first, other]);
+    holding = null;
+    held.shift()!.go();
+    await settle();
+    expect(sent).toEqual([first, other, ...cmds]);
+  });
+
+  it("a switch's chain slow to answer keeps its voice model behind it", async () => {
+    const app = await page();
+    holding = "set_effect_chain";
+    app.usePreset("deep-narrator-ai");
+    await settle();
+    expect(sent).toEqual(["set_effect_chain"]);
+    holding = null;
+    held.shift()!.go();
+    await settle();
+    expect(sent).toEqual(["set_effect_chain", "set_voice_model"]);
+  });
+
+  it("one chain per switch, then the voice model, and no chain after it (V1b)", async () => {
+    const app = await page();
+    invokeMock.mockClear();
+    app.usePreset("deep-narrator-ai");
+    await settle();
+    const narrator = FALLBACK_PRESETS.find((p) => p.id === "deep-narrator-ai")!;
+    expect(invokeMock.mock.calls.filter((c) => CHAIN.includes(c[0] as string))).toEqual([
+      ["set_effect_chain", { specs: narrator.chain.map((c) => ({ kind: c.id, enabled: c.enabled, params: c.vals })) }],
+      ["set_voice_model", { index: 2, path: null }],
+    ]);
+    // A preset without a model: one chain only. The live one again: none.
+    sent = [];
+    app.usePreset("villager");
+    await settle();
+    expect(sent).toEqual(["set_effect_chain"]);
+    sent = [];
+    app.usePreset("villager");
+    await settle();
+    expect(sent).toEqual([]);
+  });
+
+  it("a chain command that fails is logged and holds nothing back", async () => {
+    const app = await page();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    holding = "set_effect_param";
+    app.setChainParam(0, "thresh", -30);
+    app.setChainEnabled(0, false);
+    await settle();
+    expect(sent).toEqual(["set_effect_param"]);
+    holding = null;
+    held.shift()!.fail(new Error("refused"));
+    await settle();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith("[chain] set_effect_param failed:", expect.any(Error));
+    expect(sent).toEqual(["set_effect_param", "set_effect_enabled"]);
+  });
+
+  it("20 params and 20 clips, alternating, over a wire that lands what is in flight together reversed: Rust takes each queue's in send order", async () => {
+    const app = await page();
+    const wire = reversingWire(["set_effect_param", "play_soundboard_clip", "stop_soundboard_clip"]);
+    const done: unknown[] = [];
+    for (let i = 0; i < 20; i++) {
+      app.setChainParam(0, "thresh", -40 + i);
+      done.push(i % 2 === 0 ? app.playClip(TILE) : app.stopClip(TILE.id));
+    }
+    await wire.drain();
+    await Promise.all(done);
+    const chainOrder = (l: Array<[string, unknown]>) =>
+      l.filter(([c]) => c === "set_effect_param").map(([, a]) => (a as { value: number }).value);
+    const boardOrder = (l: Array<[string, unknown]>) => l.filter(([c]) => c !== "set_effect_param").map(([c]) => c);
+    const values = Array.from({ length: 20 }, (_, i) => -40 + i);
+    const clips = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? "play_soundboard_clip" : "stop_soundboard_clip"));
+    expect(chainOrder(wire.landed)).toEqual(values);
+    expect(boardOrder(wire.landed)).toEqual(clips);
+    // One of each queue in flight at once, never more.
+    expect(wire.peak()).toBe(2);
   });
 });

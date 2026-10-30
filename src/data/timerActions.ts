@@ -16,7 +16,10 @@
 // Pure, so it unit-tests.
 
 import { isTimerId, type TimerPhase } from "../overlay/timerState";
-import type { StoredTimers } from "./timers";
+import { ptmKeyWhere } from "./ptm";
+// A cycle (timers.ts sends lists with `actionsForSync`): both sides only
+// call each other's functions, never at load, so either may load first.
+import { timerRoles, type StoredTimer, type StoredTimers } from "./timers";
 
 // ---- the wire ----
 
@@ -354,17 +357,58 @@ export function revertPlan(
   return { switchTo: null, returns: rest };
 }
 
-/** S1 stub, track C fills it (§7.6): settles the returns whose end no page
- *  heard. Until then it settles nothing and keeps every return. */
+/** Whether a stored timer's At zero switches back: a countdown whose
+ *  `onFire` has a Back to the preset before that runs. What its end, a
+ *  delete and reconcile decide a leftover return by. */
+export function revertsAtZero(t: Pick<StoredTimer, "kind" | "onFire">): boolean {
+  return t.kind === "countdown" && actionsForSync(t.onFire).some((a) => a.kind === "revertPreset");
+}
+
+/** Settles the returns whose end no page heard (§7.6): a revert whose
+ *  `timer-actions` event fell inside a reload, or a countdown that ran out
+ *  while Divora was closed. The store runs it once per page, after the boot
+ *  sync has answered, the listeners are up and the real preset list has
+ *  loaded, so `exists` is never judged against the bundled list (D16).
+ *  Each return, oldest first, by the first rule that holds:
+ *  1. its timer isn't stored (deleted, its event lost) → settle with
+ *     `revert` true: `deleteTimer` drops at once a return whose At zero has
+ *     no Back to the preset before, so one left means "switch back";
+ *  2. its timer is stored as `newer` or `over` (`timerRoles`) → drop it;
+ *  3. the mirror says running or paused → keep it;
+ *  4. otherwise (done, ran out, idle, or not in the mirror) → settle with
+ *     `revert` = its At zero has Back to the preset before.
+ *  `resetReverts` false is Q2's alternative (a Reset or a delete changes
+ *  nothing else): rule 1 and an idle timer in rule 4 settle without
+ *  switching. Each settle is §7.3's `revertPlan` with the live preset as
+ *  the switches before it left it; only the last switch is returned. */
 export function reconcileReturns(
   rs: PresetReturn[],
-  _stored: StoredTimers,
-  _phaseOf: (id: string) => TimerPhase | null,
-  _live: string,
-  _exists: (id: string) => boolean,
-  _resetReverts = true,
+  stored: StoredTimers,
+  phaseOf: (id: string) => TimerPhase | null,
+  live: string,
+  exists: (id: string) => boolean,
+  resetReverts = true,
 ): { switchTo: string | null; returns: PresetReturn[] } {
-  return { switchTo: null, returns: rs };
+  const roles = timerRoles(stored);
+  let returns = rs;
+  let now = live;
+  let switchTo: string | null = null;
+  for (const { timer } of rs) {
+    const t = stored.timers.find((x) => x.id === timer);
+    const phase = phaseOf(timer);
+    let revert: boolean;
+    if (!t) revert = resetReverts;
+    else if (roles.get(timer) !== "run") revert = false;
+    else if (phase === "running" || phase === "paused") continue;
+    else revert = (resetReverts || phase !== "idle") && revertsAtZero(t);
+    const settled = revertPlan(returns, timer, now, exists, revert);
+    returns = settled.returns;
+    if (settled.switchTo !== null) {
+      now = settled.switchTo;
+      switchTo = settled.switchTo;
+    }
+  }
+  return { switchTo, returns };
 }
 
 // ---- words ----
@@ -447,15 +491,46 @@ export interface CallVoice {
   inCall: "key" | "midi" | null;
 }
 
-/** S1 stub, track C fills it (§7.7, with push-to-modulate's own words for
- *  where its key works, data/ptm.ts): the card's "Your preset is…" line.
- *  Until then, no line. */
+/** The card's line while a timer's switch is the live preset (§7.7, D29):
+ *  which preset it is, whether it stays after the end, and, when the call
+ *  doesn't hear it, why. Each fact comes on its own (UX4): the status
+ *  reads Clean both for a preset that doesn't change the voice and for
+ *  push-to-modulate holding the effects off, and the line tells them
+ *  apart. `where` is the push-to-modulate card's own ending (data/ptm.ts
+ *  `ptmKeyWhere`). No line without a return, when you moved on from the
+ *  timer's preset, or for a preset with no name. */
 export function timerVoiceLine(
-  _ret: PresetReturn | null,
-  _live: string,
-  _presetName: (id: string) => string | null,
-  _revertsAtEnd: boolean,
-  _v: CallVoice,
+  ret: PresetReturn | null,
+  live: string,
+  presetName: (id: string) => string | null,
+  revertsAtEnd: boolean,
+  v: CallVoice,
 ): string | null {
-  return null;
+  if (ret === null || live !== ret.to) return null;
+  const name = presetName(ret.to);
+  if (name === null) return null;
+  const head = revertsAtEnd
+    ? `Your preset is ${name} until this ends.`
+    : `Your preset is ${name}, and it stays after this ends.`;
+  if (v.muted) return `${head} You're muted, so your call hears none of your voice.`;
+  if (!v.transforms) return `${head} It doesn't change your voice.`;
+  if (v.bypassed && v.mode === "apply") {
+    return `${head} Push-to-modulate keeps it off your call until you hold ${v.key}${ptmKeyWhere(v.inCall)}`;
+  }
+  if (v.bypassed && v.mode === "bypass") {
+    return `${head} Push-to-modulate is holding it off, so your call hears your own voice.`;
+  }
+  return head;
+}
+
+/** Add break (BRB)'s countdown (D26): "BRB" (numbered by the store when
+ *  taken), 5:00, Mute my voice at the start, Unmute my voice at zero. No
+ *  line and no keys (Q5). New lists each call. */
+export function breakTemplate(): { name: string; durationMs: number; onStart: TimerAction[]; onFire: TimerAction[] } {
+  return {
+    name: "BRB",
+    durationMs: 300_000,
+    onStart: [{ kind: "setMuted", muted: true }],
+    onFire: [{ kind: "setMuted", muted: false }],
+  };
 }

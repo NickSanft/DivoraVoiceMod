@@ -32,12 +32,17 @@
 // v1.59.0: Hourglass's commands answer null, as no snapshot: the specs send
 // every timer state with emitTimers, so each step shows the page taking the
 // one they sent.
+//
+// v1.60.0: what a countdown's start and end do is the backend's to decide,
+// so nothing here runs a timer's actions: a spec sends the page's half with
+// emitTimerActions, and does the backend's half (the mute) with setMockMute.
 
 import { test as base, expect, type Page } from "@playwright/test";
 import wire from "../src/overlay/wire.fixture.json" with { type: "json" };
 import timerWire from "../src/overlay/timer.fixture.json" with { type: "json" };
 import type { OverlayStatus } from "../src/overlay/status";
 import type { TimerSnapshot } from "../src/overlay/timerState";
+import type { TimerActionsEvent } from "../src/data/timerActions";
 
 export const MOCK_INPUTS = [
   { name: "Mock Mic", isDefault: true, defaultSampleRate: 48000, channels: 1 },
@@ -96,6 +101,29 @@ export const MOCK_PRESETS = [
       { id: "pitch", enabled: true, vals: { shift: -7 } },
       { id: "robot", enabled: true, vals: { freq: 90, mix: 32 } },
       { id: "reverb", enabled: true, vals: { size: 48, mix: 34 } },
+    ],
+  },
+  // v1.60.0: the preset a timer switches to in the specs (the release's
+  // "Villager for five minutes"), its chain as divora-core's villager.json
+  // has it.
+  {
+    id: "villager",
+    version: 1,
+    name: "Villager",
+    color: "#8A9A5B",
+    glyph: "pitch",
+    tag: "Bundled",
+    desc: "The blocked-nose hum of the village idle.",
+    chain: [
+      { id: "gate", enabled: true, vals: { thresh: -48 } },
+      { id: "pitch", enabled: true, vals: { shift: 4 } },
+      { id: "formant", enabled: true, vals: { shift: 2 } },
+      { id: "radio_bandpass", enabled: true, vals: { hp: 200, lp: 3400, peak: 300, gain: 8, q: 2.5 } },
+      { id: "radio_bandpass", enabled: true, vals: { hp: 100, lp: 6000, peak: 1050, gain: -8, q: 6 } },
+      { id: "eq", enabled: true, vals: { low: -2, mid: 3, high: -4 } },
+      { id: "distortion", enabled: true, vals: { drive: 13, warmth: 35 } },
+      { id: "compressor", enabled: true, vals: { thresh: -28, ratio: 6, attack: 5, release: 90, makeup: 4 } },
+      { id: "tremolo", enabled: true, vals: { rate: 5, depth: 40 } },
     ],
   },
 ];
@@ -656,10 +684,12 @@ export async function installTauriMock(
         overlay_alive: () => null,
         import_overlay_asset: () => ({ ...data.importedAsset }),
         delete_overlay_asset: () => null,
-        // v1.59.0: Hourglass's commands. The seven that answer a snapshot in
+        // v1.59.0: Hourglass's commands. The eight that answer a snapshot in
         // the app answer null here, which the page reads as none, so the
         // cards say "Starting…" until a spec sends one with emitTimers.
-        // Arguments are refused as Tauri refuses them.
+        // Arguments are refused as Tauri refuses them. v1.60.0: End now's
+        // `finish_timer` among them; what its At zero list does comes only
+        // from emitTimerActions.
         sync_timers: (a: any) => {
           if (!Array.isArray(a?.timers)) throw "invalid args `timers` for command `sync_timers`";
           return null;
@@ -672,6 +702,7 @@ export async function installTauriMock(
           if (typeof a?.deltaMs !== "number") throw "invalid args `deltaMs` for command `adjust_timer`";
           return timerArgs("adjust_timer", a);
         },
+        finish_timer: (a: any) => timerArgs("finish_timer", a),
         timer_status: () => null,
         timers_dir: () => "C:/mock/timers",
       };
@@ -856,6 +887,43 @@ export async function emitTimers(page: Page, snapshot: TimerSnapshot): Promise<v
   );
 }
 
+/** v1.60.0: fire `timer-actions` with `ev`, as the backend's timer thread
+ *  does for each countdown start or end it planned (timer_actions.rs
+ *  `route`): the page's half of that hook run, numbered `seq`, and nothing
+ *  of the backend's half. Nothing here runs that half: a spec that needs the
+ *  mute moved does it with setMockMute. An event whose keys aren't exactly
+ *  the wire's (timer.fixture.json `actionsEventKeys`), a hook or a why the
+ *  wire doesn't have, or an action Rust never puts in the page's half (a kind
+ *  that runs in the backend, one a hook can't run, an unknown kind, or a
+ *  field that isn't its kind's) is refused, so a typo can't pass for a field
+ *  and a spec can't hand the page what the backend never would. */
+export async function emitTimerActions(page: Page, ev: TimerActionsEvent): Promise<void> {
+  const problems = keyProblems("the event", ev, timerWire.actionsEventKeys);
+  if (!timerWire.hooks.includes(ev.hook)) problems.push(`the event has hook ${ev.hook}`);
+  if (!timerWire.whys.includes(ev.why)) problems.push(`the event has why ${ev.why}`);
+  const at = ev.hook === "start" ? "start" : "zero";
+  (Array.isArray(ev.actions) ? ev.actions : []).forEach((a, i) => {
+    const kind = timerWire.actionKinds.find((k) => k.kind === a.kind);
+    if (!kind) {
+      problems.push(`actions[${i}] has kind ${a.kind}`);
+      return;
+    }
+    if (kind.runsIn !== "page") problems.push(`actions[${i}] is ${a.kind}, which runs in the backend`);
+    if (!kind.at.includes(at)) problems.push(`actions[${i}] is ${a.kind}, which never runs at the ${at}`);
+    problems.push(...keyProblems(`actions[${i}]`, a, ["kind", ...kind.fields]));
+  });
+  if (!Array.isArray(ev.actions)) problems.push("the event's actions aren't a list");
+  if (problems.length > 0) throw new Error(`not a TimerActionsEvent: ${problems.join(", ")}`);
+  await page.evaluate(
+    ([event, e]) => {
+      (
+        window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
+      ).__E2E_EMIT__(event as string, e);
+    },
+    [timerWire.actionWire.events.actions, ev] as const,
+  );
+}
+
 /** v1.56.0: the mute as the mock engine holds it (sessionStorage
  *  `__E2E_MUTE__`, which `input_mute`, `set_input_muted` and
  *  `toggle_input_muted` read and write). Unset means unmuted, seq 0, as at
@@ -892,6 +960,18 @@ export async function pressMuteHotkey(page: Page): Promise<MockMute> {
     emit("global-shortcut", { id: "mute", accelerator: "F20", state: "pressed" });
     emit("global-shortcut", { id: "mute", accelerator: "F20", state: "released" });
   }, next);
+  return next;
+}
+
+/** v1.60.0: what a timer's Mute my voice or Unmute my voice does in the
+ *  backend's action worker: sets the engine's word (here, the mock's; seq
+ *  bumps only on a change), with no event and no command from the page. The
+ *  page hears of it only from the next `audio-levels` tick (emitLevels), and
+ *  a reload reads it (`input_mute`). Returns the word after. */
+export async function setMockMute(page: Page, muted: boolean): Promise<MockMute> {
+  const now = await mockMute(page);
+  const next = now.muted === muted ? now : { muted, seq: now.seq + 1 };
+  await page.evaluate((n) => sessionStorage.setItem("__E2E_MUTE__", JSON.stringify(n)), next);
   return next;
 }
 

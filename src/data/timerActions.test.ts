@@ -5,6 +5,7 @@ import {
   ACTION_KINDS,
   actionsForSync,
   actionWords,
+  breakTemplate,
   canAddAction,
   FINISH_TIMER_CMD,
   LATE_ONE_SHOTS_MS,
@@ -18,22 +19,26 @@ import {
   readStoredActions,
   readTimerActionsEvent,
   reapplies,
+  reconcileReturns,
   restartNotice,
   restores,
   returnsAfterStart,
   revertPlan,
+  revertsAtZero,
   SOUNDBOARD_STOPPED_EVENT,
   TIMER_ACTIONS_EVENT,
   TIMER_ACTIONS_HOOKS,
   TIMER_WHYS,
+  timerVoiceLine,
   withAdded,
   withRemoved,
   withReplaced,
   type ActionNames,
+  type CallVoice,
   type PresetReturn,
   type TimerAction,
 } from "./timerActions";
-import { readTimers } from "./timers";
+import { defsForSync, readTimers } from "./timers";
 
 const MUTE: TimerAction = { kind: "setMuted", muted: true };
 const UNMUTE: TimerAction = { kind: "setMuted", muted: false };
@@ -348,5 +353,192 @@ describe("actionWords (§9)", () => {
     [{ kind: "panic" }, "Stop all clips and lines"],
   ] as const)("%j → %s", (a, want) => {
     expect(actionWords(a as TimerAction, names)).toBe(want);
+  });
+});
+
+describe("revertsAtZero", () => {
+  it("is a countdown whose At zero has a Back to the preset before that runs", () => {
+    expect(revertsAtZero({ kind: "countdown", onFire: [UNMUTE, REVERT] })).toBe(true);
+    expect(revertsAtZero({ kind: "countdown", onFire: [UNMUTE] })).toBe(false);
+    // A count-up never reaches zero; the 9th entry is never read; a list
+    // that isn't one is empty.
+    expect(revertsAtZero({ kind: "countup", onFire: [REVERT] })).toBe(false);
+    expect(revertsAtZero({ kind: "countdown", onFire: [...Array(8).fill(OBS), REVERT] })).toBe(false);
+    expect(revertsAtZero({ kind: "countdown", onFire: { kind: "revertPreset" } })).toBe(false);
+  });
+});
+
+describe("reconcileReturns (§7.6)", () => {
+  const r = (timer: string, from: string, to: string): PresetReturn => ({ timer, from, to });
+  const VILLAGER: TimerAction = { kind: "preset", presetId: "villager" };
+  // timer-1 switches back at zero, timer-2 doesn't; timer-3 is a newer
+  // kind; timer-4 is the 17th countdown, so it is over the limit.
+  const fillers = Array.from({ length: 14 }, (_, i) => ({
+    id: `timer-${i + 10}`,
+    name: `T${i + 10}`,
+    kind: "countdown",
+    durationMs: 60_000,
+  }));
+  const stored = readTimers({
+    version: 1,
+    timers: [
+      { id: "timer-1", name: "Villager", kind: "countdown", durationMs: 300_000, onStart: [VILLAGER], onFire: [REVERT] },
+      { id: "timer-2", name: "One way", kind: "countdown", durationMs: 300_000, onStart: [VILLAGER], onFire: [] },
+      { id: "timer-3", name: "Later", kind: "interval", durationMs: 1, onFire: [REVERT] },
+      ...fillers,
+      { id: "timer-4", name: "Over", kind: "countdown", durationMs: 300_000, onFire: [REVERT] },
+    ],
+  });
+  const exists = (id: string) => id !== "gone";
+  const phases = (m: Record<string, TimerPhase>) => (id: string) => m[id] ?? null;
+
+  it.each([
+    ["1. deleted: switches back", "timer-9", null, "villager", "hollow-king", []],
+    ["1. deleted, you moved on: dropped", "timer-9", null, "clean", null, []],
+    ["2. a newer kind: dropped, no switch", "timer-3", null, "villager", null, []],
+    ["2. over the limit: dropped, no switch", "timer-4", null, "villager", null, []],
+    ["3. running: kept", "timer-1", "running", "villager", null, [r("timer-1", "hollow-king", "villager")]],
+    ["3. paused: kept", "timer-1", "paused", "villager", null, [r("timer-1", "hollow-king", "villager")]],
+    ["4. done, switching back at zero", "timer-1", "done", "villager", "hollow-king", []],
+    ["4. ran out, switching back at zero", "timer-1", "expired", "villager", "hollow-king", []],
+    ["4. idle (a lost Reset), switching back at zero", "timer-1", "idle", "villager", "hollow-king", []],
+    ["4. stored as run but not in the mirror: by its At zero", "timer-1", null, "villager", "hollow-king", []],
+    ["4. done, no switch back at zero: dropped", "timer-2", "done", "villager", null, []],
+    ["4. idle, no switch back at zero: dropped", "timer-2", "idle", "villager", null, []],
+  ] as const)("%s", (_name, timer, phase, live, switchTo, returns) => {
+    const m: Record<string, TimerPhase> = phase === null ? {} : { [timer]: phase };
+    const rs = [r(timer, "hollow-king", "villager")];
+    expect(reconcileReturns(rs, stored, phases(m), live, exists, true)).toEqual({ switchTo, returns });
+  });
+
+  it("a deleted timer's return whose preset before is gone switches nothing and goes", () => {
+    expect(reconcileReturns([r("timer-9", "gone", "villager")], stored, phases({}), "villager", exists)).toEqual({
+      switchTo: null,
+      returns: [],
+    });
+  });
+
+  it("Q2's alternative: a deleted or idle timer's return goes without switching", () => {
+    const rs = [r("timer-9", "hollow-king", "villager")];
+    expect(reconcileReturns(rs, stored, phases({}), "villager", exists, false)).toEqual({ switchTo: null, returns: [] });
+    const idle = [r("timer-1", "hollow-king", "villager")];
+    expect(reconcileReturns(idle, stored, phases({ "timer-1": "idle" }), "villager", exists, false)).toEqual({
+      switchTo: null,
+      returns: [],
+    });
+    // A run that really ended still switches back.
+    expect(reconcileReturns(idle, stored, phases({ "timer-1": "done" }), "villager", exists, false)).toEqual({
+      switchTo: "hollow-king",
+      returns: [],
+    });
+  });
+
+  it("goes oldest first, splicing into a return stacked on top, and keeps a running one", () => {
+    // Hollow King →(timer-9, deleted) Villager →(timer-1, running) Glass
+    // Oracle: the deleted one hands Hollow King to the running one.
+    const rs = [r("timer-9", "hollow-king", "villager"), r("timer-1", "villager", "glass-oracle")];
+    expect(reconcileReturns(rs, stored, phases({ "timer-1": "running" }), "glass-oracle", exists)).toEqual({
+      switchTo: null,
+      returns: [r("timer-1", "hollow-king", "glass-oracle")],
+    });
+  });
+
+  it("judges each settle against the preset the switches before it left live, and sends only the last", () => {
+    // timer-9's switch back makes Hollow King live, which is timer-1's: it
+    // then switches back to Clean. Judged against Villager, timer-1's would
+    // read as "you moved on".
+    const rs = [r("timer-9", "hollow-king", "villager"), r("timer-1", "clean", "hollow-king")];
+    expect(reconcileReturns(rs, stored, phases({ "timer-1": "done" }), "villager", exists)).toEqual({
+      switchTo: "clean",
+      returns: [],
+    });
+  });
+
+  it("with no returns, changes nothing", () => {
+    expect(reconcileReturns([], stored, phases({}), "villager", exists)).toEqual({ switchTo: null, returns: [] });
+  });
+});
+
+describe("timerVoiceLine (§7.7)", () => {
+  const ret: PresetReturn = { timer: "timer-1", from: "hollow-king", to: "villager" };
+  const name = (id: string) => (id === "villager" ? "Villager" : null);
+  const heard: CallVoice = { muted: false, transforms: true, bypassed: false, mode: null, key: "Space", inCall: null };
+  const HEAD = "Your preset is Villager until this ends.";
+  const line = (v: Partial<CallVoice>, revertsAtEnd = true) =>
+    timerVoiceLine(ret, "villager", name, revertsAtEnd, { ...heard, ...v });
+
+  it("says nothing without a return, once you moved on, or for a preset with no name", () => {
+    expect(timerVoiceLine(null, "villager", name, true, heard)).toBeNull();
+    expect(timerVoiceLine(ret, "clean", name, true, heard)).toBeNull();
+    expect(timerVoiceLine({ ...ret, to: "gone" }, "gone", name, true, heard)).toBeNull();
+  });
+
+  it("names the preset, and says when it stays after the end", () => {
+    expect(line({})).toBe(HEAD);
+    expect(line({}, false)).toBe("Your preset is Villager, and it stays after this ends.");
+    expect(line({ muted: true }, false)).toBe(
+      "Your preset is Villager, and it stays after this ends. You're muted, so your call hears none of your voice.",
+    );
+  });
+
+  it("the mute comes first: your call hears none of your voice", () => {
+    expect(line({ muted: true })).toBe(`${HEAD} You're muted, so your call hears none of your voice.`);
+    expect(line({ muted: true, transforms: false, bypassed: true, mode: "apply" })).toBe(
+      `${HEAD} You're muted, so your call hears none of your voice.`,
+    );
+  });
+
+  // The status reads Clean both ways; the line tells them apart (UX4).
+  it.each([
+    ["off", null, false],
+    ["Hold to apply, not held", "apply", true],
+    ["Hold to apply, held", "apply", false],
+    ["Hold to bypass, held", "bypass", true],
+    ["Hold to bypass, not held", "bypass", false],
+  ] as const)("a preset that doesn't change the voice says so, push-to-modulate %s", (_name, mode, bypassed) => {
+    expect(line({ transforms: false, mode, bypassed })).toBe(`${HEAD} It doesn't change your voice.`);
+  });
+
+  it.each([
+    ["key", "."],
+    ["midi", " in Divora's window, when no control in it has the keyboard, or with your MIDI control."],
+    [
+      null,
+      " in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.",
+    ],
+  ] as const)("Hold to apply, not held: until you hold the key, where push-to-modulate's card says (%s)", (inCall, where) => {
+    expect(line({ bypassed: true, mode: "apply", key: "F13", inCall })).toBe(
+      `${HEAD} Push-to-modulate keeps it off your call until you hold F13${where}`,
+    );
+  });
+
+  it("Hold to bypass, held: your call hears your own voice", () => {
+    expect(line({ bypassed: true, mode: "bypass" })).toBe(
+      `${HEAD} Push-to-modulate is holding it off, so your call hears your own voice.`,
+    );
+  });
+
+  it("push-to-modulate letting the effects through says only the head", () => {
+    expect(line({ bypassed: false, mode: "apply" })).toBe(HEAD);
+    expect(line({ bypassed: false, mode: "bypass" })).toBe(HEAD);
+  });
+});
+
+describe("breakTemplate (D26)", () => {
+  it("is BRB, 5:00, muting at the start and unmuting at zero, and syncs as both lists", () => {
+    const b = breakTemplate();
+    expect(b).toEqual({
+      name: "BRB",
+      durationMs: 300_000,
+      onStart: [{ kind: "setMuted", muted: true }],
+      onFire: [{ kind: "setMuted", muted: false }],
+    });
+    expect(pairingWarnings(b.onStart, b.onFire)).toEqual([]);
+    const s = readTimers({ version: 1, timers: [{ id: "timer-1", kind: "countdown", hotkeys: {}, ...b }] });
+    expect(defsForSync(s)).toEqual([
+      { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000, onStart: [MUTE], onFire: [UNMUTE] },
+    ]);
+    // Each call's lists are its own.
+    expect(breakTemplate().onStart).not.toBe(b.onStart);
   });
 });

@@ -1,7 +1,7 @@
 // HotkeyCapture — dashed field that captures the next keychord into
 // Kbd chips. Click to arm; Esc cancels. Used by Settings → Hotkeys, the
-// Soundboard's tile hotkeys and, v1.59.0, each timer's two keys in
-// Settings → Hourglass.
+// Soundboard's tile hotkeys and, v1.59.0, each timer's keys in
+// Settings → Hourglass (v1.60.0: a countdown's third is End now).
 //
 // v1.59.0: the window `keydown` listener a click arms is held here, in the
 // component, and removed however the capture ends: a key, Esc, a second
@@ -10,10 +10,11 @@
 // field going away while armed. Before, the cleanup was registered inside
 // the click handler, where Solid has no owner and drops it, so a field
 // removed while armed (or clicked again to cancel) left its listener
-// behind, and the next key went to it. Hourglass puts up to 32 of these on
-// one screen, each beside a Delete. A capture armed by a pointer gives the
-// focus back to the page once it ends, so Space reaches push-to-modulate
-// again (`blurOnPointer`'s rule); armed from the keyboard, the focus stays.
+// behind, and the next key went to it. Hourglass puts up to 48 of these on
+// one screen (16 countdowns, three keys each), each beside a Delete. A
+// capture armed by a pointer gives the focus back to the page once it
+// ends, so Space reaches push-to-modulate again (`blurOnPointer`'s rule);
+// armed from the keyboard, the focus stays.
 
 import type { JSX } from "solid-js";
 import { createSignal, For, onCleanup, Show } from "solid-js";

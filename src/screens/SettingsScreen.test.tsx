@@ -11,7 +11,7 @@
 // in `App.test.tsx`.
 
 import { fireEvent, render, waitFor, within } from "@solidjs/testing-library";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeCalls: Array<{ cmd: string; args?: unknown }> = [];
 // v1.55.0: what the backend says about the overlay, and the listeners the
@@ -23,6 +23,10 @@ let outputDevices: unknown[] = [];
 // v1.59.0: what the backend answers Hourglass's commands (null unless a test
 // says, as the e2e mock answers).
 let timerReply: (cmd: string, args: unknown) => unknown = () => null;
+// v1.60.0: the presets and the Speak voices the backend lists (none unless a
+// test says, so the bundled presets stand and nothing has loaded).
+let presetsReply: () => unknown = () => [];
+let ttsVoicesReply: () => unknown = () => [];
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
@@ -40,7 +44,9 @@ vi.mock("@tauri-apps/api/core", () => ({
           output: { rms: 0, peak: 0 },
         };
       case "list_presets":
-        return [];
+        return presetsReply();
+      case "list_tts_voices":
+        return ttsVoicesReply();
       case "detect_virtual_mic":
         return { installed: false, name: null };
       case "list_voices":
@@ -57,6 +63,7 @@ vi.mock("@tauri-apps/api/core", () => ({
       case "resume_timer":
       case "reset_timer":
       case "adjust_timer":
+      case "finish_timer":
       case "timer_status":
       case "timers_dir":
         return timerReply(cmd, args);
@@ -86,6 +93,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 
 import { Sigil } from "../components/Sigil";
 import { muteCcStep } from "../data/mute";
+import { FALLBACK_PRESETS } from "../data/presets";
 import { AppProvider, useApp } from "../stores/app";
 import { HOURGLASS_SAID_MS, SettingsScreen } from "./SettingsScreen";
 
@@ -697,13 +705,14 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     expect(eyebrows.indexOf("About")).toBe(eyebrows.indexOf("Hourglass") + 1);
     const hourglass = section(view);
     expect(squash(hourglass.querySelector("p")?.textContent)).toBe(
-      "Countdowns and count-ups that keep time while Divora is in the tray. Start, pause and reset them here or with their own hotkeys, and show them on your overlay or in OBS. If your PC sleeps, a count-up pauses, and a countdown that runs out meanwhile says so instead of finishing late.",
+      "Countdowns and count-ups that keep time while Divora is in the tray. Start, pause and reset them here or with their own hotkeys, and show them on your overlay or in OBS. A countdown can also do things when it starts and when it reaches zero: switch your preset, mute you for a break, play a clip, speak a line or save a replay. If your PC sleeps, a count-up pauses, and a countdown that runs out meanwhile says so instead of finishing late.",
     );
     expect(view.getByText("No timers yet — add one below.")).toBeInTheDocument();
     expect(view.getByRole("button", { name: "Add countdown" })).not.toBeDisabled();
     expect(view.getByRole("button", { name: "Add count-up" })).not.toBeDisabled();
+    expect(view.getByRole("button", { name: "Add break (BRB)" })).not.toBeDisabled();
     expect(squash(view.getByTestId("hourglass-hotkey-note").textContent)).toBe(
-      "Keys you set here work in every app, and the app you're in doesn't get them while Divora runs: set to Space, you can't type a space anywhere. Pick keys you don't otherwise use, such as F13–F24 from a Stream Deck, or Ctrl+Alt with a letter on a US English keyboard. A key works only with exactly its modifiers: set to F9, pressing it while you hold Shift or Ctrl does nothing. A key that's already set in Divora runs what it's set for and can't be picked here; clear it there first. Some keys can't be set, and Divora doesn't say so: the row still shows the key. A key Windows or another app already holds is one; Shift with a number or symbol key is another (Shift+1 shows as !), and so, on some keyboards other than US English, is Ctrl+Alt with some letters. To check one, start its timer, press the key with Divora in the tray, then look at the timer here.",
+      "Keys you set here work in every app, and the app you're in doesn't get them while Divora runs: set to Space, you can't type a space anywhere. Pick keys you don't otherwise use, such as F13–F24 from a Stream Deck, or Ctrl+Alt with a letter on a US English keyboard. A key works only with exactly its modifiers: set to F9, pressing it while you hold Shift or Ctrl does nothing. A key that's already set in Divora runs what it's set for and can't be picked here; clear it there first. Some keys can't be set, and Divora doesn't say so: the row still shows the key. A key Windows or another app already holds is one; Shift with a number or symbol key is another (Shift+1 shows as !), and so, on some keyboards other than US English, is Ctrl+Alt with some letters. To check one, use a countdown with nothing in At start or At zero: start it, press the key with Divora in the tray, then look at the timer here.",
     );
     expect(view.getByText("Timer files for OBS")).toBeInTheDocument();
     expect(squash(view.getByText(/pick a timer's file from this folder/).textContent)).toBe(
@@ -756,6 +765,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await flush();
     expect(view.getByRole("button", { name: "Add countdown" })).toBeDisabled();
     expect(view.getByRole("button", { name: "Add count-up" })).toBeDisabled();
+    expect(view.getByRole("button", { name: "Add break (BRB)" })).toBeDisabled();
     expect(view.getByText("Hourglass holds up to 16 timers. Delete one to add another.")).toBeInTheDocument();
   });
 
@@ -1127,12 +1137,16 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     const names = [
       "Pause BRB",
       "Reset BRB",
+      "End BRB now",
       "Take 30 seconds off BRB",
       "Add 30 seconds to BRB",
+      "Add an action at the start of BRB",
+      "Add an action at zero of BRB",
       "Copy the path of BRB's file",
       "Open the timer files folder",
       "Add countdown",
       "Add count-up",
+      "Add break (BRB)",
       "Delete BRB",
     ];
     for (const name of names) {
@@ -1353,19 +1367,37 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
       expect(named.length).toBeGreaterThan(8);
       for (const n of named) expect(n, n).toContain(name);
     }
+    // v1.60.0: End now, the two lists' Add action and End now's key, on a
+    // countdown only.
     expect(controls(card("timer-1"))).toEqual([
       "Pause BRB",
       "Reset BRB",
+      "End BRB now",
       "Take 30 seconds off BRB",
       "Add 30 seconds to BRB",
       "Length of BRB",
+      "Add an action at the start of BRB",
+      "Add an action at zero of BRB",
       "BRB start or pause hotkey: F9",
       "Clear BRB start or pause hotkey",
       "BRB reset hotkey: not set",
+      "BRB end now hotkey: not set",
       "Show BRB on the overlay",
       "Copy the path of BRB's file",
       "Rename BRB",
       "Delete BRB",
+    ]);
+    expect(controls(card("timer-2"))).toEqual([
+      "Resume Uptime",
+      "Reset Uptime",
+      "Take 30 seconds off Uptime",
+      "Add 30 seconds to Uptime",
+      "Uptime start or pause hotkey: not set",
+      "Uptime reset hotkey: not set",
+      "Show Uptime on the overlay",
+      "Copy the path of Uptime's file",
+      "Rename Uptime",
+      "Delete Uptime",
     ]);
   });
 
@@ -1376,5 +1408,818 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     expect(squash(card!.textContent)).toContain(
       "or to a per-tile soundboard hotkey, or to one of a timer's keys in Settings → Hourglass. The button then fires",
     );
+  });
+});
+
+// v1.60.0: Timers that change your voice — a countdown's At start and At
+// zero lists, End now, Add break (BRB) and the lines that say what a list
+// will and won't do. The store is real (track C's bodies), so each edit is
+// checked where it lands: `divora.timers` and the one `sync_timers` it sends.
+describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  const squash = (s: string | null | undefined): string => (s ?? "").replace(/\s+/g, " ").trim();
+  const KEY = "divora.timers";
+  const ENDS = 1_793_217_900_000;
+  const MUTE = { kind: "setMuted", muted: true };
+  const UNMUTE = { kind: "setMuted", muted: false };
+  const line = (text: string, voiceId = "babble:bright") => ({ kind: "speak", text, voiceId });
+  const VOICES = [
+    { id: "af_heart", name: "Heart", lang: "en-us", installed: false, engine: "kokoro" },
+    { id: "am_adam", name: "Adam", lang: "en-us", installed: true, engine: "kokoro" },
+    { id: "babble:bright", name: "Bright", lang: "en-us", installed: true, engine: "babble" },
+  ];
+  const TILES = [{ id: "a1b2c3d4e5f60718", path: "C:/clips/intro.wav", label: "Intro", extension: "wav", sizeBytes: 1 }];
+  const START_HELP =
+    "Runs when it starts from the beginning: Start, Start again, or its start-or-pause key. Pause and Resume don't run it again. A change here counts from its next start, and if Divora restarts while it's running or paused, its Mute my voice runs again.";
+  const ZERO_HELP =
+    "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if At start mutes you. A change here counts for the run that's going on.";
+  const LIMIT =
+    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading. To try a list, give it a 0:05 countdown and watch the titlebar while it runs; a clip or a line in it plays on your call too.";
+  const WARN = {
+    muteNoUnmute:
+      "This mutes you when it starts, and nothing at zero unmutes you, so you stay muted after it ends, is reset or is deleted. Add Unmute my voice at zero.",
+    switchNoRevert:
+      "This switches your preset when it starts, and nothing at zero switches back, so you stay on that preset after it ends, is reset or is deleted. Add Back to the preset before at zero to switch back.",
+    revertNoSwitch: "The start doesn't switch preset, so there's nothing to go back to.",
+  };
+  const NOT_RUN = {
+    unreadable: "Made by a newer Divora, or can't be read here. It stays saved and doesn't run.",
+    secondLine: "Only the first line in a list is said. This one stays saved and isn't said.",
+    pastEight: "Only the first 8 actions in a list run. This one stays saved and doesn't run.",
+    startRevert: "Back to the preset before runs only at zero. This one stays saved and doesn't run.",
+  };
+  const RESET_UNDOES =
+    "Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: Unmute my voice if At start mutes you, and Back to the preset before.";
+  const TOGGLE_DESC = "Starts it, pauses it, resumes it, or starts it again once it's done or has run out.";
+  const LINE_REASON = "Type a line of up to 200 characters. A long line takes longer to prepare.";
+  const LINE_HELP =
+    "Said on your call even while you're muted, at full volume (Speak's Volume slider doesn't change it), and not kept in Saved clips. One line per list. A newer line from any timer replaces one still being prepared or playing, and Stop all clips and lines stops it; Speak's Stop doesn't.";
+  const REPLAY_OFF =
+    "Replay is off right now, so this saves nothing. Turn it on from the Record screen card; it's off after every launch.";
+
+  /** A stored countdown "BRB" of 5:00 unless `more` says otherwise. */
+  const entry = (id: string, more: Record<string, unknown> = {}) => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    durationMs: 300_000,
+    ...more,
+  });
+  const store = (timers: unknown[], more: Record<string, unknown> = {}) =>
+    window.localStorage.setItem(KEY, JSON.stringify({ version: 1, timers, ...more }));
+  const saved = (): Array<Record<string, unknown>> =>
+    (JSON.parse(window.localStorage.getItem(KEY) ?? '{"timers":[]}') as { timers: Array<Record<string, unknown>> })
+      .timers;
+  /** A timer as a snapshot has it: an idle 5:00 countdown "BRB" unless
+   *  `more` says otherwise. */
+  const state = (id: string, more: Record<string, unknown> = {}) => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    phase: "idle",
+    ms: 300_000,
+    totalMs: 300_000,
+    text: "05:00",
+    anchorMs: null,
+    fires: 0,
+    ...more,
+  });
+  const RUNNING = { phase: "running", ms: 298_400, text: "04:59", anchorMs: ENDS };
+  const PAUSED = { phase: "paused", ms: 200_000, text: "03:20" };
+  const EXPIRED = { phase: "expired", ms: 0, text: "00:00", fires: 1 };
+  const emit = async (seq: number, ...timers: unknown[]) => {
+    for (const h of eventHandlers.get("timer-state") ?? []) h({ payload: { seq, timers } });
+    await flush();
+  };
+  const sent = (cmd: string) => invokeCalls.filter((c) => c.cmd === cmd).map((c) => c.args);
+  const timerCmds = () =>
+    invokeCalls
+      .map((c) => c.cmd)
+      .filter((c) => c === "sync_timers" || c === "timer_status" || c.endsWith("_timer") || c.includes("global_shortcut"));
+  const card = (id: string): HTMLElement => {
+    const el = document.querySelector<HTMLElement>(`[data-timer-card="${id}"]`);
+    if (!el) throw new Error(`no card for ${id}`);
+    return el;
+  };
+  /** A list on a card. */
+  const list = (hook: "onStart" | "onFire", id = "timer-1"): HTMLElement => {
+    const el = card(id).querySelector<HTMLElement>(`[data-timer-list="${hook}"]`);
+    if (!el) throw new Error(`no ${hook} list on ${id}`);
+    return el;
+  };
+  const rowsOf = (hook: "onStart" | "onFire", id = "timer-1"): HTMLElement[] =>
+    Array.from(list(hook, id).querySelectorAll<HTMLElement>("[data-action-row]"));
+  /** Every button, switch and text field in an element, by its name. */
+  const controls = (el: HTMLElement): string[] =>
+    Array.from(el.querySelectorAll("button, input")).map(
+      (c) => c.getAttribute("aria-label") ?? squash(c.textContent),
+    );
+  /** An element's words, each text a word apart (textContent runs a
+   *  control's words into the next). */
+  const words = (el: HTMLElement): string => {
+    const texts: string[] = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) texts.push(n.nodeValue ?? "");
+    return squash(texts.join(" "));
+  };
+
+  /** The store itself, for what the backend or another screen changes. */
+  let app!: ReturnType<typeof useApp>;
+  function Probe() {
+    app = useApp();
+    return null;
+  }
+  const mount = () =>
+    render(() => (
+      <AppProvider>
+        <SettingsScreen />
+        <Probe />
+      </AppProvider>
+    ));
+  /** The real preset list answers (the bundled ones, as the backend lists them). */
+  const loadPresets = async (): Promise<void> => {
+    presetsReply = () => FALLBACK_PRESETS;
+    await app.refreshPresets();
+    await flush();
+  };
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    overlayReply = null;
+    timerReply = () => null;
+    presetsReply = () => [];
+    ttsVoicesReply = () => [];
+    invokeCalls.length = 0;
+    for (const ev of ["timer-state", "timer-actions", "soundboard-stopped"]) eventHandlers.delete(ev);
+  });
+  afterEach(() => {
+    presetsReply = () => [];
+    ttsVoicesReply = () => [];
+  });
+
+  it("a countdown has At start and At zero, End now and End now's key; a count-up has none, and its stored list stays", async () => {
+    store([entry("timer-1"), entry("timer-2", { name: "Uptime", kind: "countup", onStart: [MUTE] })]);
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"), state("timer-2", { name: "Uptime", kind: "countup", ms: 0, totalMs: 0, text: "00:00" }));
+    for (const [hook, title, help, add] of [
+      ["onStart", "At start", START_HELP, "Add an action at the start of BRB"],
+      ["onFire", "At zero", ZERO_HELP, "Add an action at zero of BRB"],
+    ] as const) {
+      expect(within(list(hook)).getByText(title)).toBeInTheDocument();
+      expect(within(list(hook)).getByText(help)).toBeInTheDocument();
+      expect(within(list(hook)).getByText("Nothing yet.")).toBeInTheDocument();
+      expect(within(list(hook)).getByRole("button", { name: add })).toHaveTextContent("Add action");
+    }
+    // At start, then At zero, after Length and before the keys.
+    const order = controls(card("timer-1"));
+    expect(order.indexOf("Length of BRB")).toBeLessThan(order.indexOf("Add an action at the start of BRB"));
+    expect(order.indexOf("Add an action at the start of BRB")).toBeLessThan(order.indexOf("Add an action at zero of BRB"));
+    expect(order.indexOf("Add an action at zero of BRB")).toBeLessThan(order.indexOf("BRB start or pause hotkey: not set"));
+    // End now's key: the third row.
+    const desc = within(card("timer-1")).getByText("Ends it at once and runs what's set for zero.");
+    expect(desc.previousElementSibling?.textContent).toBe("End now");
+    expect(view.getByRole("button", { name: "BRB end now hotkey: not set" })).toBeInTheDocument();
+    // Nothing in either list: no warning, no limits note.
+    expect(view.queryByText(LIMIT)).toBeNull();
+    expect(view.queryByText(/nothing at zero/)).toBeNull();
+
+    const up = card("timer-2");
+    expect(up.querySelector("[data-timer-list]")).toBeNull();
+    expect(within(up).queryByRole("button", { name: "End Uptime now" })).toBeNull();
+    expect(within(up).queryByRole("button", { name: /Uptime end now hotkey/ })).toBeNull();
+    expect(within(up).queryByText("Ends it at once and runs what's set for zero.")).toBeNull();
+    expect(within(up).queryByText("Mute my voice")).toBeNull();
+    expect(saved()[1]!.onStart).toEqual([MUTE]);
+  });
+
+  it("Add action is a listbox from the keyboard: each list's choices, the ones it can't add with their reason, and the focus stays on Add action", async () => {
+    store([entry("timer-1", { onFire: [line("I'm back.")] })]);
+    ttsVoicesReply = () => VOICES;
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const add = view.getByRole("button", { name: "Add an action at the start of BRB" });
+    expect(add).toHaveAttribute("aria-haspopup", "listbox");
+    expect(add).toHaveAttribute("aria-expanded", "false");
+    const highlighted = (b: HTMLElement): string | null | undefined =>
+      document.getElementById(b.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    add.focus();
+    fireEvent.keyDown(add, { key: "Enter" });
+    const box = view.getByRole("listbox", { name: "Actions to add at the start of BRB" });
+    expect(add).toHaveAttribute("aria-expanded", "true");
+    expect(add).toHaveAttribute("aria-controls", box.id);
+    const options = within(box).getAllByRole("option");
+    // At start never offers Back to the preset before; no folder, so no clip.
+    expect(options.map((o) => o.textContent)).toEqual([
+      "Switch preset",
+      "Random preset",
+      "Mute my voice",
+      "Unmute my voice",
+      "Play a clip — pick a soundboard folder first",
+      "Speak a line",
+      "Save a replay",
+      "Stop all clips and lines",
+    ]);
+    expect(options.filter((o) => o.getAttribute("aria-disabled") === "true").map((o) => o.textContent)).toEqual([
+      "Play a clip — pick a soundboard folder first",
+    ]);
+    expect(highlighted(add)).toBe("Switch preset");
+    // One it can't add: Enter adds nothing and the list stays open.
+    for (let i = 0; i < 4; i++) fireEvent.keyDown(add, { key: "ArrowDown" });
+    expect(highlighted(add)).toBe("Play a clip — pick a soundboard folder first");
+    invokeCalls.length = 0;
+    fireEvent.keyDown(add, { key: "Enter" });
+    await flush();
+    expect(sent("sync_timers")).toEqual([]);
+    expect(view.getByRole("listbox")).toBe(box);
+    // Home, then two down: Mute my voice, added and synced at once.
+    fireEvent.keyDown(add, { key: "Home" });
+    fireEvent.keyDown(add, { key: "ArrowDown" });
+    fireEvent.keyDown(add, { key: "ArrowDown" });
+    expect(highlighted(add)).toBe("Mute my voice");
+    fireEvent.keyDown(add, { key: "Enter" });
+    await flush();
+    expect(saved()[0]!.onStart).toEqual([MUTE]);
+    expect(sent("sync_timers")).toEqual([
+      {
+        timers: [
+          { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000, onStart: [MUTE], onFire: [line("I'm back.")] },
+        ],
+      },
+    ]);
+    expect(view.queryByRole("listbox")).toBeNull();
+    expect(add).toHaveAttribute("aria-expanded", "false");
+    expect(add).not.toHaveAttribute("aria-activedescendant");
+    expect(document.activeElement).toBe(add);
+    expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add an action at the start of BRB"]);
+
+    // At zero: Back to the preset before is offered, and its one line is
+    // taken. Space opens it too; Esc closes it with the focus kept.
+    const zero = view.getByRole("button", { name: "Add an action at zero of BRB" });
+    zero.focus();
+    fireEvent.keyDown(zero, { key: " " });
+    const zeroBox = view.getByRole("listbox", { name: "Actions to add at zero of BRB" });
+    const zeroOptions = within(zeroBox).getAllByRole("option");
+    expect(zeroOptions.map((o) => o.textContent)).toEqual([
+      "Switch preset",
+      "Random preset",
+      "Back to the preset before",
+      "Mute my voice",
+      "Unmute my voice",
+      "Play a clip — pick a soundboard folder first",
+      "Speak a line — this list already has one",
+      "Save a replay",
+      "Stop all clips and lines",
+    ]);
+    expect(zeroOptions.filter((o) => o.getAttribute("aria-disabled") === "true").map((o) => o.textContent)).toEqual([
+      "Play a clip — pick a soundboard folder first",
+      "Speak a line — this list already has one",
+    ]);
+    fireEvent.keyDown(zero, { key: "End" });
+    expect(highlighted(zero)).toBe("Stop all clips and lines");
+    fireEvent.keyDown(zero, { key: "Escape" });
+    expect(view.queryByRole("listbox")).toBeNull();
+    expect(document.activeElement).toBe(zero);
+    // Down opens it as well; Tab closes it.
+    fireEvent.keyDown(zero, { key: "ArrowDown" });
+    expect(view.getByRole("listbox")).toBeInTheDocument();
+    fireEvent.keyDown(zero, { key: "Tab" });
+    expect(view.queryByRole("listbox")).toBeNull();
+    expect(saved()[0]!.onFire).toEqual([line("I'm back.")]);
+  });
+
+  it("Speak a line asks for the voices, then adds the list's line in the first installed Kokoro voice, else Critter Chatter's Bright", async () => {
+    const pickLine = async (view: ReturnType<typeof mount>, hook: "onStart" | "onFire", name: string) => {
+      fireEvent.click(view.getByRole("button", { name }));
+      fireEvent.click(view.getByRole("option", { name: "Speak a line" }));
+      await flush();
+      return (saved()[0]![hook] as unknown[]).at(-1);
+    };
+    // An installed Kokoro voice (Heart isn't installed; Adam is).
+    store([entry("timer-1")]);
+    ttsVoicesReply = () => VOICES;
+    const first = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    expect(sent("list_tts_voices")).toEqual([]);
+    expect(await pickLine(first, "onFire", "Add an action at zero of BRB")).toEqual(line("I'm back.", "am_adam"));
+    expect(sent("list_tts_voices")).toHaveLength(1);
+    expect(first.getByRole("button", { name: "Voice of BRB's line at zero: Adam" })).toBeInTheDocument();
+    expect(first.getByRole("textbox", { name: "Line BRB says at zero" })).toHaveValue("I'm back.");
+    first.unmount();
+
+    // Kokoro not installed: Critter Chatter's Bright.
+    window.localStorage.clear();
+    eventHandlers.delete("timer-state");
+    store([entry("timer-1")]);
+    ttsVoicesReply = () => VOICES.filter((v) => v.id !== "am_adam");
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    expect(await pickLine(view, "onStart", "Add an action at the start of BRB")).toEqual(line("Be right back."));
+    expect(view.getByRole("button", { name: "Voice of BRB's line at the start: Bright" })).toBeInTheDocument();
+    expect(view.getByRole("textbox", { name: "Line BRB says at the start" })).toHaveValue("Be right back.");
+  });
+
+  it("with a pointer: Stop all clips and lines goes to the top of its list; Remove takes out its row only; the focus goes back to the page", async () => {
+    store([entry("timer-1", { onStart: [MUTE, { kind: "saveReplay" }] })]);
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const add = view.getByRole("button", { name: "Add an action at the start of BRB" });
+    add.focus();
+    fireEvent.click(add, { detail: 1 });
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(view.getByRole("option", { name: "Stop all clips and lines" }), { detail: 1 });
+    await flush();
+    expect(saved()[0]!.onStart).toEqual([{ kind: "panic" }, MUTE, { kind: "saveReplay" }]);
+    expect(rowsOf("onStart").map((r) => controls(r).at(-1))).toEqual([
+      "Remove Stop all clips and lines from the start of BRB",
+      "Remove Mute my voice from the start of BRB",
+      "Remove Save a replay from the start of BRB",
+    ]);
+    invokeCalls.length = 0;
+    const remove = view.getByRole("button", { name: "Remove Save a replay from the start of BRB" });
+    remove.focus();
+    fireEvent.click(remove, { detail: 1 });
+    await flush();
+    expect(saved()[0]!.onStart).toEqual([{ kind: "panic" }, MUTE]);
+    expect(sent("sync_timers")).toHaveLength(1);
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("an entry that doesn't run is a row with its reason and Remove only; it stays in place and counts toward 8", async () => {
+    const OBS = { kind: "obs", op: "scene", scene: "BRB" };
+    store([
+      entry("timer-1", {
+        onStart: [OBS, { kind: "revertPreset" }, MUTE],
+        onFire: [
+          line("I'm back."),
+          line("Again"),
+          line("x".repeat(201)),
+          UNMUTE,
+          { kind: "saveReplay" },
+          { kind: "revertPreset" },
+          { kind: "randomPreset" },
+          { kind: "panic" },
+          UNMUTE,
+        ],
+      }),
+    ]);
+    ttsVoicesReply = () => VOICES;
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const NOT_RUN_START = "Remove an action that doesn't run from the start of BRB";
+    const NOT_RUN_ZERO = "Remove an action that doesn't run from zero of BRB";
+    const start = rowsOf("onStart");
+    expect(start.map((r) => controls(r))).toEqual([
+      [NOT_RUN_START],
+      [NOT_RUN_START],
+      ["Remove Mute my voice from the start of BRB"],
+    ]);
+    expect(within(start[0]!).getByText(NOT_RUN.unreadable)).toBeInTheDocument();
+    expect(within(start[1]!).getByText(NOT_RUN.startRevert)).toBeInTheDocument();
+    const zero = rowsOf("onFire");
+    expect(zero).toHaveLength(9);
+    expect(controls(zero[0]!)).toEqual([
+      "Line BRB says at zero",
+      "Voice of BRB's line at zero: Bright",
+      "Remove Say “I'm back.” in Bright from zero of BRB",
+    ]);
+    expect(controls(zero[1]!)).toEqual([NOT_RUN_ZERO]);
+    expect(words(zero[1]!)).toContain("Say “Again” in Bright");
+    expect(within(zero[1]!).getByText(NOT_RUN.secondLine)).toBeInTheDocument();
+    expect(controls(zero[2]!)).toEqual([NOT_RUN_ZERO]);
+    expect(within(zero[2]!).getByText(NOT_RUN.unreadable)).toBeInTheDocument();
+    expect(controls(zero[8]!)).toEqual([NOT_RUN_ZERO]);
+    expect(within(zero[8]!).getByText(NOT_RUN.pastEight)).toBeInTheDocument();
+    // Nine stored: At zero is full, every entry counted; At start isn't.
+    expect(view.getByRole("button", { name: "Add an action at zero of BRB" })).toBeDisabled();
+    expect(within(list("onFire")).getByText("Up to 8 actions here. Remove one to add another.")).toBeInTheDocument();
+    expect(view.getByRole("button", { name: "Add an action at the start of BRB" })).not.toBeDisabled();
+    expect(within(list("onStart")).queryByText("Up to 8 actions here. Remove one to add another.")).toBeNull();
+
+    // Removing the stray switch back keeps the newer Divora's entry first.
+    fireEvent.click(within(start[1]!).getByRole("button", { name: NOT_RUN_START }));
+    await flush();
+    expect(saved()[0]!.onStart).toEqual([OBS, MUTE]);
+    expect(rowsOf("onStart").map((r) => controls(r))).toEqual([[NOT_RUN_START], ["Remove Mute my voice from the start of BRB"]]);
+    // The 9th goes; eight are still stored, so At zero is still full.
+    fireEvent.click(within(rowsOf("onFire")[8]!).getByRole("button", { name: NOT_RUN_ZERO }));
+    await flush();
+    expect((saved()[0]!.onFire as unknown[]).length).toBe(8);
+    expect(view.getByRole("button", { name: "Add an action at zero of BRB" })).toBeDisabled();
+  });
+
+  it("a line: typing sends nothing; Enter or leaving keeps it trimmed; Esc puts it back; one it can't read stays marked and sends nothing", async () => {
+    store([entry("timer-1", { onFire: [line("I'm back.")] })]);
+    ttsVoicesReply = () => VOICES;
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const field = view.getByRole("textbox", { name: "Line BRB says at zero" }) as HTMLInputElement;
+    expect(field.value).toBe("I'm back.");
+    expect(within(rowsOf("onFire")[0]!).getByText(LINE_HELP)).toBeInTheDocument();
+    invokeCalls.length = 0;
+
+    fireEvent.input(field, { target: { value: "  See you" } });
+    fireEvent.input(field, { target: { value: "  See you soon  " } });
+    await flush();
+    expect(sent("sync_timers")).toEqual([]);
+    fireEvent.keyDown(field, { key: "Enter" });
+    await flush();
+    expect(saved()[0]!.onFire).toEqual([line("See you soon")]);
+    expect(sent("sync_timers")).toEqual([
+      { timers: [{ id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000, onFire: [line("See you soon")] }] },
+    ]);
+    expect(field.value).toBe("See you soon");
+
+    // Empty, then too long: marked, its reason named, nothing sent.
+    for (const typed of ["   ", "x".repeat(201)]) {
+      invokeCalls.length = 0;
+      fireEvent.input(field, { target: { value: typed } });
+      fireEvent.keyDown(field, { key: "Enter" });
+      await flush();
+      expect(field).toHaveAttribute("aria-invalid", "true");
+      const reason = view.getByText(LINE_REASON);
+      expect(field.getAttribute("aria-describedby")).toBe(reason.id);
+      fireEvent.blur(field);
+      await flush();
+      expect(field.value).toBe(typed);
+      expect(sent("sync_timers")).toEqual([]);
+      expect(saved()[0]!.onFire).toEqual([line("See you soon")]);
+    }
+    // Esc puts the stored line back.
+    fireEvent.keyDown(field, { key: "Escape" });
+    await flush();
+    expect(field.value).toBe("See you soon");
+    expect(field).not.toHaveAttribute("aria-invalid");
+    expect(view.queryByText(LINE_REASON)).toBeNull();
+
+    // Leaving the field keeps it; the same line again sends nothing.
+    fireEvent.input(field, { target: { value: "Back!" } });
+    fireEvent.blur(field);
+    await flush();
+    expect(saved()[0]!.onFire).toEqual([line("Back!")]);
+    invokeCalls.length = 0;
+    fireEvent.input(field, { target: { value: " Back! " } });
+    fireEvent.blur(field);
+    await flush();
+    expect(sent("sync_timers")).toEqual([]);
+    // The same field throughout: a save doesn't rebuild the row.
+    expect(view.getByRole("textbox", { name: "Line BRB says at zero" })).toBe(field);
+  });
+
+  it("a target that matches nothing says so, never another's name: Missing preset once the real list has loaded, Missing clip, Voice not available after Loading voices…, and a voice not installed", async () => {
+    let answer: (v: unknown) => void = () => {};
+    ttsVoicesReply = () =>
+      new Promise((r) => {
+        answer = r;
+      });
+    store([
+      entry("timer-1", {
+        onStart: [{ kind: "preset", presetId: "gone-preset" }, { kind: "tile", tileId: "gone-tile" }, line("Be right back.", "nope")],
+        onFire: [{ kind: "preset", presetId: "villager" }, { kind: "tile", tileId: TILES[0]!.id }, line("I'm back.", "af_heart")],
+      }),
+    ]);
+    const view = mount();
+    await flush();
+    app.setSoundboardTiles(TILES);
+    await emit(1, state("timer-1"));
+    const named = (name: string) => view.getByRole("button", { name });
+    const GONE = "That preset is gone. Pick another, or remove this.";
+    // Before the real list, a preset it doesn't know may be one of yours.
+    expect(named("Preset BRB switches to at the start: Loading presets…")).toHaveTextContent("Loading presets…");
+    expect(view.queryByText(GONE)).toBeNull();
+    expect(named("Voice of BRB's line at the start: Loading voices…")).toBeInTheDocument();
+    expect(named("Voice of BRB's line at zero: Loading voices…")).toBeInTheDocument();
+
+    await loadPresets();
+    const missing = named("Preset BRB switches to at the start: Missing preset");
+    expect(missing).toHaveTextContent("Missing preset");
+    expect(missing.textContent).not.toContain("Hollow King");
+    expect(within(rowsOf("onStart")[0]!).getByText(GONE)).toBeInTheDocument();
+    expect(named("Preset BRB switches to at zero: Villager")).toBeInTheDocument();
+    const clip = named("Clip BRB plays at the start: Missing clip");
+    expect(clip).toHaveTextContent("Missing clip");
+    expect(clip.textContent).not.toContain("Intro");
+    expect(
+      within(rowsOf("onStart")[1]!).getByText("That clip isn't in your soundboard folder now, so nothing plays."),
+    ).toBeInTheDocument();
+    expect(named("Clip BRB plays at zero: Intro")).toBeInTheDocument();
+    expect(view.getAllByText("That clip isn't in your soundboard folder now, so nothing plays.")).toHaveLength(1);
+
+    answer(VOICES);
+    await flush();
+    expect(named("Voice of BRB's line at the start: Voice not available")).toHaveTextContent("Voice not available");
+    expect(named("Voice of BRB's line at zero: Heart")).toBeInTheDocument();
+    expect(
+      within(rowsOf("onFire")[2]!).getByText(
+        "Heart isn't installed in this build, so nothing is said. Pick a Critter Chatter voice.",
+      ),
+    ).toBeInTheDocument();
+    expect(view.getAllByText(/isn't installed in this build/)).toHaveLength(1);
+    // Asked once for both lines.
+    expect(sent("list_tts_voices")).toHaveLength(1);
+
+    // Picked from the keyboard: saved, synced, and the picker keeps the
+    // focus while the store saves (the row isn't rebuilt).
+    missing.focus();
+    fireEvent.keyDown(missing, { key: "Enter" });
+    fireEvent.keyDown(missing, { key: "Home" });
+    invokeCalls.length = 0;
+    fireEvent.keyDown(missing, { key: "Enter" });
+    await flush();
+    expect((saved()[0]!.onStart as unknown[])[0]).toEqual({ kind: "preset", presetId: "hollow-king" });
+    expect(sent("sync_timers")).toHaveLength(1);
+    expect(document.activeElement).toBe(missing);
+    expect(missing).toHaveAttribute("aria-label", "Preset BRB switches to at the start: Hollow King");
+    expect(view.queryByText(GONE)).toBeNull();
+  });
+
+  it("each kind's row: its words, its picker named with its value, and what it will and won't do", async () => {
+    store([
+      entry("timer-1", {
+        onStart: [
+          { kind: "panic" },
+          { kind: "preset", presetId: "villager" },
+          { kind: "randomPreset" },
+          MUTE,
+          { kind: "tile", tileId: TILES[0]!.id },
+          line("Be right back."),
+          { kind: "saveReplay" },
+        ],
+        onFire: [UNMUTE, { kind: "revertPreset" }, { kind: "saveReplay" }],
+      }),
+    ]);
+    ttsVoicesReply = () => VOICES;
+    const view = mount();
+    await flush();
+    app.setSoundboardTiles(TILES);
+    await emit(1, state("timer-1"));
+    expect(controls(list("onStart"))).toEqual([
+      "Remove Stop all clips and lines from the start of BRB",
+      "Preset BRB switches to at the start: Villager",
+      "Remove Switch to Villager from the start of BRB",
+      "Remove Switch to a random preset from the start of BRB",
+      "Remove Mute my voice from the start of BRB",
+      "Clip BRB plays at the start: Intro",
+      "Remove Play Intro from the start of BRB",
+      "Line BRB says at the start",
+      "Voice of BRB's line at the start: Bright",
+      "Remove Say “Be right back.” in Bright from the start of BRB",
+      "Remove Save a replay from the start of BRB",
+      "Add an action at the start of BRB",
+    ]);
+    expect(controls(list("onFire"))).toEqual([
+      "Remove Unmute my voice from zero of BRB",
+      "Remove Back to the preset before from zero of BRB",
+      "Remove Save a replay from zero of BRB",
+      "Add an action at zero of BRB",
+    ]);
+    // Every control on the card still names its timer, the pickers' values
+    // with it.
+    for (const n of controls(card("timer-1"))) expect(n, n).toContain("BRB");
+    const start = rowsOf("onStart");
+    expect(words(start[0]!)).toBe(
+      "Stop all clips and lines Remove Runs first in its list: it stops what was playing before, and a line still being prepared. This list's own clip and line play after it.",
+    );
+    expect(words(start[1]!)).toContain("Switch to Villager");
+    expect(words(start[2]!)).toBe("Switch to a random preset Remove");
+    expect(words(start[3]!)).toBe("Mute my voice Remove");
+    expect(words(start[4]!)).toContain("Play Intro");
+    expect(words(start[5]!)).toMatch(/^Say in Bright/);
+    expect(within(start[5]!).getByText(LINE_HELP)).toBeInTheDocument();
+    expect(within(start[6]!).getByText(REPLAY_OFF)).toBeInTheDocument();
+    expect(words(start[6]!)).toContain(
+      "Saves the seconds up to the moment it started. If a replay is already being saved, this one is refused with a notice.",
+    );
+    const zero = rowsOf("onFire");
+    expect(words(zero[0]!)).toBe(
+      "Unmute my voice Remove It unmutes you even if you muted yourself before or during the countdown, or another timer is still muting you.",
+    );
+    expect(words(zero[1]!)).toBe("Back to the preset before Remove");
+    expect(within(zero[2]!).getByText(REPLAY_OFF)).toBeInTheDocument();
+    expect(words(zero[2]!)).toContain(
+      "Saves the seconds up to the moment it reached zero. If a replay is already being saved, this one is refused with a notice.",
+    );
+    // A switch and a mute, each put back at zero: no warning; the limits
+    // note once, under both lists.
+    expect(view.queryByText(/nothing at zero/)).toBeNull();
+    expect(view.queryByText(WARN.revertNoSwitch)).toBeNull();
+    expect(view.getAllByText(LIMIT)).toHaveLength(1);
+
+    // A picker clicked with a pointer leaves the focus on the page.
+    const picker = view.getByRole("button", { name: "Clip BRB plays at the start: Intro" });
+    picker.focus();
+    fireEvent.click(picker, { detail: 1 });
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("pairing warnings: a start that mutes or switches with nothing at zero to put it back, a switch back with nothing to go back to; and the limits note once either list has an action", async () => {
+    store([entry("timer-1", { onStart: [MUTE, { kind: "preset", presetId: "villager" }] })]);
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const warned = () =>
+      (Object.keys(WARN) as Array<keyof typeof WARN>).filter((k) => view.queryByText(WARN[k]) !== null);
+    expect(warned()).toEqual(["muteNoUnmute", "switchNoRevert"]);
+    expect(view.getByText(LIMIT)).toBeInTheDocument();
+    await app.addTimerAction("timer-1", "onFire", { kind: "setMuted", muted: false });
+    await flush();
+    expect(warned()).toEqual(["switchNoRevert"]);
+    await app.addTimerAction("timer-1", "onFire", { kind: "revertPreset" });
+    await flush();
+    expect(warned()).toEqual([]);
+    // Without the switch, the switch back has nothing to go back to.
+    await app.removeTimerAction("timer-1", "onStart", 1);
+    await flush();
+    expect(warned()).toEqual(["revertNoSwitch"]);
+    // A random preset is a switch too.
+    await app.addTimerAction("timer-1", "onStart", { kind: "randomPreset" });
+    await flush();
+    expect(warned()).toEqual([]);
+    // Both lists emptied: no warning and no limits note.
+    for (const hook of ["onStart", "onFire"] as const) {
+      while ((saved()[0]![hook] as unknown[]).length > 0) await app.removeTimerAction("timer-1", hook, 0);
+    }
+    await flush();
+    expect(warned()).toEqual([]);
+    expect(view.queryByText(LIMIT)).toBeNull();
+  });
+
+  it("a paused break says you stay muted; its key rows say what pausing and Reset do; a run-out says what ran", async () => {
+    store([
+      entry("timer-1", { onStart: [MUTE], onFire: [UNMUTE] }),
+      entry("timer-2", { name: "Intro", onFire: [UNMUTE, { kind: "revertPreset" }] }),
+      entry("timer-3", { name: "Plain" }),
+    ]);
+    const view = mount();
+    await flush();
+    const others = [state("timer-2", { name: "Intro", ...EXPIRED }), state("timer-3", { name: "Plain", ...EXPIRED })];
+    await emit(1, state("timer-1", PAUSED), ...others);
+    const PAUSED_LINE = "BRB is paused, so you stay muted until you resume it and it reaches zero, or press End now or Reset.";
+    // Only while you're muted.
+    expect(view.queryByText(PAUSED_LINE)).toBeNull();
+    app.applyMuteState({ muted: true, seq: 1 });
+    await flush();
+    expect(within(card("timer-1")).getByText(PAUSED_LINE)).toBeInTheDocument();
+    await emit(2, state("timer-1", RUNNING), ...others);
+    expect(view.queryByText(PAUSED_LINE)).toBeNull();
+
+    // BRB mutes at its start: start-or-pause says a press pauses the break;
+    // its At zero unmutes, so Reset says it undoes the start.
+    expect(within(card("timer-1")).getByText(`${TOGGLE_DESC} It pauses a break and doesn't end it; End now's key ends it.`)).toBeInTheDocument();
+    expect(within(card("timer-1")).getByText(RESET_UNDOES)).toBeInTheDocument();
+    // Intro doesn't mute at its start; its At zero puts things back.
+    expect(within(card("timer-2")).getByText(TOGGLE_DESC)).toBeInTheDocument();
+    expect(within(card("timer-2")).getByText(RESET_UNDOES)).toBeInTheDocument();
+    // Plain has nothing to undo: as v1.59.0.
+    expect(within(card("timer-3")).getByText(TOGGLE_DESC)).toBeInTheDocument();
+    expect(within(card("timer-3")).getByText("Back to the start, stopped.")).toBeInTheDocument();
+
+    const HEAD = "It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.";
+    expect(
+      within(card("timer-2")).getByText(`${HEAD} Of its At zero list, only Unmute my voice and Back to the preset before ran.`),
+    ).toBeInTheDocument();
+    expect(within(card("timer-3")).getByText(HEAD)).toBeInTheDocument();
+    await emit(3, state("timer-1", EXPIRED), ...others);
+    expect(within(card("timer-1")).getByText(`${HEAD} Of its At zero list, only Unmute my voice ran.`)).toBeInTheDocument();
+  });
+
+  it("while its switch is the live preset, the card says which, whether it stays, and why the call may not hear it", async () => {
+    window.localStorage.setItem("divora.activePreset", JSON.stringify("villager"));
+    window.localStorage.setItem("divora.ptm", JSON.stringify({ on: true, hold: "apply" }));
+    store([entry("timer-1", { onStart: [{ kind: "preset", presetId: "villager" }], onFire: [{ kind: "revertPreset" }] })], {
+      presetReturns: [{ timer: "timer-1", from: "hollow-king", to: "villager" }],
+    });
+    const view = mount();
+    await flush();
+    const said = () => {
+      const el = view.queryByTestId("timer-voice-line");
+      return el ? squash(el.textContent) : null;
+    };
+    await emit(1, state("timer-1"));
+    expect(said()).toBeNull();
+    await emit(2, state("timer-1", RUNNING));
+    expect(said()).toBe("Your preset is Villager until this ends.");
+    app.applyMuteState({ muted: true, seq: 1 });
+    await flush();
+    expect(said()).toBe("Your preset is Villager until this ends. You're muted, so your call hears none of your voice.");
+    app.applyMuteState({ muted: false, seq: 2 });
+    app.applyPtmState({ mode: "apply", held: false, bypassed: true, seq: 1 });
+    await flush();
+    expect(said()).toBe(
+      "Your preset is Villager until this ends. Push-to-modulate keeps it off your call until you hold Space in Divora's window, when no control in it has the keyboard. To use it in a call, set a key in Settings → Hotkeys.",
+    );
+    // Without Back to the preset before at zero, it stays.
+    await app.removeTimerAction("timer-1", "onFire", 0);
+    await flush();
+    expect(said()).toMatch(/^Your preset is Villager, and it stays after this ends\. Push-to-modulate keeps it off/);
+    // Paused too; not once it has ended.
+    await emit(3, state("timer-1", PAUSED));
+    expect(said()).toMatch(/^Your preset is Villager, and it stays after this ends\./);
+    await emit(4, state("timer-1", { phase: "done", ms: 0, text: "00:00", fires: 1 }));
+    expect(said()).toBeNull();
+  });
+
+  it("End now: only while running or paused, and after what was clicked before it", async () => {
+    store([entry("timer-1")]);
+    const view = mount();
+    await flush();
+    const endNow = () => within(card("timer-1")).getByRole("button", { name: "End BRB now" });
+    const phases: Array<[Record<string, unknown>, boolean]> = [
+      [{ phase: "idle" }, false],
+      [RUNNING, true],
+      [PAUSED, true],
+      [{ phase: "done", ms: 0, text: "00:00", fires: 1 }, false],
+      [EXPIRED, false],
+    ];
+    let seq = 0;
+    for (const [more, on] of phases) {
+      await emit(++seq, state("timer-1", more));
+      expect(endNow()).toHaveTextContent("End now");
+      if (!on) {
+        expect(endNow(), String(more.phase)).toBeDisabled();
+        continue;
+      }
+      expect(endNow(), String(more.phase)).not.toBeDisabled();
+      invokeCalls.length = 0;
+      fireEvent.click(endNow());
+      await flush();
+      expect(sent("finish_timer")).toEqual([{ id: "timer-1" }]);
+    }
+    // A Pause still on its way: End now waits for it, then goes.
+    await emit(++seq, state("timer-1", RUNNING));
+    let release: (v: unknown) => void = () => {};
+    timerReply = (cmd) =>
+      cmd === "pause_timer"
+        ? new Promise((r) => {
+            release = r;
+          })
+        : null;
+    invokeCalls.length = 0;
+    fireEvent.click(view.getByRole("button", { name: "Pause BRB" }));
+    fireEvent.click(endNow());
+    await flush();
+    expect(timerCmds()).toEqual(["pause_timer"]);
+    release(null);
+    await flush();
+    expect(timerCmds()).toEqual(["pause_timer", "finish_timer"]);
+  });
+
+  it("End now's key binds tm:<id>:finish, named for its timer", async () => {
+    store([entry("timer-1")]);
+    const view = mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    const capture = view.getByRole("button", { name: "BRB end now hotkey: not set" });
+    invokeCalls.length = 0;
+    fireEvent.click(capture, { detail: 1 });
+    expect(view.getByRole("button", { name: "BRB end now hotkey: press a key, Esc to cancel" })).toBe(capture);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "F10", cancelable: true }));
+    await flush();
+    expect(sent("register_global_shortcut")).toEqual([{ id: "tm:timer-1:finish", accelerator: "F10" }]);
+    expect((saved()[0]!.hotkeys as Record<string, string>).finish).toBe("F10");
+    invokeCalls.length = 0;
+    fireEvent.click(view.getByRole("button", { name: "Clear BRB end now hotkey" }));
+    await flush();
+    expect(sent("unregister_global_shortcut")).toEqual([{ id: "tm:timer-1:finish" }]);
+    expect(view.getByRole("button", { name: "BRB end now hotkey: not set" })).toBeInTheDocument();
+  });
+
+  it("Add break (BRB) adds a 5:00 countdown that mutes at its start and unmutes at zero, in one sync", async () => {
+    const view = mount();
+    await flush();
+    const brb = view.getByRole("button", { name: "Add break (BRB)" });
+    brb.focus();
+    fireEvent.click(brb, { detail: 1 });
+    await flush();
+    expect(sent("sync_timers")).toEqual([
+      {
+        timers: [
+          { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000, onStart: [MUTE], onFire: [UNMUTE] },
+        ],
+      },
+    ]);
+    expect(document.activeElement).toBe(document.body);
+    expect(words(card("timer-1"))).toContain("Countdown · 5:00");
+    await emit(1, state("timer-1"));
+    expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add an action at the start of BRB"]);
+    expect(controls(list("onFire"))).toEqual(["Remove Unmute my voice from zero of BRB", "Add an action at zero of BRB"]);
+    // A break warns of nothing, and its keys are unbound.
+    expect(view.queryByText(/nothing at zero/)).toBeNull();
+    expect(view.getByRole("button", { name: "BRB start or pause hotkey: not set" })).toBeInTheDocument();
+    expect(view.getByRole("button", { name: "BRB end now hotkey: not set" })).toBeInTheDocument();
+    invokeCalls.length = 0;
+    fireEvent.click(view.getByRole("button", { name: "Add break (BRB)" }));
+    await flush();
+    const second = (sent("sync_timers")[0] as { timers: Array<{ name: string }> }).timers[1]!;
+    expect(second.name).toBe("BRB 2");
   });
 });

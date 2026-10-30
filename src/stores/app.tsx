@@ -127,6 +127,8 @@ import {
   timersDirCmd,
   subscribeTimerState,
   finishTimerCmd,
+  subscribeTimerActions,
+  subscribeSoundboardStopped,
   type CaptureMonitor,
   type CaptureStatus,
   type DesktopAudioSource,
@@ -218,6 +220,7 @@ import {
   adoptTimers,
   readTimerSnapshot,
   type TimerKind,
+  type TimerPhase,
   type TimerSnapshot,
 } from "../overlay/timerState";
 import {
@@ -239,6 +242,7 @@ import {
   DEFAULT_LENGTH_MS,
   defaultName,
   defsForSync,
+  freshNameFrom,
   MAX_LENGTH_MS,
   MAX_TIMERS,
   MIN_LENGTH_MS,
@@ -258,7 +262,22 @@ import {
   type TimerVerb,
 } from "../data/timers";
 import {
+  ACTION_KINDS,
+  breakTemplate,
+  canAddAction,
+  pickRandomPreset,
+  readAction,
   readReturns,
+  readStoredActions,
+  readTimerActionsEvent,
+  reconcileReturns,
+  restartNotice,
+  returnsAfterStart,
+  revertPlan,
+  revertsAtZero,
+  withAdded,
+  withRemoved,
+  withReplaced,
   type PresetReturn,
   type TimerAction,
   type TimerHook,
@@ -503,6 +522,10 @@ function saveRaw(key: string, value: string): boolean {
 /** Most-recently-used cap for the recent-folders dropdown. */
 const RECENT_FOLDERS_MAX = 5;
 
+/** v1.60.0: how long after the reconcile pass a re-mute at launch is named
+ *  by the restart notice (D36). */
+export const RESTART_NOTICE_MS = 3000;
+
 /**
  * Default hotkey bindings are intentionally EMPTY — registering any
  * accelerator (especially a plain key like "Space") via
@@ -595,9 +618,12 @@ export interface AppState {
   dispatchGlyphAction: (action: GlyphAction) => void;
   /** v1.60.0: the one dispatcher, for a glyph's action and a timer's page
    *  half (`timer-actions`). A glyph's runs as `dispatchGlyphAction` always
-   *  has. A timer's runs only its page kinds (preset, random preset, back to
-   *  the preset before, a clip); the backend runs the rest and the page never
-   *  sends them. S1: a timer's does nothing yet (track C). */
+   *  has. A timer's runs only its page kinds: a clip at once; a preset
+   *  switch, a random preset and (at an end) Back to the preset before once
+   *  the real preset list has loaded, in the order they came (D16). The
+   *  backend runs the rest, so the page never sends a mute, a line, a save
+   *  or a Stop all for a timer, and the glyph's toggles never run from
+   *  one. */
   dispatchAction: (action: GlyphAction | TimerAction, from: ActionSource) => void;
   /** Match a drawn path against the custom-glyph templates (built-ins use
    *  the geometric `detectShape`). */
@@ -807,6 +833,14 @@ export interface AppState {
   ttsVoices: () => TtsVoiceInfo[];
   /** Selected voice id — built-in or cloned (persisted `divora.ttsVoice`); null until first load. */
   selectedTtsVoice: () => string | null;
+  /** v1.60.0: fills `ttsVoices` once, for a timer's line, when nothing has
+   *  yet, without touching Speak's selection (`refreshTtsVoices` can
+   *  reset it). Settles when the list has answered or failed. */
+  ensureTtsVoices: () => Promise<void>;
+  /** v1.60.0: true once a list of Speak voices has answered (or failed):
+   *  until then a timer's line says "Loading voices…", not that its voice
+   *  is missing. */
+  ttsVoicesLoaded: () => boolean;
   setSelectedTtsVoice: (id: string) => void;
   /** Speak playback volume, linear 0..2 (persisted `divora.ttsVolume`). */
   ttsVolume: () => number;
@@ -915,7 +949,13 @@ export interface AppState {
   downloadVoxcpmGpuModel: () => Promise<void>;
 
   // Preset actions
-  usePreset: (id: string) => void;
+  /** Makes `id` the live preset (nothing for an id not in `presets()`),
+   *  with Compare back on A and both slots its chain. v1.60.0: the chain
+   *  goes out once, from the effect on the active preset, then the voice
+   *  model (D19). `fromTimer`: a timer's switch, which keeps the Presets
+   *  screen on the preset you are editing there (D18); anywhere else the
+   *  view follows, as for every switch. */
+  usePreset: (id: string, opts?: { fromTimer?: boolean }) => void;
   /** Preview a preset in the Presets editor without making it live. */
   viewPreset: (id: string) => void;
   /** The Coven: apply a cast member's preset + (un)set its conversion model. */
@@ -1149,9 +1189,10 @@ export interface AppState {
    *  only if it is newer. Saves a stored timer's run when it changed. */
   adoptTimerSnapshot: (raw: unknown) => void;
   /** Adds a countdown or a count-up and syncs; its id, or null at 16 stored
-   *  timers. v1.60.0: `template` "break" adds Add break (BRB)'s countdown,
-   *  its lists included, in one sync (D26). S1: a template adds nothing yet
-   *  and answers null (track C). */
+   *  timers. v1.60.0: `template` "break" (with "countdown") adds Add break
+   *  (BRB)'s countdown, "BRB" numbered if taken, 5:00, muting at its start
+   *  and unmuting at zero, its lists in the one save and the one sync
+   *  (D26); null for a count-up. */
   addTimer: (kind: TimerKind, template?: "break") => Promise<string | null>;
   /** Called on commit only (Enter, or leaving the field), with a name that
    *  passes `readTimerName`. Sends nothing when the name is the one stored,
@@ -1174,9 +1215,14 @@ export interface AppState {
   finishTimer: (id: string) => Promise<void>;
   /** v1.60.0: a countdown's At start (`onStart`) and At zero (`onFire`)
    *  lists, edited by index into the stored array so an entry this build
-   *  can't read stays where it is (D27); each saves, then syncs. Add is
-   *  refused unless `canAddAction` says "ok". S1: they change nothing yet
-   *  (track C). */
+   *  can't read stays where it is (D27); each saves, then syncs. Only for a
+   *  countdown the backend runs, and only an action `readAction` reads
+   *  (stored as read: a line trimmed). Add is refused unless `canAddAction`
+   *  says "ok" and the list offers the kind (Back to the preset before only
+   *  at zero); Stop all clips and lines goes to the top. Set changes a
+   *  row that runs, to an action of its kind (a new target or line), and
+   *  keeps the entry's other keys. Remove takes any row, one that doesn't
+   *  run included. */
   addTimerAction: (id: string, hook: TimerHook, action: TimerAction) => Promise<void>;
   setTimerAction: (id: string, hook: TimerHook, index: number, action: TimerAction) => Promise<void>;
   removeTimerAction: (id: string, hook: TimerHook, index: number) => Promise<void>;
@@ -1294,11 +1340,13 @@ export function createAppState(): AppState {
 
   // v1.60.0: the one dispatcher (D1). A glyph's five actions run as they
   // always have. A timer's page half (preset, random preset, back to the
-  // preset before, a clip) is track C's; its backend kinds and the glyph's
-  // toggles never run from a timer.
+  // preset before, a clip) runs in Hourglass's block (`runTimerAction`);
+  // its backend kinds and the glyph's toggles never run from a timer.
   const dispatchAction = (action: GlyphAction | TimerAction, from: ActionSource): void => {
-    // S1 stub: a timer's actions do nothing yet (track C).
-    if (from.kind !== "glyph") return;
+    if (from.kind === "timer") {
+      runTimerAction(action, from.id, from.hook);
+      return;
+    }
     switch (action.kind) {
       case "preset":
         usePreset(action.presetId);
@@ -2238,11 +2286,13 @@ export function createAppState(): AppState {
   // Set when the provider goes: a late answer or event then changes nothing,
   // and never writes storage.
   let timersDisposed = false;
-  let timerUnlisten: (() => void) | null = null;
+  // v1.60.0: three listeners (`timer-state`, `timer-actions`,
+  // `soundboard-stopped`), let go together.
+  let timerUnlistens: Array<() => void> = [];
   onCleanup(() => {
     timersDisposed = true;
-    if (timerUnlisten) timerUnlisten();
-    timerUnlisten = null;
+    for (const un of timerUnlistens) un();
+    timerUnlistens = [];
   });
 
   const saveTimers = (next: StoredTimers): void => {
@@ -2288,6 +2338,10 @@ export function createAppState(): AppState {
     if (next === prev || next === null) return;
     setTimerSnapshot(next);
     persistRuns(next);
+    // v1.60.0: a mirror that arrives only after everything else did (the
+    // boot sync and the pull both failed) can still let the one reconcile
+    // run. Never settles a return by itself: only events do (AT8).
+    tryReconcile();
   };
 
   // Every command that changes Hourglass in the backend goes through this
@@ -2320,23 +2374,40 @@ export function createAppState(): AppState {
   // and an event reaches only a listener already registered, so a change
   // made before it was (a restored countdown running out) would reach
   // nobody, and a paused or done timer sends nothing more: once listening,
-  // one `timer_status` closes that gap. Once per page.
+  // one `timer_status` closes that gap. Once per page. v1.60.0: with
+  // `timer-actions` (a countdown's start or end, with the page's half of
+  // its actions) and `soundboard-stopped` (a timer's Stop all clips and
+  // lines), all three registered before the pull. No pull brings back a
+  // `timer-actions` the page missed: a preset return is caught up by the
+  // one reconcile below (§7.6), and a missed clip is lost (D16).
   let timersSubscribed = false;
+  let timersListening = false;
+  const listenFor = async (what: string, listen: () => Promise<() => void>): Promise<void> => {
+    try {
+      const un = await listen();
+      if (timersDisposed) un();
+      else timerUnlistens.push(un);
+    } catch (e) {
+      console.warn(`[hourglass] listening to ${what} failed:`, e);
+    }
+  };
   const subscribeTimers = async (): Promise<void> => {
     if (timersSubscribed) return;
     timersSubscribed = true;
-    try {
-      const un = await subscribeTimerState(adoptTimerSnapshot);
-      if (timersDisposed) un();
-      else timerUnlisten = un;
-    } catch (e) {
-      console.warn("[hourglass] listening to timer-state failed:", e);
-    }
+    // Wrapped: the handlers are defined further down, and run only on an
+    // event, once this store is built.
+    await Promise.all([
+      listenFor("timer-state", () => subscribeTimerState(adoptTimerSnapshot)),
+      listenFor("timer-actions", () => subscribeTimerActions((raw) => runTimerActions(raw))),
+      listenFor("soundboard-stopped", () => subscribeSoundboardStopped(() => clearPlayingClips())),
+    ]);
+    timersListening = true;
     try {
       adoptTimerSnapshot(await timerStatusCmd());
     } catch (e) {
       console.warn("[hourglass] timer_status failed:", e);
     }
+    tryReconcile();
   };
 
   // The boot sync. Sent here, at creation, beside the mute's read and the
@@ -2344,28 +2415,46 @@ export function createAppState(): AppState {
   // before App's onMount enumerates devices (sync commands that hold the
   // main thread). It is the queue's first, and the timers' keys App
   // registers go through the queue after it: the backend knows every timer
-  // before any of their keys works.
+  // before any of their keys works. v1.60.0: once it has answered (or
+  // failed), the stored preset returns may be reconciled: a `timer_status`
+  // answer that landed before it may not hold the stored timers yet.
+  let bootSynced = false;
   if (hourglassUsed) {
-    void sendTimerSync();
+    void sendTimerSync().then(() => {
+      bootSynced = true;
+      tryReconcile();
+    });
     void subscribeTimers();
   }
 
   const addTimer: AppState["addTimer"] = async (kind, template) => {
-    // S1 stub: the Break template (D26) is track C's; until then a template
-    // adds nothing.
-    if (template !== undefined) return null;
+    // v1.60.0: Add break (BRB) is a countdown (D26); count-ups have no
+    // lists (D32).
+    if (template !== undefined && (template !== "break" || kind !== "countdown")) return null;
     const s = timerStore();
     // Every stored timer counts, a newer kind's too, so each one counted has
     // a card with Delete.
     if (s.timers.length >= MAX_TIMERS) return null;
     const id = nextTimerId(s);
-    const timer: StoredTimer = {
+    let timer: StoredTimer = {
       id,
       name: defaultName(s, kind),
       kind,
       durationMs: DEFAULT_LENGTH_MS,
       hotkeys: {},
     };
+    // The template's name, length and lists go in this one save, so one
+    // sync carries them all (not an add, a rename and an edit).
+    if (template === "break") {
+      const b = breakTemplate();
+      timer = {
+        ...timer,
+        name: freshNameFrom(s, b.name),
+        durationMs: b.durationMs,
+        onStart: b.onStart,
+        onFire: b.onFire,
+      };
+    }
     saveTimers({ ...s, timers: [...s.timers, timer] });
     const synced = sendTimerSync();
     void subscribeTimers();
@@ -2391,8 +2480,31 @@ export function createAppState(): AppState {
 
   const deleteTimer: AppState["deleteTimer"] = async (id) => {
     const s = timerStore();
-    if (!s.timers.some((t) => t.id === id)) return;
-    const after: StoredTimers = { ...s, timers: s.timers.filter((t) => t.id !== id) };
+    const doomed = s.timers.find((t) => t.id === id);
+    if (!doomed) return;
+    let after: StoredTimers = { ...s, timers: s.timers.filter((t) => t.id !== id) };
+    // v1.60.0: its preset return (D17), decided before the one save. A
+    // countdown running or paused gets a cancel from the backend, whose
+    // event switches back when its At zero has Back to the preset before:
+    // the return is kept for it. Without one, the cancel would only drop
+    // it (R2), so it goes now. One that isn't running is settled now (R2 or
+    // §7.3), its switch once the preset list has loaded. So a return left
+    // for a timer no longer stored always means "switch back", which is
+    // what reconcile does with one (§7.6).
+    const returns = readReturns(s.presetReturns);
+    const ret = returns.find((r) => r.timer === id);
+    let switchTo: string | null = null;
+    let settleLater = false;
+    if (ret) {
+      const phase = timerSnapshot()?.timers.find((t) => t.id === id)?.phase;
+      const active = phase === "running" || phase === "paused";
+      if (!revertsAtZero(doomed)) after = withReturns(after, returns.filter((r) => r !== ret));
+      else if (!active && presetsLoaded()) {
+        const plan = revertPlan(returns, id, presetId(), presetExists, true);
+        after = withReturns(after, plan.returns);
+        switchTo = plan.switchTo;
+      } else if (!active) settleLater = true;
+    }
     // A delete can move a timer that was over the limit up to "run" (D36):
     // the backend runs it from this sync on, so its stored keys go out too.
     const before = rolesOf(s);
@@ -2409,6 +2521,8 @@ export function createAppState(): AppState {
     // one's run; a key bound for the new timer is registered after these
     // unregisters.
     saveTimers(after);
+    if (switchTo !== null) switchForReturn(switchTo);
+    if (settleLater) whenPresetsLoaded(() => settleReturn(id, true));
     const keys = TIMER_VERBS.map((verb) =>
       timerQueue(() => unregisterGlobalShortcutCmd(timerHotkeyId(id, verb))).catch((err: unknown) => {
         console.warn("[hourglass] unregister hotkey failed", err);
@@ -2463,14 +2577,218 @@ export function createAppState(): AppState {
   const finishTimer: AppState["finishTimer"] = (id) =>
     sendTimerOp("finish_timer", () => finishTimerCmd(id));
 
-  // v1.60.0: a countdown's two lists. S1 stubs: track C saves and syncs
-  // them (data/timerActions.ts `withAdded`, `withReplaced`, `withRemoved`);
-  // until then they change nothing.
-  const addTimerAction: AppState["addTimerAction"] = async () => {};
-  const setTimerAction: AppState["setTimerAction"] = async () => {};
-  const removeTimerAction: AppState["removeTimerAction"] = async () => {};
+  // v1.60.0: a countdown's two lists, edited by index into the stored array
+  // (D27): an entry this build can't read (a newer Divora's, a hand edit)
+  // stays where it is through every edit, and counts toward the 8. Each
+  // change is saved, then synced: the sync carries the actions Rust will
+  // read (`defsForSync`), and an At zero edit counts for a run that is
+  // going on (Q12).
+  const runCountdown = (id: string): StoredTimer | undefined => {
+    const t = runTimer(id);
+    return t?.kind === "countdown" ? t : undefined;
+  };
+  const saveList = async (t: StoredTimer, hook: TimerHook, list: unknown[]): Promise<void> => {
+    saveTimers(withTimer(timerStore(), t.id, { ...t, [hook]: list }));
+    await sendTimerSync();
+  };
+  const addTimerAction: AppState["addTimerAction"] = async (id, hook, action) => {
+    const t = runCountdown(id);
+    const a = readAction(action);
+    if (!t || a === null) return;
+    if (!ACTION_KINDS[a.kind].at.includes(hook === "onStart" ? "start" : "zero")) return;
+    if (canAddAction(t[hook], a.kind) !== "ok") return;
+    await saveList(t, hook, withAdded(t[hook], a));
+  };
+  const setTimerAction: AppState["setTimerAction"] = async (id, hook, index, action) => {
+    const t = runCountdown(id);
+    const a = readAction(action);
+    if (!t || a === null) return;
+    const row = readStoredActions(t[hook])[index];
+    // A row that runs, to an action of its kind: the card changes a target
+    // or a line, never a kind, so this can't make a second line.
+    if (!row?.runs || row.action.kind !== a.kind) return;
+    if (JSON.stringify(row.action) === JSON.stringify(a)) return;
+    const entry = (t[hook] as unknown[])[index];
+    // The entry's other keys (a later build's) are kept; its own fields are
+    // the new ones.
+    const next = typeof entry === "object" && entry !== null ? { ...(entry as Record<string, unknown>), ...a } : a;
+    await saveList(t, hook, withReplaced(t[hook], index, next as TimerAction));
+  };
+  const removeTimerAction: AppState["removeTimerAction"] = async (id, hook, index) => {
+    const t = runCountdown(id);
+    if (!t || !Array.isArray(t[hook]) || !Number.isInteger(index) || index < 0) return;
+    if (index >= (t[hook] as unknown[]).length) return;
+    await saveList(t, hook, withRemoved(t[hook], index));
+  };
   const timerReturn: AppState["timerReturn"] = (id) =>
     readReturns(timerStore().presetReturns).find((r) => r.timer === id) ?? null;
+
+  // ---- v1.60.0: what a countdown's start and end do on the page ----
+  // Rust decides what runs (timer_actions.rs `plan`) and runs the backend's
+  // half itself: the mute, Stop all clips and lines, a replay, a line. The
+  // page hears `timer-actions` for its half (D16): clips, which play at
+  // once, and preset work (a switch, a random switch, Back to the preset
+  // before), which waits until the real preset list has loaded: until then
+  // `presets()` is the bundled list, a user preset would read as gone, and
+  // `usePreset` would ignore it. Waiting work runs in the order it came,
+  // the first time the list loads. The page never sends a command for a
+  // backend kind.
+
+  /** `presetReturns` as `returns`; the key goes when none is left. */
+  const withReturns = (s: StoredTimers, returns: PresetReturn[]): StoredTimers => {
+    const next: StoredTimers = { ...s };
+    if (returns.length > 0) next.presetReturns = returns;
+    else delete next.presetReturns;
+    return next;
+  };
+  const saveReturns = (returns: PresetReturn[]): void => {
+    if (timersDisposed) return;
+    saveTimers(withReturns(timerStore(), returns));
+  };
+  /** A preset in the loaded list. */
+  const presetExists = (id: string): boolean => presets().some((p) => p.id === id);
+  /** A switch back. Nothing when it is the live preset already (a timer
+   *  that "switched" to the preset you were on): a switch would only put
+   *  Compare back on A. */
+  const switchForReturn = (id: string): void => {
+    if (id !== presetId()) usePreset(id, { fromTimer: true });
+  };
+
+  const presetWork: Array<() => void> = [];
+  const whenPresetsLoaded = (work: () => void): void => {
+    if (presetsLoaded() && presetWork.length === 0) work();
+    else presetWork.push(work);
+  };
+  /** Runs the preset work that waited for the list, in arrival order. */
+  const drainPresetWork = (): void => {
+    while (presetsLoaded() && presetWork.length > 0 && !timersDisposed) presetWork.shift()!();
+  };
+
+  /** A timer's switch (§7.5). At a start it notes where the switch came
+   *  from first (D17): a timer that already has a return keeps its `from`
+   *  and takes the new `to`. An end's switch notes nothing. A preset not in
+   *  the loaded list switches nothing. */
+  const switchForTimer = (id: string, hook: "start" | "end", to: string): void => {
+    if (timersDisposed || !presetExists(to)) return;
+    if (hook === "start") saveReturns(returnsAfterStart(readReturns(timerStore().presetReturns), id, presetId(), to));
+    usePreset(to, { fromTimer: true });
+  };
+  /** Settles `id`'s return (§7.3): with `revert`, back to where its start
+   *  switched from while the live preset is still the timer's, or hands
+   *  that to a return stacked on top of it; then the return goes. */
+  const settleReturn = (id: string, revert: boolean): void => {
+    if (timersDisposed) return;
+    const returns = readReturns(timerStore().presetReturns);
+    const plan = revertPlan(returns, id, presetId(), presetExists, revert);
+    if (plan.returns !== returns) saveReturns(plan.returns);
+    if (plan.switchTo !== null) switchForReturn(plan.switchTo);
+  };
+
+  /** One action of a timer's page half (`dispatchAction` from a timer). */
+  const runTimerAction = (action: GlyphAction | TimerAction, id: string, hook: "start" | "end"): void => {
+    switch (action.kind) {
+      case "preset": {
+        const to = action.presetId;
+        whenPresetsLoaded(() => switchForTimer(id, hook, to));
+        break;
+      }
+      case "randomPreset":
+        // Any preset that changes the voice but the live one (§7.4, Q11).
+        whenPresetsLoaded(() => {
+          const to = pickRandomPreset(
+            presets().map((p) => p.id),
+            (pid) => transforms(chains[pid] ?? []),
+            presetId(),
+            Math.random,
+          );
+          if (to !== null) switchForTimer(id, hook, to);
+        });
+        break;
+      case "revertPreset":
+        // Never at a start (Rust never sends one there).
+        if (hook === "end") whenPresetsLoaded(() => settleReturn(id, true));
+        break;
+      case "tile":
+        void playTileById(action.tileId);
+        break;
+      default:
+        // The backend's kinds (setMuted, speak, saveReplay, panic) and the
+        // glyph's toggles: nothing on the page.
+        break;
+    }
+  };
+
+  // Events are adopted by `seq`: the backend numbers them in the order its
+  // timer thread planned them, so one at or below the last seen is old.
+  let lastActionsSeq = -1;
+  // Timers this page has heard an event for: their events settle their
+  // returns, so reconcile leaves them be. The mirror can lag an event (the
+  // thread's `timer-state` follows its `timer-actions`), and a start just
+  // heard would otherwise read as idle and be undone.
+  const timersHeard = new Set<string>();
+  /** The `timer-actions` listener (§7.5). An end's own list runs first;
+   *  then any return still left for the timer is dropped (R2): a start's
+   *  switch that At zero doesn't switch back from stays, and its record
+   *  goes. */
+  const runTimerActions = (raw: unknown): void => {
+    if (timersDisposed) return;
+    const ev = readTimerActionsEvent(raw);
+    if (ev === null || ev.seq <= lastActionsSeq) return;
+    lastActionsSeq = ev.seq;
+    timersHeard.add(ev.id);
+    for (const a of ev.actions) dispatchAction(a, { kind: "timer", id: ev.id, hook: ev.hook });
+    if (ev.hook === "end") whenPresetsLoaded(() => settleReturn(ev.id, false));
+  };
+
+  // Once per page (§7.6): after the boot sync has answered, the listeners
+  // are up, the mirror holds a snapshot and the real preset list has
+  // loaded, the stored returns whose end no page heard are settled: a
+  // revert whose event fell inside a reload, or a countdown that ran out
+  // while Divora was closed. Then the restart notice is armed (D36).
+  let reconciled = false;
+  const tryReconcile = (): void => {
+    if (reconciled || timersDisposed || !bootSynced || !timersListening) return;
+    const snap = timerSnapshot();
+    if (snap === null || !presetsLoaded()) return;
+    reconciled = true;
+    const returns = readReturns(timerStore().presetReturns);
+    if (returns.length > 0) {
+      // A timer heard since the page loaded is kept, as a running one is.
+      const phaseOf = (id: string): TimerPhase | null =>
+        timersHeard.has(id) ? "running" : (snap.timers.find((t) => t.id === id)?.phase ?? null);
+      const plan = reconcileReturns(returns, timerStore(), phaseOf, presetId(), presetExists);
+      // Kept, every one: nothing to write.
+      if (plan.returns !== returns) saveReturns(plan.returns);
+      if (plan.switchTo !== null) switchForReturn(plan.switchTo);
+    }
+    armRestartNotice();
+  };
+
+  // D36: a restart mid-break mutes you again in the backend (P7), which
+  // tells nobody why. For 3 s after the reconcile pass, the first time the
+  // mute mirror reads muted while a stored countdown that mutes at its
+  // start is running or paused, a toast names it. The window covers a boot
+  // read that lands before the re-mute (the mirror adopts by `seq`). Once
+  // per page; a reload says it again.
+  const [restartNoticeArmed, setRestartNoticeArmed] = createSignal(false);
+  let restartNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(restartNoticeTimer));
+  const armRestartNotice = (): void => {
+    setRestartNoticeArmed(true);
+    restartNoticeTimer = setTimeout(() => setRestartNoticeArmed(false), RESTART_NOTICE_MS);
+  };
+  createEffect(() => {
+    if (!restartNoticeArmed()) return;
+    const snap = timerSnapshot();
+    const phaseOf = (id: string): TimerPhase | null => snap?.timers.find((t) => t.id === id)?.phase ?? null;
+    const text = restartNotice(timerStore(), phaseOf, muted());
+    if (text === null) return;
+    setRestartNoticeArmed(false);
+    clearTimeout(restartNoticeTimer);
+    // An error's tone: it says why you can't be heard, and it stays long
+    // enough to read.
+    showToast(text, "error");
+  });
 
   // Each timer's keys live in its own entry, by verb. This build registers
   // `toggle`, `reset` and (v1.60.0) `finish`; any other verb (a later
@@ -2585,6 +2903,10 @@ export function createAppState(): AppState {
             setViewedId(fallback.id);
           }
         }
+        // v1.60.0: timers' preset work that waited for the real list runs
+        // now, in the order it came, then the one reconcile (D16, §7.6).
+        drainPresetWork();
+        tryReconcile();
       }
     } catch (err) {
       // Browser preview / Tauri unreachable — keep the fallback bundled
@@ -2771,11 +3093,20 @@ export function createAppState(): AppState {
   );
 
   // v1.60.0: the effect chain's commands, one at a time (D19), as the
-  // mute's and the timers' are: a timer's preset switch and a click on the
-  // same control could otherwise land reversed. S1 declares the queue;
-  // track C sends `set_effect_chain`, `set_effect_param`,
-  // `set_effect_enabled` and `set_voice_model` through it.
+  // mute's and the timers' are: invokes in flight together can reach Rust
+  // out of send order (measured in the real app with 40 sent at once), so
+  // a timer's preset switch and a slider moved at the same time could
+  // otherwise land reversed, and a param sent before a switch would edit
+  // the new chain's effect at that index. Every `set_effect_chain`,
+  // `set_effect_param`, `set_effect_enabled` and `set_voice_model` the
+  // store sends goes through it; a voice model sent after a chain lands
+  // after it. A failure is logged and holds nothing back.
   const chainQueue = inOrder();
+  const sendChainCmd = (what: string, send: () => Promise<unknown>): void => {
+    chainQueue(send).catch((e: unknown) => {
+      console.warn(`[chain] ${what} failed:`, e);
+    });
+  };
 
   const chainToSpecs = (entries: ChainEntry[]): EffectSpec[] =>
     entries.map((e) => ({
@@ -2786,7 +3117,8 @@ export function createAppState(): AppState {
 
   const syncChain = (): void => {
     if (!engineRunning()) return;
-    void setEffectChainCmd(chainToSpecs(chain()));
+    const specs = chainToSpecs(chain());
+    sendChainCmd("set_effect_chain", () => setEffectChainCmd(specs));
     applyActiveVoice();
   };
 
@@ -2813,11 +3145,14 @@ export function createAppState(): AppState {
   });
 
   // Send a full SetChain when either the active preset changes or the
-  // engine starts up.
+  // engine starts up. v1.60.0: the one chain a preset switch sends
+  // (`usePreset` sent a second, which, landing after the voice model,
+  // cleared it, D19).
   createEffect(
     on([presetId, engineRunning], ([, running]) => {
       if (running) {
-        void setEffectChainCmd(chainToSpecs(chain()));
+        const specs = chainToSpecs(chain());
+        sendChainCmd("set_effect_chain", () => setEffectChainCmd(specs));
         // A SetChain rebuilds every effect from scratch — including the
         // VoiceConvert, which comes back with no model. Re-point it at
         // the active voice so the selection survives preset switches.
@@ -2863,7 +3198,8 @@ export function createAppState(): AppState {
     if (!engineRunning()) return;
     const idx = voiceConvertIndex();
     if (idx < 0) return;
-    void setVoiceModelCmd(idx, activeVoicePath());
+    const path = activeVoicePath();
+    sendChainCmd("set_voice_model", () => setVoiceModelCmd(idx, path));
   };
 
   const refreshVoiceLibrary = async (): Promise<void> => {
@@ -2904,14 +3240,14 @@ export function createAppState(): AppState {
   const setChainParam = (effectIndex: number, key: string, value: number): void => {
     setChains(viewedId(), effectIndex, "vals", key, value);
     if (editIsLive()) {
-      void setEffectParamCmd(effectIndex, key, value);
+      sendChainCmd("set_effect_param", () => setEffectParamCmd(effectIndex, key, value));
     }
   };
 
   const setChainEnabled = (effectIndex: number, enabled: boolean): void => {
     setChains(viewedId(), effectIndex, "enabled", enabled);
     if (editIsLive()) {
-      void setEffectEnabledCmd(effectIndex, enabled);
+      sendChainCmd("set_effect_enabled", () => setEffectEnabledCmd(effectIndex, enabled));
     }
   };
 
@@ -2939,7 +3275,8 @@ export function createAppState(): AppState {
     if (moved !== undefined) next.splice(to, 0, moved);
     setChains(viewedId(), next);
     if (editIsLive()) {
-      void setEffectChainCmd(chainToSpecs(next));
+      const specs = chainToSpecs(next);
+      sendChainCmd("set_effect_chain", () => setEffectChainCmd(specs));
     }
   };
 
@@ -2956,7 +3293,8 @@ export function createAppState(): AppState {
     setChains(id, cloneChain(next));
     setUi("ab", slot);
     if (engineRunning()) {
-      void setEffectChainCmd(chainToSpecs(next));
+      const specs = chainToSpecs(next);
+      sendChainCmd("set_effect_chain", () => setEffectChainCmd(specs));
     }
   };
 
@@ -2984,18 +3322,22 @@ export function createAppState(): AppState {
     setViewedId(id);
   };
 
-  const usePreset = (id: string): void => {
+  const usePreset: AppState["usePreset"] = (id, opts) => {
     if (!presets().some((p) => p.id === id)) return;
     setPresetId(id);
-    setViewedId(id); // applying makes the viewed preset the active one
+    // Applying makes the viewed preset the active one. v1.60.0: except a
+    // timer's switch while you are on the Presets screen, which leaves the
+    // preset you are editing there in front of you (D18); leaving the
+    // screen brings the view to the live preset, as always.
+    if (!(opts?.fromTimer && nav() === "presets")) setViewedId(id);
 
     // Reset A/B for the new preset (both slots = current chain).
     const c = chains[id] ?? [];
     setAbSlots(id, { A: cloneChain(c), B: cloneChain(c) });
     setUi("ab", "A");
-    if (engineRunning()) {
-      void setEffectChainCmd(chainToSpecs(c));
-    }
+    // v1.60.0: no chain sent here. The effect on the active preset sends
+    // the one chain, then the voice model; a second one queued after the
+    // model would clear it (D19). A Use of the live preset changes no chain.
   };
 
   // The Coven (v1.1.0): summon a cast member — apply its preset chain and
@@ -3141,10 +3483,13 @@ export function createAppState(): AppState {
   const [soundboardLoading, setSoundboardLoading] = createSignal(false);
   const [soundboardError, setSoundboardError] = createSignal<string | null>(null);
   const [playingClips, setPlayingClips] = createStore<Record<string, PlayingClip>>({});
-  // v1.60.0: the soundboard's commands, one at a time (D19), so a timer's
-  // clip and a Panic land in the order they were sent. S1 declares the
-  // queue; track C sends `play_soundboard_clip`, `stop_soundboard_clip`,
-  // `stop_all_soundboard_clips` and Speak's play through it.
+  // v1.60.0: the soundboard's commands, one at a time (D19): invokes in
+  // flight together can reach Rust out of send order, so a Panic pressed
+  // right after a clip (a timer's or a click's) could land first and leave
+  // the clip playing. Every `play_soundboard_clip`, `stop_soundboard_clip`
+  // and `stop_all_soundboard_clips` the store sends goes through it, Speak's
+  // saved-clip play included. A timer's own Stop all clips and lines runs in
+  // the backend and meets this queue only at the engine (K2).
   const soundboardQueue = inOrder();
   const [tileHotkeys, setTileHotkeys] = createStore<Record<string, string[]>>(
     loadJson<Record<string, string[]>>(STORAGE_KEYS.tileHotkeys, {}),
@@ -3321,12 +3666,9 @@ export function createAppState(): AppState {
   };
 
   const playClip = async (tile: SoundboardTile): Promise<void> => {
+    const gain = tileGain(tile.id);
     try {
-      const durationSecs = await playSoundboardClipCmd(
-        tile.id,
-        tile.path,
-        tileGain(tile.id),
-      );
+      const durationSecs = await soundboardQueue(() => playSoundboardClipCmd(tile.id, tile.path, gain));
       setPlayingClips(tile.id, {
         clipId: tile.id,
         startedAt: typeof performance !== "undefined" ? performance.now() : Date.now(),
@@ -3339,7 +3681,7 @@ export function createAppState(): AppState {
 
   const stopClip = async (clipId: string): Promise<void> => {
     try {
-      await stopSoundboardClipCmd(clipId);
+      await soundboardQueue(() => stopSoundboardClipCmd(clipId));
     } catch (err) {
       // The local "not playing" state is what users see; record the
       // backend failure but don't re-throw — stop should always succeed
@@ -3349,15 +3691,18 @@ export function createAppState(): AppState {
     setPlayingClips(clipId, undefined as unknown as PlayingClip);
   };
 
+  /** Nothing shows as playing: the whole playing-clips store emptied. */
+  const clearPlayingClips = (): void => {
+    for (const id of Object.keys(playingClips)) {
+      setPlayingClips(id, undefined as unknown as PlayingClip);
+    }
+  };
+
   const panicSoundboard = async (): Promise<void> => {
     try {
-      await stopAllSoundboardClipsCmd();
+      await soundboardQueue(() => stopAllSoundboardClipsCmd());
     } finally {
-      // Replace the whole playing-clips store with an empty record.
-      const ids = Object.keys(playingClips);
-      for (const id of ids) {
-        setPlayingClips(id, undefined as unknown as PlayingClip);
-      }
+      clearPlayingClips();
     }
   };
 
@@ -3938,11 +4283,17 @@ export function createAppState(): AppState {
     saveJson(STORAGE_KEYS.cloneGpu, on);
   };
 
+  // v1.60.0: whether a list of voices has answered (or failed), for a
+  // timer's line: "Loading voices…" until then, never "not available".
+  const [ttsVoicesLoaded, setTtsVoicesLoaded] = createSignal(false);
+  let ttsVoicesAsked: Promise<void> | null = null;
+
   const refreshTtsVoices = async (): Promise<void> => {
     try {
       const list = await listTtsVoicesCmd();
       const next = Array.isArray(list) ? list : [];
       setTtsVoices(next);
+      setTtsVoicesLoaded(true);
       // Default to the first listed voice (a Kokoro preset — the backend lists
       // those first) when none is chosen, or the persisted one exists as
       // neither a built-in nor a cloned voice.
@@ -3960,6 +4311,30 @@ export function createAppState(): AppState {
     }
   };
 
+  // v1.60.0: a timer's line needs the voices (Settings → Hourglass, which
+  // may be opened before Speak ever was). Asked once while the list is
+  // empty, and only the list is set: Speak's selection is Speak's own, and
+  // `refreshTtsVoices` would move it off a cloned voice it doesn't list.
+  // A failure lets the next call ask again.
+  const ensureTtsVoices = (): Promise<void> => {
+    if (ttsVoices().length > 0) {
+      setTtsVoicesLoaded(true);
+      return Promise.resolve();
+    }
+    ttsVoicesAsked ??= (async () => {
+      try {
+        const list = await listTtsVoicesCmd();
+        if (ttsVoices().length === 0 && Array.isArray(list)) setTtsVoices(list);
+      } catch (err) {
+        console.warn("[tts] voice list for a timer failed", err);
+        ttsVoicesAsked = null;
+      } finally {
+        setTtsVoicesLoaded(true);
+      }
+    })();
+    return ttsVoicesAsked;
+  };
+
   const refreshSpeakClips = async (): Promise<void> => {
     try {
       const clips = await listSpeakClipsCmd();
@@ -3970,8 +4345,9 @@ export function createAppState(): AppState {
   };
 
   const playSpeakClip = async (clip: SpeakClip): Promise<void> => {
+    const gain = ttsVolume();
     try {
-      await playSoundboardClipCmd(`speak-clip-${clip.id}`, clip.path, ttsVolume());
+      await soundboardQueue(() => playSoundboardClipCmd(`speak-clip-${clip.id}`, clip.path, gain));
     } catch (err) {
       console.warn("[speak] play clip failed", err);
     }
@@ -4550,6 +4926,8 @@ export function createAppState(): AppState {
 
     ttsVoices,
     selectedTtsVoice,
+    ensureTtsVoices,
+    ttsVoicesLoaded,
     setSelectedTtsVoice,
     ttsVolume,
     setTtsVolume,

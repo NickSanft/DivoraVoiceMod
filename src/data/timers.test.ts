@@ -4,6 +4,7 @@ import type { TimerPhase, TimerSnapshot, TimerState } from "../overlay/timerStat
 import {
   DEFAULT_LENGTH_MS,
   defaultName,
+  freshNameFrom,
   defsForSync,
   lengthText,
   MAX_LENGTH_MS,
@@ -385,6 +386,13 @@ describe("nextTimerId and defaultName", () => {
     const s = stored([cd("timer-1", { name: "Countdown" }), cd("timer-2", { name: "Countdown 3" })]);
     expect(defaultName(s, "countdown")).toBe("Countdown 2");
     expect(defaultName(s, "countup")).toBe("Count-up");
+  });
+
+  it("v1.60.0: numbers Add break (BRB)'s name as a default name is", () => {
+    expect(freshNameFrom(readTimers(null), "BRB")).toBe("BRB");
+    expect(freshNameFrom(stored([cd("timer-1", { name: "BRB" }), cd("timer-2", { name: "BRB 2" })]), "BRB")).toBe(
+      "BRB 3",
+    );
   });
 
   it("every id it picks passes the grammar, and the parser reads it back", () => {

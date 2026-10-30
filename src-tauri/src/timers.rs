@@ -787,20 +787,45 @@ impl Timer {
     /// its new length; one that runs, is paused or has ended keeps its run
     /// until it starts again — and a new kind makes it idle. v1.60.0: the
     /// lists are the definition's from now on, and a change to them keeps
-    /// the run too (D7).
-    fn redefine(&mut self, def: &TimerDef, now: Duration) {
+    /// the run too (D7). A new kind on an active countdown cancels it as a
+    /// Reset does, with the lists it had before (D6): the new def's are a
+    /// count-up's, which has none (D32).
+    fn redefine(&mut self, def: &TimerDef, now: Duration) -> Option<Transition> {
         self.name.clone_from(&def.name);
         self.length_ms = def.duration_ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS);
+        let mut cancelled = None;
         if def.kind != self.kind || self.phase == TimerPhase::Idle {
+            if def.kind != self.kind && self.active() {
+                cancelled = Some(self.cancel(CancelWhy::Reset));
+            }
             self.kind = def.kind;
             self.reset(now);
         }
         self.hooks = Arc::clone(&def.hooks);
+        cancelled
+    }
+
+    /// v1.60.0: a countdown that has started and not ended — running or
+    /// paused — whose end has an undo to run (D10).
+    fn active(&self) -> bool {
+        self.kind == TimerKind::Countdown
+            && matches!(self.phase, TimerPhase::Running | TimerPhase::Paused)
+    }
+
+    /// v1.60.0: what stopping it without a fire records, with its lists as
+    /// they are.
+    fn cancel(&self, why: CancelWhy) -> Transition {
+        Transition::Cancelled {
+            id: self.id.clone(),
+            why,
+            hooks: Arc::clone(&self.hooks),
+        }
     }
 
     /// D6 (§7.1): `op` at `now`, after the tick. Labelled ops do only what
     /// they name; Toggle decides from the phase. Whether anything changed.
-    /// Never given `Finish`: the core fires it (D25).
+    /// Never given `Finish`: the core fires it (D25). What a start or a
+    /// cancel records is the core's too (§7.8).
     fn apply(&mut self, op: TimerOp, now: Duration, wall_ms: i64) -> bool {
         use TimerPhase::{Done, Expired, Idle, Paused, Running};
         let op = match (op, self.phase) {
@@ -1181,6 +1206,12 @@ impl TimerCore {
     /// if the core has never accepted that id in this process — from its
     /// `resume` (§7.8, [`Transition::Seeded`]). Marks dirty and synced.
     /// Returns the ids that left, in their old order.
+    ///
+    /// v1.60.0: every definition's lists replace the ones its timer had,
+    /// and a change to them records nothing (D7). An active countdown that
+    /// stops running — its kind changed, or its id gone (deleted, or no
+    /// longer among the first [`MAX_TIMERS`]) — records a
+    /// [`Transition::Cancelled`] with the lists it had (D6, D10).
     pub fn sync(
         &mut self,
         entries: Vec<WireEntry>,
@@ -1214,12 +1245,17 @@ impl TimerCore {
             let timer = match before.iter().position(|t| t.id == def.id) {
                 Some(i) => {
                     let mut timer = before.remove(i);
-                    timer.redefine(&def, now);
+                    if let Some(cancelled) = timer.redefine(&def, now) {
+                        push_transition(&mut self.transitions, cancelled);
+                    }
                     timer
                 }
                 None => self.accept(&def, now, wall_ms),
             };
             self.timers.push(timer);
+        }
+        for t in before.iter().filter(|t| t.active()) {
+            push_transition(&mut self.transitions, t.cancel(CancelWhy::Removed));
         }
         self.dirty = true;
         self.synced = true;
@@ -1262,6 +1298,14 @@ impl TimerCore {
     /// first, so a Finish on one already past a deadline no reader saw
     /// finds that fire taken — a plain `Fired` with its real lateness — and
     /// adds nothing.
+    ///
+    /// v1.60.0 (D6, §7.8): a countdown armed from idle, done or ran out —
+    /// Start, Start again, a Toggle that arms — records
+    /// [`Transition::Started`]; a Resume doesn't, since it isn't a start. A
+    /// Reset of a running or paused countdown records
+    /// [`Transition::Cancelled`]; of an ended one, nothing (it already
+    /// ended). A Toggle that finds its countdown due records the tick's
+    /// `Fired`, then `Started`. A count-up records neither (D32).
     pub fn apply(
         &mut self,
         id: &str,
@@ -1270,16 +1314,35 @@ impl TimerCore {
         wall_ms: i64,
         slept_from: Option<Duration>,
     ) -> Result<(), NoTimer> {
+        use TimerPhase::{Done, Expired, Idle, Paused, Running};
         self.tick(now, wall_ms, slept_from);
         let timer = self.timers.iter_mut().find(|t| t.id == id).ok_or(NoTimer)?;
         if op == TimerOp::Finish {
-            let active = matches!(timer.phase, TimerPhase::Running | TimerPhase::Paused);
-            if timer.kind == TimerKind::Countdown && active {
+            if timer.active() {
                 push_transition(&mut self.transitions, timer.fire(now, true));
                 self.dirty = true;
             }
-        } else if timer.apply(op, now, wall_ms) {
-            self.dirty = true;
+            return Ok(());
+        }
+        let before = timer.phase;
+        if !timer.apply(op, now, wall_ms) {
+            return Ok(());
+        }
+        self.dirty = true;
+        if timer.kind != TimerKind::Countdown {
+            return Ok(());
+        }
+        let recorded = match (before, timer.phase) {
+            (Idle | Done | Expired, Running) => Some(Transition::Started {
+                id: timer.id.clone(),
+                fires: timer.fires,
+                hooks: Arc::clone(&timer.hooks),
+            }),
+            (Running | Paused, Idle) => Some(timer.cancel(CancelWhy::Reset)),
+            _ => None,
+        };
+        if let Some(t) = recorded {
+            push_transition(&mut self.transitions, t);
         }
         Ok(())
     }
@@ -1378,18 +1441,19 @@ mod tests {
     use super::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use super::{
         adjust_delta, entry_from_wire, hotkey_timer_request, is_timer_id, run_from_wire,
-        timer_text, NoTimer, Note, TextUpdate, TimerCore, TimerDef, TimerKind, TimerOp, TimerPhase,
-        TimerRun, TimerSnapshot, TimerState, Transition, WireEntry, DEFAULT_LENGTH_MS,
+        timer_text, CancelWhy, NoTimer, Note, TextUpdate, TimerCore, TimerDef, TimerKind, TimerOp,
+        TimerPhase, TimerRun, TimerSnapshot, TimerState, Transition, WireEntry, DEFAULT_LENGTH_MS,
         MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_NOTES, MAX_SEED_ELAPSED_MS,
-        MAX_SYNC_ENTRIES, MAX_TIMERS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
+        MAX_SYNC_ENTRIES, MAX_TIMERS, MAX_TRANSITIONS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
     };
     use crate::timer_actions::{
-        Action, Hook, Hooks, TimerActionsEvent, Why, LATE_ONE_SHOTS_MS, MAX_ACTIONS,
-        MAX_LINE_CHARS, MAX_TARGET_CHARS, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT,
+        hooks_from_wire, plan, replay_at, Action, Hook, Hooks, TimerActionsEvent, Why,
+        LATE_ONE_SHOTS_MS, MAX_ACTIONS, MAX_LINE_CHARS, MAX_TARGET_CHARS, SOUNDBOARD_STOPPED_EVENT,
+        TIMER_ACTIONS_EVENT,
     };
     use serde_json::{json, Value};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../../src/overlay/timer.fixture.json")).unwrap()
@@ -1725,6 +1789,8 @@ mod tests {
 
     /// §7.14 again: a bad length or a bad `resume` falls back without failing
     /// its definition, and fields a later release adds are ignored (D33).
+    /// v1.60.0: an action of a kind this build doesn't know is skipped, and
+    /// a count-up's lists are dropped (D32), so both defs have none.
     #[test]
     fn entry_from_wire_falls_back_field_by_field() {
         let countdown = TimerKind::Countdown;
@@ -1762,7 +1828,11 @@ mod tests {
                 def("BRB", countdown, 600_000),
             ),
             (
-                json!({"id": "timer-1", "kind": "countup", "obsText": "x", "followObs": true}),
+                json!({
+                    "id": "timer-1", "kind": "countup", "obsText": "x", "followObs": true,
+                    "onStart": [{"kind": "setMuted", "muted": true}],
+                    "onFire": [{"kind": "setMuted", "muted": false}],
+                }),
                 def("Count-up", TimerKind::Countup, DEFAULT_LENGTH_MS),
             ),
         ] {
@@ -2036,12 +2106,83 @@ mod tests {
         }
     }
 
+    const MUTE: Action = Action::SetMuted { muted: true };
+    const UNMUTE: Action = Action::SetMuted { muted: false };
+
+    /// A countdown's two lists.
+    fn lists(on_start: Vec<Action>, on_fire: Vec<Action>) -> Arc<Hooks> {
+        Arc::new(Hooks { on_start, on_fire })
+    }
+
+    /// Add break (BRB)'s lists: mute at the start, unmute at zero (D26).
+    fn brb() -> Arc<Hooks> {
+        lists(vec![MUTE], vec![UNMUTE])
+    }
+
+    /// `entry` with these lists.
+    fn with_hooks(entry: WireEntry, hooks: &Arc<Hooks>) -> WireEntry {
+        edit(entry, |d| d.hooks = hooks.clone())
+    }
+
+    /// A start, carrying `hooks`.
+    fn started_with(id: &str, fires: u32, hooks: &Arc<Hooks>) -> Transition {
+        Transition::Started {
+            id: id.into(),
+            fires,
+            hooks: hooks.clone(),
+        }
+    }
+
+    /// A start of a timer with no lists.
+    fn started(id: &str, fires: u32) -> Transition {
+        started_with(id, fires, &Arc::default())
+    }
+
+    /// A cancel, carrying `hooks`.
+    fn cancelled_with(id: &str, why: CancelWhy, hooks: &Arc<Hooks>) -> Transition {
+        Transition::Cancelled {
+            id: id.into(),
+            why,
+            hooks: hooks.clone(),
+        }
+    }
+
+    /// A fire, carrying `hooks`.
+    fn fired_with(
+        id: &str,
+        fires: u32,
+        late_ms: u64,
+        finished: bool,
+        hooks: &Arc<Hooks>,
+    ) -> Transition {
+        Transition::Fired {
+            id: id.into(),
+            fires,
+            late_ms,
+            finished,
+            hooks: hooks.clone(),
+        }
+    }
+
+    /// v1.60.0: Arm on `id` at `now`, which records its start — a
+    /// countdown's `Started`, a count-up's nothing (D32) — and nothing else.
+    /// Drained here, so what a test takes next is what it is about.
+    fn arm(core: &mut TimerCore, id: &str, now: Duration) {
+        op(core, id, TimerOp::Arm, now);
+        let t = core.timers.iter().find(|t| t.id == id).unwrap();
+        let want = match t.kind {
+            TimerKind::Countdown => vec![started(id, t.fires)],
+            TimerKind::Countup => vec![],
+        };
+        assert_eq!(core.take_transitions(), want, "{id} armed at {now:?}");
+    }
+
     /// D4: armed for 5 s and ticked every 10 ms to 20 s, a countdown fires
     /// once — done, `fires` 1, one `Fired` — and never again.
     #[test]
     fn fires_exactly_once() {
         let mut core = core_with(vec![countdown("timer-1", 5_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         let mut now = Duration::ZERO;
         while now < secs(20) {
             now += ms(10);
@@ -2060,7 +2201,7 @@ mod tests {
     #[test]
     fn never_fires_early() {
         let mut core = core_with(vec![countdown("timer-1", 5_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, secs(1));
+        arm(&mut core, "timer-1", secs(1));
         let almost = secs(6).saturating_sub(Duration::from_nanos(1));
         tick(&mut core, almost);
         assert_eq!(
@@ -2077,11 +2218,11 @@ mod tests {
     }
 
     /// D4: each Arm allows one fire; a countdown started again from `done`
-    /// fires again, once.
+    /// fires again, once. v1.60.0: each Arm is a start.
     #[test]
     fn a_rearmed_countdown_fires_again_once() {
         let mut core = core_with(vec![countdown("timer-1", 5_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(5));
         op(&mut core, "timer-1", TimerOp::Arm, secs(6));
         assert_eq!(
@@ -2095,7 +2236,11 @@ mod tests {
         assert_eq!((s.phase, s.fires), (Done, 2));
         assert_eq!(
             core.take_transitions(),
-            vec![fired("timer-1", 1, 0), fired("timer-1", 2, 0)]
+            vec![
+                fired("timer-1", 1, 0),
+                started("timer-1", 1),
+                fired("timer-1", 2, 0)
+            ]
         );
     }
 
@@ -2106,7 +2251,7 @@ mod tests {
     #[test]
     fn a_fire_taken_by_an_op_is_reported_once() {
         let mut core = core_with(vec![countdown("timer-1", 5_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         op(&mut core, "timer-1", TimerOp::Pause, ms(6_500));
         let s = state(&mut core, ms(6_500), "timer-1");
         assert_eq!(
@@ -2120,18 +2265,40 @@ mod tests {
     }
 
     /// D6: a Toggle that finds its countdown due fires it first, then starts
-    /// it again from its length: `fires` + 1, running, one `Fired`.
+    /// it again from its length: `fires` + 1, running. v1.60.0 (§7.1):
+    /// `[Fired, Started]` in that order — P2, then P1 — so a break started
+    /// again at its deadline unmutes, then mutes again.
     #[test]
-    fn a_toggle_at_the_deadline_fires_then_rearms() {
-        let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+    fn a_toggle_at_the_deadline_fires_then_starts() {
+        let brb = brb();
+        let mut core = core_with(vec![with_hooks(countdown("timer-1", 5_000), &brb)]);
         op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        assert_eq!(
+            core.take_transitions(),
+            vec![started_with("timer-1", 0, &brb)]
+        );
         op(&mut core, "timer-1", TimerOp::Toggle, ms(5_001));
         let s = state(&mut core, ms(5_001), "timer-1");
         assert_eq!(
             (s.phase, s.ms, s.text.as_str(), s.fires),
             (Running, 5_000, "00:05", 1)
         );
-        assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 1)]);
+        let recorded = core.take_transitions();
+        assert_eq!(
+            recorded,
+            vec![
+                fired_with("timer-1", 1, 1, false, &brb),
+                started_with("timer-1", 1, &brb)
+            ]
+        );
+        let planned: Vec<(Why, Vec<Action>)> = recorded
+            .iter()
+            .map(|t| plan(t).map(|p| (p.why, p.backend)).unwrap())
+            .collect();
+        assert_eq!(
+            planned,
+            [(Why::Zero, vec![UNMUTE]), (Why::Armed, vec![MUTE])]
+        );
     }
 
     /// End now's fire, of a timer with no lists.
@@ -2151,7 +2318,7 @@ mod tests {
     #[test]
     fn finish_fires_once() {
         let mut core = core_with(vec![countdown("timer-1", 5_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         op(&mut core, "timer-1", TimerOp::Finish, secs(2));
         assert!(core.take_dirty());
         let s = state(&mut core, secs(2), "timer-1");
@@ -2173,7 +2340,7 @@ mod tests {
     #[test]
     fn finish_a_paused_countdown_is_not_late() {
         let mut core = core_with(vec![countdown("timer-1", 300_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         op(&mut core, "timer-1", TimerOp::Pause, secs(100));
         op(&mut core, "timer-1", TimerOp::Finish, secs(500));
         let s = state(&mut core, secs(500), "timer-1");
@@ -2183,19 +2350,35 @@ mod tests {
 
     /// v1.60.0 (D25): End now on a countdown already past a deadline no
     /// reader saw finds the fire taken by its own tick — the deadline's,
-    /// with its real lateness, not `finished` — and adds nothing. (What a
-    /// hook run makes of each lateness is the plan's.)
+    /// with its real lateness, not `finished` — and adds nothing. So it
+    /// plans as that fire: 0.5 s late is P2 (`zero`, all of At zero); 40 s
+    /// late is P4 (`late`, its restoring actions only: the clip is skipped).
     #[test]
     fn finish_after_an_unticked_deadline_is_a_zero_fire() {
-        for (at, late_ms) in [(ms(5_500), 500), (secs(45), 40_000)] {
-            let mut core = core_with(vec![countdown("timer-1", 5_000)]);
+        let tile = Action::Tile {
+            tile_id: "9f2c4e1a7b3d5f60".into(),
+        };
+        let hooks = lists(vec![MUTE], vec![UNMUTE, tile.clone()]);
+        for (at, late_ms, why, page) in [
+            (ms(5_500), 500, Why::Zero, vec![tile]),
+            (secs(45), 40_000, Why::Late, vec![]),
+        ] {
+            let mut core = core_with(vec![with_hooks(countdown("timer-1", 5_000), &hooks)]);
             op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+            core.take_transitions();
             op(&mut core, "timer-1", TimerOp::Finish, at);
             let s = state(&mut core, at, "timer-1");
             assert_eq!((s.phase, s.fires), (Done, 1), "{at:?}");
+            let recorded = core.take_transitions();
             assert_eq!(
-                core.take_transitions(),
-                vec![fired("timer-1", 1, late_ms)],
+                recorded,
+                vec![fired_with("timer-1", 1, late_ms, false, &hooks)],
+                "{at:?}"
+            );
+            let p = plan(&recorded[0]).unwrap();
+            assert_eq!(
+                (p.why, p.late_ms, p.backend, p.page),
+                (why, late_ms, vec![UNMUTE], page),
                 "{at:?}"
             );
         }
@@ -2234,7 +2417,7 @@ mod tests {
     #[test]
     fn a_countdown_that_ran_out_asleep_expires_unfired() {
         let mut core = core_with(vec![countdown("timer-1", 60_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(30));
         // Down after the reading at 30 s; back ten minutes later.
         let back = secs(30 + 600);
@@ -2262,7 +2445,7 @@ mod tests {
     #[test]
     fn a_countdown_counts_the_sleep() {
         let mut core = core_with(vec![countdown("timer-1", 120_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(10));
         let back = ms(70_100);
         core.tick(back, wall(back), Some(secs(10)));
@@ -2278,7 +2461,7 @@ mod tests {
     #[test]
     fn a_countup_pauses_where_the_pc_slept() {
         let mut core = core_with(vec![countup("timer-2")]);
-        op(&mut core, "timer-2", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-2", Duration::ZERO);
         tick(&mut core, ms(10_250));
         let back = ms(10_250) + secs(3_600);
         core.tick(back, wall(back), Some(ms(10_250)));
@@ -2305,7 +2488,7 @@ mod tests {
     #[test]
     fn a_late_countdown_fires_late_when_awake() {
         let mut core = core_with(vec![countdown("timer-1", 5_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(10));
         let s = state(&mut core, secs(10), "timer-1");
         assert_eq!((s.phase, s.fires), (Done, 1));
@@ -2320,14 +2503,14 @@ mod tests {
     #[test]
     fn a_late_second_signal_changes_nothing() {
         let mut core = core_with(vec![countup("timer-1"), countdown("timer-2", 3_050)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(1));
         let back = secs(1 + 3_600);
         core.tick(back, wall(back), Some(secs(1)));
         assert_eq!(state(&mut core, back, "timer-1").phase, Paused);
         core.take_transitions();
         op(&mut core, "timer-1", TimerOp::Resume, back + secs(3));
-        op(&mut core, "timer-2", TimerOp::Arm, back + secs(3));
+        arm(&mut core, "timer-2", back + secs(3));
         let mut now = back + secs(3);
         while now < back + secs(6) {
             now += ms(100);
@@ -2352,7 +2535,7 @@ mod tests {
     #[test]
     fn a_late_second_signal_after_a_stall_changes_nothing() {
         let mut core = core_with(vec![countup("timer-1"), countdown("timer-2", 3_050)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(1));
         let back = secs(1 + 3_600);
         core.tick(back, wall(back), Some(secs(1)));
@@ -2368,7 +2551,7 @@ mod tests {
             }]
         );
         op(&mut core, "timer-1", TimerOp::Resume, back + secs(3));
-        op(&mut core, "timer-2", TimerOp::Arm, back + secs(3));
+        arm(&mut core, "timer-2", back + secs(3));
         let mut now = back + secs(3);
         while now < back + secs(6) {
             now += ms(100);
@@ -2425,6 +2608,26 @@ mod tests {
         assert_eq!(core.take_notes(), vec![]);
     }
 
+    /// K13: the thread drains the transitions; until it does — one that
+    /// never started — they stop at [`MAX_TRANSITIONS`], the oldest kept,
+    /// and the timers run on regardless. 300 starts and End nows offer 600.
+    #[test]
+    fn transitions_are_capped() {
+        assert_eq!(MAX_TRANSITIONS, 256);
+        let mut core = core_with(vec![countdown("timer-1", 60_000)]);
+        for k in 0..300 {
+            op(&mut core, "timer-1", TimerOp::Arm, secs(2 * k));
+            op(&mut core, "timer-1", TimerOp::Finish, secs(2 * k + 1));
+        }
+        assert_eq!(state(&mut core, secs(600), "timer-1").fires, 300);
+        let kept = core.take_transitions();
+        assert_eq!(kept.len(), MAX_TRANSITIONS);
+        assert_eq!(kept[..2], [started("timer-1", 0), finished("timer-1", 1)]);
+        assert_eq!(kept[MAX_TRANSITIONS - 1], finished("timer-1", 128));
+        // Drained, they are recorded again.
+        arm(&mut core, "timer-1", secs(600));
+    }
+
     /// D5 (b), K2: the clock stood still through a 10-minute sleep while the
     /// wall moved on, and the signal came three readings late with a 100 ms
     /// gap. Each running timer's wall anchor decides: the countdown due
@@ -2438,7 +2641,7 @@ mod tests {
             countup("timer-3"),
         ]);
         for id in ["timer-1", "timer-2", "timer-3"] {
-            op(&mut core, id, TimerOp::Arm, Duration::ZERO);
+            arm(&mut core, id, Duration::ZERO);
         }
         let mut now = Duration::ZERO;
         while now < secs(10) {
@@ -2500,7 +2703,7 @@ mod tests {
     #[test]
     fn instant_counted_the_sleep_is_left_to_a() {
         let mut core = core_with(vec![countdown("timer-1", 900_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         let mut now = Duration::ZERO;
         while now < secs(10) {
             now += ms(100);
@@ -2542,7 +2745,7 @@ mod tests {
             countdown("timer-3", 60_000),
         ]);
         for id in ["timer-1", "timer-2", "timer-3"] {
-            op(&mut core, id, TimerOp::Arm, Duration::ZERO);
+            arm(&mut core, id, Duration::ZERO);
         }
         let mut now = Duration::ZERO;
         while now < ms(4_950) {
@@ -2591,7 +2794,7 @@ mod tests {
     #[test]
     fn a_command_after_a_resume_sees_the_sleep() {
         let mut core = core_with(vec![countdown("timer-1", 60_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         tick(&mut core, secs(30));
         let back = secs(30 + 600);
         core.apply("timer-1", TimerOp::Pause, back, wall(back), Some(secs(30)))
@@ -2640,8 +2843,8 @@ mod tests {
             wall(added),
             None,
         );
-        op(&mut core, "timer-1", TimerOp::Arm, added);
-        op(&mut core, "timer-2", TimerOp::Arm, added);
+        arm(&mut core, "timer-1", added);
+        arm(&mut core, "timer-2", added);
         let resynced = |now: Duration| {
             if now >= back + secs(15) {
                 wall(now) + 3_000
@@ -2778,6 +2981,12 @@ mod tests {
             TimerKind::Countdown => countdown("timer-1", 300_000),
             TimerKind::Countup => countup("timer-1"),
         };
+        in_phase_of(entry, phase)
+    }
+
+    /// [`in_phase`] for `entry` (a 5:00 countdown or a count-up, `timer-1`),
+    /// its lists and all.
+    fn in_phase_of(entry: WireEntry, phase: TimerPhase) -> (TimerCore, Duration) {
         let mut core = core_with(vec![entry]);
         if phase != Idle {
             op(&mut core, "timer-1", TimerOp::Arm, secs(1));
@@ -2805,9 +3014,24 @@ mod tests {
         (core, at)
     }
 
+    /// What an op records (§7.8): nothing, a start, a Reset's cancel, End
+    /// now's fire.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Rec {
+        Nothing,
+        Started,
+        Cancelled,
+        Ended,
+    }
+
     /// §7.1: every op on every phase of both kinds, by `ms`, text and total.
     /// A row with no result changes nothing: the answer shows the timer as
-    /// it was, and nothing is marked dirty.
+    /// it was, and nothing is marked dirty. v1.60.0 (§7.8): what every op,
+    /// Toggle and Finish included, records on every phase — a countdown
+    /// armed from idle, done or ran out starts (a Resume doesn't), a Reset
+    /// cancels only a running or paused one, End now fires one, a count-up
+    /// records nothing — and on a countdown past a deadline no reader saw,
+    /// the op's tick takes the fire first.
     #[test]
     #[allow(clippy::too_many_lines)] // §7.1 in one table, a row per cell
     fn op_table() {
@@ -2932,6 +3156,106 @@ mod tests {
             assert_eq!(after.anchor_ms.is_some(), phase == Running, "{what}");
             assert_eq!(after.fires, before.fires, "{what}");
             assert!(core.is_dirty(), "{what}");
+        }
+
+        let (fin, tog) = (TimerOp::Finish, TimerOp::Toggle);
+        let records: [(TimerKind, TimerPhase, TimerOp, Rec); 56] = [
+            (Countdown, Idle, Arm, Rec::Started),
+            (Countdown, Idle, Pause, Rec::Nothing),
+            (Countdown, Idle, Resume, Rec::Nothing),
+            (Countdown, Idle, Reset, Rec::Nothing),
+            (Countdown, Idle, up, Rec::Nothing),
+            (Countdown, Idle, tog, Rec::Started),
+            (Countdown, Idle, fin, Rec::Nothing),
+            (Countdown, Running, Arm, Rec::Nothing),
+            (Countdown, Running, Pause, Rec::Nothing),
+            (Countdown, Running, Resume, Rec::Nothing),
+            (Countdown, Running, Reset, Rec::Cancelled),
+            (Countdown, Running, up, Rec::Nothing),
+            (Countdown, Running, tog, Rec::Nothing),
+            (Countdown, Running, fin, Rec::Ended),
+            (Countdown, Paused, Arm, Rec::Nothing),
+            (Countdown, Paused, Pause, Rec::Nothing),
+            (Countdown, Paused, Resume, Rec::Nothing),
+            (Countdown, Paused, Reset, Rec::Cancelled),
+            (Countdown, Paused, up, Rec::Nothing),
+            (Countdown, Paused, tog, Rec::Nothing),
+            (Countdown, Paused, fin, Rec::Ended),
+            (Countdown, Done, Arm, Rec::Started),
+            (Countdown, Done, Pause, Rec::Nothing),
+            (Countdown, Done, Resume, Rec::Nothing),
+            (Countdown, Done, Reset, Rec::Nothing),
+            (Countdown, Done, up, Rec::Nothing),
+            (Countdown, Done, tog, Rec::Started),
+            (Countdown, Done, fin, Rec::Nothing),
+            (Countdown, Expired, Arm, Rec::Started),
+            (Countdown, Expired, Pause, Rec::Nothing),
+            (Countdown, Expired, Resume, Rec::Nothing),
+            (Countdown, Expired, Reset, Rec::Nothing),
+            (Countdown, Expired, up, Rec::Nothing),
+            (Countdown, Expired, tog, Rec::Started),
+            (Countdown, Expired, fin, Rec::Nothing),
+            (Countup, Idle, Arm, Rec::Nothing),
+            (Countup, Idle, Pause, Rec::Nothing),
+            (Countup, Idle, Resume, Rec::Nothing),
+            (Countup, Idle, Reset, Rec::Nothing),
+            (Countup, Idle, up, Rec::Nothing),
+            (Countup, Idle, tog, Rec::Nothing),
+            (Countup, Idle, fin, Rec::Nothing),
+            (Countup, Running, Arm, Rec::Nothing),
+            (Countup, Running, Pause, Rec::Nothing),
+            (Countup, Running, Resume, Rec::Nothing),
+            (Countup, Running, Reset, Rec::Nothing),
+            (Countup, Running, up, Rec::Nothing),
+            (Countup, Running, tog, Rec::Nothing),
+            (Countup, Running, fin, Rec::Nothing),
+            (Countup, Paused, Arm, Rec::Nothing),
+            (Countup, Paused, Pause, Rec::Nothing),
+            (Countup, Paused, Resume, Rec::Nothing),
+            (Countup, Paused, Reset, Rec::Nothing),
+            (Countup, Paused, up, Rec::Nothing),
+            (Countup, Paused, tog, Rec::Nothing),
+            (Countup, Paused, fin, Rec::Nothing),
+        ];
+        for (kind, phase, top, rec) in records {
+            let what = format!("{kind:?} {phase:?} {top:?}");
+            let (mut core, at) = in_phase(kind, phase);
+            let fires = state(&mut core, at, "timer-1").fires;
+            op(&mut core, "timer-1", top, at);
+            let want = match rec {
+                Rec::Nothing => vec![],
+                Rec::Started => vec![started("timer-1", fires)],
+                Rec::Cancelled => {
+                    vec![cancelled_with("timer-1", CancelWhy::Reset, &Arc::default())]
+                }
+                Rec::Ended => vec![finished("timer-1", fires + 1)],
+            };
+            assert_eq!(core.take_transitions(), want, "{what}");
+            assert_eq!(
+                state(&mut core, at, "timer-1").fires,
+                fires + u32::from(rec == Rec::Ended),
+                "{what}"
+            );
+        }
+
+        // Running, 1 s past a deadline no reader saw: the op's tick fires
+        // it (`fires` 1), then the op meets a done countdown.
+        for (top, then, phase) in [
+            (Arm, Rec::Started, Running),
+            (Reset, Rec::Nothing, Idle),
+            (tog, Rec::Started, Running),
+            (fin, Rec::Nothing, Done),
+        ] {
+            let mut core = core_with(vec![countdown("timer-1", 300_000)]);
+            arm(&mut core, "timer-1", secs(1));
+            op(&mut core, "timer-1", top, secs(302));
+            let mut want = vec![fired("timer-1", 1, 1_000)];
+            if then == Rec::Started {
+                want.push(started("timer-1", 1));
+            }
+            assert_eq!(core.take_transitions(), want, "{top:?}");
+            let s = state(&mut core, secs(302), "timer-1");
+            assert_eq!((s.phase, s.fires), (phase, 1), "{top:?}");
         }
     }
 
@@ -3077,7 +3401,7 @@ mod tests {
         }
         // A sub-second left kept running still ends on its old deadline.
         let mut core = core_with(vec![countdown("timer-1", 1_000)]);
-        op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
+        arm(&mut core, "timer-1", Duration::ZERO);
         op(&mut core, "timer-1", TimerOp::Adjust(-30_000), ms(600));
         tick(&mut core, ms(1_000));
         assert_eq!(core.take_transitions(), vec![fired("timer-1", 1, 0)]);
@@ -3410,6 +3734,59 @@ mod tests {
         );
     }
 
+    /// D6, D11, §7.1 P6-P8, from the fixture's `runSamples`: each stored run
+    /// seeds a `Seeded` that says the phase it was stored in (`from`), with
+    /// the lists of the sync that seeded it — the current ones (Q12). Its
+    /// plan follows: a break that was running or paused mutes again
+    /// (backend only); one that ran out while Divora was closed unmutes; a
+    /// stored ended run runs nothing. A count-up's lists were dropped by the
+    /// reader (D32), so it plans nothing.
+    #[test]
+    fn seeded_says_where_it_came_from() {
+        use TimerPhase::{Done, Expired, Paused, Running};
+        for row in fixture()["runSamples"].as_array().unwrap() {
+            let name = row_name(row);
+            let s: TimerState = serde_json::from_value(row["state"].clone()).unwrap();
+            let entry = json!({
+                "id": s.id,
+                "name": "BRB",
+                "kind": s.kind,
+                "durationMs": s.total_ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS),
+                "resume": row["run"],
+                "onStart": [{"kind": "setMuted", "muted": true}],
+                "onFire": [{"kind": "setMuted", "muted": false}],
+            });
+            let mut core = TimerCore::new();
+            let now = secs(3);
+            let wall_ms = row["nowWallMs"].as_i64().unwrap();
+            core.sync(vec![entry_from_wire(&entry).unwrap()], now, wall_ms, None);
+            let recorded = core.take_transitions();
+            let [Transition::Seeded {
+                phase, from, hooks, ..
+            }] = recorded.as_slice()
+            else {
+                panic!("{name}: {recorded:?}");
+            };
+            let stored: TimerPhase = serde_json::from_value(row["run"]["phase"].clone()).unwrap();
+            let seeded: TimerPhase = serde_json::from_value(row["seededPhase"].clone()).unwrap();
+            assert_eq!((*phase, *from), (seeded, stored), "{name}");
+            let countdown = s.kind == TimerKind::Countdown;
+            let want_hooks = if countdown { brb() } else { Arc::default() };
+            assert_eq!(*hooks, want_hooks, "{name}");
+            let want = match (countdown, stored, seeded) {
+                (true, Running | Paused, Running | Paused) => Some((Why::Restart, MUTE)),
+                (true, Running, Expired) => Some((Why::RanOut, UNMUTE)),
+                (true, Done | Expired, _) | (false, ..) => None,
+                other => panic!("{name}: {other:?}"),
+            };
+            let planned = plan(&recorded[0]).map(|p| {
+                assert!(p.page.is_empty(), "{name}");
+                (p.why, p.backend)
+            });
+            assert_eq!(planned, want.map(|(why, a)| (why, vec![a])), "{name}");
+        }
+    }
+
     /// D15, D36: what a sync changes — an add, a rename, a new length while
     /// idle (its text follows) and while running (its run stands until it
     /// starts again), a new kind (idle), a removal (returned), a duplicate
@@ -3566,6 +3943,142 @@ mod tests {
         assert_eq!(core.text_update().keep.len(), MAX_TIMERS);
     }
 
+    /// D6, D10: a Reset cancels a running or paused countdown —
+    /// `Cancelled {Reset}`, carrying its lists — and an idle or ended one
+    /// records nothing. A sync without an active countdown's id (deleted,
+    /// or no longer among the first [`MAX_TIMERS`]) records `Cancelled
+    /// {Removed}` with the lists it had; one that changes its kind records
+    /// `Cancelled {Reset}` with its lists from before that sync, not the
+    /// count-up's it becomes (D32). Ended and idle countdowns, and
+    /// count-ups, record nothing either way.
+    #[test]
+    #[allow(clippy::too_many_lines)] // Reset, delete, the 17th, a kind change
+    fn reset_and_delete_cancel_only_active_countdowns() {
+        let brb = brb();
+        let entry = || with_hooks(countdown("timer-1", 300_000), &brb);
+        let phases = [
+            (Running, true),
+            (Paused, true),
+            (Idle, false),
+            (Done, false),
+            (Expired, false),
+        ];
+        let cancelled = |active: bool, why| -> Vec<Transition> {
+            if active {
+                vec![cancelled_with("timer-1", why, &brb)]
+            } else {
+                vec![]
+            }
+        };
+        for (phase, active) in phases {
+            // Reset.
+            let (mut core, at) = in_phase_of(entry(), phase);
+            op(&mut core, "timer-1", TimerOp::Reset, at);
+            assert_eq!(
+                core.take_transitions(),
+                cancelled(active, CancelWhy::Reset),
+                "Reset {phase:?}"
+            );
+            assert_eq!(state(&mut core, at, "timer-1").phase, Idle, "{phase:?}");
+
+            // Deleted: a sync without it, beside a timer that stays.
+            let (mut core, at) = in_phase_of(entry(), phase);
+            let left = core.sync(vec![countup("timer-2")], at, wall(at), None);
+            assert_eq!(left, ["timer-1"], "{phase:?}");
+            assert_eq!(
+                core.take_transitions(),
+                cancelled(active, CancelWhy::Removed),
+                "deleted {phase:?}"
+            );
+
+            // A kind change: idle, a count-up with no lists.
+            let (mut core, at) = in_phase_of(entry(), phase);
+            core.sync(vec![countup("timer-1")], at, wall(at), None);
+            assert_eq!(
+                core.take_transitions(),
+                cancelled(active, CancelWhy::Reset),
+                "kind {phase:?}"
+            );
+            let s = state(&mut core, at, "timer-1");
+            assert_eq!((s.kind, s.phase), (TimerKind::Countup, Idle), "{phase:?}");
+            assert_eq!(core.timers[0].hooks, Arc::default(), "{phase:?}");
+        }
+
+        // Past the 16th: kept, not run, so a running one is cancelled too.
+        let (mut core, at) = in_phase_of(entry(), Running);
+        let mut entries: Vec<WireEntry> = (2..=17)
+            .map(|n| countdown(&format!("timer-{n}"), 60_000))
+            .collect();
+        entries.push(entry());
+        let left = core.sync(entries, at, wall(at), None);
+        assert_eq!(left, ["timer-1"]);
+        assert_eq!(core.take_transitions(), cancelled(true, CancelWhy::Removed));
+
+        // A count-up, running or paused, records nothing either way.
+        for phase in [Running, Paused] {
+            let (mut core, at) = in_phase(TimerKind::Countup, phase);
+            op(&mut core, "timer-1", TimerOp::Reset, at);
+            let (mut gone, at) = in_phase(TimerKind::Countup, phase);
+            gone.sync(vec![], at, wall(at), None);
+            let (mut changed, at) = in_phase(TimerKind::Countup, phase);
+            changed.sync(vec![countdown("timer-1", 60_000)], at, wall(at), None);
+            for c in [&mut core, &mut gone, &mut changed] {
+                assert_eq!(c.take_transitions(), vec![], "{phase:?}");
+            }
+        }
+    }
+
+    /// D7, TP4: a sync's lists replace the timer's. Synced with none, then
+    /// with a break's, a countdown's Start carries the break's. On a running
+    /// countdown, a list change, a rename and a new length each record
+    /// nothing and keep the run, and At zero changed mid-run counts for this
+    /// run's end (Q12).
+    #[test]
+    fn a_sync_takes_new_hooks() {
+        let plain = || countdown("timer-1", 60_000);
+        let mut core = core_with(vec![plain()]);
+        let brb = brb();
+        let resync = |core: &mut TimerCore, entry: WireEntry, now: Duration| {
+            core.sync(vec![entry], now, wall(now), None);
+            assert_eq!(core.take_transitions(), vec![], "{now:?}");
+        };
+        resync(&mut core, with_hooks(plain(), &brb), secs(1));
+        op(&mut core, "timer-1", TimerOp::Arm, secs(2));
+        assert_eq!(
+            core.take_transitions(),
+            vec![started_with("timer-1", 0, &brb)]
+        );
+
+        let line = Action::Speak {
+            text: "I'm back.".into(),
+            voice_id: "af_heart".into(),
+        };
+        let newer = lists(vec![MUTE], vec![UNMUTE, line]);
+        let running = state(&mut core, secs(3), "timer-1");
+        resync(&mut core, with_hooks(plain(), &newer), secs(3));
+        let renamed = edit(with_hooks(plain(), &newer), |d| {
+            d.name = "Break".into();
+            d.duration_ms = 120_000;
+        });
+        resync(&mut core, renamed, secs(3));
+        let s = state(&mut core, secs(3), "timer-1");
+        assert_eq!(
+            (s.phase, s.ms, s.total_ms, s.anchor_ms, s.name.as_str()),
+            (
+                running.phase,
+                running.ms,
+                running.total_ms,
+                running.anchor_ms,
+                "Break"
+            )
+        );
+        tick(&mut core, secs(62));
+        assert_eq!(
+            core.take_transitions(),
+            vec![fired_with("timer-1", 1, 0, false, &newer)]
+        );
+    }
+
     /// D17: every snapshot's `seq` is larger than the one before, whoever
     /// builds it: the thread after a change, a command's answer, a status
     /// read that changed nothing.
@@ -3677,6 +4190,7 @@ mod tests {
 
     /// D33: fields a later release sends (`obsText`, `followObs`, actions of
     /// a kind this build doesn't know) don't stop a definition: it runs.
+    /// v1.60.0: its readable actions are read, the rest skipped (D4).
     #[test]
     fn later_fields_are_ignored() {
         let sent = json!({
@@ -3685,26 +4199,61 @@ mod tests {
             "onStart": [{"kind": "setMuted", "muted": true}],
             "onFire": [{"kind": "somethingNew", "x": 1}, {"kind": "speak", "text": "back"}],
         });
+        let read = entry_from_wire(&sent).unwrap();
+        let WireEntry::Def(def) = &read else {
+            panic!("a definition");
+        };
+        // `somethingNew` is skipped, and so is a line with no voice.
+        let hooks = lists(vec![MUTE], vec![]);
+        assert_eq!(def.hooks, hooks);
         let mut core = TimerCore::new();
-        core.sync(
-            vec![entry_from_wire(&sent).unwrap()],
-            Duration::ZERO,
-            WALL0,
-            None,
-        );
+        core.sync(vec![read], Duration::ZERO, WALL0, None);
         op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
         assert_eq!(
             shown(&mut core, Duration::ZERO, "timer-1"),
             (Running, 300_000, "05:00".into())
+        );
+        assert_eq!(
+            core.take_transitions(),
+            vec![started_with("timer-1", 0, &hooks)]
         );
     }
 
     /// Every arithmetic step saturates (a panic aborts the app): the largest
     /// deltas through Adjust, lengths of 0 and `u64::MAX`, clocks and walls
     /// at their extremes, and seeds from anchors at `i64::MIN` / `i64::MAX`.
+    /// v1.60.0: End now among the ops, every transition planned, lists with
+    /// a 10 000-character line and preset id, and `replay_at` at its edges.
     #[test]
+    #[allow(clippy::too_many_lines)] // every edge, then v1.60.0's
     fn nothing_panics_at_the_edges() {
         use TimerKind::{Countdown, Countup};
+        let long = "a".repeat(10_000);
+        let wide = json!([
+            {"kind": "speak", "text": long, "voiceId": long},
+            {"kind": "preset", "presetId": long},
+            {"kind": "setMuted", "muted": true},
+            {"kind": "tile", "tileId": long},
+        ]);
+        let hooks = Arc::new(hooks_from_wire(
+            json!({"onStart": wide, "onFire": wide})
+                .as_object()
+                .unwrap(),
+        ));
+        // The line and the clip are past their caps; a preset id has none.
+        let kept = vec![
+            Action::Preset {
+                preset_id: long.clone(),
+            },
+            MUTE,
+        ];
+        assert_eq!(
+            *hooks,
+            Hooks {
+                on_start: kept.clone(),
+                on_fire: kept,
+            }
+        );
         let edge = |id: &str, kind, duration_ms| {
             WireEntry::Def(TimerDef {
                 id: id.into(),
@@ -3712,7 +4261,7 @@ mod tests {
                 kind,
                 duration_ms,
                 resume: None,
-                hooks: Arc::default(),
+                hooks: hooks.clone(),
             })
         };
         let clocks = [
@@ -3731,10 +4280,13 @@ mod tests {
             TimerOp::Adjust(i64::MAX),
             TimerOp::Resume,
             TimerOp::Toggle,
+            TimerOp::Finish,
             TimerOp::Reset,
             TimerOp::Toggle,
+            TimerOp::Finish,
         ];
         let ids = ["timer-1", "timer-2", "timer-3"];
+        let drained = Instant::now();
         for wall_ms in walls {
             let mut core = TimerCore::new();
             core.sync(
@@ -3765,16 +4317,30 @@ mod tests {
                     let _ = core.snapshot(now);
                     let _ = core.next_wake(now, TICK);
                     let _ = core.text_update();
+                    for t in core.take_transitions() {
+                        if let Some(p) = plan(&t) {
+                            let _ = replay_at(drained, p.late_ms);
+                            let _ = serde_json::to_value(TimerActionsEvent::of(&p, u64::MAX));
+                        }
+                    }
                 }
             }
             for anchor in [i64::MIN, -1, 0, i64::MAX] {
                 for phase in [Running, Paused, Done, Expired] {
                     for kind in [Countdown, Countup] {
                         let run = stored(phase, Some(u64::MAX), Some(u64::MAX), Some(anchor));
-                        let (s, _) = seeded("timer-1", kind, u64::MAX, run, wall_ms);
+                        let (s, recorded) = seeded("timer-1", kind, u64::MAX, run, wall_ms);
                         assert_eq!(s.text, timer_text(kind, s.ms));
+                        for t in &recorded {
+                            let _ = plan(t);
+                        }
                     }
                 }
+            }
+        }
+        for late_ms in [0, 1, u64::MAX] {
+            for at in [Instant::now(), drained] {
+                assert!(replay_at(at, late_ms) <= at);
             }
         }
     }

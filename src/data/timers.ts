@@ -286,7 +286,13 @@ export function nextTimerId(s: StoredTimers): string {
 /** A new timer's name: "Countdown" (or "Count-up"), then "Countdown 2",
  *  "Countdown 3"…, the first no stored timer has. */
 export function defaultName(s: StoredTimers, kind: TimerKind): string {
-  return freshName(nameBase(kind), new Set(s.timers.map((t) => t.name)));
+  return freshNameFrom(s, nameBase(kind));
+}
+
+/** v1.60.0: `base`, or `base 2`, `base 3`…, the first no stored timer has:
+ *  Add break (BRB)'s "BRB", numbered as a default name is. */
+export function freshNameFrom(s: StoredTimers, base: string): string {
+  return freshName(base, new Set(s.timers.map((t) => t.name)));
 }
 
 // ---- runs ----

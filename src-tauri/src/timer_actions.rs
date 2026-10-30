@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::timers::Transition;
+use crate::timers::{CancelWhy, TimerPhase, Transition};
 
 /// D34's kill switch: `false` makes [`plan`] return nothing, so no batch
 /// reaches the worker and no event the page: timers behave as v1.59.0's,
@@ -321,20 +321,120 @@ impl Planned {
     }
 }
 
+/// Which of a list's actions a hook run takes (§7.1).
+#[derive(Clone, Copy)]
+enum Take {
+    /// Every one: a start, a fire on time, End now.
+    All,
+    /// onFire·R, those that put back what a start changed: a late fire, a
+    /// run-out (D8, D9).
+    Restoring,
+    /// onFire·U, those that put back what this start did: a Reset, a kind
+    /// change, a delete (D10).
+    Undoing,
+    /// onStart·A, those a restart mid-run runs again: the mute (D11).
+    Reapplied,
+}
+
 /// D7, §7.1: what a transition runs, and why; `None` when it runs nothing
 /// and tells the page nothing (a stored ended run seeded again, a count-up's
 /// sleep pause, a restart with no mute to re-apply), and always with
 /// [`TIMER_ACTIONS`] off.
 ///
-/// Not filled in yet: until it is, every transition plans nothing, so
-/// timers act as v1.59.0's (End now aside).
+/// - `Started` (P1): all of `onStart` but `revertPreset`, `start`/`armed`.
+/// - `Fired` (P2-P4): End now runs all of `onFire` (`endNow`, `lateMs` 0); a
+///   fire at most [`LATE_ONE_SHOTS_MS`] late runs all of it (`zero`, its
+///   lateness); a later one only its restoring actions (`late`, its
+///   lateness).
+/// - `Expired` (P5) and a run that ran out while Divora was closed
+///   (`Seeded {expired, from: running}`, P6): `onFire`'s restoring actions,
+///   `ranOut`.
+/// - A restart mid-run (`Seeded {running|paused}`, P7): `onStart`'s mute
+///   again, backend only (`restart`, never sent).
+/// - `Cancelled` (P9, P10): the restoring actions of `onFire` that undo
+///   what `onStart` does ([`Action::undoes`]), `reset` or `deleted`.
+///
+/// Lists are the ones the transition carries: what they were when it
+/// happened (Q12). P1-P6, P9 and P10 plan even with nothing to run, so the
+/// page can settle a return and an end retires its start line. The backend
+/// half puts `panic` first, the rest in list order (D15); the page half
+/// keeps list order.
 #[must_use]
 pub fn plan(t: &Transition) -> Option<Planned> {
     if !TIMER_ACTIONS {
         return None;
     }
-    let _ = t;
-    None
+    let (id, hooks, hook, why, late_ms, take) = match t {
+        Transition::Started { id, hooks, .. } => (id, hooks, Hook::Start, Why::Armed, 0, Take::All),
+        Transition::Fired {
+            id,
+            finished: true,
+            hooks,
+            ..
+        } => (id, hooks, Hook::End, Why::EndNow, 0, Take::All),
+        Transition::Fired {
+            id, late_ms, hooks, ..
+        } if *late_ms <= LATE_ONE_SHOTS_MS => {
+            (id, hooks, Hook::End, Why::Zero, *late_ms, Take::All)
+        }
+        Transition::Fired {
+            id, late_ms, hooks, ..
+        } => (id, hooks, Hook::End, Why::Late, *late_ms, Take::Restoring),
+        Transition::Expired { id, hooks }
+        | Transition::Seeded {
+            id,
+            phase: TimerPhase::Expired,
+            from: TimerPhase::Running,
+            hooks,
+        } => (id, hooks, Hook::End, Why::RanOut, 0, Take::Restoring),
+        Transition::Seeded {
+            id,
+            phase: TimerPhase::Running | TimerPhase::Paused,
+            hooks,
+            ..
+        } => (id, hooks, Hook::Start, Why::Restart, 0, Take::Reapplied),
+        // P8 (a stored ended run, seeded at every launch) and P11.
+        Transition::Seeded { .. } | Transition::SleepPaused { .. } => return None,
+        Transition::Cancelled { id, why, hooks } => {
+            let why = match why {
+                CancelWhy::Reset => Why::Reset,
+                CancelWhy::Removed => Why::Deleted,
+            };
+            (id, hooks, Hook::End, why, 0, Take::Undoing)
+        }
+    };
+    let list = match hook {
+        Hook::Start => &hooks.on_start,
+        Hook::End => &hooks.on_fire,
+    };
+    let (mut backend, page): (Vec<Action>, Vec<Action>) = list
+        .iter()
+        .filter(|a| {
+            a.runs_at(hook)
+                && match take {
+                    Take::All => true,
+                    Take::Restoring => a.restores(),
+                    Take::Undoing => a.undoes(&hooks.on_start),
+                    Take::Reapplied => a.reapplies(),
+                }
+        })
+        .cloned()
+        .partition(|a| a.runs_in() == RunsIn::Backend);
+    // D15: Stop all first, so it stops what played before the hook and
+    // this hook's own clips and line play after it. A stable sort: the rest
+    // keep list order.
+    backend.sort_by_key(|a| *a != Action::Panic);
+    if why == Why::Restart && backend.is_empty() {
+        return None;
+    }
+    Some(Planned {
+        id: id.clone(),
+        hook,
+        why,
+        late_ms,
+        backend,
+        page,
+    })
 }
 
 /// What the action worker runs for one hook run, in order (D14).
@@ -415,12 +515,13 @@ impl TimerActionsEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_from_wire, hooks_from_wire, plan, Action, Hook, Hooks, Planned, RunsIn,
-        TimerActionsEvent, Why, MAX_LINE_CHARS, MAX_TARGET_CHARS,
+        action_from_wire, hooks_from_wire, plan, replay_at, route, Action, Hook, Hooks, Planned,
+        RunsIn, TimerActionsEvent, Why, LATE_ONE_SHOTS_MS, MAX_LINE_CHARS, MAX_TARGET_CHARS,
     };
-    use crate::timers::{entry_from_wire, CancelWhy, Transition, WireEntry};
+    use crate::timers::{entry_from_wire, CancelWhy, TimerPhase, Transition, WireEntry};
     use serde_json::{json, Value};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../../src/overlay/timer.fixture.json")).unwrap()
@@ -795,10 +896,10 @@ mod tests {
         assert_eq!(kinds, ["preset", "randomPreset", "revertPreset", "tile"]);
     }
 
-    /// Each `actionsEventSamples` row is what `plan` makes of its
-    /// transition. Ignored until `plan` holds §7.1's table.
+    /// Seam 4: each `actionsEventSamples` row — the event the page's
+    /// `readTimerActionsEvent` reads — is what `plan` makes of its
+    /// transition, one per `why`.
     #[test]
-    #[ignore = "plan isn't filled in yet: it plans nothing"]
     fn actions_event_samples_are_plans() {
         let f = fixture();
         for row in rows(&f, "actionsEventSamples") {
@@ -811,5 +912,483 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // ---- §7.1: `plan`, and where `route` sends what it plans -------------
+
+    fn preset(id: &str) -> Action {
+        Action::Preset {
+            preset_id: id.into(),
+        }
+    }
+
+    fn tile() -> Action {
+        Action::Tile {
+            tile_id: "9f2c4e1a7b3d5f60".into(),
+        }
+    }
+
+    fn line(text: &str) -> Action {
+        Action::Speak {
+            text: text.into(),
+            voice_id: "af_heart".into(),
+        }
+    }
+
+    const MUTE: Action = Action::SetMuted { muted: true };
+    const UNMUTE: Action = Action::SetMuted { muted: false };
+
+    /// Both lists holding every kind, none of them in the order `plan`
+    /// puts them in: `panic` neither first nor last, page and backend kinds
+    /// mixed, `revertPreset` in At start too.
+    fn every_hook() -> Arc<Hooks> {
+        Arc::new(Hooks {
+            on_start: vec![
+                preset("villager"),
+                MUTE,
+                tile(),
+                Action::RevertPreset,
+                line("Be right back."),
+                Action::Panic,
+                Action::RandomPreset,
+                Action::SaveReplay,
+            ],
+            on_fire: vec![
+                tile(),
+                UNMUTE,
+                preset("hollow-king"),
+                line("I'm back."),
+                Action::Panic,
+                Action::RevertPreset,
+                Action::SaveReplay,
+                Action::RandomPreset,
+            ],
+        })
+    }
+
+    fn lists(on_start: Vec<Action>, on_fire: Vec<Action>) -> Arc<Hooks> {
+        Arc::new(Hooks { on_start, on_fire })
+    }
+
+    fn started(hooks: &Arc<Hooks>) -> Transition {
+        Transition::Started {
+            id: "timer-1".into(),
+            fires: 0,
+            hooks: hooks.clone(),
+        }
+    }
+
+    fn fired(hooks: &Arc<Hooks>, late_ms: u64, finished: bool) -> Transition {
+        Transition::Fired {
+            id: "timer-1".into(),
+            fires: 1,
+            late_ms,
+            finished,
+            hooks: hooks.clone(),
+        }
+    }
+
+    fn expired(hooks: &Arc<Hooks>) -> Transition {
+        Transition::Expired {
+            id: "timer-1".into(),
+            hooks: hooks.clone(),
+        }
+    }
+
+    fn seeded(hooks: &Arc<Hooks>, phase: TimerPhase, from: TimerPhase) -> Transition {
+        Transition::Seeded {
+            id: "timer-1".into(),
+            phase,
+            from,
+            hooks: hooks.clone(),
+        }
+    }
+
+    fn cancelled(hooks: &Arc<Hooks>, why: CancelWhy) -> Transition {
+        Transition::Cancelled {
+            id: "timer-1".into(),
+            why,
+            hooks: hooks.clone(),
+        }
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // the shape `plan` answers in
+    fn planned(
+        hook: Hook,
+        why: Why,
+        late_ms: u64,
+        backend: Vec<Action>,
+        page: Vec<Action>,
+    ) -> Option<Planned> {
+        Some(Planned {
+            id: "timer-1".into(),
+            hook,
+            why,
+            late_ms,
+            backend,
+            page,
+        })
+    }
+
+    /// §7.1's rows, P1-P11, on [`every_hook`], then the rows its undo rule
+    /// adds (AT1, UX1, AT5): the transition, and what `plan` makes of it.
+    /// P12 records no transition, so there is nothing to plan: `op_table`
+    /// and `a_sync_takes_new_hooks` pin that the core records none.
+    #[allow(clippy::too_many_lines)] // §7.1 in one table, a row per line of it
+    fn plan_rows() -> Vec<(&'static str, Transition, Option<Planned>)> {
+        use CancelWhy::{Removed, Reset};
+        use Hook::{End, Start};
+        use TimerPhase::{Done, Expired, Paused, Running};
+        let every = every_hook();
+        // onFire whole: Stop all first, the rest in list order.
+        let fire_backend = || vec![Action::Panic, UNMUTE, line("I'm back."), Action::SaveReplay];
+        let fire_page = || {
+            vec![
+                tile(),
+                preset("hollow-king"),
+                Action::RevertPreset,
+                Action::RandomPreset,
+            ]
+        };
+        // onFire·R, and here onFire·U too: At start mutes.
+        let restoring = |why| planned(End, why, 0, vec![UNMUTE], vec![Action::RevertPreset]);
+        vec![
+            (
+                "P1 Started: all of At start, Stop all first, no revertPreset",
+                started(&every),
+                planned(
+                    Start,
+                    Why::Armed,
+                    0,
+                    vec![
+                        Action::Panic,
+                        MUTE,
+                        line("Be right back."),
+                        Action::SaveReplay,
+                    ],
+                    vec![preset("villager"), tile(), Action::RandomPreset],
+                ),
+            ),
+            (
+                "P2 Fired on time: all of At zero",
+                fired(&every, 0, false),
+                planned(End, Why::Zero, 0, fire_backend(), fire_page()),
+            ),
+            (
+                "P2 Fired 30 000 ms late: still all of it",
+                fired(&every, LATE_ONE_SHOTS_MS, false),
+                planned(End, Why::Zero, 30_000, fire_backend(), fire_page()),
+            ),
+            (
+                "P3 End now: all of At zero, not late",
+                fired(&every, 0, true),
+                planned(End, Why::EndNow, 0, fire_backend(), fire_page()),
+            ),
+            (
+                "P4 Fired 30 001 ms late: restoring only",
+                fired(&every, LATE_ONE_SHOTS_MS + 1, false),
+                planned(
+                    End,
+                    Why::Late,
+                    30_001,
+                    vec![UNMUTE],
+                    vec![Action::RevertPreset],
+                ),
+            ),
+            (
+                "P4 Fired an hour late: restoring only",
+                fired(&every, 3_600_000, false),
+                planned(
+                    End,
+                    Why::Late,
+                    3_600_000,
+                    vec![UNMUTE],
+                    vec![Action::RevertPreset],
+                ),
+            ),
+            (
+                "P5 Expired: restoring only",
+                expired(&every),
+                restoring(Why::RanOut),
+            ),
+            (
+                "P6 ran out while Divora was closed: restoring only",
+                seeded(&every, Expired, Running),
+                restoring(Why::RanOut),
+            ),
+            (
+                "P7 restart while running: At start's mute again, backend only",
+                seeded(&every, Running, Running),
+                planned(Start, Why::Restart, 0, vec![MUTE], vec![]),
+            ),
+            (
+                "P7 restart while paused: the same",
+                seeded(&every, Paused, Paused),
+                planned(Start, Why::Restart, 0, vec![MUTE], vec![]),
+            ),
+            (
+                "P8 a stored done run: nothing",
+                seeded(&every, Done, Done),
+                None,
+            ),
+            (
+                "P8 a stored ran-out run: nothing",
+                seeded(&every, Expired, Expired),
+                None,
+            ),
+            (
+                "P9 Reset mid-run: the undo of its start",
+                cancelled(&every, Reset),
+                restoring(Why::Reset),
+            ),
+            (
+                "P10 deleted mid-run: the undo of its start",
+                cancelled(&every, Removed),
+                restoring(Why::Deleted),
+            ),
+            (
+                "P11 a count-up's sleep pause: nothing",
+                Transition::SleepPaused {
+                    id: "timer-1".into(),
+                },
+                None,
+            ),
+            // The undo rule's rows.
+            (
+                "unmute in 5 minutes, Reset: its start muted nothing",
+                cancelled(&lists(vec![], vec![UNMUTE]), Reset),
+                planned(End, Why::Reset, 0, vec![], vec![]),
+            ),
+            (
+                "unmute in 5 minutes, deleted: the same",
+                cancelled(&lists(vec![], vec![UNMUTE]), Removed),
+                planned(End, Why::Deleted, 0, vec![], vec![]),
+            ),
+            (
+                "unmute in 5 minutes, Expired: zero passed",
+                expired(&lists(vec![], vec![UNMUTE])),
+                planned(End, Why::RanOut, 0, vec![UNMUTE], vec![]),
+            ),
+            (
+                "unmute in 5 minutes, found late: zero passed",
+                fired(&lists(vec![], vec![UNMUTE]), 40_000, false),
+                planned(End, Why::Late, 40_000, vec![UNMUTE], vec![]),
+            ),
+            (
+                "unmute in 5 minutes, ran out while closed: zero passed",
+                seeded(&lists(vec![], vec![UNMUTE]), Expired, Running),
+                planned(End, Why::RanOut, 0, vec![UNMUTE], vec![]),
+            ),
+            (
+                "a break, Reset: unmuted",
+                cancelled(&lists(vec![MUTE], vec![UNMUTE]), Reset),
+                planned(End, Why::Reset, 0, vec![UNMUTE], vec![]),
+            ),
+            (
+                "a mute with nothing at zero, Reset: you stay muted",
+                cancelled(&lists(vec![MUTE], vec![]), Reset),
+                planned(End, Why::Reset, 0, vec![], vec![]),
+            ),
+            (
+                "a mute with nothing at zero, at zero: you stay muted",
+                fired(&lists(vec![MUTE], vec![]), 0, false),
+                planned(End, Why::Zero, 0, vec![], vec![]),
+            ),
+            (
+                "a switch, deleted: back to the preset before",
+                cancelled(
+                    &lists(vec![preset("x")], vec![Action::RevertPreset]),
+                    Removed,
+                ),
+                planned(End, Why::Deleted, 0, vec![], vec![Action::RevertPreset]),
+            ),
+            (
+                "a mute edited in after the start, restart: the current lists",
+                seeded(&lists(vec![MUTE], vec![UNMUTE]), Running, Running),
+                planned(Start, Why::Restart, 0, vec![MUTE], vec![]),
+            ),
+            (
+                "a line, a clip and Stop all at zero: Stop all first",
+                fired(
+                    &lists(vec![MUTE], vec![line("I'm back."), tile(), Action::Panic]),
+                    0,
+                    false,
+                ),
+                planned(
+                    End,
+                    Why::Zero,
+                    0,
+                    vec![Action::Panic, line("I'm back.")],
+                    vec![tile()],
+                ),
+            ),
+        ]
+    }
+
+    /// D7, §7.1: every row — the backend and page halves, `hook`, `why`,
+    /// `lateMs`, whether the page hears of it, list order kept, Stop all
+    /// first — and the undo rule's rows: a Reset or a delete runs only what
+    /// undoes the start, a late fire or a run-out every restoring action.
+    #[test]
+    fn plan_table() {
+        for (name, t, want) in plan_rows() {
+            let got = plan(&t);
+            assert_eq!(got, want, "{name}");
+            let Some(p) = got else { continue };
+            let restart = matches!(
+                t,
+                Transition::Seeded {
+                    phase: TimerPhase::Running | TimerPhase::Paused,
+                    ..
+                }
+            );
+            assert_eq!(p.emits(), !restart, "{name}");
+            assert!(
+                p.backend.iter().all(|a| a.runs_in() == RunsIn::Backend),
+                "{name}"
+            );
+            assert!(p.page.iter().all(|a| a.runs_in() == RunsIn::Page), "{name}");
+        }
+    }
+
+    /// D9: 30 000 ms late is on time — all of At zero, `zero` — and 30 001
+    /// is late: only the restoring actions, `late`.
+    #[test]
+    fn late_boundary() {
+        assert_eq!(LATE_ONE_SHOTS_MS, 30_000);
+        let every = every_hook();
+        let on_time = plan(&fired(&every, 30_000, false)).unwrap();
+        assert_eq!((on_time.why, on_time.late_ms), (Why::Zero, 30_000));
+        assert_eq!(
+            on_time.backend.len() + on_time.page.len(),
+            every.on_fire.len()
+        );
+        let late = plan(&fired(&every, 30_001, false)).unwrap();
+        assert_eq!(
+            (late.why, late.late_ms, late.backend, late.page),
+            (Why::Late, 30_001, vec![UNMUTE], vec![Action::RevertPreset])
+        );
+    }
+
+    /// D11: a restart mid-run (running or paused) runs At start's mute
+    /// again and nothing else — no preset, line or replay — in the backend,
+    /// and tells the page nothing; with no mute in At start it plans
+    /// nothing at all.
+    #[test]
+    fn restart_reapplies_only_the_mute() {
+        let start = lists(
+            vec![
+                preset("villager"),
+                MUTE,
+                line("Be right back."),
+                Action::SaveReplay,
+            ],
+            vec![UNMUTE, Action::RevertPreset],
+        );
+        for phase in [TimerPhase::Running, TimerPhase::Paused] {
+            let p = plan(&seeded(&start, phase, phase)).unwrap();
+            assert_eq!(
+                Some(p.clone()),
+                planned(Hook::Start, Why::Restart, 0, vec![MUTE], vec![]),
+                "{phase:?}"
+            );
+            assert!(!p.emits(), "{phase:?}");
+            let (batch, event) = route(&p, 1, Instant::now());
+            assert_eq!(batch.map(|b| b.actions), Some(vec![MUTE]), "{phase:?}");
+            assert_eq!(event, None, "{phase:?}");
+        }
+        let no_mute = lists(vec![preset("villager"), tile()], vec![]);
+        for phase in [TimerPhase::Running, TimerPhase::Paused] {
+            assert_eq!(plan(&seeded(&no_mute, phase, phase)), None, "{phase:?}");
+        }
+    }
+
+    /// P8: a stored done or ran-out run, seeded again at every launch, runs
+    /// nothing — not even its restoring actions, which ran when it ended.
+    #[test]
+    fn a_stored_end_runs_nothing() {
+        let every = every_hook();
+        for phase in [TimerPhase::Done, TimerPhase::Expired] {
+            assert_eq!(plan(&seeded(&every, phase, phase)), None, "{phase:?}");
+        }
+    }
+
+    /// §7.1: `revertPreset` in At start is read and never run: there is
+    /// nothing to go back to at a start. The start still plans, so the page
+    /// hears of it.
+    #[test]
+    fn revert_never_runs_at_a_start() {
+        let p = plan(&started(&lists(vec![Action::RevertPreset], vec![]))).unwrap();
+        assert_eq!(
+            (p.hook, p.why, p.backend, p.page),
+            (Hook::Start, Why::Armed, vec![], vec![])
+        );
+        let p = plan(&started(&lists(
+            vec![
+                Action::RevertPreset,
+                preset("villager"),
+                Action::RevertPreset,
+            ],
+            vec![],
+        )))
+        .unwrap();
+        assert_eq!(p.page, vec![preset("villager")]);
+    }
+
+    /// The instant a test drains at: an hour ahead, so taking a lateness
+    /// off it never meets the process's first `Instant`.
+    fn drained() -> Instant {
+        Instant::now() + Duration::from_secs(3_600)
+    }
+
+    /// `ms` before `at`.
+    fn ms_before(at: Instant, ms: u64) -> Instant {
+        at.checked_sub(Duration::from_millis(ms)).unwrap()
+    }
+
+    /// D13, D21, D22, for every `plan_table` row: a batch iff the backend
+    /// half has actions or it is an end (an end retires its start line), its
+    /// `at` the moment the countdown reached zero — the drain less the
+    /// fire's lateness — and an event iff the page hears of it, numbered as
+    /// asked.
+    #[test]
+    fn route_table() {
+        let at = drained();
+        let (mut empty_ends, mut late) = (0, 0);
+        for (seq, (name, _, want)) in (1_u64..).zip(plan_rows()) {
+            let Some(p) = want else { continue };
+            let (batch, event) = route(&p, seq, at);
+            let batched = !p.backend.is_empty() || p.hook == Hook::End;
+            assert_eq!(batch.is_some(), batched, "{name}");
+            if let Some(b) = batch {
+                assert_eq!(
+                    (b.id.as_str(), b.hook, b.why, &b.actions),
+                    (p.id.as_str(), p.hook, p.why, &p.backend),
+                    "{name}"
+                );
+                assert_eq!(b.at, ms_before(at, p.late_ms), "{name}");
+                empty_ends += usize::from(b.actions.is_empty());
+                late += usize::from(p.late_ms > 0);
+            }
+            assert_eq!(
+                event,
+                p.emits().then(|| TimerActionsEvent::of(&p, seq)),
+                "{name}"
+            );
+        }
+        // The rows above hold ends with nothing for the worker to run, and
+        // late fires.
+        assert!(empty_ends > 0 && late > 0, "{empty_ends} {late}");
+    }
+
+    /// D22: `replay_at` takes the lateness off the drain; a lateness longer
+    /// than the process has existed gives the drain itself.
+    #[test]
+    fn replay_at_table() {
+        let at = drained();
+        assert_eq!(replay_at(at, 0), at);
+        assert_eq!(replay_at(at, 1), ms_before(at, 1));
+        assert_eq!(replay_at(at, 30_000), ms_before(at, 30_000));
+        assert_eq!(replay_at(at, u64::MAX), at);
     }
 }

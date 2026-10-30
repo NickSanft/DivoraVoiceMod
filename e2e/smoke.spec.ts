@@ -11,13 +11,16 @@ import {
   emitReplay,
   emitReplaySaved,
   emitsOf,
+  emitTimerActions,
   emitTimers,
   invokesOf,
   listenCount,
   mockMute,
   mockPtm,
+  MOCK_PRESETS,
   pressMuteHotkey,
   pressPtmHotkey,
+  setMockMute,
   TIMER_SAMPLES,
 } from "./tauri-mock";
 
@@ -1986,6 +1989,7 @@ test.describe("Hourglass (v1.59)", () => {
     "resume_timer",
     "reset_timer",
     "adjust_timer",
+    "finish_timer",
     "timer_status",
     "timers_dir",
   ];
@@ -2036,7 +2040,10 @@ test.describe("Hourglass (v1.59)", () => {
     await expect.poll(async () => (await invokesOf(page, "list_audio_input_devices")).length).toBeGreaterThan(0);
     await page.waitForTimeout(300);
     expect(await timerCalls(page)).toEqual([]);
-    expect(await listenCount(page, "timer-state")).toBe(0);
+    // v1.60.0: nor for what a timer does when it starts or ends.
+    for (const event of ["timer-state", "timer-actions", "soundboard-stopped"]) {
+      expect(await listenCount(page, event), event).toBe(0);
+    }
     expect(await stored(page)).toBeNull();
     expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
@@ -2047,9 +2054,12 @@ test.describe("Hourglass (v1.59)", () => {
   }) => {
     await nav(page, "Settings").click();
     await section(page).getByRole("button", { name: "Add countdown" }).click();
-    // The backend hears of it, and the page listens from now on.
+    // The backend hears of it, and the page listens from now on (v1.60.0:
+    // for what a timer's start and end do too), once each.
     await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS]);
-    expect(await listenCount(page, "timer-state")).toBe(1);
+    for (const event of ["timer-state", "timer-actions", "soundboard-stopped"]) {
+      expect(await listenCount(page, event), event).toBe(1);
+    }
     expect(await stored(page)).toEqual({ version: 1, timers: [{ ...COUNTDOWN, hotkeys: {} }] });
     // No state from the backend yet (the mock answered null): no controls
     // but Rename and Delete.
@@ -2113,12 +2123,22 @@ test.describe("Hourglass (v1.59)", () => {
     await expect(card(page).getByRole("button", { name: "Clear BRB start or pause hotkey" })).toBeVisible();
     expect(await stored(page)).toMatchObject({ timers: [{ id: "timer-1", hotkeys: { toggle: "F9" } }] });
 
+    // v1.60.0: End now's key, the third row, registers as `finish`.
+    await card(page).getByRole("button", { name: "BRB end now hotkey: not set" }).click();
+    await page.keyboard.press("F10");
+    const finish = {
+      cmd: "register_global_shortcut",
+      args: { id: "tm:timer-1:finish", accelerator: "F10" },
+    };
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound, finish]);
+    await expect(card(page).getByRole("button", { name: "BRB end now hotkey: F10" })).toBeVisible();
+
     // Kept in storage and never registered by this build: a later verb, and
     // a later kind's key.
     const LAP = { id: "timer-2", name: "Lap", kind: "lap", durationMs: 60_000 };
     await page.evaluate((lap) => {
       const s = JSON.parse(localStorage.getItem("divora.timers")!);
-      s.timers[0].hotkeys.finish = "F10";
+      s.timers[0].hotkeys.split = "F12";
       s.timers.push({ ...lap, hotkeys: { toggle: "F11" } });
       localStorage.setItem("divora.timers", JSON.stringify(s));
     }, LAP);
@@ -2128,9 +2148,10 @@ test.describe("Hourglass (v1.59)", () => {
     // Every stored timer goes to the backend, BRB with the run it had, so a
     // backend that restarted picks it up where it was.
     await expect.poll(() => invokesOf(page, "sync_timers")).toEqual([SYNC([{ ...BRB, resume: RUN }, LAP])]);
-    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    // Its End now key comes back with its start-or-pause key.
+    await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound, finish]);
     await page.waitForTimeout(300);
-    expect(await invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+    expect(await invokesOf(page, "register_global_shortcut")).toEqual([bound, finish]);
     // Sent at creation: before the boot's device enumeration (which holds
     // the main thread), and before any of its keys can work.
     const cmds = (await invokesOf(page)).map((i) => i.cmd);
@@ -2139,7 +2160,7 @@ test.describe("Hourglass (v1.59)", () => {
     // Both are still stored as they were.
     expect(await stored(page)).toMatchObject({
       timers: [
-        { id: "timer-1", hotkeys: { toggle: "F9", finish: "F10" }, run: RUN },
+        { id: "timer-1", hotkeys: { toggle: "F9", finish: "F10", split: "F12" }, run: RUN },
         { id: "timer-2", kind: "lap", hotkeys: { toggle: "F11" } },
       ],
     });
@@ -2156,10 +2177,11 @@ test.describe("Hourglass (v1.59)", () => {
 
     // The backend paused it on the press and still sends the event. The page
     // must not act on it as well: that would pause it and start it again.
+    // v1.60.0: End now's key too, which the backend ends it on.
     await page.evaluate(() => {
       const emit = (window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void })
         .__E2E_EMIT__;
-      for (const verb of ["toggle", "reset"]) {
+      for (const verb of ["toggle", "reset", "finish"]) {
         for (const state of ["pressed", "released"]) {
           emit("global-shortcut", { id: `tm:timer-1:${verb}`, accelerator: "F9", state });
         }
@@ -2175,7 +2197,7 @@ test.describe("Hourglass (v1.59)", () => {
     expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
   });
 
-  test("Delete asks twice, then unregisters both keys, syncs without the timer and takes its face off the overlay", async ({
+  test("Delete asks twice, then unregisters its three keys, syncs without the timer and takes its face off the overlay", async ({
     page,
     consoleErrors,
   }) => {
@@ -2211,11 +2233,12 @@ test.describe("Hourglass (v1.59)", () => {
     await expect(charmRow).toHaveCount(1);
 
     await confirm.click();
-    // Both keys, set or not, so none is left to start whatever timer takes
-    // this id next; then the backend drops it.
+    // Every key, set or not, so none is left to start whatever timer takes
+    // this id next (v1.60.0: End now's too); then the backend drops it.
     await expect.poll(() => invokesOf(page, "unregister_global_shortcut")).toEqual([
       { cmd: "unregister_global_shortcut", args: { id: "tm:timer-1:toggle" } },
       { cmd: "unregister_global_shortcut", args: { id: "tm:timer-1:reset" } },
+      { cmd: "unregister_global_shortcut", args: { id: "tm:timer-1:finish" } },
     ]);
     await expect.poll(() => timerCalls(page)).toEqual([...before, SYNC([])]);
     // Its face goes too, not just its name: a face left behind would read
@@ -2227,6 +2250,275 @@ test.describe("Hourglass (v1.59)", () => {
     await expect(section(page)).toContainText("No timers yet — add one below.");
     expect(await stored(page)).toMatchObject({ timers: [] });
     expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+  });
+
+  // v1.60.0: a countdown's At start and At zero lists. The backend decides
+  // what a start or an end runs and runs its own half (the mute, a line,
+  // a replay, Stop all); the page hears its half (preset switches, clips)
+  // as `timer-actions`. These specs send that event with emitTimerActions
+  // and move the mute with setMockMute, as the action worker would.
+  test.describe("timers that change your voice (v1.60)", () => {
+    const VILLAGER = { ...COUNTDOWN, name: "Villager" };
+    /** What Add break (BRB) stores and sends: one countdown, its lists in it. */
+    const BREAK = {
+      ...BRB,
+      onStart: [{ kind: "setMuted", muted: true }],
+      onFire: [{ kind: "setMuted", muted: false }],
+    };
+    /** The run the page keeps for PAUSED (runOf). */
+    const PAUSED_RUN = { phase: "paused", ms: RUNNING.ms, totalMs: 300_000 };
+    const named = (s: Snapshot, name: string): Snapshot => ({
+      seq: s.seq,
+      timers: brb(s).timers.map((t) => ({ ...t, name })),
+    });
+    const atStart = (page: Page) => card(page).locator('[data-timer-list="onStart"]');
+    const atZero = (page: Page) => card(page).locator('[data-timer-list="onFire"]');
+    /** The chain each `set_effect_chain` sent, in order. */
+    const chainsSent = async (page: Page) =>
+      (await invokesOf(page, "set_effect_chain")).map((i) => i.args.specs);
+    /** A preset's chain as the page sends it, at least the values the
+     *  mock's list gives (the page fills in each effect's defaults). */
+    const specsOf = (id: string) =>
+      MOCK_PRESETS.find((p) => p.id === id)!.chain.map((e) => ({
+        kind: e.id,
+        enabled: e.enabled,
+        params: e.vals,
+      }));
+    /** The mute commands this page has sent: a timer's are the backend's. */
+    const muteWrites = async (page: Page) =>
+      (await invokesOf(page)).filter((i) => ["set_input_muted", "toggle_input_muted"].includes(i.cmd));
+    const pill = (page: Page) => page.getByTestId("titlebar-status");
+    /** Settings → Add break (BRB): one save and one sync, both lists in it,
+     *  and the backend's idle state for it. */
+    async function addBreak(page: Page): Promise<void> {
+      await nav(page, "Settings").click();
+      await section(page).getByRole("button", { name: "Add break (BRB)" }).click();
+      await expect.poll(() => timerCalls(page)).toEqual([SYNC([BREAK]), STATUS]);
+      expect(await stored(page)).toEqual({ version: 1, timers: [{ ...BREAK, hotkeys: {} }] });
+      await emitTimers(page, brb(TIMER_SAMPLES.idle));
+    }
+    /** Start BRB, then what the backend does: its worker mutes, its thread
+     *  tells the page (nothing in its half) and sends the state, and the
+     *  next level tick brings the mute. */
+    async function startBreak(page: Page): Promise<void> {
+      await card(page).getByRole("button", { name: "Start BRB" }).click();
+      await expect
+        .poll(async () => (await timerCalls(page)).at(-1))
+        .toEqual({ cmd: "arm_timer", args: { id: "timer-1" } });
+      expect(await setMockMute(page, true)).toEqual({ muted: true, seq: 1 });
+      await emitTimerActions(page, { seq: 1, id: "timer-1", hook: "start", why: "armed", lateMs: 0, actions: [] });
+      await emitTimers(page, brb(TIMER_SAMPLES.running));
+      await emitLevels(page, { inputMuted: true, inputMuteSeq: 1 });
+      await expect(pill(page)).toHaveText("Muted");
+    }
+
+    test("Villager: its lists are built by clicks, one sync each; its start switches with one chain, and zero switches back", async ({
+      page,
+      consoleErrors,
+    }) => {
+      await nav(page, "Settings").click();
+      // Through the boot: the engine starts once the real preset list has
+      // loaded, so the pickers offer it and a switch sends a chain.
+      await expect.poll(async () => (await invokesOf(page, "start_audio_engine")).length).toBe(1);
+      await section(page).getByRole("button", { name: "Add countdown" }).click();
+      await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS]);
+      await card(page).getByRole("button", { name: "Rename Countdown" }).click();
+      const field = card(page).getByRole("textbox", { name: "Name of Countdown" });
+      await field.fill("Villager");
+      await field.press("Enter");
+      await expect.poll(() => timerCalls(page)).toEqual([SYNC([COUNTDOWN]), STATUS, SYNC([VILLAGER])]);
+      // The lists come with the backend's state, as the other controls do.
+      await emitTimers(page, named(TIMER_SAMPLES.idle, "Villager"));
+      await expect(atStart(page)).toContainText("Nothing yet.");
+      await expect(atZero(page)).toContainText("Nothing yet.");
+
+      // At start: Switch preset. It starts on a preset other than the live
+      // one (Hollow King), and its picker says which.
+      await card(page).getByRole("button", { name: "Add an action at the start of Villager" }).click();
+      await card(page)
+        .getByRole("listbox", { name: "Actions to add at the start of Villager" })
+        .getByRole("option", { name: "Switch preset", exact: true })
+        .click();
+      const toWraith = SYNC([{ ...VILLAGER, onStart: [{ kind: "preset", presetId: "static-wraith" }] }]);
+      await expect.poll(async () => (await timerCalls(page)).slice(3)).toEqual([toWraith]);
+      await card(page)
+        .getByRole("button", { name: "Preset Villager switches to at the start: Static Wraith" })
+        .click();
+      await card(page)
+        .getByRole("listbox", { name: "Preset Villager switches to at the start" })
+        .getByRole("option", { name: /^Villager/ })
+        .click();
+      const START = [{ kind: "preset" as const, presetId: "villager" }];
+      const toVillager = SYNC([{ ...VILLAGER, onStart: START }]);
+      await expect.poll(async () => (await timerCalls(page)).slice(3)).toEqual([toWraith, toVillager]);
+      await expect(
+        card(page).getByRole("button", { name: "Preset Villager switches to at the start: Villager" }),
+      ).toBeVisible();
+      // Nothing at zero switches back yet, and the card says so.
+      const NO_REVERT = "This switches your preset when it starts, and nothing at zero switches back";
+      await expect(card(page)).toContainText(NO_REVERT);
+
+      // At zero: Back to the preset before.
+      await card(page).getByRole("button", { name: "Add an action at zero of Villager" }).click();
+      await card(page)
+        .getByRole("listbox", { name: "Actions to add at zero of Villager" })
+        .getByRole("option", { name: "Back to the preset before", exact: true })
+        .click();
+      const ZERO = [{ kind: "revertPreset" as const }];
+      const withRevert = SYNC([{ ...VILLAGER, onStart: START, onFire: ZERO }]);
+      await expect
+        .poll(async () => (await timerCalls(page)).slice(3))
+        .toEqual([toWraith, toVillager, withRevert]);
+      await expect(atZero(page)).toContainText("Back to the preset before");
+      await expect(card(page)).not.toContainText(NO_REVERT);
+      expect(await stored(page)).toEqual({
+        version: 1,
+        timers: [{ ...VILLAGER, hotkeys: {}, onStart: START, onFire: ZERO }],
+      });
+
+      // Start. The backend runs nothing of its own here and sends the page
+      // its half: the switch to Villager.
+      const booted = await chainsSent(page);
+      expect(booted.at(-1)).toMatchObject(specsOf("hollow-king"));
+      await card(page).getByRole("button", { name: "Start Villager" }).click();
+      await expect
+        .poll(async () => (await timerCalls(page)).at(-1))
+        .toEqual({ cmd: "arm_timer", args: { id: "timer-1" } });
+      await emitTimerActions(page, {
+        seq: 1,
+        id: "timer-1",
+        hook: "start",
+        why: "armed",
+        lateMs: 0,
+        actions: START,
+      });
+      await emitTimers(page, named(TIMER_SAMPLES.running, "Villager"));
+      // One chain, Villager's, and where it came from is kept for zero.
+      await expect.poll(async () => (await chainsSent(page)).length).toBe(booted.length + 1);
+      expect((await chainsSent(page)).at(-1)).toMatchObject(specsOf("villager"));
+      expect(await stored(page)).toMatchObject({
+        presetReturns: [{ timer: "timer-1", from: "hollow-king", to: "villager" }],
+      });
+      await expect(page.getByTestId("timer-voice-line")).toHaveText("Your preset is Villager until this ends.");
+      await page.waitForTimeout(300);
+      expect(await chainsSent(page)).toHaveLength(booted.length + 1);
+
+      // 00:00: the page's half is Back to the preset before, and Villager is
+      // still the live preset, so it switches back to Hollow King.
+      await emitTimerActions(page, {
+        seq: 2,
+        id: "timer-1",
+        hook: "end",
+        why: "zero",
+        lateMs: 0,
+        actions: ZERO,
+      });
+      await emitTimers(page, named(TIMER_SAMPLES.done, "Villager"));
+      await expect.poll(async () => (await chainsSent(page)).length).toBe(booted.length + 2);
+      expect((await chainsSent(page)).at(-1)).toEqual(booted.at(-1));
+      await expect(page.getByTestId("timer-voice-line")).toHaveCount(0);
+      // The return is settled, and the key goes with the last one.
+      await expect.poll(async () => "presetReturns" in ((await stored(page)) as object)).toBe(false);
+      await page.waitForTimeout(300);
+      expect(await chainsSent(page)).toHaveLength(booted.length + 2);
+      // Nothing of the backend's was sent from the page.
+      expect(await muteWrites(page)).toEqual([]);
+      expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+    });
+
+    test("Add break (BRB) syncs once with both lists; End now goes after a Pause, and the mute is the backend's", async ({
+      page,
+      consoleErrors,
+    }) => {
+      await addBreak(page);
+      // Its rows say what it does, and End now waits for a run.
+      await expect(atStart(page)).toContainText("Mute my voice");
+      await expect(atZero(page)).toContainText("Unmute my voice");
+      const endNow = card(page).getByRole("button", { name: "End BRB now" });
+      await expect(endNow).toBeDisabled();
+
+      await startBreak(page);
+      await expect(endNow).toBeEnabled();
+
+      // Pause, then End now at once: through the timers' queue, End now
+      // reaches the backend after the pause.
+      const before = (await timerCalls(page)).length;
+      await card(page).getByRole("button", { name: "Pause BRB" }).click();
+      await endNow.click();
+      await expect.poll(async () => (await timerCalls(page)).slice(before)).toEqual([
+        { cmd: "pause_timer", args: { id: "timer-1" } },
+        { cmd: "finish_timer", args: { id: "timer-1" } },
+      ]);
+      // The backend: its worker unmutes, its thread tells the page and sends
+      // Done, and the next tick brings the unmute.
+      expect(await setMockMute(page, false)).toEqual({ muted: false, seq: 2 });
+      await emitTimerActions(page, { seq: 2, id: "timer-1", hook: "end", why: "endNow", lateMs: 0, actions: [] });
+      await emitTimers(page, brb(TIMER_SAMPLES.done));
+      await expect(page.getByTestId("hourglass-announcer")).toHaveText("BRB is done.");
+      await emitLevels(page, { inputMuted: false, inputMuteSeq: 2 });
+      await expect(pill(page)).not.toHaveText("Muted");
+      await expect(card(page)).toContainText("Done");
+      await expect(endNow).toBeDisabled();
+      // The page never sent the mute, either way.
+      await page.waitForTimeout(300);
+      expect(await muteWrites(page)).toEqual([]);
+      expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+    });
+
+    test("a break paused by its key says you stay muted, and says so again after a reload", async ({
+      page,
+      consoleErrors,
+    }) => {
+      await addBreak(page);
+      // Its start-or-pause key, which on a break says it pauses.
+      await card(page).getByRole("button", { name: "BRB start or pause hotkey: not set" }).click();
+      await page.keyboard.press("F9");
+      const bound = {
+        cmd: "register_global_shortcut",
+        args: { id: "tm:timer-1:toggle", accelerator: "F9" },
+      };
+      await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+      await expect(card(page)).toContainText("It pauses a break and doesn't end it; End now's key ends it.");
+      await startBreak(page);
+
+      // The key, pressed: the backend pauses it and still sends the event;
+      // the page sends nothing for it.
+      const before = await timerCalls(page);
+      await page.evaluate(() => {
+        const emit = (window as unknown as { __E2E_EMIT__: (e: string, p: unknown) => void })
+          .__E2E_EMIT__;
+        for (const state of ["pressed", "released"]) {
+          emit("global-shortcut", { id: "tm:timer-1:toggle", accelerator: "F9", state });
+        }
+      });
+      await emitTimers(page, PAUSED);
+      const LINE =
+        "BRB is paused, so you stay muted until you resume it and it reaches zero, or press End now or Reset.";
+      await expect(card(page)).toContainText(LINE);
+      expect(await timerCalls(page)).toEqual(before);
+
+      // A reload: the backend keeps the run and the mute.
+      await page.reload();
+      await expect(page.locator(".titlebar-wordmark")).toBeVisible();
+      // The boot syncs the paused run with both lists, then registers its key.
+      await expect
+        .poll(() => invokesOf(page, "sync_timers"))
+        .toEqual([SYNC([{ ...BREAK, resume: PAUSED_RUN }])]);
+      await expect.poll(() => invokesOf(page, "register_global_shortcut")).toEqual([bound]);
+      await expect(pill(page)).toHaveText("Muted");
+      await nav(page, "Settings").click();
+      // The backend's state reaches the page once it listens (in the app,
+      // the boot's `timer_status` brings it).
+      await expect.poll(() => listenCount(page, "timer-state")).toBe(1);
+      await emitTimers(page, PAUSED);
+      await expect(card(page)).toContainText(LINE);
+      // The page names why you're muted, once.
+      await expect(page.getByTestId("toast")).toHaveText(
+        "BRB is paused, so you stay muted. Press End now or Reset to unmute.",
+      );
+      expect(await muteWrites(page)).toEqual([]);
+      expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
+    });
   });
 });
 

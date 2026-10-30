@@ -8,17 +8,19 @@
 //! lock, reads the clock once, asks the one [`SleepCheck`] about that
 //! reading, then acts (D5). The lock is a leaf: nothing else is locked while
 //! it is held, and nothing slow happens under it. The core never logs: the
-//! thread logs its transitions and notes after letting go, then emits and
-//! hands the texts to the writer, and only the writer touches the timers'
-//! files, so no disk wait can delay a deadline (D13, D21).
+//! thread logs its transitions and notes after letting go — v1.60.0: after
+//! its hand-offs, its emit and the texts — and only the writer touches the
+//! timers' files, so no disk wait can delay a deadline (D13, D21).
 //!
 //! Neither thread is joined or stopped: Divora has no exit hook, and both
 //! run for the process (D14).
 //!
-//! v1.60.0: a hook run's backend half goes to `divora-timer-actions`, the
-//! action worker, by a send that never waits ([`hand_off`]); the worker runs
-//! each batch in order against an [`ActionHost`], so nothing that can wait
-//! runs on `divora-timers` (D13, D14).
+//! v1.60.0: the thread plans each drained transition once ([`plan`]) and
+//! hands its backend half to `divora-timer-actions`, the action worker, by a
+//! send that never waits ([`hand_off`]); the worker runs each batch in order
+//! against an [`ActionHost`], so nothing that can wait runs on
+//! `divora-timers` (D13, D14). Its log lines come after every hand-off, so a
+//! log write stuck on the disk can't delay a mute (AT4).
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -30,7 +32,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::timer_actions::{route, Action, ActionBatch, Hook, Planned, TimerActionsEvent};
+use crate::timer_actions::{
+    plan, route, Action, ActionBatch, Hook, Planned, TimerActionsEvent, LATE_ONE_SHOTS_MS,
+};
 use crate::timers::{
     entry_from_wire, hotkey_timer_request, CancelWhy, Note, TextUpdate, TimerCore, TimerOp,
     TimerSnapshot, Transition, LATE_LOG, MAX_SYNC_ENTRIES,
@@ -124,37 +128,23 @@ pub trait ActionHost: Send + 'static {
     fn end_run(&self, timer: &str);
 }
 
-/// v1.60.0: `b` to the action worker without waiting. `false` when it was
-/// dropped — the queue full or the worker gone — warned once per 10 s at
-/// most.
+/// v1.60.0: `b` to the action worker without waiting (`try_send`, as the
+/// wake channel's): `false` when it was dropped — the queue full (the worker
+/// [`ACTION_QUEUE`] batches behind) or the worker gone. It never logs:
+/// [`hand_off`] warns of a drop after its emit.
 pub fn hand_batch(tx: &SyncSender<ActionBatch>, b: ActionBatch) -> bool {
-    const WARN_EVERY: Duration = Duration::from_secs(10);
-    static WARNED: Mutex<Option<Instant>> = Mutex::new(None);
-    let (why, id) = match tx.try_send(b) {
-        Ok(()) => return true,
-        Err(TrySendError::Full(b)) => ("the action worker is behind", b.id),
-        Err(TrySendError::Disconnected(b)) => ("the action worker isn't running", b.id),
-    };
-    let now = Instant::now();
-    let warn = {
-        let mut warned = lock(&WARNED);
-        let due = warned.is_none_or(|at| now.saturating_duration_since(at) >= WARN_EVERY);
-        if due {
-            *warned = Some(now);
-        }
-        due
-    };
-    if warn {
-        tracing::warn!(id = %id, "a timer's actions were dropped: {why}");
+    match tx.try_send(b) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
     }
-    false
 }
 
 /// v1.60.0 (D13): one hook run's hand-off, in this order: [`route`], the
 /// batch to the worker ([`hand_batch`]), then `emit` with the page's event —
-/// so the batch never waits for the emit. `drained` is when the timer thread
-/// drained the transition. A restart's re-mute hands a batch and emits
-/// nothing.
+/// so the batch never waits for the emit — and only then, if the batch was
+/// dropped, a warning (once per 10 s at most), so even that write comes
+/// after the emit. `drained` is when the timer thread drained the
+/// transition. A restart's re-mute hands a batch and emits nothing.
 #[doc(hidden)]
 pub fn hand_off(
     p: &Planned,
@@ -164,11 +154,34 @@ pub fn hand_off(
     emit: impl FnOnce(&TimerActionsEvent),
 ) {
     let (batch, event) = route(p, seq, drained);
-    if let Some(b) = batch {
-        hand_batch(tx, b);
-    }
+    let dropped = batch.is_some_and(|b| !hand_batch(tx, b));
     if let Some(ev) = event {
         emit(&ev);
+    }
+    if dropped {
+        warn_dropped(&p.id, seq);
+    }
+}
+
+/// K3: a dropped batch's warning, at most once per 10 s.
+fn warn_dropped(id: &str, seq: u64) {
+    const WARN_EVERY: Duration = Duration::from_secs(10);
+    static WARNED: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let due = {
+        let mut warned = lock(&WARNED);
+        let due = warned.is_none_or(|at| now.saturating_duration_since(at) >= WARN_EVERY);
+        if due {
+            *warned = Some(now);
+        }
+        due
+    };
+    if due {
+        tracing::warn!(
+            id = %id,
+            seq,
+            "a timer's actions were dropped: the action worker is behind or isn't running"
+        );
     }
 }
 
@@ -445,10 +458,14 @@ pub fn timer_on_hotkey(shared: &TimerShared, id: &str, pressed: bool) {
 /// sleep, tick, build a snapshot if anything changed, take the texts (once
 /// a sync has said which timers exist), compute the next wake instant from
 /// that same reading, and drain the transitions and notes — any reader's,
-/// so one a command or a press left is logged within a [`TICK`] at most;
-/// then, unlocked, log them, emit, and hand the texts on. Returns when the
-/// waiter reports [`Woke::Closed`]. Tests run it on their own thread with
-/// fakes.
+/// so one a command or a press left is acted on and logged within a
+/// [`TICK`] at most. Then, unlocked and in this order (v1.60.0, AT4): each
+/// transition [`plan`]ned once and, when it runs or tells anything, handed
+/// on with the next `seq` ([`TimerEvents::timer_actions`]: the batch to the
+/// worker, then the page's event); the snapshot's emit; the texts to the
+/// writer; and only then the notes' and transitions' log lines, each
+/// transition's with the `seq` it got. Returns when the waiter reports
+/// [`Woke::Closed`]. Tests run it on their own thread with fakes.
 ///
 /// [`TICK`]: crate::timers::TICK
 #[doc(hidden)]
@@ -460,6 +477,9 @@ pub fn run_timer_loop(
     cap: Duration,
 ) {
     let mut wake_at = Duration::ZERO;
+    // v1.60.0: the last hook run's number (`timer-actions`' `seq`), + 1 per
+    // planned transition; a restart's re-mute takes one and isn't sent.
+    let mut seq: u64 = 0;
     loop {
         if waiter.wait(wake_at.saturating_sub(shared.clock.now())) == Woke::Closed {
             return;
@@ -472,24 +492,35 @@ pub fn run_timer_loop(
                 wake_at = now.saturating_add(core.next_wake(now, cap));
                 (snapshot, update, core.take_transitions(), core.take_notes())
             });
-        for n in &notes {
-            log_note(n);
-        }
-        for t in &transitions {
-            log_transition(t);
-        }
+        let seqs: Vec<Option<u64>> = transitions
+            .iter()
+            .map(|t| {
+                let p = plan(t)?;
+                seq = seq.saturating_add(1);
+                events.timer_actions(&p, seq);
+                Some(seq)
+            })
+            .collect();
         if let Some(s) = snapshot {
             events.timer_state(&s);
         }
         if let Some(u) = update {
             sink.update(u);
         }
+        for n in &notes {
+            log_note(n);
+        }
+        for (t, seq) in transitions.iter().zip(seqs) {
+            log_transition(t, seq);
+        }
     }
 }
 
-/// One line per transition (D34): what S2 reads back, and v1.60.0's place
-/// to act from.
-fn log_transition(t: &Transition) {
+/// One line per transition (D34): what S2 reads back. v1.60.0: with the
+/// `seq` of its hook run when it had one (`timer-actions`' `seq`, or the
+/// restart's re-mute's, which isn't sent), so a run can be matched to what
+/// the page heard; written only after every hand-off.
+fn log_transition(t: &Transition, seq: Option<u64>) {
     match t {
         Transition::Fired {
             id,
@@ -497,19 +528,32 @@ fn log_transition(t: &Transition) {
             finished: true,
             ..
         } => {
-            tracing::info!(id = %id, fires, "a timer was ended now");
+            tracing::info!(id = %id, fires, seq, "a timer was ended now");
         }
         Transition::Fired {
             id, fires, late_ms, ..
         } => {
-            if Duration::from_millis(*late_ms) > LATE_LOG {
-                tracing::warn!(id = %id, fires, late_ms, "a timer finished late");
+            if seq.is_some() && *late_ms > LATE_ONE_SHOTS_MS {
+                // D9: its plan ran only what puts a start's change back.
+                tracing::warn!(
+                    id = %id,
+                    fires,
+                    late_ms,
+                    seq,
+                    "a timer finished late; only what puts things back runs"
+                );
+            } else if Duration::from_millis(*late_ms) > LATE_LOG {
+                tracing::warn!(id = %id, fires, late_ms, seq, "a timer finished late");
             } else {
-                tracing::info!(id = %id, fires, late_ms, "a timer finished");
+                tracing::info!(id = %id, fires, late_ms, seq, "a timer finished");
             }
         }
         Transition::Expired { id, .. } => {
-            tracing::info!(id = %id, "a timer ran out while the PC slept; not finished");
+            tracing::info!(
+                id = %id,
+                seq,
+                "a timer ran out while the PC slept; not finished"
+            );
         }
         Transition::SleepPaused { id } => {
             tracing::info!(id = %id, "a count-up paused where the PC slept");
@@ -517,14 +561,14 @@ fn log_transition(t: &Transition) {
         Transition::Seeded {
             id, phase, from, ..
         } => {
-            tracing::info!(id = %id, ?phase, ?from, "a timer picked up its stored run");
+            tracing::info!(id = %id, ?phase, ?from, seq, "a timer picked up its stored run");
         }
         Transition::Started { id, fires, .. } => {
-            tracing::info!(id = %id, fires, "a timer started");
+            tracing::info!(id = %id, fires, seq, "a timer started");
         }
         Transition::Cancelled { id, why, .. } => match why {
-            CancelWhy::Reset => tracing::info!(id = %id, "a running timer was reset"),
-            CancelWhy::Removed => tracing::info!(id = %id, "a running timer was deleted"),
+            CancelWhy::Reset => tracing::info!(id = %id, seq, "a running timer was reset"),
+            CancelWhy::Removed => tracing::info!(id = %id, seq, "a running timer was deleted"),
         },
     }
 }
@@ -1149,23 +1193,25 @@ fn numbered(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        retryable, run_timer_loop, spawn_text_writer, sweepable, timer_on_hotkey, timers_dir_name,
-        write_text, ChannelWaiter, RealClock, SleepCheck, TextFiles, TextSink, TextSlot,
-        TextWriter, TimerClock, TimerEvents, TimerShared, Waiter, Woke, BACKOFF_AFTER,
-        REPAIR_EVERY, RETRY_WAIT,
+        hand_batch, hand_off, retryable, run_action_worker, run_timer_loop, spawn_text_writer,
+        sweepable, timer_on_hotkey, timers_dir_name, write_text, ActionHost, ChannelWaiter,
+        RealClock, SleepCheck, TextFiles, TextSink, TextSlot, TextWriter, TimerClock, TimerEvents,
+        TimerShared, Waiter, Woke, ACTION_QUEUE, BACKOFF_AFTER, REPAIR_EVERY, RETRY_WAIT,
     };
-    use crate::timer_actions::Planned;
+    use crate::timer_actions::{
+        plan, route, Action, ActionBatch, Hook, Hooks, Planned, TimerActionsEvent, Why,
+    };
     use crate::timers::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use crate::timers::{
-        timer_text, TextUpdate, TimerKind, TimerOp, TimerPhase, TimerSnapshot, MAX_SYNC_ENTRIES,
-        TICK,
+        timer_text, TextUpdate, TimerKind, TimerOp, TimerPhase, TimerSnapshot, Transition,
+        MAX_SYNC_ENTRIES, TICK,
     };
     use serde_json::{json, Value};
     use std::collections::{HashSet, VecDeque};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1443,11 +1489,20 @@ mod tests {
         s: &'scope std::thread::Scope<'scope, '_>,
         f: impl FnOnce() -> T + Send + 'scope,
     ) -> bool {
+        answer_within(s, f).is_some()
+    }
+
+    /// What `f`, run on its own thread, returns within a second; `None` if
+    /// it hasn't returned by then.
+    fn answer_within<'scope, T: Send + 'scope>(
+        s: &'scope std::thread::Scope<'scope, '_>,
+        f: impl FnOnce() -> T + Send + 'scope,
+    ) -> Option<T> {
         let (done, finished) = mpsc::channel();
         s.spawn(move || {
             let _ = done.send(f());
         });
-        finished.recv_timeout(secs(1)).is_ok()
+        finished.recv_timeout(secs(1)).ok()
     }
 
     /// Holds whoever passes it until the test says go.
@@ -1471,26 +1526,28 @@ mod tests {
         }
     }
 
-    /// Blocks its first emit — a snapshot or (v1.60.0) a hook run — at a
-    /// gate.
-    struct GatedEvents(Mutex<Option<Gate>>);
+    /// Blocks its first snapshot emit at one gate and (v1.60.0) its first
+    /// hook run's hand-off at another.
+    struct GatedEvents {
+        state: Mutex<Option<Gate>>,
+        actions: Mutex<Option<Gate>>,
+    }
 
-    impl GatedEvents {
-        fn pass(&self) {
-            let gate = self.0.lock().unwrap().take();
-            if let Some(gate) = gate {
-                gate.pass();
-            }
+    /// Passes `gate` the first time; after that, nothing holds.
+    fn pass_once(gate: &Mutex<Option<Gate>>) {
+        let gate = gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.pass();
         }
     }
 
     impl TimerEvents for GatedEvents {
         fn timer_state(&self, _s: &TimerSnapshot) {
-            self.pass();
+            pass_once(&self.state);
         }
 
         fn timer_actions(&self, _p: &Planned, _seq: u64) {
-            self.pass();
+            pass_once(&self.actions);
         }
     }
 
@@ -1537,6 +1594,204 @@ mod tests {
                 gate.pass();
             }
         }
+    }
+
+    /// The app's log format, its first line containing `at` held at `gate`.
+    fn gated_log(at: &'static str, gate: Gate) -> impl tracing::Subscriber + Send + Sync {
+        let gate = Arc::new(Mutex::new(Some(gate)));
+        tracing_subscriber::fmt()
+            .with_writer(move || GatedLog {
+                at,
+                gate: gate.clone(),
+            })
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .finish()
+    }
+
+    // ---- v1.60.0: the hand-off and the worker ----------------------------
+
+    /// What the loop handed on through [`Handing`], in order.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Out {
+        /// A hook run handed on: its plan and `seq`.
+        Run(Planned, u64),
+        /// The page's `timer-actions` event, emitted inside the hand-off.
+        Page(TimerActionsEvent),
+        /// A `timer-state` snapshot, with the fake clock it went out at.
+        State(Duration, TimerSnapshot),
+    }
+
+    /// The timer thread's outputs as production wires them: each hook run
+    /// through the real [`hand_off`] onto a real queue for the worker, the
+    /// page's event recorded where `TimerOutputs` emits it. (`TimerOutputs`
+    /// itself needs an `AppHandle`; lib.rs's `the_outputs_hand_off` pins
+    /// that its `timer_actions` is this one call.)
+    struct Handing {
+        clock: Arc<FakeClock>,
+        tx: SyncSender<ActionBatch>,
+        out: Mutex<Vec<Out>>,
+    }
+
+    impl Handing {
+        fn new(clock: &Arc<FakeClock>, tx: SyncSender<ActionBatch>) -> Self {
+            Self {
+                clock: clock.clone(),
+                tx,
+                out: Mutex::default(),
+            }
+        }
+
+        fn out(&self) -> Vec<Out> {
+            self.out.lock().unwrap().clone()
+        }
+    }
+
+    impl TimerEvents for Handing {
+        fn timer_state(&self, s: &TimerSnapshot) {
+            let at = self.clock.now();
+            self.out.lock().unwrap().push(Out::State(at, s.clone()));
+        }
+
+        fn timer_actions(&self, p: &Planned, seq: u64) {
+            self.out.lock().unwrap().push(Out::Run(p.clone(), seq));
+            hand_off(p, seq, Instant::now(), &self.tx, |ev| {
+                self.out.lock().unwrap().push(Out::Page(ev.clone()));
+            });
+        }
+    }
+
+    /// The hook runs in `out`: (timer, hook, why, seq).
+    fn runs(out: &[Out]) -> Vec<(&str, Hook, Why, u64)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Run(p, seq) => Some((p.id.as_str(), p.hook, p.why, *seq)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The page's events in `out`: (seq, timer, hook, why).
+    fn pages(out: &[Out]) -> Vec<(u64, &str, Hook, Why)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Page(ev) => Some((ev.seq, ev.id.as_str(), ev.hook, ev.why)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One thing the worker asked of its host.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Call {
+        Muted(bool),
+        StopAll,
+        Save(Instant),
+        /// The timer, the text and the voice.
+        Speak(String, String, String),
+        EndRun(String),
+    }
+
+    fn end_run(id: &str) -> Call {
+        Call::EndRun(id.to_string())
+    }
+
+    /// A host that records what the worker asks of it.
+    #[derive(Clone, Default)]
+    struct Host(Arc<Mutex<Vec<Call>>>);
+
+    impl Host {
+        fn calls(&self) -> Vec<Call> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// Whether the calls come to satisfy `pred` within `limit`.
+        fn within(&self, limit: Duration, pred: impl Fn(&[Call]) -> bool) -> bool {
+            let end = Instant::now() + limit;
+            loop {
+                if pred(&self.0.lock().unwrap()) {
+                    return true;
+                }
+                if Instant::now() >= end {
+                    return false;
+                }
+                std::thread::sleep(ms(2));
+            }
+        }
+
+        fn push(&self, call: Call) {
+            self.0.lock().unwrap().push(call);
+        }
+    }
+
+    impl ActionHost for Host {
+        fn set_muted(&self, muted: bool) {
+            self.push(Call::Muted(muted));
+        }
+
+        fn stop_all(&self) {
+            self.push(Call::StopAll);
+        }
+
+        fn save_replay(&self, at: Instant) {
+            self.push(Call::Save(at));
+        }
+
+        fn speak(&self, timer: &str, text: &str, voice_id: &str) {
+            self.push(Call::Speak(
+                timer.to_string(),
+                text.to_string(),
+                voice_id.to_string(),
+            ));
+        }
+
+        fn end_run(&self, timer: &str) {
+            self.push(end_run(timer));
+        }
+    }
+
+    fn set_muted(muted: bool) -> Value {
+        json!({"kind": "setMuted", "muted": muted})
+    }
+
+    /// A countdown sync entry with these lists.
+    fn with_lists(id: &str, length_ms: u64, on_start: &[Value], on_fire: &[Value]) -> Value {
+        let mut entry = countdown(id, length_ms);
+        entry["onStart"] = Value::from(on_start.to_vec());
+        entry["onFire"] = Value::from(on_fire.to_vec());
+        entry
+    }
+
+    /// A break: mute at the start, unmute at zero.
+    fn brb(id: &str, length_ms: u64) -> Value {
+        with_lists(id, length_ms, &[set_muted(true)], &[set_muted(false)])
+    }
+
+    /// A break's lists, as the core carries them.
+    fn brb_hooks() -> Arc<Hooks> {
+        Arc::new(Hooks {
+            on_start: vec![Action::SetMuted { muted: true }],
+            on_fire: vec![Action::SetMuted { muted: false }],
+        })
+    }
+
+    /// The real loop on the fake clock, handing on through the real
+    /// [`hand_off`]; then the real worker over every batch it handed. What
+    /// the loop handed on, and what the worker asked of its host.
+    fn loop_then_worker(
+        shared: &Arc<TimerShared>,
+        clock: &Arc<FakeClock>,
+        mut waiter: FakeWaiter,
+    ) -> (Vec<Out>, Vec<Call>) {
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let events = Handing::new(clock, tx);
+        run_timer_loop(shared, &mut waiter, &events, &mut Handed::default(), TICK);
+        let out = events.out();
+        drop(events);
+        let host = Host::default();
+        run_action_worker(rx, &host);
+        (out, host.calls())
     }
 
     /// The log lines `f` writes on this thread at INFO and up, formatted as
@@ -2049,13 +2304,19 @@ mod tests {
     /// D13, D16: the thread emits, then hands texts over, only after it lets
     /// go of the core's lock. While its emit blocks, and then while its
     /// hand-off blocks, a command and a status read from another thread each
-    /// answer within a second.
+    /// answer within a second. v1.60.0 (TP5): and so they do while it is
+    /// held inside a hook run's hand-off — the `Started` of the Arm made
+    /// while it was held the first time.
     #[test]
     fn commands_never_wait_for_the_sink() {
         let (shared, woken) = real();
         let (entered_tx, entered) = mpsc::channel();
-        let (gate, emit_go) = Gate::new("emit", &entered_tx);
-        let events = GatedEvents(Mutex::new(Some(gate)));
+        let (state, emit_go) = Gate::new("emit", &entered_tx);
+        let (actions, actions_go) = Gate::new("actions", &entered_tx);
+        let events = GatedEvents {
+            state: Mutex::new(Some(state)),
+            actions: Mutex::new(Some(actions)),
+        };
         let (gate, hand_go) = Gate::new("hand-off", &entered_tx);
         let mut sink = GatedSink(Some(gate));
         std::thread::scope(|s| {
@@ -2064,21 +2325,29 @@ mod tests {
             s.spawn(move || run_timer_loop(looped, &mut waiter, events, &mut sink, TICK));
             shared.sync(vec![countdown("timer-1", 300_000)]);
             let mut blocked = Vec::new();
-            for op in [TimerOp::Arm, TimerOp::Pause] {
+            for op in [TimerOp::Arm, TimerOp::Pause, TimerOp::Resume] {
                 let at = entered.recv_timeout(secs(2)).expect("the thread blocked");
                 let core = &shared;
                 let readers = (
                     returns_within(s, move || core.apply("timer-1", op)),
                     returns_within(s, || shared.status()),
                 );
-                let go = if at == "emit" { &emit_go } else { &hand_go };
+                let go = match at {
+                    "emit" => &emit_go,
+                    "actions" => &actions_go,
+                    _ => &hand_go,
+                };
                 go.send(()).unwrap();
                 blocked.push((at, readers));
             }
             // (true, true): both readers answered while the thread was held.
             assert_eq!(
                 blocked,
-                [("emit", (true, true)), ("hand-off", (true, true))]
+                [
+                    ("emit", (true, true)),
+                    ("hand-off", (true, true)),
+                    ("actions", (true, true))
+                ]
             );
         });
     }
@@ -2179,6 +2448,567 @@ mod tests {
             timer_on_hotkey(&shared, id, true);
             assert_eq!(state(), (Idle, 60_000), "{id}");
         }
+    }
+
+    // ---- v1.60.0 (track B): the hand-off, the worker, End now's key -------
+
+    /// v1.60.0 (D13, seam 2): the thread plans each transition it drains
+    /// exactly once, whoever took it — a fire taken by a command's tick, End
+    /// now from a `tm:` press, a fire the thread's own tick takes — and
+    /// numbers its hook runs in turn. Every end hands the worker a batch
+    /// (its start's line retired, D21), and each transition's log line names
+    /// the `seq` it got.
+    #[test]
+    fn each_transition_is_planned_once() {
+        let (shared, clock, _woken) = fake();
+        let waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(3_000))
+            .at(ms(50), |s| {
+                s.sync(vec![
+                    countdown("timer-1", 1_000),
+                    countdown("timer-2", 60_000),
+                    countdown("timer-3", 2_000),
+                ]);
+            })
+            .at(ms(100), |s| {
+                for id in ["timer-1", "timer-2", "timer-3"] {
+                    s.apply(id, TimerOp::Arm).unwrap();
+                }
+            })
+            .at(ms(500), |s| timer_on_hotkey(s, "tm:timer-2:finish", true))
+            // timer-1's deadline: this command's tick takes the fire.
+            .at(ms(1_100), |s| {
+                s.apply("timer-1", TimerOp::Pause).unwrap();
+            });
+        let ((out, calls), log) = logged(|| loop_then_worker(&shared, &clock, waiter));
+
+        assert_eq!(
+            runs(&out),
+            [
+                ("timer-1", Hook::Start, Why::Armed, 1),
+                ("timer-2", Hook::Start, Why::Armed, 2),
+                ("timer-3", Hook::Start, Why::Armed, 3),
+                ("timer-2", Hook::End, Why::EndNow, 4),
+                ("timer-1", Hook::End, Why::Zero, 5),
+                ("timer-3", Hook::End, Why::Zero, 6),
+            ]
+        );
+        let seqs: Vec<u64> = pages(&out).iter().map(|&(seq, ..)| seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            calls,
+            [end_run("timer-2"), end_run("timer-1"), end_run("timer-3")]
+        );
+        for line in [
+            "a timer started id=timer-1 fires=0 seq=1",
+            "a timer started id=timer-3 fires=0 seq=3",
+            "a timer was ended now id=timer-2 fires=1 seq=4",
+            "a timer finished id=timer-1 fires=1 late_ms=0 seq=5",
+            "a timer finished id=timer-3 fires=1 late_ms=0 seq=6",
+        ] {
+            assert_eq!(lines(&log, "INFO", line), 1, "{line}\n{log}");
+        }
+    }
+
+    /// v1.60.0 (D13): within a pass the thread's own hand-offs go before its
+    /// snapshot — the batch and the page's event of each transition it
+    /// drained, then the `timer-state` of that pass. (Only the thread's own
+    /// emits are ordered: a command's answer can land before or after them,
+    /// AT8.)
+    #[test]
+    fn actions_go_before_the_snapshot() {
+        let (shared, clock, _woken) = fake();
+        let waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(1_500))
+            .at(ms(50), |s| {
+                s.sync(vec![countdown("timer-1", 1_000)]);
+            })
+            .at(ms(100), |s| {
+                s.apply("timer-1", TimerOp::Arm).unwrap();
+            });
+        let (out, _) = loop_then_worker(&shared, &clock, waiter);
+        let order: Vec<String> = out
+            .iter()
+            .map(|o| match o {
+                Out::Run(p, _) => format!("run {:?}", p.hook),
+                Out::Page(ev) => format!("page {:?}", ev.hook),
+                Out::State(at, s) => format!("state {} {:?}", at.as_millis(), s.timers[0].phase),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "state 50 Idle",
+                "run Start",
+                "page Start",
+                "state 100 Running",
+                "run End",
+                "page End",
+                "state 1100 Done",
+            ]
+        );
+    }
+
+    /// v1.60.0 (D13, TP2): [`hand_off`] itself. The page's emit finds the
+    /// batch already in the worker's queue; a restart's re-mute (P7) hands
+    /// its batch and calls no emit; a start with nothing for the backend
+    /// hands no batch and is emitted.
+    #[test]
+    fn hand_off_hands_the_batch_before_the_emit() {
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let drained = Instant::now();
+        let zero = plan(&Transition::Fired {
+            id: "timer-1".to_string(),
+            fires: 1,
+            late_ms: 0,
+            finished: false,
+            hooks: brb_hooks(),
+        })
+        .unwrap();
+        let mut heard = Vec::new();
+        hand_off(&zero, 7, drained, &tx, |ev| {
+            heard.push((ev.clone(), rx.try_recv().ok()));
+        });
+        let (batch, event) = route(&zero, 7, drained);
+        let batch = batch.expect("an end hands a batch");
+        assert_eq!(batch.actions, [Action::SetMuted { muted: false }]);
+        assert_eq!(heard, [(event.unwrap(), Some(batch))]);
+
+        let restart = plan(&Transition::Seeded {
+            id: "timer-1".to_string(),
+            phase: TimerPhase::Running,
+            from: TimerPhase::Running,
+            hooks: brb_hooks(),
+        })
+        .unwrap();
+        let mut emitted = false;
+        hand_off(&restart, 8, drained, &tx, |_| emitted = true);
+        let batch = rx.try_recv().expect("the re-mute was handed");
+        assert_eq!(
+            (batch.hook, batch.why, batch.actions, emitted),
+            (
+                Hook::Start,
+                Why::Restart,
+                vec![Action::SetMuted { muted: true }],
+                false
+            )
+        );
+
+        let start = plan(&Transition::Started {
+            id: "timer-1".to_string(),
+            fires: 0,
+            hooks: Arc::default(),
+        })
+        .unwrap();
+        let mut seqs = Vec::new();
+        hand_off(&start, 9, drained, &tx, |ev| seqs.push(ev.seq));
+        assert_eq!(seqs, [9]);
+        assert!(rx.try_recv().is_err(), "nothing for the worker");
+    }
+
+    /// v1.60.0 (D13, K3, AT10): a stalled worker never stalls the timer
+    /// thread. With the worker's queue full and its receiver alive and
+    /// unread, a hand-off returns at once and drops the batch — inside
+    /// `answer_within`'s second, not by hanging; with no worker, too. And
+    /// the real loop, every batch dropped, still emits each boundary's
+    /// snapshot and each page event at its time on the fake clock.
+    #[test]
+    fn a_full_action_queue_never_blocks_the_timer_thread() {
+        let batch = |id: &str| ActionBatch {
+            id: id.to_string(),
+            hook: Hook::End,
+            why: Why::Zero,
+            at: Instant::now(),
+            actions: vec![Action::SetMuted { muted: false }],
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(hand_batch(&tx, batch("timer-1")), "its one slot");
+        std::thread::scope(|s| {
+            let second = answer_within(s, || hand_batch(&tx, batch("timer-2")));
+            // A send that waits for room would still be waiting: make room,
+            // so the scope can end and the assertion below can fail.
+            let _ = rx.try_recv();
+            assert_eq!(second, Some(false), "a full queue drops the batch at once");
+        });
+        drop(rx);
+        assert!(!hand_batch(&tx, batch("timer-3")), "no worker drops it too");
+
+        let (shared, clock, _woken) = fake();
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(hand_batch(&tx, batch("ahead")), "the worker is behind");
+        let mut waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(4_000))
+            .at(ms(50), |s| {
+                s.sync(vec![brb("timer-1", 2_500)]);
+            })
+            .at(ms(100), |s| {
+                s.apply("timer-1", TimerOp::Arm).unwrap();
+            });
+        let events = Handing::new(&clock, tx);
+        std::thread::scope(|s| {
+            let (done_tx, done) = mpsc::channel();
+            let (looped, events) = (&shared, &events);
+            s.spawn(move || {
+                run_timer_loop(looped, &mut waiter, events, &mut Handed::default(), TICK);
+                let _ = done_tx.send(());
+            });
+            let finished = done.recv_timeout(secs(5)).is_ok();
+            // A hand-off that waited for room is stuck: let it through, so
+            // the scope can end and the assertion below can fail.
+            while !finished && done.try_recv().is_err() {
+                let _ = rx.recv_timeout(ms(10));
+            }
+            assert!(finished, "the loop waited on the worker's queue");
+        });
+        let out = events.out();
+        let states: Vec<(Duration, String)> = out
+            .iter()
+            .filter_map(|o| match o {
+                Out::State(at, s) => Some((*at, s.timers[0].text.clone())),
+                _ => None,
+            })
+            .collect();
+        let expected = [
+            (ms(50), "00:03"),
+            (ms(100), "00:03"),
+            (ms(600), "00:02"),
+            (ms(1_600), "00:01"),
+            (ms(2_600), "00:00"),
+        ]
+        .map(|(at, text)| (at, text.to_string()));
+        assert_eq!(states, expected);
+        assert_eq!(
+            pages(&out),
+            [
+                (1, "timer-1", Hook::Start, Why::Armed),
+                (2, "timer-1", Hook::End, Why::Zero)
+            ]
+        );
+        assert_eq!(rx.try_recv().map(|b| b.id).ok().as_deref(), Some("ahead"));
+        assert!(
+            rx.try_recv().is_err(),
+            "both of the timer's batches dropped"
+        );
+    }
+
+    /// v1.60.0 (D13, D14, AT4): no log write comes before an action. With the
+    /// timer thread's "a timer started" line stuck in the log file's write,
+    /// the worker has already muted; with the worker's own line for that
+    /// batch stuck, it has already muted too.
+    #[test]
+    fn a_slow_log_write_never_delays_an_action() {
+        let (entered_tx, entered) = mpsc::channel();
+
+        let (shared, clock, _woken) = fake();
+        shared.sync(vec![brb("timer-1", 300_000)]);
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let host = Host::default();
+        let (gate, go) = Gate::new("thread", &entered_tx);
+        let subscriber = gated_log("a timer started", gate);
+        let mut waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(1_000))
+            .at(ms(100), |s| {
+                s.apply("timer-1", TimerOp::Arm).unwrap();
+            });
+        let events = Handing::new(&clock, tx);
+        std::thread::scope(|s| {
+            let worker = host.clone();
+            s.spawn(move || run_action_worker(rx, &worker));
+            let looped = &shared;
+            s.spawn(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    run_timer_loop(looped, &mut waiter, &events, &mut Handed::default(), TICK);
+                });
+            });
+            let at = entered.recv_timeout(secs(2)).expect("the thread logged");
+            let muted = host.within(secs(2), |calls| calls.contains(&Call::Muted(true)));
+            go.send(()).unwrap();
+            assert_eq!((at, muted), ("thread", true));
+        });
+
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let start = plan(&Transition::Started {
+            id: "timer-1".to_string(),
+            fires: 0,
+            hooks: brb_hooks(),
+        })
+        .unwrap();
+        hand_off(&start, 1, Instant::now(), &tx, |_| {});
+        drop(tx);
+        let host = Host::default();
+        let (gate, go) = Gate::new("worker", &entered_tx);
+        let subscriber = gated_log("timer actions ran", gate);
+        std::thread::scope(|s| {
+            let worker = host.clone();
+            s.spawn(move || {
+                tracing::subscriber::with_default(subscriber, || run_action_worker(rx, &worker));
+            });
+            let at = entered.recv_timeout(secs(2)).expect("the worker logged");
+            let calls = host.calls();
+            go.send(()).unwrap();
+            assert_eq!((at, calls), ("worker", vec![Call::Muted(true)]));
+        });
+    }
+
+    /// v1.60.0 (D14): the worker runs batches in the order handed and each
+    /// batch's actions in list order (`panic` already first); an end first
+    /// retires its timer's start line, even with nothing else to run. The
+    /// page's kinds never reach a batch; the worker ignores one that did.
+    #[test]
+    fn the_worker_runs_in_order() {
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let at = Instant::now();
+        let batch = |id: &str, hook, why, actions| ActionBatch {
+            id: id.to_string(),
+            hook,
+            why,
+            at,
+            actions,
+        };
+        let line = Action::Speak {
+            text: "I'm back.".to_string(),
+            voice_id: "babble:bright".to_string(),
+        };
+        for b in [
+            batch(
+                "timer-1",
+                Hook::Start,
+                Why::Armed,
+                vec![Action::SetMuted { muted: true }],
+            ),
+            batch(
+                "timer-2",
+                Hook::End,
+                Why::Zero,
+                vec![
+                    Action::Panic,
+                    line,
+                    Action::RevertPreset,
+                    Action::SaveReplay,
+                    Action::SetMuted { muted: false },
+                ],
+            ),
+            batch("timer-1", Hook::End, Why::Reset, vec![]),
+        ] {
+            tx.send(b).unwrap();
+        }
+        drop(tx);
+        let host = Host::default();
+        run_action_worker(rx, &host);
+        assert_eq!(
+            host.calls(),
+            [
+                Call::Muted(true),
+                end_run("timer-2"),
+                Call::StopAll,
+                Call::Speak(
+                    "timer-2".to_string(),
+                    "I'm back.".to_string(),
+                    "babble:bright".to_string()
+                ),
+                Call::Save(at),
+                Call::Muted(false),
+                end_run("timer-1"),
+            ]
+        );
+    }
+
+    /// v1.60.0 (D25, seam 7): End now's key through the real core, as the
+    /// shortcut handler runs it: a release does nothing; a press ends a
+    /// running countdown at once — done, fired once — and wakes the thread;
+    /// another press has nothing left to end.
+    #[test]
+    fn the_finish_hotkey_ends_through_the_core() {
+        let (shared, clock, woken) = fake();
+        shared.sync(vec![countdown("timer-1", 60_000)]);
+        shared.apply("timer-1", TimerOp::Arm).unwrap();
+        clock.set(secs(5));
+        let drain = || while woken.try_recv().is_ok() {};
+        let state = || {
+            let t = shared.status().timers[0].clone();
+            (t.phase, t.fires)
+        };
+        drain();
+        timer_on_hotkey(&shared, "tm:timer-1:finish", false);
+        assert!(woken.try_recv().is_err(), "a release does nothing");
+        assert_eq!(state(), (Running, 0));
+        drain();
+        timer_on_hotkey(&shared, "tm:timer-1:finish", true);
+        assert!(woken.try_recv().is_ok(), "a press wakes the thread");
+        assert_eq!(state(), (Done, 1));
+        timer_on_hotkey(&shared, "tm:timer-1:finish", true);
+        assert_eq!(state(), (Done, 1), "nothing left to end");
+    }
+
+    /// v1.60.0 (D10, seam 2): a break reset mid-run unmutes, and so does a
+    /// paused one deleted by a sync — through the real loop, `hand_off` and
+    /// worker. Each end retires its start's line before it unmutes.
+    #[test]
+    fn a_reset_mid_break_unmutes() {
+        let (shared, clock, _woken) = fake();
+        let waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(3_000))
+            .at(ms(50), |s| {
+                s.sync(vec![brb("timer-1", 300_000), brb("timer-2", 300_000)]);
+            })
+            .at(ms(100), |s| {
+                s.apply("timer-1", TimerOp::Arm).unwrap();
+                s.apply("timer-2", TimerOp::Arm).unwrap();
+            })
+            .at(ms(1_000), |s| {
+                s.apply("timer-2", TimerOp::Pause).unwrap();
+            })
+            .at(ms(2_000), |s| {
+                s.apply("timer-1", TimerOp::Reset).unwrap();
+            })
+            .at(ms(2_500), |s| {
+                s.sync(vec![brb("timer-1", 300_000)]);
+            });
+        let (out, calls) = loop_then_worker(&shared, &clock, waiter);
+        assert_eq!(
+            calls,
+            [
+                Call::Muted(true),
+                Call::Muted(true),
+                end_run("timer-1"),
+                Call::Muted(false),
+                end_run("timer-2"),
+                Call::Muted(false),
+            ]
+        );
+        assert_eq!(
+            pages(&out),
+            [
+                (1, "timer-1", Hook::Start, Why::Armed),
+                (2, "timer-2", Hook::Start, Why::Armed),
+                (3, "timer-1", Hook::End, Why::Reset),
+                (4, "timer-2", Hook::End, Why::Deleted),
+            ]
+        );
+    }
+
+    /// v1.60.0 (D10, AT1): a countdown used as "unmute me in 5 minutes" —
+    /// nothing at the start, Unmute my voice at zero — unmutes nobody when
+    /// it is reset or deleted, since its start changed nothing: the worker
+    /// only retires its start's line.
+    #[test]
+    fn a_reset_of_an_unmute_timer_changes_nothing() {
+        let (shared, clock, _woken) = fake();
+        let unmute_later = |id| with_lists(id, 300_000, &[], &[set_muted(false)]);
+        let waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(3_000))
+            .at(ms(50), move |s| {
+                s.sync(vec![unmute_later("timer-1"), unmute_later("timer-2")]);
+            })
+            .at(ms(100), |s| {
+                s.apply("timer-1", TimerOp::Arm).unwrap();
+                s.apply("timer-2", TimerOp::Arm).unwrap();
+            })
+            .at(ms(2_000), |s| {
+                s.apply("timer-1", TimerOp::Reset).unwrap();
+            })
+            .at(ms(2_500), move |s| {
+                s.sync(vec![unmute_later("timer-1")]);
+            });
+        let (out, calls) = loop_then_worker(&shared, &clock, waiter);
+        assert_eq!(calls, [end_run("timer-1"), end_run("timer-2")]);
+        let ends: Vec<_> = pages(&out)
+            .into_iter()
+            .filter(|&(_, _, hook, _)| hook == Hook::End)
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                (3, "timer-1", Hook::End, Why::Reset),
+                (4, "timer-2", Hook::End, Why::Deleted)
+            ]
+        );
+    }
+
+    /// v1.60.0 (D9, P4): a fire found more than 30 s late (here the PC
+    /// stalled awake) runs only what puts things back: the worker unmutes
+    /// and says nothing; the page hears `late` with the lateness; the log
+    /// says so at warn.
+    #[test]
+    fn a_late_fire_runs_only_what_puts_things_back() {
+        let (shared, clock, _woken) = fake();
+        let line = json!({"kind": "speak", "text": "I'm back.", "voiceId": "babble:bright"});
+        let stall = clock.clone();
+        let waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(42_000))
+            .at(ms(50), move |s| {
+                s.sync(vec![with_lists(
+                    "timer-1",
+                    1_000,
+                    &[set_muted(true)],
+                    &[line, set_muted(false)],
+                )]);
+            })
+            .at(ms(100), |s| {
+                s.apply("timer-1", TimerOp::Arm).unwrap();
+            })
+            // Nothing reads the clock for 40.5 s: the deadline at 1.1 s is
+            // found 40 s late.
+            .at(ms(600), move |_| stall.set(ms(41_100)));
+        let ((out, calls), log) = logged(|| loop_then_worker(&shared, &clock, waiter));
+        assert_eq!(
+            calls,
+            [Call::Muted(true), end_run("timer-1"), Call::Muted(false)]
+        );
+        let late: Vec<(Why, u64)> = out
+            .iter()
+            .filter_map(|o| match o {
+                Out::Page(ev) if ev.hook == Hook::End => Some((ev.why, ev.late_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(late, [(Why::Late, 40_000)]);
+        assert_eq!(
+            lines(
+                &log,
+                "WARN",
+                "only what puts things back runs id=timer-1 fires=1 late_ms=40000 seq=2"
+            ),
+            1,
+            "{log}"
+        );
+    }
+
+    /// v1.60.0 (D11, P7): Divora restarted mid-break. The boot sync seeds a
+    /// running break and a paused one; each start's mute goes to the worker
+    /// through the real `hand_off` (numbered, so the page sees a gap), and
+    /// the page hears nothing.
+    #[test]
+    fn restart_mid_break_mutes_again() {
+        let (shared, clock, _woken) = fake();
+        let mut running = brb("timer-1", 300_000);
+        running["resume"] = json!({
+            "phase": "running",
+            "anchorMs": clock.wall_ms() + 120_000,
+            "totalMs": 300_000
+        });
+        let mut paused = brb("timer-2", 300_000);
+        paused["resume"] = json!({"phase": "paused", "ms": 60_000, "totalMs": 300_000});
+        let waiter = FakeWaiter::new(&shared, &clock)
+            .until(ms(1_000))
+            .at(ms(50), move |s| {
+                s.sync(vec![running, paused]);
+            });
+        let (out, calls) = loop_then_worker(&shared, &clock, waiter);
+        assert_eq!(calls, [Call::Muted(true), Call::Muted(true)]);
+        assert_eq!(
+            runs(&out),
+            [
+                ("timer-1", Hook::Start, Why::Restart, 1),
+                ("timer-2", Hook::Start, Why::Restart, 2)
+            ]
+        );
+        assert!(pages(&out).is_empty(), "the page hears nothing");
+        let Some(Out::State(_, last)) = out.last() else {
+            panic!("{out:?}");
+        };
+        let phases: Vec<TimerPhase> = last.timers.iter().map(|t| t.phase).collect();
+        assert_eq!(phases, [Running, Paused]);
     }
 
     // ---- v1.59.0 (track B): the text files -------------------------------

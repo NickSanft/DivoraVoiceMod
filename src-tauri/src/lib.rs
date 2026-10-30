@@ -64,7 +64,7 @@ use screen::{
     MonitorDto, Quality, ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
 use timer_actions::{ActionBatch, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT};
-use timer_lines::{Line, TimerLines};
+use timer_lines::{run_line_thread, Line, TimerLines, TIMER_LINE_CLIP_ID};
 use timer_thread::{
     hand_off, spawn_action_worker, spawn_text_writer, spawn_timer_thread, ActionHost,
     ChannelWaiter, RealClock, TextFiles, TextSlot, TimerEvents, TimerShared, ACTION_QUEUE,
@@ -1095,9 +1095,15 @@ fn stop_soundboard_clip(state: State<'_, AppState>, clip_id: String) {
         .send_soundboard(SoundboardCommand::Stop { clip_id });
 }
 
+/// Stop every clip. v1.60.0: and every timer line — one waiting or being
+/// prepared goes stale, under the lines' lock with the `StopAll` (D23), so
+/// none checked before it plays after it. No event: the page clears its own
+/// clips when this answers.
 #[tauri::command]
 fn stop_all_soundboard_clips(state: State<'_, AppState>) {
-    state.engine.send_soundboard(SoundboardCommand::StopAll);
+    state
+        .timer_lines
+        .stop_all(|| state.engine.send_soundboard(SoundboardCommand::StopAll));
 }
 
 /// Phase 15: set the master soundboard gain (linear, 1.0 = unity).
@@ -1122,13 +1128,17 @@ const TTS_CLIP_ID: &str = "tts";
 /// a same-id voice, so without it every press stacks another voice on top of
 /// the last. A multi-second Kokoro render mostly hid that; a babble render is
 /// near-instant, so rapid presses would talk over themselves.
+///
+/// v1.60.0: in the slot `clip_id` names — [`TTS_CLIP_ID`] for `speak`,
+/// [`TIMER_LINE_CLIP_ID`] for a timer's line, so neither stops the other.
 fn speak_commands(
+    clip_id: &str,
     samples: Arc<Vec<f32>>,
     sample_rate: u32,
     gain: f32,
     preview_only: bool,
 ) -> [SoundboardCommand; 2] {
-    let clip_id = TTS_CLIP_ID.to_string();
+    let clip_id = clip_id.to_string();
     let stop = SoundboardCommand::Stop {
         clip_id: clip_id.clone(),
     };
@@ -1159,12 +1169,13 @@ fn speak_commands(
 /// would look fine in a test that checked `speak_commands` alone.
 fn emit_speak(
     mut sink: impl FnMut(SoundboardCommand),
+    clip_id: &str,
     samples: Arc<Vec<f32>>,
     sample_rate: u32,
     gain: f32,
     preview_only: bool,
 ) {
-    for cmd in speak_commands(samples, sample_rate, gain, preview_only) {
+    for cmd in speak_commands(clip_id, samples, sample_rate, gain, preview_only) {
         sink(cmd);
     }
 }
@@ -1258,6 +1269,7 @@ async fn speak(
         );
         emit_speak(
             |cmd| state.engine.send_soundboard(cmd),
+            TTS_CLIP_ID,
             samples,
             sample_rate,
             gain.unwrap_or(1.0),
@@ -3130,10 +3142,12 @@ impl TimerEvents for TimerOutputs {
 }
 
 /// v1.60.0: what the action worker runs a timer's backend actions against
-/// (D14, D21-D23). State made after the worker starts (the recorder, the
-/// recordings folder, the lines) comes from `try_state` when an action
-/// runs; before `AppState` is managed, no line can exist yet and no replay
-/// can be saved.
+/// (D14, D21-D23). Every method returns at once. State made after the
+/// worker starts (the recorder, the recordings folder, the lines) comes
+/// from `try_state` when an action runs, so the lines are `AppState`'s own
+/// (D23: one owner, the one the page's Stop all and the line thread use);
+/// before `AppState` is managed, no line can exist yet and no replay can be
+/// saved.
 struct AppHost {
     engine: Arc<AudioEngine>,
     app: AppHandle,
@@ -3169,6 +3183,8 @@ impl ActionHost for AppHost {
         }
     }
 
+    /// Into the line slot for `divora-timer-lines`, which renders it; never
+    /// rendered here.
     fn speak(&self, timer: &str, text: &str, voice_id: &str) {
         if let Some(state) = self.app.try_state::<AppState>() {
             state.timer_lines.put(Line {
@@ -3200,6 +3216,40 @@ fn host_set_muted(engine: &AudioEngine, muted: bool) {
 pub fn host_stop_all(engine: &AudioEngine, lines: &TimerLines, emit: impl FnOnce()) {
     lines.stop_all(|| engine.send_soundboard(SoundboardCommand::StopAll));
     emit();
+}
+
+/// v1.60.0: starts `divora-timer-lines` (D21) on `lines`, `AppState`'s own.
+/// It renders a timer's line with Kokoro or Critter Chatter — never a
+/// cloned voice, and never kept in Saved clips — one at a time, and plays
+/// it in its own mixer slot ([`TIMER_LINE_CLIP_ID`]) at full volume on both
+/// paths, so the call hears it. A failed spawn is logged, and timers' lines
+/// then never play.
+fn spawn_line_thread(lines: Arc<TimerLines>, engine: Arc<AudioEngine>, tts_dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("divora-timer-lines".into())
+        .spawn(move || {
+            run_line_thread(
+                &lines,
+                &mut |line: &Line| {
+                    divora_core::tts::synthesize(&line.text, &line.voice_id, &tts_dir)
+                        .map_err(|e| e.to_string())
+                },
+                &mut |audio: divora_core::tts::TtsAudio| {
+                    emit_speak(
+                        |cmd| engine.send_soundboard(cmd),
+                        TIMER_LINE_CLIP_ID,
+                        Arc::new(audio.samples),
+                        audio.sample_rate,
+                        1.0,
+                        false,
+                    );
+                },
+                &|| engine.is_running(),
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "couldn't start the timer line thread; timers' lines won't play");
+    }
 }
 
 /// Decode a clip on first play; subsequent plays reuse the cached
@@ -3923,6 +3973,17 @@ pub fn run() {
                 timers,
                 timer_lines: Arc::new(TimerLines::new()),
             });
+            // v1.60.0: `divora-timer-lines` says a timer's lines, one at a
+            // time, from the lines `AppState` now holds — the ones the
+            // worker's host and the page's Stop all reach (D21, D23).
+            {
+                let state = app.state::<AppState>();
+                spawn_line_thread(
+                    state.timer_lines.clone(),
+                    state.engine.clone(),
+                    state.tts_assets_dir.clone(),
+                );
+            }
             overlay_windows::init(app);
 
             // The window is created hidden (`visible: false`) so the user never
@@ -5904,7 +5965,14 @@ mod tests {
         // a version that emitted only the Play would still satisfy a test of
         // `speak_commands` alone, and would bring back the stacking bug.
         let mut sent: Vec<SoundboardCommand> = Vec::new();
-        emit_speak(|cmd| sent.push(cmd), utterance(), 24_000, 1.0, false);
+        emit_speak(
+            |cmd| sent.push(cmd),
+            TTS_CLIP_ID,
+            utterance(),
+            24_000,
+            1.0,
+            false,
+        );
         assert_eq!(sent.len(), 2, "both commands must reach the engine");
         assert!(matches!(&sent[0], SoundboardCommand::Stop { clip_id } if clip_id == TTS_CLIP_ID));
         assert!(
@@ -5914,7 +5982,7 @@ mod tests {
 
     #[test]
     fn speak_commands_stop_the_tts_slot_then_play_into_it() {
-        let [stop, play] = speak_commands(utterance(), 24_000, 0.5, false);
+        let [stop, play] = speak_commands(TTS_CLIP_ID, utterance(), 24_000, 0.5, false);
         assert!(
             matches!(&stop, SoundboardCommand::Stop { clip_id } if clip_id == TTS_CLIP_ID),
             "first command must stop the previous utterance, got {stop:?}"
@@ -5931,7 +5999,7 @@ mod tests {
         assert_eq!((clip_id.as_str(), sample_rate), (TTS_CLIP_ID, 24_000));
         assert!((gain - 0.5).abs() < f32::EPSILON);
 
-        let [_, preview] = speak_commands(utterance(), 24_000, 1.0, true);
+        let [_, preview] = speak_commands(TTS_CLIP_ID, utterance(), 24_000, 1.0, true);
         assert!(
             matches!(&preview, SoundboardCommand::PlayMonitorOnly { clip_id, .. } if clip_id == TTS_CLIP_ID),
             "preview-only must stay off the main send, got {preview:?}"
@@ -5944,7 +6012,7 @@ mod tests {
     fn repeated_speaks_never_overlap() {
         let mut mixer = SoundboardMixer::new();
         for preview_only in [false, false, true, false] {
-            for cmd in speak_commands(utterance(), 48_000, 1.0, preview_only) {
+            for cmd in speak_commands(TTS_CLIP_ID, utterance(), 48_000, 1.0, preview_only) {
                 drop(mixer.apply(cmd));
             }
             assert_eq!(mixer.active_voice_count(), 1);
@@ -6247,6 +6315,11 @@ mod tests {
 
     /// v1.59.0: the setup starts both timer threads, the writer on the
     /// folder `tauri dev` keeps apart, and the app keeps the shared core.
+    /// v1.60.0: and the action worker on a queue of [`ACTION_QUEUE`], before
+    /// the timer thread whose outputs hold its sender; and, once `AppState`
+    /// is managed, the line thread.
+    ///
+    /// [`ACTION_QUEUE`]: crate::timer_thread::ACTION_QUEUE
     #[test]
     fn the_setup_spawns_the_timer_threads() {
         let prod = production_source();
@@ -6256,8 +6329,205 @@ mod tests {
             concat!("spawn_text", "_writer("),
             concat!("timers_dir_name(", "tauri::is_dev())"),
             concat!("divora_capture::SleepWatch", "::new()"),
+            concat!("mpsc::sync_channel(", "ACTION_QUEUE)"),
+            concat!("spawn_action", "_worker("),
+            concat!("TimerOutputs", " {"),
+            concat!("spawn_line", "_thread("),
         ] {
             assert_eq!(setup.matches(needle).count(), 1, "{needle}");
         }
+        let at = |needle: &str| setup.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at(concat!("spawn_action", "_worker(")) < at(concat!("spawn_timer", "_thread(")));
+        assert!(at(concat!("app.manage(", "AppState {")) < at(concat!("spawn_line", "_thread(")));
+    }
+
+    // ---- v1.60.0: timers that change your voice --------------------------
+
+    /// `s` without whitespace, so a needle doesn't depend on rustfmt's line
+    /// breaks.
+    fn squashed(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// v1.60.0 (D23, TP3): there is one `TimerLines`, built in the
+    /// `AppState` literal. The worker's host holds none of its own: each of
+    /// its line actions reaches `AppState`'s through `try_state`; the line
+    /// thread is handed `AppState`'s; the page's Stop all uses `AppState`'s.
+    /// So a Panic from the page or a timer and a timer's line share one
+    /// epoch. The host needs an `AppHandle`, so this reads the source.
+    #[test]
+    fn the_timer_lines_have_one_owner() {
+        let prod = production_source();
+        assert_eq!(prod.matches(concat!("TimerLines", "::new(")).count(), 1);
+        let literal = body_of(&prod, concat!("app.manage(", "AppState {"));
+        assert!(literal.contains(concat!("timer_lines: Arc::new(", "TimerLines::new()),")));
+        let fields = body_of(&prod, concat!("struct ", "AppHost {"));
+        assert!(!fields.contains("TimerLines"), "{fields}");
+        let host = body_of(&prod, concat!("impl ActionHost for ", "AppHost {"));
+        for method in ["fn stop_all(", "fn speak(", "fn end_run("] {
+            let body = body_of(host, method);
+            assert!(
+                body.contains(concat!("self.app.try_state::", "<AppState>()")),
+                "{method}"
+            );
+            assert!(body.contains(concat!("state.", "timer_lines")), "{method}");
+        }
+        let setup = squashed(body_of(&prod, concat!(".setup(", "|app|")));
+        assert!(setup.contains(concat!(
+            "letstate=app.state::<AppState>();",
+            "spawn_line_thread(state.timer_lines.clone(),"
+        )));
+        let command = squashed(body_of(&prod, concat!("fn stop_all_soundboard", "_clips(")));
+        assert!(command.contains(concat!("state.timer_lines", ".stop_all(")));
+    }
+
+    /// v1.60.0 (D24, seam 3): a timer's `setMuted` against a real engine,
+    /// stopped: a plain set, so muting twice moves the word once.
+    #[test]
+    fn the_timer_host_mutes_the_real_engine() {
+        use super::host_set_muted;
+        let engine = AudioEngine::new();
+        let st = |muted, seq| InputMute { muted, seq };
+        host_set_muted(&engine, true);
+        assert_eq!(engine.input_mute(), st(true, 1));
+        host_set_muted(&engine, true);
+        assert_eq!(engine.input_mute(), st(true, 1), "a set, not a toggle");
+        host_set_muted(&engine, false);
+        assert_eq!(engine.input_mute(), st(false, 2));
+        assert!(!engine.is_running());
+    }
+
+    /// v1.60.0 (D23, seam 3): a timer's Stop all against a real engine,
+    /// stopped, so nothing plays: the lines' epoch rises by one, the line
+    /// waiting is dropped, the one being prepared is stale, and the page is
+    /// told once.
+    #[test]
+    fn the_timer_host_stops_all_on_the_real_engine() {
+        use super::host_stop_all;
+        use crate::timer_lines::{Line, TimerLines};
+        let line = |timer: &str, text: &str| Line {
+            timer: timer.to_string(),
+            text: text.to_string(),
+            voice_id: "babble:bright".to_string(),
+        };
+        let engine = AudioEngine::new();
+        let lines = TimerLines::new();
+        lines.put(line("timer-1", "Be right back."));
+        let preparing = lines.take_or_wait(Duration::ZERO).unwrap();
+        lines.put(line("timer-2", "Starting soon."));
+        let mut emitted = 0;
+        host_stop_all(&engine, &lines, || emitted += 1);
+        assert_eq!(emitted, 1, "soundboard-stopped once");
+        assert!(
+            lines.take_or_wait(Duration::ZERO).is_none(),
+            "the waiting line"
+        );
+        assert!(!lines.wanted(&preparing), "the line being prepared");
+        lines.put(line("timer-1", "I'm back."));
+        let after = lines.take_or_wait(Duration::ZERO).unwrap();
+        // Put, put, Stop all, put: the Stop all bumped the epoch once.
+        assert_eq!(after.epoch, preparing.epoch + 3);
+        assert!(!engine.is_running());
+    }
+
+    /// v1.60.0 (D14, D21, D22): nothing the worker's host does can wait. A
+    /// replay save goes to the blocking pool; a line goes into the slot and
+    /// is rendered on the line thread with `synthesize` (Kokoro and Critter
+    /// Chatter only), never a clone and never saved to Saved clips, and
+    /// plays in its own slot at full volume on both paths. The host needs an
+    /// `AppHandle`, so this reads the source.
+    #[test]
+    fn the_timer_host_runs_long_work_off_the_worker() {
+        let prod = production_source();
+        let host = body_of(&prod, concat!("impl ActionHost for ", "AppHost {"));
+        let save = body_of(host, "fn save_replay(");
+        let pool = save
+            .find(concat!("tauri::async_runtime::", "spawn_blocking("))
+            .expect("the save goes to the blocking pool");
+        assert!(save.find(concat!("recorder.", "save_replay(")).unwrap() > pool);
+        let speak = body_of(host, "fn speak(");
+        assert!(speak.contains(".put("), "{speak}");
+        assert!(!speak.contains("synthesize"), "{speak}");
+        let thread = body_of(&prod, concat!("fn spawn_line", "_thread("));
+        assert!(thread.contains(concat!("divora_core::tts::", "synthesize(")));
+        for not in [
+            concat!("load_cloned", "_voice("),
+            concat!("synthesize", "_cloned("),
+            concat!("save_tts", "_clip("),
+        ] {
+            assert!(!thread.contains(not), "{not}");
+        }
+        assert!(squashed(thread).contains(concat!(
+            "TIMER_LINE_CLIP_ID,Arc::new(audio.samples),",
+            "audio.sample_rate,1.0,false,"
+        )));
+    }
+
+    /// v1.60.0 (D23): a timer's Stop all and the page's both stop through
+    /// the lines, so a line being prepared can't play after either. The
+    /// host and the command need an `AppHandle`, so this reads the source.
+    #[test]
+    fn the_host_and_the_command_stop_through_the_lines() {
+        let prod = production_source();
+        let host = body_of(&prod, concat!("impl ActionHost for ", "AppHost {"));
+        let stop = body_of(host, "fn stop_all(");
+        assert!(stop.contains(concat!(
+            "host_stop_all(&self.engine, ",
+            "&state.timer_lines, emit);"
+        )));
+        let command = squashed(body_of(&prod, concat!("fn stop_all_soundboard", "_clips(")));
+        assert_eq!(
+            command,
+            concat!(
+                "{state.timer_lines.stop_all(||",
+                "state.engine.send_soundboard(SoundboardCommand::StopAll));}"
+            )
+        );
+    }
+
+    /// v1.60.0 (TP2): the production outputs hand each hook run on with one
+    /// [`hand_off`](crate::timer_thread::hand_off) — the function the timer
+    /// thread's tests run — and nothing before it.
+    #[test]
+    fn the_outputs_hand_off() {
+        let prod = production_source();
+        let outputs = body_of(&prod, concat!("impl TimerEvents for ", "TimerOutputs {"));
+        let actions = body_of(outputs, "fn timer_actions(");
+        assert_eq!(actions.matches(concat!("hand_", "off(")).count(), 1);
+        assert!(squashed(actions)
+            .starts_with(concat!("{hand_off(p,seq,", "Instant::now(),&self.actions,")));
+    }
+
+    /// v1.60.0 (D21): a timer's line stops then plays in its own slot, at
+    /// the gain it is given, on both paths; the Speak screen's lines keep
+    /// `tts`. Neither slot's Stop stops the other's line.
+    #[test]
+    fn timer_line_commands_stop_then_play() {
+        use crate::timer_lines::TIMER_LINE_CLIP_ID;
+        assert_eq!(TIMER_LINE_CLIP_ID, "timer-line");
+        assert_ne!(TIMER_LINE_CLIP_ID, TTS_CLIP_ID);
+        assert_ne!(TIMER_LINE_CLIP_ID, PREVIEW_CLIP_ID);
+        let [stop, play] = speak_commands(TIMER_LINE_CLIP_ID, utterance(), 24_000, 1.0, false);
+        assert!(
+            matches!(&stop, SoundboardCommand::Stop { clip_id } if clip_id == "timer-line"),
+            "{stop:?}"
+        );
+        assert!(
+            matches!(&play, SoundboardCommand::Play { clip_id, gain, .. }
+                if clip_id == "timer-line" && (*gain - 1.0).abs() < f32::EPSILON),
+            "{play:?}"
+        );
+        let prod = production_source();
+        let speak = body_of(&prod, concat!("async fn ", "speak("));
+        assert!(speak.contains(concat!("TTS_", "CLIP_ID,")));
+        assert!(!speak.contains(concat!("TIMER_LINE", "_CLIP_ID")));
+
+        let mut mixer = SoundboardMixer::new();
+        for clip_id in [TTS_CLIP_ID, TIMER_LINE_CLIP_ID] {
+            for cmd in speak_commands(clip_id, utterance(), 48_000, 1.0, false) {
+                drop(mixer.apply(cmd));
+            }
+        }
+        assert_eq!(mixer.active_voice_count(), 2, "a Speak line and a timer's");
     }
 }
