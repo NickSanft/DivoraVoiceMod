@@ -111,11 +111,35 @@ fn espeak_args(lang: &str, data: Option<&Path>, text: &str) -> Vec<String> {
     ];
     if let Some(dir) = data {
         args.push("--path".to_string());
-        args.push(dir.to_string_lossy().into_owned());
+        args.push(plain_path(dir));
     }
     args.push("--".to_string());
     args.push(text.to_string());
     args
+}
+
+/// `dir` without Windows' verbatim `\\?\` prefix: `\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\host\share` → `\\host\share`, anything else as it is.
+///
+/// v1.60.0: a built app's resource dir comes from Tauri's canonicalized exe
+/// path, so its `tts` dir starts `\\?\` (only a dev build, which uses the
+/// source-staged assets, didn't). espeak-ng joins `/espeak-ng-data` onto
+/// `--path` with a forward slash, which a verbatim path never treats as a
+/// separator, so it missed its data, fell back to the dir itself and exited
+/// on `phontab`: every Kokoro line failed outside a dev build.
+fn plain_path(dir: &Path) -> String {
+    let s = dir.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // Only a drive path has a plain form (`\\?\Volume{…}\` has none).
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return rest.to_string();
+        }
+    }
+    s.into_owned()
 }
 
 fn espeak_bin_name() -> &'static str {
@@ -181,6 +205,60 @@ mod tests {
         let dd = args.iter().position(|a| a == "--").unwrap();
         let pp = args.iter().position(|a| a == "--path").unwrap();
         assert!(pp < dd);
+    }
+
+    /// v1.60.0: a built app's `tts` dir is `\\?\`-prefixed (Tauri
+    /// canonicalizes the exe path), and espeak-ng can't find its data under
+    /// one, so `--path` always goes out plain.
+    #[test]
+    fn args_pass_a_plain_path_never_a_verbatim_one() {
+        let args = espeak_args(
+            "en-us",
+            Some(Path::new(r"\\?\C:\Program Files\DivoraVoice\tts")),
+            "hi",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-q",
+                "--ipa",
+                "-v",
+                "en-us",
+                "--path",
+                r"C:\Program Files\DivoraVoice\tts",
+                "--",
+                "hi"
+            ],
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\host\share\tts")),
+            r"\\host\share\tts"
+        );
+        assert_eq!(plain_path(Path::new(r"C:\e\tts")), r"C:\e\tts");
+        assert_eq!(plain_path(Path::new("/opt/divora/tts")), "/opt/divora/tts");
+        // No plain form: left as it is.
+        assert_eq!(
+            plain_path(Path::new(r"\\?\Volume{1}\tts")),
+            r"\\?\Volume{1}\tts"
+        );
+    }
+
+    /// The real espeak-ng, handed its dir the way a built app gets it: through
+    /// `canonicalize`, which on Windows returns a `\\?\` path. Before v1.60.0
+    /// this exited 1 on `…\tts\phontab`. Needs the staged binary, so it's
+    /// `#[ignore]`d (local only). Run with:
+    /// `cargo test -p divora-core verbatim_dir -- --ignored`.
+    #[test]
+    #[ignore = "requires the staged espeak-ng (local only)"]
+    fn espeak_reads_its_data_from_a_verbatim_dir() {
+        let res = concat!(env!("CARGO_MANIFEST_DIR"), "/../src-tauri/resources/tts");
+        let dir = Path::new(res).canonicalize().expect("staged tts dir");
+        #[cfg(windows)]
+        assert!(dir.to_string_lossy().starts_with(r"\\?\"), "{dir:?}");
+        let ipa = Phonemizer::from_dir(&dir)
+            .phonemize("I'm back.", "en-us")
+            .expect("espeak-ng should find its data");
+        assert_ne!(ipa, "");
     }
 
     #[test]
