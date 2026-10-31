@@ -12,8 +12,9 @@
 //! its hand-offs, its emit and the texts — and only the writer touches the
 //! timers' files, so no disk wait can delay a deadline (D13, D21).
 //!
-//! Neither thread is joined or stopped: Divora has no exit hook, and both
-//! run for the process (D14).
+//! No thread here is joined or stopped: Divora has no exit hook, and each
+//! runs for the process (D14). v1.60.0's action worker ends only once its
+//! sender is gone, and in the app the timer thread holds that for good.
 //!
 //! v1.60.0: the thread plans each drained transition once ([`plan`]) and
 //! hands its backend half to `divora-timer-actions`, the action worker, by a
@@ -442,7 +443,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// timer; a release, any other id, or an id the core doesn't run does
 /// nothing. Runs inside `WM_HOTKEY` on the main thread, so it only takes
 /// the core's lock for microseconds: it never registers, unregisters,
-/// writes, logs or emits (the timer thread logs and emits).
+/// writes, logs, emits or runs an action (the timer thread logs, emits and,
+/// since v1.60.0, hands a start's or an end's actions on).
 pub fn timer_on_hotkey(shared: &TimerShared, id: &str, pressed: bool) {
     let Some((timer, op)) = hotkey_timer_request(id, pressed) else {
         return;

@@ -36,11 +36,13 @@ accidental break fails CI before it ships:
 - The `ptm` hotkey id: a press holds push-to-modulate and its release lets go; `PTM`, `ptm:toggle`, `mute` and `sb:ptm` do nothing to it — `src-tauri/src/lib.rs` (`hotkey_ptm_request_table`; v1.58.0).
 - `set_ptm_mode` and `set_ptm_held` stay sync commands — `src-tauri/src/lib.rs` (`ptm_commands_stay_sync`; v1.58.0).
 - `TimerSnapshot` / `TimerState` / `TimerRun` / `TimerDefWire` keys, the phase and kind strings, the timer id grammar, the `tm:` hotkey-id table, the timer limits, the run samples (what the page stores for a state, and what the backend seeds from it), and the `timer-state` event and `timer_status` command names — `src/overlay/timer.fixture.json`, read by `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`, `timer_id_table`, `hotkey_timer_request_table`, `seed_table`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/overlay/timerState.test.ts` / `src/data/timers.test.ts` (v1.59.0).
-- The `tm:` hotkey ids: a press of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id acts on that timer; a release, `tm:<id>:finish` and any other spelling don't — `src-tauri/src/timers.rs` (`hotkey_timer_request_table`), and `src-tauri/src/lib.rs` (`the_shortcut_handler_runs_the_timer_hotkey`; v1.59.0).
-- The eight Hourglass commands stay sync — `src-tauri/src/lib.rs` (`timer_commands_stay_sync`; v1.59.0).
-- The main window sends three features' state-changing commands one at a time, one queue per feature, each once the one before it in that queue has answered or failed: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands and `tm:` key registers and unregisters; the reads (`input_mute`, `timer_status`) aren't held back, and no other command the page sends goes through these queues (the stream overlay's controller has kept its own since v1.55.0, for opening, closing, Fit, the background and pictures) — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" and "one mute command at a time" tests; v1.59.0). Being sync orders only commands that aren't in flight together.
-- `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`).
-- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, and the Hourglass ones since v1.59.0).
+- The timer actions' wire (v1.60.0): the `TimerAction` kinds, their fields, where each runs and which list offers it; the action limits; how an action is read (the valid and skipped samples) and how a list is read (the list samples); `TimerActionsEvent`'s keys, the `why` and `hook` strings, and one event per `why` as the backend builds it from its plan; `TimerDefWire`'s optional `onStart` / `onFire`; the `timer-actions` and `soundboard-stopped` event names and the `finish_timer` command name — the same fixture's v1.60.0 keys, read by `src-tauri/src/timer_actions.rs` (`action_kinds_match_the_fixture`, `action_from_wire_table`, `to_wire_round_trips`, `hooks_from_wire_reads_eight`, `actions_event_samples_are_rusts`, `actions_event_samples_are_plans`), `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/data/timerActions.test.ts` / `src/data/timers.test.ts`. v1.59.0's `events`, `commands` and `limits` objects are left as they were, so `timerState.test.ts`'s exact checks of them still hold.
+- A timer's actions: what runs at a start, at zero, on End now, on a fire more than 30 s late, after a sleep or a close, at a restart mid-run, and on a Reset or a delete — `src-tauri/src/timer_actions.rs` (`plan_table`, `late_boundary`, `restart_reapplies_only_the_mute`, `a_stored_end_runs_nothing`, `revert_never_runs_at_a_start`, `route_table`) and `src-tauri/src/timers.rs` (`op_table`, `a_cancel_undoes_what_its_start_did`; v1.60.0).
+- The `tm:` hotkey ids: a press of `tm:<id>:toggle`, `tm:<id>:reset` or (since v1.60.0) `tm:<id>:finish` with a valid id acts on that timer; a release and any other spelling don't — `src-tauri/src/timers.rs` (`hotkey_timer_request_table`), and `src-tauri/src/lib.rs` (`the_shortcut_handler_runs_the_timer_hotkey`; v1.59.0).
+- The nine Hourglass commands stay sync (eight in v1.59.0; `finish_timer` since v1.60.0) — `src-tauri/src/lib.rs` (`timer_commands_stay_sync`; v1.59.0).
+- The main window sends five features' state-changing commands one at a time, one queue per feature, each once the one before it in that queue has answered or failed: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands (`finish_timer` since v1.60.0) and `tm:` key registers and unregisters (v1.59.0); and since v1.60.0 the effect chain's (`set_effect_chain`, `set_effect_param`, `set_effect_enabled`, `set_voice_model`) and the soundboard's (`play_soundboard_clip`, `stop_soundboard_clip`, `stop_all_soundboard_clips`, and Speak's saved-clip play). The reads (`input_mute`, `timer_status`) aren't held back, and no other command the page sends goes through these queues (the stream overlay's controller has kept its own since v1.55.0, for opening, closing, Fit, the background and pictures) — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" and "one mute command at a time" tests, v1.59.0; "one chain and one soundboard command at a time", which holds each answer and lands what is in flight together reversed, v1.60.0). Being sync orders only commands that aren't in flight together. A timer's own actions in the backend (its mute, its Stop all clips and lines) go through none of these queues.
+- `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0); since v1.60.0 `onStart`, `onFire` and `presetReturns` kept as written, whatever they hold (`readTimers`), a list sent only for a countdown with an action that runs (`defsForSync`), and a list read entry by entry with what can't run kept in place (`src/data/timerActions.test.ts`: `readStoredActions`, the editing-by-index rows, `readReturns`). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`); and with its `onStart` / `onFire`, since v1.60.0 — `src-tauri/src/timer_actions.rs` (`action_from_wire_table`, `hooks_from_wire_reads_eight`, `hooks_from_wire_keeps_one_line`, `to_wire_round_trips`).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, the Hourglass ones since v1.59.0, and `finish_timer` since v1.60.0).
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -77,7 +79,11 @@ Divora's own mute of the voice (v1.56.0) — on the call, the headphone monitor
 and Divora's recordings (WAV, screen recordings and their stems, Replay).
 Soundboard clips, Speak and Critter Chatter still play. Engine-wide: it can be
 set with the engine stopped, it outlives Stop, Start and device-loss rebuilds,
-and it is never stored; every launch starts unmuted. Every change adds 1 to
+and it is never stored; every launch starts unmuted. (Since v1.60.0 a
+countdown whose At start mutes, running or paused when Divora closed, mutes
+again once the page's first `sync_timers` picks its run up: §1 "Hourglass".
+A timer's Mute my voice and Unmute my voice are the backend's own plain
+sets, made without these commands.) Every change adds 1 to
 `seq`. The three commands are sync (they run on the main thread, in turn with
 each other and with the hotkey), and each is one atomic operation;
 `LevelUpdate` carries the same state on every tick. Being sync doesn't order
@@ -232,7 +238,7 @@ take: it records without desktop audio, and `desktopError` says why. The
 | `scan_soundboard_folder` | `folder: string` | `SoundboardTile[]` / error |
 | `play_soundboard_clip` | `clipId`, `path`, `gain?` | duration seconds `f32` / error |
 | `stop_soundboard_clip` | `clipId: string` | — |
-| `stop_all_soundboard_clips` | — | — |
+| `stop_all_soundboard_clips` | — | — (v1.60.0: it also drops a timer's line that is waiting or still being prepared, so none prepared before the stop plays after it. It sends no event; a timer's Stop all clips and lines sends `soundboard-stopped`, §2) |
 | `set_soundboard_master_gain` | `gain: f32` | — |
 
 ### Virtual mic & hotkeys
@@ -266,14 +272,14 @@ explainer has been seen. The tray has no item that turns Replay on.
 | Id | Meaning |
 |---|---|
 | `ptm` | push-to-modulate (press and release). v1.58.0: acted on by the backend, so it doesn't go through the page: a press holds push-to-modulate, its release lets go (which way that switches your effects is the mode, `set_ptm_mode`). The `global-shortcut` event still goes out, press and release, and the frontend does nothing with it. Unbound by default. The prefix `ptm:` is reserved (a latched push-to-modulate, later) |
-| `panic` | stop all soundboard clips |
+| `panic` | stop all soundboard clips (v1.60.0: and a timer's line, playing, waiting or being prepared) |
 | `monitor` | toggle hearing yourself |
 | `sb:<clipId>` | play one soundboard tile (prefix reserved) |
 | `rec:<recorder>` | start / stop a recorder (prefix reserved) — v1.52.0. Defined: `rec:screen` (the screen recorder), `rec:wav` (the WAV recorder). Both unbound by default |
 | `replay:<action>` | Replay (prefix reserved) — v1.54.0. Defined: `replay:save` (save the replay), `replay:toggle` (turn Replay on / off; it works once Replay has been turned on from the Record screen card). Both unbound by default |
 | `overlay:<action>` | the stream overlay (prefix reserved) — v1.55.0. Defined: `overlay:arrange`, which switches the open overlay between Arrange and Locked. It is acted on by the backend when pressed; the frontend only shows a notice while the overlay is off or starting. Unbound by default. A different namespace from the `overlay:state` / `overlay:*` **event** names, despite the shared spelling |
 | `mute` | mute or unmute your voice (a toggle) — v1.56.0. Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. Unbound by default. The prefix `mute:` is reserved for later variants |
-| `tm:<timerId>:<verb>` | an Hourglass timer (prefix reserved) — v1.59.0. Defined: `toggle` (idle, done or ran out → start from the full length, a count-up from 0; running → pause; paused → resume) and `reset` (back to idle). Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. A press for a timer the backend doesn't run does nothing. Unbound by default; the keys are stored with each timer in `divora.timers`, not in `divora.hotkeyBindings`. `tm:<timerId>:finish` is reserved for v1.60.0 (it does nothing in v1.59.0); any other verb or spelling does nothing. A timer id is 1-32 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit, never a Windows device name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so never contains `:` |
+| `tm:<timerId>:<verb>` | an Hourglass timer (prefix reserved) — v1.59.0. Defined: `toggle` (idle, done or ran out → start from the full length, a count-up from 0; running → pause; paused → resume) and `reset` (back to idle); and since v1.60.0 `finish` (End now: a running or paused countdown finishes now, as `finish_timer`). A start, a reset and End now run what `arm_timer`, `reset_timer` and `finish_timer` run (§1 "Hourglass"). Acted on by the backend when pressed (a release does nothing), so it doesn't go through the page; the `global-shortcut` event still goes out, and the frontend does nothing with it. A press for a timer the backend doesn't run does nothing. Unbound by default; the keys are stored with each timer in `divora.timers`, not in `divora.hotkeyBindings`. Any other verb or spelling does nothing. A timer id is 1-32 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit, never a Windows device name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so never contains `:` |
 
 ### Stream overlay (v1.55.0)
 
@@ -340,7 +346,8 @@ position or size, which the backend does.
 
 ### Hourglass (v1.59.0)
 
-Countdowns and count-ups the backend keeps. All eight commands are sync: each
+Countdowns and count-ups the backend keeps. All nine commands are sync
+(eight in v1.59.0; `finish_timer` since v1.60.0): each
 runs to completion on the main thread, one at a time and in turn with the
 `tm:` hotkeys. Being sync doesn't keep commands in the order they were sent:
 Tauri sends each invoke as its own request, and commands in flight together
@@ -359,16 +366,26 @@ changes nothing and answers the timer as it is. `"no such timer"` is the
 answer for an `id` the backend doesn't run (never synced, deleted, or kept
 without being run).
 
+Since v1.60.0 a countdown can carry two lists of actions, `onStart` (At
+start) and `onFire` (At zero), and the backend decides what each change runs:
+it runs the mute, Stop all clips and lines, a replay save and a line itself,
+and tells the main window what it runs (preset switches and clips) with a
+`timer-actions` event (§2). The rule is under `TimerAction` notes (§3). A
+command's answer doesn't wait for the actions it caused, and can land before
+or after their event. Pause, Resume and Adjust run no actions. Count-ups
+have no lists.
+
 | Command | Args | Returns |
 |---|---|---|
-| `sync_timers` | `timers: TimerDefWire[]` — every stored timer, in list order | `TimerSnapshot`. The definitions become `timers`. Reads each entry on its own and never fails, apart from Tauri's own ``"invalid args `timers` for command `sync_timers`: {e}"`` when `timers` isn't a list: an entry that isn't an object, has no `id` passing the timer id grammar (§1 hotkey ids) or no string `kind`, repeats an earlier entry's id, or comes after the 64th is skipped; a `name` that isn't 1-40 characters after trimming runs as "Countdown" or "Count-up"; a `durationMs` that isn't a finite number is 300 000 (5:00), any other is rounded and held to 1 000..86 400 000; a `resume` that can't be read is ignored and the timer starts idle; unknown keys are ignored. The first 16 entries of kind `"countdown"` or `"countup"` run; any other kind, and a known kind past the 16th, is kept, not run, and its file stays. A timer already running keeps its run through a new name or length; a new kind makes it idle. `resume` seeds a timer only for an id the backend hasn't accepted since it started (`TimerRun` notes, §3); after that the backend's own state wins |
-| `arm_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Idle, done or ran out → running from the full length (a count-up from 0). Otherwise unchanged |
+| `sync_timers` | `timers: TimerDefWire[]` — every stored timer, in list order | `TimerSnapshot`. The definitions become `timers`. Reads each entry on its own and never fails, apart from Tauri's own ``"invalid args `timers` for command `sync_timers`: {e}"`` when `timers` isn't a list: an entry that isn't an object, has no `id` passing the timer id grammar (§1 hotkey ids) or no string `kind`, repeats an earlier entry's id, or comes after the 64th is skipped; a `name` that isn't 1-40 characters after trimming runs as "Countdown" or "Count-up"; a `durationMs` that isn't a finite number is 300 000 (5:00), any other is rounded and held to 1 000..86 400 000; a `resume` that can't be read is ignored and the timer starts idle; unknown keys are ignored. The first 16 entries of kind `"countdown"` or `"countup"` run; any other kind, and a known kind past the 16th, is kept, not run, and its file stays. A timer already running keeps its run through a new name or length; a new kind makes it idle. `resume` seeds a timer only for an id the backend hasn't accepted since it started (`TimerRun` notes, §3); after that the backend's own state wins. v1.60.0: an entry may carry `onStart` and `onFire` (`TimerAction[]`, §3). Each is read on its own: absent or not a list → empty; only its first 8 entries are read, each on its own (one that can't be read — an unknown kind, a missing or bad field — is skipped, the rest kept); a `speak` after the list's first is skipped; a count-up's lists are ignored. A list change, like a new name or length, keeps the run and runs nothing; the lists are read when something happens to the timer, so an `onFire` change counts for the run going on and an `onStart` change from the next start. A sync that stops a running or paused countdown — it changed kind, or it no longer runs (left out, past the 16th, or a kind this build doesn't run) — runs the At zero actions that undo its start (`timer-actions`, `why` `reset` for a kind change, else `deleted`). A seed that picks up a running or paused countdown runs its At start's `setMuted` actions again (so a break mutes you again), with no event; one that finds a running countdown's end passed while Divora was closed runs At zero's putting-back actions (`ranOut`) |
+| `arm_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Idle, done or ran out → running from the full length (a count-up from 0); v1.60.0: a countdown's start runs its At start list (`timer-actions`, `armed`). Otherwise unchanged |
 | `pause_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Running → paused. Otherwise unchanged |
 | `resume_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Paused → running. Otherwise unchanged |
-| `reset_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Anything → idle |
+| `reset_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Anything → idle. v1.60.0: a running or paused countdown's Reset also runs the At zero actions that undo its start — Unmute my voice if the At start it started with muted, and Back to the preset before (`timer-actions`, `reset`); it isn't a finish (`fires` unchanged), and nothing else on either list runs. An ended or idle one runs nothing |
 | `adjust_timer` | `id: string`, `deltaMs: number` | `TimerSnapshot` / `"no such timer"` / `"deltaMs must be a whole number of milliseconds, at most 24 hours either way"`. A running or paused countdown's time left moves by `deltaMs`, to at most 24 h, and, going down, to no less than 1 s (a time left already under 1 s stays as it is), so this never ends one; its `totalMs` moves by what the time left moved and can pass 24 h. A running or paused count-up's time counted moves by `deltaMs`, never below 0. Idle, done or ran out: unchanged. The app sends ±30 000 |
 | `timer_status` | — | `TimerSnapshot`, the set now. Main and the overlay page each call it once after they start listening to `timer-state`, since a paused or idle set sends no events |
 | `timers_dir` | — | `string`, the absolute path of the timers' folder (§6), created if missing / `"couldn't create the timers folder: {e}"` |
+| `finish_timer` | `id: string` | `TimerSnapshot` / `"no such timer"` — v1.60.0, End now. A running or paused countdown finishes now: `done`, `fires` + 1, and its whole At zero list runs (`timer-actions`, `endNow`, `lateMs` 0). One already past a deadline nothing had read finishes as that deadline's (the tick before the op takes it), so it runs as a finish that late: `zero` at 30 000 ms or less, `late` beyond. Idle, done, ran out, or a count-up: unchanged |
 
 ### MIDI control surfaces (v1.9.0)
 
@@ -399,8 +416,10 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `voice-reading` | `VoiceReadingUpdate` | ~5 Hz, **only while the Voice reading panel is on**; silent otherwise |
 | `screen-recording` | `ScreenRecordingUpdate` | on every phase change of a take, and about once a second while one records (v1.52.0); silent otherwise — also while only Replay runs |
 | `replay-buffer` | `ReplayStatus` | on every change of Replay's state or `saving`, and about once a second while armed; a held ring only on change (v1.54.0) |
-| `replay-saved` | `ReplaySaved` | the outcome of every save attempt, refusals included — exactly one per attempt (v1.54.0) |
+| `replay-saved` | `ReplaySaved` | the outcome of every save attempt, refusals included — exactly one per attempt (v1.54.0); since v1.60.0 a timer's Save a replay too, which the backend makes without the command |
 | `timer-state` | `TimerSnapshot` | backend → all windows, on every change of a timer the backend runs: a command or `tm:` key that changed one, every `sync_timers`, a countdown finishing or running out, a sleep handled, an anchor moved after a wall-clock change, and each whole-second change of a running timer's `text`; nothing on a schedule beyond that, so a paused or idle set sends nothing — v1.59.0. Sent by the backend's timer thread alone, in `seq` order; a command's answer can arrive after the event that follows it, so readers keep the snapshot with the larger `seq` |
+| `timer-actions` | `TimerActionsEvent` | backend → all windows, once for each countdown start (`armed`) and each end (`zero`, `endNow`, `late`, `ranOut`, `reset`, `deleted`), even one with no page actions (an end still lets the page settle a preset return); never for a restart's re-mute — v1.60.0. Sent by the timer thread, before its `timer-state` for the same change; a command's answer can arrive before or after either. Only the main window acts on it. An event no page listens for (a reload, the moments before the page's listeners are up) is lost: nothing sends it again |
+| `soundboard-stopped` | `null` | backend → all windows, when a timer's Stop all clips and lines has stopped every clip and line (v1.60.0). The page's own `stop_all_soundboard_clips` sends none |
 
 **Why `voice-reading` is its own event and not a field on `LevelUpdate`.**
 Additive-only permits either, so this is a design choice, recorded here because
@@ -627,16 +646,33 @@ TimerRun          { phase: "running" | "paused" | "done" | "expired",
                     // as `resume`. Running: anchorMs (required) and a
                     // countdown's totalMs; paused: ms and a countdown's
                     // totalMs; done or expired: totalMs. Idle has none
-TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun }
+TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun,
+                    onStart?: TimerAction[], onFire?: TimerAction[] }
                     // v1.59.0: an argument only (sync_timers). The page sends
                     // validated fields only; later releases add fields, which
-                    // older builds ignore
+                    // older builds ignore. v1.60.0: onStart / onFire, a
+                    // countdown's At start and At zero; absent → empty to the
+                    // backend. The page sends each only for a countdown, and
+                    // only when it holds an action that runs (as resume goes
+                    // only with a run)
+TimerAction       { kind: "preset", presetId } | { kind: "randomPreset" }
+                  | { kind: "revertPreset" } | { kind: "tile", tileId }
+                  | { kind: "speak", text, voiceId } | { kind: "saveReplay" }
+                  | { kind: "setMuted", muted: boolean } | { kind: "panic" }
+                    // v1.60.0: in sync_timers, in divora.timers (§5), and
+                    // out in timer-actions. preset, tile and panic keep
+                    // GlyphAction's shape
+TimerActionsEvent { seq, id, hook: "start" | "end",
+                    why: "armed" | "zero" | "endNow" | "late" | "ranOut"
+                         | "reset" | "deleted",
+                    lateMs, actions: TimerAction[] }  // v1.60.0
 ```
 
 **`TimerState` notes (v1.59.0).**
 
 - `done`: a countdown reached zero while the PC was awake and Divora was
-  running, and finished — late, if Divora was held up. `expired`: it reached
+  running, and finished — late, if Divora was held up; or (v1.60.0) End now
+  finished it. `expired`: it reached
   zero while the PC slept or Divora was closed, and didn't finish. Both show
   `00:00`. A count-up is only ever `idle`, `running` or `paused`. (From the
   code and fake-clock tests; no real sleep was tried. Two edge cases differ,
@@ -647,9 +683,10 @@ TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun }
   held up more than 500 ms makes countdowns due in that hold `expired` with
   the PC awake, and ones due during the sleep itself end `done`, late by its
   length.)
-- A countdown never finishes early, and finishes at most once until it is
-  started again (`arm_timer`, or the hotkey's toggle from `done` or
-  `expired`); each finish adds 1 to `fires`.
+- A countdown never finishes before its deadline unless End now ends it
+  (`finish_timer` or the `finish` key, v1.60.0), and finishes at most once
+  until it is started again (`arm_timer`, or the hotkey's toggle from `done`
+  or `expired`); each finish, End now's included, adds 1 to `fires`.
 - The page reads a snapshot with every timer's keys checked: a timer entry it
   can't read (a missing key, a phase or kind it doesn't know) is dropped and
   the rest kept, keys a later version adds are ignored, and a snapshot without
@@ -657,6 +694,52 @@ TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun }
 - `text` is the one string every surface shows — the overlay, the text file,
   Settings — so its format is part of the contract: no sign, no overtime, and
   paused shows the digits as they stopped.
+
+**`TimerAction` notes (v1.60.0).**
+
+- Fields: `presetId` a non-empty string, any length; `tileId` and `voiceId`
+  strings of 1 to 128 characters; `text` 1 to 200 characters (Unicode scalar
+  values) after trimming, read and sent trimmed; `muted` a boolean. Nothing
+  is coerced; extra keys and another kind's fields are ignored. An entry
+  that isn't one of these — not an object, a `kind` missing or unknown (the
+  glyph's `monitor` and `mute` included), a field missing or of the wrong
+  type or length — can't be read: the backend skips it, and the page keeps
+  it in storage and never sends it. The page also refuses a `text` holding a
+  lone surrogate.
+- A list: only its first 8 entries are read, readable or not; a `speak`
+  after the list's first readable one is skipped (one line per list).
+- Where each runs: `preset`, `randomPreset`, `revertPreset` and `tile` in the
+  main window; `speak`, `saveReplay`, `setMuted` and `panic` in the backend.
+  `revertPreset` never runs at a start.
+- When: At start runs when a countdown starts from idle, done or ran out
+  (`arm_timer`, or the toggle key from those), never on resume. At zero runs
+  whole at 00:00 when 30 000 ms late or less, and on End now. A countdown
+  found due more than 30 000 ms late, or that ran out while the PC slept or
+  Divora was closed, runs only At zero's putting-back actions: `setMuted
+  {muted: false}` and `revertPreset`. A Reset (or a kind change) or a delete
+  of a running or paused countdown runs only those of them that undo its
+  start: `setMuted {muted: false}` when the `onStart` its run started with
+  has `setMuted {muted: true}`, and `revertPreset` (which the page acts on
+  only with a return the start noted, §5). A relaunch that picks a running or
+  paused countdown up runs its `onStart`'s `setMuted` actions again, in the
+  backend only, with no event. Nothing else runs. Lists are read when the
+  change happens, so an `onFire` edit counts for the run going on.
+- `setMuted` is a plain set, never a toggle: the last one wins, and an
+  unmute unmutes a mute made any other way.
+
+**`TimerActionsEvent` notes (v1.60.0).**
+
+- `actions` is the page's half only (`preset`, `randomPreset`,
+  `revertPreset`, `tile`), in list order; the backend runs its own half
+  without the page. It can be empty: an end still lets the page settle a
+  preset return.
+- `lateMs` is the finish's lateness for `zero` and `late`, and 0 for every
+  other `why`.
+- `seq` rises by 1 for each start or end the backend plans in this run of
+  Divora; a restart's re-mute takes one and isn't sent, so a gap is
+  expected. Of two, the larger is newer, and the page acts on each once.
+- The page reads it with every key checked and ignores keys a later version
+  adds; an action in it the page can't read is skipped.
 
 **`TimerRun` notes (v1.59.0): what a stored run seeds.** The backend seeds a
 timer from its `resume` only the first time it accepts that id after it
@@ -825,7 +908,7 @@ to defaults (never throw).
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
 | `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super". `ptm`'s key also sets the in-app push-to-modulate key (`Space` while unbound). Hourglass's `tm:` keys (v1.59.0) aren't kept here: each timer's are in `divora.timers` |
-| `divora.timers` | `{version: 1, timers: [{id, name, kind, durationMs, hotkeys?: {toggle?, reset?, …}, run?: TimerRun}]}` — v1.59.0, Hourglass's timers in list order. Read field by field, each falling back alone: missing, unparseable or not an object → no timers; `version` an integer ≥ 1 (else 1), a larger one read with these rules and never lowered on write; an entry is dropped when it isn't an object, its `id` fails the timer id grammar (§1 hotkey ids) or repeats an earlier one, or its `kind` isn't a string; a `name` that isn't 1-40 characters after trimming gets a default ("Countdown", "Count-up", "Timer", numbered " 2", " 3"… to stay unique); a `"countdown"` or `"countup"` `durationMs` that isn't a finite number is 300 000, any other is rounded and held to 1 000..86 400 000 (another kind's finite value is kept as it is); `hotkeys` keeps every string value, read as `divora.hotkeyBindings`' are ("Win" → "Super"), and anything else is `{}`; a `run` that isn't a `TimerRun` (§3) is dropped and the timer is idle. Unknown keys, kinds and hotkey verbs are kept and written back. The page adds no timer once 16 are stored (a kind it doesn't know counted); the first 16 of kind `"countdown"` or `"countup"` among the first 64 entries run, and the rest are kept, shown with Delete only, and their keys never registered. v1.59.0 registers `toggle` and `reset` only; `finish` is v1.60.0's. `run` is the last running, paused, done or ran-out state the page saw, written only when a snapshot changes it (a start, a pause, a finish — never a running timer's text alone); every `sync_timers` sends it as `resume`, and the backend uses it only for an id it hasn't accepted since it started. Absent: boot sends no timer command. Once written it stays, `timers: []` after the last delete. **Never `fires`**, and never the backend's clock |
+| `divora.timers` | `{version: 1, timers: [{id, name, kind, durationMs, hotkeys?: {toggle?, reset?, finish?, …}, run?: TimerRun, onStart?, onFire?}], presetReturns?}` — v1.59.0 (`finish`, `onStart`, `onFire`, `presetReturns` v1.60.0), Hourglass's timers in list order. Read field by field, each falling back alone: missing, unparseable or not an object → no timers; `version` an integer ≥ 1 (else 1), a larger one read with these rules and never lowered on write; an entry is dropped when it isn't an object, its `id` fails the timer id grammar (§1 hotkey ids) or repeats an earlier one, or its `kind` isn't a string; a `name` that isn't 1-40 characters after trimming gets a default ("Countdown", "Count-up", "Timer", numbered " 2", " 3"… to stay unique); a `"countdown"` or `"countup"` `durationMs` that isn't a finite number is 300 000, any other is rounded and held to 1 000..86 400 000 (another kind's finite value is kept as it is); `hotkeys` keeps every string value, read as `divora.hotkeyBindings`' are ("Win" → "Super"), and anything else is `{}`; a `run` that isn't a `TimerRun` (§3) is dropped and the timer is idle. Unknown keys, kinds and hotkey verbs are kept and written back. The page adds no timer once 16 are stored (a kind it doesn't know counted); the first 16 of kind `"countdown"` or `"countup"` among the first 64 entries run, and the rest are kept, shown with Delete only, and their keys never registered. v1.59.0 registers `toggle` and `reset` only; since v1.60.0 `finish` (End now, a countdown's) is registered too. `run` is the last running, paused, done or ran-out state the page saw, written only when a snapshot changes it (a start, a pause, a finish — never a running timer's text alone); every `sync_timers` sends it as `resume`, and the backend uses it only for an id it hasn't accepted since it started. Absent: boot sends no timer command. Once written it stays, `timers: []` after the last delete. **Never `fires`**, and never the backend's clock. v1.60.0: `onStart` and `onFire` are a countdown's At start and At zero lists of `TimerAction` (§3), kept exactly as written whatever they hold. The page reads a list that isn't an array as empty, reads its first 8 entries as §3 says, and sends only those that run; an entry that doesn't run (one it can't read, a second line, one past the 8th) stays in place, is written back and is never sent. An edit changes one entry by its index, so nothing it can't read is dropped, and Add stops at 8 stored entries, readable or not. A count-up's lists are kept and never sent. `presetReturns` is `[{timer, from, to}]`: where a timer's start switched the preset from and to, at most one per timer, read leniently (an entry that can't be read is left out of the reading, and the key is kept as written until the page next writes it) and removed once empty. A return is settled when its timer's end is heard, or at the next page load when no page heard it (a reload, or a run-out while Divora was closed); one left for a timer no longer stored means "switch back" |
 | `divora.ptm` | `{ on: bool, hold: "apply" \| "bypass" }` — v1.58.0: whether push-to-modulate is on, and which way the Mixer card's hold goes (kept while it is off, so turning it back on restores it). Written only from the engine's answer to `set_ptm_mode`, from the mode that answer carries, so a refused call changes nothing. Absent or malformed (not an object, `on` not a boolean, `hold` neither value) reads as `{ on: false, hold: "apply" }`: off. Sent back to the engine as `set_ptm_mode {mode, restore: true}` each time the main window loads (`mode` is `hold` while on, `"always"` while off). **Never a hold**: what holds it lives in the engine |
 | `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
@@ -856,6 +939,9 @@ the session, and the baseline dies with the worker thread that held it.
 **The mute itself is never stored (v1.56.0)**, and neither is the side a
 mute CC was last on. Every launch starts unmuted; only the bindings above
 (`divora.hotkeyBindings`, `divora.midiMappings`, the glyph keys) are kept.
+Since v1.60.0 a countdown whose At start mutes, running or paused when
+Divora closed, mutes you again once the page's first `sync_timers` picks its
+stored run up, and the page says which timer did it.
 
 **Push-to-modulate's on/off and direction are stored, in `divora.ptm`
 (v1.58.0); its holds never are**, nor which MIDI mappings are down or the side
@@ -865,7 +951,8 @@ held, because the backend tracks that one.
 
 **Hourglass's timers are stored by the page, in `divora.timers` (v1.59.0);
 the backend keeps no timer state on disk** (its text files, §6, are output
-only). Each timer's last run is kept with wall-clock anchors, so a restart
+only). Since v1.60.0 so are each countdown's action lists and the preset
+returns. Each timer's last run is kept with wall-clock anchors, so a restart
 picks a running timer up with the time that passed while Divora was closed. A
 page reload changes nothing in the backend, which keeps its own state and
 ignores the runs the reload sends.

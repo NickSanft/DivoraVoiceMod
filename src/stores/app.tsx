@@ -2351,14 +2351,23 @@ export function createAppState(): AppState {
 
   // Every command that changes Hourglass in the backend goes through this
   // one queue, each sent only once the one before it answered: the syncs,
-  // the labelled commands, and the `tm:<id>:<verb>` keys' registers and
-  // unregisters. Invokes in flight together can reach Rust out of send order
-  // (measured in the real app with 40 sent at once), so a Start and a Reset
-  // clicked quickly could land reversed and leave the timer as the first
-  // click left it, and a delete's unregister could land after a key bound
-  // for the timer that took its id. `timer_status` isn't queued: it changes
-  // nothing, and its answer is adopted by `seq` wherever it lands, so it
-  // needn't wait behind a slow command.
+  // the labelled commands (v1.60.0: End now's `finish_timer` too), and the
+  // `tm:<id>:<verb>` keys' registers and unregisters. Invokes in flight
+  // together can reach Rust out of send order (measured in the real app
+  // with 40 sent at once), so a Start and a Reset clicked quickly could
+  // land reversed and leave the timer as the first click left it, and a
+  // delete's unregister could land after a key bound for the timer that
+  // took its id. `timer_status` isn't queued: it changes nothing, and its
+  // answer is adopted by `seq` wherever it lands, so it needn't wait behind
+  // a slow command.
+  //
+  // The store keeps one such queue per feature: the mute's,
+  // push-to-modulate's and this one since v1.59.0, the effect chain's and
+  // the soundboard's since v1.60.0 (D19). A timer's actions never come
+  // through here: the backend runs its half (the mute, Stop all clips and
+  // lines, a replay, a line) with no page command, and the page's half (a
+  // preset switch, a clip) goes through the chain's and the soundboard's
+  // queues, in order with the page's other sends there.
   const timerQueue = inOrder();
 
   // Every stored timer, in list order, with its run as `resume`: the backend
@@ -3098,14 +3107,15 @@ export function createAppState(): AppState {
   );
 
   // v1.60.0: the effect chain's commands, one at a time (D19), as the
-  // mute's and the timers' are: invokes in flight together can reach Rust
-  // out of send order (measured in the real app with 40 sent at once), so
-  // a timer's preset switch and a slider moved at the same time could
-  // otherwise land reversed, and a param sent before a switch would edit
-  // the new chain's effect at that index. Every `set_effect_chain`,
-  // `set_effect_param`, `set_effect_enabled` and `set_voice_model` the
-  // store sends goes through it; a voice model sent after a chain lands
-  // after it. A failure is logged and holds nothing back.
+  // mute's, push-to-modulate's and the timers' are: invokes in flight
+  // together can reach Rust out of send order (measured in the real app
+  // with 40 sent at once), so a timer's preset switch and a slider moved at
+  // the same time could otherwise land reversed, and a param sent before a
+  // switch would edit the new chain's effect at that index. Every
+  // `set_effect_chain`, `set_effect_param`, `set_effect_enabled` and
+  // `set_voice_model` the store sends goes through it; a voice model sent
+  // after a chain lands after it. A failure is logged and holds nothing
+  // back.
   const chainQueue = inOrder();
   const sendChainCmd = (what: string, send: () => Promise<unknown>): void => {
     chainQueue(send).catch((e: unknown) => {

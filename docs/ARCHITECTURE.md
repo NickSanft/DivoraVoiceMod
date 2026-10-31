@@ -309,6 +309,11 @@ User picks a different preset (Phase 4 will surface this)
             └─ setEffectChain(chainToSpecs(chain()))     (full SetChain)
 ```
 
+Since v1.60.0 every chain command above goes out through the store's chain
+queue, one at a time, and a preset switch sends one `SetChain`, from that
+effect, then the voice model (see "Timers that change your voice (v1.60.0)",
+"The queues").
+
 ### Spell circle geometry
 
 `nodePositions(n)` distributes `n` nodes evenly around a circle of radius 158 centred at (220, 220), starting at -90° (top). Stack contents (back to front):
@@ -399,7 +404,7 @@ Same struct on both sides; serde + TypeScript types stay in lockstep via `WirePr
 | `abSlots` / `setAbSlots` | store | Per-preset `{ A, B }` chain snapshots |
 | `setAbSlot(slot)` | action | Snapshot current → old slot, restore new slot, sync to engine |
 | `resetAbSlots` | action | Collapse both slots to the current chain |
-| `usePreset(id)` | action | Switch active preset; reset A/B; resync |
+| `usePreset(id)` | action | Switch active preset; reset A/B; resync (v1.60.0: the effect on the active preset sends the one chain; `usePreset` sends none of its own) |
 | `savePreset(p)` | action | Refuse bundled; save user via backend |
 | `duplicatePreset(id)` | action | Slug-generates new id; saves as User |
 | `deletePreset(id)` | action | Refuse bundled; deletes user via backend |
@@ -559,7 +564,7 @@ Each shortcut id is stable application-defined (`ptm` / `panic` / `monitor` / `m
 - **`overlay:arrange`** (v1.55.0): the handler hands every event to `overlay_windows::hotkey`, and a press switches the open overlay between Arrange and Locked (see "Stream overlay window"). Its JavaScript branch never calls `set_overlay_mode`, which would toggle the press twice.
 - **`mute`** (v1.56.0): the handler then hands every event to `mute_on_hotkey`, and a press — never a release (`hotkey_mute_request`) — calls `engine.toggle_input_muted()`, one atomic operation on the engine's mute (see "Mute (v1.56.0)"). The page plays no part, so it doesn't matter whether it is hidden, reloading or busy, and two quick presses are two flips. global-hotkey 0.8.0 registers every key with `MOD_NOREPEAT`, so a held key doesn't repeat. Its JavaScript branch does nothing: acting there would flip it twice. The page learns the new state from the next `audio-levels` tick.
 - **`ptm`** (v1.58.0): the handler then hands every event to `ptm_on_hotkey`, and a press holds push-to-modulate's global-key source and its release lets go (`engine.set_ptm_held(PtmSource::Hotkey, …)`, one atomic operation, safe on the poller thread; see "Push-to-modulate (v1.58.0)"). The page plays no part, for the mute's reasons. Its JavaScript branch does nothing: acting there would hold it twice. The page learns the new state from the next `audio-levels` tick.
-- **`tm:<id>:toggle` and `tm:<id>:reset`** (v1.59.0): the handler then hands every event to `timer_thread::timer_on_hotkey`, and a press — never a release (`hotkey_timer_request`) — toggles or resets that Hourglass timer under the timers' lock: start, pause or resume by its phase, or back to idle (see "Hourglass (v1.59.0)"). It never registers, unregisters, writes, logs or emits; the timer thread emits what changed as `timer-state`. Its JavaScript branch does nothing: acting there would do it twice. `tm:<id>:finish` is reserved for v1.60.0 and does nothing yet.
+- **`tm:<id>:toggle`, `tm:<id>:reset`** (v1.59.0) **and `tm:<id>:finish`** (v1.60.0): the handler then hands every event to `timer_thread::timer_on_hotkey`, and a press — never a release (`hotkey_timer_request`) — toggles, resets or ends that Hourglass timer under the timers' lock: start, pause or resume by its phase, back to idle, or End now (see "Hourglass (v1.59.0)" and "Timers that change your voice (v1.60.0)"). It never registers, unregisters, writes, logs, emits or runs a timer's actions; the timer thread emits what changed as `timer-state` and hands on what the change runs. Its JavaScript branch does nothing: acting there would do it twice.
 
 The routes:
 
@@ -2138,6 +2143,66 @@ Drag, border, taskbar, focus and reopen behaviour from v1.51.3 can only be
 checked on a desktop: see "Stream overlay (v1.16.0)" in
 [`MANUAL_TESTS.md`](MANUAL_TESTS.md).
 
+## Speak's voice files (v1.17.0; the helper's path, v1.60.0)
+
+Speak's Kokoro voices, their previews, cloned voices built on a Kokoro base
+and (since v1.60.0) timers' lines render through `divora_core::tts` from one
+folder of assets: Kokoro's model, its config and voice pack, and
+`espeak-ng.exe` with its `espeak-ng-data`, which turns each chunk of text
+into phonemes. Critter Chatter is procedural and reads none of it. `setup`
+resolves the folder once, as `AppState.tts_assets_dir`:
+
+- **A built app:** the resource dir's `tts/` (`app.path().resource_dir()`),
+  logged as "tts assets dir resolved". The resource dir comes from
+  tauri-utils 2.9.2's `StartingBinary`, which canonicalizes the exe's path,
+  so on Windows the folder is a verbatim path, `\\?\C:\…\tts`.
+- **A debug build** (`debug_assertions`) uses that folder only when Kokoro's
+  model is in it, and otherwise the source-staged `src-tauri/resources/tts/`
+  (filled by `scripts/fetch-voice-assets.ps1`), a plain path built from
+  `CARGO_MANIFEST_DIR`, and points `ORT_DYLIB_PATH` at the staged runtime
+  when it isn't set. `tauri dev` copies no resources, and nor did this PC's
+  `tauri build --debug --no-bundle` builds (there is no `target\debug\tts`),
+  so they took the staged folder.
+
+**The path bug, fixed in v1.60.0.** `espeak-ng` builds
+`<--path>/espeak-ng-data` with a forward slash, which a verbatim path never
+treats as a separator. Handed `\\?\C:\…\tts`, it missed its data, fell back
+to the folder itself and exited 1 on `…\tts\phontab`. So, from the code,
+every Kokoro render failed in a built app: Speak, previews, cloned voices on
+a Kokoro base, and timers' lines. A debug build's plain path hid it. S2's L1,
+run on a release build, found it: its first Kokoro line failed with
+"phonemization failed: espeak-ng exited with status 1: Error processing file
+'\\?\C:\…\target\release\tts\phontab'". By hand, with the bundled
+`espeak-ng.exe` and `CREATE_NO_WINDOW` both times (so the console flag below
+isn't involved), the verbatim path exited 1 with that error and the plain
+one printed the IPA and exited 0. The lock file had tauri-utils 2.9.2 at
+every tag from v1.17.0 to v1.59.0, so every built release would have failed
+the same way; no installed Divora was tried here (owner check P7 in
+`MANUAL_TESTS.md`).
+
+`espeak_args` now passes `plain_path(dir)`: `\\?\C:\x` becomes `C:\x`,
+`\\?\UNC\host\share` becomes `\\host\share`, and anything else, a
+`\\?\Volume{…}\` path with no plain form included, goes as it is. Only
+`espeak-ng`'s argument changes; the folder stays as resolved everywhere
+else. `args_pass_a_plain_path_never_a_verbatim_one` runs in CI; the ignored
+`espeak_reads_its_data_from_a_verbatim_dir` runs the staged `espeak-ng` on a
+canonicalized folder, locally only:
+`cargo test -p divora-core verbatim_dir -- --ignored`. Both fail with the
+strip removed. L1 again, on a release build with the fix: the Kokoro line
+rendered in 1,624 ms and logged `played`, with the engine stopped, so
+nothing was heard.
+
+**No console window (v1.60.0).** `espeak-ng.exe` is a console program, and a
+built Divora is a GUI process with no console to share, so each spawn — one
+per chunk of a line — could open a window of its own, over a game, when a
+timer's line fires unattended. `Phonemizer::phonemize` sets
+`CREATE_NO_WINDOW` on Windows. `phonemize_never_opens_a_console` reads the
+source, since whether a window shows depends on how the app was started (a
+debug build shares its console). L1 listed every top-level window, every
+50 ms, through a Kokoro line on a release build: none opened, from any
+process, and the foreground didn't change. An installed build wasn't tried
+(P7).
+
 ## Screen recording (v1.52.0)
 
 One monitor to an MP4 — H.264 High plus AAC-LC 48 kHz stereo 192 kbps — with
@@ -2781,7 +2846,10 @@ isn't a boolean.
 life, and teardown never touches it. Stop, Start, a device switch and a
 device-loss rebuild keep the user muted, and a mute made while stopped holds
 for the next Start (`input_mute_survives_stop_start_and_a_rebuild`). It is
-never stored: every launch starts unmuted, at `seq` 0.
+never stored: every launch starts unmuted, at `seq` 0. (Since v1.60.0 a
+countdown that mutes at its start, running or paused when Divora closed,
+mutes again once the page's boot sync seeds it: see "Timers that change your
+voice (v1.60.0)", "A restart mid-break".)
 
 ### The gate
 
@@ -3088,9 +3156,9 @@ different rates, and joining them flashed "Input silent" after every unmute.
   `inputMuteSeq` always agree.
 - **The reading worker:** one load per pass.
 - `AudioEngine::set_input_muted` takes `&self` and no lock, so any thread can
-  call it; that is the way in planned for the break timer in "Timers that
-  change your voice" (now planned as v1.60.0; see
-  [`research/stream-studio.md`](research/stream-studio.md)).
+  call it. Since v1.60.0 a timer's Mute my voice and Unmute my voice call it
+  from the timers' action worker (see "Timers that change your voice
+  (v1.60.0)").
 
 **Latency**, from the press: the main-thread queue (normally empty), then up
 to one buffer before the callback reads the word (about 10 ms at 480 frames),
@@ -3307,7 +3375,8 @@ commands must stay sync: global-hotkey registers on its window's thread, and
 the plugin holds its own lock while it runs our handler. Mute, chain edits
 and other atomic or channel-send commands stay sync: they are fast. Being sync
 doesn't keep commands in flight together in order (Hourglass's "Command
-order"): the mute's are queued since v1.59.0, chain edits not yet. Deferred,
+order"): the mute's are queued since v1.59.0, chain edits since v1.60.0.
+Deferred,
 each needing more than a move:
 `start_audio_engine` (roughly 150–450 ms here, added up from parts timed
 separately rather than end to end; likely seconds with a Bluetooth headset
@@ -4033,8 +4102,9 @@ JavaScript timers play no part. Besides Settings, a timer shows in
 two places: a `timer` element on the stream overlay, and a text file,
 `timers/<id>.txt`, for an OBS **Text (GDI+)** source's **Read from file**. A
 second thread, `divora-timer-files`, writes the files, so no disk wait reaches
-the timer thread. At zero a countdown shows `00:00` and says Done, and nothing
-else happens: actions at zero are v1.60.0's. The plan, and what the build
+the timer thread. At zero a countdown shows `00:00` and says Done; since
+v1.60.0 it also runs its At zero list (see "Timers that change your voice
+(v1.60.0)", which also adds End now). The plan, and what the build
 changed from it, are in [`research/stream-studio.md`](research/stream-studio.md)
 (v1.59.0).
 
@@ -4046,7 +4116,8 @@ Where it lives:
 - `src-tauri/src/timer_thread.rs`: the clocks, the sleep check, `TimerShared`,
   the `divora-timers` loop, the `tm:` step and the file writer.
 - `src-tauri/src/lib.rs`: `AppState.timers`, the folder and both threads in
-  `setup`, the eight commands, one line in the shortcut handler.
+  `setup`, the eight commands (nine since v1.60.0's `finish_timer`), one line
+  in the shortcut handler.
 - `divora-capture`: `pub use native::power::SleepWatch`, and a stub for other
   platforms.
 - `src/overlay/timerState.ts`: the snapshot's types, `readTimerSnapshot`,
@@ -4081,8 +4152,8 @@ running or paused.
 - `expired`: it reached zero while the PC slept or Divora was closed, and
   didn't finish.
 
-Both show `00:00`. They differ on the wire so that v1.60.0, which runs
-actions at zero, can tell a finish from a timer that ran out unseen. Two edge
+Both show `00:00`. They differ on the wire so that the actions at zero
+(v1.60.0) can tell a finish from a timer that ran out unseen. Two edge
 cases break the split (under "Sleep", from the code): a countdown due in a
 second sleep of 5 s or less within a minute of one handled ends `done`, and on
 a clock that doesn't count sleep, a resume signal during a hold-up past
@@ -4112,19 +4183,22 @@ changes nothing marks nothing changed and sets no new anchor.
 
 **Adjust** (`adjust_timer`; ±30 s in Settings) moves a running or paused timer
 only. A countdown keeps at most 24 h left, and going down stops at 1 s, so
-−30 s never ends one (in v1.60.0 ending runs the actions at zero); a left
+−30 s never ends one (since v1.60.0 an end runs its At zero list); a left
 already under 1 s stays as it is. Its total moves by what its left moved, so
 the total can pass 24 h. A count-up moves by the whole delta and stops at 0. A
 running timer runs on from the new value, with a new anchor.
 
-**Fires once, never early.** The only way a running countdown gets to `done`
-is `Timer::fire` (a restart's seed only puts a stored `done` back, `fires` 0),
+**Fires once, never early.** The only way a countdown gets to `done` is
+`Timer::fire` (a restart's seed only puts a stored `done` back, `fires` 0),
 which `tick`'s settle step calls for a running countdown whose deadline is at
 or before `now`. Every entry point runs `tick` first, so a due countdown fires
 before any op: Pause can't freeze a timer at 0, and a Toggle that finds its
 countdown due fires it, then arms it again (`fires` + 1, running). `fires`
 counts per definition: 0 when an id enters the set, so a deleted and re-added
-id starts again at 0. v1.60.0's Finish is to call the same `fire`.
+id starts again at 0. Since v1.60.0, End now (`TimerOp::Finish`) calls the
+same `fire` for a running or paused countdown, before its deadline on
+purpose, so "fires once" covers both ("Timers that change your voice
+(v1.60.0)", "End now").
 
 **The text** is formatted once, in Rust (`timer_text`), and shown the same on
 the overlay, in the file and in Settings. Under an hour it is `MM:SS`
@@ -4149,7 +4223,10 @@ dropped). Only the timer thread drains both, under the lock it builds its
 snapshot under, and logs each one after letting go of the lock. So each is
 reported once, and no reader writes the log file under the lock (the app's
 log writer is a blocking file appender). A fire more than 1 s late
-(`LATE_LOG`) is logged at warn, with its lateness.
+(`LATE_LOG`) is logged at warn, with its lateness. v1.60.0 adds `Started`
+and `Cancelled`, has each transition carry the timer's action lists, caps
+the list at 256, and logs only after the thread has handed each transition's
+actions on ("Timers that change your voice (v1.60.0)").
 
 ### The clocks
 
@@ -4230,8 +4307,8 @@ the rule covers timers added soon after
 **A stall isn't a sleep.** With no sleep signal, a countdown found past its
 deadline finishes, however late (a debugger, a starved CPU), and the thread
 logs by how much. Only a sleep or a closed Divora expires a countdown, but for
-the limit below, so in v1.60.0 a break's unmute will run late rather than not
-at all.
+the limit below, so a break's unmute (v1.60.0) runs late rather than not at
+all; more than 30 s late, only its putting-back actions run.
 
 **A limit, on a clock that doesn't count sleep.** With no (a) in the last
 minute, a resume signal that arrives while the readers are held up past
@@ -4355,9 +4432,15 @@ loop:
        → the texts, if there is a snapshot and a sync has happened
        → wake_at = now + next_wake(now, TICK)       from the same reading
        → drain transitions and notes
-  unlock → log notes and transitions → emit timer-state
+  unlock → (v1.60.0) plan each transition, hand its actions on
+         → emit timer-state
          → put the texts in the writer's slot
+         → log notes and transitions
 ```
+
+Until v1.60.0 the log lines came first, right after unlocking; they now come
+last, so a log write stuck on the disk can't delay a timer's mute (see
+"Timers that change your voice (v1.60.0)", "The hand-off").
 
 `next_wake` is the soonest moment a running timer's text changes — a
 countdown's deadline being its last boundary — computed in ns from the pass's
@@ -4381,9 +4464,10 @@ the page and the overlay keep whichever snapshot has the larger `seq`
 (`adoptTimers`). A `timer_status` read wakes the thread only when its own
 tick changed something.
 
-**Emits** (`TimerEvents for AppHandle`): from a std thread, `emit` posts to
-the event loop and returns; only the first failure is logged, since the next
-change sends the whole set again. `timer-state` goes out on every change — an
+**Emits** (`TimerEvents for AppHandle`; `for TimerOutputs` since v1.60.0,
+which also hands on each transition's actions): from a std thread, `emit`
+posts to the event loop and returns; only the first failure is logged, since
+the next change sends the whole set again. `timer-state` goes out on every change — an
 op, a sync, a fire, an expiry, a sleep pause, a (b) correction, a moved
 anchor, and each whole-second change of a running timer's text — and never
 on a schedule beyond that. A paused or idle set sends nothing, which is why a
@@ -4481,7 +4565,8 @@ rarely; FreeType 2 keeps its old text instead. Owner checks O1 (GDI+) and O2
 
 ### The commands
 
-Eight, all sync (`timer_commands_stay_sync`): Tauri runs each sync command to
+Eight, nine since v1.60.0's `finish_timer`, all sync
+(`timer_commands_stay_sync`): Tauri runs each sync command to
 completion on the main thread, one at a time and in turn with `WM_HOTKEY`, so
 no two commands, and no command and key press, act on the timers at the same
 moment. Being sync doesn't keep commands in the order they were sent, though:
@@ -4502,6 +4587,7 @@ any timer command the page sent before it that hasn't answered.
 | `sync_timers {timers}` | the definitions become `timers` (above); never fails |
 | `arm_timer {id}`, `pause_timer {id}`, `resume_timer {id}`, `reset_timer {id}` | the op; "no such timer" for an id the core doesn't run |
 | `adjust_timer {id, deltaMs}` | `adjust_delta` refuses a delta that isn't a whole number of ms within ±24 h; then Adjust |
+| `finish_timer {id}` | v1.60.0, End now: Finish ("Timers that change your voice (v1.60.0)"); "no such timer" as above |
 | `timer_status` | ticks, then answers the set; wakes the thread only if that tick changed something |
 | `timers_dir` | creates the folder, then answers its absolute path: the only file work on the main thread |
 
@@ -4542,11 +4628,14 @@ one queue per feature, and the queues don't wait on each other:
   edge. The restore is the queue's first, so a press made before its answer
   goes after it.
 - **Hourglass:** `sync_timers`, the labelled commands (`arm_timer`,
-  `pause_timer`, `resume_timer`, `reset_timer`, `adjust_timer`) and every
+  `pause_timer`, `resume_timer`, `reset_timer`, `adjust_timer`, and since
+  v1.60.0 `finish_timer`) and every
   register and unregister of a `tm:` key: a bind, a clear, a delete's, the
   boot's. A sync carries the timers as they stood when it was queued, so a
   delete's sync reaches Rust before a later Add's, and a key bound for a
   timer that took a deleted id registers after the delete's unregisters.
+- **The effect chain and the soundboard** (v1.60.0): see "Timers that change
+  your voice (v1.60.0)", "The queues".
 
 **Reads stay out.** `input_mute` and `timer_status` change nothing, and their
 answers are adopted by `seq` wherever they land, so they don't wait in the
@@ -4571,23 +4660,22 @@ feature, which drive the real store over a mock wire that lands whatever is
 in flight together reversed).
 
 **Not queued yet:** any other command the page sends without waiting for the
-one before it to answer. For example, a slider drag sends `set_effect_param`
-at each step, so an older value could land last and the engine keep it while
-the slider shows the newer (from the code; not seen). The chain's
-`set_effect_chain` and the binds in Settings → Hotkeys are in the same
-position. To check: if two sends, of one command or of two, can be in flight
-together and the order they land in matters, they need one queue. Queuing
-those is a follow-up.
+one before it to answer. For example, the binds in Settings → Hotkeys: two
+binds in flight together could land in either order (from the code; not
+seen). Until v1.60.0 a slider drag's `set_effect_param` and the chain's
+`set_effect_chain` were in the same position; v1.60.0 queues them. To
+check: if two sends, of one command or of two, can be in flight together
+and the order they land in matters, they need one queue.
 
 ### The keys
 
 `global_shortcut_handler` calls `timer_thread::timer_on_hotkey(&state.timers,
 &id, pressed)` after `ptm_on_hotkey`. `hotkey_timer_request` acts on a press
-of `tm:<id>:toggle` or `tm:<id>:reset` with a valid id; a release,
-`tm:<id>:finish` (reserved for v1.60.0) and any other spelling do nothing, and
-take no lock. A press arrives inside `WM_HOTKEY` on the main thread. The step
-locks the core, reads the clocks, checks for a sleep, applies Toggle or
-Reset, unlocks and wakes the thread, which emits. It never registers,
+of `tm:<id>:toggle`, `tm:<id>:reset` or (since v1.60.0) `tm:<id>:finish` with
+a valid id; a release and any other spelling do nothing, and take no lock. A
+press arrives inside `WM_HOTKEY` on the main thread. The step
+locks the core, reads the clocks, checks for a sleep, applies Toggle, Reset
+or Finish, unlocks and wakes the thread, which emits. It never registers,
 unregisters, writes, logs or emits, so it works while the main page is
 hidden, reloading or busy, and decides from the core's state. The shortcut
 map's lock is released before the steps run, and the core's lock is a leaf
@@ -4597,8 +4685,9 @@ and the page's `tm:` branch does nothing with it.
 
 The keys live with each timer in `divora.timers` (`hotkeys`, accelerators by
 verb), not in `divora.hotkeyBindings`, whose action list is closed. v1.59.0
-registers `toggle` and `reset`; any other verb, such as v1.60.0's `finish`, is
-kept, written back unchanged and never registered. `syncHotkeyBindings`
+registered `toggle` and `reset`; v1.60.0 adds `finish` (End now, a
+countdown's third row). Any other verb is kept, written back unchanged and
+never registered. `syncHotkeyBindings`
 registers them after the fixed actions and the tiles, for timers the backend
 runs only, reading each key just before it is queued. Every register and
 unregister of a `tm:` key goes through the timers' queue ("Command order"),
@@ -4618,7 +4707,9 @@ to a key nothing shows. Every key is unbound until the user sets it.
   doesn't make it run first ("Command order"); what makes the backend know
   every timer before any of their keys works is the timers' queue: the sync
   is its first, and the keys `App` registers are queued after it. Then it awaits
-  `listen("timer-state")` and calls `timer_status` once, because an emit
+  `listen("timer-state")` (since v1.60.0 with `timer-actions` and
+  `soundboard-stopped`, all three before the pull) and calls `timer_status`
+  once, because an emit
   reaches only a listener already registered (a seeded countdown running out
   in between would reach nobody) and a paused or done timer sends nothing
   more. Without the key, boot sends no timer command and doesn't listen. The
@@ -4638,7 +4729,8 @@ to a key nothing shows. Every key is unbound until the user sets it.
   counted, so each counted timer has a card with Delete. Rename and length act
   only on timers the backend runs, and an unchanged commit sends nothing.
 - **Delete** saves first, so a capture still open can't bind the timer's keys
-  again. Then, in the same turn, it queues the two unregisters, takes the
+  again. Then, in the same turn, it queues an unregister for each verb (two
+  in v1.59.0, three since v1.60.0's `finish`), takes the
   timer's faces off the overlay and queues the sync without it; the timers'
   queue sends them in that order, each once the one before has answered
   ("Command order"). Until `f22eb17` they were sent together, and their order
@@ -4652,8 +4744,9 @@ to a key nothing shows. Every key is unbound until the user sets it.
   listens.
 - **Buttons.** Start sends `arm_timer`, `pause_timer` or `resume_timer` by the
   mirror's phase, the label it drew (`timerAction`); with no state yet there
-  is no button. Reset and ±30 s send their commands. All go through
-  the timers' queue, and each adopts its answer.
+  is no button. Reset and ±30 s send their commands (and since v1.60.0 End
+  now, `finish_timer`). All go through the timers' queue, and each adopts
+  its answer.
 
 ### The overlay face
 
@@ -4716,6 +4809,9 @@ with the mirror.
   Length, for a countdown; two hotkey rows; Show on overlay; the file line
   with Copy path; Rename and Delete. A timer that ran out adds "It reached
   00:00 while your PC was asleep or Divora was closed, so it didn't finish."
+  v1.60.0 adds, for a countdown, End now, a third hotkey row, the At start
+  and At zero lists, and lines about them ("Timers that change your voice
+  (v1.60.0)"), and an **Add break (BRB)** button beside the two Adds.
 - **With no state yet** (before the backend's first answer, or after a failed
   sync): the name, the kind line, "Starting…", Rename and Delete.
 - **A timer this build doesn't run:** a read-only row with Delete only, "Made
@@ -4766,6 +4862,7 @@ with the mirror.
   a screen reader).
 - **Focus.** A pointer click on Start / Pause / Resume, Reset, ±30 s, Add
   countdown, Add count-up, Show on overlay, Copy path, Open folder or Delete
+  (and since v1.60.0 End now and Add break (BRB))
   hands the focus back to the page (`blurOnPointer`), because a focused button
   takes Space, push-to-modulate's in-app key: after Add, each Space would add
   a timer. From the keyboard they keep it.
@@ -4801,6 +4898,11 @@ path of BRB's file").
 | logging, the emit | `divora-timers`, unlocked | nothing | — |
 | the hand-off | `divora-timers`, unlocked | the slot's lock, for a swap | waiting on the writer |
 | writes, removals, the sweep, repair | `divora-timer-files` | nothing | the core lock |
+
+v1.60.0 adds the hand-off of each transition's actions to `divora-timers`
+(before its emit and the texts, with the log lines last) and two threads,
+`divora-timer-actions` and `divora-timer-lines`: see "Timers that change your
+voice (v1.60.0)", "Threads".
 
 **Latency**, from the code, with S2's figures from the real app on this PC
 (debug builds; the setup is under "Tests"):
@@ -4960,7 +5062,8 @@ running.
   takes only newer snapshots, Pause sends `pause_timer`); a bound key and a
   reload (the sync carries `resume` and goes before device enumeration and
   registration; exactly the run timers' `toggle` and `reset` register, no
-  `finish`, no newer kind); the key left to the backend; Delete twice; and
+  `finish`, no newer kind — since v1.60.0, `finish` too); the key left to the
+  backend; Delete twice; and
   the overlay's face (nothing before a snapshot, no badge in Arrange, newer
   `seq` only, updates under Functional motion, "Timer missing" in Arrange).
   The mock answers every timer command `null`, so the e2e never runs Rust's
@@ -5082,24 +5185,765 @@ running.
 
 ### Not in this release
 
-- **v1.60.0, "Timers that change your voice":** actions at zero. Its Finish
-  (`finish_timer`, and the reserved `tm:<id>:finish`) is to call the same
-  `fire`, so "finishes once" covers both. Actions are to run from the drained
-  transitions on a worker of their own: nothing may block `divora-timers` or
-  `WM_HOTKEY` (a replay save waits up to 90 s), so where the plan has the
-  timer thread run mute, unmute, panic and saving a replay, a worker fed from
-  it runs them. Open: whether a timer that ends `expired` runs its restoring
-  actions (an unmute, a preset reverted) while skipping one-shot ones (a
-  spoken line, a tile, a replay save); skipping all of them would leave a
-  break muted. `Seeded` transitions let it put a start action back for a
-  timer restored running after a crash. Its new definition fields arrive
-  through `sync_timers`, read one by one.
+- **v1.60.0, "Timers that change your voice":** shipped; see the next
+  section. As planned here, End now calls the same `fire`, the actions run
+  from the drained transitions on a worker of their own, a seed puts a
+  break's mute back after a restart, and the lists arrive through
+  `sync_timers`, read one by one. The open question was answered: a
+  countdown that ran out runs only its putting-back actions (an unmute, a
+  preset switched back), never a line, a clip, a replay or a switch.
 - **v1.61.0, "Talk to OBS":** the same text pushed to an OBS source. The
   thread hands texts to one `TextSink`, which is to take a `watch` sender
   beside the writer's slot. A count-up that follows OBS's stream needs a core
   op of its own to set a known timer's time, since a seed applies only to an
   id not yet seen; it can reuse `seed`'s arithmetic.
 - Later, or not planned: overtime; laps; styling the face (style the text
-  file in OBS instead); a sound at zero (with v1.60.0's tile action); a tray
-  item; a Mixer card; a titlebar pill; MIDI or glyph actions for timers; a
-  fix for the sleep limit above.
+  file in OBS instead); a sound at zero (done in v1.60.0: Play a clip at
+  zero); a tray item; a Mixer card; a titlebar pill; MIDI or glyph actions
+  for timers; a fix for the sleep limit above.
+
+## Timers that change your voice (v1.60.0)
+
+A countdown in **Settings → Hourglass** now does things when it starts and
+when it reaches zero. It has two lists, **At start** (`onStart`) and **At
+zero** (`onFire`), of up to 8 actions each: switch preset, random preset,
+back to the preset before, play a clip, speak a line (one per list), save a
+replay, mute my voice, unmute my voice, and stop all clips and lines. **Add
+break (BRB)** makes a 5:00 countdown that mutes at its start and unmutes at
+zero, in one save and one sync. **End now** — a button, the command
+`finish_timer` and a third key, `tm:<id>:finish` — finishes a running or
+paused countdown and runs its At zero list. Count-ups have no lists and no
+End now: they never reach zero, so nothing would put a start's change back.
+Rust decides what runs and runs most of it; the main window runs the preset
+switches and the clips, because it owns the chains and the tile list. The
+plan, and what the build changed from it, are in
+[`research/stream-studio.md`](research/stream-studio.md) (v1.60.0).
+
+Where it lives:
+
+- `src-tauri/src/timer_actions.rs` (pure): the eight kinds and how a list is
+  read (`action_from_wire`, `hooks_from_wire`), `plan`, `route`,
+  `replay_at`, the `timer-actions` payload, the limits and the kill switch.
+- `src-tauri/src/timers.rs`: each timer's lists (`TimerDef.hooks`),
+  `TimerOp::Finish`, and the transitions below.
+- `src-tauri/src/timer_thread.rs`: the hand-off at the end of each pass
+  (`hand_off`), `ActionHost`, and the action worker, `divora-timer-actions`.
+- `src-tauri/src/timer_lines.rs`: `TimerLines` (the latest line, and what
+  makes one stale) and the line thread, `divora-timer-lines`.
+- `src-tauri/src/lib.rs`: `finish_timer`; `TimerOutputs`, what the timer
+  thread hands to; `AppHost`, what the worker runs against;
+  `AppState.timer_lines`; both new threads in `setup`;
+  `stop_all_soundboard_clips` through the lines.
+- `divora-core/src/tts/phonemize.rs`: `espeak-ng` with no console window and
+  a plain `--path` (see "Speak's voice files").
+- `src/data/timerActions.ts`: the page's pure rules — reading an action, a
+  stored list and the event; editing a list by index; returns and
+  reconcile; random preset; the card's lines; the restart notice; the Break
+  template.
+- The store (`src/stores/app.tsx`): three listeners, the page half, returns,
+  two new queues. `TimerControls` in `src/screens/SettingsScreen.tsx`.
+  `Select` gains a name, a missing value and keys, for every picker that
+  uses it. Three sigils: `endNow`, `shuffle`, `undo`.
+- `src/overlay/timer.fixture.json`: v1.59.0's contract, untouched, and this
+  release's beside it under keys of its own (`actionWire`,
+  `actionsEventKeys`, `whys`, `hooks`, `actionKinds`, `actionLimits`,
+  `actionSamples`, `listSamples`, `actionsEventSamples`); `defKeys` and
+  `hotkeyIds` gain rows. Both sides' tests read it.
+
+`timer_actions.rs` and `timer_lines.rs` are `pub` modules, as Hourglass's
+are, so the thread's and `lib.rs`'s tests drive the real functions.
+
+### What the core records
+
+v1.59.0 recorded `Fired`, `Expired`, `SleepPaused` and `Seeded`. This release
+adds a start and a cancel, and each transition that can run actions carries
+the timer's lists as an `Arc<Hooks>`, cloned under the lock (an increment,
+no allocation), so a deleted timer's lists still reach the plan:
+
+| Transition | Recorded when |
+|---|---|
+| `Started {id, fires, hooks}` | Arm takes a countdown from idle, done or ran out to running: Start, Start again, or a start-or-pause press that arms. Never on Resume, which isn't a start |
+| `Fired {id, fires, late_ms, finished, hooks}` | as before: a reader's tick finds a running countdown at or past its deadline; or End now (`finished`, `late_ms` 0) |
+| `Expired {id, hooks}` | as before: it ran out while the PC slept |
+| `Seeded {id, phase, from, hooks}` | as before; `from` is the stored run's phase, so a run that ran out while Divora was closed (`running` → `expired`) is told from a stored `expired` seeded again at every launch |
+| `Cancelled {id, why, hooks, started}` | a running or paused countdown stops without firing: a Reset, or a sync that changes its kind (`Reset`); a sync without it among the run timers (`Removed`): a delete, or it was pushed past the 16th, or it became a kind this build doesn't run |
+
+A kind change's `Cancelled` carries the lists from before the sync: the new
+definition is a count-up's, which has none. `started` is the lists this run
+started with: set where `Started` is recorded and where a running or paused
+seed is taken, kept through syncs (step R). A Reset of an ended countdown
+records nothing: it already ended. A sync replaces every timer's lists, and
+a list edit, a rename or a new length records nothing and keeps the run. At
+most 256 transitions wait for the thread (`MAX_TRANSITIONS`), and more are
+dropped; only a thread that never started lets that many pile up.
+
+### What a transition runs
+
+`plan(&Transition) -> Option<Planned>` is the one table; `None` runs nothing
+and tells the page nothing. It uses three subsets of a list:
+
+- **restoring** actions put back what a start changed: Unmute my voice
+  (`setMuted {muted: false}`) and Back to the preset before
+  (`revertPreset`). Every other action is a one-shot.
+- **the undo of the start** is those restoring actions that undo something
+  the run's At start did: Unmute my voice only when that At start has Mute
+  my voice; Back to the preset before always, because the page acts on it
+  only with a return the start noted (below).
+- **re-applied** actions are At start's `setMuted` actions: the mute is
+  never stored, so a relaunch forgets it.
+
+| Transition | Runs | `hook` / `why` | `lateMs` | Page told |
+|---|---|---|---|---|
+| `Started` | At start (Back to the preset before never runs at a start) | start / `armed` | 0 | yes |
+| `Fired`, at most 30 s late (`LATE_ONE_SHOTS_MS`) | At zero | end / `zero` | its lateness | yes |
+| `Fired {finished}` (End now) | At zero | end / `endNow` | 0 | yes |
+| `Fired`, more than 30 s late | At zero's restoring actions | end / `late` | its lateness | yes |
+| `Expired`; `Seeded {expired, from: running}` | At zero's restoring actions | end / `ranOut` | 0 | yes |
+| `Seeded {running or paused}` (a restart mid-run) | At start's `setMuted` actions again | start / restart | — | no: backend only |
+| `Seeded` of a stored ended run; `SleepPaused` | nothing | — | — | no |
+| `Cancelled {Reset}`, `{Removed}` | the undo of the start, from At zero | end / `reset`, `deleted` | 0 | yes |
+
+Pause, Resume, Adjust, a rename, a new length and a list edit record nothing,
+so they run nothing. A restart with no mute to re-apply plans nothing. Every
+other row plans even when both halves are empty, so the page can settle a
+return and an end can retire its timer's start line (below).
+
+**The rule, said once.** A countdown that ends late — it ran out while the
+PC slept or Divora was closed, or was found due more than 30 s late — runs
+only its At zero list's Unmute my voice and Back to the preset before. A
+Reset or a delete runs them only to undo its own start. One-shots — a line,
+a clip, a replay, a switch — run only at zero on time and on End now.
+Nothing puts back a change At zero doesn't list: a start that mutes, with no
+Unmute my voice at zero, leaves you muted after it ends, is reset or is
+deleted. The card warns of that pairing (`pairingWarnings`), and of a start
+switch with no switch back.
+
+**Which lists.** A transition carries the lists as they were when it
+happened. So an At zero edit counts for the run going on (an Unmute my voice
+added mid-break runs at its end), an At start edit counts from the next
+start, and a relaunch re-applies the mute of the At start its boot sync
+carried. A cancel takes its actions from the current At zero but judges the
+undo against `started`, the At start its run began with, so an At start
+edited mid-break can't stop a Reset from unmuting, nor make one unmute what
+the start never muted (`a_cancel_undoes_what_its_start_did`; step R). Reset's
+key row on the card names only the restoring actions that card's At zero
+holds (`resetUndoes`).
+
+A Toggle at a deadline no reader saw records `[Fired, Started]` (the op's
+tick fires first): the end runs, then the start. So a re-armed break
+unmutes, then mutes again, and with a line in each list only the start's is
+said (newest wins, below).
+
+Within a half the order is the list's, except that the backend half puts
+Stop all clips and lines first ("The order between halves"). A list's second
+line is never read: both readers skip it, so it never reaches a plan.
+
+### End now
+
+`TimerOp::Finish` goes through the one `fire()`, so "fires once" covers it.
+A running or paused countdown fires with `finished` and `late_ms` 0: a
+paused countdown's deadline is stale, so its lateness isn't read. Anything
+else — idle, ended, a count-up — changes nothing. `fires` rises, so the live
+region says "{name} is done." as at 00:00.
+
+**Past an unticked deadline.** `apply` ticks before any op, so a Finish on a
+countdown already past a deadline no reader saw finds that fire taken: a
+plain `Fired` with its real lateness, then nothing for the Finish. It runs as
+at 00:00 (`zero`) when 30 s late or less, and as `late` beyond
+(`finish_after_an_unticked_deadline_is_a_zero_fire`). The Toggle above is
+the same mechanism.
+
+Three ways in: the card's **End now** button (enabled while running or
+paused; a count-up has none); `finish_timer {id}`, sync, which the page
+sends through the timers' queue, so an End now clicked after a Pause lands
+after it; and the `tm:<id>:finish` key, which `hotkey_timer_request` maps to
+Finish and `timer_on_hotkey` applies inside `WM_HOTKEY`, as it does toggle
+and reset. The key is a countdown's third row, unbound until set, and
+registered through the timers' queue like the other two.
+
+### The hand-off
+
+The end of the timer thread's pass:
+
+```
+unlock → for each transition, in drain order:
+             plan → when it plans: seq + 1 → hand_off:
+                 route → the batch to the worker (try_send)
+                       → emit timer-actions (the page's half)
+                       → a dropped batch: warn, at most once per 10 s
+       → emit timer-state
+       → put the texts in the writer's slot
+       → log the notes, then each transition's line, with its seq
+```
+
+`route` makes a batch for the worker when the backend half has actions or
+the hook is an end (an end retires its start line even with nothing else to
+run), and an event for the page unless it is a restart's re-mute. The batch
+goes first and never waits: `try_send` on a channel of 32 (`ACTION_QUEUE`),
+as the wake channel's; a full or closed channel drops the batch, and the
+drop is warned. Then the emit, which from a std thread posts and returns.
+Every log line comes after every hand-off and both emits, because the log
+writer is a blocking file appender: a disk stall can delay a log line, never
+a mute (`a_slow_log_write_never_delays_an_action`).
+
+`seq` rises by one per planned transition in this process. A restart's
+re-mute takes one and isn't sent, so the page sees a gap. Each transition's
+log line carries its `seq`, so a run in the log can be matched to what the
+page heard. A fire planned as more than 30 s late logs at warn: "a timer
+finished late; only what puts things back runs".
+
+In the app, `TimerOutputs {app, actions}` implements `TimerEvents`:
+`timer_state` as v1.59.0's `AppHandle` impl did, and `timer_actions` as one
+`hand_off(p, seq, Instant::now(), …)`. Only the first failed emit of each
+event is logged.
+
+### The worker
+
+**`divora-timer-actions`** (`run_action_worker`) is spawned in `setup`
+before the timer thread whose outputs hold its sender. It takes batches in
+the order handed. An end batch first retires that timer's start line
+(`end_run`); then each action runs in order, against an `ActionHost` whose
+every method returns without waiting; then one info line, "timer actions
+ran", after the actions. In the app the host is `AppHost`:
+
+- **Mute my voice, Unmute my voice:** `engine.set_input_muted`, the engine's
+  plain set: an atomic op, applied at the next buffer, also with the engine
+  stopped. Never a toggle. So with two timers muting, the last action in
+  drain order wins, and a break's end unmutes you whatever muted you
+  meanwhile: the mute key, a glyph, the Mixer or another timer.
+  Push-to-modulate is untouched: the mute wins over it, as always.
+- **Stop all clips and lines:** `host_stop_all`: the lines' Stop all (below),
+  which sends the mixer's `StopAll` under its lock, then `soundboard-stopped`
+  (payload `null`), on which the page clears the clips it shows playing.
+- **Save a replay:** on the blocking pool (`spawn_blocking`), as the tray's
+  Save, since a save can wait up to 90 s. It saves up to `at`, the hand-off's
+  instant less the fire's lateness (`replay_at`): the moment the countdown
+  reached zero, not the moment the thread got to it. Every outcome is one
+  `replay-saved` event, so the toast comes from Replay's own handler: "Replay
+  is off." while it is off, and Replay's usual refusal while another save
+  runs.
+- **Speak a line:** `TimerLines::put`, and nothing more on this thread.
+
+`AppState` is managed after the worker starts, so the host reaches what it
+needs later — the recorder, the recordings folder, the lines — through
+`try_state` when an action runs. Before that, no line can exist and no
+replay is saved; a Stop all still sends `StopAll` and the event.
+
+### The lines
+
+**`TimerLines`** holds the newest line not yet taken, an epoch (+1 at each
+put and each Stop all) and a run counter per timer id (+1 at each of that
+timer's ends). A line's ticket takes both when it is put, and the line is
+wanted while neither has moved. So:
+
+- a newer line from any timer replaces one waiting, and makes one being
+  rendered stale (newest wins);
+- an end batch makes its timer's start line stale before the end's own
+  actions run: End now two seconds into a break doesn't say "Be right back."
+  seconds later, and the end's own line is still wanted;
+- a Stop all — the page's Panic, its key or glyph, or a timer's — drops the
+  line waiting and makes one being rendered stale.
+
+There is one, built in the `AppState` literal: the worker's host, the line
+thread and the page's `stop_all_soundboard_clips` share it
+(`the_timer_lines_have_one_owner`). One small lock guards its fields. It is
+held only to read or change them and around sends that never wait (the
+engine's command channel is unbounded): Stop all bumps the epoch and sends
+`StopAll` under it, and the line thread checks a ticket and sends its Stop
+and Play under it. So a Stop all can't land between a line's check and its
+Play (`panic_never_lands_between_a_lines_check_and_its_play`), and a line put
+after a Stop all plays after it.
+
+**`divora-timer-lines`** (`run_line_thread`), spawned right after `AppState`
+is managed, renders one line at a time. It takes the newest, skips it if it
+is already stale, renders it outside the lock with
+`divora_core::tts::synthesize`, and plays it only if it is still wanted
+after the render. It plays through `emit_speak` in a mixer slot of its own,
+`"timer-line"` (Stop, then Play), at gain 1.0, as a plain `Play`, never
+monitor-only, so it reaches the main send like a clip. So a timer's line
+never cuts off your Speak line or the other way round, Speak's Stop doesn't
+stop it, Speak's Volume slider doesn't apply (the master soundboard volume
+does, as the mixer's `master_gain` scales every voice), and it isn't kept in
+Saved clips. `synthesize` handles Kokoro and Critter Chatter and never looks a
+cloned voice up, so a clone's id fails as an unknown voice; the `speak`
+command, which tries a clone first, isn't used. Each line taken logs one
+info line, "timer line": its timer, voice, characters, render time, outcome
+(`played`, `replaced`, `ended`, `stopped`, `failed`) and whether the engine
+was running. With the engine stopped a line still renders and logs
+`played`, and the mixer, with no session, drops it (L1, below). One render at a time keeps two
+timers ending together from running two Kokoro sessions beside a game; the
+cost is that a newer line waits for a render already under way, which is
+then thrown away. Kokoro's `espeak-ng` now starts with no console window
+(L1 saw none open on a release build) and gets a plain `--path`, without
+which no Kokoro line rendered in a built app (see "Speak's voice files").
+
+Speak moved to the backend against the plan, which had the page call
+`speak`: there a cloned voice named like a Kokoro voice would shadow it, every
+line would land in Saved clips and cut off your own Speak line, a line would
+be lost to a reload, and a page queue would hold a timer's other commands
+behind seconds of rendering.
+
+### Threads
+
+| Work | Thread | Holds | Never |
+|---|---|---|---|
+| `finish_timer` and the other timer commands | main (sync IPC) | the core lock (a Finish runs `fire()` under it) | file work (but `timers_dir`), emit, drain, plan |
+| a `tm:` press, `finish` included | main, inside `WM_HOTKEY` | the core lock | plugin calls, file work, emit, log, actions |
+| plan, route, the batch's `try_send`, both emits, then the log lines | `divora-timers`, unlocked | nothing | waiting on the worker, the line thread or the page; a log write before a hand-off |
+| the mute, Stop all and its event, `end_run`, putting a line | `divora-timer-actions` | the lines lock, around sends that never wait | waiting; rendering; saving; a log write before its batch's actions |
+| rendering a line, then its Stop and Play | `divora-timer-lines`, one at a time | the lines lock, only around the check and the two sends | the core lock; rendering under the lines lock |
+| saving a replay | the blocking pool | the recorder's own | `divora-timers`, `WM_HOTKEY`, the worker |
+| the page's Stop all (`stop_all_soundboard_clips`) | main (sync IPC) | the lines lock, around one send | — |
+| preset switches, clips | the main page's JavaScript, through the chain and soundboard queues | — | the timers' queue |
+
+The core's lock stays a leaf, and the only new work under it is an `Arc`
+clone per transition. No other lock of Divora's is taken while the lines
+lock is held.
+
+### Where each kind runs
+
+| Kind | Runs in | Restoring | Re-applied at a restart | Offered at |
+|---|---|---|---|---|
+| `preset` (Switch preset) | page | no | no | start, zero |
+| `randomPreset` | page | no | no | start, zero |
+| `revertPreset` (Back to the preset before) | page | yes | no | zero |
+| `tile` (Play a clip) | page | no | no | start, zero |
+| `speak` (Speak a line) | backend: the line thread | no | no | start, zero; one per list |
+| `saveReplay` | backend: the blocking pool | no | no | start, zero |
+| `setMuted` (Mute my voice, Unmute my voice) | backend: the worker | when `muted` is false | yes | start, zero |
+| `panic` (Stop all clips and lines) | backend: the worker | no | no | start, zero |
+
+The fields are checked the same on both sides (`action_from_wire`,
+`readAction`, against the fixture's samples): `presetId` any non-empty
+string, since preset ids have no length bound; `tileId` and `voiceId` 1 to
+128 characters; `text` 1 to 200 characters after trimming, read trimmed;
+`muted` a boolean. The page also refuses a `text` holding a lone surrogate:
+`JSON.stringify` would write it as `\udXXX`, and Tauri's JSON reader refuses
+the whole invoke for one (from its code), so every later `sync_timers` would
+fail. Only a list's first 8 stored entries are read, each on its own; one
+that can't be read is skipped by Rust and kept in storage by the page. The
+glyph's two toggles, Monitor and Mute / unmute, aren't timer actions: a timer
+runs unattended, and a toggle could do the opposite of what its list says.
+
+### The order between halves
+
+Within one hook the backend half is handed off first, before the emit; the
+page half runs when the page hears the event, after the emit is delivered
+and the store's queues let it out. In B4 (below) the worker's line for a
+break's batch came 0.05 ms before the thread's own line for the fire, which
+the thread writes only after its hand-offs and emits. Within a half, list order,
+except that Stop all clips and lines goes first in the backend half: it stops
+what played before the hook and a line still being prepared, and the same
+hook's line plays after it. The card puts it at the top of its list and
+says so. That is the one order both halves can keep: a page clip runs only
+after the event, so a backend Stop all listed after it would otherwise run
+first anyway. Across timers, drain order. The mute never covers clips or
+lines, and a preset switch is independent of the mute, so the two halves
+meet only at Stop all.
+
+### The page's half
+
+**Delivery.** The main window's store listens to `timer-actions` and
+`soundboard-stopped` beside `timer-state`, all three registered before its
+one `timer_status` pull, and only once Hourglass is used (`divora.timers`
+exists, or the first Add): a profile without timers listens to none. The
+overlay page hears the broadcast but doesn't build the store, so nothing
+runs twice. Events reach a hidden page (V1, below, ran with main hidden). An
+event is read with every key checked (`readTimerActionsEvent`) and adopted
+once, by `seq`; actions it can't read, and the backend's kinds, are skipped.
+The page never sends a command for a backend kind.
+
+`dispatchAction(action, source)` is now the one dispatcher: a glyph's
+actions run as they always have, and a timer's through Hourglass's block.
+
+- **A clip** plays when the event arrives, through the soundboard queue, if
+  its tile is in the folder's scan. A tile not scanned yet (a launch's or a
+  reload's scan comes after the devices and the presets), or gone, plays
+  nothing.
+- **Preset work** — a switch, a random switch, Back to the preset before, an
+  end's settle — runs only once `presetsLoaded()` is true, and until then
+  waits, in the order it came. At boot and after a reload `presets()` is the
+  bundled list until `list_presets` answers, while the boot sync and the
+  subscription go out at the store's creation: judged against the bundled
+  list, a user preset would read as gone, its return would be dropped for
+  good, and `usePreset` would ignore it.
+- **A switch** is `usePreset(id, {fromTimer: true})`. A preset not in the
+  loaded list switches nothing. **Random preset** picks evenly among the
+  presets whose chain changes your voice (`transforms`, the test the
+  titlebar's status uses), the live one left out; with none left it switches
+  nothing.
+
+**The loss window (K1).** A page half that fires while no main page listens
+— during a reload, a WebView2 restart, or the moments before the listeners
+are up — is lost: nothing re-sends an event, since a replay would need
+acknowledgements and could still play a clip twice. The one page action
+whose loss matters is a switch back, and that is state the page stores
+(returns, below), so reconcile catches it up. The backend half doesn't
+depend on the page. The card states the limit by its cause: an action that
+can't run when its moment comes is skipped, not tried later — for example
+its preset, clip or voice is gone, Replay is off or already saving, the
+engine is stopped, or Divora's window was reloading — and gives the check: a
+0:05 countdown, watching the titlebar while it runs.
+
+### Answers and events
+
+The thread emits a run's `timer-actions` before its own `timer-state`, but a
+command's answer — a snapshot built under the lock before the thread is
+woken, adopted by `seq` — can land before or after either. So no page logic
+assumes an order. Returns are settled only by events, never by an answer or
+the mirror's phase (the store's "an answer that lands before the end event
+settles nothing; the event does"), and the card goes by phase. Reconcile
+treats a timer the page has heard an event for as running: the mirror can
+lag the event, and a start just heard would otherwise read as idle and be
+undone.
+
+### Back to the preset before
+
+A start's first switch that lands notes a **return**, `{timer, from: the
+live preset, to}`, in `divora.timers`' `presetReturns`; a timer that already
+has one keeps its `from` and takes the new `to` (`returnsAfterStart`). An
+end's switch notes nothing. When an end runs Back to the preset before,
+`revertPlan` settles the timer's return:
+
+| State | Result |
+|---|---|
+| no return for the timer | nothing |
+| the live preset is still `to`, and `from` exists | switch to `from`; drop it |
+| the live preset is still `to`, and `from` is gone | no switch; drop it |
+| the live preset isn't `to`, and another timer's return was stacked on this one (its `from` is this `to`) | that one takes this `from`; drop this; no switch |
+| the live preset isn't `to`, nothing stacked | you moved on: no switch; drop it |
+
+After an end's list, any return left for that timer is dropped, so an end
+without Back to the preset before stays on the timer's preset and forgets
+where it came from. "Only if still ours" keeps a timer from undoing a switch
+you made by hand; it is the rule v1.61.0's OBS scene back is to use. The
+splice makes two timers that both switch back nest: A (Hollow King →
+Villager), then B (Villager → Glass Oracle); A ends under B and hands B
+Hollow King, so B's end goes back to Hollow King. A timer that doesn't
+switch back drops its return without splicing, so nesting holds only when
+both switch back. A switch back to the preset already live sends nothing.
+`from` is judged only against the loaded list.
+
+**Delete.** The store decides a deleted timer's return before its one save.
+Running or paused, with Back to the preset before at zero: kept for the
+cancel's event, which does the switching. Running or paused without it:
+dropped by the delete itself, as the cancel would. Not running: settled by
+the delete itself, its switch once the list has loaded. So a return left for a timer no longer
+stored always means "switch back".
+
+**Reconcile** (`reconcileReturns`) runs once per page, once the boot sync has
+answered (or failed), the three listens have settled, the mirror holds a
+snapshot and the preset list has loaded. Each stored return, oldest first,
+by the first rule that holds:
+
+1. its timer isn't stored (deleted, its event lost) → settle, switching back;
+2. its timer is stored but not run (a newer kind, or past the 16th) → drop
+   it, no switch;
+3. the mirror says running or paused, or this page has heard an event for
+   it → keep it;
+4. otherwise (done, ran out, idle, or not in the mirror) → settle, switching
+   back if its At zero has Back to the preset before.
+
+Each settle sees the live preset as the settles before it left it, and only
+the last switch is sent. This catches a switch back whose event reached no
+page: a countdown that ran out while Divora was closed (its event goes out
+at the boot sync, before any page listens), and any end during a reload.
+While the list hasn't loaded, or `list_presets` failed, reconcile waits, and
+runs at the next load that succeeds.
+
+### Compare, the Presets screen, a preset that's gone
+
+A timer's switch is `usePreset`, as a glyph's is: Compare goes back to A
+with both slots the new preset's chain. So a preset left on Compare's B and
+switched back to by a timer comes back with both slots B's chain, and its A
+is lost, as with any switch away and back. On the Presets screen a timer's
+switch leaves the preset you are editing in view; anywhere else the view
+follows the live preset, as for every switch, and leaving the Presets screen
+brings it there. A preset id that no longer exists switches nothing; its
+picker reads "Missing preset" (`Select`'s `missing`), never the first
+option.
+
+### The queues
+
+The store now sends two more features' commands one at a time, each through
+an `inOrder` queue of its own, as the mute's, push-to-modulate's and the
+timers' (Hourglass's "Command order"):
+
+- **The chain:** every `set_effect_chain`, `set_effect_param`,
+  `set_effect_enabled` and `set_voice_model`. A timer's switch and a slider
+  moved at the same moment could otherwise land reversed, and a param sent
+  before a switch would edit the new chain's effect at that index. A preset
+  switch now sends one chain, from the effect on the active preset, then the
+  voice model; `usePreset` used to send a second chain, which, queued after
+  the model, would clear it (V1b, below).
+- **The soundboard:** every `play_soundboard_clip`, `stop_soundboard_clip`
+  and `stop_all_soundboard_clips`, and Speak's saved-clip play, so a Panic
+  pressed right after a clip lands after it.
+- **The timers':** gains `finish_timer`, and the `finish` key's register and
+  unregister.
+
+Reads stay out. The binds in Settings → Hotkeys still aren't queued.
+
+**The backend's actions meet these queues only at the engine (K2).** A
+timer's Stop all goes from the worker straight to the mixer, so a page clip
+sent just before it can still land after it and play; another Stop all stops
+it. And `soundboard-stopped` can cross a play's answer, so the clips shown
+as playing can briefly be wrong (cosmetic): a play answered after the event
+shows its clip again. Within one hook, Stop all comes first: its batch is
+handed to the worker before the event is emitted, and the hook's own clip
+waits for the event's delivery and an IPC round trip (from the code; not
+measured).
+
+### A restart mid-break
+
+Divora never stores the mute: the engine starts every launch unmuted. When
+the boot sync seeds a countdown running or paused, `plan` re-applies its At
+start's `setMuted` actions, in the backend only, so a break cut short by a
+crash or a Quit stays silent after the relaunch. A paused break counts: it
+is still a break. Nothing else runs again: the preset and its return are
+stored, and a line, a clip or a replay must not repeat. The re-mute tells the page
+nothing, and the titlebar's pill names no cause, so the page names it: for
+3 s after its reconcile pass (`RESTART_NOTICE_MS`), the first time the mute
+mirror reads muted while a stored countdown that mutes at its start is
+running or paused, a toast says why — "{name} is running, so you're muted
+until it ends. Press End now or Reset to unmute.", the paused form, or,
+when its At zero has no Unmute my voice, "Unmute from the Mixer." The window
+covers a boot read that lands before the re-mute (the mirror adopts by
+`seq`). Once per page; a reload says it again. A stale stored run after a
+hard kill (Hourglass's limit) re-mutes the same way, and the notice names
+its timer.
+
+### The card
+
+`TimerControls` shows a countdown's two lists after Length, rendered from
+the stored array in stored order. A row that runs has a sigil, the action's
+words, its picker (a preset, a clip, or a line and its voice) and Remove,
+each named for its timer. An entry that doesn't run — unreadable, a second
+line, past the 8th, Back to the preset before in At start — is a row of its
+own with its reason and Remove only, and counts toward the 8. **Add action**
+opens a listbox of the kinds that list offers; Stop all clips and lines goes
+to the top, everything else to the end, and there is no reordering. Edits
+change one stored entry by its index (`addTimerAction`, `setTimerAction`,
+`removeTimerAction`), keeping every other entry, readable or not, in place;
+each saves, then syncs. A line commits on Enter or on leaving the field; Esc
+puts it back. A clip picker reads "Loading clips…" until the folder's scan
+has finished, and a voice picker "Loading voices…" until the voice list has
+answered, never "missing" before they know.
+
+The card also shows: the pairing warnings, under the lists; while its
+return is the live preset, what the call hears (`timerVoiceLine`: the
+preset, and why the call doesn't hear it when it doesn't — the mute, a
+preset that doesn't change the voice, or push-to-modulate holding it off, in
+push-to-modulate's own words for where its key works); a paused break's
+"you stay muted" line; and, for a countdown that ran out, what such an end
+runs, said of the list as it is now ("When it runs out like this, only …
+from its At zero list run."), since the card keeps no record of what ran.
+
+`Select`, shared with Settings' device, glyph and MIDI pickers, the Mixer's
+recording card and the first-run Wizard's device pickers, gains an
+accessible name (`"{ariaLabel}: {shown value}"`), a shown value for a value
+it doesn't list (`missing`, never the first option), and keys by the
+active-descendant model: the focus stays on the trigger; Enter, Space or
+Down opens it; Up, Down, Home and End move; Enter or Space picks; Esc or Tab
+closes. A key's open or move scrolls the highlight into view; hovering
+doesn't. Picking the value a MIDI or glyph picker already has keeps its
+targets (step R). No screen reader was run: the names and the active
+descendant are pinned by tests.
+
+### What was measured
+
+S2, 2026-10-31, on this PC (Windows 11), driven over CDP, with the owner's
+consent for each run that needed it. Every run used one route: input
+"Analogue 1 + 2 (2- Focusrite USB Audio)", output "Speakers (Realtek USB
+Audio)", no monitor device, Monitor off, so the output played silence. There
+was no CABLE device, and nothing was played on a device. Every run but L1
+ran on a debug build of `9014df0`; L1 on a release build (`pnpm tauri build
+--no-bundle --config src-tauri/tauri.bundle.conf.json`: opt-level 3 with
+LTO, no console, the `tts` resources beside the exe, not installed), first of
+`9014df0`, then of `9014df0` with the `espeak-ng` path fix. Each run had a
+harness mutation that had to fail, and every one did, except B2's two, which
+an inconclusive take can't judge. After each run storage was restored, the
+timers', recordings', Speak clips' and presets' folders were as before, and
+main's window was put back.
+
+- **V1, a Villager countdown (5:00):** At start Switch preset → Villager, At
+  zero Back to the preset before, from Hollow King, main hidden. One
+  `set_effect_chain`, Villager's, at the start event, and one, Hollow King's,
+  at the end event: on the passing run 2 ms and 1 ms before its event, and
+  within 4.6 ms of it either way across the three runs (the CDP Network
+  clock and the page's differ by a few ms, so the sign means nothing), and
+  no `set_voice_model`. `divora.activePreset` went villager → hollow-king.
+  9,025 level ticks, the longest gap between two 49 ms, with the engine
+  running and Monitor off throughout; the end event's `lateMs` was 7 ms (6
+  to 16 ms across the runs). 21/21 checks on the third run (the first two
+  failed on harness bugs).
+- **V1b, one chain per switch:** Use on Deep Narrator sent one chain 2 ms
+  after the click, answered at 4.1 ms, then one `set_voice_model {index 2,
+  path null}` at 5.2 ms, and no chain after it.
+- **B1, a break:** after the click on Start, the first level tick that read
+  muted came 10 ms later; after the click on End now, the first unmuted
+  tick 5 ms later (22 and 27 ms in B2's repeat). The tick reports the
+  engine's mute word about every 33 ms, so each figure overstates when the
+  word changed by 0 to about 33 ms; the audio follows within a buffer and
+  the fade (Mute's "Latency"). All 601 ticks between the two events read
+  muted. The page sent no `set_input_muted`; the snapshot said done,
+  `fires` 1.
+- **B2, what Divora sends across a break (a WAV take): inconclusive.** The
+  take held one run of exact zeros, 20,078 ms long against 20,039 ms between
+  the start and end events (inside the ±60.7 ms allowed), starting 3.055 s
+  into the take against 3.046 s expected. But the 2 s either side were only
+  96.3 % and 96.2 % non-zero, against the 99 % the check needed: a quiet room
+  through the gate. The take was deleted after analysis.
+- **B3, End now's key:** one `SendInput` press of a chord bound through
+  Settings, main hidden. The next `timer-state` said done, `fires` 1, 1 ms
+  after the key-down, and the first unmuted tick came 29 ms after it. The
+  page sent no `finish_timer`, reset or pause.
+- **B4, a reload:** a 0:08 break and a 0:08 countdown switching from a user
+  preset (a Duplicate of Hollow King, made for the run) to Villager, with
+  main on `about:blank` from 1.99 s before the first fire to 2.0 s after the
+  second. No page heard either end event. The worker's line for the break's
+  batch came 0.05 ms before the thread's line for its fire (the log follows
+  the hand-off). The new page's reconcile sent the Duplicate's chain 944 ms
+  after its `list_presets` answer (1,090 ms after the boot sync's), and
+  `divora.activePreset` was the Duplicate again. The new page's first level
+  tick read unmuted: the worker had run the break's unmute at its end
+  without any page.
+- **B5, a restart:** a 3:00 break and a 0:25 switch countdown running; Quit
+  from the tray (by UI Automation); closed 20.8 s, so the switch ran out
+  while closed. The boot sync answered 713 ms after the relaunch; the first
+  level tick after that answer, 116.5 ms later, read muted, and so did every
+  one after it; the restart notice showed. The log had the break seeded
+  running from running and the worker's restart batch `[setMuted]`, and the
+  switch seeded expired from running. Hollow King's chain went out 802 ms
+  after the preset list, and `divora.activePreset` was back to hollow-king.
+- **X1, Stop all (engine stopped):** one `soundboard-stopped`, 1 ms after the
+  end event; no page command.
+- **L1, a line (release build, engine stopped):** Critter Chatter Bright
+  rendered in 37 ms and Kokoro (`af_heart`, "Aria — warm (US)") in
+  1,624 ms, each logged `played` with `engine_running=false`. `speak-clips/`
+  was unchanged and the IPC log had no `speak`. A list of every top-level
+  window, read every 50 ms (the longest gap 64 ms), showed no new window
+  from any process and no foreground change, and main stayed hidden. The
+  first run's Kokoro line failed on `espeak-ng`'s path (see "Speak's voice
+  files"); the second, with the fix, passed.
+- **R1, Replay off:** one `replay-saved`, `{path: null, error: "Replay is
+  off."}`, 1 ms after the end event; the toast; no file in `recordings/`.
+
+Not tried here: a real call's far end (owner check P1 in `MANUAL_TESTS.md`,
+"Timers that change your voice (v1.60.0)"), a Stream Deck (P2), a Kokoro line
+heard on a call and how long after 00:00 (P3), a real sleep (P4), a clip
+heard at zero (P5), an installed (NSIS) build (P7), Kokoro's render time on
+another PC, a screen reader, Windows 10, and two Divoras at once. L1 ran on a
+release build and saw no window, so the design's fallback owner check for
+the console window (P6) isn't needed.
+
+### Tests
+
+- **Counts at `9934825`** (local, Windows; `CI=true cargo test --workspace
+  --all-features`): `divora-app`'s lib 302 passed, 1 ignored;
+  `divora-capture` 181 passed, 1 ignored; `divora-core` 562 passed, 17
+  ignored. Vitest 1,894 in 59 files; E2E 65.
+- **The pure plan** (`timer_actions.rs`): `plan_table` (with the undo
+  rows), `late_boundary`, `restart_reapplies_only_the_mute`,
+  `a_stored_end_runs_nothing`, `revert_never_runs_at_a_start`, `route_table`,
+  `replay_at_table`; and the wire against the fixture,
+  `action_kinds_match_the_fixture`, `action_from_wire_table`,
+  `to_wire_round_trips`, `hooks_from_wire_reads_eight`,
+  `hooks_from_wire_keeps_one_line`, `actions_event_samples_are_rusts`,
+  `actions_event_samples_are_plans`.
+- **The core** (`timers.rs`): `op_table`, now with what every op records,
+  Finish included; `finish_fires_once`,
+  `finish_a_paused_countdown_is_not_late`,
+  `finish_after_an_unticked_deadline_is_a_zero_fire`,
+  `finish_leaves_idle_ended_and_countups`,
+  `reset_and_delete_cancel_only_active_countdowns`, `a_sync_takes_new_hooks`,
+  `seeded_says_where_it_came_from`, `a_cancel_undoes_what_its_start_did`,
+  `transitions_are_capped`, `a_toggle_at_the_deadline_fires_then_starts`.
+- **The shell** (`timer_thread.rs`): `each_transition_is_planned_once`,
+  `actions_go_before_the_snapshot`,
+  `hand_off_hands_the_batch_before_the_emit`,
+  `a_full_action_queue_never_blocks_the_timer_thread`,
+  `a_slow_log_write_never_delays_an_action`, `the_worker_runs_in_order`,
+  `the_finish_hotkey_ends_through_the_core`, `a_reset_mid_break_unmutes`,
+  `a_reset_of_an_unmute_timer_changes_nothing`,
+  `a_late_fire_runs_only_what_puts_things_back`,
+  `restart_mid_break_mutes_again`; `commands_never_wait_for_the_sink` gains
+  an actions leg.
+- **The lines** (`timer_lines.rs`): `newest_line_wins`,
+  `an_end_drops_its_timers_start_line`,
+  `panic_never_lands_between_a_lines_check_and_its_play`,
+  `a_line_put_after_a_stop_all_plays_after_it`,
+  `timer_lines_render_one_at_a_time`,
+  `a_toggle_at_the_deadline_says_only_the_start_line`,
+  `a_failed_render_plays_nothing`. The two race tests each wait 500 ms when
+  they pass.
+- **The app** (`lib.rs`): `the_timer_lines_have_one_owner` (a source test:
+  Tauri's `test` feature isn't on, so no test builds an app with `AppState`
+  managed), `the_timer_host_reaches_the_engine_and_the_lines`,
+  `the_timer_host_mutes_the_real_engine` and
+  `the_timer_host_stops_all_on_the_real_engine` (a real engine, stopped, so
+  nothing plays), `the_timer_host_runs_long_work_off_the_worker`,
+  `the_host_and_the_command_stop_through_the_lines`, `the_outputs_hand_off`,
+  `timer_line_commands_stop_then_play`; `timer_commands_stay_sync` and
+  `the_timer_commands_are_registered` with nine names;
+  `the_setup_spawns_the_timer_threads` also checks the worker starts before
+  the timer thread and the line thread after `AppState` is managed.
+- **divora-core:** `phonemize_never_opens_a_console`,
+  `args_pass_a_plain_path_never_a_verbatim_one`, and the ignored
+  `espeak_reads_its_data_from_a_verbatim_dir`.
+- **Vitest:** `timerActions.test.ts` (the fixture's names, limits, kinds,
+  samples, list samples and one event per `why`; editing by index; pairing
+  warnings; returns and nesting; random preset; reconcile; the restart
+  notice; the card's voice line; the Break template); `timers.test.ts` (the
+  lists and returns kept as written; `defsForSync` sending a list only for a
+  countdown with an action in it; the `finish` verb); the store (the
+  dispatch table; switching and back; preset work waiting for the list;
+  reconcile; End now's answer against its event; Add break; editing by
+  index; a delete with a return; the restart notice under fake timers;
+  `soundboard-stopped`; and "one chain and one soundboard command at a
+  time", over a mock wire that lands what is in flight together reversed);
+  `Select.test.tsx`; `SettingsScreen.test.tsx`; `Sigil.test.tsx`;
+  `api.test.ts`.
+- **E2E** (mocked Tauri): the Villager lists built by clicks, one sync each,
+  its start switching with one chain and zero switching back; Add break
+  syncing once with both lists, and End now going after a Pause, the mute
+  left to the backend; a break paused by its key saying you stay muted, and
+  again after a reload; the three keys registered and unregistered.
+- **Mutations.** Every row of the design's mutation table was put back by
+  the track that owns it and seen failing its named test, with extra rows
+  of the tracks' own, each file restored and checked byte for byte.
+- **The review (step R)**, in six lenses, confirmed 9 of 17 findings (two of
+  them one defect) and refuted 8. All are fixed: a Reset or a delete judged
+  its undo against an At start edited mid-run (now `started`); a store test
+  of "never at a start" that couldn't fail; Reset's key row naming undo
+  actions its At zero didn't hold; the ran-out line saying in the past tense
+  what ran, from the list as it is now; arrow keys moving `Select`'s
+  highlight out of view; a clip row taking "not scanned yet" for "gone";
+  re-picking a MIDI or glyph picker's value resetting its targets; and
+  nothing pinning `AppHost`'s bodies to the tested helpers.
+
+### Kill switches
+
+- `TIMER_ACTIONS` (`timer_actions.rs`): `false` makes `plan` plan nothing,
+  so no batch reaches the worker, no event the page and no line is said:
+  timers behave as v1.59.0's, plus End now, which still fires.
+- **The safety net:** a profile without timers sends no timer command and
+  listens to none of the three events. A countdown with no lists sends the
+  `sync_timers` entry v1.59.0 sent (a list goes only when it has an action
+  that runs); its starts and ends still reach the page as events with no
+  actions, and each end hands the worker a batch that only retires its start
+  line.
+
+### Not in this release
+
+- Actions for count-ups; Monitor or Mute / unmute as timer actions (they
+  toggle); MIDI or glyph triggers for timer actions; a volume for timer
+  lines; several lines per list said in turn; page actions lost to a reload
+  replayed; Compare's A/B kept across a timer's switch; an unmute that puts
+  back only what the break found. The follow-ups are in
+  [`research/stream-studio.md`](research/stream-studio.md).
+- **v1.61.0, "Talk to OBS":** `obs {op}` is to be a backend kind, run by
+  `divora-timer-actions`. Its scene back restores, so End now, a late fire
+  and a sleep are to run it, and Reset and delete when the start set a
+  scene; across a restart or a run-out while closed only if v1.61.0 stores
+  its return slot.

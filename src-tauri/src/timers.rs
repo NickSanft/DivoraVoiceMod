@@ -9,10 +9,12 @@
 //! calls Tauri, so every rule is tested on any machine. `timer_thread.rs` is
 //! the shell around it. What happens to a timer (a fire, an expiry, a sleep
 //! pause, a seed; v1.60.0 adds a start and a cancel) is collected as a
-//! [`Transition`], carrying the timer's action lists (`timer_actions.rs`),
-//! and the core's rare decisions — a sleep handled, a wall-clock step
-//! followed, a duplicate id — as a [`Note`], for the timer thread to drain
-//! and log once it has let go of the lock (§8.1).
+//! [`Transition`], and the core's rare decisions — a sleep handled, a
+//! wall-clock step followed, a duplicate id — as a [`Note`], for the timer
+//! thread to drain; once it has let go of the lock it plans each
+//! transition and hands its actions on (v1.60.0), and only then logs
+//! (§8.1). Every transition but a sleep pause carries the timer's action
+//! lists (`timer_actions.rs`).
 //!
 //! The clock is a `Duration` since a process origin (monotonic). Wall time
 //! (Unix ms) only sets the anchors a restart seeds from, and checks a sleep
@@ -108,13 +110,14 @@ pub enum TimerKind {
 }
 
 /// Where a timer is. `Done`: a countdown reached zero while the PC was awake
-/// and Divora running, and fired (late, if Divora was held up). `Expired`: it
-/// reached zero while the PC slept or Divora was closed, and did not fire. A
-/// count-up is only ever idle, running or paused (D2). Two edge cases break
-/// the split (D5): a countdown due in a second sleep of 5 s or less within a
-/// minute of one handled ends `Done`, and on a clock that doesn't count
-/// sleep, a resume signal during a hold-up past 500 ms ends what came due in
-/// the hold-up `Expired` with the PC awake.
+/// and Divora running, and fired (late, if Divora was held up), or (v1.60.0)
+/// End now fired it before zero. `Expired`: it reached zero while the PC
+/// slept or Divora was closed, and did not fire. A count-up is only ever
+/// idle, running or paused (D2). Two edge cases break the split (D5): a
+/// countdown due in a second sleep of 5 s or less within a minute of one
+/// handled ends `Done`, and on a clock that doesn't count sleep, a resume
+/// signal during a hold-up past 500 ms ends what came due in the hold-up
+/// `Expired` with the PC awake.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum TimerPhase {
