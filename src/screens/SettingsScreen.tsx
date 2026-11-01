@@ -3775,7 +3775,7 @@ function TimerActionRow(props: {
       </Show>
       <Show when={props.action.kind === "panic"}>
         <div style={helpStyle}>
-          Runs first in its list: it stops what was playing before, and a line still being prepared.
+          Runs first in its list: it stops what was playing before, and a timer's line still being prepared.
           This list's own clip and line play after it.
         </div>
       </Show>

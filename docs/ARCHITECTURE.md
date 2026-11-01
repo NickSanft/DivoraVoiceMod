@@ -5558,7 +5558,7 @@ and the store's queues let it out. In B4 (below) the worker's line for a
 break's batch came 0.05 ms before the thread's own line for the fire, which
 the thread writes only after its hand-offs and emits. Within a half, list order,
 except that Stop all clips and lines goes first in the backend half: it stops
-what played before the hook and a line still being prepared, and the same
+what played before the hook and a timer's line still being prepared, and the same
 hook's line plays after it. The card puts it at the top of its list and
 says so. That is the one order both halves can keep: a page clip runs only
 after the event, so a backend Stop all listed after it would otherwise run

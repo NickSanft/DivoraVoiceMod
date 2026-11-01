@@ -2103,7 +2103,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     for (const n of controls(card("timer-1"))) expect(n, n).toContain("BRB");
     const start = rowsOf("onStart");
     expect(words(start[0]!)).toBe(
-      "Stop all clips and lines Remove Runs first in its list: it stops what was playing before, and a line still being prepared. This list's own clip and line play after it.",
+      "Stop all clips and lines Remove Runs first in its list: it stops what was playing before, and a timer's line still being prepared. This list's own clip and line play after it.",
     );
     expect(words(start[1]!)).toContain("Switch to Villager");
     expect(words(start[2]!)).toBe("Switch to a random preset Remove");
