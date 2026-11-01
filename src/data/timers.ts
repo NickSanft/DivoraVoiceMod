@@ -89,7 +89,8 @@ export interface StoredTimers {
 }
 
 /** What `sync_timers` takes for each timer: validated fields only. v1.60.0:
- *  a countdown's lists, each only when it has an action that runs. */
+ *  a countdown's lists, each only when it holds an action that runs, or a
+ *  `revertPreset`, though one in `onStart` never runs. */
 export interface TimerDefWire {
   id: string;
   name: string;

@@ -3221,9 +3221,10 @@ pub fn host_stop_all(engine: &AudioEngine, lines: &TimerLines, emit: impl FnOnce
 /// v1.60.0: starts `divora-timer-lines` (D21) on `lines`, `AppState`'s own.
 /// It renders a timer's line with Kokoro or Critter Chatter — never a
 /// cloned voice, and never kept in Saved clips — one at a time, and plays
-/// it in its own mixer slot ([`TIMER_LINE_CLIP_ID`]) at full volume on both
-/// paths, so the call hears it. A failed spawn is logged, and timers' lines
-/// then never play.
+/// it in its own mixer slot ([`TIMER_LINE_CLIP_ID`]) at gain 1.0 (Speak's
+/// default 100 %; the soundboard's master volume scales it, as it does every
+/// clip) on both paths, so the call hears it. A failed spawn is logged, and
+/// timers' lines then never play.
 fn spawn_line_thread(lines: Arc<TimerLines>, engine: Arc<AudioEngine>, tts_dir: PathBuf) {
     let spawned = std::thread::Builder::new()
         .name("divora-timer-lines".into())
@@ -3818,9 +3819,10 @@ pub fn run() {
 
             // v1.59.0: Hourglass. `divora-timers` keeps the time and emits
             // `timer-state`; `divora-timer-files` puts each timer's text in
-            // `timers/<id>.txt` for OBS, so no disk wait reaches the timer
-            // thread. The folder isn't created here: the writer makes it at
-            // its first write and `timers_dir` for Open folder and Copy path,
+            // `timers/<id>.txt` for OBS, so no file write's disk wait reaches
+            // the timer thread (a stuck log write still can). The folder isn't
+            // created here: the writer makes it at its first write and
+            // `timers_dir` for Open folder and Copy path,
             // so someone who never adds a timer gets none unless they press
             // Open folder.
             // `tauri dev` builds keep their own timers, so their own files.
@@ -6401,7 +6403,7 @@ mod tests {
     /// tested helpers, as the v1.56.0 hotkey reaches `mute_on_hotkey`. Its
     /// `setMuted` is [`host_set_muted`](super::host_set_muted) and nothing
     /// else — no toggle, no other `_input_muted(` in the host; its Stop all
-    /// tells the page on both paths; End now's `end_run` reaches
+    /// tells the page on both paths; every end's `end_run` reaches
     /// `AppState`'s lines. The host needs an `AppHandle`, so this reads the
     /// source.
     #[test]
@@ -6472,7 +6474,8 @@ mod tests {
     /// replay save goes to the blocking pool; a line goes into the slot and
     /// is rendered on the line thread with `synthesize` (Kokoro and Critter
     /// Chatter only), never a clone and never saved to Saved clips, and
-    /// plays in its own slot at full volume on both paths. The host needs an
+    /// plays in its own slot at gain 1.0 (Speak's default; the soundboard's
+    /// master volume still scales it) on both paths. The host needs an
     /// `AppHandle`, so this reads the source.
     #[test]
     fn the_timer_host_runs_long_work_off_the_worker() {

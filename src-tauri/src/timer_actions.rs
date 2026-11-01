@@ -4,9 +4,10 @@
 //! A countdown carries two lists of actions, `onStart` and `onFire`
 //! ([`Hooks`]), read from its `sync_timers` entry by [`hooks_from_wire`]
 //! (§7.2). The core records what happens to a timer as a [`Transition`],
-//! carrying the timer's lists. The timer thread turns each drained one into
-//! a hook run with [`plan`] (§7.1) and routes it with [`route`]: the backend
-//! half ([`ActionBatch`]) goes to the action worker, the page half
+//! every one but a sleep pause carrying the timer's lists. The timer thread
+//! turns each drained one into a hook run with [`plan`] (§7.1) and routes it
+//! with [`route`]: the backend half ([`ActionBatch`]) goes to the action
+//! worker, the page half
 //! ([`TimerActionsEvent`]) to the main window as `timer-actions`. Nothing
 //! here reads a clock, waits, logs or calls Tauri, so every rule is tested
 //! on any machine.
@@ -72,7 +73,8 @@ pub enum Action {
     /// Say this line in a Kokoro or Critter Chatter voice (the line thread's,
     /// D21). At most one per list.
     Speak { text: String, voice_id: String },
-    /// Save the replay up to the moment the countdown reached zero (D22).
+    /// Save the replay up to its hook's moment: the start, or the moment the
+    /// countdown reached zero or End now ended it (D22).
     SaveReplay,
     /// Mute or unmute your voice: a plain set, never a toggle (D24).
     SetMuted { muted: bool },
@@ -458,8 +460,9 @@ pub struct ActionBatch {
 }
 
 /// D22: the moment a save covers up to — `drained` less the fire's
-/// lateness, the moment the countdown reached zero; `drained` if that is
-/// earlier than an `Instant` can be.
+/// lateness: the moment the countdown reached zero, or, for a start (and
+/// End now, never late), the drain itself; `drained` if that is earlier
+/// than an `Instant` can be.
 #[must_use]
 pub fn replay_at(drained: Instant, late_ms: u64) -> Instant {
     drained
@@ -1392,9 +1395,9 @@ mod tests {
 
     /// D13, D21, D22, for every `plan_table` row: a batch iff the backend
     /// half has actions or it is an end (an end retires its start line), its
-    /// `at` the moment the countdown reached zero — the drain less the
-    /// fire's lateness — and an event iff the page hears of it, numbered as
-    /// asked.
+    /// `at` its hook's moment — the drain less the fire's lateness, so the
+    /// start, or the moment the countdown reached zero or End now ended it —
+    /// and an event iff the page hears of it, numbered as asked.
     #[test]
     fn route_table() {
         let at = drained();

@@ -1439,14 +1439,14 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
   const START_HELP =
     "Runs when it starts from the beginning: Start, Start again, or its start-or-pause key. Pause and Resume don't run it again. A change here counts from its next start, and if Divora restarts while it's running or paused, its Mute my voice runs again.";
   const ZERO_HELP =
-    "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if At start mutes you. A change here counts for the run that's going on.";
+    "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you. A change here counts for the run that's going on.";
   const LIMIT =
-    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading. To try a list, give it a 0:05 countdown and watch the titlebar while it runs; a clip or a line in it plays on your call too.";
+    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
   const WARN = {
     muteNoUnmute:
       "This mutes you when it starts, and nothing at zero unmutes you, so you stay muted after it ends, is reset or is deleted. Add Unmute my voice at zero.",
     switchNoRevert:
-      "This switches your preset when it starts, and nothing at zero switches back, so you stay on that preset after it ends, is reset or is deleted. Add Back to the preset before at zero to switch back.",
+      "This switches your preset when it starts, and At zero has no Back to the preset before, so a reset or a delete leaves you on that preset, as does its end unless At zero switches preset. Add Back to the preset before at zero to switch back.",
     revertNoSwitch: "The start doesn't switch preset, so there's nothing to go back to.",
   };
   const NOT_RUN = {
@@ -1459,12 +1459,12 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
    *  that list has, and nothing it hasn't. */
   const RESET_UNDOES = (what: string) =>
     `Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: ${what}.`;
-  const UNDO_UNMUTE = "Unmute my voice if At start mutes you";
+  const UNDO_UNMUTE = "Unmute my voice if its start muted you";
   const UNDO_REVERT = "Back to the preset before";
   const TOGGLE_DESC = "Starts it, pauses it, resumes it, or starts it again once it's done or has run out.";
   const LINE_REASON = "Type a line of up to 200 characters. A long line takes longer to prepare.";
   const LINE_HELP =
-    "Said on your call even while you're muted, at full volume (Speak's Volume slider doesn't change it), and not kept in Saved clips. One line per list. A newer line from any timer replaces one still being prepared or playing, and Stop all clips and lines stops it; Speak's Stop doesn't.";
+    "Said on your call even while you're muted, at 100 %, Speak's default volume (Speak's Volume slider doesn't change it; the master soundboard volume does), and not kept in Saved clips. One line per list. A newer line from any timer replaces one still being prepared or playing, and Stop all clips and lines stops it; Speak's Stop doesn't.";
   const REPLAY_OFF =
     "Replay is off right now, so this saves nothing. Turn it on from the Record screen card; it's off after every launch.";
 
@@ -1594,7 +1594,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(view.getByRole("button", { name: "BRB end now hotkey: not set" })).toBeInTheDocument();
     // Nothing in either list: no warning, no limits note.
     expect(view.queryByText(LIMIT)).toBeNull();
-    expect(view.queryByText(/nothing at zero/)).toBeNull();
+    expect(view.queryByText(/nothing at zero|At zero has no/)).toBeNull();
 
     const up = card("timer-2");
     expect(up.querySelector("[data-timer-list]")).toBeNull();
@@ -1923,7 +1923,12 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
       });
     store([
       entry("timer-1", {
-        onStart: [{ kind: "preset", presetId: "gone-preset" }, { kind: "tile", tileId: "gone-tile" }, line("Be right back.", "nope")],
+        onStart: [
+          { kind: "preset", presetId: "gone-preset" },
+          { kind: "tile", tileId: "gone-tile" },
+          line("Be right back.", "nope"),
+          line("Back soon.", "nope"),
+        ],
         onFire: [{ kind: "preset", presetId: "villager" }, { kind: "tile", tileId: TILES[0]!.id }, line("I'm back.", "af_heart")],
       }),
     ]);
@@ -1938,10 +1943,17 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(view.queryByText(GONE)).toBeNull();
     expect(named("Voice of BRB's line at the start: Loading voices…")).toBeInTheDocument();
     expect(named("Voice of BRB's line at zero: Loading voices…")).toBeInTheDocument();
+    // Remove's name, and a row that doesn't run, say what the picker says:
+    // nothing is called missing before its list has loaded (D16).
+    expect(named("Remove Switch to Loading presets… from the start of BRB")).toBeInTheDocument();
+    expect(named("Remove Say “Be right back.” in Loading voices… from the start of BRB")).toBeInTheDocument();
+    expect(words(rowsOf("onStart")[3]!)).toContain("Say “Back soon.” in Loading voices…");
+    expect(view.queryByText(/Missing preset|Voice not available/)).toBeNull();
 
     await loadPresets();
     const missing = named("Preset BRB switches to at the start: Missing preset");
     expect(missing).toHaveTextContent("Missing preset");
+    expect(named("Remove Switch to Missing preset from the start of BRB")).toBeInTheDocument();
     expect(missing.textContent).not.toContain("Hollow King");
     expect(within(rowsOf("onStart")[0]!).getByText(GONE)).toBeInTheDocument();
     expect(named("Preset BRB switches to at zero: Villager")).toBeInTheDocument();
@@ -1957,6 +1969,8 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     answer(VOICES);
     await flush();
     expect(named("Voice of BRB's line at the start: Voice not available")).toHaveTextContent("Voice not available");
+    expect(named("Remove Say “Be right back.” in Voice not available from the start of BRB")).toBeInTheDocument();
+    expect(words(rowsOf("onStart")[3]!)).toContain("Say “Back soon.” in Voice not available");
     expect(named("Voice of BRB's line at zero: Heart")).toBeInTheDocument();
     expect(
       within(rowsOf("onFire")[2]!).getByText(
@@ -2007,6 +2021,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     // Before the folder's scan (at a launch or a reload it comes after the
     // devices and the presets): the clip isn't called gone.
     expect(named("Clip BRB plays at zero: Loading clips…")).toHaveTextContent("Loading clips…");
+    expect(named("Remove Play Loading clips… from zero of BRB")).toBeInTheDocument();
     expect(view.queryByText(GONE)).toBeNull();
     expect(clipChoice()).toEqual(["Play a clip — loading your clips…", false]);
 
@@ -2025,6 +2040,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     await app.scanCurrentSoundboardFolder();
     await flush();
     expect(named("Clip BRB plays at zero: Missing clip")).toHaveTextContent("Missing clip");
+    expect(named("Remove Play Missing clip from zero of BRB")).toBeInTheDocument();
     expect(view.getByText(GONE)).toBeInTheDocument();
     expect(clipChoice()).toEqual(["Play a clip — no clips found in your soundboard folder", false]);
 
@@ -2110,7 +2126,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     );
     // A switch and a mute, each put back at zero: no warning; the limits
     // note once, under both lists.
-    expect(view.queryByText(/nothing at zero/)).toBeNull();
+    expect(view.queryByText(/nothing at zero|At zero has no/)).toBeNull();
     expect(view.queryByText(WARN.revertNoSwitch)).toBeNull();
     expect(view.getAllByText(LIMIT)).toHaveLength(1);
 
@@ -2151,6 +2167,19 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     await flush();
     expect(warned()).toEqual([]);
     expect(view.queryByText(LIMIT)).toBeNull();
+  });
+
+  it("Unmute my voice says what it overrides by its list: at the start, a mute from before it started; at zero, one from before or during the countdown", async () => {
+    store([entry("timer-1", { onStart: [UNMUTE], onFire: [UNMUTE] })]);
+    mount();
+    await flush();
+    await emit(1, state("timer-1"));
+    expect(words(rowsOf("onStart")[0]!)).toBe(
+      "Unmute my voice Remove It unmutes you even if you muted yourself before it started, or another timer is still muting you.",
+    );
+    expect(words(rowsOf("onFire")[0]!)).toBe(
+      "Unmute my voice Remove It unmutes you even if you muted yourself before or during the countdown, or another timer is still muting you.",
+    );
   });
 
   it("a paused break says you stay muted; its key rows say what pausing and Reset do; a run-out says what such a run-out runs", async () => {
@@ -2254,10 +2283,10 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     // Without Back to the preset before at zero, it stays.
     await app.removeTimerAction("timer-1", "onFire", 0);
     await flush();
-    expect(said()).toMatch(/^Your preset is Villager, and it stays after this ends\. Push-to-modulate keeps it off/);
+    expect(said()).toMatch(/^Your preset is Villager, and it stays after this ends unless At zero switches preset\. Push-to-modulate keeps it off/);
     // Paused too; not once it has ended.
     await emit(3, state("timer-1", PAUSED));
-    expect(said()).toMatch(/^Your preset is Villager, and it stays after this ends\./);
+    expect(said()).toMatch(/^Your preset is Villager, and it stays after this ends unless At zero switches preset\./);
     await emit(4, state("timer-1", { phase: "done", ms: 0, text: "00:00", fires: 1 }));
     expect(said()).toBeNull();
   });
@@ -2347,7 +2376,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add an action at the start of BRB"]);
     expect(controls(list("onFire"))).toEqual(["Remove Unmute my voice from zero of BRB", "Add an action at zero of BRB"]);
     // A break warns of nothing, and its keys are unbound.
-    expect(view.queryByText(/nothing at zero/)).toBeNull();
+    expect(view.queryByText(/nothing at zero|At zero has no/)).toBeNull();
     expect(view.getByRole("button", { name: "BRB start or pause hotkey: not set" })).toBeInTheDocument();
     expect(view.getByRole("button", { name: "BRB end now hotkey: not set" })).toBeInTheDocument();
     invokeCalls.length = 0;

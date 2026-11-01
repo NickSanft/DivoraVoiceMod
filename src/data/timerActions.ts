@@ -206,7 +206,9 @@ export function readAction(raw: unknown): TimerAction | null {
   }
 }
 
-/** One stored entry as the card shows it. `runs`: sent and run. Otherwise
+/** One stored entry as the card shows it. `runs`: sent, and run, but for
+ *  Back to the preset before in At start (a hand edit), which Rust never
+ *  runs there (the card's `shownRow` marks it). Otherwise
  *  why not: it can't be read here, it is a list's second line, or it is
  *  past the 8th entry (which Rust never reads, whatever it holds). */
 export type ActionRow =
@@ -232,7 +234,8 @@ export function readStoredActions(raw: unknown): ActionRow[] {
   });
 }
 
-/** What `sync_timers` sends for a list: the actions that run, in order. */
+/** What `sync_timers` sends for a list: the rows marked `runs`, in order (a
+ *  `revertPreset` in `onStart` among them, though it never runs there). */
 export function actionsForSync(raw: unknown): TimerAction[] {
   const out: TimerAction[] = [];
   for (const row of readStoredActions(raw)) if (row.runs) out.push(row.action);
@@ -509,9 +512,13 @@ export function timerVoiceLine(
   if (ret === null || live !== ret.to) return null;
   const name = presetName(ret.to);
   if (name === null) return null;
-  const head = revertsAtEnd
-    ? `Your preset is ${name} until this ends.`
-    : `Your preset is ${name}, and it stays after this ends.`;
+  // A start that "switched" to the preset you were on stores a return whose
+  // switch back goes nowhere (app.tsx `switchForReturn`), so it stays.
+  const head = !revertsAtEnd
+    ? `Your preset is ${name}, and it stays after this ends unless At zero switches preset.`
+    : ret.from === ret.to
+      ? `Your preset is ${name}, the one you had before this started, so it stays after this ends unless At zero switches preset.`
+      : `Your preset is ${name} until this ends.`;
   if (v.muted) return `${head} You're muted, so your call hears none of your voice.`;
   if (!v.transforms) return `${head} It doesn't change your voice.`;
   if (v.bypassed && v.mode === "apply") {

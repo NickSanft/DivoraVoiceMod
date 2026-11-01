@@ -2355,7 +2355,7 @@ test.describe("Hourglass (v1.59)", () => {
         card(page).getByRole("button", { name: "Preset Villager switches to at the start: Villager" }),
       ).toBeVisible();
       // Nothing at zero switches back yet, and the card says so.
-      const NO_REVERT = "This switches your preset when it starts, and nothing at zero switches back";
+      const NO_REVERT = "This switches your preset when it starts, and At zero has no Back to the preset before";
       await expect(card(page)).toContainText(NO_REVERT);
 
       // At zero: Back to the preset before.

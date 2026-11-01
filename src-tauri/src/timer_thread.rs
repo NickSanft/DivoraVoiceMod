@@ -10,7 +10,8 @@
 //! it is held, and nothing slow happens under it. The core never logs: the
 //! thread logs its transitions and notes after letting go — v1.60.0: after
 //! its hand-offs, its emit and the texts — and only the writer touches the
-//! timers' files, so no disk wait can delay a deadline (D13, D21).
+//! timers' files, so no disk wait happens under the lock and no file write
+//! can delay a deadline; a stuck log write can (below) (D13, D21).
 //!
 //! No thread here is joined or stopped: Divora has no exit hook, and each
 //! runs for the process (D14). v1.60.0's action worker ends only once its
@@ -19,9 +20,12 @@
 //! v1.60.0: the thread plans each drained transition once ([`plan`]) and
 //! hands its backend half to `divora-timer-actions`, the action worker, by a
 //! send that never waits ([`hand_off`]); the worker runs each batch in order
-//! against an [`ActionHost`], so nothing that can wait runs on
-//! `divora-timers` (D13, D14). Its log lines come after every hand-off, so a
-//! log write stuck on the disk can't delay a mute (AT4).
+//! against an [`ActionHost`], so no action that can wait runs on
+//! `divora-timers` (D13, D14). Its transitions' and notes' log lines come
+//! after the pass's hand-offs (a dropped batch's warning is written at its
+//! hand-off), so a log write stuck on the disk can't delay that pass's mutes
+//! (AT4); but the log is written synchronously, so a stuck write holds up
+//! the next pass, and its hand-offs, until it returns.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -189,7 +193,8 @@ fn warn_dropped(id: &str, seq: u64) {
 /// v1.60.0 (D14): the `divora-timer-actions` loop. Each batch, in the order
 /// handed: an end first retires its timer's start line (`end_run`), then
 /// each action in list order (`panic` already first), then one log line —
-/// after the actions, so a disk stall can't delay a mute. The page's kinds
+/// after the actions, so a disk stall can't delay the batch's own actions,
+/// though it holds up the next batch until the write returns. The page's kinds
 /// never reach a batch. Returns once every sender is gone.
 #[doc(hidden)]
 pub fn run_action_worker(rx: Receiver<ActionBatch>, host: &dyn ActionHost) {
@@ -2693,10 +2698,10 @@ mod tests {
         );
     }
 
-    /// v1.60.0 (D13, D14, AT4): no log write comes before an action. With the
-    /// timer thread's "a timer started" line stuck in the log file's write,
-    /// the worker has already muted; with the worker's own line for that
-    /// batch stuck, it has already muted too.
+    /// v1.60.0 (D13, D14, AT4): no log line comes before the actions it
+    /// logs. With the timer thread's "a timer started" line stuck in the log
+    /// file's write, the worker has already muted; with the worker's own line
+    /// for that batch stuck, it has already muted too.
     #[test]
     fn a_slow_log_write_never_delays_an_action() {
         let (entered_tx, entered) = mpsc::channel();

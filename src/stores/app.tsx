@@ -3351,8 +3351,9 @@ export function createAppState(): AppState {
     setAbSlots(id, { A: cloneChain(c), B: cloneChain(c) });
     setUi("ab", "A");
     // v1.60.0: no chain sent here. The effect on the active preset sends
-    // the one chain, then the voice model; a second one queued after the
-    // model would clear it (D19). A Use of the live preset changes no chain.
+    // the one chain (with the engine running), then, for a chain with a
+    // Voice Convert, the voice model; a second chain queued after the model
+    // would clear it (D19). A Use of the live preset changes no chain.
   };
 
   // The Coven (v1.1.0): summon a cast member — apply its preset chain and

@@ -197,10 +197,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// stale while it waited; else `render` it — outside the lock, one at a
 /// time — and `play` the result inside [`TimerLines::play_if_wanted`], so
 /// only a line still wanted after its render plays. One log line per line
-/// taken, after it played or was dropped: its timer, voice, characters,
-/// render time, outcome (`played`, `replaced`, `ended`, `stopped`,
-/// `failed`) and whether the engine was running (`running`; a stopped
-/// engine plays nothing). Returns once [`TimerLines::close`] is called.
+/// taken, after it played or was dropped: its timer, voice, characters and
+/// outcome (`played`, `replaced`, `ended`, `stopped`, `failed`). One that
+/// reached its render adds its render time (`render_ms`); a failed render
+/// adds its `error`; one that rendered adds whether the engine was running
+/// (`engine_running`; a stopped engine plays nothing). Returns once
+/// [`TimerLines::close`] is called.
 #[doc(hidden)]
 pub fn run_line_thread<R>(
     lines: &TimerLines,

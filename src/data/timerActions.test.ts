@@ -475,9 +475,24 @@ describe("timerVoiceLine (§7.7)", () => {
 
   it("names the preset, and says when it stays after the end", () => {
     expect(line({})).toBe(HEAD);
-    expect(line({}, false)).toBe("Your preset is Villager, and it stays after this ends.");
+    expect(line({}, false)).toBe("Your preset is Villager, and it stays after this ends unless At zero switches preset.");
     expect(line({ muted: true }, false)).toBe(
-      "Your preset is Villager, and it stays after this ends. You're muted, so your call hears none of your voice.",
+      "Your preset is Villager, and it stays after this ends unless At zero switches preset. You're muted, so your call hears none of your voice.",
+    );
+  });
+
+  // A start that switched to the preset you were on: its switch back goes
+  // nowhere, so the preset stays even with Back to the preset before.
+  it("a return to the same preset says it stays, not that it changes at the end", () => {
+    const same: PresetReturn = { timer: "timer-1", from: "villager", to: "villager" };
+    const SAME =
+      "Your preset is Villager, the one you had before this started, so it stays after this ends unless At zero switches preset.";
+    expect(timerVoiceLine(same, "villager", name, true, heard)).toBe(SAME);
+    expect(timerVoiceLine(same, "villager", name, true, { ...heard, muted: true })).toBe(
+      `${SAME} You're muted, so your call hears none of your voice.`,
+    );
+    expect(timerVoiceLine(same, "villager", name, false, heard)).toBe(
+      "Your preset is Villager, and it stays after this ends unless At zero switches preset.",
     );
   });
 

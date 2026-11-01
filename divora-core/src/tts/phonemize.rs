@@ -126,7 +126,9 @@ fn espeak_args(lang: &str, data: Option<&Path>, text: &str) -> Vec<String> {
 /// source-staged assets, didn't). espeak-ng joins `/espeak-ng-data` onto
 /// `--path` with a forward slash, which a verbatim path never treats as a
 /// separator, so it missed its data, fell back to the dir itself and exited
-/// on `phontab`: every Kokoro line failed outside a dev build.
+/// on `phontab`: every Kokoro line failed outside a dev build (seen on this
+/// version's release build; for an installed build, from the code: none was
+/// tried).
 fn plain_path(dir: &Path) -> String {
     let s = dir.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {

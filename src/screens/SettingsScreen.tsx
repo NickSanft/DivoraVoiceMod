@@ -2546,7 +2546,7 @@ const BREAK_PAUSE_KEY = "It pauses a break and doesn't end it; End now's key end
  *  naming only what its At zero has: the undo runs no other (§7.1 P9).
  *  With both, §9's sentence as it was. */
 function resetUndoes(t: StoredTimer): string | null {
-  const parts = restoringNames(t).map((n) => (n === "Unmute my voice" ? `${n} if At start mutes you` : n));
+  const parts = restoringNames(t).map((n) => (n === "Unmute my voice" ? `${n} if its start muted you` : n));
   return parts.length > 0
     ? `Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: ${parts.join(", and ")}.`
     : null;
@@ -2563,7 +2563,7 @@ const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; f
   },
   onFire: {
     title: "At zero",
-    help: "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if At start mutes you. A change here counts for the run that's going on.",
+    help: "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you. A change here counts for the run that's going on.",
     at: "at zero",
     from: "from zero of",
     add: "at zero of",
@@ -2573,7 +2573,7 @@ const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; f
 /** Said once under a countdown's lists when either has an action: the one
  *  general limit, with its cause, examples and a way to check (D37). */
 const ACTIONS_LIMIT =
-  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading. To try a list, give it a 0:05 countdown and watch the titlebar while it runs; a clip or a line in it plays on your call too.";
+  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
 
 const LIST_FULL = "Up to 8 actions here. Remove one to add another.";
 
@@ -2581,7 +2581,7 @@ const PAIRING_WORDS: Record<PairingWarning, string> = {
   muteNoUnmute:
     "This mutes you when it starts, and nothing at zero unmutes you, so you stay muted after it ends, is reset or is deleted. Add Unmute my voice at zero.",
   switchNoRevert:
-    "This switches your preset when it starts, and nothing at zero switches back, so you stay on that preset after it ends, is reset or is deleted. Add Back to the preset before at zero to switch back.",
+    "This switches your preset when it starts, and At zero has no Back to the preset before, so a reset or a delete leaves you on that preset, as does its end unless At zero switches preset. Add Back to the preset before at zero to switch back.",
   revertNoSwitch: "The start doesn't switch preset, so there's nothing to go back to.",
 };
 
@@ -2597,7 +2597,7 @@ const NOT_RUN_WORDS: Record<"unreadable" | "secondLine" | "pastEight" | "startRe
 
 const LINE_REASON = "Type a line of up to 200 characters. A long line takes longer to prepare.";
 const LINE_HELP =
-  "Said on your call even while you're muted, at full volume (Speak's Volume slider doesn't change it), and not kept in Saved clips. One line per list. A newer line from any timer replaces one still being prepared or playing, and Stop all clips and lines stops it; Speak's Stop doesn't.";
+  "Said on your call even while you're muted, at 100 %, Speak's default volume (Speak's Volume slider doesn't change it; the master soundboard volume does), and not kept in Saved clips. One line per list. A newer line from any timer replaces one still being prepared or playing, and Stop all clips and lines stops it; Speak's Stop doesn't.";
 /** A new line's words (§9). */
 const NEW_LINE: Record<TimerHook, string> = { onStart: "Be right back.", onFire: "I'm back." };
 /** Always there: Critter Chatter needs no download. */
@@ -3058,7 +3058,8 @@ function TimerCard(props: { id: string }): JSX.Element {
 /** A timer the backend runs, once it has said how it is: the buttons, the
  *  Length, the hotkeys, the overlay toggle and the file. v1.60.0: on a
  *  countdown, End now, its At start and At zero lists, a third hotkey (End
- *  now's), and the lines that say what its lists did or are doing. */
+ *  now's), and the lines that say what its lists do or are doing (never
+ *  what ran: the card keeps no record of that). */
 function TimerControls(props: {
   id: string;
   name: string;
@@ -3564,6 +3565,19 @@ function actionNames(app: ReturnType<typeof useApp>): ActionNames {
   };
 }
 
+/** A row's names: as `actionNames`, but a target its list hasn't loaded yet
+ *  reads as its picker does ("Loading presets…"), never as missing (D16),
+ *  so Remove's name and a row that doesn't run match the picker. Null only
+ *  once the list has loaded and the target isn't in it. */
+function rowNames(app: ReturnType<typeof useApp>): ActionNames {
+  const n = actionNames(app);
+  return {
+    preset: (id) => n.preset(id) ?? (app.presetsLoaded() ? null : "Loading presets…"),
+    tile: (id) => n.tile(id) ?? (app.soundboardScanned() ? null : "Loading clips…"),
+    voice: (id) => n.voice(id) ?? (app.ttsVoicesLoaded() ? null : "Loading voices…"),
+  };
+}
+
 /** A row that runs: its sigil and words, the target's picker (a preset, a
  *  clip, a voice and the line's text), Remove, and what it will and won't
  *  do. A target that matches nothing says so (D18, UX8). */
@@ -3576,7 +3590,7 @@ function TimerActionRow(props: {
 }): JSX.Element {
   const app = useApp();
   const place = () => LIST_WORDS[props.hook];
-  const names = actionNames(app);
+  const names = rowNames(app);
   const words = () => actionWords(props.action, names);
   const set = (a: TimerAction): void => void app.setTimerAction(props.id, props.hook, props.index, a);
 
@@ -3754,8 +3768,9 @@ function TimerActionRow(props: {
       </Show>
       <Show when={props.action.kind === "setMuted" && !props.action.muted}>
         <div style={helpStyle}>
-          It unmutes you even if you muted yourself before or during the countdown, or another timer is
-          still muting you.
+          {props.hook === "onFire"
+            ? "It unmutes you even if you muted yourself before or during the countdown, or another timer is still muting you."
+            : "It unmutes you even if you muted yourself before it started, or another timer is still muting you."}
         </div>
       </Show>
       <Show when={props.action.kind === "panic"}>
@@ -3793,7 +3808,7 @@ function TimerActionNotRun(props: {
   row: ShownRow;
 }): JSX.Element {
   const app = useApp();
-  const names = actionNames(app);
+  const names = rowNames(app);
   const why = () => (props.row.runs ? "unreadable" : props.row.why);
   return (
     <div data-action-row={props.index} style={rowStyle}>
