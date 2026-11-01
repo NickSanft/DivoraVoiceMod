@@ -5339,7 +5339,8 @@ edited mid-break can't stop a Reset from unmuting, nor make one unmute what
 the start never muted (`a_cancel_undoes_what_its_start_did`; step R), unless
 Divora relaunches in between: a seed takes At start as it is at the
 relaunch for `started`, so the restart's mute and a later Reset's or
-delete's undo follow that one. Reset's key row on the card names only the
+delete's unmute follow that one (Back to the preset before still follows
+the return the original start stored). Reset's key row on the card names only the
 restoring actions that card's At zero holds (`resetUndoes`).
 
 A Toggle at a deadline no reader saw records `[Fired, Started]` (the op's
