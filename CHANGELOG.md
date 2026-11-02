@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.60.0] — 2026-11-02 — Timers that change your voice
+
 A countdown in **Settings → Hourglass** can now do things when it starts and when it reaches zero: switch your preset and switch back, mute you for a break, play a clip, say a line or save a replay. **Add break (BRB)** makes a 5:00 countdown that mutes you until it ends, and **End now** ends a countdown early, from its card or its own hotkey. This release also fixes Speak's Kokoro voices, which have failed with an error in an installed Divora since 1.17.0 (from the code; under Fixed).
 
 ### Added
