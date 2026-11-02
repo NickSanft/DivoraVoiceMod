@@ -2334,7 +2334,7 @@ test.describe("Hourglass (v1.59)", () => {
 
       // At start: Switch preset. It starts on a preset other than the live
       // one (Hollow King), and its picker says which.
-      await card(page).getByRole("button", { name: "Add an action at the start of Villager" }).click();
+      await card(page).getByRole("button", { name: "Add action at the start of Villager" }).click();
       await card(page)
         .getByRole("listbox", { name: "Actions to add at the start of Villager" })
         .getByRole("option", { name: "Switch preset", exact: true })
@@ -2359,7 +2359,7 @@ test.describe("Hourglass (v1.59)", () => {
       await expect(card(page)).toContainText(NO_REVERT);
 
       // At zero: Back to the preset before.
-      await card(page).getByRole("button", { name: "Add an action at zero of Villager" }).click();
+      await card(page).getByRole("button", { name: "Add action at zero of Villager" }).click();
       await card(page)
         .getByRole("listbox", { name: "Actions to add at zero of Villager" })
         .getByRole("option", { name: "Back to the preset before", exact: true })
@@ -2434,7 +2434,7 @@ test.describe("Hourglass (v1.59)", () => {
       // Its rows say what it does, and End now waits for a run.
       await expect(atStart(page)).toContainText("Mute my voice");
       await expect(atZero(page)).toContainText("Unmute my voice");
-      const endNow = card(page).getByRole("button", { name: "End BRB now" });
+      const endNow = card(page).getByRole("button", { name: "End now: BRB" });
       await expect(endNow).toBeDisabled();
 
       await startBreak(page);

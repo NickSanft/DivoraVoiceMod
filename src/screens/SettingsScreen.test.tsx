@@ -1141,11 +1141,11 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     const names = [
       "Pause BRB",
       "Reset BRB",
-      "End BRB now",
+      "End now: BRB",
       "Take 30 seconds off BRB",
       "Add 30 seconds to BRB",
-      "Add an action at the start of BRB",
-      "Add an action at zero of BRB",
+      "Add action at the start of BRB",
+      "Add action at zero of BRB",
       "Copy the path of BRB's file",
       "Open the timer files folder",
       "Add countdown",
@@ -1376,12 +1376,12 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     expect(controls(card("timer-1"))).toEqual([
       "Pause BRB",
       "Reset BRB",
-      "End BRB now",
+      "End now: BRB",
       "Take 30 seconds off BRB",
       "Add 30 seconds to BRB",
       "Length of BRB",
-      "Add an action at the start of BRB",
-      "Add an action at zero of BRB",
+      "Add action at the start of BRB",
+      "Add action at zero of BRB",
       "BRB start or pause hotkey: F9",
       "Clear BRB start or pause hotkey",
       "BRB reset hotkey: not set",
@@ -1575,8 +1575,8 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     await flush();
     await emit(1, state("timer-1"), state("timer-2", { name: "Uptime", kind: "countup", ms: 0, totalMs: 0, text: "00:00" }));
     for (const [hook, title, help, add] of [
-      ["onStart", "At start", START_HELP, "Add an action at the start of BRB"],
-      ["onFire", "At zero", ZERO_HELP, "Add an action at zero of BRB"],
+      ["onStart", "At start", START_HELP, "Add action at the start of BRB"],
+      ["onFire", "At zero", ZERO_HELP, "Add action at zero of BRB"],
     ] as const) {
       expect(within(list(hook)).getByText(title)).toBeInTheDocument();
       expect(within(list(hook)).getByText(help)).toBeInTheDocument();
@@ -1585,9 +1585,9 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     }
     // At start, then At zero, after Length and before the keys.
     const order = controls(card("timer-1"));
-    expect(order.indexOf("Length of BRB")).toBeLessThan(order.indexOf("Add an action at the start of BRB"));
-    expect(order.indexOf("Add an action at the start of BRB")).toBeLessThan(order.indexOf("Add an action at zero of BRB"));
-    expect(order.indexOf("Add an action at zero of BRB")).toBeLessThan(order.indexOf("BRB start or pause hotkey: not set"));
+    expect(order.indexOf("Length of BRB")).toBeLessThan(order.indexOf("Add action at the start of BRB"));
+    expect(order.indexOf("Add action at the start of BRB")).toBeLessThan(order.indexOf("Add action at zero of BRB"));
+    expect(order.indexOf("Add action at zero of BRB")).toBeLessThan(order.indexOf("BRB start or pause hotkey: not set"));
     // End now's key: the third row.
     const desc = within(card("timer-1")).getByText("Ends it at once and runs what's set for zero.");
     expect(desc.previousElementSibling?.textContent).toBe("End now");
@@ -1598,7 +1598,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
 
     const up = card("timer-2");
     expect(up.querySelector("[data-timer-list]")).toBeNull();
-    expect(within(up).queryByRole("button", { name: "End Uptime now" })).toBeNull();
+    expect(within(up).queryByRole("button", { name: "End now: Uptime" })).toBeNull();
     expect(within(up).queryByRole("button", { name: /Uptime end now hotkey/ })).toBeNull();
     expect(within(up).queryByText("Ends it at once and runs what's set for zero.")).toBeNull();
     expect(within(up).queryByText("Mute my voice")).toBeNull();
@@ -1611,7 +1611,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     const view = mount();
     await flush();
     await emit(1, state("timer-1"));
-    const add = view.getByRole("button", { name: "Add an action at the start of BRB" });
+    const add = view.getByRole("button", { name: "Add action at the start of BRB" });
     expect(add).toHaveAttribute("aria-haspopup", "listbox");
     expect(add).toHaveAttribute("aria-expanded", "false");
     const highlighted = (b: HTMLElement): string | null | undefined =>
@@ -1664,11 +1664,11 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(add).toHaveAttribute("aria-expanded", "false");
     expect(add).not.toHaveAttribute("aria-activedescendant");
     expect(document.activeElement).toBe(add);
-    expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add an action at the start of BRB"]);
+    expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add action at the start of BRB"]);
 
     // At zero: Back to the preset before is offered, and its one line is
     // taken. Space opens it too; Esc closes it with the focus kept.
-    const zero = view.getByRole("button", { name: "Add an action at zero of BRB" });
+    const zero = view.getByRole("button", { name: "Add action at zero of BRB" });
     zero.focus();
     fireEvent.keyDown(zero, { key: " " });
     const zeroBox = view.getByRole("listbox", { name: "Actions to add at zero of BRB" });
@@ -1715,7 +1715,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
       scrolled.push(this.textContent ?? "");
     };
     try {
-      const add = view.getByRole("button", { name: "Add an action at zero of BRB" });
+      const add = view.getByRole("button", { name: "Add action at zero of BRB" });
       add.focus();
       fireEvent.keyDown(add, { key: "Enter" });
       expect(scrolled).toEqual(["Switch preset"]);
@@ -1746,7 +1746,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     await flush();
     await emit(1, state("timer-1"));
     expect(sent("list_tts_voices")).toEqual([]);
-    expect(await pickLine(first, "onFire", "Add an action at zero of BRB")).toEqual(line("I'm back.", "am_adam"));
+    expect(await pickLine(first, "onFire", "Add action at zero of BRB")).toEqual(line("I'm back.", "am_adam"));
     expect(sent("list_tts_voices")).toHaveLength(1);
     expect(first.getByRole("button", { name: "Voice of BRB's line at zero: Adam" })).toBeInTheDocument();
     expect(first.getByRole("textbox", { name: "Line BRB says at zero" })).toHaveValue("I'm back.");
@@ -1760,7 +1760,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     const view = mount();
     await flush();
     await emit(1, state("timer-1"));
-    expect(await pickLine(view, "onStart", "Add an action at the start of BRB")).toEqual(line("Be right back."));
+    expect(await pickLine(view, "onStart", "Add action at the start of BRB")).toEqual(line("Be right back."));
     expect(view.getByRole("button", { name: "Voice of BRB's line at the start: Bright" })).toBeInTheDocument();
     expect(view.getByRole("textbox", { name: "Line BRB says at the start" })).toHaveValue("Be right back.");
   });
@@ -1770,7 +1770,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     const view = mount();
     await flush();
     await emit(1, state("timer-1"));
-    const add = view.getByRole("button", { name: "Add an action at the start of BRB" });
+    const add = view.getByRole("button", { name: "Add action at the start of BRB" });
     add.focus();
     fireEvent.click(add, { detail: 1 });
     expect(document.activeElement).toBe(document.body);
@@ -1839,9 +1839,9 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(controls(zero[8]!)).toEqual([NOT_RUN_ZERO]);
     expect(within(zero[8]!).getByText(NOT_RUN.pastEight)).toBeInTheDocument();
     // Nine stored: At zero is full, every entry counted; At start isn't.
-    expect(view.getByRole("button", { name: "Add an action at zero of BRB" })).toBeDisabled();
+    expect(view.getByRole("button", { name: "Add action at zero of BRB" })).toBeDisabled();
     expect(within(list("onFire")).getByText("Up to 8 actions here. Remove one to add another.")).toBeInTheDocument();
-    expect(view.getByRole("button", { name: "Add an action at the start of BRB" })).not.toBeDisabled();
+    expect(view.getByRole("button", { name: "Add action at the start of BRB" })).not.toBeDisabled();
     expect(within(list("onStart")).queryByText("Up to 8 actions here. Remove one to add another.")).toBeNull();
 
     // Removing the stray switch back keeps the newer Divora's entry first.
@@ -1853,7 +1853,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     fireEvent.click(within(rowsOf("onFire")[8]!).getByRole("button", { name: NOT_RUN_ZERO }));
     await flush();
     expect((saved()[0]!.onFire as unknown[]).length).toBe(8);
-    expect(view.getByRole("button", { name: "Add an action at zero of BRB" })).toBeDisabled();
+    expect(view.getByRole("button", { name: "Add action at zero of BRB" })).toBeDisabled();
   });
 
   it("a line: typing sends nothing; Enter or leaving keeps it trimmed; Esc puts it back; one it can't read stays marked and sends nothing", async () => {
@@ -2011,7 +2011,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     const named = (name: string) => view.getByRole("button", { name });
     /** Add action's clip choice at the start, and whether it can be added. */
     const clipChoice = (): [string | null, boolean] => {
-      const add = view.getByRole("button", { name: "Add an action at the start of BRB" });
+      const add = view.getByRole("button", { name: "Add action at the start of BRB" });
       fireEvent.click(add, { detail: 0 });
       const o = within(view.getByRole("listbox")).getAllByRole("option")[4]!;
       const seen: [string | null, boolean] = [o.textContent, o.getAttribute("aria-disabled") !== "true"];
@@ -2090,13 +2090,13 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
       "Voice of BRB's line at the start: Bright",
       "Remove Say “Be right back.” in Bright from the start of BRB",
       "Remove Save a replay from the start of BRB",
-      "Add an action at the start of BRB",
+      "Add action at the start of BRB",
     ]);
     expect(controls(list("onFire"))).toEqual([
       "Remove Unmute my voice from zero of BRB",
       "Remove Back to the preset before from zero of BRB",
       "Remove Save a replay from zero of BRB",
-      "Add an action at zero of BRB",
+      "Add action at zero of BRB",
     ]);
     // Every control on the card still names its timer, the pickers' values
     // with it.
@@ -2295,7 +2295,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     store([entry("timer-1")]);
     const view = mount();
     await flush();
-    const endNow = () => within(card("timer-1")).getByRole("button", { name: "End BRB now" });
+    const endNow = () => within(card("timer-1")).getByRole("button", { name: "End now: BRB" });
     const phases: Array<[Record<string, unknown>, boolean]> = [
       [{ phase: "idle" }, false],
       [RUNNING, true],
@@ -2373,8 +2373,8 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(document.activeElement).toBe(document.body);
     expect(words(card("timer-1"))).toContain("Countdown · 5:00");
     await emit(1, state("timer-1"));
-    expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add an action at the start of BRB"]);
-    expect(controls(list("onFire"))).toEqual(["Remove Unmute my voice from zero of BRB", "Add an action at zero of BRB"]);
+    expect(controls(list("onStart"))).toEqual(["Remove Mute my voice from the start of BRB", "Add action at the start of BRB"]);
+    expect(controls(list("onFire"))).toEqual(["Remove Unmute my voice from zero of BRB", "Add action at zero of BRB"]);
     // A break warns of nothing, and its keys are unbound.
     expect(view.queryByText(/nothing at zero|At zero has no/)).toBeNull();
     expect(view.getByRole("button", { name: "BRB start or pause hotkey: not set" })).toBeInTheDocument();

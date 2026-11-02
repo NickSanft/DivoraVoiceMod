@@ -3209,7 +3209,7 @@ function TimerControls(props: {
             size="sm"
             icon="endNow"
             disabled={!adjustable()}
-            aria-label={`End ${props.name} now`}
+            aria-label={`End now: ${props.name}`}
             onClick={(e) => {
               blurOnPointer(e);
               void app.finishTimer(props.id);
@@ -3965,7 +3965,7 @@ function AddActionMenu(props: {
         type="button"
         class="btn btn-secondary btn-sm"
         disabled={props.disabled}
-        aria-label={`Add an action ${LIST_WORDS[props.hook].add} ${props.name}`}
+        aria-label={`Add action ${LIST_WORDS[props.hook].add} ${props.name}`}
         aria-haspopup="listbox"
         aria-expanded={open()}
         aria-controls={open() ? listId : undefined}
