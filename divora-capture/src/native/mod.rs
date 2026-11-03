@@ -3,6 +3,7 @@
 //! is the crate's only `unsafe` scope.
 
 pub mod d3d;
+pub mod dpapi;
 pub mod encoder;
 pub mod loopback;
 pub mod mf;

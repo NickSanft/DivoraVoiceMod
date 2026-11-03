@@ -13,6 +13,7 @@ import {
   MAX_TIMERS,
   MIN_LENGTH_MS,
   nextTimerId,
+  obsTextOwners,
   parseLength,
   parseTimerHotkeyId,
   phaseWord,
@@ -27,6 +28,7 @@ import {
   timerRoles,
   timersForSave,
   TIMER_VERBS,
+  withObsNames,
   type StoredTimer,
   type StoredTimers,
   type TimerEdges,
@@ -457,6 +459,108 @@ describe("timerRoles", () => {
 
   it("is empty with no timers", () => {
     expect(timerRoles(readTimers(null)).size).toBe(0);
+  });
+});
+
+// v1.61.0: Talk to OBS.
+describe("obsTextOwners", () => {
+  const OTHER = "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13";
+  it("the sources the backend's timers show in, but `except`'s, each by its first timer in list order", () => {
+    const s = stored([
+      cd("timer-1", { name: "BRB", obsText: { uuid: UUID, name: "Timer text" } }),
+      cd("timer-2", { name: "Intro", obsText: { uuid: UUID, name: "Timer text" } }),
+      cd("timer-3", { name: "Uptime", kind: "countup", obsText: { uuid: OTHER, name: "Uptime text" } }),
+      cd("timer-4", { name: "None" }),
+    ]);
+    expect([...obsTextOwners(s, "timer-4")]).toEqual([
+      [UUID, "BRB"],
+      [OTHER, "Uptime"],
+    ]);
+    expect([...obsTextOwners(s, "timer-1")]).toEqual([
+      [UUID, "Intro"],
+      [OTHER, "Uptime"],
+    ]);
+  });
+
+  it("leaves out a timer the backend doesn't run, and an obsText whose uuid can't be read", () => {
+    const s = stored([
+      { id: "timer-1", name: "Laps", kind: "interval", durationMs: 1, obsText: { uuid: UUID, name: "x" } },
+      cd("timer-2", { obsText: { uuid: "" } }),
+      cd("timer-3", { obsText: UUID }),
+      cd("timer-4", { obsText: { uuid: `${UUID}\uD800` } }),
+      ...Array.from({ length: 16 }, (_, i) => cd(`timer-${i + 5}`)),
+      cd("timer-21", { name: "Over", obsText: { uuid: UUID, name: "x" } }),
+    ]);
+    expect(timerRoles(s).get("timer-21")).toBe("over");
+    expect(obsTextOwners(s, "timer-5").size).toBe(0);
+  });
+});
+
+describe("withObsNames", () => {
+  const SCENE = "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13";
+  const GAME = "0b9d8c7e-6f5a-4b3c-9d2e-1f0a9b8c7d6e";
+  const inv = (sceneName: string, sourceName: string) => ({
+    rev: 4,
+    scenes: [
+      { uuid: SCENE, name: sceneName },
+      { uuid: GAME, name: "Game" },
+    ],
+    textSources: [{ uuid: UUID, name: sourceName, kind: "gdiplus" as const, readsFromFile: false }],
+    programSceneUuid: GAME,
+    truncated: false,
+  });
+  const scene = (uuid: string, sceneName: string, more: Record<string, unknown> = {}) => ({
+    kind: "obs",
+    op: "scene",
+    sceneUuid: uuid,
+    sceneName,
+    ...more,
+  });
+
+  it("brings each name the inventory lists under another up to date, by uuid, keeping every other key", () => {
+    const s = stored([
+      cd("timer-1", {
+        obsText: { uuid: UUID, name: "Old text", later: 1 },
+        onStart: [{ kind: "setMuted", muted: true }, scene(SCENE, "Old BRB", { later: 2 })],
+        onFire: [{ kind: "obs", op: "sceneBack" }, scene(GAME, "Game")],
+      }),
+      cd("timer-2", { kind: "countup", obsText: { uuid: UUID, name: "Old text" } }),
+    ]);
+    const next = withObsNames(s, inv("BRB", "Timer text"));
+    expect(next.timers[0]).toEqual({
+      ...s.timers[0],
+      obsText: { uuid: UUID, name: "Timer text", later: 1 },
+      onStart: [{ kind: "setMuted", muted: true }, scene(SCENE, "BRB", { later: 2 })],
+    });
+    // A list nothing in it changed keeps its array.
+    expect(next.timers[0]!.onFire).toBe(s.timers[0]!.onFire);
+    expect(next.timers[1]).toEqual({ ...s.timers[1], obsText: { uuid: UUID, name: "Timer text" } });
+  });
+
+  it("cuts a name past 256 characters as stored", () => {
+    const s = stored([cd("timer-1", { obsText: { uuid: UUID, name: "x" }, onStart: [scene(SCENE, "y")] })]);
+    const next = withObsNames(s, inv("b".repeat(300), "t".repeat(300)));
+    expect(next.timers[0]).toMatchObject({
+      obsText: { name: "t".repeat(256) },
+      onStart: [{ sceneName: "b".repeat(256) }],
+    });
+    // Already cut: nothing to change.
+    expect(withObsNames(next, inv("b".repeat(300), "t".repeat(300)))).toBe(next);
+  });
+
+  it("the stored timers themselves when nothing changed; what it can't read, or a uuid it doesn't list, kept as written", () => {
+    const s = stored([
+      cd("timer-1", {
+        obsText: { uuid: "c3d4e5f6-0000-4000-8000-000000000001", name: "Gone" },
+        onStart: [scene(SCENE, "BRB"), scene("", "Bad"), { kind: "obs", op: "startStream" }],
+        onFire: "not a list",
+      }),
+      cd("timer-2", { obsText: { uuid: UUID, name: 5 } }),
+      // A count-up's lists are never read.
+      cd("timer-3", { kind: "countup", onStart: [scene(SCENE, "Old")] }),
+      { id: "timer-4", name: "Laps", kind: "interval", durationMs: 1, onStart: [scene(SCENE, "Old")] },
+    ]);
+    expect(withObsNames(s, inv("BRB", "Timer text"))).toBe(s);
   });
 });
 

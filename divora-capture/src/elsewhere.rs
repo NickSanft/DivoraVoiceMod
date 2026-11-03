@@ -201,3 +201,18 @@ impl Default for SleepWatch {
         Self::new()
     }
 }
+
+/// v1.61.0: there is no DPAPI here; see the Windows build's.
+pub mod dpapi {
+    use crate::dpapi::DpapiError;
+
+    /// Always fails: there is no DPAPI here.
+    pub fn protect(_plain: &[u8], _entropy: &[u8]) -> Result<Vec<u8>, DpapiError> {
+        Err(DpapiError::Unavailable)
+    }
+
+    /// Always fails: there is no DPAPI here.
+    pub fn unprotect(_blob: &[u8], _entropy: &[u8]) -> Result<Vec<u8>, DpapiError> {
+        Err(DpapiError::Unavailable)
+    }
+}

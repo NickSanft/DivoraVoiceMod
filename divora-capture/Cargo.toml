@@ -36,6 +36,11 @@ hound = "3"
 # v1.57.0 adds `Win32_UI_Shell` (and `_Common`) for `native::shell`, which
 # opens links through the desktop's Explorer so they start outside Divora's
 # process tree. Features only, no new copy.
+#
+# v1.61.0 adds `Win32_Security_Cryptography` for `native::dpapi` (the OBS
+# password), for its blob type and flag only: `CryptProtectData` and
+# `CryptUnprotectData` are resolved at run time, so the exe gains no
+# crypt32.dll import. A feature of the same copy, no new crate.
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.61"
 windows = { version = "0.61", features = [
@@ -54,6 +59,7 @@ windows = { version = "0.61", features = [
     "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

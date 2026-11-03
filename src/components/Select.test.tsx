@@ -237,3 +237,121 @@ describe("Select (v1.60.0)", () => {
     expect(listboxStep("End", 0, 0)).toBe(0);
   });
 });
+
+// v1.61.0: Talk to OBS's pickers read OBS's list again each time one opens
+// (`onOpen`), and offer a text source that can't be picked (it reads a file,
+// or another timer shows it) as a disabled option that says why.
+describe("Select (v1.61.0)", () => {
+  const SOURCES: SelectOption[] = [
+    { value: "", label: "None" },
+    { value: "a", label: "Timer text", sub: "Text (GDI+)" },
+    {
+      value: "b",
+      label: "From file",
+      sub: "reads a file — untick Read from file in its Properties in OBS to show a timer here",
+      disabled: true,
+    },
+    { value: "c", label: "Intro text", sub: "shown by Intro", disabled: true },
+  ];
+
+  function mountSources(value = "", onOpen = vi.fn()) {
+    const onChange = vi.fn();
+    const view = render(() => {
+      const [v, setV] = createSignal(value);
+      return (
+        <Select
+          icon="link"
+          value={v()}
+          options={SOURCES}
+          onChange={(next) => {
+            onChange(next);
+            setV(next);
+          }}
+          onOpen={onOpen}
+          ariaLabel="BRB OBS text source"
+          blurOnPointer
+        />
+      );
+    });
+    const trigger = view.container.querySelector<HTMLButtonElement>("button.select")!;
+    const highlighted = (): HTMLElement | null =>
+      document.getElementById(trigger.getAttribute("aria-activedescendant") ?? "");
+    return { view, trigger, onChange, onOpen, highlighted };
+  }
+
+  it("onOpen is called each time the list opens, by a click or a key, and not on a close or a pick", () => {
+    const { view, trigger, onOpen } = mountSources();
+    fireEvent.click(trigger, { detail: 1 });
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    // A click on the open trigger closes it: no call.
+    fireEvent.click(trigger, { detail: 1 });
+    expect(view.queryByRole("listbox")).toBeNull();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    trigger.focus();
+    for (const [i, key] of (["Enter", " ", "ArrowDown"] as const).entries()) {
+      fireEvent.keyDown(trigger, { key });
+      expect(onOpen, key).toHaveBeenCalledTimes(2 + i);
+      fireEvent.keyDown(trigger, { key: "Escape" });
+    }
+    // Moving and picking don't open it again.
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    expect(onOpen).toHaveBeenCalledTimes(5);
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    expect(view.queryByRole("listbox")).toBeNull();
+    expect(onOpen).toHaveBeenCalledTimes(5);
+  });
+
+  it("without onOpen it opens as before", () => {
+    const { view, trigger } = mountSelect();
+    fireEvent.click(trigger, { detail: 1 });
+    expect(view.getByRole("listbox")).toBeInTheDocument();
+  });
+
+  it("a disabled option is in the arrow and Home/End order, says why, and Enter, Space and a click refuse it, the list kept open", () => {
+    const { view, trigger, onChange, highlighted } = mountSources();
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const options = view.getAllByRole("option");
+    expect(options.map((o) => o.getAttribute("aria-disabled"))).toEqual([null, null, "true", "true"]);
+    // Its reason is in its name.
+    expect(view.getByRole("option", { name: /From file.*reads a file — untick Read from file/ })).toBe(options[2]);
+    expect(view.getByRole("option", { name: /Intro text.*shown by Intro/ })).toBe(options[3]);
+    // Down, Down: the file-reading source, not skipped.
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(highlighted()).toBe(options[2]);
+    for (const key of ["Enter", " "]) {
+      fireEvent.keyDown(trigger, { key });
+      expect(view.getByRole("listbox"), key).toBeInTheDocument();
+    }
+    // End reaches the last, disabled too; Home the first.
+    fireEvent.keyDown(trigger, { key: "End" });
+    expect(highlighted()).toBe(options[3]);
+    fireEvent.keyDown(trigger, { key: "ArrowUp" });
+    expect(highlighted()).toBe(options[2]);
+    fireEvent.keyDown(trigger, { key: "Home" });
+    expect(highlighted()).toBe(options[0]);
+    // A click on one is refused as well, and keeps the focus where it was.
+    fireEvent.click(options[3]!, { detail: 1 });
+    expect(view.getByRole("listbox")).toBeInTheDocument();
+    expect(document.activeElement).toBe(trigger);
+    expect(onChange).not.toHaveBeenCalled();
+    expect(trigger).toHaveAttribute("aria-label", "BRB OBS text source: None");
+    // One that can be picked still is.
+    fireEvent.click(options[1]!, { detail: 1 });
+    expect(onChange.mock.calls).toEqual([["a"]]);
+    expect(view.queryByRole("listbox")).toBeNull();
+  });
+
+  it("a stored value whose option is disabled shows as any other, and opening highlights it", () => {
+    const { view, trigger } = mountSources("c");
+    expect(trigger).toHaveAttribute("aria-label", "BRB OBS text source: Intro text");
+    expect(trigger.querySelector(".select-sub")).toHaveTextContent("shown by Intro");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const chosen = view.getByRole("option", { selected: true });
+    expect(chosen).toHaveAttribute("aria-disabled", "true");
+    expect(trigger.getAttribute("aria-activedescendant")).toBe(chosen.id);
+  });
+});

@@ -29,6 +29,9 @@ let presetsReply: () => unknown = () => [];
 let ttsVoicesReply: () => unknown = () => [];
 // v1.60.0: what a soundboard folder's scan finds (nothing unless a test says).
 let scanReply: () => unknown = () => [];
+// v1.61.0: what the backend answers the six OBS commands (null unless a test
+// says; a refusal is a thrown string, as Tauri rejects with Rust's `Err`).
+let obsReply: (cmd: string, args: unknown) => unknown = () => null;
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
@@ -71,6 +74,13 @@ vi.mock("@tauri-apps/api/core", () => ({
       case "timer_status":
       case "timers_dir":
         return timerReply(cmd, args);
+      case "obs_configure":
+      case "obs_reconnect":
+      case "obs_set_password":
+      case "obs_forget_password":
+      case "obs_status":
+      case "obs_inventory":
+        return obsReply(cmd, args);
       default:
         return null;
     }
@@ -96,6 +106,8 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 import { Sigil } from "../components/Sigil";
+import obsFixture from "../data/obs.fixture.json";
+import { OBS_HOST_ERRORS, obsClockTime, obsStatusLine, readObsStatus } from "../data/obs";
 import { muteCcStep } from "../data/mute";
 import { FALLBACK_PRESETS } from "../data/presets";
 import { AppProvider, useApp } from "../stores/app";
@@ -706,7 +718,9 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await flush();
     const eyebrows = Array.from(document.querySelectorAll("section > .eyebrow")).map((e) => squash(e.textContent));
     expect(eyebrows.indexOf("Hourglass")).toBe(eyebrows.indexOf("Stream overlay") + 1);
-    expect(eyebrows.indexOf("About")).toBe(eyebrows.indexOf("Hourglass") + 1);
+    // v1.61.0: OBS comes between Hourglass and About.
+    expect(eyebrows.indexOf("OBS")).toBe(eyebrows.indexOf("Hourglass") + 1);
+    expect(eyebrows.indexOf("About")).toBe(eyebrows.indexOf("OBS") + 1);
     const hourglass = section(view);
     expect(squash(hourglass.querySelector("p")?.textContent)).toBe(
       "Countdowns and count-ups that keep time while Divora is in the tray. Start, pause and reset them here or with their own hotkeys, and show them on your overlay or in OBS. A countdown can also do things when it starts and when it reaches zero: switch your preset, mute you for a break, play a clip, speak a line or save a replay. If your PC sleeps, a count-up pauses, and a countdown that runs out meanwhile says so instead of finishing late.",
@@ -1438,10 +1452,12 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
   const TILES = [{ id: "a1b2c3d4e5f60718", path: "C:/clips/intro.wav", label: "Intro", extension: "wav", sizeBytes: 1 }];
   const START_HELP =
     "Runs when it starts from the beginning: Start, Start again, or its start-or-pause key. Pause and Resume don't run it again. A change here counts from its next start, and if Divora restarts while it's running or paused, its Mute my voice runs again.";
+  // v1.61.0: Switch OBS back is one of the putting-back actions, and OBS
+  // not connected one of the limit's examples.
   const ZERO_HELP =
-    "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you. A change here counts for the run that's going on.";
+    "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice, Back to the preset before and Switch OBS back run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you, and Switch OBS back only if its start switched OBS. A change here counts for the run that's going on.";
   const LIMIT =
-    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
+    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, OBS isn't connected (a Switch OBS back excepted: it waits up to 2 minutes for OBS), or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
   const WARN = {
     muteNoUnmute:
       "This mutes you when it starts, and nothing at zero unmutes you, so you stay muted after it ends, is reset or is deleted. Add Unmute my voice at zero.",
@@ -1622,7 +1638,8 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
     expect(add).toHaveAttribute("aria-expanded", "true");
     expect(add).toHaveAttribute("aria-controls", box.id);
     const options = within(box).getAllByRole("option");
-    // At start never offers Back to the preset before; no folder, so no clip.
+    // At start never offers Back to the preset before (nor, v1.61.0, Switch
+    // OBS back); no folder, so no clip; Settings → OBS off, so no scene.
     expect(options.map((o) => o.textContent)).toEqual([
       "Switch preset",
       "Random preset",
@@ -1632,9 +1649,11 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
       "Speak a line",
       "Save a replay",
       "Stop all clips and lines",
+      "Switch OBS scene — turn on Settings → OBS first",
     ]);
     expect(options.filter((o) => o.getAttribute("aria-disabled") === "true").map((o) => o.textContent)).toEqual([
       "Play a clip — pick a soundboard folder first",
+      "Switch OBS scene — turn on Settings → OBS first",
     ]);
     expect(highlighted(add)).toBe("Switch preset");
     // One it can't add: Enter adds nothing and the list stays open.
@@ -1683,13 +1702,17 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
       "Speak a line — this list already has one",
       "Save a replay",
       "Stop all clips and lines",
+      "Switch OBS scene — turn on Settings → OBS first",
+      "Switch OBS back — turn on Settings → OBS first",
     ]);
     expect(zeroOptions.filter((o) => o.getAttribute("aria-disabled") === "true").map((o) => o.textContent)).toEqual([
       "Play a clip — pick a soundboard folder first",
       "Speak a line — this list already has one",
+      "Switch OBS scene — turn on Settings → OBS first",
+      "Switch OBS back — turn on Settings → OBS first",
     ]);
     fireEvent.keyDown(zero, { key: "End" });
-    expect(highlighted(zero)).toBe("Stop all clips and lines");
+    expect(highlighted(zero)).toBe("Switch OBS back — turn on Settings → OBS first");
     fireEvent.keyDown(zero, { key: "Escape" });
     expect(view.queryByRole("listbox")).toBeNull();
     expect(document.activeElement).toBe(zero);
@@ -1723,7 +1746,13 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
       fireEvent.keyDown(add, { key: "ArrowUp" });
       fireEvent.keyDown(add, { key: "Home" });
       fireEvent.keyDown(add, { key: "ArrowDown" });
-      expect(scrolled).toEqual(["Switch preset", "Stop all clips and lines", "Save a replay", "Switch preset", "Random preset"]);
+      expect(scrolled).toEqual([
+        "Switch preset",
+        "Switch OBS back — turn on Settings → OBS first",
+        "Switch OBS scene — turn on Settings → OBS first",
+        "Switch preset",
+        "Random preset",
+      ]);
       fireEvent.pointerEnter(view.getByRole("option", { name: "Save a replay" }));
       expect(scrolled).toHaveLength(5);
     } finally {
@@ -2466,5 +2495,1172 @@ describe("SettingsScreen — picking what a picker already has (v1.60.0)", () =>
       kind: "preset",
       presetId: FALLBACK_PRESETS[0]!.id,
     });
+  });
+});
+
+// v1.61.0: Talk to OBS. Settings → OBS (the consent card, its fields shown
+// on or off, the status line and its announcer), a timer's Show in OBS and
+// Follow OBS, the Switch OBS scene and Switch OBS back actions, and the
+// Break row. Rust's statuses come from obs.fixture.json's
+// `obsStatusSamples`, which Rust builds; every command is answered by the
+// mocked backend.
+describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  /** Microtasks only, for a test with faked timers. */
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+  const squash = (s: string | null | undefined): string => (s ?? "").replace(/\s+/g, " ").trim();
+  const TIMERS = "divora.timers";
+  const OBS = "divora.obs";
+  const ENDS = 1_793_217_900_000;
+  const MUTE = { kind: "setMuted", muted: true };
+  const UNMUTE = { kind: "setMuted", muted: false };
+  const BACK = { kind: "obs", op: "sceneBack" } as const;
+
+  const INTRO =
+    "Divora can show a timer's time in an OBS text source, switch OBS to a scene for a break and back, and start a count-up when you go live or start recording. It talks to the WebSocket server built into OBS.";
+  const EXPLAINER = [
+    "When this is on, Divora keeps one connection open to OBS at the address below — this PC unless you change it. For OBS, it connects nowhere else, and it never listens for connections.",
+    "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick.",
+    "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. It changes only the text of the sources you pick, and that text stays in OBS after Divora stops.",
+    "OBS ships with its WebSocket server off. In OBS: Tools → WebSocket Server Settings → Enable WebSocket server, then Show Connect Info for the password.",
+  ];
+  const ADDRESS_HELP =
+    "This PC is 127.0.0.1: keep it for OBS on this PC, even though OBS's Show Connect Info shows this PC's network address. For OBS on another PC, type that PC's IP address, like 192.168.1.20; that connection isn't encrypted. Divora doesn't look this address up as a name, so a name like obs.local won't work.";
+  const PASSWORD_SAVED =
+    "A password is saved, stored encrypted for your Windows account. OBS keeps its own copy in its settings.";
+  const PASSWORD_NONE = "No password saved. If OBS's Enable Authentication is on, it needs one.";
+  const SPACES = "This starts or ends with a space. OBS's password has to as well, or OBS will reject it.";
+  const SAVED_ADDRESS = "Not connected: the saved address isn't valid. Fix it below.";
+  const NETWORK = (host: string) =>
+    `${host} is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent.`;
+  const NO_AUTH =
+    "OBS isn't asking for a password, so anything that can reach it on your network can control it. Turn on Enable Authentication in OBS's WebSocket Server Settings.";
+  const SHOW_HELP =
+    "Pick a text source made for this timer: Divora replaces its text, and what it said before isn't kept. Set its font, colour and position in OBS. While the timer runs, each new second refreshes the source's Properties window in OBS if it's open, so pause the timer to edit it there. When this timer stops showing here, Divora clears the source's text the next time it's connected to OBS, unless Divora was closed in between.";
+  const FOLLOW_HELP =
+    "Starts from 0:00 when OBS starts, pauses when it stops (its last time stays until OBS starts again), and pauses with a paused recording. If OBS was already going when Divora connected, it starts from OBS's own count, so it's about right, and can be further behind after the stream reconnected. Its own buttons and keys still work; OBS's next start, stop, pause or resume, each time Divora connects to OBS, and a wake from sleep set it again. If Divora loses OBS, it keeps counting on its own until it connects again.";
+  const READS_A_FILE = "reads a file — untick Read from file in its Properties in OBS to show a timer here";
+  const SCENE_NOTE =
+    "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS takes more than 5 seconds to get to it, it doesn't switch.";
+  const BACK_NOTE =
+    "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.";
+  const ACTION_OFF = "Settings → OBS is off, so this does nothing until you turn it on.";
+  const SCENE_NO_BACK =
+    "This switches OBS's scene when it starts, and At zero has no Switch OBS back, so a reset or a delete leaves OBS on that scene, as does its end unless At zero switches scene. Add Switch OBS back at zero.";
+  const BACK_NO_SCENE = "The start doesn't switch OBS's scene, so there's nothing to switch back to.";
+  const START_SCENE_BACK = "Switch OBS back runs only at zero. This one stays saved and doesn't run.";
+  const BREAK_HELP =
+    "Breaks you add from now on switch OBS to this scene at their start and back at zero, as two actions you can change on their card. For a break you already have, add Switch OBS scene and Switch OBS back on its card.";
+
+  // ---- Rust's side ----
+  type Status = Record<string, unknown>;
+  const SAMPLES = (obsFixture as unknown as { obsStatusSamples: Array<{ name: string; status: Status }> })
+    .obsStatusSamples;
+  let seq = 0;
+  /** A status as Rust sends it: a fixture sample with `more`, and the
+   *  next seq, so it's newer than every one before. */
+  const obsStatus = (name: string, more: Status = {}): Status => {
+    const s = SAMPLES.find((x) => x.name === name);
+    if (!s) throw new Error(`no status sample "${name}"`);
+    return { ...s.status, ...more, seq: ++seq };
+  };
+  const CONNECTED = "connected";
+  const CONNECTING = "connecting, the first attempt";
+  const OFF_SAVED = "off, configured with enabled:false, a password saved";
+  const SKIPS = "connected, live and recording, a source missing, a scene skip and a text skip";
+  /** `obs-status`, heard by the store's listener. */
+  const emitObs = async (s: Status): Promise<void> => {
+    for (const h of eventHandlers.get("obs-status") ?? []) h({ payload: s });
+    await flush();
+  };
+  const uuid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  const GAME = { uuid: uuid(1), name: "Game" };
+  const BRB_SCENE = { uuid: uuid(2), name: "BRB" };
+  const CHAT = { uuid: uuid(3), name: "Just Chatting" };
+  const TEXT = { uuid: uuid(11), name: "Timer text", kind: "gdiplus", readsFromFile: false };
+  const INTRO_TEXT = { uuid: uuid(12), name: "Intro text", kind: "ft2", readsFromFile: false };
+  const FILE_TEXT = { uuid: uuid(13), name: "From file", kind: "gdiplus", readsFromFile: true };
+  const inventory = (more: Record<string, unknown> = {}) => ({
+    rev: 1,
+    scenes: [GAME, BRB_SCENE, CHAT],
+    textSources: [TEXT, INTRO_TEXT, FILE_TEXT],
+    programSceneUuid: GAME.uuid,
+    truncated: false,
+    ...more,
+  });
+  /** An answer the test gives when it chooses. */
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+  /** OBS control on at launch: a configure answers `connecting`, and an
+   *  inventory `inv()` (unless the test answers it). */
+  const obsOn = (inv: () => unknown = () => inventory()) => {
+    window.localStorage.setItem(OBS, JSON.stringify({ enabled: true, host: "127.0.0.1", port: 4455 }));
+    obsReply = (cmd) => {
+      if (cmd === "obs_configure") return obsStatus(CONNECTING);
+      if (cmd === "obs_inventory") return inv();
+      return null;
+    };
+  };
+  const storedObs = (): Record<string, unknown> =>
+    JSON.parse(window.localStorage.getItem(OBS) ?? "null") as Record<string, unknown>;
+  const sent = (cmd: string) => invokeCalls.filter((c) => c.cmd === cmd).map((c) => c.args);
+  const obsCmds = () => invokeCalls.map((c) => c.cmd).filter((c) => c.startsWith("obs_"));
+  const lastSync = (): Array<Record<string, unknown>> =>
+    (sent("sync_timers").at(-1) as { timers: Array<Record<string, unknown>> }).timers;
+
+  // ---- the timers ----
+  const entry = (id: string, more: Record<string, unknown> = {}) => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    durationMs: 300_000,
+    ...more,
+  });
+  const storeTimers = (...timers: unknown[]) =>
+    window.localStorage.setItem(TIMERS, JSON.stringify({ version: 1, timers }));
+  const saved = (): Array<Record<string, unknown>> =>
+    (JSON.parse(window.localStorage.getItem(TIMERS) ?? '{"timers":[]}') as { timers: Array<Record<string, unknown>> })
+      .timers;
+  const timerState = (id: string, more: Record<string, unknown> = {}) => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    phase: "idle",
+    ms: 300_000,
+    totalMs: 300_000,
+    text: "05:00",
+    anchorMs: null,
+    fires: 0,
+    ...more,
+  });
+  const UPTIME = { name: "Uptime", kind: "countup", ms: 0, totalMs: 0, text: "00:00" };
+  const RUNNING = { phase: "running", ms: 298_400, text: "04:59", anchorMs: ENDS };
+  const emitTimers = async (n: number, ...timers: unknown[]) => {
+    for (const h of eventHandlers.get("timer-state") ?? []) h({ payload: { seq: n, timers } });
+    await flush();
+  };
+  const card = (id: string): HTMLElement => {
+    const el = document.querySelector<HTMLElement>(`[data-timer-card="${id}"]`);
+    if (!el) throw new Error(`no card for ${id}`);
+    return el;
+  };
+  const list = (hook: "onStart" | "onFire", id = "timer-1"): HTMLElement => {
+    const el = card(id).querySelector<HTMLElement>(`[data-timer-list="${hook}"]`);
+    if (!el) throw new Error(`no ${hook} list on ${id}`);
+    return el;
+  };
+  const rowsOf = (hook: "onStart" | "onFire", id = "timer-1"): HTMLElement[] =>
+    Array.from(list(hook, id).querySelectorAll<HTMLElement>("[data-action-row]"));
+  const controls = (el: HTMLElement): string[] =>
+    Array.from(el.querySelectorAll("button, input")).map(
+      (c) => c.getAttribute("aria-label") ?? squash(c.textContent),
+    );
+  const words = (el: HTMLElement): string => {
+    const texts: string[] = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) texts.push(n.nodeValue ?? "");
+    return squash(texts.join(" "));
+  };
+  /** A picker's trigger, by its name's start ("BRB OBS text source"). */
+  const picker = (el: HTMLElement, name: string): HTMLElement =>
+    within(el).getByRole("button", { name: new RegExp(`^${name}: `) });
+  /** What a picker's trigger shows: its text and its sub. */
+  const showing = (trigger: HTMLElement): [string, string | null] => [
+    squash(trigger.querySelector(".select-main")?.textContent),
+    trigger.querySelector(".select-sub") ? squash(trigger.querySelector(".select-sub")?.textContent) : null,
+  ];
+
+  let app!: ReturnType<typeof useApp>;
+  function Probe() {
+    app = useApp();
+    return null;
+  }
+  const mount = () =>
+    render(() => (
+      <AppProvider>
+        <SettingsScreen />
+        <Probe />
+      </AppProvider>
+    ));
+  const section = (view: ReturnType<typeof mount>): HTMLElement =>
+    view.getByText("OBS", { selector: ".eyebrow" }).closest("section")!;
+  const line = (view: ReturnType<typeof mount>): string => squash(view.getByTestId("obs-status-line").textContent);
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    overlayReply = null;
+    timerReply = () => null;
+    presetsReply = () => [];
+    ttsVoicesReply = () => [];
+    scanReply = () => [];
+    obsReply = () => null;
+    seq = 0;
+    invokeCalls.length = 0;
+    for (const ev of ["timer-state", "timer-actions", "soundboard-stopped", "obs-status"]) eventHandlers.delete(ev);
+  });
+  afterEach(() => {
+    obsReply = () => null;
+  });
+
+  // ---- Settings → OBS ----
+
+  it("renders off with its explainer, Connect to OBS, Address, Port and Password; mounting pulls obs_status once and connects nothing", async () => {
+    obsReply = (cmd) => (cmd === "obs_status" ? obsStatus(OFF_SAVED) : null);
+    const view = mount();
+    await flush();
+    const obs = section(view);
+    expect(squash(obs.querySelector("p")?.textContent)).toBe(INTRO);
+    expect(Array.from(within(obs).getByTestId("obs-explainer").children).map((c) => squash(c.textContent))).toEqual(
+      EXPLAINER,
+    );
+    const toggle = within(obs).getByRole("switch", { name: "Connect to OBS" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(within(obs).getByRole("textbox", { name: "OBS address" })).toHaveValue("127.0.0.1");
+    expect(within(obs).getByRole("textbox", { name: "OBS port" })).toHaveValue("4455");
+    const password = within(obs).getByLabelText("OBS password");
+    expect(password).toHaveAttribute("type", "password");
+    expect(password).toHaveAttribute("autocomplete", "off");
+    expect(password).toHaveAttribute("spellcheck", "false");
+    expect(password).toHaveAttribute("placeholder", "Paste OBS's password");
+    expect(password).toHaveValue("");
+    expect(within(obs).getByText(ADDRESS_HELP)).toBeInTheDocument();
+    expect(within(obs).getByText("OBS's default is 4455.")).toBeInTheDocument();
+    // Off: no status line, nothing to try again.
+    expect(within(obs).queryByTestId("obs-status-line")).toBeNull();
+    expect(within(obs).queryByRole("button", { name: /Try again|Connect again/ })).toBeNull();
+    // One read, nothing that changes anything, no listener.
+    expect(obsCmds()).toEqual(["obs_status"]);
+    expect(eventHandlers.get("obs-status") ?? []).toHaveLength(0);
+    // The read says a password is saved.
+    expect(within(obs).getByText(PASSWORD_SAVED)).toBeInTheDocument();
+    expect(within(obs).getByRole("button", { name: "Forget password" })).toBeInTheDocument();
+    // The words e2e matches strictly elsewhere on the page aren't here.
+    expect(obs.textContent).not.toMatch(/Stream overlay|Show overlay window|capture it in OBS/);
+  });
+
+  it("with OBS control on, mounting pulls nothing: the boot listened and configured", async () => {
+    obsOn();
+    mount();
+    await flush();
+    expect(obsCmds().filter((c) => c !== "obs_inventory")).toEqual(["obs_configure"]);
+    expect(eventHandlers.get("obs-status") ?? []).toHaveLength(1);
+  });
+
+  it("an address edit while off is checked with enabled:false and stored once Rust takes it; a refusal stays marked under its field; Esc puts the stored one back", async () => {
+    obsReply = (cmd, args) => {
+      if (cmd !== "obs_configure") return null;
+      const { config } = args as { config: { host: string; port: number } };
+      if (config.host === "obs.local") throw OBS_HOST_ERRORS.notAnIp;
+      return obsStatus(OFF_SAVED, { host: config.host, port: config.port });
+    };
+    const view = mount();
+    await flush();
+    const obs = section(view);
+    const host = within(obs).getByRole("textbox", { name: "OBS address" });
+    // Typing sends nothing.
+    fireEvent.input(host, { target: { value: " 192.168.1.20 " } });
+    await flush();
+    expect(sent("obs_configure")).toEqual([]);
+    // Enter, then leaving the field before Rust answers: sent once.
+    fireEvent.keyDown(host, { key: "Enter" });
+    fireEvent.blur(host);
+    await flush();
+    expect(sent("obs_configure")).toEqual([{ config: { enabled: false, host: "192.168.1.20", port: 4455 } }]);
+    expect(storedObs()).toEqual({ enabled: false, host: "192.168.1.20", port: 4455 });
+    expect(host).toHaveValue("192.168.1.20");
+    expect(host).not.toHaveAttribute("aria-invalid");
+
+    // A name: Rust refuses it, and its words go under the field.
+    fireEvent.input(host, { target: { value: "obs.local" } });
+    fireEvent.blur(host);
+    await flush();
+    expect(sent("obs_configure").at(-1)).toEqual({ config: { enabled: false, host: "obs.local", port: 4455 } });
+    const reason = within(obs).getByText(OBS_HOST_ERRORS.notAnIp);
+    expect(host).toHaveAttribute("aria-invalid", "true");
+    expect(host).toHaveAttribute("aria-describedby", reason.id);
+    expect(host).toHaveValue("obs.local");
+    expect(storedObs().host).toBe("192.168.1.20");
+    // A space inside can't be an address: refused here, nothing sent.
+    const before = sent("obs_configure").length;
+    fireEvent.input(host, { target: { value: "1 27.0.0.1" } });
+    fireEvent.keyDown(host, { key: "Enter" });
+    await flush();
+    expect(sent("obs_configure")).toHaveLength(before);
+    expect(within(obs).getByText(OBS_HOST_ERRORS.notAnIp)).toBeInTheDocument();
+    // Esc: the stored one back, unmarked.
+    fireEvent.keyDown(host, { key: "Escape" });
+    await flush();
+    expect(host).toHaveValue("192.168.1.20");
+    expect(host).not.toHaveAttribute("aria-invalid");
+    expect(within(obs).queryByText(OBS_HOST_ERRORS.notAnIp)).toBeNull();
+
+    // A port that can't be one: Rust's words, here, and nothing sent.
+    const port = within(obs).getByRole("textbox", { name: "OBS port" });
+    fireEvent.input(port, { target: { value: "70000" } });
+    fireEvent.keyDown(port, { key: "Enter" });
+    await flush();
+    expect(sent("obs_configure")).toHaveLength(before);
+    const portReason = within(obs).getByText("Type a port from 1 to 65535.");
+    expect(port).toHaveAttribute("aria-invalid", "true");
+    expect(port).toHaveAttribute("aria-describedby", portReason.id);
+    expect(host).not.toHaveAttribute("aria-invalid");
+    // One that is goes, with the stored address.
+    fireEvent.input(port, { target: { value: "4456" } });
+    fireEvent.blur(port);
+    await flush();
+    expect(sent("obs_configure").at(-1)).toEqual({ config: { enabled: false, host: "192.168.1.20", port: 4456 } });
+    expect(storedObs()).toEqual({ enabled: false, host: "192.168.1.20", port: 4456 });
+    expect(port).toHaveValue("4456");
+    expect(port).not.toHaveAttribute("aria-invalid");
+    // Never a configure that turns it on.
+    for (const a of sent("obs_configure")) expect((a as { config: { enabled: boolean } }).config.enabled).toBe(false);
+    expect(eventHandlers.get("obs-status") ?? []).toHaveLength(0);
+  });
+
+  it("Save password and Forget password work while off; the field empties once each answers, a refusal shows under it, and the password is nowhere else", async () => {
+    const PW = "s3cr3t-Ω-pw";
+    const REFUSED = "nope-Ω-pw";
+    let has = false;
+    obsReply = (cmd, args) => {
+      const now = () => obsStatus(OFF_SAVED, { hasPassword: has });
+      if (cmd === "obs_status") return now();
+      if (cmd === "obs_set_password") {
+        const { password } = args as { password: string };
+        if (password === "") throw "Paste a password first.";
+        if (password === REFUSED) throw "Couldn't save the password: Windows couldn't encrypt it.";
+        has = true;
+        return now();
+      }
+      if (cmd === "obs_forget_password") {
+        has = false;
+        return now();
+      }
+      return null;
+    };
+    const warn = vi.spyOn(console, "warn");
+    try {
+      const view = mount();
+      await flush();
+      const obs = section(view);
+      expect(within(obs).getByText(PASSWORD_NONE)).toBeInTheDocument();
+      expect(within(obs).queryByRole("button", { name: "Forget password" })).toBeNull();
+      const field = within(obs).getByLabelText("OBS password");
+      // A space at an end: a hint, since OBS's own would have to match.
+      fireEvent.input(field, { target: { value: ` ${PW}` } });
+      expect(within(obs).getByText(SPACES)).toBeInTheDocument();
+      fireEvent.click(within(obs).getByRole("button", { name: "Save password" }));
+      await flush();
+      expect(sent("obs_set_password")).toEqual([{ password: ` ${PW}` }]);
+      expect(field).toHaveValue("");
+      expect(within(obs).queryByText(SPACES)).toBeNull();
+      expect(within(obs).getByText(PASSWORD_SAVED)).toBeInTheDocument();
+      expect(field).not.toHaveAttribute("aria-invalid");
+
+      // Refused: the field empties all the same, and Rust's words show.
+      fireEvent.input(field, { target: { value: REFUSED } });
+      fireEvent.keyDown(field, { key: "Enter" });
+      await flush();
+      expect(field).toHaveValue("");
+      const why = within(obs).getByText("Couldn't save the password: Windows couldn't encrypt it.");
+      expect(field).toHaveAttribute("aria-invalid", "true");
+      expect(field).toHaveAttribute("aria-describedby", why.id);
+      // Typing again clears the mark; an empty Save gets Rust's words.
+      fireEvent.input(field, { target: { value: "x" } });
+      expect(field).not.toHaveAttribute("aria-invalid");
+      fireEvent.input(field, { target: { value: "" } });
+      fireEvent.click(within(obs).getByRole("button", { name: "Save password" }));
+      await flush();
+      expect(within(obs).getByText("Paste a password first.")).toBeInTheDocument();
+
+      // Forget asks twice: one click sends nothing.
+      const forget = within(obs).getByRole("button", { name: "Forget password" });
+      fireEvent.click(forget);
+      await flush();
+      expect(sent("obs_forget_password")).toEqual([]);
+      expect(forget).toHaveTextContent("Forget?");
+      expect(forget).toHaveAccessibleName("Click again to forget the OBS password");
+      fireEvent.click(forget);
+      await flush();
+      expect(sent("obs_forget_password")).toHaveLength(1);
+      expect(within(obs).getByText(PASSWORD_NONE)).toBeInTheDocument();
+      expect(within(obs).queryByRole("button", { name: /Forget/ })).toBeNull();
+
+      // Nothing connected, and the password went only into its command.
+      expect(sent("obs_configure")).toEqual([]);
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const value = window.localStorage.getItem(window.localStorage.key(i)!) ?? "";
+        expect(value).not.toContain(PW);
+        expect(value).not.toContain(REFUSED);
+      }
+      expect(document.body.innerHTML).not.toContain(PW);
+      expect(document.body.innerHTML).not.toContain(REFUSED);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(PW);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(REFUSED);
+      expect(JSON.stringify(app.obsStatus())).not.toContain(PW);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("Connect to OBS saves it, listens, and sends obs_configure with 127.0.0.1:4455; Off sends enabled:false; the status shows only while on", async () => {
+    obsReply = (cmd, args) => {
+      if (cmd === "obs_status") return obsStatus("off, never configured: ObsStatus::off()");
+      if (cmd !== "obs_configure") return null;
+      const { config } = args as { config: { enabled: boolean } };
+      return config.enabled ? obsStatus(CONNECTING) : obsStatus(OFF_SAVED, { hasPassword: false });
+    };
+    const view = mount();
+    await flush();
+    const toggle = within(section(view)).getByRole("switch", { name: "Connect to OBS" });
+    fireEvent.click(toggle);
+    await flush();
+    expect(storedObs()).toEqual({ enabled: true, host: "127.0.0.1", port: 4455 });
+    expect(eventHandlers.get("obs-status") ?? []).toHaveLength(1);
+    expect(sent("obs_configure")).toEqual([{ config: { enabled: true, host: "127.0.0.1", port: 4455 } }]);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(line(view)).toBe("Connecting to 127.0.0.1:4455…");
+    // The status line's sigil is the link.
+    expect(view.getByTestId("obs-status-line").querySelectorAll("svg rect")).toHaveLength(2);
+
+    fireEvent.click(toggle);
+    await flush();
+    expect(sent("obs_configure").at(-1)).toEqual({ config: { enabled: false, host: "127.0.0.1", port: 4455 } });
+    expect(storedObs().enabled).toBe(false);
+    expect(view.queryByTestId("obs-status-line")).toBeNull();
+  });
+
+  it("the status line: each state's words, Try again or Connect again where they help, the skip, text-skip and held-back lines; never in a live region", async () => {
+    obsOn();
+    const view = mount();
+    await flush();
+    const status = (): HTMLElement => view.getByTestId("obs-status");
+    const buttons = (): string[] => within(status()).queryAllByRole("button").map((b) => squash(b.textContent));
+    const SOON = Date.now() + 4_500;
+    const cases: Array<[string, Status, string, string[]]> = [
+      [CONNECTED, {}, "Connected to OBS 30.2.2 (WebSocket 5.5.2)", []],
+      [
+        CONNECTED,
+        { stream: "live", record: "paused" },
+        "Connected to OBS 30.2.2 (WebSocket 5.5.2) · live · recording paused",
+        [],
+      ],
+      [CONNECTED, { obsVersion: null }, "Connected to OBS (WebSocket 5.5.2)", []],
+      [
+        "retrying, refused; a switch back ran out of time",
+        { retryAtMs: SOON, lastSkip: null },
+        "Can't reach OBS at 127.0.0.1:4455. Nothing is listening there. Is OBS open, with its WebSocket server on? Trying again in 5 s.",
+        ["Try again"],
+      ],
+      [
+        "retrying, obsExiting",
+        { retryAtMs: Date.now() - 1 },
+        "Can't reach OBS at 127.0.0.1:4455. OBS is closing. Trying again now.",
+        ["Try again"],
+      ],
+      [
+        "needsPassword",
+        {},
+        "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password. Or turn off Enable Authentication in OBS and press Try again.",
+        ["Try again"],
+      ],
+      [
+        "authFailed",
+        {},
+        "OBS rejected the password. Paste it again from OBS's Show Connect Info, then Save password.",
+        ["Try again"],
+      ],
+      [
+        "passwordUnreadable",
+        {},
+        "Re-enter your OBS password. Windows couldn't read the saved one, which can happen after a change to your Windows account.",
+        [],
+      ],
+      [
+        "tooOld",
+        {},
+        "Update OBS, then press Try again. Its WebSocket server is 5.3.3, and Divora needs 5.4.0 or later.",
+        ["Try again"],
+      ],
+      ["needsNewerDivora", {}, "This OBS needs a newer Divora. Check for updates in Settings → About.", []],
+      [
+        "kicked",
+        {},
+        "OBS disconnected Divora from its list of connections. Divora won't reconnect on its own.",
+        ["Connect again"],
+      ],
+      [
+        "unsupported, missingRequest",
+        {},
+        "This OBS's WebSocket server doesn't offer GetInputSettings, which Divora needs. Update OBS, then press Try again.",
+        ["Try again"],
+      ],
+      [
+        "unsupported, badVersion",
+        {},
+        "Divora can't read this OBS's WebSocket version. Update OBS, then press Try again.",
+        ["Try again"],
+      ],
+    ];
+    for (const [name, more, words, offered] of cases) {
+      await emitObs(obsStatus(name, more));
+      expect(line(view), name).toBe(words);
+      expect(buttons(), name).toEqual(offered);
+    }
+    // Every status Rust builds shows its own line.
+    for (const s of SAMPLES) {
+      if (s.status.state === "off") continue;
+      await emitObs(obsStatus(s.name));
+      expect(line(view), s.name).toBe(obsStatusLine(readObsStatus(s.status)!, Date.now()));
+    }
+    // The line is plain text: no live region holds it.
+    expect(view.getByTestId("obs-status-line").closest("[aria-live], [role='status'], [role='alert'], [role='log']")).toBeNull();
+
+    // Try again sends obs_reconnect.
+    await emitObs(obsStatus("retrying, noAnswer"));
+    fireEvent.click(within(status()).getByRole("button", { name: "Try again" }));
+    await flush();
+    expect(sent("obs_reconnect")).toHaveLength(1);
+
+    // A scene skip, a text skip, a switch back held.
+    await emitObs(obsStatus(SKIPS));
+    expect(squash(view.getByTestId("obs-skip-line").textContent)).toBe(
+      `${obsClockTime(1793217840000)}: Didn't switch OBS to BRB: OBS doesn't have that scene now.`,
+    );
+    expect(squash(view.getByTestId("obs-text-skip-line").textContent)).toBe(
+      `${obsClockTime(1793217845000)}: OBS refused a timer's text. Divora tries again in a moment.`,
+    );
+    expect(view.queryByTestId("obs-held-back")).toBeNull();
+    await emitObs(obsStatus("retrying, closed; a switch back held back"));
+    expect(squash(view.getByTestId("obs-held-back").textContent)).toBe(
+      "Waiting for OBS, to switch it back after a break (up to 2 minutes).",
+    );
+    expect(view.queryByTestId("obs-skip-line")).toBeNull();
+    for (const id of ["obs-skip-line", "obs-text-skip-line", "obs-held-back"]) {
+      const el = view.queryByTestId(id);
+      if (el) expect(el.closest("[aria-live]")).toBeNull();
+    }
+  });
+
+  it("Trying again in N s counts down while the section is on screen, to now", async () => {
+    obsOn();
+    const view = mount();
+    await flush();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], now: ENDS });
+    try {
+      for (const h of eventHandlers.get("obs-status") ?? []) {
+        h({ payload: obsStatus("retrying, noAnswer", { retryAtMs: ENDS + 3_000 }) });
+      }
+      await settle();
+      expect(line(view)).toBe("Can't reach OBS at 127.0.0.1:4455. It didn't answer in time. Trying again in 3 s.");
+      vi.advanceTimersByTime(1_000);
+      expect(line(view)).toMatch(/Trying again in 2 s\.$/);
+      vi.advanceTimersByTime(1_000);
+      expect(line(view)).toMatch(/Trying again in 1 s\.$/);
+      vi.advanceTimersByTime(1_000);
+      expect(line(view)).toMatch(/Trying again now\.$/);
+      // Nothing more to count: no timer left.
+      vi.advanceTimersByTime(10_000);
+      expect(line(view)).toMatch(/Trying again now\.$/);
+      view.unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the announcer says edges only: a connection, its loss once, a stop state's line, a new skip; never a countdown or a second retry", async () => {
+    obsOn();
+    const view = mount();
+    await flush();
+    const region = view.getByTestId("obs-announcer");
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(region).toHaveTextContent("");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"] });
+    try {
+      const heard: string[] = [];
+      const now = (): string => region.textContent ?? "";
+      const step = async (s: Status) => {
+        for (const h of eventHandlers.get("obs-status") ?? []) h({ payload: s });
+        await settle();
+        heard.push(now());
+        // The same node throughout: a region inserted with its text is missed.
+        expect(view.getByTestId("obs-announcer")).toBe(region);
+      };
+      const frame = (): string => {
+        vi.advanceTimersToNextFrame();
+        heard.push(now());
+        return now();
+      };
+      // The boot's answer (connecting) was the first status heard: nothing.
+      expect(frame()).toBe("");
+      await step(obsStatus(CONNECTED));
+      expect(frame()).toBe("Connected to OBS.");
+      const RETRY = "retrying, refused; a switch back ran out of time";
+      await step(obsStatus(RETRY, { lastSkip: null, retryAtMs: Date.now() + 4_000 }));
+      expect(frame()).toBe("Lost the connection to OBS. Divora keeps trying.");
+      // Another retry, differing only in its time and seq: the words stay.
+      await step(obsStatus(RETRY, { lastSkip: null, retryAtMs: Date.now() + 8_000 }));
+      expect(now()).toBe("Lost the connection to OBS. Divora keeps trying.");
+      expect(frame()).toBe("Lost the connection to OBS. Divora keeps trying.");
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS);
+      expect(now()).toBe("");
+      // An attempt, and the next retry after it: nothing.
+      await step(obsStatus(CONNECTING));
+      expect(frame()).toBe("");
+      await step(obsStatus("retrying, noAnswer"));
+      expect(frame()).toBe("");
+      // A stop state: its line.
+      await step(obsStatus("authFailed"));
+      expect(frame()).toBe(
+        "OBS rejected the password. Paste it again from OBS's Show Connect Info, then Save password.",
+      );
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS);
+      // Connected again with a new scene skip: both, in that order.
+      await step(obsStatus(SKIPS));
+      expect(frame()).toBe(
+        `Connected to OBS. ${obsClockTime(1793217840000)}: Didn't switch OBS to BRB: OBS doesn't have that scene now.`,
+      );
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS);
+      // The same skip in a later status isn't news.
+      await step(obsStatus(SKIPS, { stream: "off" }));
+      expect(frame()).toBe("");
+      // A switch back held, from none: the held-back line.
+      await step(obsStatus(CONNECTED, { heldBack: 1 }));
+      expect(frame()).toBe("Waiting for OBS, to switch it back after a break (up to 2 minutes).");
+      for (const text of heard) expect(text).not.toMatch(/Trying again|\d+ s\b/);
+      vi.advanceTimersByTime(HOURGLASS_SAID_MS);
+      // An edge, then the section goes before its frame: nothing is left.
+      await step(obsStatus(CONNECTING));
+      await step(obsStatus(CONNECTED));
+      view.unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("warnings, only while on: a network address, and OBS asking for no password", async () => {
+    obsOn();
+    const view = mount();
+    await flush();
+    const warnings = (): string[] => view.queryAllByTestId("obs-warning").map((w) => squash(w.textContent));
+    expect(warnings()).toEqual([]);
+    await emitObs(obsStatus("retrying, unreachable, OBS on another PC"));
+    expect(warnings()).toEqual([NETWORK("192.168.1.20")]);
+    await emitObs(obsStatus(CONNECTED, { authRequired: false }));
+    expect(warnings()).toEqual([NO_AUTH]);
+    await emitObs(obsStatus(CONNECTED, { host: "192.168.1.20", loopback: false, authRequired: false }));
+    expect(warnings()).toEqual([NETWORK("192.168.1.20"), NO_AUTH]);
+    await emitObs(obsStatus(CONNECTED));
+    expect(warnings()).toEqual([]);
+  });
+
+  it("a saved address Rust refuses: the status line says so and Address shows Rust's words, until an address it takes", async () => {
+    window.localStorage.setItem(OBS, JSON.stringify({ enabled: true, host: "obs.local", port: 4455 }));
+    obsReply = (cmd, args) => {
+      if (cmd !== "obs_configure") return null;
+      const { config } = args as { config: { host: string } };
+      if (config.host === "obs.local") throw OBS_HOST_ERRORS.notAnIp;
+      return obsStatus(CONNECTING);
+    };
+    const view = mount();
+    await flush();
+    expect(line(view)).toBe(SAVED_ADDRESS);
+    const host = view.getByRole("textbox", { name: "OBS address" });
+    expect(host).toHaveValue("obs.local");
+    expect(host).toHaveAttribute("aria-invalid", "true");
+    expect(host).toHaveAttribute("aria-describedby", view.getByText(OBS_HOST_ERRORS.notAnIp).id);
+    fireEvent.input(host, { target: { value: "127.0.0.1" } });
+    fireEvent.keyDown(host, { key: "Enter" });
+    await flush();
+    expect(sent("obs_configure").at(-1)).toEqual({ config: { enabled: true, host: "127.0.0.1", port: 4455 } });
+    expect(host).not.toHaveAttribute("aria-invalid");
+    expect(view.queryByText(OBS_HOST_ERRORS.notAnIp)).toBeNull();
+    expect(line(view)).toBe("Connecting to 127.0.0.1:4455…");
+  });
+
+  // ---- a timer's card ----
+
+  it("Show in OBS and Follow OBS are hidden while OBS control is off, unless set: then a line says when they work, and they can still be cleared", async () => {
+    storeTimers(
+      entry("timer-1", { obsText: { uuid: TEXT.uuid, name: "Timer text" } }),
+      entry("timer-2", { ...UPTIME, followObs: "record" }),
+      entry("timer-3", { name: "Plain" }),
+    );
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"), timerState("timer-2", UPTIME), timerState("timer-3", { name: "Plain" }));
+    const shownIn = picker(card("timer-1"), "BRB OBS text source");
+    expect(showing(shownIn)).toEqual(["Timer text", null]);
+    expect(within(card("timer-1")).getByText("Shows in OBS's “Timer text” when Settings → OBS is on.")).toBeInTheDocument();
+    expect(within(card("timer-1")).queryByText(SHOW_HELP)).toBeNull();
+    // A countdown never follows OBS.
+    expect(within(card("timer-1")).queryByRole("radiogroup")).toBeNull();
+    const follow = within(card("timer-2")).getByRole("radiogroup", { name: "Follow OBS for Uptime" });
+    expect(within(follow).getByRole("radio", { name: "Recording" })).toHaveAttribute("aria-checked", "true");
+    expect(within(card("timer-2")).getByText("Follows OBS's recording when Settings → OBS is on.")).toBeInTheDocument();
+    expect(within(card("timer-2")).queryByText("Show in OBS")).toBeNull();
+    expect(within(card("timer-3")).queryByText("Show in OBS")).toBeNull();
+    expect(within(card("timer-3")).queryByText("Follow OBS")).toBeNull();
+    // Off, nothing is asked of OBS on open; None clears it.
+    fireEvent.click(shownIn, { detail: 1 });
+    expect(view.getAllByRole("option").map((o) => squash(o.textContent))).toEqual(["None", "Timer text"]);
+    fireEvent.click(view.getByRole("option", { name: "None" }), { detail: 1 });
+    await flush();
+    expect(saved()[0]).not.toHaveProperty("obsText");
+    expect(lastSync()[0]).not.toHaveProperty("obsText");
+    expect(sent("obs_inventory")).toEqual([]);
+    expect(within(card("timer-1")).queryByText("Show in OBS")).toBeNull();
+    fireEvent.click(within(follow).getByRole("radio", { name: "Off" }));
+    await flush();
+    expect(saved()[1]).not.toHaveProperty("followObs");
+    expect(within(card("timer-2")).queryByRole("radiogroup")).toBeNull();
+  });
+
+  it("Show in OBS while on: not connected, then loading, then OBS's text sources; one that reads a file or that another timer shows can't be picked; a pick stores its uuid and name, cut, and syncs the uuid", async () => {
+    let answer = deferred<unknown>();
+    const LONG = { uuid: uuid(14), name: "L".repeat(300), kind: "ft2", readsFromFile: false };
+    obsOn(() => answer.promise);
+    storeTimers(entry("timer-1"), entry("timer-2", { name: "Intro", obsText: { uuid: INTRO_TEXT.uuid, name: "Intro text" } }));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"), timerState("timer-2", { name: "Intro" }));
+    const mine = () => picker(card("timer-1"), "BRB OBS text source");
+    const theirs = () => picker(card("timer-2"), "Intro OBS text source");
+    // Connecting: what is stored, and that it isn't connected.
+    expect(showing(mine())).toEqual(["None", null]);
+    expect(showing(theirs())).toEqual(["Intro text (not connected)", null]);
+    expect(within(card("timer-1")).getByText(SHOW_HELP)).toBeInTheDocument();
+    // Connected: the store asks for the list (the section is on screen).
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
+    expect(sent("obs_inventory")).toHaveLength(1);
+    expect(showing(mine())).toEqual(["None", "Loading OBS sources…"]);
+    expect(showing(theirs())).toEqual(["Intro text", "Loading OBS sources…"]);
+    answer.resolve(inventory({ textSources: [TEXT, INTRO_TEXT, FILE_TEXT, LONG] }));
+    await flush();
+    expect(showing(mine())).toEqual(["None", null]);
+    expect(showing(theirs())).toEqual(["Intro text", "Text (FreeType 2)"]);
+    // Opening reads the list again.
+    answer = deferred<unknown>();
+    fireEvent.click(mine(), { detail: 1 });
+    expect(sent("obs_inventory")).toHaveLength(2);
+    answer.resolve(inventory({ textSources: [TEXT, INTRO_TEXT, FILE_TEXT, LONG] }));
+    await flush();
+    const options = () => view.getAllByRole("option");
+    expect(options().map((o) => [words(o), o.getAttribute("aria-disabled")])).toEqual([
+      ["None", null],
+      ["Timer text Text (GDI+)", null],
+      ["Intro text shown by Intro", "true"],
+      [`From file ${READS_A_FILE}`, "true"],
+      [`${"L".repeat(300)} Text (FreeType 2)`, null],
+    ]);
+    // The file-reading source: refused, the list kept open; so is Intro's.
+    invokeCalls.length = 0;
+    fireEvent.click(view.getByRole("option", { name: /From file/ }), { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: /Intro text/ }), { detail: 1 });
+    await flush();
+    expect(view.getByRole("listbox")).toBeInTheDocument();
+    expect(saved()[0]).not.toHaveProperty("obsText");
+    expect(sent("sync_timers")).toEqual([]);
+    // By the keys, it's reachable and refused the same way.
+    const trigger = mine();
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Home" });
+    for (let i = 0; i < 3; i++) fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(document.getElementById(trigger.getAttribute("aria-activedescendant") ?? "")?.textContent).toContain(
+      "From file",
+    );
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    await flush();
+    expect(sent("sync_timers")).toEqual([]);
+    // Timer text: stored with its name, synced as its uuid alone.
+    fireEvent.click(view.getByRole("option", { name: /Timer text/ }), { detail: 1 });
+    await flush();
+    expect(saved()[0]!.obsText).toEqual({ uuid: TEXT.uuid, name: "Timer text" });
+    expect(lastSync()[0]!.obsText).toEqual({ uuid: TEXT.uuid });
+    expect(showing(mine())).toEqual(["Timer text", "Text (GDI+)"]);
+    expect(mine()).toHaveAccessibleName("BRB OBS text source: Timer text");
+    // A name past 256 characters is stored cut, so it still reads.
+    fireEvent.click(mine(), { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: /^L{300}/ }), { detail: 1 });
+    await flush();
+    expect(saved()[0]!.obsText).toEqual({ uuid: LONG.uuid, name: "L".repeat(256) });
+    expect(lastSync()[0]!.obsText).toEqual({ uuid: LONG.uuid });
+    // None clears it.
+    fireEvent.click(mine(), { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: "None" }), { detail: 1 });
+    await flush();
+    expect(saved()[0]).not.toHaveProperty("obsText");
+  });
+
+  it("Show in OBS when OBS can't find the source, when the list can't be read, when OBS has no text sources, and when the list is cut", async () => {
+    let answer: () => unknown = () => inventory();
+    obsOn(() => answer());
+    storeTimers(entry("timer-1", { obsText: { uuid: TEXT.uuid, name: "Timer text" } }));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    const mine = () => picker(card("timer-1"), "BRB OBS text source");
+    const at = card("timer-1");
+    // OBS said it can't find it on this connection.
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1, missing: [TEXT.uuid] }));
+    expect(showing(mine())).toEqual(["Timer text (not in OBS now)", null]);
+    expect(within(at).getByText("OBS can't find this source now. Pick it again, or pick another.")).toBeInTheDocument();
+    // A complete list without it: the same.
+    answer = () => inventory({ textSources: [INTRO_TEXT] });
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 2 }));
+    expect(showing(mine())).toEqual(["Timer text (not in OBS now)", null]);
+    expect(within(at).getByText("OBS can't find this source now. Pick it again, or pick another.")).toBeInTheDocument();
+    // Listed again: its name, and the line goes.
+    answer = () => inventory();
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 3 }));
+    expect(showing(mine())).toEqual(["Timer text", "Text (GDI+)"]);
+    expect(within(at).queryByText(/OBS can't find this source/)).toBeNull();
+    // The list can't be read: what is stored, and Rust's words under it.
+    answer = () => {
+      throw "OBS didn't answer in time.";
+    };
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 4 }));
+    expect(showing(mine())).toEqual(["Timer text", null]);
+    expect(within(at).getByText("Couldn't read OBS's sources: OBS didn't answer in time.")).toBeInTheDocument();
+    // No text sources at all.
+    answer = () => inventory({ textSources: [] });
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 5 }));
+    expect(
+      within(at).getByText("No text sources in OBS. Add a Text (GDI+) source there, then open this again."),
+    ).toBeInTheDocument();
+    // A list cut at 100: said under it, and a source past the cut keeps its name.
+    const hundred = Array.from({ length: 100 }, (_, i) => ({
+      uuid: uuid(1000 + i),
+      name: `Text ${i}`,
+      kind: "gdiplus",
+      readsFromFile: false,
+    }));
+    answer = () => inventory({ textSources: hundred, truncated: true });
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 6 }));
+    expect(within(at).getByText("Divora lists OBS's first 100 text sources.")).toBeInTheDocument();
+    expect(showing(mine())).toEqual(["Timer text", null]);
+  });
+
+  it("Follow OBS on a count-up is a radio group named for its timer: a pick saves and syncs, the arrows move it, Off clears it", async () => {
+    obsOn();
+    storeTimers(entry("timer-1"), entry("timer-2", UPTIME));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"), timerState("timer-2", UPTIME));
+    expect(within(card("timer-1")).queryByRole("radiogroup")).toBeNull();
+    const group = within(card("timer-2")).getByRole("radiogroup", { name: "Follow OBS for Uptime" });
+    const radios = within(group).getAllByRole("radio");
+    expect(radios.map((r) => [squash(r.textContent), r.getAttribute("aria-checked")])).toEqual([
+      ["Off", "true"],
+      ["Streaming", "false"],
+      ["Recording", "false"],
+    ]);
+    expect(within(card("timer-2")).getByText(FOLLOW_HELP)).toBeInTheDocument();
+    fireEvent.click(within(group).getByRole("radio", { name: "Streaming" }));
+    await flush();
+    expect(saved()[1]!.followObs).toBe("stream");
+    expect(lastSync()[1]!.followObs).toBe("stream");
+    const streaming = within(group).getByRole("radio", { name: "Streaming" });
+    streaming.focus();
+    fireEvent.keyDown(streaming, { key: "ArrowRight" });
+    await flush();
+    expect(saved()[1]!.followObs).toBe("record");
+    expect(within(group).getByRole("radio", { name: "Recording" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(group).getByRole("radio", { name: "Off" }));
+    await flush();
+    expect(saved()[1]).not.toHaveProperty("followObs");
+    expect(lastSync()[1]).not.toHaveProperty("followObs");
+    // A countdown never sends one.
+    expect(lastSync()[0]).not.toHaveProperty("followObs");
+    expect(view.getAllByRole("radiogroup", { name: /^Follow OBS for/ })).toHaveLength(1);
+  });
+
+  it("a scene skip shows on its timer's card while it runs or is paused, and only on its own", async () => {
+    obsOn();
+    storeTimers(entry("timer-1"), entry("timer-2", { name: "Intro" }));
+    const view = mount();
+    await flush();
+    await emitObs(obsStatus(SKIPS));
+    const SKIP = `${obsClockTime(1793217840000)}: Didn't switch OBS to BRB: OBS doesn't have that scene now.`;
+    await emitTimers(1, timerState("timer-1"), timerState("timer-2", { name: "Intro", ...RUNNING }));
+    expect(within(card("timer-1")).queryByTestId("timer-obs-skip")).toBeNull();
+    expect(within(card("timer-2")).queryByTestId("timer-obs-skip")).toBeNull();
+    await emitTimers(2, timerState("timer-1", RUNNING), timerState("timer-2", { name: "Intro", ...RUNNING }));
+    expect(squash(within(card("timer-1")).getByTestId("timer-obs-skip").textContent)).toBe(SKIP);
+    expect(within(card("timer-2")).queryByTestId("timer-obs-skip")).toBeNull();
+    await emitTimers(3, timerState("timer-1", { phase: "paused", ms: 200_000, text: "03:20" }), timerState("timer-2", { name: "Intro" }));
+    expect(within(card("timer-1")).getByTestId("timer-obs-skip")).toBeInTheDocument();
+    // The next switch that works clears it.
+    await emitObs(obsStatus(CONNECTED));
+    expect(within(card("timer-1")).queryByTestId("timer-obs-skip")).toBeNull();
+    expect(view.queryByTestId("obs-skip-line")).toBeNull();
+  });
+
+  // ---- the action editor ----
+
+  it("the OBS choices in Add action: off, then not connected, each led by its words; Switch OBS back needs only Settings → OBS on", async () => {
+    storeTimers(entry("timer-1"));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    const offered = (name: string): Array<[string, string | null]> => {
+      const add = view.getByRole("button", { name });
+      fireEvent.click(add, { detail: 1 });
+      const out = within(view.getByRole("listbox"))
+        .getAllByRole("option")
+        .map((o): [string, string | null] => [squash(o.textContent), o.getAttribute("aria-disabled")])
+        .filter(([t]) => t.includes("OBS"));
+      fireEvent.keyDown(add, { key: "Escape" });
+      return out;
+    };
+    expect(offered("Add action at the start of BRB")).toEqual([["Switch OBS scene — turn on Settings → OBS first", "true"]]);
+    expect(offered("Add action at zero of BRB")).toEqual([
+      ["Switch OBS scene — turn on Settings → OBS first", "true"],
+      ["Switch OBS back — turn on Settings → OBS first", "true"],
+    ]);
+    // On, still connecting: a scene needs OBS now; a switch back can wait.
+    obsReply = (cmd) => (cmd === "obs_configure" ? obsStatus(CONNECTING) : null);
+    await app.setObsEnabled(true);
+    await flush();
+    expect(offered("Add action at the start of BRB")).toEqual([["Switch OBS scene — Divora isn't connected to OBS", "true"]]);
+    expect(offered("Add action at zero of BRB")).toEqual([
+      ["Switch OBS scene — Divora isn't connected to OBS", "true"],
+      ["Switch OBS back", null],
+    ]);
+    fireEvent.click(view.getByRole("button", { name: "Add action at zero of BRB" }), { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: "Switch OBS back" }), { detail: 1 });
+    await flush();
+    expect(saved()[0]!.onFire).toEqual([BACK]);
+    expect(lastSync()[0]!.onFire).toEqual([BACK]);
+    const back = rowsOf("onFire")[0]!;
+    expect(controls(back)).toEqual(["Remove Switch OBS back from zero of BRB"]);
+    expect(words(back)).toBe(`Switch OBS back Remove ${BACK_NOTE}`);
+    // Its sigil is the link.
+    expect(back.querySelectorAll("svg rect")).toHaveLength(2);
+    // Nothing at the start switches OBS: nothing to switch back to.
+    expect(within(card("timer-1")).getByText(BACK_NO_SCENE)).toBeInTheDocument();
+  });
+
+  it("Switch OBS scene waits for OBS's scenes and adds the first that isn't live; its row names its scene from OBS's list and picks another; the pairing warning goes with a switch back at zero", async () => {
+    const answer = deferred<unknown>();
+    obsOn(() => answer.promise);
+    storeTimers(entry("timer-1", { onStart: [MUTE] }));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    // Connected, with no list yet: the store's read is on its way.
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
+    expect(app.obsInventory()).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Add action at the start of BRB" }), { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: "Switch OBS scene" }), { detail: 1 });
+    await flush();
+    // Nothing is added until OBS answers.
+    expect(saved()[0]!.onStart).toEqual([MUTE]);
+    answer.resolve(inventory());
+    await flush();
+    const SCENE = { kind: "obs", op: "scene", sceneUuid: BRB_SCENE.uuid, sceneName: "BRB" };
+    expect(saved()[0]!.onStart).toEqual([MUTE, SCENE]);
+    expect(lastSync()[0]!.onStart).toEqual([MUTE, SCENE]);
+    expect(sent("obs_inventory")).toHaveLength(1);
+    const row = rowsOf("onStart")[1]!;
+    expect(controls(row)).toEqual(["BRB OBS scene at the start: BRB", "Remove Switch OBS to BRB from the start of BRB"]);
+    expect(words(row)).toContain("Switch OBS to");
+    expect(within(row).getByText(SCENE_NOTE)).toBeInTheDocument();
+    expect(within(row).queryByText(ACTION_OFF)).toBeNull();
+    expect(row.querySelectorAll("svg rect").length).toBeGreaterThanOrEqual(2);
+    expect(within(card("timer-1")).getByText(SCENE_NO_BACK)).toBeInTheDocument();
+    // Another scene, from its picker: kept in place, the row kept mounted.
+    const scene = picker(row, "BRB OBS scene at the start");
+    fireEvent.click(scene, { detail: 1 });
+    await flush();
+    expect(within(view.getByRole("listbox")).getAllByRole("option").map((o) => squash(o.textContent))).toEqual([
+      "Game",
+      "BRB",
+      "Just Chatting",
+    ]);
+    fireEvent.click(view.getByRole("option", { name: "Just Chatting" }), { detail: 1 });
+    await flush();
+    expect(saved()[0]!.onStart).toEqual([MUTE, { ...SCENE, sceneUuid: CHAT.uuid, sceneName: "Just Chatting" }]);
+    expect(rowsOf("onStart")[1]).toBe(row);
+    expect(picker(row, "BRB OBS scene at the start")).toHaveAccessibleName("BRB OBS scene at the start: Just Chatting");
+    // A switch back at zero: no warning.
+    await app.addTimerAction("timer-1", "onFire", BACK);
+    await flush();
+    expect(within(card("timer-1")).queryByText(SCENE_NO_BACK)).toBeNull();
+    expect(within(card("timer-1")).queryByText(BACK_NO_SCENE)).toBeNull();
+    // Not connected: the row says so, by the table.
+    await emitObs(obsStatus("retrying, noAnswer"));
+    expect(showing(picker(row, "BRB OBS scene at the start"))).toEqual(["Just Chatting (not connected)", null]);
+    // …and offers only what is stored, never the list from before.
+    const invokes = sent("obs_inventory").length;
+    fireEvent.click(picker(row, "BRB OBS scene at the start"), { detail: 1 });
+    expect(within(view.getByRole("listbox")).getAllByRole("option").map((o) => words(o))).toEqual([
+      "Just Chatting (not connected)",
+    ]);
+    // Not connected, opening asks OBS for nothing.
+    expect(sent("obs_inventory")).toHaveLength(invokes);
+    fireEvent.keyDown(picker(row, "BRB OBS scene at the start"), { key: "Escape" });
+    // Off: both rows say they do nothing until it's on.
+    await app.setObsEnabled(false);
+    await flush();
+    expect(within(rowsOf("onStart")[1]!).getByText(ACTION_OFF)).toBeInTheDocument();
+    expect(within(rowsOf("onFire")[0]!).getByText(ACTION_OFF)).toBeInTheDocument();
+  });
+
+  it("Switch OBS scene when OBS's scenes can't be read: nothing is added, and the note says why", async () => {
+    obsOn(() => {
+      throw "OBS isn't connected.";
+    });
+    storeTimers(entry("timer-1"));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
+    invokeCalls.length = 0;
+    fireEvent.click(view.getByRole("button", { name: "Add action at zero of BRB" }), { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: "Switch OBS scene" }), { detail: 1 });
+    await flush();
+    expect(sent("obs_inventory")).toHaveLength(1);
+    expect(saved()[0]).not.toHaveProperty("onFire");
+    expect(sent("sync_timers")).toEqual([]);
+    expect(within(list("onFire")).getByTestId("add-action-note")).toHaveTextContent(
+      "Couldn't read OBS's scenes: OBS isn't connected.",
+    );
+    // Opening the menu again clears it.
+    fireEvent.click(view.getByRole("button", { name: "Add action at zero of BRB" }), { detail: 1 });
+    expect(within(list("onFire")).queryByTestId("add-action-note")).toBeNull();
+  });
+
+  it("a Switch OBS back stored in At start is a row that doesn't run, with its reason and Remove; at zero it runs", async () => {
+    storeTimers(entry("timer-1", { onStart: [BACK, MUTE], onFire: [UNMUTE, BACK] }));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    const start = rowsOf("onStart");
+    expect(controls(start[0]!)).toEqual(["Remove an action that doesn't run from the start of BRB"]);
+    expect(words(start[0]!)).toContain("Switch OBS back");
+    expect(within(start[0]!).getByText(START_SCENE_BACK)).toBeInTheDocument();
+    const zero = rowsOf("onFire");
+    expect(controls(zero[1]!)).toEqual(["Remove Switch OBS back from zero of BRB"]);
+    // Settings → OBS off: the row says it does nothing until it's on.
+    expect(within(zero[1]!).getByText(ACTION_OFF)).toBeInTheDocument();
+    expect(within(zero[1]!).getByText(BACK_NOTE)).toBeInTheDocument();
+    // Removing the stray one keeps the rest in place.
+    fireEvent.click(within(start[0]!).getByRole("button", { name: "Remove an action that doesn't run from the start of BRB" }));
+    await flush();
+    expect(saved()[0]!.onStart).toEqual([MUTE]);
+    expect(view.queryByText(START_SCENE_BACK)).toBeNull();
+  });
+
+  it("the restoring copy names Switch OBS back: Reset's row, a run-out's line and At zero's help", async () => {
+    const SCENE = { kind: "obs", op: "scene", sceneUuid: BRB_SCENE.uuid, sceneName: "BRB" };
+    storeTimers(
+      entry("timer-1", { onStart: [MUTE, SCENE], onFire: [UNMUTE, BACK] }),
+      entry("timer-2", { name: "Intro", onStart: [SCENE], onFire: [UNMUTE, { kind: "revertPreset" }, BACK] }),
+    );
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1", { phase: "expired", ms: 0, text: "00:00", fires: 1 }), timerState("timer-2", { name: "Intro" }));
+    const HEAD = "It reached 00:00 while your PC was asleep or Divora was closed, so it didn't finish.";
+    expect(
+      within(card("timer-1")).getByText(
+        `${HEAD} When it runs out like this, only Unmute my voice and Switch OBS back from its At zero list run.`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(card("timer-1")).getByText(
+        "Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: Unmute my voice if its start muted you, and Switch OBS back if its start switched OBS.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(card("timer-2")).getByText(
+        "Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: Unmute my voice if its start muted you, and Back to the preset before, and Switch OBS back if its start switched OBS.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(list("onFire")).getByText(/only Unmute my voice, Back to the preset before and Switch OBS back run\./)).toBeInTheDocument();
+    expect(view.getAllByText(/OBS isn't connected \(a Switch OBS back excepted: it waits up to 2 minutes for OBS\)/)).toHaveLength(2);
+  });
+
+  // ---- Hourglass ----
+
+  it("the Break row, only while OBS control is on: its scene is stored in divora.obs, and Add break then makes the four actions in one sync", async () => {
+    obsOn();
+    const view = mount();
+    await flush();
+    const row = view.getByTestId("obs-break-row");
+    expect(words(row)).toContain("Switch OBS to");
+    expect(words(row)).toContain("for the break");
+    expect(within(row).getByText(BREAK_HELP)).toBeInTheDocument();
+    const scene = picker(row, "OBS scene for breaks");
+    expect(showing(scene)).toEqual(["Don't switch", null]);
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
+    fireEvent.click(scene, { detail: 1 });
+    await flush();
+    expect(within(view.getByRole("listbox")).getAllByRole("option").map((o) => squash(o.textContent))).toEqual([
+      "Don't switch",
+      "Game",
+      "BRB",
+      "Just Chatting",
+    ]);
+    fireEvent.click(view.getByRole("option", { name: "BRB" }), { detail: 1 });
+    await flush();
+    expect(storedObs().breakScene).toEqual(BRB_SCENE);
+    expect(scene).toHaveAccessibleName("OBS scene for breaks: BRB");
+    invokeCalls.length = 0;
+    fireEvent.click(view.getByRole("button", { name: "Add break (BRB)" }));
+    await flush();
+    const SCENE = { kind: "obs", op: "scene", sceneUuid: BRB_SCENE.uuid, sceneName: "BRB" };
+    expect(sent("sync_timers")).toEqual([
+      {
+        timers: [
+          {
+            id: "timer-1",
+            name: "BRB",
+            kind: "countdown",
+            durationMs: 300_000,
+            onStart: [MUTE, SCENE],
+            onFire: [UNMUTE, BACK],
+          },
+        ],
+      },
+    ]);
+    // Don't switch clears it.
+    fireEvent.click(scene, { detail: 1 });
+    fireEvent.click(view.getByRole("option", { name: "Don't switch" }), { detail: 1 });
+    await flush();
+    expect(storedObs()).not.toHaveProperty("breakScene");
+    // Off: no row.
+    await app.setObsEnabled(false);
+    await flush();
+    expect(view.queryByTestId("obs-break-row")).toBeNull();
+  });
+
+  it("the timer files block says what Show in OBS does instead", async () => {
+    const view = mount();
+    await flush();
+    expect(squash(view.getByTestId("hourglass-obs-direct").textContent)).toBe(
+      "With Settings → OBS on, a timer can also show in an OBS text source directly: pick it under Show in OBS on its card. Divora then sends each new time to OBS as it changes, instead of OBS checking the file once a second. A source set to Read from file can't be picked until you untick that in OBS.",
+    );
+  });
+
+  it("About's No telemetry pillar says what stays true with OBS on another PC", async () => {
+    const view = mount();
+    await flush();
+    expect(view.getByText("Nothing is collected or sent home. Audio stays on device.")).toBeInTheDocument();
+    expect(view.queryByText(/Nothing leaves your machine/)).toBeNull();
   });
 });

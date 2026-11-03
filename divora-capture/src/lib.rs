@@ -13,6 +13,8 @@ pub mod annexb;
 pub mod clock_fit;
 pub mod desktop;
 pub mod desktop_thread;
+/// v1.61.0: DPAPI for the current user (the OBS password).
+pub mod dpapi;
 pub mod keyframes;
 #[doc(hidden)]
 pub mod mp4_box;

@@ -83,6 +83,20 @@ describe("Sigil", () => {
     }
   });
 
+  it("includes Talk to OBS's sigil, and it draws (v1.61.0)", () => {
+    expect(SIGIL_NAMES).toContain("link");
+    const { container } = render(() => <Sigil name="link" size={16} />);
+    const svg = container.querySelector("svg")!;
+    expect(svg.getAttribute("width")).toBe("16");
+    expect(svg.getAttribute("viewBox")).toBe("0 0 24 24");
+    // Two chain links, stroked 1.5 in the text's colour, as the hourglass is.
+    expect(svg.querySelectorAll("rect")).toHaveLength(2);
+    const g = svg.querySelector("svg > g")!;
+    expect(g.getAttribute("fill")).toBe("none");
+    expect(g.getAttribute("stroke")).toBe("currentColor");
+    expect(g.getAttribute("stroke-width")).toBe("1.5");
+  });
+
   it("includes every nav name in the catalog", () => {
     for (const name of ["mixer", "soundboard", "presets", "settings"] as const) {
       expect(SIGIL_NAMES).toContain(name);

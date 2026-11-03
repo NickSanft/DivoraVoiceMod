@@ -5,6 +5,7 @@ import { FALLBACK_PRESETS } from "../data/presets";
 import type { StoredTimer, StoredTimers, TimerDefWire } from "../data/timers";
 import type { TimerSnapshot, TimerState } from "../overlay/timerState";
 import obsFixture from "../data/obs.fixture.json";
+import type { ObsStatus } from "../data/obs";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -7128,11 +7129,14 @@ describe("app store — one chain and one soundboard command at a time (v1.60.0)
   });
 });
 
-// v1.61.0: Talk to OBS. Only the parts that hold already: a profile without
-// `divora.obs`, or with it off, sends no OBS command and listens to no
-// `obs-status` (v1.60.0's boot, whatever it holds), and the mirror keeps
-// the larger `seq`.
+// v1.61.0: Talk to OBS. A profile without `divora.obs`, or with it off,
+// sends no OBS command and listens to no `obs-status` (v1.60.0's boot,
+// whatever it holds); with it on, the boot listens, then configures. Every
+// command that changes something goes through the OBS queue, every timer
+// edit through the timers', the mirror keeps the larger `seq`, and the
+// password goes nowhere but its one command.
 describe("app store — Talk to OBS (v1.61.0)", () => {
+  type Handler = (e: { payload: unknown }) => void;
   const settle = async () => {
     for (let i = 0; i < 10; i++) await Promise.resolve();
     await new Promise<void>((r) => setTimeout(r, 0));
@@ -7140,17 +7144,32 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
   /** Every command invoked and every event listened to, in order. */
   let log: string[] = [];
   const obsLog = () => log.filter((c) => c.startsWith("obs_") || c === "listen obs-status");
+  const handlers = new Map<string, Handler[]>();
+  /** Tauri's listen: with `holdObsListen`, `obs-status`'s registers only
+   *  when the test lets it; every other one at once. */
+  let holdObsListen = false;
+  const pendingListens: Array<() => void> = [];
 
   beforeEach(() => {
     log = [];
+    handlers.clear();
+    holdObsListen = false;
+    pendingListens.length = 0;
     invokeMock.mockReset();
     invokeMock.mockImplementation(async (cmd: string) => {
       log.push(cmd);
       return null;
     });
-    vi.mocked(listen).mockImplementation((async (event: string) => {
+    vi.mocked(listen).mockImplementation(((event: string, handler: Handler) => {
       log.push(`listen ${event}`);
-      return () => {};
+      const register = () => {
+        handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        return () => handlers.set(event, (handlers.get(event) ?? []).filter((h) => h !== handler));
+      };
+      if (event === "obs-status" && holdObsListen) {
+        return new Promise((resolve) => pendingListens.push(() => resolve(register())));
+      }
+      return Promise.resolve(register());
     }) as unknown as typeof listen);
     window.localStorage.clear();
   });
@@ -7211,5 +7230,656 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
     expect(result.obsWatchers()).toBe(1);
     b();
     expect(result.obsWatchers()).toBe(0);
+  });
+
+  // ---- the commands (design §6.2, §8.2-§8.4) ----
+
+  const ON = { enabled: true, host: "127.0.0.1", port: 4455 };
+  const BRB = "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13";
+  const GAME = "a7e2c94b-1f3d-4b8a-9c6e-0d5f7b2e4a91";
+  const TEXT = "c3d4e5f6-0000-4000-8000-000000000001";
+  const INVENTORY = {
+    rev: 1,
+    scenes: [
+      { uuid: BRB, name: "BRB" },
+      { uuid: GAME, name: "Game" },
+    ],
+    textSources: [{ uuid: TEXT, name: "Timer text", kind: "gdiplus", readsFromFile: false }],
+    programSceneUuid: GAME,
+    truncated: false,
+  };
+  const SCENE = { kind: "obs", op: "scene", sceneUuid: BRB, sceneName: "BRB" } as const;
+  const BACK = { kind: "obs", op: "sceneBack" } as const;
+  const MUTE = { kind: "setMuted", muted: true } as const;
+  const UNMUTE = { kind: "setMuted", muted: false } as const;
+  type Status = ObsStatus;
+  type App = ReturnType<typeof useApp>;
+
+  /** Rust's side of OBS (src-tauri/src/obs/): each OBS command answers the
+   *  whole status as it left it, one `seq` later per change. `hold(cmd)`
+   *  keeps a command's answer back until `release(cmd)`, after Rust has
+   *  done it (the mute's heldWord pattern); `refuseNext` makes its next
+   *  call reject with Rust's words, as Tauri hands over an `Err`. `emit` is
+   *  a change made in Rust (the link connecting), sent to the `obs-status`
+   *  listeners registered. Rust refuses the address "obs.local"; every
+   *  other command answers null. */
+  function rust() {
+    let status = { ...obsFixture.obsStatusSamples[0]!.status } as unknown as Status;
+    const calls: Array<{ cmd: string; args: Record<string, unknown> | undefined }> = [];
+    const held = new Map<string, Array<() => void>>();
+    const refusals = new Map<string, string>();
+    let inventory: unknown = INVENTORY;
+    const change = (patch: Partial<Status>): Status => {
+      status = { ...status, ...patch, seq: status.seq + 1 };
+      return { ...status };
+    };
+    invokeMock.mockImplementation(async (cmd: string, a?: Record<string, unknown>) => {
+      log.push(cmd);
+      calls.push({ cmd, args: a });
+      let refused = refusals.get(cmd) ?? null;
+      refusals.delete(cmd);
+      let answer: unknown = null;
+      if (refused === null) {
+        switch (cmd) {
+          case "obs_configure": {
+            const c = a!.config as { enabled: boolean; host: string; port: number };
+            if (c.host === "obs.local") refused = obsFixture.hostErrors.notAnIp;
+            else {
+              const loopback = c.host.startsWith("127.");
+              answer = change({ state: c.enabled ? "connecting" : "off", host: c.host, port: c.port, loopback });
+            }
+            break;
+          }
+          case "obs_set_password":
+            answer = change({ hasPassword: true });
+            break;
+          case "obs_forget_password":
+            answer = change({ hasPassword: false });
+            break;
+          case "obs_reconnect":
+            answer = change({ state: "connecting" });
+            break;
+          case "obs_status":
+            answer = { ...status };
+            break;
+          case "obs_inventory":
+            answer = inventory;
+            break;
+        }
+      }
+      const gate = held.get(cmd);
+      if (gate) await new Promise<void>((r) => gate.push(r));
+      if (refused !== null) throw refused;
+      return answer;
+    });
+    return {
+      calls,
+      configs: () => calls.filter((c) => c.cmd === "obs_configure").map((c) => c.args!.config),
+      hold: (cmd: string) => held.set(cmd, []),
+      release: (cmd: string) => {
+        for (const r of held.get(cmd) ?? []) r();
+        held.delete(cmd);
+      },
+      refuseNext: (cmd: string, words: string) => refusals.set(cmd, words),
+      setInventory: (inv: unknown) => {
+        inventory = inv;
+      },
+      emit: (patch: Partial<Status>): Status => {
+        const s = change(patch);
+        for (const h of handlers.get("obs-status") ?? []) h({ payload: s });
+        return s;
+      },
+    };
+  }
+
+  /** The page booted with `obs` as `divora.obs` and `timers` as
+   *  `divora.timers` (either left out when absent), every command so far
+   *  answered and forgotten. */
+  async function boot(o: { obs?: unknown; timers?: unknown[] } = {}) {
+    if (o.obs !== undefined) window.localStorage.setItem("divora.obs", JSON.stringify(o.obs));
+    if (o.timers !== undefined) window.localStorage.setItem("divora.timers", JSON.stringify({ version: 1, timers: o.timers }));
+    const be = rust();
+    const { result } = setupApp();
+    await settle();
+    log.length = 0;
+    be.calls.length = 0;
+    return { result, be };
+  }
+  const storedObs = () => JSON.parse(window.localStorage.getItem("divora.obs") ?? "null") as unknown;
+  const storedTimers = () =>
+    (JSON.parse(window.localStorage.getItem("divora.timers") ?? "null") as StoredTimers | null)?.timers ?? [];
+  const obsCmds = () => log.filter((c) => c.startsWith("obs_"));
+  const syncs = (be: ReturnType<typeof rust>) =>
+    be.calls.filter((c) => c.cmd === "sync_timers").map((c) => c.args!.timers as TimerDefWire[]);
+  const countdown = (id: string, more: Record<string, unknown> = {}) => ({
+    id,
+    name: "BRB",
+    kind: "countdown",
+    durationMs: 300_000,
+    ...more,
+  });
+
+  describe("the boot", () => {
+    it("with it on: listens to obs-status first, then sends obs_configure with the stored address, after the boot sync", async () => {
+      window.localStorage.setItem("divora.timers", JSON.stringify({ version: 1, timers: [countdown("timer-1")] }));
+      window.localStorage.setItem("divora.obs", JSON.stringify({ enabled: true, host: "192.168.1.20", port: 4456 }));
+      const be = rust();
+      holdObsListen = true;
+      const { result } = setupApp();
+      await settle();
+      // The configure waits for the listener: a change made in between
+      // would reach nobody.
+      expect(log.filter((c) => c === "sync_timers" || c === "listen obs-status" || c.startsWith("obs_"))).toEqual([
+        "sync_timers",
+        "listen obs-status",
+      ]);
+      pendingListens.shift()!();
+      await settle();
+      expect(log.filter((c) => c === "sync_timers" || c === "listen obs-status" || c.startsWith("obs_"))).toEqual([
+        "sync_timers",
+        "listen obs-status",
+        "obs_configure",
+      ]);
+      expect(be.configs()).toEqual([{ enabled: true, host: "192.168.1.20", port: 4456 }]);
+      expect(result.obsStatus()).toMatchObject({ state: "connecting", host: "192.168.1.20", seq: 1 });
+      expect(result.obsConfigError()).toBeNull();
+      // A change Rust makes now reaches the page.
+      be.emit({ state: "connected" });
+      expect(result.obsStatus()).toMatchObject({ state: "connected", seq: 2 });
+    });
+
+    it("a saved address Rust refuses is kept in obsConfigError, the toggle left on; an address it takes clears it", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { result, be } = await boot({ obs: { enabled: true, host: "obs.local", port: 4455 } });
+      expect(result.obsConfigError()).toBe("Type an IP address, like 127.0.0.1, or localhost.");
+      expect(warn).toHaveBeenCalledWith("[obs] obs_configure failed:", "Type an IP address, like 127.0.0.1, or localhost.");
+      expect(result.obsSettings()).toEqual({ enabled: true, host: "obs.local", port: 4455 });
+      expect(result.obsStatus()).toBeNull();
+      expect(await result.setObsAddress("127.0.0.1", 4455)).toBeNull();
+      expect(be.configs()).toEqual([{ enabled: true, host: "127.0.0.1", port: 4455 }]);
+      expect(result.obsConfigError()).toBeNull();
+      expect(storedObs()).toEqual(ON);
+    });
+  });
+
+  describe("Connect to OBS", () => {
+    it("on: saved, listened to once, and obs_configure with the stored address; off: saved and configured off, the listener kept", async () => {
+      const { result, be } = await boot();
+      await result.setObsEnabled(true);
+      expect(storedObs()).toEqual(ON);
+      expect(log).toEqual(["listen obs-status", "obs_configure"]);
+      expect(be.configs()).toEqual([ON]);
+      expect(result.obsStatus()).toMatchObject({ state: "connecting" });
+      await result.setObsEnabled(false);
+      await result.setObsEnabled(true);
+      expect(log).toEqual(["listen obs-status", "obs_configure", "obs_configure", "obs_configure"]);
+      expect(be.configs()).toEqual([ON, { ...ON, enabled: false }, ON]);
+      await result.setObsEnabled(false);
+      expect(storedObs()).toEqual({ ...ON, enabled: false });
+      expect(result.obsStatus()).toMatchObject({ state: "off", seq: 4 });
+    });
+
+    it("on, then off while the listen is still on its way: the last configure Rust gets is off", async () => {
+      const { result, be } = await boot();
+      holdObsListen = true;
+      const on = result.setObsEnabled(true);
+      await settle();
+      expect(obsCmds()).toEqual([]);
+      const off = result.setObsEnabled(false);
+      await settle();
+      pendingListens.shift()!();
+      await Promise.all([on, off]);
+      await settle();
+      expect(be.configs().map((c) => (c as { enabled: boolean }).enabled)).toEqual([false, false]);
+      expect(storedObs()).toMatchObject({ enabled: false });
+      expect(result.obsStatus()).toMatchObject({ state: "off" });
+    });
+  });
+
+  describe("Address and Port", () => {
+    it("refuses what can't be an address, and a port Tauri wouldn't pass on, in Rust's words, sending nothing", async () => {
+      const { result } = await boot({ obs: ON });
+      for (const typed of ["", "   ", "1 27.0.0.1", "ws://127.0.0.1"]) {
+        expect(await result.setObsAddress(typed, 4455), typed).toBe("Type an IP address, like 127.0.0.1, or localhost.");
+      }
+      for (const port of [0, 65_536, 4455.5, Number.NaN]) {
+        expect(await result.setObsAddress("127.0.0.1", port), String(port)).toBe("Type a port from 1 to 65535.");
+      }
+      expect(obsCmds()).toEqual([]);
+      expect(storedObs()).toEqual(ON);
+    });
+
+    it("Rust's refusal comes back for the field, and nothing is saved", async () => {
+      const { result, be } = await boot({ obs: ON });
+      expect(await result.setObsAddress("obs.local", 4455)).toBe("Type an IP address, like 127.0.0.1, or localhost.");
+      be.refuseNext("obs_configure", "Divora can't use a link-local IPv6 address (fe80::…). Type the PC's IPv4 address, like 192.168.1.20.");
+      expect(await result.setObsAddress("fe80::1", 4455)).toBe(
+        "Divora can't use a link-local IPv6 address (fe80::…). Type the PC's IPv4 address, like 192.168.1.20.",
+      );
+      expect(storedObs()).toEqual(ON);
+    });
+
+    it("while off it only checks the address: configured off, saved trimmed once Rust took it", async () => {
+      const { result, be } = await boot({ obs: { ...ON, enabled: false, later: 1 } });
+      expect(await result.setObsAddress(" 192.168.1.20 ", 4456)).toBeNull();
+      expect(be.configs()).toEqual([{ enabled: false, host: "192.168.1.20", port: 4456 }]);
+      expect(storedObs()).toEqual({ enabled: false, host: "192.168.1.20", port: 4456, later: 1 });
+      expect(log.filter((c) => c === "listen obs-status")).toEqual([]);
+    });
+
+    it("an address answered after Off keeps Off: it is saved into the value stored then", async () => {
+      const { result, be } = await boot({ obs: ON });
+      be.hold("obs_configure");
+      const address = result.setObsAddress("192.168.1.20", 4456);
+      await settle();
+      const off = result.setObsEnabled(false);
+      await settle();
+      be.release("obs_configure");
+      await Promise.all([address, off]);
+      expect(storedObs()).toEqual({ enabled: false, host: "192.168.1.20", port: 4456 });
+      expect(result.obsSettings()).toEqual({ enabled: false, host: "192.168.1.20", port: 4456 });
+      expect(be.configs()).toEqual([
+        { enabled: true, host: "192.168.1.20", port: 4456 },
+        { enabled: false, host: "192.168.1.20", port: 4456 },
+      ]);
+    });
+
+    it("Connect to OBS queued behind an address Rust is still answering connects to that address", async () => {
+      const { result, be } = await boot({ obs: { ...ON, enabled: false } });
+      be.hold("obs_configure");
+      const address = result.setObsAddress("192.168.1.20", 4456);
+      await settle();
+      const on = result.setObsEnabled(true);
+      await settle();
+      be.release("obs_configure");
+      await Promise.all([address, on]);
+      expect(be.configs()).toEqual([
+        { enabled: false, host: "192.168.1.20", port: 4456 },
+        { enabled: true, host: "192.168.1.20", port: 4456 },
+      ]);
+      expect(storedObs()).toEqual({ enabled: true, host: "192.168.1.20", port: 4456 });
+    });
+  });
+
+  describe("the password", () => {
+    const PASSWORD = "correct horse 7f3a battery";
+
+    it("Save password and Forget password work while off: queued, answered with hasPassword, and nothing configured", async () => {
+      const { result } = await boot();
+      expect(await result.obsSavePassword(PASSWORD)).toBeNull();
+      expect(result.obsStatus()).toMatchObject({ hasPassword: true, state: "off" });
+      expect(await result.obsForgetPassword()).toBeNull();
+      expect(result.obsStatus()).toMatchObject({ hasPassword: false });
+      expect(log).toEqual(["obs_set_password", "obs_forget_password"]);
+      expect(window.localStorage.getItem("divora.obs")).toBeNull();
+    });
+
+    it("a refused save says so in Rust's words: it never reads as saved", async () => {
+      const { result, be } = await boot({ obs: ON });
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      be.refuseNext("obs_set_password", "Couldn't save the password: Windows couldn't encrypt it.");
+      expect(await result.obsSavePassword(PASSWORD)).toBe("Couldn't save the password: Windows couldn't encrypt it.");
+      // Not in Tauri at all: still a failure, never null.
+      be.refuseNext("obs_set_password", "window.__TAURI_INTERNALS__ is undefined");
+      expect(await result.obsSavePassword(PASSWORD)).not.toBeNull();
+      be.refuseNext("obs_forget_password", "window.__TAURI_INTERNALS__ is undefined");
+      expect(await result.obsForgetPassword()).not.toBeNull();
+    });
+
+    it("one with a lone surrogate is refused here, and nothing is sent", async () => {
+      const { result } = await boot({ obs: ON });
+      expect(await result.obsSavePassword("abc\uD800")).toBe(
+        "This password has a character Divora can't send. Paste it again from OBS's Show Connect Info.",
+      );
+      expect(obsCmds()).toEqual([]);
+    });
+
+    it("is never in localStorage, a store signal or a console line: only in its one command", async () => {
+      const lines: unknown[][] = [];
+      for (const level of ["log", "info", "warn", "error", "debug"] as const) {
+        vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+          lines.push(args);
+        });
+      }
+      const { result, be } = await boot({ obs: ON });
+      await result.obsSavePassword(PASSWORD);
+      be.refuseNext("obs_set_password", "Couldn't save the password: the file couldn't be written.");
+      await result.obsSavePassword(PASSWORD);
+      be.refuseNext("obs_set_password", "The password can be up to 256 characters.");
+      await result.obsSavePassword(PASSWORD);
+      await result.refreshObsInventory();
+      const sent = be.calls.filter((c) => JSON.stringify(c.args ?? null).includes("7f3a"));
+      expect(sent.map((c) => [c.cmd, c.args])).toEqual(Array(3).fill(["obs_set_password", { password: PASSWORD }]));
+      const storage = Object.keys(window.localStorage).map((k) => `${k}=${window.localStorage.getItem(k)}`);
+      expect(storage.join("\n")).not.toContain("7f3a");
+      const signals = [
+        result.obsSettings(),
+        result.obsStatus(),
+        result.obsInventory(),
+        result.obsInventoryError(),
+        result.obsConfigError(),
+        result.obsWatchers(),
+      ];
+      expect(JSON.stringify(signals)).not.toContain("7f3a");
+      expect(lines.length).toBeGreaterThan(0);
+      expect(JSON.stringify(lines.map((l) => l.map(String)))).not.toContain("7f3a");
+    });
+  });
+
+  describe("one OBS command at a time (§8.2)", () => {
+    // Every sender of the four commands that change something, with the
+    // command it sends: the queue's first command is held, and it goes only
+    // once that one has answered. The reads go at once meanwhile.
+    it.each<[string, string, (a: App) => unknown]>([
+      ["Connect to OBS, on", "obs_configure", (a) => a.setObsEnabled(true)],
+      ["Connect to OBS, off", "obs_configure", (a) => a.setObsEnabled(false)],
+      ["Address and Port", "obs_configure", (a) => a.setObsAddress("192.168.1.20", 4456)],
+      ["Save password", "obs_set_password", (a) => a.obsSavePassword("a throwaway")],
+      ["Forget password", "obs_forget_password", (a) => a.obsForgetPassword()],
+      ["Try again", "obs_reconnect", (a) => a.obsReconnect()],
+    ])("%s goes through the OBS queue", async (_name, cmd, send) => {
+      const { result, be } = await boot({ obs: ON });
+      be.hold("obs_reconnect");
+      const first = result.obsReconnect();
+      await settle();
+      expect(obsCmds()).toEqual(["obs_reconnect"]);
+      // The reads aren't queued: they go at once.
+      void result.pullObsStatus();
+      void result.refreshObsInventory();
+      await settle();
+      expect(obsCmds()).toEqual(["obs_reconnect", "obs_status", "obs_inventory"]);
+      const done = send(result);
+      await settle();
+      expect(obsCmds()).toEqual(["obs_reconnect", "obs_status", "obs_inventory"]);
+      be.release("obs_reconnect");
+      await Promise.all([first, done]);
+      await settle();
+      expect(obsCmds()).toEqual(["obs_reconnect", "obs_status", "obs_inventory", cmd]);
+    });
+
+    it("a command Rust refuses holds nothing back, and each caller gets its own outcome", async () => {
+      const { result, be } = await boot({ obs: ON });
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      be.hold("obs_set_password");
+      be.refuseNext("obs_set_password", "Paste a password first.");
+      const save = result.obsSavePassword("");
+      const forget = result.obsForgetPassword();
+      await settle();
+      expect(obsCmds()).toEqual(["obs_set_password"]);
+      be.release("obs_set_password");
+      expect(await save).toBe("Paste a password first.");
+      expect(await forget).toBeNull();
+      expect(obsCmds()).toEqual(["obs_set_password", "obs_forget_password"]);
+    });
+
+    it("20 saves and forgets, alternating, over a wire that lands what is in flight together reversed: Rust takes them in send order", async () => {
+      const { result } = await boot({ obs: ON });
+      const wire = reversingWire(["obs_set_password", "obs_forget_password", "obs_configure", "obs_reconnect"]);
+      const done = Array.from({ length: 20 }, (_, i) =>
+        i % 2 === 0 ? result.obsSavePassword(`pw-${i}`) : result.obsForgetPassword(),
+      );
+      await wire.drain();
+      await Promise.all(done);
+      const want = Array.from({ length: 20 }, (_, i) =>
+        i % 2 === 0 ? ["obs_set_password", { password: `pw-${i}` }] : ["obs_forget_password", undefined],
+      );
+      expect(wire.sent).toEqual(want);
+      expect(wire.landed).toEqual(want);
+      expect(wire.peak()).toBe(1);
+      expect(result.obsStatus()).toMatchObject({ hasPassword: false, seq: 21 });
+    });
+
+    it("20 address edits over the same wire: Rust takes them in send order, and the last is what's stored and in use", async () => {
+      const { result, be } = await boot({ obs: ON });
+      const wire = reversingWire(["obs_configure", "obs_set_password"]);
+      const ports = Array.from({ length: 20 }, (_, i) => 4456 + i);
+      const done = ports.map((port) => result.setObsAddress("192.168.1.20", port));
+      await wire.drain();
+      expect(await Promise.all(done)).toEqual(Array(20).fill(null));
+      const want = ports.map((port) => ["obs_configure", { config: { enabled: true, host: "192.168.1.20", port } }]);
+      expect(wire.sent).toEqual(want);
+      expect(wire.landed).toEqual(want);
+      expect(wire.peak()).toBe(1);
+      expect(storedObs()).toEqual({ ...ON, host: "192.168.1.20", port: 4475 });
+      expect(result.obsStatus()).toMatchObject({ host: "192.168.1.20", port: 4475, seq: 21 });
+      expect(be.configs().at(-1)).toEqual({ enabled: true, host: "192.168.1.20", port: 4475 });
+    });
+
+    it("an answer that lands after a newer event doesn't win: the larger seq does", async () => {
+      const { result, be } = await boot({ obs: ON });
+      expect(result.obsStatus()).toMatchObject({ state: "connecting", seq: 1 });
+      be.hold("obs_reconnect");
+      const again = result.obsReconnect();
+      await settle();
+      // Rust has answered (seq 2, connecting); then the link connects
+      // (seq 3), and the event lands before the answer.
+      const connected = be.emit({ state: "connected" });
+      expect(result.obsStatus()).toEqual(connected);
+      be.release("obs_reconnect");
+      await again;
+      expect(result.obsStatus()).toEqual(connected);
+    });
+
+    it("pullObsStatus reads once, listens to nothing and connects nothing", async () => {
+      const { result } = await boot();
+      await result.pullObsStatus();
+      expect(log).toEqual(["obs_status"]);
+      expect(result.obsStatus()).toMatchObject({ state: "off", seq: 0 });
+    });
+  });
+
+  describe("the inventory", () => {
+    it("reads OBS's lists, one call at a time: a second joins the one in flight", async () => {
+      const { result, be } = await boot({ obs: ON });
+      be.hold("obs_inventory");
+      const a = result.refreshObsInventory();
+      const b = result.refreshObsInventory();
+      await settle();
+      expect(result.obsInventoryBusy()).toBe(true);
+      be.release("obs_inventory");
+      expect(await a).toEqual(INVENTORY);
+      expect(await b).toEqual(INVENTORY);
+      expect(obsCmds()).toEqual(["obs_inventory"]);
+      expect(result.obsInventoryBusy()).toBe(false);
+      expect(result.obsInventory()).toEqual(INVENTORY);
+      expect(result.obsInventoryError()).toBeNull();
+    });
+
+    it("one that fails clears the list and keeps Rust's words; the next that works clears them", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { result, be } = await boot({ obs: ON });
+      await result.refreshObsInventory();
+      be.refuseNext("obs_inventory", "OBS is busy. Try again in a moment.");
+      expect(await result.refreshObsInventory()).toBeNull();
+      expect(result.obsInventory()).toBeNull();
+      expect(result.obsInventoryError()).toBe("OBS is busy. Try again in a moment.");
+      expect(warn).toHaveBeenCalledWith("[obs] obs_inventory failed:", "OBS is busy. Try again in a moment.");
+      be.setInventory({ rev: 1 });
+      expect(await result.refreshObsInventory()).toBeNull();
+      expect(result.obsInventoryError()).toBe("OBS and Divora didn't understand each other.");
+      be.setInventory(INVENTORY);
+      expect(await result.refreshObsInventory()).toEqual(INVENTORY);
+      expect(result.obsInventoryError()).toBeNull();
+    });
+
+    it("while OBS control is off nothing is asked", async () => {
+      const { result } = await boot({ obs: { ...ON, enabled: false } });
+      expect(await result.refreshObsInventory()).toBeNull();
+      expect(obsCmds()).toEqual([]);
+      expect(result.obsInventoryBusy()).toBe(false);
+    });
+
+    it("refreshes every stored name it lists under another, in one save and one sync_timers", async () => {
+      const { result, be } = await boot({
+        obs: { ...ON, breakScene: { uuid: BRB, name: "Old BRB" } },
+        timers: [
+          countdown("timer-1", {
+            obsText: { uuid: TEXT, name: "Old text" },
+            onStart: [MUTE, { ...SCENE, sceneName: "Old BRB" }],
+            onFire: [UNMUTE, BACK],
+          }),
+          countdown("timer-2", { name: "Uptime", kind: "countup", obsText: { uuid: GAME, name: "Not a source" } }),
+        ],
+      });
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+      await result.refreshObsInventory();
+      await settle();
+      expect(setItem.mock.calls.filter((c) => c[0] === "divora.timers")).toHaveLength(1);
+      expect(storedTimers()[0]).toMatchObject({
+        obsText: { uuid: TEXT, name: "Timer text" },
+        onStart: [MUTE, SCENE],
+        onFire: [UNMUTE, BACK],
+      });
+      // A uuid it lists only as a scene isn't a text source's.
+      expect(storedTimers()[1]!.obsText).toEqual({ uuid: GAME, name: "Not a source" });
+      expect(syncs(be)).toHaveLength(1);
+      expect(syncs(be)[0]![0]!.onStart).toEqual([MUTE, SCENE]);
+      expect(storedObs()).toEqual({ ...ON, breakScene: { uuid: BRB, name: "BRB" } });
+      expect(result.obsSettings().breakScene).toEqual({ uuid: BRB, name: "BRB" });
+      // The same lists again: nothing to write.
+      await result.refreshObsInventory();
+      await settle();
+      expect(setItem.mock.calls.filter((c) => c[0] === "divora.timers")).toHaveLength(1);
+      expect(syncs(be)).toHaveLength(1);
+    });
+
+    it("a text source's new name alone is saved but not synced: Rust gets its uuid only", async () => {
+      const { result, be } = await boot({
+        obs: ON,
+        timers: [countdown("timer-1", { obsText: { uuid: TEXT, name: "Old text" } })],
+      });
+      await result.refreshObsInventory();
+      await settle();
+      expect(storedTimers()[0]!.obsText).toEqual({ uuid: TEXT, name: "Timer text" });
+      expect(syncs(be)).toEqual([]);
+    });
+
+    it("read again once per inventoryRev while connected and a picker or the OBS section is on screen", async () => {
+      const { result, be } = await boot({ obs: ON });
+      const inventories = () => obsCmds().filter((c) => c === "obs_inventory").length;
+      be.emit({ state: "connected", inventoryRev: 1 });
+      await settle();
+      expect(inventories()).toBe(0);
+      const unwatch = result.watchObs();
+      await settle();
+      expect(inventories()).toBe(1);
+      // A second watcher, a stream starting: the same rev.
+      const unwatch2 = result.watchObs();
+      be.emit({ stream: "live" });
+      await settle();
+      expect(inventories()).toBe(1);
+      be.emit({ inventoryRev: 2 });
+      await settle();
+      expect(inventories()).toBe(2);
+      unwatch();
+      unwatch2();
+      be.emit({ inventoryRev: 3 });
+      await settle();
+      expect(inventories()).toBe(2);
+      // Not connected: nothing to read.
+      be.emit({ state: "retrying", inventoryRev: 4 });
+      result.watchObs();
+      await settle();
+      expect(inventories()).toBe(2);
+      be.emit({ state: "connected", inventoryRev: 5 });
+      await settle();
+      expect(inventories()).toBe(3);
+    });
+  });
+
+  describe("a timer's Show in OBS and Follow OBS, and the Break row", () => {
+    const TIMERS = [countdown("timer-1"), countdown("timer-2", { name: "Uptime", kind: "countup" })];
+
+    it("Show in OBS: saved as {uuid, name}, sent as {uuid}; None removes it; the same again sends nothing", async () => {
+      const { result, be } = await boot({ obs: ON, timers: TIMERS });
+      await result.setTimerObsText("timer-1", { uuid: TEXT, name: "t".repeat(300) });
+      expect(storedTimers()[0]!.obsText).toEqual({ uuid: TEXT, name: "t".repeat(256) });
+      expect(syncs(be).map((defs) => defs[0]!.obsText)).toEqual([{ uuid: TEXT }]);
+      await result.setTimerObsText("timer-1", { uuid: TEXT, name: "t".repeat(256) });
+      await result.setTimerObsText("timer-1", { uuid: "", name: "Bad" });
+      await result.setTimerObsText("timer-9", { uuid: TEXT, name: "No timer" });
+      expect(syncs(be)).toHaveLength(1);
+      await result.setTimerObsText("timer-2", { uuid: GAME, name: "Uptime text" });
+      await result.setTimerObsText("timer-1", null);
+      expect("obsText" in storedTimers()[0]!).toBe(false);
+      expect(syncs(be).map((defs) => defs.map((d) => d.obsText))).toEqual([
+        [{ uuid: TEXT }, undefined],
+        [{ uuid: TEXT }, { uuid: GAME }],
+        [undefined, { uuid: GAME }],
+      ]);
+      await result.setTimerObsText("timer-1", null);
+      expect(syncs(be)).toHaveLength(3);
+    });
+
+    it("Follow OBS: a count-up's only; Off removes it", async () => {
+      const { result, be } = await boot({ obs: ON, timers: TIMERS });
+      await result.setTimerFollowObs("timer-1", "stream");
+      expect("followObs" in storedTimers()[0]!).toBe(false);
+      await result.setTimerFollowObs("timer-2", "record");
+      await result.setTimerFollowObs("timer-2", "record");
+      expect(storedTimers()[1]!.followObs).toBe("record");
+      await result.setTimerFollowObs("timer-2", "stream");
+      await result.setTimerFollowObs("timer-2", null);
+      expect("followObs" in storedTimers()[1]!).toBe(false);
+      expect(syncs(be).map((defs) => defs[1]!.followObs)).toEqual(["record", "stream", undefined]);
+    });
+
+    it("the break scene: saved in divora.obs, its name cut; Don't switch removes it", async () => {
+      const { result } = await boot({ obs: ON });
+      result.setBreakScene({ uuid: BRB, name: "b".repeat(300) });
+      expect(storedObs()).toEqual({ ...ON, breakScene: { uuid: BRB, name: "b".repeat(256) } });
+      result.setBreakScene({ uuid: "f".repeat(129), name: "Bad" });
+      expect(result.obsSettings().breakScene).toEqual({ uuid: BRB, name: "b".repeat(256) });
+      result.setBreakScene(null);
+      expect(storedObs()).toEqual(ON);
+      expect(obsCmds()).toEqual([]);
+    });
+
+    it("Add break (BRB) with a break scene and OBS control on: the four actions, in one save and one sync", async () => {
+      const { result, be } = await boot({ obs: { ...ON, breakScene: { uuid: BRB, name: "BRB" } } });
+      expect(await result.addTimer("countdown", "break")).toBe("timer-1");
+      const brb = { id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000 };
+      expect(syncs(be)).toEqual([[{ ...brb, onStart: [MUTE, SCENE], onFire: [UNMUTE, BACK] }]]);
+      expect(storedTimers()).toEqual([{ ...brb, hotkeys: {}, onStart: [MUTE, SCENE], onFire: [UNMUTE, BACK] }]);
+    });
+
+    it("with OBS control off, Add break (BRB) is v1.60.0's, whatever scene is stored", async () => {
+      const { result, be } = await boot({ obs: { ...ON, enabled: false, breakScene: { uuid: BRB, name: "BRB" } } });
+      await result.addTimer("countdown", "break");
+      expect(syncs(be)[0]![0]).toMatchObject({ onStart: [MUTE], onFire: [UNMUTE] });
+    });
+
+    it("a Switch OBS scene added or set with a name past 256 characters is stored cut, not refused", async () => {
+      const { result } = await boot({ obs: ON, timers: TIMERS });
+      await result.addTimerAction("timer-1", "onStart", { ...SCENE, sceneName: "n".repeat(300) });
+      expect(storedTimers()[0]!.onStart).toEqual([{ ...SCENE, sceneName: "n".repeat(256) }]);
+      await result.setTimerAction("timer-1", "onStart", 0, { ...SCENE, sceneUuid: GAME, sceneName: "g".repeat(400) });
+      expect(storedTimers()[0]!.onStart).toEqual([{ ...SCENE, sceneUuid: GAME, sceneName: "g".repeat(256) }]);
+    });
+
+    // Every timer edit §8.4 names: its sync goes through the timers' queue,
+    // behind a timer command still waiting for its answer.
+    it.each<[string, (a: App) => unknown]>([
+      ["Show in OBS", (a) => a.setTimerObsText("timer-1", { uuid: TEXT, name: "Timer text" })],
+      ["Follow OBS", (a) => a.setTimerFollowObs("timer-2", "record")],
+      ["Add break (BRB) with a break scene", (a) => a.addTimer("countdown", "break")],
+      ["a Switch OBS scene added", (a) => a.addTimerAction("timer-1", "onStart", SCENE)],
+      ["the names an inventory refreshes", (a) => a.refreshObsInventory()],
+    ])("%s syncs through the timers' queue", async (_name, send) => {
+      const { result, be } = await boot({
+        obs: { ...ON, breakScene: { uuid: BRB, name: "BRB" } },
+        timers: [countdown("timer-1", { onFire: [{ ...SCENE, sceneName: "Old BRB" }] }), TIMERS[1]],
+      });
+      be.hold("reset_timer");
+      const first = result.resetTimer("timer-1");
+      await settle();
+      const done = send(result);
+      await settle();
+      expect(log.filter((c) => c === "reset_timer" || c === "sync_timers")).toEqual(["reset_timer"]);
+      be.release("reset_timer");
+      await Promise.all([first, done]);
+      await settle();
+      expect(log.filter((c) => c === "reset_timer" || c === "sync_timers")).toEqual(["reset_timer", "sync_timers"]);
+    });
   });
 });

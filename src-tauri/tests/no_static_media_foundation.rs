@@ -98,4 +98,12 @@ fn the_app_does_not_import_media_foundation() {
         audio.is_empty(),
         "divora-app.exe imports {audio:?} at load time: resolve it at run time instead."
     );
+    // v1.61.0: the OBS password's DPAPI (`native::dpapi`) resolves
+    // `CryptProtectData` and `CryptUnprotectData` at run time too, so the
+    // exe gains no crypt32.dll import.
+    assert!(
+        !dlls.iter().any(|d| d == "crypt32.dll"),
+        "divora-app.exe imports crypt32.dll at load time: resolve DPAPI at run time \
+         in divora-capture's native::dpapi instead."
+    );
 }

@@ -1,5 +1,5 @@
 {
-  "about": "v1.61.0: Talk to OBS's wire contract, read by both test suites (src-tauri/src/obs/; src/data/obs.test.ts) and by e2e/tauri-mock.ts. Production code never imports it, and the fake OBS server (src-tauri/src/obs/fake.rs) never reads it. hostSamples: what parse_host makes of a typed address (ip, the canonical address in use, or error, a HostError whose message is in hostErrors) and whether the page's hostPrecheck passes it on to Rust. gateTable: a Hello's d and what the version gate makes of it (pass, tooOld, badVersion, or notObs: not a Hello). textKindTable and readsFromFileTable: which inputs are text sources, and when one reads a file. followTable: what follow_op does with an output event (event: stream, a StreamStateChanged, or record, a RecordStateChanged; outputState as OBS sends it) for a count-up that follows the stream or the recording (setElapsed: SetElapsed {ms: the time since the event was read, running: true}; pause, resume: TimerOp::Pause, TimerOp::Resume; seed: GetStreamStatus or GetRecordStatus, then join_seed; null: nothing). seedTable: what join_seed does with a GetStreamStatus or GetRecordStatus answer and the timer's phase (timerNow: only whether it is running counts). failureTable: what request_failure makes of an error code for each kind of work, in failureResults' words: a success, a timeout and a 207 after ExitStarted (which ends the connection retrying/obsExiting) are the driver's, not in it. obsStatusSamples: ObsStatus values as Rust serializes them, every state and every reason. authVectors: Identify's authentication from a password and Hello's salt and challenge (Python hashlib and Node crypto agree on each).",
+  "about": "v1.61.0: Talk to OBS's wire contract, read by both test suites (src-tauri/src/obs/; src/data/obs.test.ts) and by e2e/tauri-mock.ts. Production code never imports it, and the fake OBS server (src-tauri/src/obs/fake.rs) never reads it. hostSamples: what parse_host makes of a typed address (ip, the canonical address in use, or error, a HostError whose message is in hostErrors) and whether the page's hostPrecheck passes it on to Rust. gateTable: a Hello's d and what the version gate makes of it (pass, tooOld, badVersion, or notObs: not a Hello). textKindTable and readsFromFileTable: which inputs are text sources, and when one reads a file. followTable: what follow_op does with an output event (event: stream, a StreamStateChanged, or record, a RecordStateChanged; outputState as OBS sends it) for a count-up that follows the stream or the recording (setElapsed: SetElapsed {ms: the time since the event was read, running: true}; pause, resume: TimerOp::Pause, TimerOp::Resume; seed: GetStreamStatus or GetRecordStatus, then join_seed; null: nothing). seedTable: what join_seed does with a GetStreamStatus or GetRecordStatus answer and the timer's phase (timerNow: only whether it is running counts). failureTable: what request_failure makes of an error code for each kind of work, in failureResults' words: a success, a timeout and a 207 after ExitStarted (which ends the connection retrying/obsExiting) are the driver's, not in it. obsStatusSamples: ObsStatus values as Rust serializes them, every state and every reason. authVectors: Identify's authentication from a password and Hello's salt and challenge (Python hashlib and Node crypto agree on each). commandErrors: every message a command answers with when it refuses (an Err), by obsWire.commands' key: the e2e mock answers these, and Rust's own strings are tested equal to them; reconnect, forgetPassword and status never refuse.",
   "obsWire": {
     "commands": {
       "configure": "obs_configure",
@@ -1021,5 +1021,27 @@
       "secret": "rPXSMjuxCVr8/dAxzHv7Kq8aJT6tBFv59kZ2tKDAhfk=",
       "authentication": "5WaFmEvbriEFlwpsD4n+U1qzUh+KQN3UOopVP6WvLjg="
     }
-  ]
+  ],
+  "commandErrors": {
+    "configure": {
+      "notAnIp": "Type an IP address, like 127.0.0.1, or localhost.",
+      "linkLocalV6": "Divora can't use a link-local IPv6 address (fe80::…). Type the PC's IPv4 address, like 192.168.1.20.",
+      "badPort": "Type a port from 1 to 65535."
+    },
+    "reconnect": {},
+    "setPassword": {
+      "empty": "Paste a password first.",
+      "tooLong": "The password can be up to 256 characters.",
+      "encryptFailed": "Couldn't save the password: Windows couldn't encrypt it.",
+      "writeFailed": "Couldn't save the password: the file couldn't be written."
+    },
+    "forgetPassword": {},
+    "status": {},
+    "inventory": {
+      "notConnected": "OBS isn't connected.",
+      "noAnswer": "OBS didn't answer in time.",
+      "busy": "OBS is busy. Try again in a moment.",
+      "refused": "OBS refused the request."
+    }
+  }
 }

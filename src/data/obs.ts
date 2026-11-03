@@ -45,6 +45,10 @@ export const OBS_DEFAULT_PORT = 4455;
 export const OBS_MAX_UUID_CHARS = 128;
 export const OBS_MAX_NAME_CHARS = 256;
 export const OBS_MAX_PASSWORD_CHARS = 256;
+/** How many of each an inventory lists at most; past either, it says
+ *  `truncated`. */
+export const OBS_MAX_SCENES = 200;
+export const OBS_MAX_TEXT_SOURCES = 100;
 
 /** Rust's words for an address it refuses (`obs_configure`), by
  *  `HostError`. The page shows `notAnIp` for what `hostPrecheck` refuses, so
@@ -54,6 +58,18 @@ export const OBS_HOST_ERRORS = {
   linkLocalV6:
     "Divora can't use a link-local IPv6 address (fe80::…). Type the PC's IPv4 address, like 192.168.1.20.",
 } as const;
+
+/** Rust's words for a port it refuses (`BAD_PORT`). The page says them for
+ *  any port that isn't a whole number from 1 to 65535 and sends nothing:
+ *  Rust takes a `u16`, and Tauri would refuse anything else with words of
+ *  its own. */
+export const OBS_PORT_ERROR = "Type a port from 1 to 65535.";
+
+/** v1.61.0: what Save password says, without sending it, for a password
+ *  with a lone surrogate (a broken paste): the backend's JSON reader would
+ *  refuse the whole invoke, and OBS can't hold one either. */
+export const OBS_PASSWORD_UNSENDABLE =
+  "This password has a character Divora can't send. Paste it again from OBS's Show Connect Info.";
 
 /** What `obs_configure` takes. Rust keeps the last one in memory only;
  *  `divora.obs` is the record. */
@@ -408,6 +424,33 @@ export function hostPrecheck(typed: string): string | null {
   return host;
 }
 
+/** A port Rust takes: a whole number from 1 to 65535. */
+export function obsPortOk(port: unknown): port is number {
+  return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
+/** A password the page can send: no lone surrogate. Rust judges the rest
+ *  (empty, longer than 256 characters) and answers in its own words. */
+export function obsPasswordSendable(password: string): boolean {
+  return !LONE_SURROGATE.test(password);
+}
+
+/** A name from OBS as the page stores it: its first 256 characters, counted
+ *  by code point as `readObsName` (and Rust) count them, so a picked scene
+ *  or source with a longer name still makes an action and an `obsText`
+ *  that read. OBS sets no limit; the uuid is what Divora acts on, and the
+ *  name is only for words. A cut never splits a pair: Rust strings hold
+ *  none to split, and a code point is never cut in half. */
+export function cutObsName(name: string): string {
+  return codePoints(name) <= OBS_MAX_NAME_CHARS ? name : Array.from(name).slice(0, OBS_MAX_NAME_CHARS).join("");
+}
+
+/** A picked scene or source as stored: its uuid and its cut name; null
+ *  when the uuid can't be stored (`readObsRef`). */
+export function obsRef(uuid: string, name: string): ObsRef | null {
+  return readObsRef({ uuid, name: cutObsName(name) });
+}
+
 function readLastSkip(v: unknown): ObsLastSkip | null | undefined {
   if (v === null) return null;
   if (!isObject(v)) return undefined;
@@ -505,11 +548,268 @@ export function readObsInventory(raw: unknown): ObsInventory | null {
 }
 
 // ---- words and pickers ----
-// v1.61.0 S1: declared only. The store's OBS track writes these bodies and
-// their tests; nothing calls them yet, and each throws if something does.
+// Every user-visible string the OBS section, a timer's card and the pickers
+// build from a status or an inventory (design §9). Settings lays them out;
+// these say them.
 
-function notYet(name: string): never {
-  throw new Error(`data/obs.ts: ${name} isn't written yet (v1.61.0 S1)`);
+/** The states that stay until the address, the password or Try again
+ *  changes something (`retrying` retries by itself; `off` is no link). */
+export const OBS_STOP_STATES: readonly ObsState[] = [
+  "needsPassword",
+  "authFailed",
+  "passwordUnreadable",
+  "tooOld",
+  "needsNewerDivora",
+  "kicked",
+  "unsupported",
+];
+
+export function isObsStopState(state: ObsState): boolean {
+  return OBS_STOP_STATES.includes(state);
+}
+
+/** `{host}:{port}` as the status line says it; an IPv6 address in
+ *  brackets, so its last group isn't read as the port. */
+export function obsAddressText(host: string, port: number): string {
+  return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+/** A scene's name in a sentence. OBS gives every scene one, so an empty
+ *  name is a hand edit; it reads as a scene with no name, never as nothing
+ *  ("Switch OBS to "). */
+export function obsSceneName(name: string | null): string {
+  return name === null || name === "" ? "a scene with no name" : name;
+}
+
+/** A name as a picker shows it; an empty one as "(no name)". */
+function pickerName(name: string): string {
+  return name === "" ? "(no name)" : name;
+}
+
+/** A skip's `{time}`: its wall-clock ms as the local hour and minute, in
+ *  the PC's own way of writing them. */
+export function obsClockTime(ms: number): string {
+  const d = new Date(ms);
+  try {
+    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  } catch {
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+}
+
+/** Why the link is retrying, as a sentence (§9.1). `badVersion` and
+ *  `missingRequest` are `unsupported`'s, never a retry's. */
+const RETRY_WHY: Partial<Record<ObsReason, string>> = {
+  refused: "Nothing is listening there. Is OBS open, with its WebSocket server on?",
+  unreachable: "No answer from that address.",
+  noAnswer: "It didn't answer in time.",
+  notObs: "That isn't OBS's WebSocket server.",
+  notReady: "OBS stayed busy for 30 seconds (starting, closing or changing scene collection).",
+  closed: "OBS closed the connection.",
+  obsExiting: "OBS is closing.",
+  silent: "OBS stopped answering.",
+  tooBig: "OBS sent a message over 4 MiB, more than Divora takes.",
+  protocol: "OBS and Divora didn't understand each other.",
+};
+
+const STREAM_WORDS: Record<ObsStreamState, string> = {
+  off: "",
+  starting: " · stream starting",
+  live: " · live",
+  reconnecting: " · stream reconnecting",
+  stopping: " · stream stopping",
+};
+
+const RECORD_WORDS: Record<ObsRecordState, string> = {
+  off: "",
+  starting: " · recording starting",
+  recording: " · recording",
+  paused: " · recording paused",
+  stopping: " · recording stopping",
+};
+
+/** What the status line says with the toggle on and the saved address
+ *  refused by Rust (at boot, or on Connect to OBS): the store's
+ *  `obsConfigError` holds Rust's words for the field. */
+export const OBS_SAVED_ADDRESS_LINE = "Not connected: the saved address isn't valid. Fix it below.";
+
+/** Settings → OBS's status line for `s` (§9.1); `nowMs` for "Trying again in
+ *  N s", whole seconds rounded up, "now" at or past the attempt. Plain
+ *  text: the section never puts it in a live region (it would speak the
+ *  countdown), and `obsAnnouncement` says only the edges. */
+export function obsStatusLine(s: ObsStatus, nowMs: number): string {
+  switch (s.state) {
+    case "off":
+      return "Off. Divora doesn't connect to OBS.";
+    case "connecting":
+      return `Connecting to ${obsAddressText(s.host, s.port)}…`;
+    case "connected": {
+      const head =
+        s.obsVersion !== null && s.websocketVersion !== null
+          ? `Connected to OBS ${s.obsVersion} (WebSocket ${s.websocketVersion})`
+          : s.obsVersion !== null
+            ? `Connected to OBS ${s.obsVersion}`
+            : s.websocketVersion !== null
+              ? `Connected to OBS (WebSocket ${s.websocketVersion})`
+              : "Connected to OBS";
+      return `${head}${s.stream === null ? "" : STREAM_WORDS[s.stream]}${s.record === null ? "" : RECORD_WORDS[s.record]}`;
+    }
+    case "retrying": {
+      const why = s.reason === null ? undefined : RETRY_WHY[s.reason];
+      const parts = [`Can't reach OBS at ${obsAddressText(s.host, s.port)}.`];
+      if (why !== undefined) parts.push(why);
+      if (s.retryAtMs !== null) {
+        const n = Math.ceil((s.retryAtMs - nowMs) / 1000);
+        parts.push(n <= 0 ? "Trying again now." : `Trying again in ${n} s.`);
+      }
+      return parts.join(" ");
+    }
+    case "needsPassword":
+      return "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password. Or turn off Enable Authentication in OBS and press Try again.";
+    case "authFailed":
+      return "OBS rejected the password. Paste it again from OBS's Show Connect Info, then Save password.";
+    case "passwordUnreadable":
+      return "Re-enter your OBS password. Windows couldn't read the saved one, which can happen after a change to your Windows account.";
+    case "tooOld":
+      return s.websocketVersion !== null
+        ? `Update OBS, then press Try again. Its WebSocket server is ${s.websocketVersion}, and Divora needs 5.4.0 or later.`
+        : "Update OBS, then press Try again. Divora needs its WebSocket server 5.4.0 or later.";
+    case "needsNewerDivora":
+      return "This OBS needs a newer Divora. Check for updates in Settings → About.";
+    case "kicked":
+      return "OBS disconnected Divora from its list of connections. Divora won't reconnect on its own.";
+    case "unsupported":
+      if (s.reason === "badVersion") {
+        return "Divora can't read this OBS's WebSocket version. Update OBS, then press Try again.";
+      }
+      // `missingRequest` names the request; without a name (not a status
+      // Rust writes), the sentence still says what to do.
+      return s.detail !== null
+        ? `This OBS's WebSocket server doesn't offer ${s.detail}, which Divora needs. Update OBS, then press Try again.`
+        : "This OBS's WebSocket server doesn't offer everything Divora needs. Update OBS, then press Try again.";
+  }
+}
+
+/** The button beside the status line: "Try again" where pressing it can
+ *  help (a retry now, or after fixing OBS or the password), "Connect again"
+ *  after OBS's Kick; none otherwise (§9.1). */
+export function obsRetryLabel(s: ObsStatus): "Try again" | "Connect again" | null {
+  switch (s.state) {
+    case "needsPassword":
+    case "authFailed":
+    case "tooOld":
+    case "unsupported":
+    case "retrying":
+      return "Try again";
+    case "kicked":
+      return "Connect again";
+    default:
+      return null;
+  }
+}
+
+/** The warnings under the status line, only for a status that isn't `off`
+ *  and has a host: a network address, and OBS asking for no password. */
+export function obsWarnings(s: ObsStatus): string[] {
+  if (s.state === "off" || s.host === "") return [];
+  const out: string[] = [];
+  if (!s.loopback) {
+    out.push(
+      `${s.host} is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent.`,
+    );
+  }
+  if (s.authRequired === false) {
+    out.push(
+      "OBS isn't asking for a password, so anything that can reach it on your network can control it. Turn on Enable Authentication in OBS's WebSocket Server Settings.",
+    );
+  }
+  return out;
+}
+
+/** A Switch OBS scene's skip, by why, `t` its time and `n` its scene. */
+const SCENE_SKIP: Record<SkipWhy, (t: string, n: string) => string> = {
+  notConnected: (t, n) => `${t}: Didn't switch OBS to ${n}: Divora wasn't connected to OBS.`,
+  queueFull: (t, n) => `${t}: Didn't switch OBS to ${n}: too many OBS requests were waiting.`,
+  notFound: (t, n) => `${t}: Didn't switch OBS to ${n}: OBS doesn't have that scene now.`,
+  notReady: (t, n) => `${t}: Didn't switch OBS to ${n}: OBS was busy (starting, closing or changing scene collection).`,
+  late: (t, n) =>
+    `${t}: Didn't switch OBS to ${n}: OBS was busy for more than 5 seconds, and a late switch is worse than none.`,
+  timedOut: (t, n) => `${t}: OBS didn't answer the switch to ${n} in time. It may switch late, or not at all.`,
+  failed: (t, n) => `${t}: OBS refused the switch to ${n}.`,
+};
+
+/** A Switch OBS back's skip. Never `queueFull` or `late` (`readObsStatus`
+ *  refuses a status with either): a full queue or a slow OBS makes it wait
+ *  instead. */
+const BACK_SKIP: Partial<Record<SkipWhy, (t: string) => string>> = {
+  notConnected: (t) => `${t}: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes of the break's end.`,
+  notReady: (t) => `${t}: Didn't switch OBS back: OBS stayed busy for 2 minutes after the break's end.`,
+  notFound: (t) => `${t}: Didn't switch OBS back: OBS doesn't have that scene now.`,
+  timedOut: (t) => `${t}: OBS didn't answer the switch back in time. It may switch late, or not at all.`,
+  failed: (t) => `${t}: OBS refused the switch back.`,
+};
+
+/** The last scene skip's line, `fmtTime` giving its hour and minute; null
+ *  without one. */
+export function obsSkipLine(s: ObsStatus, fmtTime: (ms: number) => string): string | null {
+  const k = s.lastSkip;
+  if (k === null) return null;
+  const t = fmtTime(k.atMs);
+  if (k.op === "scene") return SCENE_SKIP[k.why](t, obsSceneName(k.name));
+  return BACK_SKIP[k.why]?.(t) ?? null;
+}
+
+/** The last text skip's line; null without one. */
+export function obsTextSkipLine(s: ObsStatus, fmtTime: (ms: number) => string): string | null {
+  const k = s.textSkip;
+  if (k === null) return null;
+  const t = fmtTime(k.atMs);
+  return k.why === "failed"
+    ? `${t}: OBS refused a timer's text. Divora tries again in a moment.`
+    : `${t}: OBS didn't take a timer's text in time. Divora tries again in a moment.`;
+}
+
+/** The held-back line: Switch OBS backs waiting for a connection; null
+ *  with none. */
+export function obsHeldBackLine(s: ObsStatus): string | null {
+  return s.heldBack > 0 ? "Waiting for OBS, to switch it back after a break (up to 2 minutes)." : null;
+}
+
+function sameSkip(a: ObsLastSkip | null, b: ObsLastSkip): boolean {
+  return a !== null && a.atMs === b.atMs && a.op === b.op && a.why === b.why && a.timer === b.timer && a.name === b.name;
+}
+
+/** What the OBS section's live region says for a change from `prev` to
+ *  `next`: edges only, never a countdown; "" for nothing to say (§9.1).
+ *  The edges: entering `connected` ("Connected to OBS."); entering a stop
+ *  state (its status line); `connected` → `retrying` ("Lost the connection
+ *  to OBS. Divora keeps trying."); a new scene skip (its line); held-back
+ *  switches going from none to some (the held-back line). Never
+ *  `connecting`, a countdown, or a `retrying` after a `retrying` or an
+ *  attempt (`connecting`): backoff goes retrying → connecting → retrying
+ *  every attempt, and only the first loss is news. The first status the
+ *  section sees (`prev` null) is not a change. Several edges at once are
+ *  said in that order. `fmtTime` as `obsSkipLine`'s. */
+export function obsAnnouncement(
+  prev: ObsStatus | null,
+  next: ObsStatus,
+  fmtTime: (ms: number) => string = obsClockTime,
+): string {
+  if (prev === null) return "";
+  const said: string[] = [];
+  if (prev.state !== next.state) {
+    if (next.state === "connected") said.push("Connected to OBS.");
+    else if (isObsStopState(next.state)) said.push(obsStatusLine(next, 0));
+    else if (prev.state === "connected" && next.state === "retrying") {
+      said.push("Lost the connection to OBS. Divora keeps trying.");
+    }
+  }
+  if (next.lastSkip !== null && !sameSkip(prev.lastSkip, next.lastSkip)) {
+    const line = obsSkipLine(next, fmtTime);
+    if (line !== null) said.push(line);
+  }
+  if (prev.heldBack === 0 && next.heldBack > 0) said.push(obsHeldBackLine(next)!);
+  return said.join(" ");
 }
 
 /** One choice in an OBS picker, as `Select` takes it. */
@@ -528,41 +828,29 @@ export interface ObsPickerShown {
   note: string | null;
 }
 
-/** Settings → OBS's status line for `s` (§9.1); `nowMs` for "Trying again in
- *  N s". S1: declared only. */
-export function obsStatusLine(s: ObsStatus, nowMs: number): string {
-  return notYet("obsStatusLine");
-}
-
-/** The warnings under the status line, only for a status that isn't `off`
- *  and has a host: a network address, and OBS asking for no password. S1:
- *  declared only. */
-export function obsWarnings(s: ObsStatus): string[] {
-  return notYet("obsWarnings");
-}
-
-/** The last scene skip's line, `fmtTime` giving its hour and minute; null
- *  without one. S1: declared only. */
-export function obsSkipLine(s: ObsStatus, fmtTime: (ms: number) => string): string | null {
-  return notYet("obsSkipLine");
-}
-
-/** The last text skip's line; null without one. S1: declared only. */
-export function obsTextSkipLine(s: ObsStatus, fmtTime: (ms: number) => string): string | null {
-  return notYet("obsTextSkipLine");
-}
-
-/** What the OBS section's live region says for a change from `prev` to
- *  `next`: edges only, never a countdown; "" for nothing to say. S1:
- *  declared only. */
-export function obsAnnouncement(prev: ObsStatus | null, next: ObsStatus): string {
-  return notYet("obsAnnouncement");
-}
-
-/** §9.3's table: what an OBS picker shows for `stored`, given whether OBS
- *  control is on, the status, the inventory, whether one is loading and
- *  why the last one failed. `what` picks the words (sources or scenes). S1:
- *  declared only. */
+/** §9.3's table: what an OBS picker (Show in OBS, a Switch OBS scene row,
+ *  the Break row) shows for `stored`, given whether OBS control is on, the
+ *  status, the inventory, whether one is loading and why the last one
+ *  failed (Rust's words). `what` picks the words: sources or scenes; with
+ *  nothing stored a source picker reads "None" and a scene picker "Don't
+ *  switch". By the first row that holds:
+ *  1. OBS control off: the stored name, nothing more (the card says it
+ *     works once Settings → OBS is on);
+ *  2. a text source in `status.missing`: "{name} (not in OBS now)";
+ *  3. not connected: "{name} (not connected)";
+ *  4. loading, or connected with no inventory yet: "{name}", sub "Loading
+ *     OBS sources…" / "Loading OBS scenes…";
+ *  5. the inventory failed: the stored name, and "Couldn't read OBS's
+ *     sources: {error}" / "…OBS's scenes: …" under the picker;
+ *  6. the inventory lists the uuid: the inventory's name (the store
+ *     refreshes the stored one to it); it doesn't: "{name} (not in OBS
+ *     now)", unless that list was cut at its limit (`truncated`), when the
+ *     uuid may be past the cut and the stored name shows. Under the picker,
+ *     no text sources: "No text sources in OBS…"; a list cut: "Divora lists
+ *     OBS's first 100 text sources." / "…first 200 scenes.".
+ *  §9.3 names row 6's "not in OBS now" for scenes; a text source an
+ *  uncut inventory doesn't list is just as gone (deleted, or in another
+ *  scene collection), so it says so too. */
 export function pickerShown(p: {
   what: "textSource" | "scene";
   stored: ObsRef | null;
@@ -572,17 +860,61 @@ export function pickerShown(p: {
   busy: boolean;
   error: string | null;
 }): ObsPickerShown {
-  return notYet("pickerShown");
+  const scenes = p.what === "scene";
+  const name = p.stored === null ? (scenes ? "Don't switch" : "None") : pickerName(p.stored.name);
+  const plain = (text: string, sub: string | null = null, note: string | null = null): ObsPickerShown => ({
+    text,
+    sub,
+    note,
+  });
+  const gone = p.stored === null ? name : `${name} (not in OBS now)`;
+  if (!p.enabled) return plain(name);
+  if (!scenes && p.stored !== null && p.status?.missing.includes(p.stored.uuid)) return plain(gone);
+  if (p.status?.state !== "connected") return plain(p.stored === null ? name : `${name} (not connected)`);
+  if (p.busy || (p.inventory === null && p.error === null)) {
+    return plain(name, scenes ? "Loading OBS scenes…" : "Loading OBS sources…");
+  }
+  if (p.error !== null || p.inventory === null) {
+    return plain(name, null, `Couldn't read OBS's ${scenes ? "scenes" : "sources"}: ${p.error ?? ""}`);
+  }
+  const inv = p.inventory;
+  const list: ReadonlyArray<{ uuid: string; name: string }> = scenes ? inv.scenes : inv.textSources;
+  const cut = inv.truncated && list.length >= (scenes ? OBS_MAX_SCENES : OBS_MAX_TEXT_SOURCES);
+  const note =
+    !scenes && inv.textSources.length === 0
+      ? "No text sources in OBS. Add a Text (GDI+) source there, then open this again."
+      : cut
+        ? scenes
+          ? "Divora lists OBS's first 200 scenes."
+          : "Divora lists OBS's first 100 text sources."
+        : null;
+  if (p.stored === null) return plain(name, null, note);
+  const listed = list.find((x) => x.uuid === p.stored!.uuid);
+  if (listed) return plain(pickerName(listed.name), null, note);
+  return plain(cut ? name : gone, null, note);
 }
 
-/** Show in OBS's choices: "None", then each text source, one that reads a
- *  file or that another timer shows (`mappedByOthers`: uuid → that timer's
- *  name) disabled with its reason. S1: declared only. */
+/** The sub of a text source that reads a file: it can't be picked. */
+const READS_A_FILE = "reads a file — untick Read from file in its Properties in OBS to show a timer here";
+
+/** Show in OBS's choices: "None" (value ""), then each text source in OBS's
+ *  order (value its uuid), its kind as its sub; one that reads a file, or
+ *  that another timer shows (`mappedByOthers`: uuid → that timer's name),
+ *  disabled with its reason as its sub. */
 export function textSourceOptions(inv: ObsInventory, mappedByOthers: ReadonlyMap<string, string>): ObsOption[] {
-  return notYet("textSourceOptions");
+  const out: ObsOption[] = [{ value: "", label: "None" }];
+  for (const t of inv.textSources) {
+    const label = pickerName(t.name);
+    const other = mappedByOthers.get(t.uuid);
+    if (t.readsFromFile) out.push({ value: t.uuid, label, sub: READS_A_FILE, disabled: true });
+    else if (other !== undefined) out.push({ value: t.uuid, label, sub: `shown by ${other}`, disabled: true });
+    else out.push({ value: t.uuid, label, sub: t.kind === "gdiplus" ? "Text (GDI+)" : "Text (FreeType 2)" });
+  }
+  return out;
 }
 
-/** A scene picker's choices, in OBS's order. S1: declared only. */
+/** A scene picker's choices, in OBS's order (value its uuid). The Break
+ *  row puts its "Don't switch" first. */
 export function sceneOptions(inv: ObsInventory): ObsOption[] {
-  return notYet("sceneOptions");
+  return inv.scenes.map((s) => ({ value: s.uuid, label: pickerName(s.name) }));
 }

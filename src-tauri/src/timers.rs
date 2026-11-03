@@ -742,6 +742,11 @@ struct Timer {
     /// against (Q2: Reset and delete undo only what the start did). Empty
     /// before any start.
     started: Arc<Hooks>,
+    /// v1.61.0: the OBS text source its text goes to (D18), the latest
+    /// sync's.
+    obs_text: Option<ObsTarget>,
+    /// v1.61.0: the OBS output a count-up follows (D26), the latest sync's.
+    follow_obs: Option<FollowObs>,
 }
 
 impl Timer {
@@ -764,6 +769,8 @@ impl Timer {
             text: String::new(),
             hooks: Arc::clone(&def.hooks),
             started: Arc::default(),
+            obs_text: def.obs_text.clone(),
+            follow_obs: def.follow_obs,
         };
         timer.reset(Duration::ZERO);
         timer
@@ -896,7 +903,8 @@ impl Timer {
     /// the run too (D7) — and what the run started with, which a cancel
     /// undoes. A new kind on an active countdown cancels it as a Reset
     /// does, with the lists it had before (D6): the new def's are a
-    /// count-up's, which has none (D32).
+    /// count-up's, which has none (D32). v1.61.0: so are its OBS source and
+    /// what it follows (D18, D26); neither changes the run.
     fn redefine(&mut self, def: &TimerDef, now: Duration) -> Option<Transition> {
         self.name.clone_from(&def.name);
         self.length_ms = def.duration_ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS);
@@ -909,6 +917,8 @@ impl Timer {
             self.reset(now);
         }
         self.hooks = Arc::clone(&def.hooks);
+        self.obs_text.clone_from(&def.obs_text);
+        self.follow_obs = def.follow_obs;
         cancelled
     }
 
@@ -957,8 +967,9 @@ impl Timer {
             (TimerOp::Adjust(delta_ms), Running | Paused) => {
                 return self.adjust(delta_ms, now, wall_ms);
             }
-            // S1: track C gives `SetElapsed` its arm (D27); until then it
-            // changes nothing, and nothing sends it.
+            (TimerOp::SetElapsed { ms, running }, _) if self.kind == TimerKind::Countup => {
+                return self.set_elapsed(ms, running, now, wall_ms);
+            }
             _ => return false,
         }
         true
@@ -998,6 +1009,33 @@ impl Timer {
             self.base_ms = next;
             self.retext(now);
         }
+        true
+    }
+
+    /// v1.61.0 (D27): Follow OBS sets a count-up to `ms`, running or paused,
+    /// as the stored run `{phase, ms, anchorMs: wall − ms}` would seed it:
+    /// through the one [`seed`] and [`Timer::take_seed`] a restart uses, so
+    /// the 10 000 h clamp and the anchor arithmetic are the same, saturating.
+    /// Whether the phase or the value changed: one already there is left as
+    /// it is (its anchor too).
+    fn set_elapsed(&mut self, ms: u64, running: bool, now: Duration, wall_ms: i64) -> bool {
+        let run = TimerRun {
+            phase: if running {
+                TimerPhase::Running
+            } else {
+                TimerPhase::Paused
+            },
+            ms: Some(ms),
+            total_ms: None,
+            anchor_ms: Some(wall_ms.saturating_sub(signed(ms))),
+        };
+        let Some(seeded) = seed(self.kind, self.length_ms, &run, wall_ms) else {
+            return false;
+        };
+        if seeded.phase == self.phase && seeded.ms == self.ms_at(now) {
+            return false;
+        }
+        self.take_seed(seeded, now, wall_ms);
         true
     }
 
@@ -1124,6 +1162,10 @@ pub struct TimerCore {
     /// (a) from a gap of [`Discontinuities::COALESCE`] or less, for
     /// [`RECENT_SLEEP`] after it.
     last_clock_sleep: Option<Duration>,
+    /// v1.61.0 (D26): count-ups sleep-paused in this process, by either
+    /// check. The OBS feed carries it, so a change re-seeds every count-up
+    /// that follows OBS.
+    sleeps: u64,
 }
 
 impl TimerCore {
@@ -1138,6 +1180,7 @@ impl TimerCore {
             dirty: false,
             synced: false,
             last_clock_sleep: None,
+            sleeps: 0,
         }
     }
 
@@ -1224,6 +1267,7 @@ impl TimerCore {
                 TimerKind::Countdown => continue,
                 TimerKind::Countup => {
                     paused += 1;
+                    self.sleeps = self.sleeps.saturating_add(1);
                     t.sleep_pause(before, now)
                 }
             };
@@ -1288,6 +1332,7 @@ impl TimerCore {
                         continue;
                     }
                     paused += 1;
+                    self.sleeps = self.sleeps.saturating_add(1);
                     push_transition(&mut self.transitions, t.sleep_pause(before, now));
                 }
             }
@@ -1516,7 +1561,34 @@ impl TimerCore {
     }
 
     /// Each run timer's text, in list order, and every id whose file stays.
+    /// v1.61.0 (D18, D26): and the OBS link's feed — each run timer's text
+    /// by its OBS source (the first timer per source, in list order: the
+    /// same text as its file's), each count-up that follows OBS, and the
+    /// sleep count.
     pub fn text_update(&self) -> TextUpdate {
+        let mut texts: Vec<ObsText> = Vec::new();
+        for t in &self.timers {
+            let Some(target) = &t.obs_text else {
+                continue;
+            };
+            if texts.iter().all(|x| x.uuid != target.uuid) {
+                texts.push(ObsText {
+                    uuid: target.uuid.clone(),
+                    text: t.text.clone(),
+                });
+            }
+        }
+        let follows = self
+            .timers
+            .iter()
+            .filter(|t| t.kind == TimerKind::Countup)
+            .filter_map(|t| {
+                t.follow_obs.map(|what| Follow {
+                    id: t.id.clone(),
+                    what,
+                })
+            })
+            .collect();
         TextUpdate {
             texts: self
                 .timers
@@ -1529,8 +1601,11 @@ impl TimerCore {
                 .map(|t| t.id.clone())
                 .chain(self.kept.iter().cloned())
                 .collect(),
-            // S1: track C fills the feed (D18, D26).
-            obs: ObsFeed::default(),
+            obs: ObsFeed {
+                texts,
+                follows,
+                sleeps: self.sleeps,
+            },
         }
     }
 
@@ -1557,12 +1632,12 @@ impl Default for TimerCore {
 mod tests {
     use super::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use super::{
-        adjust_delta, entry_from_wire, hotkey_timer_request, is_timer_id, run_from_wire,
-        timer_text, CancelWhy, FollowObs, NoTimer, Note, ObsTarget, TextUpdate, TimerCore,
-        TimerDef, TimerKind, TimerOp, TimerPhase, TimerRun, TimerSnapshot, TimerState, Transition,
-        WireEntry, DEFAULT_LENGTH_MS, MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_NOTES,
-        MAX_SEED_ELAPSED_MS, MAX_SYNC_ENTRIES, MAX_TIMERS, MAX_TRANSITIONS, MIN_LENGTH_MS, TICK,
-        TIMER_STATE_EVENT,
+        adjust_delta, entry_from_wire, hotkey_timer_request, is_timer_id, run_from_wire, signed,
+        timer_text, CancelWhy, Follow, FollowObs, NoTimer, Note, ObsTarget, ObsText, TextUpdate,
+        TimerCore, TimerDef, TimerKind, TimerOp, TimerPhase, TimerRun, TimerSnapshot, TimerState,
+        Transition, WireEntry, DEFAULT_LENGTH_MS, MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS,
+        MAX_NOTES, MAX_SEED_ELAPSED_MS, MAX_SYNC_ENTRIES, MAX_TIMERS, MAX_TRANSITIONS,
+        MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
     };
     use crate::obs::MAX_UUID_CHARS;
     use crate::timer_actions::{
@@ -1804,6 +1879,12 @@ mod tests {
             .unwrap()
             .iter()
             .any(|row| row["verb"] == "finish"));
+        // v1.61.0 (D27): only the OBS link sets a count-up's time; no key
+        // does.
+        for verb in ["follow", "setElapsed", "set-elapsed", "set_elapsed"] {
+            let id = format!("tm:timer-1:{verb}");
+            assert_eq!(hotkey_timer_request(&id, true), None, "{id}");
+        }
     }
 
     /// §7.4: rounding up for a countdown, down for a count-up, and the hour
@@ -4525,6 +4606,343 @@ mod tests {
         assert_eq!(core.next_wake(ms(5_500), secs(5)), ms(30));
     }
 
+    // ---- v1.61.0: Talk to OBS -------------------------------------------
+
+    /// D27: Follow OBS's `SetElapsed` on a count-up — idle, running or
+    /// paused — leaves it running or paused at `ms`, clamped at
+    /// [`MAX_SEED_ELAPSED_MS`], dirty, recording nothing; one that finds the
+    /// count-up already there changes nothing (not dirty). A countdown's is
+    /// ignored in every phase.
+    #[test]
+    fn set_elapsed_table() {
+        use TimerKind::{Countdown, Countup};
+        type Want = Option<(TimerPhase, u64, &'static str)>;
+        let set = |ms, running| TimerOp::SetElapsed { ms, running };
+        let rows: [(TimerKind, TimerPhase, TimerOp, Want); 16] = [
+            (
+                Countup,
+                Idle,
+                set(125_000, true),
+                Some((Running, 125_000, "02:05")),
+            ),
+            (
+                Countup,
+                Idle,
+                set(125_000, false),
+                Some((Paused, 125_000, "02:05")),
+            ),
+            (Countup, Idle, set(0, false), Some((Paused, 0, "00:00"))),
+            (Countup, Running, set(0, true), Some((Running, 0, "00:00"))),
+            (
+                Countup,
+                Running,
+                set(125_000, false),
+                Some((Paused, 125_000, "02:05")),
+            ),
+            // In `in_phase`, a running count-up reads 10.5 s: no change.
+            (Countup, Running, set(10_500, true), None),
+            (
+                Countup,
+                Paused,
+                set(3_600_000, true),
+                Some((Running, 3_600_000, "1:00:00")),
+            ),
+            // Paused at 10.5 s already.
+            (Countup, Paused, set(10_500, false), None),
+            (
+                Countup,
+                Paused,
+                set(u64::MAX, false),
+                Some((Paused, MAX_SEED_ELAPSED_MS, "10000:00:00")),
+            ),
+            (
+                Countup,
+                Running,
+                set(u64::MAX, true),
+                Some((Running, MAX_SEED_ELAPSED_MS, "10000:00:00")),
+            ),
+            (Countdown, Idle, set(125_000, true), None),
+            (Countdown, Running, set(125_000, true), None),
+            (Countdown, Running, set(0, false), None),
+            (Countdown, Paused, set(125_000, false), None),
+            (Countdown, Done, set(125_000, true), None),
+            (Countdown, Expired, set(0, true), None),
+        ];
+        for (kind, phase, top, want) in rows {
+            let (mut core, at) = in_phase(kind, phase);
+            let before = shown(&mut core, at, "timer-1");
+            core.take_dirty();
+            op(&mut core, "timer-1", top, at);
+            let what = format!("{kind:?} {phase:?} {top:?}");
+            assert_eq!(core.take_transitions(), vec![], "{what}");
+            if let Some((phase, ms, text)) = want {
+                assert!(core.take_dirty(), "{what}: dirty");
+                assert_eq!(
+                    shown(&mut core, at, "timer-1"),
+                    (phase, ms, text.to_string()),
+                    "{what}"
+                );
+            } else {
+                assert!(!core.take_dirty(), "{what}: not dirty");
+                assert_eq!(shown(&mut core, at, "timer-1"), before, "{what}");
+            }
+        }
+        // A running one runs on from there.
+        let (mut core, at) = in_phase(Countup, Idle);
+        op(&mut core, "timer-1", set(125_000, true), at);
+        assert_eq!(
+            shown(&mut core, at + secs(5), "timer-1"),
+            (Running, 130_000, "02:10".into())
+        );
+    }
+
+    /// D27: a `SetElapsed` is the seed of the stored run `{phase, ms,
+    /// anchorMs: wall − ms}`: the same `ms`, `anchorMs` and text as a
+    /// restart seeding that run, running and paused, the clamp included.
+    #[test]
+    fn set_elapsed_is_a_seed() {
+        let now = secs(30);
+        let wall_ms = wall(now);
+        for (ms, running) in [
+            (125_000, true),
+            (125_000, false),
+            (0, true),
+            (MAX_SEED_ELAPSED_MS + 1, true),
+            (u64::MAX, false),
+        ] {
+            let mut core = core_with(vec![countup("timer-1")]);
+            op(
+                &mut core,
+                "timer-1",
+                TimerOp::SetElapsed { ms, running },
+                now,
+            );
+            let set = state(&mut core, now, "timer-1");
+            let phase = if running { Running } else { Paused };
+            let run = stored(
+                phase,
+                Some(ms),
+                None,
+                Some(wall_ms.saturating_sub(signed(ms))),
+            );
+            let (want, _) = seeded(
+                "timer-1",
+                TimerKind::Countup,
+                DEFAULT_LENGTH_MS,
+                run,
+                wall_ms,
+            );
+            assert_eq!(
+                (set.phase, set.ms, set.anchor_ms, set.text),
+                (want.phase, want.ms, want.anchor_ms, want.text),
+                "{ms} {running}"
+            );
+        }
+    }
+
+    /// The shape a `obsText` or `followObs` takes in a sync entry.
+    fn obs_def(entry: WireEntry, uuid: Option<&str>, follow: Option<FollowObs>) -> WireEntry {
+        edit(entry, |d| {
+            d.obs_text = uuid.map(|uuid| ObsTarget { uuid: uuid.into() });
+            d.follow_obs = follow;
+        })
+    }
+
+    /// D18, D26: a sync's OBS source and follow are the timer's from then
+    /// on, set, changed or cleared, and neither changes its run.
+    #[test]
+    fn redefine_takes_obs_fields() {
+        let mut core = core_with(vec![countup("timer-1"), countdown("timer-2", 300_000)]);
+        arm(&mut core, "timer-1", Duration::ZERO);
+        arm(&mut core, "timer-2", Duration::ZERO);
+        let now = secs(5);
+        let feed = |core: &mut TimerCore| {
+            let u = core.text_update();
+            (u.obs.texts, u.obs.follows)
+        };
+        assert_eq!(feed(&mut core), (vec![], vec![]));
+        for (up, down, follow) in [
+            (Some("source-a"), Some("source-b"), Some(FollowObs::Record)),
+            (Some("source-c"), None, Some(FollowObs::Stream)),
+            (None, Some("source-a"), None),
+        ] {
+            core.sync(
+                vec![
+                    obs_def(countup("timer-1"), up, follow),
+                    obs_def(countdown("timer-2", 300_000), down, None),
+                ],
+                now,
+                wall(now),
+                None,
+            );
+            assert_eq!(core.take_transitions(), vec![]);
+            assert_eq!(
+                shown(&mut core, now, "timer-1"),
+                (Running, 5_000, "00:05".into())
+            );
+            assert_eq!(
+                shown(&mut core, now, "timer-2"),
+                (Running, 295_000, "04:55".into())
+            );
+            let mut texts = Vec::new();
+            for (uuid, text) in [(up, "00:05"), (down, "04:55")] {
+                if let Some(uuid) = uuid {
+                    texts.push(ObsText {
+                        uuid: uuid.into(),
+                        text: text.into(),
+                    });
+                }
+            }
+            let follows = follow
+                .map(|what| Follow {
+                    id: "timer-1".into(),
+                    what,
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(feed(&mut core), (texts, follows), "{up:?} {down:?}");
+        }
+        // A kind change keeps the source; a countdown follows nothing.
+        core.sync(
+            vec![obs_def(
+                countdown("timer-1", 300_000),
+                Some("source-d"),
+                Some(FollowObs::Stream),
+            )],
+            now,
+            wall(now),
+            None,
+        );
+        let u = core.text_update();
+        assert_eq!(
+            u.obs.texts,
+            vec![ObsText {
+                uuid: "source-d".into(),
+                text: "05:00".into(),
+            }]
+        );
+        assert_eq!(u.obs.follows, vec![]);
+    }
+
+    /// D18, D26: the feed holds each run timer's text by its source, in
+    /// list order, the first timer per source only (the second shows
+    /// nowhere in OBS); the count-ups that follow OBS, never a countdown or
+    /// a kept entry; and the sleep count.
+    #[test]
+    fn obs_feed_table() {
+        let mut entries = vec![
+            obs_def(countdown("timer-1", 60_000), Some("source-a"), None),
+            obs_def(
+                countup("timer-2"),
+                Some("source-b"),
+                Some(FollowObs::Stream),
+            ),
+            // A second timer on source-a: the first wins.
+            obs_def(countdown("timer-3", 120_000), Some("source-a"), None),
+            obs_def(countup("timer-4"), None, Some(FollowObs::Record)),
+            // A countdown can't follow, even one a hand edit gave a follow.
+            obs_def(
+                countdown("timer-5", 30_000),
+                Some("source-c"),
+                Some(FollowObs::Stream),
+            ),
+        ];
+        // Past the 16th, kept: no feed.
+        for n in 6..=17 {
+            entries.push(countdown(&format!("timer-{n}"), 60_000));
+        }
+        entries.push(obs_def(
+            countup("timer-18"),
+            Some("source-z"),
+            Some(FollowObs::Record),
+        ));
+        let mut core = core_with(entries);
+        arm(&mut core, "timer-2", Duration::ZERO);
+        tick(&mut core, ms(3_100));
+        let u = core.text_update();
+        assert_eq!(
+            u.obs.texts,
+            vec![
+                ObsText {
+                    uuid: "source-a".into(),
+                    text: "01:00".into(),
+                },
+                ObsText {
+                    uuid: "source-b".into(),
+                    text: "00:03".into(),
+                },
+                ObsText {
+                    uuid: "source-c".into(),
+                    text: "00:30".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            u.obs.follows,
+            vec![
+                Follow {
+                    id: "timer-2".into(),
+                    what: FollowObs::Stream,
+                },
+                Follow {
+                    id: "timer-4".into(),
+                    what: FollowObs::Record,
+                },
+            ]
+        );
+        assert_eq!(u.obs.sleeps, 0);
+        // The text is the file's.
+        for t in &u.obs.texts {
+            let id = match t.uuid.as_str() {
+                "source-a" => "timer-1",
+                "source-b" => "timer-2",
+                _ => "timer-5",
+            };
+            assert!(u.texts.contains(&(id.to_string(), t.text.clone())), "{t:?}");
+        }
+    }
+
+    /// D26: the core counts every count-up it sleep-pauses, by the clock's
+    /// check (a) and the wall's (b); a countdown's expiry, a paused or idle
+    /// count-up and a sleep with nothing running count nothing.
+    #[test]
+    fn sleeps_counts_each_sleep_paused_count_up() {
+        let sleeps = |core: &TimerCore| core.text_update().obs.sleeps;
+        let mut core = core_with(vec![
+            countup("timer-1"),
+            countup("timer-2"),
+            countup("timer-3"),
+            countdown("timer-4", 5_000),
+        ]);
+        for id in ["timer-1", "timer-2", "timer-4"] {
+            arm(&mut core, id, Duration::ZERO);
+        }
+        tick(&mut core, secs(1));
+        assert_eq!(sleeps(&core), 0);
+        // (a): the clock counted an hour's sleep; two count-ups were running.
+        let back = secs(1) + secs(3_600);
+        core.tick(back, wall(back), Some(secs(1)));
+        assert_eq!(sleeps(&core), 2);
+        // Nothing running now: another sleep counts nothing.
+        let again = back + secs(7_200);
+        core.tick(again, wall(again), Some(back + secs(1)));
+        assert_eq!(sleeps(&core), 2);
+        // (b), past (a)'s minute: a signal with no clock jump, the wall 10
+        // minutes ahead.
+        let start = again + secs(120);
+        op(&mut core, "timer-3", TimerOp::Arm, start);
+        let mut now = start;
+        for _ in 0..3 {
+            now += ms(100);
+            tick(&mut core, now);
+        }
+        let before = now;
+        now += ms(100);
+        core.tick(now, wall(now) + 600_000, Some(before));
+        assert_eq!(state(&mut core, now, "timer-3").phase, Paused);
+        assert_eq!(sleeps(&core), 3);
+    }
+
     /// D33: fields a later release sends (`obsText`, `followObs`, actions of
     /// a kind this build doesn't know) don't stop a definition: it runs.
     /// v1.60.0: its readable actions are read, the rest skipped (D4).
@@ -4566,6 +4984,9 @@ mod tests {
     /// at their extremes, and seeds from anchors at `i64::MIN` / `i64::MAX`.
     /// v1.60.0: End now among the ops, every transition planned, lists with
     /// a 10 000-character line and preset id, and `replay_at` at its edges.
+    /// v1.61.0 (D27): Follow OBS's `SetElapsed` at `u64::MAX` and 0, running
+    /// and paused, on every kind; the count-up follows OBS and shows in a
+    /// source, so the feed is built at every edge too.
     #[test]
     #[allow(clippy::too_many_lines)] // every edge, then v1.60.0's
     fn nothing_panics_at_the_edges() {
@@ -4604,8 +5025,10 @@ mod tests {
                 duration_ms,
                 resume: None,
                 hooks: hooks.clone(),
-                obs_text: None,
-                follow_obs: None,
+                obs_text: Some(ObsTarget {
+                    uuid: "u".repeat(MAX_UUID_CHARS),
+                }),
+                follow_obs: (kind == Countup).then_some(FollowObs::Stream),
             })
         };
         let clocks = [
@@ -4628,6 +5051,24 @@ mod tests {
             TimerOp::Reset,
             TimerOp::Toggle,
             TimerOp::Finish,
+            TimerOp::SetElapsed {
+                ms: u64::MAX,
+                running: true,
+            },
+            TimerOp::SetElapsed {
+                ms: u64::MAX,
+                running: false,
+            },
+            TimerOp::SetElapsed {
+                ms: 0,
+                running: true,
+            },
+            TimerOp::Adjust(i64::MAX),
+            TimerOp::SetElapsed {
+                ms: u64::MAX,
+                running: false,
+            },
+            TimerOp::Adjust(i64::MIN),
         ];
         let ids = ["timer-1", "timer-2", "timer-3"];
         let drained = Instant::now();

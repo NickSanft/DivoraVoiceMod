@@ -13,6 +13,10 @@
 //   • v1.59.0: Hourglass (countdowns and count-ups the backend keeps, after
 //     Stream overlay); v1.60.0: a countdown's At start and At zero lists,
 //     End now and Add break (BRB)
+//   • v1.61.0: OBS (Talk to OBS: Divora's one connection to OBS's own
+//     WebSocket server, after Hourglass), and in Hourglass a timer's Show in
+//     OBS and Follow OBS, the Switch OBS scene and Switch OBS back actions,
+//     and the scene Add break (BRB) switches OBS to
 
 import {
   createEffect,
@@ -72,6 +76,7 @@ import {
   lengthText,
   MAX_NAME,
   MAX_TIMERS,
+  obsTextOwners,
   parseLength,
   phaseWord,
   readTimerName,
@@ -85,22 +90,47 @@ import {
 import type { TimerPhase, TimerState } from "../overlay/timerState";
 import {
   ACTION_KINDS,
+  ACTION_OPS,
   actionsForSync,
   actionWords,
   canAddAction,
+  obsSceneAction,
   pairingWarnings,
   readAction,
   readStoredActions,
   restores,
   revertsAtZero,
+  runsAt,
   timerVoiceLine,
+  type ActionAt,
   type ActionNames,
   type ActionRow,
   type PairingWarning,
   type TimerAction,
-  type TimerActionKind,
   type TimerHook,
 } from "../data/timerActions";
+import {
+  OBS_PORT_ERROR,
+  OBS_SAVED_ADDRESS_LINE,
+  obsAnnouncement,
+  obsClockTime,
+  obsHeldBackLine,
+  obsRetryLabel,
+  obsSkipLine,
+  obsStatusLine,
+  obsTextSkipLine,
+  obsWarnings,
+  pickerShown,
+  readFollowObs,
+  readObsRef,
+  sceneOptions,
+  textSourceOptions,
+  type FollowObs,
+  type ObsInventory,
+  type ObsOption,
+  type ObsRef,
+  type ObsStatus,
+} from "../data/obs";
 import { transforms } from "../data/ptm";
 import {
   MAX_AV_OFFSET_MS,
@@ -225,6 +255,8 @@ export function SettingsScreen(): JSX.Element {
       <StreamOverlaySection />
 
       <HourglassSection />
+
+      <ObsSection />
 
       <AboutSection />
     </div>
@@ -2141,7 +2173,9 @@ const PILLARS: PillarDef[] = [
   {
     icon: "shield",
     title: "No telemetry",
-    body: "Nothing leaves your machine. Audio stays on device.",
+    // v1.61.0 (Q4): with OBS on another PC, timers' times and scene
+    // switches do leave it, so the pillar says what stays true.
+    body: "Nothing is collected or sent home. Audio stays on device.",
   },
   {
     icon: "lock",
@@ -2544,9 +2578,14 @@ const LENGTH_REASON = "Enter whole minutes, m:ss or h:mm:ss, from 1 second to 24
 const BREAK_PAUSE_KEY = "It pauses a break and doesn't end it; End now's key ends it.";
 /** Reset's row on a countdown whose At zero puts something back (D10),
  *  naming only what its At zero has: the undo runs no other (§7.1 P9).
- *  With both, §9's sentence as it was. */
+ *  With both, §9's sentence as it was. v1.61.0: Switch OBS back too, which
+ *  a reset runs only if the start switched OBS. */
+const UNDO_WORDS: Record<string, string> = {
+  "Unmute my voice": "Unmute my voice if its start muted you",
+  "Switch OBS back": "Switch OBS back if its start switched OBS",
+};
 function resetUndoes(t: StoredTimer): string | null {
-  const parts = restoringNames(t).map((n) => (n === "Unmute my voice" ? `${n} if its start muted you` : n));
+  const parts = restoringNames(t).map((n) => UNDO_WORDS[n] ?? n);
   return parts.length > 0
     ? `Back to the start, stopped. While it's running or paused, this also undoes its start with its At zero list: ${parts.join(", and ")}.`
     : null;
@@ -2563,7 +2602,7 @@ const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; f
   },
   onFire: {
     title: "At zero",
-    help: "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice and Back to the preset before run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you. A change here counts for the run that's going on.",
+    help: "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice, Back to the preset before and Switch OBS back run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you, and Switch OBS back only if its start switched OBS. A change here counts for the run that's going on.",
     at: "at zero",
     from: "from zero of",
     add: "at zero of",
@@ -2571,9 +2610,10 @@ const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; f
 };
 
 /** Said once under a countdown's lists when either has an action: the one
- *  general limit, with its cause, examples and a way to check (D37). */
+ *  general limit, with its cause, examples and a way to check (D37).
+ *  v1.61.0: OBS not connected is one, Switch OBS back excepted. */
 const ACTIONS_LIMIT =
-  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
+  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, OBS isn't connected (a Switch OBS back excepted: it waits up to 2 minutes for OBS), or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
 
 const LIST_FULL = "Up to 8 actions here. Remove one to add another.";
 
@@ -2583,16 +2623,25 @@ const PAIRING_WORDS: Record<PairingWarning, string> = {
   switchNoRevert:
     "This switches your preset when it starts, and At zero has no Back to the preset before, so a reset or a delete leaves you on that preset, as does its end unless At zero switches preset. Add Back to the preset before at zero to switch back.",
   revertNoSwitch: "The start doesn't switch preset, so there's nothing to go back to.",
+  // v1.61.0: the same two for OBS's scene.
+  sceneNoBack:
+    "This switches OBS's scene when it starts, and At zero has no Switch OBS back, so a reset or a delete leaves OBS on that scene, as does its end unless At zero switches scene. Add Switch OBS back at zero.",
+  backNoScene: "The start doesn't switch OBS's scene, so there's nothing to switch back to.",
 };
 
 /** Why a stored entry doesn't run, under its row. `startRevert`: Back to the
  *  preset before stored in At start (a hand edit): Rust reads it and never
- *  runs it there, so the card says so rather than show it as working. */
-const NOT_RUN_WORDS: Record<"unreadable" | "secondLine" | "pastEight" | "startRevert", string> = {
+ *  runs it there, so the card says so rather than show it as working.
+ *  v1.61.0: `startSceneBack`, the same for Switch OBS back. */
+const NOT_RUN_WORDS: Record<
+  "unreadable" | "secondLine" | "pastEight" | "startRevert" | "startSceneBack",
+  string
+> = {
   unreadable: "Made by a newer Divora, or can't be read here. It stays saved and doesn't run.",
   secondLine: "Only the first line in a list is said. This one stays saved and isn't said.",
   pastEight: "Only the first 8 actions in a list run. This one stays saved and doesn't run.",
   startRevert: "Back to the preset before runs only at zero. This one stays saved and doesn't run.",
+  startSceneBack: "Switch OBS back runs only at zero. This one stays saved and doesn't run.",
 };
 
 const LINE_REASON = "Type a line of up to 200 characters. A long line takes longer to prepare.";
@@ -2603,20 +2652,43 @@ const NEW_LINE: Record<TimerHook, string> = { onStart: "Be right back.", onFire:
 /** Always there: Critter Chatter needs no download. */
 const FALLBACK_VOICE = "babble:bright";
 
-/** Add action's choices, in the listbox's order; the kinds a list doesn't
- *  offer (Back to the preset before at a start) are left out per list. */
-type AddChoice = "preset" | "randomPreset" | "revertPreset" | "mute" | "unmute" | "tile" | "speak" | "saveReplay" | "panic";
-const ADD_CHOICES: Array<{ choice: AddChoice; kind: TimerActionKind; label: string }> = [
-  { choice: "preset", kind: "preset", label: "Switch preset" },
-  { choice: "randomPreset", kind: "randomPreset", label: "Random preset" },
-  { choice: "revertPreset", kind: "revertPreset", label: "Back to the preset before" },
-  { choice: "mute", kind: "setMuted", label: "Mute my voice" },
-  { choice: "unmute", kind: "setMuted", label: "Unmute my voice" },
-  { choice: "tile", kind: "tile", label: "Play a clip" },
-  { choice: "speak", kind: "speak", label: "Speak a line" },
-  { choice: "saveReplay", kind: "saveReplay", label: "Save a replay" },
-  { choice: "panic", kind: "panic", label: "Stop all clips and lines" },
+/** Add action's choices, in the listbox's order, each with where it runs;
+ *  the ones a list doesn't offer (Back to the preset before and Switch OBS
+ *  back at a start) are left out per list. v1.61.0: by choice, not by kind,
+ *  since one kind (`obs`) has two choices that run in different places. */
+type AddChoice =
+  | "preset"
+  | "randomPreset"
+  | "revertPreset"
+  | "mute"
+  | "unmute"
+  | "tile"
+  | "speak"
+  | "saveReplay"
+  | "panic"
+  | "obsScene"
+  | "obsBack";
+const ADD_CHOICES: Array<{ choice: AddChoice; at: readonly ActionAt[]; label: string }> = [
+  { choice: "preset", at: ACTION_KINDS.preset.at, label: "Switch preset" },
+  { choice: "randomPreset", at: ACTION_KINDS.randomPreset.at, label: "Random preset" },
+  { choice: "revertPreset", at: ACTION_KINDS.revertPreset.at, label: "Back to the preset before" },
+  { choice: "mute", at: ACTION_KINDS.setMuted.at, label: "Mute my voice" },
+  { choice: "unmute", at: ACTION_KINDS.setMuted.at, label: "Unmute my voice" },
+  { choice: "tile", at: ACTION_KINDS.tile.at, label: "Play a clip" },
+  { choice: "speak", at: ACTION_KINDS.speak.at, label: "Speak a line" },
+  { choice: "saveReplay", at: ACTION_KINDS.saveReplay.at, label: "Save a replay" },
+  { choice: "panic", at: ACTION_KINDS.panic.at, label: "Stop all clips and lines" },
+  { choice: "obsScene", at: ACTION_OPS.obs.scene.at, label: "Switch OBS scene" },
+  { choice: "obsBack", at: ACTION_OPS.obs.sceneBack.at, label: "Switch OBS back" },
 ];
+
+/** v1.61.0: an `obs` row's note (§9.4), and the line both say while
+ *  Settings → OBS is off. */
+const OBS_SCENE_NOTE =
+  "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS takes more than 5 seconds to get to it, it doesn't switch.";
+const OBS_BACK_NOTE =
+  "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.";
+const OBS_ACTION_OFF = "Settings → OBS is off, so this does nothing until you turn it on.";
 
 /** The sigil a row leads with. */
 function actionSigil(a: TimerAction): SigilName {
@@ -2638,8 +2710,7 @@ function actionSigil(a: TimerAction): SigilName {
     case "panic":
       return "panic";
     case "obs":
-      // v1.61.0 S1: a stand-in until OBS's own sigil (`link`, D36) lands.
-      return "screen";
+      return "link";
   }
 }
 
@@ -2650,12 +2721,13 @@ const mutesAtStart = (t: StoredTimer): boolean =>
 const unmutesAtZero = (t: StoredTimer): boolean =>
   actionsForSync(t.onFire).some((a) => a.kind === "setMuted" && !a.muted);
 /** At zero's putting-back actions, as the expired line names them: what a
- *  run-out runs (§7.1 P5, P6). */
+ *  run-out runs (§7.1 P5, P6). v1.61.0: Switch OBS back is one. */
 function restoringNames(t: StoredTimer): string[] {
   const kept = actionsForSync(t.onFire).filter(restores);
   const names: string[] = [];
   if (kept.some((a) => a.kind === "setMuted")) names.push("Unmute my voice");
   if (kept.some((a) => a.kind === "revertPreset")) names.push("Back to the preset before");
+  if (kept.some((a) => a.kind === "obs")) names.push("Switch OBS back");
   return names;
 }
 
@@ -2823,6 +2895,11 @@ function HourglassSection(): JSX.Element {
             Add break (BRB)
           </Button>
         </div>
+        {/* v1.61.0 (D35): with OBS control on, the scene the next breaks
+            switch OBS to, and back at zero. */}
+        <Show when={app.obsSettings().enabled}>
+          <BreakSceneRow />
+        </Show>
         <Show when={full()}>
           <div style={reasonStyle}>Hourglass holds up to 16 timers. Delete one to add another.</div>
         </Show>
@@ -2867,6 +2944,13 @@ function HourglassSection(): JSX.Element {
               the file about once a second, so its text can run up to about 2 seconds behind the
               overlay, and now and then it may show nothing for a second or two. While Divora is
               closed, a file keeps the last time it showed.
+            </div>
+            {/* v1.61.0: the direct way, for those with Settings → OBS on. */}
+            <div data-testid="hourglass-obs-direct" style={{ ...helpStyle, "margin-top": "var(--s1)" }}>
+              With Settings → OBS on, a timer can also show in an OBS text source directly: pick it
+              under Show in OBS on its card. Divora then sends each new time to OBS as it changes,
+              instead of OBS checking the file once a second. A source set to Read from file can't
+              be picked until you untick that in OBS.
             </div>
           </div>
           {/* Named apart from Recordings' "Open folder" on the same page. */}
@@ -3115,6 +3199,13 @@ function TimerControls(props: {
       },
     );
   };
+  // v1.61.0: while it runs or is paused, the last OBS scene switch that
+  // didn't happen, when it was this timer's (the OBS section says it too).
+  const obsSkip = (): string | null => {
+    const s = app.obsStatus();
+    if (!adjustable() || !s || s.lastSkip?.timer !== props.id) return null;
+    return obsSkipLine(s, obsClockTime);
+  };
   // Where push-to-modulate's key works from a call: the Mixer card's rule
   // (MixerScreen.tsx `PushToModulateCard`), so the two lines agree.
   const ptmInCall = (): "key" | "midi" | null =>
@@ -3177,6 +3268,13 @@ function TimerControls(props: {
       <Show when={voiceLine()}>
         {(line) => (
           <div data-testid="timer-voice-line" style={helpStyle}>
+            {line()}
+          </div>
+        )}
+      </Show>
+      <Show when={obsSkip()}>
+        {(line) => (
+          <div data-testid="timer-obs-skip" style={reasonStyle}>
             {line()}
           </div>
         )}
@@ -3319,6 +3417,8 @@ function TimerControls(props: {
         </Show>
       </Show>
 
+      <TimerObsRows id={props.id} name={props.name} timer={props.timer} />
+
       <div
         style={{
           display: "flex",
@@ -3436,6 +3536,228 @@ function TimerHotkeyRow(props: {
   );
 }
 
+// ---- v1.61.0: a timer and OBS ----
+//
+// Show in OBS, Follow OBS, a Switch OBS scene row's scene and the Break row
+// pick from what OBS has, read when a picker opens (`obs_inventory`, through
+// the store) and again whenever OBS's scenes change while one is on screen.
+// Each stores OBS's uuid, which is what Divora acts on, and the name as last
+// seen, for words (the store keeps it up to date with OBS's).
+
+/** One OBS picker's choices from an inventory, and without one. */
+type ObsChoices = (inv: ObsInventory) => ObsOption[];
+
+/** An OBS picker (Show in OBS, a Switch OBS scene row, the Break row): a
+ *  Select of what OBS has, its shown words and the line under it by §9.3's
+ *  table (data/obs.ts `pickerShown`). Its stored choice is always one of
+ *  its options, in the table's words, so the field never shows another's
+ *  name. Until OBS is connected and its list read, it offers only its
+ *  leading None or Don't switch (`fallback`) and what is stored, never a
+ *  list from an earlier connection. It reads OBS's list again each time it
+ *  opens while connected, and counts as a watcher while it's on screen, so
+ *  the store reads the list again when OBS's scenes change. */
+function ObsPicker(props: {
+  what: "textSource" | "scene";
+  /** What is stored; null for None or Don't switch (value ""). */
+  stored: ObsRef | null;
+  /** The choices an inventory gives, a leading None or Don't switch
+   *  included. */
+  options: ObsChoices;
+  /** The choices without one. */
+  fallback: ObsOption[];
+  ariaLabel: string;
+  /** Under the picker while OBS can't find what is stored. */
+  goneLine?: string;
+  /** A choice other than the stored one: its value. */
+  onPick: (value: string) => void;
+}): JSX.Element {
+  const app = useApp();
+  onCleanup(app.watchObs());
+  const connected = () => app.obsStatus()?.state === "connected";
+  const shown = createMemo(() =>
+    pickerShown({
+      what: props.what,
+      stored: props.stored,
+      enabled: app.obsSettings().enabled,
+      status: app.obsStatus(),
+      inventory: app.obsInventory(),
+      busy: app.obsInventoryBusy(),
+      error: app.obsInventoryError(),
+    }),
+  );
+  const value = () => props.stored?.uuid ?? "";
+  const options = createMemo<ObsOption[]>(() => {
+    const inv = app.obsInventory();
+    const base = connected() && inv !== null ? props.options(inv) : props.fallback;
+    const s = shown();
+    const own = base.find((o) => o.value === value());
+    const mine: ObsOption = { ...(own ?? { value: value() }), label: s.text };
+    // The table's sub ("Loading OBS sources…"), else the option's own
+    // (its kind, or why it can't be picked) while the table shows the
+    // name OBS lists; none beside "(not in OBS now)".
+    const sub = s.sub ?? (own !== undefined && s.text === own.label ? own.sub : undefined);
+    if (sub === undefined) delete mine.sub;
+    else mine.sub = sub;
+    return own ? base.map((o) => (o === own ? mine : o)) : [...base, mine];
+  });
+  // `pickerShown` says "(not in OBS now)" both for a source OBS answered it
+  // can't find and for one a complete list leaves out.
+  const gone = () => {
+    const s = props.stored;
+    return s !== null && shown().text === `${s.name === "" ? "(no name)" : s.name} (not in OBS now)`;
+  };
+  return (
+    <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+      <Select
+        icon="link"
+        value={value()}
+        options={options()}
+        onChange={(v) => {
+          if (v !== value()) props.onPick(v);
+        }}
+        onOpen={() => {
+          if (connected()) void app.refreshObsInventory();
+        }}
+        ariaLabel={props.ariaLabel}
+        blurOnPointer
+      />
+      <Show when={gone() && props.goneLine}>
+        {(line) => <div style={reasonStyle}>{line()}</div>}
+      </Show>
+      <Show when={shown().note}>
+        {(note) => <div style={app.obsInventoryError() !== null ? reasonStyle : helpStyle}>{note()}</div>}
+      </Show>
+    </div>
+  );
+}
+
+const SHOW_IN_OBS_HELP =
+  "Pick a text source made for this timer: Divora replaces its text, and what it said before isn't kept. Set its font, colour and position in OBS. While the timer runs, each new second refreshes the source's Properties window in OBS if it's open, so pause the timer to edit it there. When this timer stops showing here, Divora clears the source's text the next time it's connected to OBS, unless Divora was closed in between.";
+const SHOW_IN_OBS_GONE = "OBS can't find this source now. Pick it again, or pick another.";
+const FOLLOW_OBS_HELP =
+  "Starts from 0:00 when OBS starts, pauses when it stops (its last time stays until OBS starts again), and pauses with a paused recording. If OBS was already going when Divora connected, it starts from OBS's own count, so it's about right, and can be further behind after the stream reconnected. Its own buttons and keys still work; OBS's next start, stop, pause or resume, each time Divora connects to OBS, and a wake from sleep set it again. If Divora loses OBS, it keeps counting on its own until it connects again.";
+const FOLLOW_OBS_CHOICES: Array<{ value: "off" | FollowObs; label: string }> = [
+  { value: "off", label: "Off" },
+  { value: "stream", label: "Streaming" },
+  { value: "record", label: "Recording" },
+];
+const NO_SOURCE: ObsOption = { value: "", label: "None" };
+const DONT_SWITCH: ObsOption = { value: "", label: "Don't switch" };
+
+/** A timer's OBS rows (D34). Show in OBS on every timer: the text source
+ *  it shows in (its uuid goes to Rust in the next sync). Follow OBS on a
+ *  count-up: OBS's stream or recording starts it at 0:00 and pauses it.
+ *  Each shows while OBS control is on, or while it's set, with a line that
+ *  says it works once Settings → OBS is on (so it can still be cleared). */
+function TimerObsRows(props: { id: string; name: string; timer: StoredTimer }): JSX.Element {
+  const app = useApp();
+  const obsOn = () => app.obsSettings().enabled;
+  const shownIn = () => readObsRef(props.timer.obsText);
+  const follow = (): FollowObs | null => (props.timer.kind === "countup" ? readFollowObs(props.timer.followObs) : null);
+  // The sources the other timers show in: offered, but not to pick.
+  const owners = createMemo(() => obsTextOwners(app.timerStore(), props.id));
+  const nameOf = (n: string): string => (n === "" ? "(no name)" : n);
+  return (
+    <>
+      <Show when={obsOn() || shownIn() !== null}>
+        <FieldRow label="Show in OBS">
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+            <div style={{ "max-width": "280px" }}>
+              <ObsPicker
+                what="textSource"
+                stored={shownIn()}
+                options={(inv) => textSourceOptions(inv, owners())}
+                fallback={[NO_SOURCE]}
+                ariaLabel={`${props.name} OBS text source`}
+                goneLine={SHOW_IN_OBS_GONE}
+                onPick={(uuid) => {
+                  if (uuid === "") {
+                    void app.setTimerObsText(props.id, null);
+                    return;
+                  }
+                  const picked = app.obsInventory()?.textSources.find((x) => x.uuid === uuid);
+                  if (picked) void app.setTimerObsText(props.id, { uuid: picked.uuid, name: picked.name });
+                }}
+              />
+            </div>
+            <Show
+              when={obsOn()}
+              fallback={
+                <div style={helpStyle}>
+                  Shows in OBS's “{nameOf(shownIn()?.name ?? "")}” when Settings → OBS is on.
+                </div>
+              }
+            >
+              <div style={helpStyle}>{SHOW_IN_OBS_HELP}</div>
+            </Show>
+          </div>
+        </FieldRow>
+      </Show>
+      <Show when={props.timer.kind === "countup" && (obsOn() || follow() !== null)}>
+        <FieldRow label="Follow OBS">
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)", "align-items": "flex-start" }}>
+            <Segmented<"off" | FollowObs>
+              options={FOLLOW_OBS_CHOICES}
+              value={follow() ?? "off"}
+              onChange={(v) => void app.setTimerFollowObs(props.id, v === "off" ? null : v)}
+              ariaLabel={`Follow OBS for ${props.name}`}
+              blurOnPointer
+            />
+            <Show
+              when={obsOn()}
+              fallback={
+                <div style={helpStyle}>
+                  Follows OBS's {follow() === "stream" ? "streaming" : "recording"} when Settings → OBS is on.
+                </div>
+              }
+            >
+              <div style={helpStyle}>{FOLLOW_OBS_HELP}</div>
+            </Show>
+          </div>
+        </FieldRow>
+      </Show>
+    </>
+  );
+}
+
+/** Hourglass's Break row, while OBS control is on (D35): the scene Add
+ *  break (BRB) switches OBS to at a new break's start, and back at its
+ *  zero, as two actions on its card (`divora.obs`' `breakScene`). Breaks
+ *  already made keep their lists. */
+function BreakSceneRow(): JSX.Element {
+  const app = useApp();
+  return (
+    <div data-testid="obs-break-row" style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+      <div style={rowLineStyle}>
+        <span style={rowTextStyle}>Switch OBS to</span>
+        <div style={pickerBox}>
+          <ObsPicker
+            what="scene"
+            stored={app.obsSettings().breakScene ?? null}
+            options={(inv) => [DONT_SWITCH, ...sceneOptions(inv)]}
+            fallback={[DONT_SWITCH]}
+            ariaLabel="OBS scene for breaks"
+            onPick={(uuid) => {
+              if (uuid === "") {
+                app.setBreakScene(null);
+                return;
+              }
+              const picked = app.obsInventory()?.scenes.find((x) => x.uuid === uuid);
+              if (picked) app.setBreakScene(picked);
+            }}
+          />
+        </div>
+        <span style={rowTextStyle}>for the break</span>
+      </div>
+      <div style={helpStyle}>
+        Breaks you add from now on switch OBS to this scene at their start and back at zero, as two
+        actions you can change on their card. For a break you already have, add Switch OBS scene and
+        Switch OBS back on its card.
+      </div>
+    </div>
+  );
+}
+
 /** v1.60.0: a countdown's At start and At zero lists, then what they say
  *  together: the pairing warnings (§7.9) and, once either list has an
  *  action, the one general limit (D37). */
@@ -3473,15 +3795,22 @@ type ShownRow =
   | { index: number; runs: true; action: TimerAction }
   | { index: number; runs: false; action: TimerAction | null; why: keyof typeof NOT_RUN_WORDS };
 
+/** v1.61.0: by `runsAt`, as Rust's `runs_at` decides: one kind (`obs`) has
+ *  an op that runs at either hook (Switch OBS scene) and one that runs only
+ *  at zero (Switch OBS back), so the kind alone can't say. */
 function shownRow(row: ActionRow, hook: TimerHook): ShownRow {
-  if (row.runs && hook === "onStart" && !ACTION_KINDS[row.action.kind].at.includes("start")) {
-    return { index: row.index, runs: false, action: row.action, why: "startRevert" };
+  if (row.runs && hook === "onStart" && !runsAt(row.action, "start")) {
+    const why = row.action.kind === "obs" ? "startSceneBack" : "startRevert";
+    return { index: row.index, runs: false, action: row.action, why };
   }
   return row;
 }
 
-/** What keeps a row mounted: its kind while it runs, else why it doesn't. */
-const rowKey = (r: ShownRow): string => (r.runs ? `run:${r.action.kind}` : `not:${r.why}`);
+/** What keeps a row mounted: its kind while it runs (v1.61.0: an `obs`
+ *  row's op too, so a Switch OBS scene and a Switch OBS back are never one
+ *  row), else why it doesn't. */
+const rowKey = (r: ShownRow): string =>
+  r.runs ? (r.action.kind === "obs" ? `run:obs:${r.action.op}` : `run:${r.action.kind}`) : `not:${r.why}`;
 
 /** One list: its title and help, a row per stored entry, and Add action.
  *  Rows are kept by place (`Index`) and rebuilt only when the kind at that
@@ -3600,6 +3929,13 @@ function TimerActionRow(props: {
   const preset = () => (props.action.kind === "preset" ? props.action : null);
   const tile = () => (props.action.kind === "tile" ? props.action : null);
   const line = () => (props.action.kind === "speak" ? props.action : null);
+  // v1.61.0: Switch OBS scene's scene, as stored (its uuid switches; its
+  // name is for words, and the store keeps it up to date with OBS's).
+  const obsScene = (): ObsRef | null =>
+    props.action.kind === "obs" && props.action.op === "scene"
+      ? { uuid: props.action.sceneUuid, name: props.action.sceneName }
+      : null;
+  const obsOp = () => (props.action.kind === "obs" ? props.action.op : null);
   const presetOptions = (): SelectOption[] => app.presets().map((p) => ({ value: p.id, label: p.name, sub: p.tag }));
   const tileOptions = (): SelectOption[] => app.soundboardTiles().map((t) => ({ value: t.id, label: t.label }));
   const voiceOptions = (): SelectOption[] =>
@@ -3732,7 +4068,27 @@ function TimerActionRow(props: {
             </>
           )}
         </Show>
-        <Show when={!preset() && !tile() && !line()}>
+        <Show when={obsScene()}>
+          {(scene) => (
+            <>
+              <span style={rowTextStyle}>Switch OBS to</span>
+              <div style={pickerBox}>
+                <ObsPicker
+                  what="scene"
+                  stored={scene()}
+                  options={sceneOptions}
+                  fallback={[]}
+                  ariaLabel={`${props.name} OBS scene ${place().at}`}
+                  onPick={(uuid) => {
+                    const picked = app.obsInventory()?.scenes.find((x) => x.uuid === uuid);
+                    if (picked && uuid !== scene().uuid) set(obsSceneAction(picked));
+                  }}
+                />
+              </div>
+            </>
+          )}
+        </Show>
+        <Show when={!preset() && !tile() && !line() && !obsScene()}>
           <span style={rowTextStyle}>{words()}</span>
         </Show>
         <div style={{ "margin-left": "auto" }}>
@@ -3795,6 +4151,16 @@ function TimerActionRow(props: {
             : "Saves the seconds up to the moment it started."}{" "}
           If a replay is already being saved, this one is refused with a notice.
         </div>
+      </Show>
+      <Show when={obsOp()}>
+        {(op) => (
+          <>
+            <Show when={!app.obsSettings().enabled}>
+              <div style={reasonStyle}>{OBS_ACTION_OFF}</div>
+            </Show>
+            <div style={helpStyle}>{op() === "scene" ? OBS_SCENE_NOTE : OBS_BACK_NOTE}</div>
+          </>
+        )}
       </Show>
     </div>
   );
@@ -3869,8 +4235,12 @@ function AddActionMenu(props: {
     onCleanup(() => document.removeEventListener("pointerdown", handler));
   });
 
+  // v1.61.0: why a Switch OBS scene couldn't be added (OBS's scenes
+  // couldn't be read), under the menu until the next open.
+  const [note, setNote] = createSignal<string | null>(null);
+
   const choices = createMemo(() => {
-    const at = props.hook === "onStart" ? "start" : "zero";
+    const at: ActionAt = props.hook === "onStart" ? "start" : "zero";
     const noTiles = app.soundboardTiles().length === 0;
     // Why there's no clip to add: no folder, its scan not finished yet, or
     // none found in it (an empty folder, or one that couldn't be read).
@@ -3880,15 +4250,21 @@ function AddActionMenu(props: {
         ? "Play a clip — loading your clips…"
         : "Play a clip — no clips found in your soundboard folder";
     const hasLine = canAddAction(props.timer[props.hook], "speak") === "hasLine";
-    return ADD_CHOICES.filter((c) => ACTION_KINDS[c.kind].at.includes(at)).map((c) => {
-      const off = (c.choice === "tile" && noTiles) || (c.choice === "speak" && hasLine);
-      const label =
-        c.choice === "tile" && noTiles
-          ? noTilesWhy
-          : c.choice === "speak" && hasLine
-            ? "Speak a line — this list already has one"
-            : c.label;
-      return { ...c, label, off };
+    // v1.61.0: Switch OBS scene needs OBS's scenes now, so a connection;
+    // Switch OBS back only OBS control (it can wait for a connection).
+    const obsOn = app.obsSettings().enabled;
+    const connected = app.obsStatus()?.state === "connected";
+    const why = (c: AddChoice): string | null => {
+      if (c === "tile" && noTiles) return noTilesWhy;
+      if (c === "speak" && hasLine) return "Speak a line — this list already has one";
+      if (c === "obsScene" && !obsOn) return "Switch OBS scene — turn on Settings → OBS first";
+      if (c === "obsScene" && !connected) return "Switch OBS scene — Divora isn't connected to OBS";
+      if (c === "obsBack" && !obsOn) return "Switch OBS back — turn on Settings → OBS first";
+      return null;
+    };
+    return ADD_CHOICES.filter((c) => c.at.includes(at)).map((c) => {
+      const off = why(c.choice);
+      return { ...c, label: off ?? c.label, off: off !== null };
     });
   });
 
@@ -3923,6 +4299,21 @@ function AddActionMenu(props: {
         return { kind: "saveReplay" };
       case "panic":
         return { kind: "panic" };
+      case "obsScene": {
+        // v1.61.0: OBS's scenes as they are now (the list is null after
+        // every launch), then one other than the live scene, so it switches
+        // something. Unreadable: nothing is added, and the note says why.
+        const inv = await app.refreshObsInventory();
+        if (inv === null) {
+          const why = app.obsInventoryError();
+          if (why !== null) setNote(`Couldn't read OBS's scenes: ${why}`);
+          return null;
+        }
+        const scene = inv.scenes.find((x) => x.uuid !== inv.programSceneUuid) ?? inv.scenes[0];
+        return scene ? obsSceneAction(scene) : null;
+      }
+      case "obsBack":
+        return { kind: "obs", op: "sceneBack" };
     }
   };
 
@@ -3930,6 +4321,7 @@ function AddActionMenu(props: {
     const c = choices()[i];
     if (!c || c.off) return;
     setOpen(false);
+    setNote(null);
     const a = await actionFor(c.choice);
     if (a) await app.addTimerAction(props.id, props.hook, a);
   };
@@ -3941,6 +4333,7 @@ function AddActionMenu(props: {
         e.preventDefault();
         setActive(0);
         setOpen(true);
+        setNote(null);
         revealOption(optionId(active()));
       }
       return;
@@ -3962,72 +4355,544 @@ function AddActionMenu(props: {
   };
 
   return (
-    <div ref={rootRef} style={{ position: "relative", display: "inline-block" }}>
-      <button
-        ref={trigger}
-        type="button"
-        class="btn btn-secondary btn-sm"
-        disabled={props.disabled}
-        aria-label={`Add action ${LIST_WORDS[props.hook].add} ${props.name}`}
-        aria-haspopup="listbox"
-        aria-expanded={open()}
-        aria-controls={open() ? listId : undefined}
-        aria-activedescendant={open() ? optionId(active()) : undefined}
-        onClick={(e) => {
-          blurOnPointer(e);
-          if (open()) {
-            setOpen(false);
-          } else {
-            setActive(0);
-            setOpen(true);
-          }
-        }}
-        onKeyDown={onKeyDown}
-        // A Space released on the button would click it once more.
-        onKeyUp={(e) => {
-          if (e.key === " ") e.preventDefault();
+    <>
+      <div ref={rootRef} style={{ position: "relative", display: "inline-block" }}>
+        <button
+          ref={trigger}
+          type="button"
+          class="btn btn-secondary btn-sm"
+          disabled={props.disabled}
+          aria-label={`Add action ${LIST_WORDS[props.hook].add} ${props.name}`}
+          aria-haspopup="listbox"
+          aria-expanded={open()}
+          aria-controls={open() ? listId : undefined}
+          aria-activedescendant={open() ? optionId(active()) : undefined}
+          onClick={(e) => {
+            blurOnPointer(e);
+            if (open()) {
+              setOpen(false);
+            } else {
+              setActive(0);
+              setOpen(true);
+              setNote(null);
+            }
+          }}
+          onKeyDown={onKeyDown}
+          // A Space released on the button would click it once more.
+          onKeyUp={(e) => {
+            if (e.key === " ") e.preventDefault();
+          }}
+        >
+          <Sigil name="plus" size={15} />
+          Add action
+        </button>
+        <Show when={open() && !props.disabled}>
+          <div
+            id={listId}
+            class="dropdown"
+            role="listbox"
+            aria-label={`Actions to add ${LIST_WORDS[props.hook].add} ${props.name}`}
+            style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, "min-width": "300px", "z-index": 50 }}
+          >
+            <For each={choices()}>
+              {(c, i) => (
+                <div
+                  id={optionId(i())}
+                  class="dropdown-opt"
+                  role="option"
+                  aria-selected={false}
+                  aria-disabled={c.off ? "true" : undefined}
+                  style={{
+                    ...(i() === active() ? { outline: "1px solid var(--line-glow)", "outline-offset": "-1px" } : {}),
+                    ...(c.off ? { opacity: 0.55, cursor: "default" } : {}),
+                    "font-size": "var(--t-sm)",
+                    "font-weight": 600,
+                  }}
+                  onPointerEnter={() => setActive(i())}
+                  onClick={(e) => {
+                    if (c.off) return;
+                    // A pointer's pick leaves the focus on the page.
+                    if (e.detail > 0) trigger?.blur();
+                    void add(i());
+                  }}
+                >
+                  {c.label}
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+      </div>
+      <Show when={note()}>
+        {(n) => (
+          <div data-testid="add-action-note" style={{ ...reasonStyle, "margin-top": "var(--s1)" }}>
+            {n()}
+          </div>
+        )}
+      </Show>
+    </>
+  );
+}
+
+// ---------- OBS (v1.61.0) ----------
+//
+// Talk to OBS: one WebSocket connection to OBS's own server, kept only while
+// Connect to OBS is on. Rust holds it (src-tauri/src/obs/); this section
+// shows the store's mirror of Rust's status and sends what a control says,
+// and decides nothing. The fields show on or off, since the explainer points
+// at the address below before anyone turns it on: editing them while off
+// checks the address or stores the password, and connects nothing. The
+// password is the field's own signal, cleared once Save or Forget answers,
+// never the store's.
+
+const OBS_INTRO =
+  "Divora can show a timer's time in an OBS text source, switch OBS to a scene for a break and back, and start a count-up when you go live or start recording. It talks to the WebSocket server built into OBS.";
+const OBS_EXPLAINER: readonly string[] = [
+  "When this is on, Divora keeps one connection open to OBS at the address below — this PC unless you change it. For OBS, it connects nowhere else, and it never listens for connections.",
+  "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick.",
+  "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. It changes only the text of the sources you pick, and that text stays in OBS after Divora stops.",
+  // The menu path is the plan's; U15 checks it against OBS before the tag.
+  "OBS ships with its WebSocket server off. In OBS: Tools → WebSocket Server Settings → Enable WebSocket server, then Show Connect Info for the password.",
+];
+const OBS_ADDRESS_HELP =
+  "This PC is 127.0.0.1: keep it for OBS on this PC, even though OBS's Show Connect Info shows this PC's network address. For OBS on another PC, type that PC's IP address, like 192.168.1.20; that connection isn't encrypted. Divora doesn't look this address up as a name, so a name like obs.local won't work.";
+const OBS_PASSWORD_SAVED =
+  "A password is saved, stored encrypted for your Windows account. OBS keeps its own copy in its settings.";
+const OBS_PASSWORD_NONE = "No password saved. If OBS's Enable Authentication is on, it needs one.";
+const OBS_PASSWORD_SPACES = "This starts or ends with a space. OBS's password has to as well, or OBS will reject it.";
+
+/** v1.61.0: a live region's words, spoken for edges only, the Hourglass
+ *  section's way: `say` empties the region and puts its words up on the
+ *  next frame, so the same words again are spoken again (words set and
+ *  cleared inside one frame never reach a screen reader); words said
+ *  before that frame are joined, each once; and they're emptied `holdMs`
+ *  later. Nothing is left pending when its owner goes. */
+function createSaid(holdMs: number): [() => string, (text: string) => void] {
+  const [said, setSaid] = createSignal("");
+  let waiting: string[] = [];
+  let frame: number | undefined;
+  let emptyLater: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => {
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    clearTimeout(emptyLater);
+  });
+  const say = (text: string): void => {
+    if (text === "") return;
+    if (!waiting.includes(text)) waiting.push(text);
+    if (frame !== undefined) return;
+    clearTimeout(emptyLater);
+    setSaid("");
+    frame = requestAnimationFrame(() => {
+      frame = undefined;
+      setSaid(waiting.join(" "));
+      waiting = [];
+      emptyLater = setTimeout(() => setSaid(""), holdMs);
+    });
+  };
+  return [said, say];
+}
+
+/** A port as typed: a whole number, else NaN (refused, in Rust's words). */
+function typedPort(text: string): number {
+  return /^\s*\d+\s*$/.test(text) ? Number(text) : Number.NaN;
+}
+
+function ObsSection(): JSX.Element {
+  const app = useApp();
+  const obsOn = () => app.obsSettings().enabled;
+  const status = () => app.obsStatus();
+  // On screen, it counts as a watcher: while OBS is connected, the store
+  // reads OBS's scenes and sources again at each `inventoryRev`, so the
+  // names Divora keeps follow renames in OBS.
+  onCleanup(app.watchObs());
+  // Off, with nothing heard yet: one read (no listener, no connection), for
+  // whether a password is saved.
+  onMount(() => {
+    if (!app.obsSettings().enabled && app.obsStatus() === null) void app.pullObsStatus();
+  });
+
+  // The announcer says edges only (data/obs.ts `obsAnnouncement`): a
+  // connection made or lost, a stop state, a scene skip, a switch back held.
+  // Never the status line: its "Trying again in N s" changes every second,
+  // and the house rule is that a live region never speaks a time. Nothing
+  // for the first status the section sees.
+  const [said, say] = createSaid(HOURGLASS_SAID_MS);
+  let heard: ObsStatus | null = null;
+  createEffect(
+    on(app.obsStatus, (s) => {
+      if (s === null) return;
+      const text = obsAnnouncement(heard, s);
+      heard = s;
+      say(text);
+    }),
+  );
+
+  // "Trying again in N s": recomputed when its number changes (N rounds
+  // up, so at each whole second before the attempt), only while retrying
+  // with the section on screen. A hidden page shows the line as of its last
+  // render, which is cosmetic.
+  const [now, setNow] = createSignal(Date.now());
+  createEffect(() => {
+    const s = status();
+    setNow(Date.now());
+    if (s?.state !== "retrying" || s.retryAtMs === null) return;
+    const at = s.retryAtMs;
+    let tick: ReturnType<typeof setTimeout> | undefined;
+    const next = (): void => {
+      const left = at - Date.now();
+      if (left <= 0) return;
+      tick = setTimeout(() => {
+        setNow(Date.now());
+        next();
+      }, left % 1_000 || 1_000);
+    };
+    next();
+    onCleanup(() => clearTimeout(tick));
+  });
+
+  // Address and Port: the drafts while typing (null shows what's stored),
+  // sent together on Enter or on leaving either field, never per
+  // keystroke; Esc puts the stored one back. Rust judges the address (while
+  // off it only checks it), and only one it took is stored. A refusal stays
+  // marked under its field, in Rust's words, with the draft kept.
+  const [hostDraft, setHostDraft] = createSignal<string | null>(null);
+  const [portDraft, setPortDraft] = createSignal<string | null>(null);
+  const [hostError, setHostError] = createSignal<string | null>(null);
+  const [portError, setPortError] = createSignal<string | null>(null);
+  const hostReasonId = `obs-host-reason-${createUniqueId()}`;
+  const portReasonId = `obs-port-reason-${createUniqueId()}`;
+  // A saved address Rust refused (at boot, or on Connect to OBS) shows under
+  // the field it's about until an address is taken.
+  const savedError = () => app.obsConfigError();
+  const hostShownError = () =>
+    hostError() ?? (savedError() !== null && savedError() !== OBS_PORT_ERROR ? savedError() : null);
+  const portShownError = () => portError() ?? (savedError() === OBS_PORT_ERROR ? savedError() : null);
+  // The drafts on their way: Enter, then leaving the field, sends them once.
+  let sending: string | null = null;
+  const commitAddress = async (): Promise<void> => {
+    const host = hostDraft();
+    const port = portDraft();
+    if (host === null && port === null) return;
+    const key = JSON.stringify([host, port]);
+    if (sending === key) return;
+    sending = key;
+    const s = app.obsSettings();
+    const refused = await app.setObsAddress(host ?? s.host, port === null ? s.port : typedPort(port));
+    if (sending === key) sending = null;
+    if (refused === null) {
+      // Only what was sent: a field typed in meanwhile keeps its draft.
+      if (hostDraft() === host) {
+        setHostDraft(null);
+        setHostError(null);
+      }
+      if (portDraft() === port) {
+        setPortDraft(null);
+        setPortError(null);
+      }
+    } else if (refused === OBS_PORT_ERROR) {
+      setPortError(refused);
+    } else {
+      setHostError(refused);
+    }
+  };
+  const fieldKeys = (e: KeyboardEvent, restore: () => void): void => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commitAddress();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      restore();
+    }
+  };
+
+  // Password: never stored here or in the store; it goes from this field
+  // into `obs_set_password` only. The field empties once Save or Forget
+  // has answered, either way, and a refusal shows under it.
+  const [password, setPassword] = createSignal("");
+  const [passwordError, setPasswordError] = createSignal<string | null>(null);
+  const passwordReasonId = `obs-password-reason-${createUniqueId()}`;
+  const hasPassword = () => status()?.hasPassword ?? null;
+  const savePassword = async (): Promise<void> => {
+    const refused = await app.obsSavePassword(password());
+    setPassword("");
+    setPasswordError(refused);
+  };
+  // Forget asks twice: the first click turns it into "Forget?" for 3 s (the
+  // timers' Delete rule).
+  const [forgetting, setForgetting] = createSignal(false);
+  let forgetReset: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(forgetReset));
+  const forgetPassword = async (): Promise<void> => {
+    const refused = await app.obsForgetPassword();
+    setPassword("");
+    setPasswordError(refused);
+  };
+
+  return (
+    <section data-obs-seq={status()?.seq}>
+      <div class="eyebrow" style={{ "margin-bottom": "var(--s3)" }}>
+        OBS
+      </div>
+      <div
+        class="panel"
+        style={{
+          padding: "var(--s5)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "var(--s4)",
         }}
       >
-        <Sigil name="plus" size={15} />
-        Add action
-      </button>
-      <Show when={open() && !props.disabled}>
-        <div
-          id={listId}
-          class="dropdown"
-          role="listbox"
-          aria-label={`Actions to add ${LIST_WORDS[props.hook].add} ${props.name}`}
-          style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, "min-width": "300px", "z-index": 50 }}
-        >
-          <For each={choices()}>
-            {(c, i) => (
-              <div
-                id={optionId(i())}
-                class="dropdown-opt"
-                role="option"
-                aria-selected={false}
-                aria-disabled={c.off ? "true" : undefined}
-                style={{
-                  ...(i() === active() ? { outline: "1px solid var(--line-glow)", "outline-offset": "-1px" } : {}),
-                  ...(c.off ? { opacity: 0.55, cursor: "default" } : {}),
-                  "font-size": "var(--t-sm)",
-                  "font-weight": 600,
+        <p style={{ "font-size": "var(--t-sm)", color: "var(--text-mid)", margin: 0 }}>{OBS_INTRO}</p>
+        <div data-testid="obs-explainer" style={{ display: "flex", "flex-direction": "column", gap: "var(--s2)" }}>
+          <For each={OBS_EXPLAINER}>{(text) => <div style={helpStyle}>{text}</div>}</For>
+        </div>
+        {/* Always mounted: a region inserted together with its text is
+            commonly missed. */}
+        <span class="sr-only" role="status" aria-live="polite" data-testid="obs-announcer">
+          {said()}
+        </span>
+        <Row label="Connect to OBS" icon="link">
+          <Toggle
+            on={obsOn()}
+            onChange={(v) => void app.setObsEnabled(v)}
+            ariaLabel="Connect to OBS"
+            blurOnPointer
+          />
+        </Row>
+        <Show when={obsOn()}>
+          <div data-testid="obs-status" style={{ display: "flex", "flex-direction": "column", gap: "var(--s2)" }}>
+            <Show
+              when={savedError() === null}
+              fallback={
+                <div data-testid="obs-status-line" style={{ ...rowLineStyle, ...rowTextStyle }}>
+                  <Sigil name="link" size={16} style={{ color: "var(--warning)", "flex-shrink": 0 }} />
+                  <span>{OBS_SAVED_ADDRESS_LINE}</span>
+                </div>
+              }
+            >
+              <Show when={status()}>
+                {(s) => (
+                  <>
+                    {/* Plain text, never a live region: its countdown would
+                        talk every second. The announcer says the edges. */}
+                    <div style={{ ...rowLineStyle, "justify-content": "space-between" }}>
+                      <div data-testid="obs-status-line" style={{ ...rowLineStyle, ...rowTextStyle, flex: "1 1 240px" }}>
+                        <Sigil
+                          name="link"
+                          size={16}
+                          style={{
+                            color: s().state === "connected" ? "var(--success)" : "var(--text-lo)",
+                            "flex-shrink": 0,
+                          }}
+                        />
+                        <span style={{ flex: 1, "min-width": 0 }}>{obsStatusLine(s(), now())}</span>
+                      </div>
+                      <Show when={obsRetryLabel(s())}>
+                        {(label) => (
+                          <Button
+                            size="sm"
+                            icon="refresh"
+                            onClick={(e) => {
+                              blurOnPointer(e);
+                              void app.obsReconnect();
+                            }}
+                          >
+                            {label()}
+                          </Button>
+                        )}
+                      </Show>
+                    </div>
+                    <Show when={obsSkipLine(s(), obsClockTime)}>
+                      {(line) => (
+                        <div data-testid="obs-skip-line" style={reasonStyle}>
+                          {line()}
+                        </div>
+                      )}
+                    </Show>
+                    <Show when={obsTextSkipLine(s(), obsClockTime)}>
+                      {(line) => (
+                        <div data-testid="obs-text-skip-line" style={reasonStyle}>
+                          {line()}
+                        </div>
+                      )}
+                    </Show>
+                    <Show when={obsHeldBackLine(s())}>
+                      {(line) => (
+                        <div data-testid="obs-held-back" style={helpStyle}>
+                          {line()}
+                        </div>
+                      )}
+                    </Show>
+                    <For each={obsWarnings(s())}>
+                      {(w) => (
+                        <div data-testid="obs-warning" style={reasonStyle}>
+                          {w}
+                        </div>
+                      )}
+                    </For>
+                  </>
+                )}
+              </Show>
+            </Show>
+          </div>
+        </Show>
+
+        <FieldRow label="Address">
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+            <input
+              type="text"
+              class="mono"
+              value={hostDraft() ?? app.obsSettings().host}
+              aria-label="OBS address"
+              aria-invalid={hostShownError() !== null ? "true" : undefined}
+              aria-describedby={hostShownError() !== null ? hostReasonId : undefined}
+              spellcheck={false}
+              autocomplete="off"
+              onInput={(e) => {
+                setHostDraft(e.currentTarget.value);
+                setHostError(null);
+              }}
+              onKeyDown={(e) =>
+                fieldKeys(e, () => {
+                  setHostDraft(null);
+                  setHostError(null);
+                })
+              }
+              onBlur={() => void commitAddress()}
+              style={{
+                ...fieldStyle,
+                width: "100%",
+                "max-width": "280px",
+                "border-color": hostShownError() !== null ? "var(--warning)" : "var(--line-strong)",
+              }}
+            />
+            <Show when={hostShownError()}>
+              {(why) => (
+                <div id={hostReasonId} style={reasonStyle}>
+                  {why()}
+                </div>
+              )}
+            </Show>
+            <div style={helpStyle}>{OBS_ADDRESS_HELP}</div>
+          </div>
+        </FieldRow>
+        <FieldRow label="Port">
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+            <input
+              type="text"
+              class="mono tnum"
+              inputmode="numeric"
+              value={portDraft() ?? String(app.obsSettings().port)}
+              aria-label="OBS port"
+              aria-invalid={portShownError() !== null ? "true" : undefined}
+              aria-describedby={portShownError() !== null ? portReasonId : undefined}
+              spellcheck={false}
+              autocomplete="off"
+              onInput={(e) => {
+                setPortDraft(e.currentTarget.value);
+                setPortError(null);
+              }}
+              onKeyDown={(e) =>
+                fieldKeys(e, () => {
+                  setPortDraft(null);
+                  setPortError(null);
+                })
+              }
+              onBlur={() => void commitAddress()}
+              style={{
+                ...fieldStyle,
+                width: "110px",
+                "border-color": portShownError() !== null ? "var(--warning)" : "var(--line-strong)",
+              }}
+            />
+            <Show when={portShownError()}>
+              {(why) => (
+                <div id={portReasonId} style={reasonStyle}>
+                  {why()}
+                </div>
+              )}
+            </Show>
+            <div style={helpStyle}>OBS's default is 4455.</div>
+          </div>
+        </FieldRow>
+        <FieldRow label="Password">
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
+            <div style={rowLineStyle}>
+              <input
+                type="password"
+                value={password()}
+                placeholder="Paste OBS's password"
+                aria-label="OBS password"
+                aria-invalid={passwordError() !== null ? "true" : undefined}
+                aria-describedby={passwordError() !== null ? passwordReasonId : undefined}
+                autocomplete="off"
+                spellcheck={false}
+                onInput={(e) => {
+                  setPassword(e.currentTarget.value);
+                  setPasswordError(null);
                 }}
-                onPointerEnter={() => setActive(i())}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void savePassword();
+                  }
+                }}
+                style={{
+                  ...fieldStyle,
+                  flex: "1 1 200px",
+                  "min-width": "160px",
+                  "max-width": "280px",
+                  "border-color": passwordError() !== null ? "var(--warning)" : "var(--line-strong)",
+                }}
+              />
+              <Button
+                size="sm"
                 onClick={(e) => {
-                  if (c.off) return;
-                  // A pointer's pick leaves the focus on the page.
-                  if (e.detail > 0) trigger?.blur();
-                  void add(i());
+                  blurOnPointer(e);
+                  void savePassword();
                 }}
               >
-                {c.label}
-              </div>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
+                Save password
+              </Button>
+              <Show when={hasPassword()}>
+                <Button
+                  variant="danger"
+                  size="sm"
+                  icon="trash"
+                  aria-label={forgetting() ? "Click again to forget the OBS password" : undefined}
+                  onClick={(e) => {
+                    blurOnPointer(e);
+                    clearTimeout(forgetReset);
+                    if (forgetting()) {
+                      setForgetting(false);
+                      void forgetPassword();
+                      return;
+                    }
+                    setForgetting(true);
+                    forgetReset = setTimeout(() => setForgetting(false), 3000);
+                  }}
+                >
+                  {forgetting() ? "Forget?" : "Forget password"}
+                </Button>
+              </Show>
+            </div>
+            <Show when={passwordError()}>
+              {(why) => (
+                <div id={passwordReasonId} style={reasonStyle}>
+                  {why()}
+                </div>
+              )}
+            </Show>
+            <Show when={/^\s|\s$/.test(password())}>
+              <div style={reasonStyle}>{OBS_PASSWORD_SPACES}</div>
+            </Show>
+            <Show when={hasPassword() !== null}>
+              <div style={helpStyle}>{hasPassword() ? OBS_PASSWORD_SAVED : OBS_PASSWORD_NONE}</div>
+            </Show>
+          </div>
+        </FieldRow>
+      </div>
+    </section>
   );
 }
 

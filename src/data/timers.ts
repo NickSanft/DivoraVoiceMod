@@ -22,8 +22,8 @@ import {
   type TimerState,
 } from "../overlay/timerState";
 import { normalizeAccelerator } from "./hotkeys";
-import { readFollowObs, readObsUuid, type FollowObs } from "./obs";
-import { actionsForSync, type TimerAction } from "./timerActions";
+import { cutObsName, readFollowObs, readObsRef, readObsUuid, type FollowObs, type ObsInventory } from "./obs";
+import { actionsForSync, readAction, type TimerAction } from "./timerActions";
 
 /** `divora.timers`' version now. A larger one is read with these rules and
  *  never lowered. */
@@ -299,6 +299,64 @@ export function timerRoles(s: StoredTimers): Map<string, TimerRole> {
     }
   });
   return roles;
+}
+
+/** v1.61.0: the OBS text sources the timers the backend runs show in,
+ *  other than `except`'s: uuid → the first such timer's name, in list
+ *  order (the backend's feed, too, gives a source to its first timer
+ *  only). Show in OBS offers these disabled ("shown by {name}"). */
+export function obsTextOwners(s: StoredTimers, except: string): Map<string, string> {
+  const roles = timerRoles(s);
+  const out = new Map<string, string>();
+  for (const t of s.timers) {
+    if (t.id === except || roles.get(t.id) !== "run" || !isObject(t.obsText)) continue;
+    const uuid = readObsUuid(t.obsText.uuid);
+    if (uuid !== null && !out.has(uuid)) out.set(uuid, t.name);
+  }
+  return out;
+}
+
+/** v1.61.0: the stored timers with each OBS name `inv` lists under another
+ *  name brought up to date, by uuid: a timer's `obsText` name (any kind)
+ *  and the scene name of every Switch OBS scene in a countdown's lists,
+ *  each cut as stored (data/obs.ts `cutObsName`). A name is only words:
+ *  the uuid is what Divora acts on, and OBS lets a scene or a source be
+ *  renamed at any time. An entry's other keys, and every entry it can't
+ *  read, are kept as written. `s` itself when nothing changed. */
+export function withObsNames(s: StoredTimers, inv: ObsInventory): StoredTimers {
+  const scenes = new Map(inv.scenes.map((x) => [x.uuid, cutObsName(x.name)]));
+  const sources = new Map(inv.textSources.map((x) => [x.uuid, cutObsName(x.name)]));
+  const renamedList = (raw: unknown): unknown[] | null => {
+    if (!Array.isArray(raw)) return null;
+    let changed = false;
+    const list = (raw as unknown[]).map((entry) => {
+      const a = readAction(entry);
+      if (a?.kind !== "obs" || a.op !== "scene") return entry;
+      const name = scenes.get(a.sceneUuid);
+      if (name === undefined || name === a.sceneName) return entry;
+      changed = true;
+      return { ...(entry as Record<string, unknown>), sceneName: name };
+    });
+    return changed ? list : null;
+  };
+  let changed = false;
+  const timers = s.timers.map((t) => {
+    let next = t;
+    const shown = readObsRef(t.obsText);
+    const name = shown === null ? undefined : sources.get(shown.uuid);
+    if (shown !== null && name !== undefined && name !== shown.name) {
+      next = { ...next, obsText: { ...(t.obsText as Record<string, unknown>), name } };
+    }
+    if (t.kind === "countdown") {
+      for (const hook of ["onStart", "onFire"] as const) {
+        const list = renamedList(t[hook]);
+        if (list) next = { ...next, [hook]: list };
+      }
+    }
+    if (next !== t) changed = true;
+    return next;
+  });
+  return changed ? { ...s, timers } : s;
 }
 
 /** A new timer's id: `timer-<n>`, the lowest n from 1 that no stored timer

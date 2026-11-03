@@ -16,7 +16,7 @@
 // Pure, so it unit-tests.
 
 import { isTimerId, type TimerPhase } from "../overlay/timerState";
-import { readObsName, readObsUuid, type ObsOp, type ObsOpName } from "./obs";
+import { cutObsName, obsSceneName, readObsName, readObsUuid, type ObsOp, type ObsOpName, type ObsRef } from "./obs";
 import { ptmKeyWhere } from "./ptm";
 // A cycle (timers.ts sends lists with `actionsForSync`): both sides only
 // call each other's functions, never at load, so either may load first.
@@ -362,20 +362,27 @@ export function withRemoved(raw: unknown, index: number): unknown[] {
 }
 
 /** A start whose change nothing at zero puts back, and a switch back with
- *  nothing to go back to (§7.9). Runnable rows only. */
-export type PairingWarning = "muteNoUnmute" | "switchNoRevert" | "revertNoSwitch";
+ *  nothing to go back to (§7.9). Runnable rows only. v1.61.0: the same two
+ *  for OBS's scene: a Switch OBS scene At start with no Switch OBS back At
+ *  zero (`sceneNoBack`), and a Switch OBS back At zero with no Switch OBS
+ *  scene At start (`backNoScene`), the order the card lists them in. */
+export type PairingWarning = "muteNoUnmute" | "switchNoRevert" | "revertNoSwitch" | "sceneNoBack" | "backNoScene";
 
 export function pairingWarnings(onStart: unknown, onFire: unknown): PairingWarning[] {
   const start = actionsForSync(onStart);
   const fire = actionsForSync(onFire);
   const switches = start.some((a) => a.kind === "preset" || a.kind === "randomPreset");
   const reverts = fire.some((a) => a.kind === "revertPreset");
+  const scenes = start.some((a) => a.kind === "obs" && a.op === "scene");
+  const backs = fire.some((a) => a.kind === "obs" && a.op === "sceneBack");
   const out: PairingWarning[] = [];
   if (start.some((a) => a.kind === "setMuted" && a.muted) && !fire.some((a) => a.kind === "setMuted" && !a.muted)) {
     out.push("muteNoUnmute");
   }
   if (switches && !reverts) out.push("switchNoRevert");
   if (reverts && !switches) out.push("revertNoSwitch");
+  if (scenes && !backs) out.push("sceneNoBack");
+  if (backs && !scenes) out.push("backNoScene");
   return out;
 }
 
@@ -533,8 +540,9 @@ export function actionWords(a: TimerAction, names: ActionNames): string {
       return "Stop all clips and lines";
     case "obs":
       // v1.61.0: by the stored name, which an inventory refreshes; the uuid
-      // is what switches.
-      return a.op === "scene" ? `Switch OBS to ${a.sceneName}` : "Switch OBS back";
+      // is what switches. An empty name (a hand edit: OBS gives every scene
+      // one) reads as one with no name, not "Switch OBS to ".
+      return a.op === "scene" ? `Switch OBS to ${obsSceneName(a.sceneName)}` : "Switch OBS back";
   }
 }
 
@@ -585,14 +593,32 @@ export function timerVoiceLine(
   return head;
 }
 
+/** v1.61.0: Switch OBS scene to `scene`, as the card and the store store
+ *  it: its uuid, and its name cut to the 256 characters `readAction` takes
+ *  (data/obs.ts `cutObsName`; OBS sets no limit, and only the uuid
+ *  switches). */
+export function obsSceneAction(scene: ObsRef): TimerAction {
+  return { kind: "obs", op: "scene", sceneUuid: scene.uuid, sceneName: cutObsName(scene.name) };
+}
+
 /** Add break (BRB)'s countdown (D26): "BRB" (numbered by the store when
  *  taken), 5:00, Mute my voice at the start, Unmute my voice at zero. No
- *  line and no keys (Q5). New lists each call. */
-export function breakTemplate(): { name: string; durationMs: number; onStart: TimerAction[]; onFire: TimerAction[] } {
-  return {
-    name: "BRB",
-    durationMs: 300_000,
-    onStart: [{ kind: "setMuted", muted: true }],
-    onFire: [{ kind: "setMuted", muted: false }],
-  };
+ *  line and no keys (Q5). New lists each call. v1.61.0 (D35): with a
+ *  `scene` (Settings' "Switch OBS to … for the break"), Switch OBS scene to
+ *  it after the mute at the start, and Switch OBS back after the unmute at
+ *  zero: both run in the backend, in list order, so the call is muted
+ *  before OBS shows the break and unmuted before OBS leaves it. */
+export function breakTemplate(scene?: ObsRef): {
+  name: string;
+  durationMs: number;
+  onStart: TimerAction[];
+  onFire: TimerAction[];
+} {
+  const onStart: TimerAction[] = [{ kind: "setMuted", muted: true }];
+  const onFire: TimerAction[] = [{ kind: "setMuted", muted: false }];
+  if (scene) {
+    onStart.push(obsSceneAction(scene));
+    onFire.push({ kind: "obs", op: "sceneBack" });
+  }
+  return { name: "BRB", durationMs: 300_000, onStart, onFire };
 }

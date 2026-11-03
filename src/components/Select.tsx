@@ -22,10 +22,15 @@
 //     touch click, so Space reaches push-to-modulate again; from the
 //     keyboard the focus stays (blurOnPointer.ts).
 //
-// v1.61.0 (declared for Talk to OBS's pickers; not acted on yet): `onOpen`,
-// called each time the list opens, so a picker can read OBS's sources
-// again; and an option's `disabled`, shown with `aria-disabled`, kept in
-// the arrow and Home/End order, and refused by Enter, Space and a click.
+// v1.61.0, for Talk to OBS's pickers:
+//   - `onOpen`, called each time the list opens, by a click or a key, so a
+//     picker reads OBS's sources again.
+//   - An option's `disabled` (a text source that reads a file, or one
+//     another timer shows): `aria-disabled="true"`, dimmed, its reason in
+//     its `sub`, which its name carries. It stays in the arrow and Home/End
+//     order, so the keys reach it and a screen reader says why; Enter, Space
+//     and a click refuse it, and the list stays open. A stored value whose
+//     option is disabled shows and highlights as any other.
 
 import type { JSX } from "solid-js";
 import { createSignal, createUniqueId, For, onCleanup, onMount, Show } from "solid-js";
@@ -36,9 +41,9 @@ export interface SelectOption {
   value: string;
   label: string;
   sub?: string;
-  /** v1.61.0 (declared; not acted on yet): it can't be picked (a text
-   *  source that reads a file, or one another timer shows); `sub` says
-   *  why. */
+  /** v1.61.0: it can't be picked (a text source that reads a file, or one
+   *  another timer shows); `sub` says why. Reachable by the keys, refused
+   *  by Enter, Space and a click. */
   disabled?: boolean;
 }
 
@@ -59,8 +64,7 @@ export interface SelectProps {
   /** v1.60.0: a pointer click leaves the focus on the page, not on the
    *  trigger. */
   blurOnPointer?: boolean;
-  /** v1.61.0 (declared; not called yet): each time the list opens, by a
-   *  click or a key. */
+  /** v1.61.0: called each time the list opens, by a click or a key. */
   onOpen?: () => void;
 }
 
@@ -124,11 +128,16 @@ export function Select(props: SelectProps): JSX.Element {
     const at = props.options.findIndex((o) => o.value === props.value);
     setActive(at >= 0 ? at : 0);
     setOpen(true);
+    props.onOpen?.();
   };
-  const pick = (i: number): void => {
+  /** Picks option `i` and closes; a disabled one is refused, and the list
+   *  stays open. True when it picked. */
+  const pick = (i: number): boolean => {
     const o = props.options[i];
+    if (o?.disabled) return false;
     setOpen(false);
     if (o) props.onChange(o.value);
+    return true;
   };
 
   const onKeyDown = (e: KeyboardEvent): void => {
@@ -221,14 +230,14 @@ export function Select(props: SelectProps): JSX.Element {
                 class={`dropdown-opt ${o.value === props.value ? "is-selected" : ""}`}
                 role="option"
                 aria-selected={o.value === props.value}
-                style={
-                  i() === active()
-                    ? { outline: "1px solid var(--line-glow)", "outline-offset": "-1px" }
-                    : undefined
-                }
+                aria-disabled={o.disabled ? "true" : undefined}
+                style={{
+                  ...(i() === active() ? { outline: "1px solid var(--line-glow)", "outline-offset": "-1px" } : {}),
+                  ...(o.disabled ? { opacity: 0.55, cursor: "default" } : {}),
+                }}
                 onPointerEnter={() => setActive(i())}
                 onClick={(e) => {
-                  pick(i());
+                  if (!pick(i())) return;
                   // A pointer's pick leaves the focus on the page.
                   if (props.blurOnPointer && e.detail > 0) trigger?.blur();
                 }}

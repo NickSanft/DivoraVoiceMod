@@ -13,6 +13,7 @@ import {
   MAX_ACTIONS,
   MAX_LINE_CHARS,
   MAX_TARGET_CHARS,
+  obsSceneAction,
   pairingWarnings,
   pickRandomPreset,
   readAction,
@@ -318,6 +319,17 @@ describe("pairingWarnings (§7.9)", () => {
       "switchNoRevert",
     ]],
     ["lists that aren't arrays", 5, {}, []],
+    // v1.61.0: OBS's scene, by the same rule.
+    ["a break that switches OBS and back", [MUTE, SCENE], [UNMUTE, SCENE_BACK], []],
+    ["a switch of OBS's scene with no switch back", [SCENE], [UNMUTE], ["sceneNoBack"]],
+    ["a switch of OBS's scene at zero only switches nothing back", [], [SCENE], []],
+    ["a switch back with no switch of OBS's scene", [MUTE], [UNMUTE, SCENE_BACK], ["backNoScene"]],
+    // Stored At start (a hand edit) it never runs, so it backs nothing.
+    ["a Switch OBS back At start is no switch back", [SCENE, SCENE_BACK], [], ["sceneNoBack"]],
+    ["a preset's switch back doesn't switch OBS back", [SCENE], [REVERT], ["revertNoSwitch", "sceneNoBack"]],
+    ["an OBS op this build can't read counts for nothing", [OBS], [OBS], []],
+    ["three at once, in order", [MUTE, { kind: "randomPreset" }, SCENE], [], ["muteNoUnmute", "switchNoRevert", "sceneNoBack"]],
+    ["the two switch backs with nothing to go back to", [], [REVERT, SCENE_BACK], ["revertNoSwitch", "backNoScene"]],
   ])("%s", (_name, onStart, onFire, want) => {
     expect(pairingWarnings(onStart, onFire)).toEqual(want);
   });
@@ -419,6 +431,10 @@ describe("actionWords (§9)", () => {
     [LINE("I'm back."), "Say “I'm back.” in Voice not available"],
     [{ kind: "saveReplay" }, "Save a replay"],
     [{ kind: "panic" }, "Stop all clips and lines"],
+    // v1.61.0: by the stored name; one with nothing in it still reads.
+    [SCENE, "Switch OBS to BRB"],
+    [{ ...SCENE, sceneName: "" }, "Switch OBS to a scene with no name"],
+    [SCENE_BACK, "Switch OBS back"],
   ] as const)("%j → %s", (a, want) => {
     expect(actionWords(a as TimerAction, names)).toBe(want);
   });
@@ -623,5 +639,48 @@ describe("breakTemplate (D26)", () => {
     ]);
     // Each call's lists are its own.
     expect(breakTemplate().onStart).not.toBe(b.onStart);
+  });
+
+  // v1.61.0 (D35): Settings' "Switch OBS to … for the break".
+  it("with a scene: switches OBS to it after the mute, and back after the unmute, and syncs as both lists", () => {
+    const scene = { uuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", name: "BRB" };
+    const b = breakTemplate(scene);
+    expect(b).toEqual({
+      name: "BRB",
+      durationMs: 300_000,
+      onStart: [MUTE, SCENE],
+      onFire: [UNMUTE, SCENE_BACK],
+    });
+    expect(pairingWarnings(b.onStart, b.onFire)).toEqual([]);
+    const s = readTimers({ version: 1, timers: [{ id: "timer-1", kind: "countdown", hotkeys: {}, ...b }] });
+    expect(defsForSync(s)).toEqual([
+      {
+        id: "timer-1",
+        name: "BRB",
+        kind: "countdown",
+        durationMs: 300_000,
+        onStart: [MUTE, SCENE],
+        onFire: [UNMUTE, SCENE_BACK],
+      },
+    ]);
+    // Without one, v1.60.0's.
+    expect(breakTemplate(undefined)).toEqual(breakTemplate());
+    expect(breakTemplate(scene).onFire).not.toBe(b.onFire);
+  });
+
+  it("a scene whose name OBS let grow past 256 characters is stored cut, so it reads and is sent", () => {
+    const long = { uuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", name: "\u{1F642}".repeat(300) };
+    const b = breakTemplate(long);
+    expect(b.onStart[1]).toEqual({ ...SCENE, sceneName: "\u{1F642}".repeat(256) });
+    expect(actionsForSync(b.onStart)).toEqual(b.onStart);
+  });
+});
+
+describe("obsSceneAction (v1.61.0)", () => {
+  it("is a Switch OBS scene by the scene's uuid, its name cut as stored", () => {
+    expect(obsSceneAction({ uuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", name: "BRB" })).toEqual(SCENE);
+    const a = obsSceneAction({ uuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", name: "x".repeat(257) });
+    expect(a).toEqual({ ...SCENE, sceneName: "x".repeat(256) });
+    expect(readAction(a)).toEqual(a);
   });
 });

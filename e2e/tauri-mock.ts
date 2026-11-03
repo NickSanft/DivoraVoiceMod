@@ -20,6 +20,8 @@
 //                     delayPtmModeAnswers)
 //   __E2E_LISTENERS__ : Map<event, handler ids> — every `listen` so far
 //                     (v1.59.0; see listenCount)
+//   __E2E_OBS__ : { answer } — answers the held `obs_inventory` calls
+//                     (v1.61.0; see holdObsInventory, answerObsInventory)
 //
 // v1.57.0: a model download stays open until the spec ends it
 // (emitDownloadProgress, endDownload), and the backend's download slot lives
@@ -36,13 +38,28 @@
 // v1.60.0: what a countdown's start and end do is the backend's to decide,
 // so nothing here runs a timer's actions: a spec sends the page's half with
 // emitTimerActions, and does the backend's half (the mute) with setMockMute.
+//
+// v1.61.0: Talk to OBS. The six obs_* commands answer as Rust's `ObsShared`
+// does, over a status kept in sessionStorage (so a reload finds it, as the
+// backend keeps its link across one), and a change they make goes out as
+// `obs-status` too, as Rust's status cell sends every change. No OBS
+// exists here: a link only ever gets as far as `connecting`, and every
+// later state is one a spec sends with emitObsStatus, as the link's driver
+// would. `obs_inventory` answers while the status is `connected`, with
+// MOCK_OBS_INVENTORY or what setMockObsInventory set; holdObsInventory keeps
+// the answers waiting until answerObsInventory. Words for a refusal come
+// from obs.fixture.json `commandErrors`, which Rust's own strings are
+// tested equal to. A password is checked as Rust checks it and never kept:
+// only `hasPassword` is.
 
 import { test as base, expect, type Page } from "@playwright/test";
 import wire from "../src/overlay/wire.fixture.json" with { type: "json" };
 import timerWire from "../src/overlay/timer.fixture.json" with { type: "json" };
+import obsWire from "../src/data/obs.fixture.json" with { type: "json" };
 import type { OverlayStatus } from "../src/overlay/status";
 import type { TimerSnapshot } from "../src/overlay/timerState";
 import type { TimerActionsEvent } from "../src/data/timerActions";
+import type { ObsInventory, ObsStatus } from "../src/data/obs";
 
 export const MOCK_INPUTS = [
   { name: "Mock Mic", isDefault: true, defaultSampleRate: 48000, channels: 1 },
@@ -147,6 +164,45 @@ export const TIMER_SAMPLES = timerWire.samples as Record<
   TimerSnapshot
 >;
 
+/** v1.61.0: Talk to OBS's wire samples (src/data/obs.fixture.json
+ *  `obsStatusSamples`), as Rust serializes each state and reason: the file
+ *  both unit suites read. */
+const OBS_STATUS_SAMPLES = obsWire.obsStatusSamples.map((s) => s.status as ObsStatus);
+
+/** v1.61.0: the fixture's first sample in `state` with `reason`, without
+ *  its `seq`, to hand emitObsStatus (which numbers what it sends). Throws
+ *  for a pair the fixture doesn't have. */
+export function obsStatusSample(state: ObsStatus["state"], reason: ObsStatus["reason"] = null): Omit<ObsStatus, "seq"> {
+  const found = OBS_STATUS_SAMPLES.find((s) => s.state === state && s.reason === reason);
+  if (!found) throw new Error(`obs.fixture.json has no ${state} sample with reason ${reason}`);
+  const { seq: _seq, ...rest } = found;
+  return rest;
+}
+
+/** v1.61.0: Rust's `ObsStatus::off()`, the status before any OBS command:
+ *  the fixture's first `off` sample (host "", port 0). */
+const OBS_OFF: ObsStatus = { seq: 0, ...obsStatusSample("off") };
+
+/** v1.61.0: what `obs_inventory` answers while connected, unless a spec set
+ *  another (setMockObsInventory): three scenes, Game live, and three text
+ *  sources, one of them reading a file. `rev` is the status's
+ *  `inventoryRev` when it answers. */
+export const MOCK_OBS_INVENTORY: ObsInventory = {
+  rev: 0,
+  scenes: [
+    { uuid: "5f1c2a90-3b7e-4d21-9a0c-6e8b4f2d1a01", name: "Game" },
+    { uuid: "5f1c2a90-3b7e-4d21-9a0c-6e8b4f2d1a02", name: "BRB scene" },
+    { uuid: "5f1c2a90-3b7e-4d21-9a0c-6e8b4f2d1a03", name: "Just Chatting" },
+  ],
+  textSources: [
+    { uuid: "8d3e7b14-c6a2-4f0e-b5d9-2a7c1e9f4b11", name: "Timer text", kind: "gdiplus", readsFromFile: false },
+    { uuid: "8d3e7b14-c6a2-4f0e-b5d9-2a7c1e9f4b12", name: "Clock file", kind: "gdiplus", readsFromFile: true },
+    { uuid: "8d3e7b14-c6a2-4f0e-b5d9-2a7c1e9f4b13", name: "Uptime text", kind: "ft2", readsFromFile: false },
+  ],
+  programSceneUuid: "5f1c2a90-3b7e-4d21-9a0c-6e8b4f2d1a01",
+  truncated: false,
+};
+
 export interface MockOptions {
   /** Seed `divora.wizardSeen=true` so the app lands on the Mixer, not the
    *  first-run wizard. Default true; the wizard spec passes false. */
@@ -177,6 +233,13 @@ export async function installTauriMock(
       importedAsset: Record<string, unknown>;
       kokoroInstalled: boolean;
       downloadBusy: string;
+      obs: {
+        off: Record<string, unknown>;
+        hosts: Array<{ typed: string; ip: string | null; loopback: boolean | null; error: string | null }>;
+        errors: Record<string, Record<string, string>>;
+        maxPasswordChars: number;
+        inventory: Record<string, unknown>;
+      };
     }) => {
       const invokes: Array<{ cmd: string; args: unknown }> = [];
       (window as unknown as { __E2E_INVOKES__: unknown }).__E2E_INVOKES__ =
@@ -388,6 +451,109 @@ export async function installTauriMock(
       const timerArgs = (cmd: string, a: any): null => {
         if (typeof a?.id !== "string") throw `invalid args \`id\` for command \`${cmd}\``;
         return null;
+      };
+
+      // v1.61.0: Talk to OBS, as Rust's `ObsShared` holds it: the status,
+      // the address it last took (`config`, the host canonical, as
+      // `LastConfig`) and what `obs_inventory` answers while connected (or
+      // the key of its refusal in `commandErrors.inventory`). Kept in
+      // sessionStorage, so a reload finds them, as the backend keeps them
+      // across one; never the password. Read only inside the handlers, once
+      // the page has an origin.
+      type ObsConfigTaken = { enabled: boolean; host: string; port: number; loopback: boolean };
+      type ObsMockState = {
+        status: Record<string, any>;
+        config: ObsConfigTaken | null;
+        inventory: Record<string, unknown> | { error: string };
+        hold: boolean;
+      };
+      const OBS_KEY = "__E2E_OBS__";
+      // The states that stay until something changes (obs/mod.rs `is_stop`).
+      const OBS_STOPS = [
+        "needsPassword",
+        "authFailed",
+        "passwordUnreadable",
+        "tooOld",
+        "needsNewerDivora",
+        "kicked",
+        "unsupported",
+      ];
+      // Each part a spec hasn't set (the test-side helpers write only
+      // theirs) reads as at launch: off, never configured, the mock's
+      // inventory, nothing held.
+      const isObj = (v: unknown): v is Record<string, any> => typeof v === "object" && v !== null;
+      const readObs = (): ObsMockState => {
+        const o = readSession(OBS_KEY);
+        const s: Record<string, unknown> = isObj(o) ? o : {};
+        return {
+          status: isObj(s.status) ? s.status : { ...data.obs.off },
+          config: isObj(s.config) ? (s.config as ObsConfigTaken) : null,
+          inventory: isObj(s.inventory) ? s.inventory : data.obs.inventory,
+          hold: s.hold === true,
+        };
+      };
+      const writeObs = (o: ObsMockState): void => sessionStorage.setItem(OBS_KEY, JSON.stringify(o));
+      /** A change to the status, as Rust's status cell makes one: `f` on a
+       *  copy, and only if that differs, `seq` + 1, kept and sent as
+       *  `obs-status`. */
+      const writeObsStatus = (f: (s: Record<string, any>) => void): void => {
+        const o = readObs();
+        const next: Record<string, any> = { ...o.status, missing: [...(o.status.missing ?? [])] };
+        f(next);
+        next.seq = o.status.seq;
+        if (JSON.stringify(next) === JSON.stringify(o.status)) return;
+        next.seq = o.status.seq + 1;
+        writeObs({ ...o, status: next });
+        emit("obs-status", next);
+      };
+      /** A link starts for `at` (`StatusCell::begin`): `connecting` there,
+       *  what belonged to the last connection gone, and what the last Hello
+       *  said kept only for the same address. Nothing here gets further. */
+      const obsBegin = (at: ObsConfigTaken): void =>
+        writeObsStatus((s) => {
+          if (s.host !== at.host || s.port !== at.port) {
+            s.authRequired = null;
+            s.obsVersion = null;
+            s.websocketVersion = null;
+          }
+          Object.assign(s, {
+            state: "connecting",
+            host: at.host,
+            port: at.port,
+            loopback: at.loopback,
+            reason: null,
+            detail: null,
+            retryAtMs: null,
+            stream: null,
+            record: null,
+            missing: [],
+          });
+        });
+      /** Rust's `restart_if_on`: a saved or forgotten password restarts a
+       *  link that is on, whatever its state. */
+      const obsRestartIfOn = (): void => {
+        const c = readObs().config;
+        if (c?.enabled) obsBegin(c);
+      };
+      // Inventory answers held by holdObsInventory, each answered (and the
+      // hold let go) by answerObsInventory.
+      const obsWaiting: Array<() => void> = [];
+      (window as unknown as { __E2E_OBS__: unknown }).__E2E_OBS__ = {
+        answer: (): number => {
+          const o = readObs();
+          writeObs({ ...o, hold: false });
+          const n = obsWaiting.length;
+          for (const answer of obsWaiting.splice(0)) answer();
+          return n;
+        },
+      };
+      /** `obs_inventory`'s answer now: Rust's link answers only while
+       *  connected. */
+      const obsInventoryNow = (): unknown => {
+        const o = readObs();
+        if (o.status.state !== "connected") throw data.obs.errors.inventory!.notConnected;
+        if ("error" in o.inventory) throw data.obs.errors.inventory![o.inventory.error as string];
+        return { ...o.inventory, rev: o.status.inventoryRev };
       };
 
       const NOT_OPEN = "The overlay isn't open.";
@@ -705,6 +871,94 @@ export async function installTauriMock(
         finish_timer: (a: any) => timerArgs("finish_timer", a),
         timer_status: () => null,
         timers_dir: () => "C:/mock/timers",
+        // v1.61.0: Talk to OBS's six commands, each answering the whole
+        // status as Rust's do (`obs_inventory` its own answer). Arguments
+        // are refused as Tauri refuses them; an address the fixture's
+        // `hostSamples` don't list is refused too, in words that say so, so
+        // a spec types one Rust's answer is known for.
+        obs_configure: (a: any) => {
+          const c = a?.config;
+          if (
+            typeof c !== "object" ||
+            c === null ||
+            typeof c.enabled !== "boolean" ||
+            typeof c.host !== "string" ||
+            !Number.isInteger(c.port) ||
+            c.port < 0 ||
+            c.port > 65535
+          ) {
+            throw "invalid args `config` for command `obs_configure`";
+          }
+          const row = data.obs.hosts.find((h) => h.typed === c.host);
+          if (!row) throw `The e2e mock doesn't know what Rust makes of ${c.host}: use a hostSamples address.`;
+          if (row.error !== null) throw data.obs.errors.configure![row.error];
+          if (c.port === 0) throw data.obs.errors.configure!.badPort;
+          const o = readObs();
+          const at: ObsConfigTaken = { enabled: c.enabled, host: row.ip!, port: c.port, loopback: row.loopback! };
+          // A link already running for this address is kept (a reload's
+          // configure changes nothing, a stop state included).
+          const running = o.config?.enabled === true && o.config.host === at.host && o.config.port === at.port;
+          writeObs({ ...o, config: at });
+          if (!c.enabled) {
+            // Off: every switch back still due is dropped, and the link stops.
+            writeObsStatus((s) => {
+              Object.assign(s, data.obs.off, {
+                host: at.host,
+                port: at.port,
+                loopback: at.loopback,
+                hasPassword: s.hasPassword,
+                heldBack: 0,
+                inventoryRev: s.inventoryRev,
+              });
+            });
+          } else if (!running) {
+            obsBegin(at);
+          }
+          return readObs().status;
+        },
+        // Try again: a stop state restarts; `retrying` tries now, which
+        // changes nothing the page can see until the attempt's outcome (a
+        // spec's emitObsStatus); anything else, or off, nothing.
+        obs_reconnect: () => {
+          const o = readObs();
+          if (o.config?.enabled && OBS_STOPS.includes(o.status.state)) obsBegin(o.config);
+          return readObs().status;
+        },
+        obs_set_password: (a: any) => {
+          if (typeof a?.password !== "string") throw "invalid args `password` for command `obs_set_password`";
+          const chars = Array.from(a.password as string).length;
+          if (chars === 0) throw data.obs.errors.setPassword!.empty;
+          if (chars > data.obs.maxPasswordChars) throw data.obs.errors.setPassword!.tooLong;
+          writeObsStatus((s) => {
+            s.hasPassword = true;
+          });
+          obsRestartIfOn();
+          return readObs().status;
+        },
+        obs_forget_password: () => {
+          writeObsStatus((s) => {
+            s.hasPassword = false;
+          });
+          obsRestartIfOn();
+          return readObs().status;
+        },
+        obs_status: () => readObs().status,
+        // Refused at once unless connected; held answers wait for
+        // answerObsInventory and are read then, as the link answers once
+        // OBS has (not connected any more by then: refused).
+        obs_inventory: () => {
+          if (!readObs().hold) return obsInventoryNow();
+          if (readObs().status.state !== "connected") throw data.obs.errors.inventory!.notConnected;
+          return new Promise((resolve, reject) => {
+            obsWaiting.push(() => {
+              try {
+                resolve(obsInventoryNow());
+              } catch (err) {
+                reject(err);
+              }
+            });
+          });
+        },
       };
       // Plugin calls answer null, except where null would mean something:
       // the main window's toasts wait while `isVisible()` is false. A spec
@@ -782,6 +1036,13 @@ export async function installTauriMock(
       importedAsset: IMPORTED_ASSET_SAMPLE,
       kokoroInstalled,
       downloadBusy: MODEL_DOWNLOAD_BUSY,
+      obs: {
+        off: OBS_OFF as unknown as Record<string, unknown>,
+        hosts: obsWire.hostSamples,
+        errors: obsWire.commandErrors,
+        maxPasswordChars: obsWire.limits.maxPasswordChars,
+        inventory: MOCK_OBS_INVENTORY as unknown as Record<string, unknown>,
+      },
     },
   );
 
@@ -922,6 +1183,128 @@ export async function emitTimerActions(page: Page, ev: TimerActionsEvent): Promi
     },
     [timerWire.actionWire.events.actions, ev] as const,
   );
+}
+
+/** v1.61.0: `status`'s problems against the wire (obs.fixture.json): a key
+ *  it doesn't have, a state, reason, stream or record word it doesn't
+ *  know, or a skip whose keys aren't exactly its own or whose why its op
+ *  can't have (a switch back is never `queueFull` or `late`). The page
+ *  drops a status it can't read, so each would pass for one it ignored. */
+function obsStatusProblems(status: Record<string, unknown>): string[] {
+  const problems = Object.keys(status)
+    .filter((k) => !obsWire.statusKeys.includes(k))
+    .map((k) => `the status has ${k}`);
+  const oneOf = (key: string, list: readonly string[], nullable: boolean): void => {
+    if (!(key in status)) return;
+    const v = status[key];
+    if (!(nullable && v === null) && !(typeof v === "string" && list.includes(v))) {
+      problems.push(`the status has ${key} ${JSON.stringify(v)}`);
+    }
+  };
+  oneOf("state", obsWire.states, false);
+  oneOf("reason", obsWire.reasons, true);
+  oneOf("stream", obsWire.streamStates, true);
+  oneOf("record", obsWire.recordStates, true);
+  const skip = status.lastSkip;
+  if (typeof skip === "object" && skip !== null) {
+    const k = skip as Record<string, unknown>;
+    problems.push(...keyProblems("lastSkip", k, obsWire.lastSkipKeys));
+    const whys = (obsWire.skipWhysByOp as Record<string, string[]>)[String(k.op)];
+    if (!whys) problems.push(`lastSkip has op ${String(k.op)}`);
+    else if (!whys.includes(String(k.why))) problems.push(`lastSkip's ${String(k.op)} has why ${String(k.why)}`);
+  }
+  const text = status.textSkip;
+  if (typeof text === "object" && text !== null) {
+    const k = text as Record<string, unknown>;
+    problems.push(...keyProblems("textSkip", k, obsWire.textSkipKeys));
+    if (!obsWire.textSkipWhys.includes(String(k.why))) problems.push(`textSkip has why ${String(k.why)}`);
+  }
+  return problems;
+}
+
+/** v1.61.0: what the backend's link does on each change it makes (a
+ *  connection made or lost, OBS going live, a scene switch that didn't
+ *  happen…): `patch` over the mock's status, numbered one past it, kept
+ *  (so the commands answer it, after a reload too) and sent as
+ *  `obs-status`. With a `seq` of its own it is sent as given; one at or
+ *  below the mock's is an event that arrived late, sent and not kept. A
+ *  key, word or skip the wire doesn't have is refused (obsStatusProblems).
+ *  Returns what was sent. */
+export async function emitObsStatus(page: Page, patch: Partial<ObsStatus>): Promise<ObsStatus> {
+  const problems = obsStatusProblems(patch as Record<string, unknown>);
+  if (problems.length > 0) throw new Error(`not an ObsStatus: ${problems.join(", ")}`);
+  return page.evaluate(
+    ([event, p, off]) => {
+      const cur = (JSON.parse(sessionStorage.getItem("__E2E_OBS__") ?? "null") ?? {}) as Record<string, unknown>;
+      const status = (cur.status ?? off) as Record<string, unknown>;
+      const held = status.seq as number;
+      const next = { ...status, ...p, seq: typeof p.seq === "number" ? p.seq : held + 1 };
+      if (next.seq > held) sessionStorage.setItem("__E2E_OBS__", JSON.stringify({ ...cur, status: next }));
+      (
+        window as unknown as { __E2E_EMIT__: (e: string, payload: unknown) => void }
+      ).__E2E_EMIT__(event as string, next);
+      return next as unknown as ObsStatus;
+    },
+    [obsWire.obsWire.events.status, patch, OBS_OFF] as const,
+  );
+}
+
+/** v1.61.0: the status as the mock backend holds it (what `obs_status`
+ *  answers); Rust's `ObsStatus::off()` before any OBS command. */
+export function mockObsStatus(page: Page): Promise<ObsStatus> {
+  return page.evaluate(
+    (off) =>
+      ((JSON.parse(sessionStorage.getItem("__E2E_OBS__") ?? "null") as { status?: ObsStatus } | null)?.status ??
+        off) as ObsStatus,
+    OBS_OFF,
+  );
+}
+
+/** v1.61.0: `patch` over the mock's OBS state in sessionStorage (the parts
+ *  the page side doesn't find read as at launch). */
+function patchObsMock(page: Page, patch: Record<string, unknown>): Promise<void> {
+  return page.evaluate((p) => {
+    const cur = (JSON.parse(sessionStorage.getItem("__E2E_OBS__") ?? "null") ?? {}) as Record<string, unknown>;
+    sessionStorage.setItem("__E2E_OBS__", JSON.stringify({ ...cur, ...p }));
+  }, patch);
+}
+
+/** v1.61.0: what `obs_inventory` answers from now on while connected (its
+ *  `rev` the status's `inventoryRev` then), or the refusal it answers
+ *  instead, by its key in obs.fixture.json `commandErrors.inventory`. An
+ *  inventory, a scene or a source whose keys aren't exactly the wire's, or
+ *  a kind it doesn't have, is refused. */
+export async function setMockObsInventory(
+  page: Page,
+  answer: ObsInventory | { error: keyof typeof obsWire.commandErrors.inventory },
+): Promise<void> {
+  if ("error" in answer) {
+    if (!(answer.error in obsWire.commandErrors.inventory)) throw new Error(`no inventory error ${answer.error}`);
+  } else {
+    const problems = keyProblems("the inventory", answer, obsWire.inventoryKeys);
+    answer.scenes.forEach((s, i) => problems.push(...keyProblems(`scenes[${i}]`, s, obsWire.sceneKeys)));
+    answer.textSources.forEach((t, i) => {
+      problems.push(...keyProblems(`textSources[${i}]`, t, obsWire.textSourceKeys));
+      if (!obsWire.textSourceKinds.includes(t.kind)) problems.push(`textSources[${i}] has kind ${t.kind}`);
+    });
+    if (problems.length > 0) throw new Error(`not an ObsInventory: ${problems.join(", ")}`);
+  }
+  await patchObsMock(page, { inventory: answer });
+}
+
+/** v1.61.0: from now on, and across reloads of this tab, `obs_inventory`
+ *  waits to answer until answerObsInventory, as the link does while OBS
+ *  reads its sources (up to 15 s), so a spec sees the page while it loads.
+ *  A call while not connected is still refused at once. */
+export async function holdObsInventory(page: Page): Promise<void> {
+  await patchObsMock(page, { hold: true });
+}
+
+/** v1.61.0: answers every `obs_inventory` waiting since holdObsInventory,
+ *  with what it answers now (refused if the status isn't `connected` any
+ *  more), and stops holding. Returns how many were waiting. */
+export function answerObsInventory(page: Page): Promise<number> {
+  return page.evaluate(() => (window as unknown as { __E2E_OBS__: { answer: () => number } }).__E2E_OBS__.answer());
 }
 
 /** v1.56.0: the mute as the mock engine holds it (sessionStorage

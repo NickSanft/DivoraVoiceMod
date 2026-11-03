@@ -201,16 +201,18 @@ test.describe("what's new (v1.49)", () => {
 
     // No banner off Tauri: there is no app version to compare against. (The
     // shell's toast is a status region too, always mounted since v1.54.0, and
-    // so are the titlebar's mute announcer since v1.56.0 and Settings →
-    // Hourglass's since v1.59.0; all are empty.)
+    // so are the titlebar's mute announcer since v1.56.0, Settings →
+    // Hourglass's since v1.59.0 and Settings → OBS's since v1.61.0; all are
+    // empty.)
     await expect(
       page.locator(
-        '[role="status"]:not([data-testid="toast"]):not([data-testid="mute-announcer"]):not([data-testid="hourglass-announcer"])',
+        '[role="status"]:not([data-testid="toast"]):not([data-testid="mute-announcer"]):not([data-testid="hourglass-announcer"]):not([data-testid="obs-announcer"])',
       ),
     ).toHaveCount(0);
     await expect(page.getByTestId("toast")).toHaveText("");
     await expect(page.getByTestId("mute-announcer")).toHaveText("");
     await expect(page.getByTestId("hourglass-announcer")).toHaveText("");
+    await expect(page.getByTestId("obs-announcer")).toHaveText("");
 
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);

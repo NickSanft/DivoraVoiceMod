@@ -22,6 +22,7 @@ export type SigilName =
   | "clean" | "modulated" | "muted" | "monitor" | "mic" | "output"
   | "lock" | "unlock" | "panic" | "play" | "stop" | "pause" | "hourglass" | "record" | "screen" | "replay"
   | "endNow" | "shuffle" | "undo"
+  | "link"
   | "image" | "expand"
   | "chevronR" | "chevronD" | "chevronL"
   | "check" | "x" | "plus" | "search" | "drag" | "folder"
@@ -280,6 +281,15 @@ const SIGILS: Record<SigilName, () => JSX.Element> = {
     <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M9 5 L5 9 L9 13" />
       <path d="M5 9 H14 A5 5 0 0 1 14 19 H10" />
+    </g>
+  ),
+  // v1.61.0: Talk to OBS. Two chain links on a slant, each a rounded
+  // capsule through the other, stroked as the hourglass is: Divora linked
+  // to OBS. Never OBS's own logo (D36).
+  link: () => (
+    <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3.5" y="12.25" width="11" height="5.5" rx="2.75" transform="rotate(-45 9 15)" />
+      <rect x="9.5" y="6.25" width="11" height="5.5" rx="2.75" transform="rotate(-45 15 9)" />
     </g>
   ),
   chevronR: () => <path d="M9.5 6 L15.5 12 L9.5 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />,

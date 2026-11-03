@@ -70,7 +70,8 @@ use timer_actions::{ActionBatch, ObsOp, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER
 use timer_lines::{run_line_thread, Line, TimerLines, TIMER_LINE_CLIP_ID};
 use timer_thread::{
     hand_off, spawn_action_worker, spawn_text_writer, spawn_timer_thread, ActionHost,
-    ChannelWaiter, RealClock, TextFiles, TextSlot, TimerEvents, TimerShared, ACTION_QUEUE,
+    ChannelWaiter, RealClock, TextFiles, TextSlot, TimerEvents, TimerShared, TimerSinks,
+    ACTION_QUEUE,
 };
 use timers::{adjust_delta, TimerOp, TimerSnapshot, TICK, TIMER_STATE_EVENT};
 use zeroize::Zeroizing;
@@ -3118,10 +3119,8 @@ fn timers_dir(state: State<'_, AppState>) -> Result<String, String> {
 // `obs_status` and `obs_inventory` stay out. Each answers the whole
 // `ObsStatus` (`obs_inventory` its own answer): of two, the larger `seq` is
 // newer, events included. Each is a thin wrapper over `ObsShared`, which
-// `obs::init` manages at setup; one that isn't managed answers as a link
-// that is off.
-// S1: track C calls `obs::init` from setup; until then every command
-// answers that way.
+// `obs::init` manages at setup; one that isn't managed (only before setup
+// has run) answers as a link that is off.
 
 /// v1.61.0: the address and the switch (D4). `enabled:false` validates the
 /// address, stops any link and drops the switch-backs still due; it never
@@ -3703,6 +3702,10 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // v1.55.0: the overlay's `NonRudeHWND` comes off first; its
                 // window isn't closed through `CloseRequested` on the way out.
                 overlay_windows::before_exit(app);
+                // v1.61.0: the OBS link closes its connection with 1001, so
+                // OBS shows no "client disconnected" alert; at most 300 ms
+                // (D5).
+                obs::before_exit(app);
                 app.exit(0);
             }
             TRAY_SAVE_ID => {
@@ -3932,6 +3935,11 @@ pub fn run() {
             );
             let timer_texts = Arc::new(TextSlot::new());
             spawn_text_writer(&timer_texts, TextFiles::new(timers_dir));
+            // v1.61.0: the OBS link's feed (D17, D18): the timer thread puts
+            // each pass's feed in it when it changes (latest wins); the link,
+            // while OBS is on, reads it. Made before the thread, which holds
+            // the sender for good.
+            let (obs_feed, obs_feed_rx) = tokio::sync::watch::channel(Arc::default());
             // v1.60.0: `divora-timer-actions` runs a timer's backend actions
             // (the mute, Stop all, a replay save, a line) in order, off the
             // timer thread, which hands each batch on without waiting (D13,
@@ -3951,9 +3959,26 @@ pub fn run() {
                     app: app.handle().clone(),
                     actions: timer_actions,
                 },
-                timer_texts,
+                TimerSinks {
+                    files: timer_texts,
+                    obs: obs_feed,
+                },
                 TICK,
             );
+            // v1.61.0: Talk to OBS (D3). `ObsShared` is managed here, before
+            // any page exists, with the slots `obs/returns.json` holds, so a
+            // break's switch back survives a restart (D24). Nothing starts:
+            // no link runs and no `obs/` folder is made until the page
+            // switches OBS on. `tauri dev` builds keep their own folder.
+            let obs_name = obs::obs_dir_name(tauri::is_dev());
+            let obs_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir.join(obs_name),
+                Err(e) => {
+                    tracing::warn!(?e, "no app data dir; falling back to temp for obs");
+                    std::env::temp_dir().join("DivoraVoice").join(obs_name)
+                }
+            };
+            obs::init(app.handle(), obs_feed_rx, timers.clone(), obs_dir);
 
             // Phase 12.4: discover bundled voice assets shipped in the
             // installer's resource dir (onnxruntime.dll + voices/*.onnx).
@@ -6460,7 +6485,11 @@ mod tests {
     /// folder `tauri dev` keeps apart, and the app keeps the shared core.
     /// v1.60.0: and the action worker on a queue of [`ACTION_QUEUE`], before
     /// the timer thread whose outputs hold its sender; and, once `AppState`
-    /// is managed, the line thread.
+    /// is managed, the line thread. v1.61.0 (D3, seam 3): the timer thread's
+    /// sink is the files' slot and the OBS feed's sender, and `obs::init`
+    /// runs once, after the timer thread (whose sink holds the feed's
+    /// sender) and before `AppState` is managed, with the feed's receiver
+    /// and the folder `tauri dev` keeps apart.
     ///
     /// [`ACTION_QUEUE`]: crate::timer_thread::ACTION_QUEUE
     #[test]
@@ -6476,12 +6505,79 @@ mod tests {
             concat!("spawn_action", "_worker("),
             concat!("TimerOutputs", " {"),
             concat!("spawn_line", "_thread("),
+            concat!("TimerSinks", " {"),
+            concat!("obs::init", "("),
+            concat!("obs::obs_dir_name(", "tauri::is_dev())"),
+            concat!("watch::channel(", "Arc::default())"),
         ] {
             assert_eq!(setup.matches(needle).count(), 1, "{needle}");
         }
         let at = |needle: &str| setup.find(needle).unwrap_or_else(|| panic!("{needle}"));
         assert!(at(concat!("spawn_action", "_worker(")) < at(concat!("spawn_timer", "_thread(")));
         assert!(at(concat!("app.manage(", "AppState {")) < at(concat!("spawn_line", "_thread(")));
+        assert!(
+            at(concat!("watch::channel(", "Arc::default())")) < at(concat!("TimerSinks", " {"))
+        );
+        assert!(at(concat!("TimerSinks", " {")) < at(concat!("obs::init", "(")));
+        assert!(at(concat!("spawn_timer", "_thread(")) < at(concat!("obs::init", "(")));
+        assert!(at(concat!("obs::init", "(")) < at(concat!("app.manage(", "AppState {")));
+        assert_eq!(
+            squashed(&setup[at(concat!("obs::init", "("))..])
+                .split_once(';')
+                .unwrap()
+                .0,
+            concat!(
+                "obs::init(app.handle(),obs_feed_rx,",
+                "timers.clone(),obs_dir)"
+            )
+        );
+        let sinks = body_of(setup, concat!("TimerSinks", " {"));
+        assert_eq!(
+            squashed(sinks),
+            concat!("{files:timer_texts,", "obs:obs_feed,}")
+        );
+    }
+
+    /// v1.61.0 (D3, §10.5): `obs::init` manages the `ObsShared` it builds —
+    /// without that, `AppHost::obs` and every OBS command would find none and
+    /// do nothing — on Tauri's own runtime (not a second one), with DPAPI
+    /// and the production timings, and starts nothing.
+    #[test]
+    fn obs_init_manages_the_shared_state() {
+        let obs = include_str!("obs/mod.rs").replace('\r', "");
+        let init = body_of(&obs, concat!("pub fn ", "init("));
+        let init = squashed(init);
+        for needle in [
+            concat!("app.", "manage(ObsShared::new("),
+            concat!("tauri::async_runtime::", "handle().inner().clone()"),
+            concat!("Arc::new(", "files::Dpapi)"),
+            concat!("LinkTiming::", "production()"),
+            concat!("emitter.emit(", "OBS_STATUS_EVENT,s)"),
+        ] {
+            assert_eq!(init.matches(needle).count(), 1, "{needle}: {init}");
+        }
+        for never in ["configure(", "spawn(", "create_dir", "link::run"] {
+            assert!(!init.contains(never), "{never}: {init}");
+        }
+    }
+
+    /// v1.61.0 (D5, §10.5): the tray's Quit closes the OBS link (1001, so
+    /// OBS shows no alert; at most 300 ms) after the overlay's goes, and
+    /// before the app exits.
+    #[test]
+    fn the_tray_quit_closes_the_obs_link() {
+        let prod = production_source();
+        let quit = body_of(&prod, concat!("\"quit\"", " =>"));
+        let at = |needle: &str| quit.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert_eq!(
+            quit.matches(concat!("obs::before_exit", "(app);")).count(),
+            1
+        );
+        assert!(
+            at(concat!("overlay_windows::before_exit", "(app);"))
+                < at(concat!("obs::before_exit", "(app);"))
+        );
+        assert!(at(concat!("obs::before_exit", "(app);")) < at(concat!("app.exit", "(0);")));
     }
 
     // ---- v1.60.0: timers that change your voice --------------------------
