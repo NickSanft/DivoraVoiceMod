@@ -4,6 +4,7 @@ import { makeTemplate } from "../data/unistroke";
 import { FALLBACK_PRESETS } from "../data/presets";
 import type { StoredTimer, StoredTimers, TimerDefWire } from "../data/timers";
 import type { TimerSnapshot, TimerState } from "../overlay/timerState";
+import obsFixture from "../data/obs.fixture.json";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -6198,7 +6199,9 @@ describe("app store — Hourglass (v1.59.0)", () => {
     const REVERT = { kind: "revertPreset" } as const;
     const MUTE = { kind: "setMuted", muted: true } as const;
     const UNMUTE = { kind: "setMuted", muted: false } as const;
-    const OBS = { kind: "obs", op: "sceneBack" };
+    // An action this build can't read: v1.61.0 reads `obs`, but not a later
+    // release's op.
+    const OBS = { kind: "obs", op: "startStream" };
     const TILE = { id: "9f2c4e1a7b3d5f60", path: "C:\\sb\\intro.wav", label: "intro", extension: "wav", sizeBytes: 1 };
     const PLAY_TILE = { kind: "tile", tileId: TILE.id } as const;
     const LINE = (text: string) => ({ kind: "speak" as const, text, voiceId: "babble:bright" });
@@ -6732,6 +6735,34 @@ describe("app store — Hourglass (v1.59.0)", () => {
         expect(saved()[0]!.onStart).toEqual([LINE("Be right back.")]);
       });
 
+      // v1.61.0: one kind, two ops: Switch OBS scene runs at either hook,
+      // Switch OBS back only at zero, and an edit never turns one into the
+      // other.
+      it("Switch OBS back is refused At start, and Set never changes an obs action's op", async () => {
+        const SCENE = { kind: "obs", op: "scene", sceneUuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", sceneName: "BRB" } as const;
+        const GAME = { ...SCENE, sceneUuid: "a7e2c94b-1f3d-4b8a-9c6e-0d5f7b2e4a91", sceneName: "Game" };
+        const BACK = { kind: "obs", op: "sceneBack" } as const;
+        const { result } = await boot({ timers: [entry("timer-1")] });
+        await result.addTimerAction("timer-1", "onStart", BACK);
+        expect(saved()[0]!.onStart).toBeUndefined();
+        expect(synced()).toEqual([]);
+        await result.addTimerAction("timer-1", "onStart", SCENE);
+        await result.addTimerAction("timer-1", "onFire", BACK);
+        expect(saved()[0]).toMatchObject({ onStart: [SCENE], onFire: [BACK] });
+        expect(synced().map((defs) => [defs[0]!.onStart, defs[0]!.onFire])).toEqual([
+          [[SCENE], undefined],
+          [[SCENE], [BACK]],
+        ]);
+        await result.setTimerAction("timer-1", "onStart", 0, BACK);
+        await result.setTimerAction("timer-1", "onFire", 0, SCENE);
+        expect(saved()[0]).toMatchObject({ onStart: [SCENE], onFire: [BACK] });
+        expect(synced()).toHaveLength(2);
+        // Another scene is a new target.
+        await result.setTimerAction("timer-1", "onStart", 0, GAME);
+        expect(saved()[0]!.onStart).toEqual([GAME]);
+        expect(synced()).toHaveLength(3);
+      });
+
       it("Set changes a running row's target or line, keeping the entry's other keys; never its kind or a row that doesn't run", async () => {
         const { result } = await boot({
           timers: [entry("timer-1", { onStart: [{ kind: "tile", tileId: "a", later: 1 }, OBS, LINE("Be right back.")] })],
@@ -7094,5 +7125,91 @@ describe("app store — one chain and one soundboard command at a time (v1.60.0)
     expect(boardOrder(wire.landed)).toEqual(clips);
     // One of each queue in flight at once, never more.
     expect(wire.peak()).toBe(2);
+  });
+});
+
+// v1.61.0: Talk to OBS. Only the parts that hold already: a profile without
+// `divora.obs`, or with it off, sends no OBS command and listens to no
+// `obs-status` (v1.60.0's boot, whatever it holds), and the mirror keeps
+// the larger `seq`.
+describe("app store — Talk to OBS (v1.61.0)", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+  /** Every command invoked and every event listened to, in order. */
+  let log: string[] = [];
+  const obsLog = () => log.filter((c) => c.startsWith("obs_") || c === "listen obs-status");
+
+  beforeEach(() => {
+    log = [];
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      log.push(cmd);
+      return null;
+    });
+    vi.mocked(listen).mockImplementation((async (event: string) => {
+      log.push(`listen ${event}`);
+      return () => {};
+    }) as unknown as typeof listen);
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    vi.mocked(listen).mockImplementation((async () => () => {}) as unknown as typeof listen);
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+  });
+
+  it.each([
+    ["without divora.obs", null],
+    ["with it off", { enabled: false, host: "127.0.0.1", port: 4455 }],
+    ["with one it can't read", "x"],
+  ])("%s: no OBS command, no obs-status listener, and storage as it was", async (_name, stored) => {
+    if (stored !== null) window.localStorage.setItem("divora.obs", JSON.stringify(stored));
+    // A profile that uses Hourglass, so the boot does send timer commands.
+    window.localStorage.setItem(
+      "divora.timers",
+      JSON.stringify({ version: 1, timers: [{ id: "timer-1", name: "BRB", kind: "countdown", durationMs: 300_000 }] }),
+    );
+    const { result } = setupApp();
+    await settle();
+    expect(log).toContain("sync_timers");
+    expect(obsLog()).toEqual([]);
+    expect(window.localStorage.getItem("divora.obs")).toBe(stored === null ? null : JSON.stringify(stored));
+    expect(result.obsStatus()).toBeNull();
+    expect(result.obsInventory()).toBeNull();
+    expect(result.obsSettings()).toEqual({ enabled: false, host: "127.0.0.1", port: 4455 });
+  });
+
+  it("reads divora.obs field by field", async () => {
+    const raw = { enabled: true, host: "192.168.1.20", port: 70_000, breakScene: { uuid: "", name: "BRB" }, later: 1 };
+    window.localStorage.setItem("divora.obs", JSON.stringify(raw));
+    const { result } = setupApp();
+    expect(result.obsSettings()).toEqual({ enabled: true, host: "192.168.1.20", port: 4455, later: 1 });
+  });
+
+  it("the mirror takes a status only if it is newer, and nothing that isn't one", async () => {
+    const { result } = setupApp();
+    const at = (seq: number) => ({ ...obsFixture.obsStatusSamples[3]!.status, seq });
+    result.applyObsStatus(at(5));
+    expect(result.obsStatus()).toEqual(at(5));
+    result.applyObsStatus(at(4));
+    result.applyObsStatus({ ...at(9), state: "paused" });
+    result.applyObsStatus(null);
+    expect(result.obsStatus()).toEqual(at(5));
+    result.applyObsStatus(at(6));
+    expect(result.obsStatus()).toEqual(at(6));
+  });
+
+  it("watchObs counts each watcher in, and out once", () => {
+    const { result } = setupApp();
+    const a = result.watchObs();
+    const b = result.watchObs();
+    expect(result.obsWatchers()).toBe(2);
+    a();
+    a();
+    expect(result.obsWatchers()).toBe(1);
+    b();
+    expect(result.obsWatchers()).toBe(0);
   });
 });

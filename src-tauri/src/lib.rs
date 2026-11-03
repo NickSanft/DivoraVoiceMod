@@ -36,6 +36,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 mod midi;
+pub mod obs;
 pub mod overlay_assets;
 pub mod overlay_machine;
 mod overlay_windows;
@@ -49,6 +50,8 @@ use midi::{
     list_inputs as list_midi_inputs_core, open_input as open_midi_input_core, MidiInputInfo,
 };
 use midir::MidiInputConnection;
+use obs::machine::{ObsConfig, ObsInventory, ObsStatus};
+use obs::ObsShared;
 use overlay_assets::{ImportedAsset, ServeGate, CHARM_SCHEME, SERVE_SLOTS};
 use overlay_machine::{
     HandshakeStage, ModeRequest, OverlayRect, OverlayStatus, BAD_MODE, BAD_STAGE,
@@ -63,13 +66,14 @@ use screen::{
     sanitize_fps, screen_recording_path, ArmRequest, CaptureStatusDto, DesktopSourceDto,
     MonitorDto, Quality, ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
-use timer_actions::{ActionBatch, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT};
+use timer_actions::{ActionBatch, ObsOp, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT};
 use timer_lines::{run_line_thread, Line, TimerLines, TIMER_LINE_CLIP_ID};
 use timer_thread::{
     hand_off, spawn_action_worker, spawn_text_writer, spawn_timer_thread, ActionHost,
     ChannelWaiter, RealClock, TextFiles, TextSlot, TimerEvents, TimerShared, ACTION_QUEUE,
 };
 use timers::{adjust_delta, TimerOp, TimerSnapshot, TICK, TIMER_STATE_EVENT};
+use zeroize::Zeroizing;
 
 /// Payload of the periodic `audio-levels` event. Frontend listens with
 /// `tauri.event.listen("audio-levels", …)`.
@@ -3105,6 +3109,84 @@ fn timers_dir(state: State<'_, AppState>) -> Result<String, String> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
+// ---- v1.61.0: Talk to OBS ----
+//
+// Every OBS command is async (D30): it runs on a tokio worker, never on the
+// main thread beside `WM_HOTKEY`, and only `obs_inventory` waits on OBS
+// (15 s at most). The page sends the four that change something through
+// its own queue (`obsQueue`), each once the one before it answered;
+// `obs_status` and `obs_inventory` stay out. Each answers the whole
+// `ObsStatus` (`obs_inventory` its own answer): of two, the larger `seq` is
+// newer, events included. Each is a thin wrapper over `ObsShared`, which
+// `obs::init` manages at setup; one that isn't managed answers as a link
+// that is off.
+// S1: track C calls `obs::init` from setup; until then every command
+// answers that way.
+
+/// v1.61.0: the address and the switch (D4). `enabled:false` validates the
+/// address, stops any link and drops the switch-backs still due; it never
+/// connects. `enabled:true` starts, keeps or restarts the link. `Err`: the
+/// address's or the port's message.
+#[tauri::command]
+async fn obs_configure(app: AppHandle, config: ObsConfig) -> Result<ObsStatus, String> {
+    match app.try_state::<ObsShared>() {
+        Some(obs) => obs.configure(config),
+        None => Ok(ObsStatus::off()),
+    }
+}
+
+/// v1.61.0: Try again (D4): retrying, an attempt now; a stop state, a
+/// restart; otherwise nothing.
+#[tauri::command]
+async fn obs_reconnect(app: AppHandle) -> Result<ObsStatus, String> {
+    Ok(match app.try_state::<ObsShared>() {
+        Some(obs) => obs.reconnect(),
+        None => ObsStatus::off(),
+    })
+}
+
+/// v1.61.0: Save password (D28, D29): encrypted for this Windows user into
+/// `obs/password.bin`, then a link that needs it restarts. Works while off.
+/// The password is wiped from Divora's copy when this returns, and never
+/// echoed.
+#[tauri::command]
+async fn obs_set_password(app: AppHandle, password: String) -> Result<ObsStatus, String> {
+    let password = Zeroizing::new(password);
+    match app.try_state::<ObsShared>() {
+        Some(obs) => obs.set_password(password).await,
+        None => Err(obs::WRITE_FAILED.to_string()),
+    }
+}
+
+/// v1.61.0: Forget password: `obs/password.bin` deleted (absent is fine),
+/// and a running link restarts. Works while off.
+#[tauri::command]
+async fn obs_forget_password(app: AppHandle) -> Result<ObsStatus, String> {
+    match app.try_state::<ObsShared>() {
+        Some(obs) => obs.forget_password().await,
+        None => Ok(ObsStatus::off()),
+    }
+}
+
+/// v1.61.0: the status now. Connects nothing.
+#[tauri::command]
+async fn obs_status(app: AppHandle) -> Result<ObsStatus, String> {
+    Ok(match app.try_state::<ObsShared>() {
+        Some(obs) => obs.status(),
+        None => ObsStatus::off(),
+    })
+}
+
+/// v1.61.0: OBS's scenes and text sources, from a connected link, within
+/// 15 s (D19); a second call while one runs joins it.
+#[tauri::command]
+async fn obs_inventory(app: AppHandle) -> Result<ObsInventory, String> {
+    match app.try_state::<ObsShared>() {
+        Some(obs) => obs.inventory().await,
+        None => Err(obs::NOT_CONNECTED.to_string()),
+    }
+}
+
 /// v1.60.0: what the timer thread hands on — its `timer-state` emits
 /// (v1.59.0's), and each hook run's two halves: the backend's to the action
 /// worker, the page's as `timer-actions` (D13).
@@ -3198,6 +3280,14 @@ impl ActionHost for AppHost {
     fn end_run(&self, timer: &str) {
         if let Some(state) = self.app.try_state::<AppState>() {
             state.timer_lines.end_run(timer);
+        }
+    }
+
+    /// v1.61.0: to the OBS link, which never waits (D17). Before `obs::init`
+    /// has managed it, nothing.
+    fn obs(&self, timer: &str, op: &ObsOp) {
+        if let Some(obs) = self.app.try_state::<ObsShared>() {
+            obs.offer(timer, op);
         }
     }
 }
@@ -4108,6 +4198,12 @@ pub fn run() {
             timer_status,
             timers_dir,
             finish_timer,
+            obs_configure,
+            obs_reconnect,
+            obs_set_password,
+            obs_forget_password,
+            obs_status,
+            obs_inventory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DivoraVoice");
@@ -6274,6 +6370,51 @@ mod tests {
         );
     }
 
+    /// v1.61.0 (D30): the six OBS commands, by the fixture's names (the
+    /// page's `api.ts` calls the same), are `async fn`s — on a tokio worker,
+    /// never the main thread — registered once each, after `finish_timer`
+    /// (so the timer needles keep their neighbours), with the argument names
+    /// the page sends. The commands need an `AppHandle`, so this reads the
+    /// source.
+    #[test]
+    fn obs_commands_are_async_and_registered() {
+        let prod = production_source();
+        let handler = &prod[prod.find("tauri::generate_handler![").expect("the handler")..];
+        let handler = &handler[..handler.find(']').expect("its end")];
+        let finish = handler
+            .find("\n            finish_timer,\n")
+            .expect("finish_timer");
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/data/obs.fixture.json")).unwrap();
+        let commands = fixture["obsWire"]["commands"].as_object().unwrap();
+        assert_eq!(commands.len(), 6);
+        for name in commands.values().map(|name| name.as_str().unwrap()) {
+            assert!(
+                prod.contains(&format!(
+                    "#[tauri::command]\nasync fn {name}(app: AppHandle"
+                )),
+                "{name} must be an async command (D30): a sync one runs on the \
+                 main thread, beside WM_HOTKEY"
+            );
+            assert!(!prod.contains(&format!("\nfn {name}(")), "{name} is sync");
+            let line = format!("\n            {name},\n");
+            assert_eq!(handler.matches(&line).count(), 1, "{name}");
+            assert!(handler.find(&line).unwrap() > finish, "{name}");
+        }
+        for args in [
+            concat!(
+                "async fn obs_configure(",
+                "app: AppHandle, config: ObsConfig)"
+            ),
+            concat!(
+                "async fn obs_set_password(",
+                "app: AppHandle, password: String)"
+            ),
+        ] {
+            assert!(prod.contains(args), "{args}");
+        }
+    }
+
     /// v1.59.0 (D19): the handler passes the event's real press state to the
     /// timer step once, and doesn't act on a timer any other way. The handler
     /// needs an `AppHandle`, so this reads the source. (It already locks the
@@ -6433,6 +6574,23 @@ mod tests {
                 "{ifletSome(state)=self.app.try_state::<AppState>(){",
                 "state.timer_lines.end_run(",
                 "timer);}}"
+            )
+        );
+    }
+
+    /// v1.61.0 (D17, seam 2): the worker's production host hands an `obs`
+    /// action to `ObsShared::offer`, which never waits, and does nothing
+    /// before `obs::init` has managed it. The host needs an `AppHandle`, so
+    /// this reads the source.
+    #[test]
+    fn the_timer_host_hands_obs_ops_to_the_link() {
+        let prod = production_source();
+        let host = body_of(&prod, concat!("impl ActionHost for ", "AppHost {"));
+        assert_eq!(
+            squashed(body_of(host, "fn obs(")),
+            concat!(
+                "{ifletSome(obs)=self.app.try_state::<ObsShared>(){",
+                "obs.offer(timer,op);}}"
             )
         );
     }

@@ -38,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::timer_actions::{
-    plan, route, Action, ActionBatch, Hook, Planned, TimerActionsEvent, LATE_ONE_SHOTS_MS,
+    plan, route, Action, ActionBatch, Hook, ObsOp, Planned, TimerActionsEvent, LATE_ONE_SHOTS_MS,
 };
 use crate::timers::{
     entry_from_wire, hotkey_timer_request, CancelWhy, Note, TextUpdate, TimerCore, TimerOp,
@@ -131,6 +131,9 @@ pub trait ActionHost: Send + 'static {
     /// Every end batch, before its actions: `timer`'s start line, waiting or
     /// being prepared, is stale (D21).
     fn end_run(&self, timer: &str);
+    /// v1.61.0: `Obs`: hand `timer`'s scene switch to the OBS link, which
+    /// never waits (D17).
+    fn obs(&self, timer: &str, op: &ObsOp);
 }
 
 /// v1.60.0: `b` to the action worker without waiting (`try_send`, as the
@@ -208,6 +211,7 @@ pub fn run_action_worker(rx: Receiver<ActionBatch>, host: &dyn ActionHost) {
                 Action::Panic => host.stop_all(),
                 Action::SaveReplay => host.save_replay(b.at),
                 Action::Speak { text, voice_id } => host.speak(&b.id, text, voice_id),
+                Action::Obs(op) => host.obs(&b.id, op),
                 Action::Preset { .. }
                 | Action::RandomPreset
                 | Action::RevertPreset
@@ -1206,7 +1210,7 @@ mod tests {
         TimerShared, Waiter, Woke, ACTION_QUEUE, BACKOFF_AFTER, REPAIR_EVERY, RETRY_WAIT,
     };
     use crate::timer_actions::{
-        plan, route, Action, ActionBatch, Hook, Hooks, Planned, TimerActionsEvent, Why,
+        plan, route, Action, ActionBatch, Hook, Hooks, ObsOp, Planned, TimerActionsEvent, Why,
     };
     use crate::timers::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use crate::timers::{
@@ -1698,6 +1702,8 @@ mod tests {
         /// The timer, the text and the voice.
         Speak(String, String, String),
         EndRun(String),
+        /// v1.61.0: the timer and its OBS op.
+        Obs(String, ObsOp),
     }
 
     fn end_run(id: &str) -> Call {
@@ -1755,6 +1761,10 @@ mod tests {
 
         fn end_run(&self, timer: &str) {
             self.push(end_run(timer));
+        }
+
+        fn obs(&self, timer: &str, op: &ObsOp) {
+            self.push(Call::Obs(timer.to_string(), op.clone()));
         }
     }
 
@@ -1861,6 +1871,7 @@ mod tests {
                 .map(|&(id, text)| (id.to_string(), text.to_string()))
                 .collect(),
             keep: texts.iter().map(|&(id, _)| id.to_string()).collect(),
+            ..TextUpdate::default()
         }
     }
 
@@ -2816,6 +2827,56 @@ mod tests {
                 Call::Save(at),
                 Call::Muted(false),
                 end_run("timer-1"),
+            ]
+        );
+    }
+
+    /// v1.61.0 (seam 2, the worker's half): an `obs` action reaches the
+    /// host's `obs` with its timer, in list order with the rest; the host
+    /// hands it to the OBS link (`AppHost::obs`, which never waits).
+    #[test]
+    fn the_worker_hands_obs_ops_to_its_host() {
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let at = Instant::now();
+        let brb = ObsOp::Scene {
+            scene_uuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13".to_string(),
+            scene_name: "BRB".to_string(),
+        };
+        for (hook, why, actions) in [
+            (
+                Hook::Start,
+                Why::Armed,
+                vec![Action::SetMuted { muted: true }, Action::Obs(brb.clone())],
+            ),
+            (
+                Hook::End,
+                Why::EndNow,
+                vec![
+                    Action::SetMuted { muted: false },
+                    Action::Obs(ObsOp::SceneBack),
+                ],
+            ),
+        ] {
+            tx.send(ActionBatch {
+                id: "timer-1".to_string(),
+                hook,
+                why,
+                at,
+                actions,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        let host = Host::default();
+        run_action_worker(rx, &host);
+        assert_eq!(
+            host.calls(),
+            [
+                Call::Muted(true),
+                Call::Obs("timer-1".to_string(), brb),
+                end_run("timer-1"),
+                Call::Muted(false),
+                Call::Obs("timer-1".to_string(), ObsOp::SceneBack),
             ]
         );
     }

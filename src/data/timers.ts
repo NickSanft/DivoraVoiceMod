@@ -22,6 +22,7 @@ import {
   type TimerState,
 } from "../overlay/timerState";
 import { normalizeAccelerator } from "./hotkeys";
+import { readFollowObs, readObsUuid, type FollowObs } from "./obs";
 import { actionsForSync, type TimerAction } from "./timerActions";
 
 /** `divora.timers`' version now. A larger one is read with these rules and
@@ -64,8 +65,11 @@ export interface TimerRun {
  *  v1.60.0: `onStart` and `onFire` are a countdown's At start and At zero
  *  lists, kept as written and read only through data/timerActions.ts
  *  (`readStoredActions`, `actionsForSync`), which take a non-array as
- *  empty: nothing checks them on the way in, so they are `unknown`. Every
- *  other key is kept. */
+ *  empty: nothing checks them on the way in, so they are `unknown`.
+ *  v1.61.0: `obsText` is the OBS text source the timer shows in (`{uuid,
+ *  name}`, data/obs.ts `ObsRef`; any kind), and `followObs` what a count-up
+ *  follows ("stream" or "record"); kept as written too, and checked only
+ *  when sent (`defsForSync`). Every other key is kept. */
 export interface StoredTimer {
   id: string;
   name: string;
@@ -75,6 +79,8 @@ export interface StoredTimer {
   run?: TimerRun;
   onStart?: unknown;
   onFire?: unknown;
+  obsText?: unknown;
+  followObs?: unknown;
   [k: string]: unknown;
 }
 
@@ -90,7 +96,9 @@ export interface StoredTimers {
 
 /** What `sync_timers` takes for each timer: validated fields only. v1.60.0:
  *  a countdown's lists, each only when it holds an action that runs, or a
- *  `revertPreset`, though one in `onStart` never runs. */
+ *  `revertPreset`, though one in `onStart` never runs. v1.61.0: `obsText`
+ *  (its uuid only: Rust never uses the name) and a count-up's `followObs`,
+ *  each only when it can be read; sent whether OBS control is on or off. */
 export interface TimerDefWire {
   id: string;
   name: string;
@@ -99,6 +107,8 @@ export interface TimerDefWire {
   resume?: TimerRun;
   onStart?: TimerAction[];
   onFire?: TimerAction[];
+  obsText?: { uuid: string };
+  followObs?: FollowObs;
 }
 
 /** "run": the backend runs it. "newer": a kind this build doesn't know.
@@ -186,7 +196,8 @@ function readHotkeys(raw: unknown): Record<string, string> {
  *  to 1 s..24 h (a kind this build doesn't know keeps any finite length as
  *  it is: what it means is that kind's); a run that can't be read is
  *  dropped, and the timer is idle. Unknown keys, kinds and hotkey verbs are
- *  kept; `version` is never lowered. */
+ *  kept, the lists and (v1.61.0) `obsText` and `followObs` as written;
+ *  `version` is never lowered. */
 export function readTimers(raw: unknown): StoredTimers {
   if (!isObject(raw)) return { version: TIMERS_VERSION, timers: [] };
   const v = raw.version;
@@ -238,7 +249,11 @@ export function timersForSave(s: StoredTimers): StoredTimers {
  *  countdown's `onStart` and `onFire`, each only when `actionsForSync`
  *  gives it an action (as `resume` goes only with a run), so a timer
  *  without actions sends what v1.59.0 sent; a count-up's lists never go
- *  (it never reaches zero). No other key is sent. */
+ *  (it never reaches zero). v1.61.0: `obsText` as `{uuid}` when its uuid
+ *  can be read (`readObsUuid`), on any kind; `followObs` on a count-up only
+ *  (a countdown's is left out, as a count-up's lists are). Each goes only
+ *  when it is there, so a timer without them sends what v1.60.0 sent.
+ *  No other key is sent. */
 export function defsForSync(s: StoredTimers): TimerDefWire[] {
   return readTimers(s).timers.map((t) => {
     const def: TimerDefWire = { id: t.id, name: t.name, kind: t.kind, durationMs: t.durationMs };
@@ -249,8 +264,20 @@ export function defsForSync(s: StoredTimers): TimerDefWire[] {
       if (onStart.length > 0) def.onStart = onStart;
       if (onFire.length > 0) def.onFire = onFire;
     }
+    const obsText = obsTextForSync(t.obsText);
+    if (obsText) def.obsText = obsText;
+    const follow = t.kind === "countup" ? readFollowObs(t.followObs) : null;
+    if (follow) def.followObs = follow;
     return def;
   });
+}
+
+/** v1.61.0: a stored `obsText` as sent: `{uuid}` when it is an object whose
+ *  uuid can be read, its name and any other key left out; else null. */
+function obsTextForSync(raw: unknown): { uuid: string } | null {
+  if (!isObject(raw)) return null;
+  const uuid = readObsUuid(raw.uuid);
+  return uuid === null ? null : { uuid };
 }
 
 /** Each stored timer's role: the first 16 of a known kind run, in list

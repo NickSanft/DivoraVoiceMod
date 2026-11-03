@@ -2637,6 +2637,9 @@ function actionSigil(a: TimerAction): SigilName {
       return a.muted ? "muted" : "mic";
     case "panic":
       return "panic";
+    case "obs":
+      // v1.61.0 S1: a stand-in until OBS's own sigil (`link`, D36) lands.
+      return "screen";
   }
 }
 

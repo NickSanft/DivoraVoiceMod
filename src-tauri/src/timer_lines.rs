@@ -239,7 +239,7 @@ pub fn run_line_thread<R>(
 #[cfg(test)]
 mod tests {
     use super::{lock, run_line_thread, Line, Ticket, TimerLines};
-    use crate::timer_actions::{plan, Action, ActionBatch, Hooks};
+    use crate::timer_actions::{plan, Action, ActionBatch, Hooks, ObsOp};
     use crate::timer_thread::{hand_off, run_action_worker, ActionHost, ACTION_QUEUE};
     use crate::timers::Transition;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -327,6 +327,8 @@ mod tests {
         fn end_run(&self, timer: &str) {
             self.0.end_run(timer);
         }
+
+        fn obs(&self, _timer: &str, _op: &ObsOp) {}
     }
 
     /// `transitions` planned in order and handed off as the timer thread

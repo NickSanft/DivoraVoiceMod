@@ -6,6 +6,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { OBS_COMMANDS, OBS_STATUS_EVENT, type ObsConfig } from "../data/obs";
 import { FINISH_TIMER_CMD, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT } from "../data/timerActions";
 import type { TimerDefWire } from "../data/timers";
 import type { Rect } from "../overlay/geometry";
@@ -1431,6 +1432,62 @@ export async function subscribeTimerActions(handler: (raw: unknown) => void): Pr
  *  and lines stopped every clip. Resolves once the listener is registered. */
 export async function subscribeSoundboardStopped(handler: () => void): Promise<UnlistenFn> {
   return listen<unknown>(SOUNDBOARD_STOPPED_EVENT, () => handler());
+}
+
+// ---- Talk to OBS (v1.61.0) ----
+// Rust holds the one connection to OBS (src-tauri/src/obs/), and only while
+// Settings → OBS is on. Every command is async in the backend and answers
+// the whole `ObsStatus` (`obs_inventory` answers `ObsInventory`), read with
+// data/obs.ts `readObsStatus` / `readObsInventory`, like every `obs-status`
+// event: keep the one with the largest `seq`. A refused command rejects
+// with the backend's words, ready to show. The store sends the four that
+// change something one at a time (its OBS queue); none of them waits on
+// OBS. The names are pinned by obs.fixture.json (`obsWire`).
+
+export type { ObsConfig, ObsInventory, ObsStatus } from "../data/obs";
+
+/** Validates the address and, with `enabled`, starts the link (or keeps a
+ *  running one at the same address, or restarts it at a new one); without,
+ *  stops any link and connects nothing. Rejects with the words for an
+ *  address or a port it refuses. */
+export async function obsConfigureCmd(config: ObsConfig): Promise<unknown> {
+  return invoke<unknown>(OBS_COMMANDS.configure, { config });
+}
+
+/** Try again: while retrying, an attempt now; after a stop (a wrong
+ *  password, a Kick, an old OBS…), a fresh start; otherwise nothing. */
+export async function obsReconnectCmd(): Promise<unknown> {
+  return invoke<unknown>(OBS_COMMANDS.reconnect);
+}
+
+/** Saves the password (1-256 characters), encrypted for the Windows
+ *  account, and restarts a link that runs or stopped; works while off. Never
+ *  echoed back. Rejects with the words to show under the field. */
+export async function obsSetPasswordCmd(password: string): Promise<unknown> {
+  return invoke<unknown>(OBS_COMMANDS.setPassword, { password });
+}
+
+/** Deletes the saved password (none saved is fine); works while off. */
+export async function obsForgetPasswordCmd(): Promise<unknown> {
+  return invoke<unknown>(OBS_COMMANDS.forgetPassword);
+}
+
+/** The current status: only reads, connects nothing. */
+export async function obsStatusCmd(): Promise<unknown> {
+  return invoke<unknown>(OBS_COMMANDS.status);
+}
+
+/** OBS's scenes and text sources, read from OBS now (up to 15 s); a second
+ *  call while one runs joins it. Rejects with the words to show when OBS
+ *  isn't connected, is busy, is slow or refuses. */
+export async function obsInventoryCmd(): Promise<unknown> {
+  return invoke<unknown>(OBS_COMMANDS.inventory);
+}
+
+/** Listens to `obs-status`. Resolves once the listener is registered, so a
+ *  command sent after it can't miss a change made in between. */
+export async function subscribeObsStatus(handler: (raw: unknown) => void): Promise<UnlistenFn> {
+  return listen<unknown>(OBS_STATUS_EVENT, (e) => handler(e.payload));
 }
 
 // ---- Soundboard ----

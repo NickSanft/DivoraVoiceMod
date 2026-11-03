@@ -239,6 +239,16 @@ import { FALLBACK_PRESETS, presetFromWire } from "../data/presets";
 import { adoptMute, muteCcStep, readInputMute } from "../data/mute";
 import { inOrder } from "../data/inOrder";
 import {
+  adoptObsStatus,
+  readObsSettings,
+  readObsStatus,
+  type FollowObs,
+  type ObsInventory,
+  type ObsRef,
+  type ObsSettings,
+  type ObsStatus,
+} from "../data/obs";
+import {
   DEFAULT_LENGTH_MS,
   defaultName,
   defsForSync,
@@ -262,7 +272,6 @@ import {
   type TimerVerb,
 } from "../data/timers";
 import {
-  ACTION_KINDS,
   breakTemplate,
   canAddAction,
   pickRandomPreset,
@@ -275,6 +284,7 @@ import {
   returnsAfterStart,
   revertPlan,
   revertsAtZero,
+  runsAt,
   withAdded,
   withRemoved,
   withReplaced,
@@ -455,6 +465,10 @@ const STORAGE_KEYS = {
   // anchors, so a restart can pick it up. Absent: boot sends no timer
   // command.
   timers: "divora.timers",
+  // v1.61.0: Settings → OBS — `{enabled, host, port, breakScene?}`
+  // (data/obs.ts). Never the password, which only Rust keeps (encrypted).
+  // Absent, or `enabled` not true: boot sends no OBS command.
+  obs: "divora.obs",
 } as const;
 
 /** The first-run wizard's own key (it manages its own state in
@@ -1246,6 +1260,60 @@ export interface AppState {
   /** Show on overlay: adds the timer's element, or removes every element
    *  for it. */
   setTimerOnOverlay: (id: string, on: boolean) => void;
+
+  // Talk to OBS (v1.61.0). Rust holds the one connection to OBS
+  // (src-tauri/src/obs/), and only while Settings → OBS is on; the store
+  // keeps `divora.obs` and a read-only mirror of Rust's status, ordered by
+  // `seq` as the mute's is. v1.61.0 S1: declared; the commands are stubs
+  // that send nothing yet.
+  /** `divora.obs`, read by `readObsSettings`. */
+  obsSettings: () => ObsSettings;
+  /** The mirror: the newest status seen (largest `seq`), or null before
+   *  any. */
+  obsStatus: () => ObsStatus | null;
+  /** The last inventory read, or null before one (so after every launch). */
+  obsInventory: () => ObsInventory | null;
+  /** True while an `obs_inventory` is in flight. */
+  obsInventoryBusy: () => boolean;
+  /** Why the last inventory couldn't be read, in Rust's words; else null. */
+  obsInventoryError: () => string | null;
+  /** Rust's words for the saved address when it refused it (at boot or on
+   *  Connect to OBS), shown under Address; else null. */
+  obsConfigError: () => string | null;
+  /** How many OBS pickers (and the OBS section) are on screen: while any
+   *  is, the inventory is read again when `inventoryRev` changes. */
+  obsWatchers: () => number;
+  /** Counts one watcher in; the function it returns counts it out, once. */
+  watchObs: () => () => void;
+  /** The mirror's only writer: an answer or an `obs-status` payload, taken
+   *  only if it is newer. */
+  applyObsStatus: (raw: unknown) => void;
+  /** Connect to OBS. On: saves it, listens to `obs-status` (once per page)
+   *  and sends `obs_configure` with the stored address. Off: saves it and
+   *  sends `obs_configure {enabled: false}`, which stops the link. */
+  setObsEnabled: (on: boolean) => Promise<void>;
+  /** Address and Port: `obs_configure` with them (while off it only
+   *  validates), saved only once Rust took them. Rust's words for a
+   *  refusal, or null. */
+  setObsAddress: (host: string, port: number) => Promise<string | null>;
+  /** Save password and Forget password, on or off: Rust's words for a
+   *  refusal, or null. The password is never stored, logged or kept here. */
+  obsSavePassword: (password: string) => Promise<string | null>;
+  obsForgetPassword: () => Promise<string | null>;
+  /** Try again (and Connect again). */
+  obsReconnect: () => Promise<void>;
+  /** One `obs_status`, for `hasPassword` while off: it only reads. */
+  pullObsStatus: () => Promise<void>;
+  /** Reads OBS's scenes and text sources (not queued; a second call joins
+   *  the one in flight) and refreshes the stored names it lists. */
+  refreshObsInventory: () => Promise<void>;
+  /** Show in OBS: the text source a timer shows in, or null for none.
+   *  Saves, then syncs. */
+  setTimerObsText: (id: string, target: ObsRef | null) => Promise<void>;
+  /** Follow OBS on a count-up, or null for Off. Saves, then syncs. */
+  setTimerFollowObs: (id: string, what: FollowObs | null) => Promise<void>;
+  /** The scene Add break (BRB) switches OBS to, or null for Don't switch. */
+  setBreakScene: (scene: ObsRef | null) => void;
 
   // Derived
   hasEnabled: () => boolean;
@@ -2609,7 +2677,9 @@ export function createAppState(): AppState {
     const t = runCountdown(id);
     const a = readAction(action);
     if (!t || a === null) return;
-    if (!ACTION_KINDS[a.kind].at.includes(hook === "onStart" ? "start" : "zero")) return;
+    // v1.61.0: by `runsAt`, since one kind (`obs`) has an op that runs only
+    // at zero (Switch OBS back) and one that runs at either.
+    if (!runsAt(a, hook === "onStart" ? "start" : "zero")) return;
     if (canAddAction(t[hook], a.kind) !== "ok") return;
     await saveList(t, hook, withAdded(t[hook], a));
   };
@@ -2619,8 +2689,11 @@ export function createAppState(): AppState {
     if (!t || a === null) return;
     const row = readStoredActions(t[hook])[index];
     // A row that runs, to an action of its kind: the card changes a target
-    // or a line, never a kind, so this can't make a second line.
+    // or a line, never a kind, so this can't make a second line. v1.61.0:
+    // nor an `obs` action's op, so a Switch OBS scene never becomes a
+    // Switch OBS back (which never runs At start).
     if (!row?.runs || row.action.kind !== a.kind) return;
+    if (row.action.kind === "obs" && a.kind === "obs" && row.action.op !== a.op) return;
     if (JSON.stringify(row.action) === JSON.stringify(a)) return;
     const entry = (t[hook] as unknown[])[index];
     // The entry's other keys (a later build's) are kept; its own fields are
@@ -2856,6 +2929,61 @@ export function createAppState(): AppState {
     if (on) overlay.addOverlayTimer(id);
     else overlay.removeOverlayTimer(id);
   };
+
+  // ---- v1.61.0: Talk to OBS ----
+  // Rust holds the one connection to OBS (src-tauri/src/obs/), and only
+  // while Settings → OBS is on. The page keeps what the user chose in
+  // `divora.obs` (data/obs.ts) and a read-only mirror of Rust's
+  // `ObsStatus`, ordered by `seq` as the mute's is: every OBS command
+  // answers it, and `obs-status` carries each change.
+  //
+  // v1.61.0 S1: declared only. The commands below are stubs that send
+  // nothing, and there is no boot here yet, so the page sends no `obs_*`
+  // command and listens to no `obs-status`, whatever `divora.obs` holds.
+  // The store's OBS track writes them (design §6.2): boot sends nothing
+  // while `divora.obs` is absent or off; on, it listens, then sends
+  // `obs_configure` through `obsQueue`.
+  const [obsSettings, setObsSettings] = createSignal<ObsSettings>(
+    readObsSettings(loadJson<unknown>(STORAGE_KEYS.obs, null)),
+  );
+  const [obsStatus, setObsStatus] = createSignal<ObsStatus | null>(null);
+  const [obsInventory, setObsInventory] = createSignal<ObsInventory | null>(null);
+  const [obsInventoryBusy, setObsInventoryBusy] = createSignal(false);
+  const [obsInventoryError, setObsInventoryError] = createSignal<string | null>(null);
+  const [obsConfigError, setObsConfigError] = createSignal<string | null>(null);
+  const [obsWatchers, setObsWatchers] = createSignal(0);
+  // The four OBS commands that change something (`obs_configure`,
+  // `obs_reconnect`, `obs_set_password`, `obs_forget_password`) go through
+  // this one queue, each sent only once the one before it answered, as the
+  // other features' do: a Save password then a Forget password must reach
+  // Rust in that order. None of them waits on OBS, so a slow OBS holds
+  // nothing here. The reads (`obs_status`, `obs_inventory`) aren't queued.
+  const obsQueue = inOrder();
+  const applyObsStatus: AppState["applyObsStatus"] = (raw) => {
+    const next = adoptObsStatus(obsStatus(), readObsStatus(raw));
+    if (next !== obsStatus()) setObsStatus(next);
+  };
+  const watchObs: AppState["watchObs"] = () => {
+    setObsWatchers((n) => n + 1);
+    let counted = true;
+    return () => {
+      if (!counted) return;
+      counted = false;
+      setObsWatchers((n) => n - 1);
+    };
+  };
+  // S1 stubs: each sends nothing and changes nothing. The queue and the
+  // setters above are for their bodies.
+  const setObsEnabled: AppState["setObsEnabled"] = async () => {};
+  const setObsAddress: AppState["setObsAddress"] = async () => null;
+  const obsSavePassword: AppState["obsSavePassword"] = async () => null;
+  const obsForgetPassword: AppState["obsForgetPassword"] = async () => null;
+  const obsReconnect: AppState["obsReconnect"] = async () => {};
+  const pullObsStatus: AppState["pullObsStatus"] = async () => {};
+  const refreshObsInventory: AppState["refreshObsInventory"] = async () => {};
+  const setTimerObsText: AppState["setTimerObsText"] = async () => {};
+  const setTimerFollowObs: AppState["setTimerFollowObs"] = async () => {};
+  const setBreakScene: AppState["setBreakScene"] = () => {};
 
   const hasEnabled = createMemo(() => chain().some((c) => c.enabled));
   // v1.58.0: the status says what happens to what you say from now on. Push
@@ -5143,6 +5271,26 @@ export function createAppState(): AppState {
     timersDir,
     timerOnOverlay,
     setTimerOnOverlay,
+
+    obsSettings,
+    obsStatus,
+    obsInventory,
+    obsInventoryBusy,
+    obsInventoryError,
+    obsConfigError,
+    obsWatchers,
+    watchObs,
+    applyObsStatus,
+    setObsEnabled,
+    setObsAddress,
+    obsSavePassword,
+    obsForgetPassword,
+    obsReconnect,
+    pullObsStatus,
+    refreshObsInventory,
+    setTimerObsText,
+    setTimerFollowObs,
+    setBreakScene,
 
     hasEnabled,
     status,

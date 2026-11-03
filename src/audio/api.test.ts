@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import obsFixture from "../data/obs.fixture.json";
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
@@ -118,6 +119,13 @@ import {
   finishTimerCmd,
   subscribeTimerActions,
   subscribeSoundboardStopped,
+  obsConfigureCmd,
+  obsReconnectCmd,
+  obsSetPasswordCmd,
+  obsForgetPasswordCmd,
+  obsStatusCmd,
+  obsInventoryCmd,
+  subscribeObsStatus,
 } from "./api";
 
 describe("audio api", () => {
@@ -1301,6 +1309,82 @@ describe("timer actions api (v1.60.0)", () => {
     const un = () => {};
     let settled = false;
     const subscribing = subscribe(() => {}).then((u) => {
+      settled = true;
+      return u;
+    });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(settled).toBe(false);
+    registered(un);
+    expect(await subscribing).toBe(un);
+    expect(settled).toBe(true);
+  });
+});
+
+// v1.61.0: Talk to OBS. The names are obs.fixture.json's `obsWire`, which
+// the backend's `obs_commands_are_async_and_registered` reads too; the
+// arguments are flat, as Tauri maps them to the commands' parameters
+// (`config`, `password`).
+describe("talk to OBS api (v1.61.0)", () => {
+  const cmds = obsFixture.obsWire.commands;
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+  });
+
+  it("each command goes by the fixture's name, with flat args", async () => {
+    invokeMock.mockResolvedValue(null);
+    const config = { enabled: true, host: "127.0.0.1", port: 4455 };
+    await obsConfigureCmd(config);
+    expect(invokeMock).toHaveBeenLastCalledWith(cmds.configure, { config });
+    expect(Object.keys(config).sort()).toEqual(obsFixture.configKeys);
+    await obsReconnectCmd();
+    expect(invokeMock).toHaveBeenLastCalledWith(cmds.reconnect);
+    await obsSetPasswordCmd("supersecretpassword");
+    expect(invokeMock).toHaveBeenLastCalledWith(cmds.setPassword, { password: "supersecretpassword" });
+    await obsForgetPasswordCmd();
+    expect(invokeMock).toHaveBeenLastCalledWith(cmds.forgetPassword);
+    await obsStatusCmd();
+    expect(invokeMock).toHaveBeenLastCalledWith(cmds.status);
+    await obsInventoryCmd();
+    expect(invokeMock).toHaveBeenLastCalledWith(cmds.inventory);
+    expect(invokeMock).toHaveBeenCalledTimes(6);
+    expect(invokeMock.mock.calls.map((c) => c[0])).toEqual(Object.values(cmds));
+  });
+
+  it("answers the backend's status as it came, and rejects with its words", async () => {
+    const status = obsFixture.obsStatusSamples[0]!.status;
+    invokeMock.mockResolvedValueOnce(status);
+    expect(await obsConfigureCmd({ enabled: false, host: "127.0.0.1", port: 4455 })).toBe(status);
+    invokeMock.mockRejectedValueOnce(obsFixture.hostErrors.notAnIp);
+    await expect(obsConfigureCmd({ enabled: false, host: "obs.local", port: 4455 })).rejects.toBe(
+      obsFixture.hostErrors.notAnIp,
+    );
+    invokeMock.mockRejectedValueOnce("OBS isn't connected.");
+    await expect(obsInventoryCmd()).rejects.toBe("OBS isn't connected.");
+  });
+
+  it("listens to obs-status and forwards the payloads", async () => {
+    const seen: unknown[] = [];
+    listenMock.mockImplementation(async (event: string, handler: (e: { payload: unknown }) => void) => {
+      handler({ payload: { from: event } });
+      return () => {};
+    });
+    await subscribeObsStatus((s) => seen.push(s));
+    expect(listenMock.mock.calls.map((c) => c[0])).toEqual([obsFixture.obsWire.events.status]);
+    expect(seen).toEqual([{ from: "obs-status" }]);
+  });
+
+  it("subscribeObsStatus resolves only once the listener is registered", async () => {
+    let registered!: (un: () => void) => void;
+    listenMock.mockImplementation(
+      () =>
+        new Promise<() => void>((resolve) => {
+          registered = resolve;
+        }),
+    );
+    const un = () => {};
+    let settled = false;
+    const subscribing = subscribeObsStatus(() => {}).then((u) => {
       settled = true;
       return u;
     });

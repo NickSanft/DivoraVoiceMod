@@ -13,15 +13,17 @@
 //! on any machine.
 //!
 //! The wire contract — the event and command names, the action kinds and
-//! their fields, the limits, the reading table, the list samples and one
-//! event per `why` — is in `src/overlay/timer.fixture.json` beside
-//! Hourglass's, which the frontend's tests read too.
+//! their fields (v1.61.0: and the `obs` kind's two ops, `actionOps`), the
+//! limits, the reading table, the list samples and one event per `why` — is
+//! in `src/overlay/timer.fixture.json` beside Hourglass's, which the
+//! frontend's tests read too.
 
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::obs::{MAX_SCENE_NAME_CHARS, MAX_UUID_CHARS};
 use crate::timers::{CancelWhy, TimerPhase, Transition};
 
 /// D34's kill switch: `false` makes [`plan`] return nothing, so no batch
@@ -80,6 +82,38 @@ pub enum Action {
     SetMuted { muted: bool },
     /// Stop every clip and line (D23). Runs first in its batch (D15).
     Panic,
+    /// v1.61.0: switch OBS's program scene, or back (the OBS link's, D21).
+    Obs(ObsOp),
+}
+
+/// v1.61.0 (D21): what an `obs` action asks of OBS — its wire shape after
+/// `kind`, flat like every other kind's fields: `{op: "scene", sceneUuid,
+/// sceneName}` or `{op: "sceneBack"}`.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ObsOp {
+    /// Switch OBS's program scene to this one: by uuid, 1 to
+    /// [`MAX_UUID_CHARS`] characters; the name (at most
+    /// [`MAX_SCENE_NAME_CHARS`], empty allowed) is only shown. At start or at
+    /// zero.
+    Scene {
+        scene_uuid: String,
+        scene_name: String,
+    },
+    /// Back to the scene this timer's `scene` replaced, if OBS is still on
+    /// the one it set (D22). Never runs at a start.
+    SceneBack,
+}
+
+impl ObsOp {
+    /// The op's wire name (`op`).
+    #[must_use]
+    pub fn op(&self) -> &'static str {
+        match self {
+            Self::Scene { .. } => "scene",
+            Self::SceneBack => "sceneBack",
+        }
+    }
 }
 
 /// Which half of a hook run an action belongs to (D5).
@@ -88,7 +122,8 @@ pub enum RunsIn {
     /// The main window's store: preset switches and clips.
     Page,
     /// The action worker (and the line thread): the mute, Stop all, a
-    /// replay save, a line.
+    /// replay save, a line. v1.61.0: and OBS's scene switches, through the
+    /// OBS link.
     Backend,
 }
 
@@ -105,6 +140,7 @@ impl Action {
             Self::SaveReplay => "saveReplay",
             Self::SetMuted { .. } => "setMuted",
             Self::Panic => "panic",
+            Self::Obs(_) => "obs",
         }
     }
 
@@ -115,26 +151,32 @@ impl Action {
             Self::Preset { .. } | Self::RandomPreset | Self::RevertPreset | Self::Tile { .. } => {
                 RunsIn::Page
             }
-            Self::Speak { .. } | Self::SaveReplay | Self::SetMuted { .. } | Self::Panic => {
-                RunsIn::Backend
-            }
+            Self::Speak { .. }
+            | Self::SaveReplay
+            | Self::SetMuted { .. }
+            | Self::Panic
+            | Self::Obs(_) => RunsIn::Backend,
         }
     }
 
-    /// §7.1: whether a hook ever runs it. `RevertPreset` never runs at a
-    /// start (there is nothing to go back to yet), so the card offers it at
-    /// zero only; everything else runs at either.
+    /// §7.1: whether a hook ever runs it. `RevertPreset` and (v1.61.0, D21)
+    /// OBS's `sceneBack` never run at a start (there is nothing to go back
+    /// to yet), so the card offers them at zero only; everything else runs
+    /// at either.
     #[must_use]
     pub fn runs_at(&self, hook: Hook) -> bool {
-        !(hook == Hook::Start && *self == Self::RevertPreset)
+        !(hook == Hook::Start && matches!(self, Self::RevertPreset | Self::Obs(ObsOp::SceneBack)))
     }
 
-    /// Whether it puts back what a start changed: `RevertPreset` and
-    /// `SetMuted {muted: false}` (v1.61.0 adds OBS's `sceneBack`). The rest
-    /// are one-shots. A late fire and a run-out run only these (D8, D9).
+    /// Whether it puts back what a start changed: `RevertPreset`,
+    /// `SetMuted {muted: false}` and (v1.61.0, D21) OBS's `sceneBack`. The
+    /// rest are one-shots. A late fire and a run-out run only these (D8, D9).
     #[must_use]
     pub fn restores(&self) -> bool {
-        matches!(self, Self::RevertPreset | Self::SetMuted { muted: false })
+        matches!(
+            self,
+            Self::RevertPreset | Self::SetMuted { muted: false } | Self::Obs(ObsOp::SceneBack)
+        )
     }
 
     /// D11: whether a restart mid-run runs it again from `onStart`: the
@@ -147,12 +189,16 @@ impl Action {
     /// D10: whether it [`restores`](Self::restores) something `on_start`
     /// did, so a Reset or a delete runs it: `SetMuted {false}` only when
     /// `on_start` has `SetMuted {true}`; `RevertPreset` always, because the
-    /// page acts on it only with a return the start noted (§7.3).
+    /// page acts on it only with a return the start noted (§7.3); (v1.61.0,
+    /// D21) OBS's `sceneBack` only when `on_start` has a `scene`.
     #[must_use]
     pub fn undoes(&self, on_start: &[Action]) -> bool {
         match self {
             Self::SetMuted { muted: false } => on_start.contains(&Self::SetMuted { muted: true }),
             Self::RevertPreset => true,
+            Self::Obs(ObsOp::SceneBack) => on_start
+                .iter()
+                .any(|a| matches!(a, Self::Obs(ObsOp::Scene { .. }))),
             _ => false,
         }
     }
@@ -172,6 +218,16 @@ impl Action {
             Self::RandomPreset | Self::RevertPreset | Self::SaveReplay | Self::Panic => {
                 json!({"kind": kind})
             }
+            Self::Obs(ObsOp::Scene {
+                scene_uuid,
+                scene_name,
+            }) => json!({
+                "kind": kind,
+                "op": "scene",
+                "sceneUuid": scene_uuid,
+                "sceneName": scene_name,
+            }),
+            Self::Obs(ObsOp::SceneBack) => json!({"kind": kind, "op": "sceneBack"}),
         }
     }
 }
@@ -191,12 +247,14 @@ pub struct Hooks {
 
 /// §7.2: one list entry, read on its own. `None` — skipped, and kept in the
 /// page's storage — for anything but an object whose `kind` is one of the
-/// eight with every field it needs: a non-empty `presetId`; a `tileId` and a
+/// nine with every field it needs: a non-empty `presetId`; a `tileId` and a
 /// `voiceId` of 1 to [`MAX_TARGET_CHARS`] characters; a `text` of 1 to
 /// [`MAX_LINE_CHARS`] characters once trimmed (and read trimmed); a boolean
-/// `muted`. Nothing is coerced; extra keys and another kind's fields are
-/// ignored. A kind this build doesn't know (`monitor`, `mute`, v1.61.0's
-/// `obs`) is skipped.
+/// `muted`; (v1.61.0, D21) an `obs` `op` of `scene`, with a `sceneUuid` of 1
+/// to [`MAX_UUID_CHARS`] characters and a string `sceneName` of at most
+/// [`MAX_SCENE_NAME_CHARS`], or `sceneBack`. Nothing is coerced; extra keys
+/// and another kind's or op's fields are ignored. A kind this build doesn't
+/// know (`monitor`, `mute`), or an `obs` op (`startStream`), is skipped.
 #[must_use]
 pub fn action_from_wire(v: &Value) -> Option<Action> {
     let a = v.as_object()?;
@@ -227,6 +285,18 @@ pub fn action_from_wire(v: &Value) -> Option<Action> {
             muted: a.get("muted")?.as_bool()?,
         },
         "panic" => Action::Panic,
+        "obs" => Action::Obs(match string("op")? {
+            "scene" => ObsOp::Scene {
+                scene_uuid: string("sceneUuid")
+                    .filter(|uuid| (1..=MAX_UUID_CHARS).contains(&uuid.chars().count()))?
+                    .to_string(),
+                scene_name: string("sceneName")
+                    .filter(|name| name.chars().count() <= MAX_SCENE_NAME_CHARS)?
+                    .to_string(),
+            },
+            "sceneBack" => ObsOp::SceneBack,
+            _ => return None,
+        }),
         _ => return None,
     })
 }
@@ -525,9 +595,11 @@ impl TimerActionsEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_from_wire, hooks_from_wire, plan, replay_at, route, Action, Hook, Hooks, Planned,
-        RunsIn, TimerActionsEvent, Why, LATE_ONE_SHOTS_MS, MAX_LINE_CHARS, MAX_TARGET_CHARS,
+        action_from_wire, hooks_from_wire, plan, replay_at, route, Action, Hook, Hooks, ObsOp,
+        Planned, RunsIn, TimerActionsEvent, Why, LATE_ONE_SHOTS_MS, MAX_LINE_CHARS,
+        MAX_TARGET_CHARS,
     };
+    use crate::obs::{MAX_SCENE_NAME_CHARS, MAX_UUID_CHARS};
     use crate::timers::{entry_from_wire, CancelWhy, TimerPhase, Transition, WireEntry};
     use serde_json::{json, Value};
     use std::sync::Arc;
@@ -546,8 +618,41 @@ mod tests {
         f[key].as_array().unwrap_or_else(|| panic!("{key}"))
     }
 
+    /// v1.61.0: an OBS scene switch to `name`, by a uuid made from it.
+    fn scene(name: &str) -> Action {
+        Action::Obs(ObsOp::Scene {
+            scene_uuid: format!("5d3f1c9e-{name}"),
+            scene_name: name.into(),
+        })
+    }
+
+    const SCENE_BACK: Action = Action::Obs(ObsOp::SceneBack);
+
+    /// v1.61.0: one `obs` op of each, in the fixture's `actionOps.obs`
+    /// order. The match makes a new op fail to compile here until it has
+    /// its place (and its fixture row).
+    fn every_obs_op() -> Vec<ObsOp> {
+        let every = vec![
+            ObsOp::Scene {
+                scene_uuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13".into(),
+                scene_name: "BRB".into(),
+            },
+            ObsOp::SceneBack,
+        ];
+        for (i, op) in every.iter().enumerate() {
+            let at = match op {
+                ObsOp::Scene { .. } => 0,
+                ObsOp::SceneBack => 1,
+            };
+            assert_eq!(at, i, "{op:?}");
+        }
+        every
+    }
+
     /// One action of every kind, in §7.2's order. The match makes a new kind
     /// fail to compile here until it has its place (and its fixture row).
+    /// v1.61.0: `obs` by its `scene` op, the one whose fields and hooks the
+    /// kind's row carries.
     fn every_kind() -> Vec<Action> {
         let every = vec![
             Action::Preset {
@@ -565,6 +670,7 @@ mod tests {
             Action::SaveReplay,
             Action::SetMuted { muted: true },
             Action::Panic,
+            Action::Obs(every_obs_op().swap_remove(0)),
         ];
         for (i, a) in every.iter().enumerate() {
             let at = match a {
@@ -576,6 +682,7 @@ mod tests {
                 Action::SaveReplay => 5,
                 Action::SetMuted { .. } => 6,
                 Action::Panic => 7,
+                Action::Obs(_) => 8,
             };
             assert_eq!(at, i, "{a:?}");
         }
@@ -594,6 +701,24 @@ mod tests {
         Value::from(list.iter().map(Action::to_wire).collect::<Vec<_>>())
     }
 
+    /// The hooks `a` can run at, as the fixture names them (`zero` is the
+    /// end's).
+    fn hooks_of(a: &Action) -> Vec<&'static str> {
+        [(Hook::Start, "start"), (Hook::End, "zero")]
+            .into_iter()
+            .filter(|(hook, _)| a.runs_at(*hook))
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// The fields beside `kind` in `wire`, sorted.
+    fn fields_in(wire: &Value) -> Vec<String> {
+        let mut fields: Vec<String> = wire.as_object().unwrap().keys().cloned().collect();
+        fields.retain(|k| k != "kind");
+        fields.sort();
+        fields
+    }
+
     /// §7.2's table, from the fixture's `actionKinds` (the page's
     /// `ACTION_KINDS` reads the same rows): every kind in order, where it
     /// runs, the hooks it can run at (`zero` is the end's), and the fields
@@ -607,17 +732,8 @@ mod tests {
         for (row, a) in kinds.iter().zip(&every) {
             assert_eq!(row["kind"], a.kind(), "{a:?}");
             assert_eq!(row["runsIn"], runs_in(a.runs_in()), "{a:?}");
-            let at: Vec<&str> = [(Hook::Start, "start"), (Hook::End, "zero")]
-                .into_iter()
-                .filter(|(hook, _)| a.runs_at(*hook))
-                .map(|(_, name)| name)
-                .collect();
-            assert_eq!(row["at"], json!(at), "{a:?}");
-            let mut fields: Vec<String> =
-                a.to_wire().as_object().unwrap().keys().cloned().collect();
-            fields.retain(|k| k != "kind");
-            fields.sort();
-            assert_eq!(row["fields"], json!(fields), "{a:?}");
+            assert_eq!(row["at"], json!(hooks_of(a)), "{a:?}");
+            assert_eq!(row["fields"], json!(fields_in(&a.to_wire())), "{a:?}");
         }
         // Every kind has a valid sample.
         let sampled: Vec<&str> = rows(&f["actionSamples"], "valid")
@@ -627,6 +743,57 @@ mod tests {
         for a in &every {
             assert!(sampled.contains(&a.kind()), "{a:?}");
         }
+    }
+
+    /// v1.61.0 (D21, §7.9): one kind, two ops. The fixture's `actionOps.obs`
+    /// (the page's `ACTION_OPS` and `runsAt` read the same) holds each op's
+    /// fields and hooks, as `to_wire` and `runs_at` give them; the kind's
+    /// `actionKinds` row is their fields' union with `scene`'s hooks; every
+    /// valid `obs` sample has its op's fields; and an op's serde shape is its
+    /// wire shape less `kind`.
+    #[test]
+    fn action_ops_match_the_fixture() {
+        let f = fixture();
+        let ops = f["actionOps"].as_object().unwrap();
+        assert_eq!(ops.keys().collect::<Vec<_>>(), ["obs"]);
+        let obs = ops["obs"].as_object().unwrap();
+        let every = every_obs_op();
+        assert_eq!(obs.len(), every.len());
+        let mut union = Vec::new();
+        for op in &every {
+            let a = Action::Obs(op.clone());
+            let row = &obs[op.op()];
+            assert_eq!(row["at"], json!(hooks_of(&a)), "{op:?}");
+            let wire = a.to_wire();
+            assert_eq!(row["fields"], json!(fields_in(&wire)), "{op:?}");
+            union.extend(fields_in(&wire));
+            let mut serde_wire = serde_json::to_value(op).unwrap();
+            serde_wire["kind"] = json!("obs");
+            assert_eq!(serde_wire, wire, "{op:?}");
+        }
+        union.sort();
+        union.dedup();
+        let row = rows(&f, "actionKinds")
+            .iter()
+            .find(|row| row["kind"] == "obs")
+            .unwrap();
+        assert_eq!(row["fields"], json!(union));
+        assert_eq!(row["at"], obs["scene"]["at"]);
+        let mut sampled = 0;
+        for row in rows(&f["actionSamples"], "valid") {
+            if row["read"]["kind"] != "obs" {
+                continue;
+            }
+            sampled += 1;
+            let op = row["read"]["op"].as_str().unwrap();
+            assert_eq!(
+                obs[op]["fields"],
+                json!(fields_in(&row["read"])),
+                "{}",
+                row_name(row)
+            );
+        }
+        assert!(sampled >= every.len());
     }
 
     /// §7.2, from the fixture's `actionSamples` (the page's `readAction`
@@ -657,7 +824,8 @@ mod tests {
             }
             assert_eq!(action_from_wire(&row["action"]), None, "{}", row_name(row));
         }
-        assert_eq!(page_only, 1);
+        // The line's, and v1.61.0's two in a scene switch's uuid and name.
+        assert_eq!(page_only, 3);
 
         // The edges the rows above carry, stated here too, so neither the
         // fixture nor the reader can lose one.
@@ -688,6 +856,26 @@ mod tests {
         // No cap on a preset id.
         let preset = json!({"kind": "preset", "presetId": "a".repeat(10 * MAX_TARGET_CHARS)});
         assert!(action_from_wire(&preset).is_some());
+        // v1.61.0 (D21): a scene's uuid is 1 to 128 characters, its name at
+        // most 256 (empty allowed), counted in characters and kept as sent.
+        let switch = |uuid: String, name: String| json!({"kind": "obs", "op": "scene", "sceneUuid": uuid, "sceneName": name});
+        let uuid = || "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13".to_string();
+        let ok = |uuid: String, name: String| action_from_wire(&switch(uuid, name)).is_some();
+        assert!(ok("f".repeat(MAX_UUID_CHARS), "BRB".into()));
+        assert!(!ok("f".repeat(MAX_UUID_CHARS + 1), "BRB".into()));
+        assert!(ok("é".repeat(MAX_UUID_CHARS), "BRB".into()));
+        assert!(!ok(String::new(), "BRB".into()));
+        assert!(ok(uuid(), "a".repeat(MAX_SCENE_NAME_CHARS)));
+        assert!(!ok(uuid(), "a".repeat(MAX_SCENE_NAME_CHARS + 1)));
+        assert!(ok(uuid(), "🙂".repeat(MAX_SCENE_NAME_CHARS)));
+        assert!(ok(uuid(), String::new()));
+        assert_eq!(
+            action_from_wire(&switch(uuid(), " BRB ".into())),
+            Some(Action::Obs(ObsOp::Scene {
+                scene_uuid: uuid(),
+                scene_name: " BRB ".into(),
+            }))
+        );
     }
 
     /// TP1: every kind, and both mutes, read back from what `to_wire`
@@ -735,12 +923,12 @@ mod tests {
                 assert_eq!(wire(list), sent, "{name}: {key}");
             }
         }
-        // Ten entries, the third of a kind this build doesn't know: entries
-        // 1-8 are read, so 7 run, and the 10th's line never counts.
+        // Ten entries, the third an `obs` op this build doesn't know:
+        // entries 1-8 are read, so 7 run, and the 10th's line never counts.
         let ten = json!({"onFire": [
             {"kind": "setMuted", "muted": true},
             {"kind": "preset", "presetId": "villager"},
-            {"kind": "obs", "op": "sceneBack"},
+            {"kind": "obs", "op": "startStream"},
             {"kind": "tile", "tileId": "9f2c4e1a7b3d5f60"},
             {"kind": "saveReplay"},
             {"kind": "randomPreset"},
@@ -1269,7 +1457,68 @@ mod tests {
                     vec![tile()],
                 ),
             ),
+            // v1.61.0 (§7.10): OBS's scene switches go where every backend
+            // kind goes, with no change to `plan`.
+            (
+                "obs: a break's start mutes, then switches",
+                started(&obs_break()),
+                planned(Start, Why::Armed, 0, vec![MUTE, scene("BRB")], vec![]),
+            ),
+            (
+                "obs: at zero, every switch, in list order",
+                fired(&obs_break(), 0, false),
+                planned(End, Why::Zero, 0, obs_zero(), vec![]),
+            ),
+            (
+                "obs: End now, the same",
+                fired(&obs_break(), 0, true),
+                planned(End, Why::EndNow, 0, obs_zero(), vec![]),
+            ),
+            (
+                "obs: found late, only the switch back",
+                fired(&obs_break(), 40_000, false),
+                planned(End, Why::Late, 40_000, vec![UNMUTE, SCENE_BACK], vec![]),
+            ),
+            (
+                "obs: slept, only the switch back",
+                expired(&obs_break()),
+                planned(End, Why::RanOut, 0, vec![UNMUTE, SCENE_BACK], vec![]),
+            ),
+            (
+                "obs: ran out while Divora was closed, only the switch back",
+                seeded(&obs_break(), Expired, Running),
+                planned(End, Why::RanOut, 0, vec![UNMUTE, SCENE_BACK], vec![]),
+            ),
+            (
+                "obs: Reset, the switch back: its start switched",
+                cancelled(&obs_break(), Reset),
+                planned(End, Why::Reset, 0, vec![UNMUTE, SCENE_BACK], vec![]),
+            ),
+            (
+                "obs: deleted, a start that switched nothing: no switch back",
+                cancelled(&lists(vec![MUTE], vec![UNMUTE, SCENE_BACK]), Removed),
+                planned(End, Why::Deleted, 0, vec![UNMUTE], vec![]),
+            ),
+            (
+                "obs: a restart mid-break re-applies only the mute",
+                seeded(&obs_break(), Running, Running),
+                planned(Start, Why::Restart, 0, vec![MUTE], vec![]),
+            ),
         ]
+    }
+
+    /// v1.61.0: a break that switches OBS (`Add break` with a break scene),
+    /// with a switch at zero too.
+    fn obs_break() -> Arc<Hooks> {
+        lists(
+            vec![MUTE, scene("BRB")],
+            vec![UNMUTE, scene("Just Chatting"), SCENE_BACK],
+        )
+    }
+
+    /// [`obs_break`]'s At zero, whole.
+    fn obs_zero() -> Vec<Action> {
+        vec![UNMUTE, scene("Just Chatting"), SCENE_BACK]
     }
 
     /// D7, §7.1: every row — the backend and page halves, `hook`, `why`,
@@ -1380,6 +1629,21 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(p.page, vec![preset("villager")]);
+    }
+
+    /// v1.61.0 (D21): OBS's `sceneBack` in At start is read and never run,
+    /// as `revertPreset`; a `scene` there runs.
+    #[test]
+    fn scene_back_never_runs_at_a_start() {
+        assert!(!SCENE_BACK.runs_at(Hook::Start));
+        assert!(SCENE_BACK.runs_at(Hook::End));
+        assert!(scene("BRB").runs_at(Hook::Start));
+        let p = plan(&started(&lists(
+            vec![SCENE_BACK, scene("BRB"), SCENE_BACK],
+            vec![],
+        )))
+        .unwrap();
+        assert_eq!((p.backend, p.page), (vec![scene("BRB")], vec![]));
     }
 
     /// The instant a test drains at: an hour ahead, so taking a lateness

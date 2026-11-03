@@ -3,6 +3,7 @@ import fixture from "../overlay/timer.fixture.json";
 import type { TimerPhase } from "../overlay/timerState";
 import {
   ACTION_KINDS,
+  ACTION_OPS,
   actionsForSync,
   actionWords,
   breakTemplate,
@@ -25,6 +26,7 @@ import {
   returnsAfterStart,
   revertPlan,
   revertsAtZero,
+  runsAt,
   SOUNDBOARD_STOPPED_EVENT,
   TIMER_ACTIONS_EVENT,
   TIMER_ACTIONS_HOOKS,
@@ -44,7 +46,11 @@ const MUTE: TimerAction = { kind: "setMuted", muted: true };
 const UNMUTE: TimerAction = { kind: "setMuted", muted: false };
 const REVERT: TimerAction = { kind: "revertPreset" };
 const LINE = (text: string): TimerAction => ({ kind: "speak", text, voiceId: "af_heart" });
-const OBS = { kind: "obs", op: "sceneBack" };
+/** An action this build can't read. v1.61.0: an `obs` op of a later
+ *  release's (until v1.61.0 any `obs` action was one). */
+const OBS = { kind: "obs", op: "startStream" };
+const SCENE: TimerAction = { kind: "obs", op: "scene", sceneUuid: "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", sceneName: "BRB" };
+const SCENE_BACK: TimerAction = { kind: "obs", op: "sceneBack" };
 
 describe("the wire is the fixture's (v1.60.0)", () => {
   it("names the event, the stop event and End now's command as the fixture does", () => {
@@ -74,6 +80,45 @@ describe("the wire is the fixture's (v1.60.0)", () => {
       expect(ACTION_KINDS[row.kind as TimerAction["kind"]], row.kind).toEqual({ runsIn: row.runsIn, at: row.at });
     }
   });
+
+  // v1.61.0: one kind with two ops. The backend's
+  // `action_ops_match_the_fixture` reads the same rows.
+  it("ACTION_OPS is the fixture's actionOps, and a kind's row is its first op's", () => {
+    expect(Object.keys(ACTION_OPS)).toEqual(Object.keys(fixture.actionOps));
+    expect(Object.keys(ACTION_OPS.obs)).toEqual(Object.keys(fixture.actionOps.obs));
+    for (const [op, row] of Object.entries(fixture.actionOps.obs)) {
+      expect(ACTION_OPS.obs[op as keyof typeof ACTION_OPS.obs], op).toEqual({ at: row.at });
+    }
+    const obsRow = fixture.actionKinds.find((k) => k.kind === "obs")!;
+    expect(obsRow.at).toEqual(fixture.actionOps.obs.scene.at);
+    const union = [...new Set(Object.values(fixture.actionOps.obs).flatMap((r) => r.fields))].sort();
+    expect(obsRow.fields).toEqual(union);
+  });
+});
+
+describe("runsAt (v1.61.0)", () => {
+  it("is the backend's runs_at: Back to the preset before and Switch OBS back never at a start", () => {
+    expect(runsAt(REVERT, "start")).toBe(false);
+    expect(runsAt(REVERT, "zero")).toBe(true);
+    expect(runsAt(SCENE_BACK, "start")).toBe(false);
+    expect(runsAt(SCENE_BACK, "zero")).toBe(true);
+    expect(runsAt(SCENE, "start")).toBe(true);
+    expect(runsAt(SCENE, "zero")).toBe(true);
+    for (const a of [MUTE, UNMUTE, LINE("Hi."), { kind: "panic" } as const]) {
+      expect(runsAt(a, "start")).toBe(true);
+      expect(runsAt(a, "zero")).toBe(true);
+    }
+  });
+
+  it("says, for every valid fixture sample, its op's at when its kind has ops, else its kind's", () => {
+    for (const row of fixture.actionSamples.valid) {
+      const a = readAction(row.action)!;
+      const ops = (fixture.actionOps as Record<string, Record<string, { at: string[] }>>)[a.kind];
+      const want = ops ? ops[(a as { op: string }).op]!.at : fixture.actionKinds.find((k) => k.kind === a.kind)!.at;
+      const at = (["start", "zero"] as const).filter((h) => runsAt(a, h));
+      expect(at, row.name).toEqual(want);
+    }
+  });
 });
 
 describe("readAction", () => {
@@ -88,8 +133,19 @@ describe("readAction", () => {
       expect(reapplies(read!), row.name).toBe(row.reapplies);
       // What it reads is what it sends: read again, it is the same.
       expect(readAction(row.read), row.name).toEqual(row.read);
+      // v1.61.0: a kind with ops (`obs`) has its fields per op.
       const fields = Object.keys(row.read).filter((k) => k !== "kind").sort();
-      expect(fields, row.name).toEqual(fixture.actionKinds.find((k) => k.kind === read!.kind)!.fields);
+      const ops = (fixture.actionOps as Record<string, Record<string, { fields: string[] }>>)[read!.kind];
+      const want = ops
+        ? ops[(read as { op: string }).op]!.fields
+        : fixture.actionKinds.find((k) => k.kind === read!.kind)!.fields;
+      expect(fields, row.name).toEqual(want);
+    }
+    // Every kind and every op has a valid sample.
+    const sampled = fixture.actionSamples.valid.map((r) => r.read as Record<string, unknown>);
+    for (const kind of Object.keys(ACTION_KINDS)) expect(sampled.some((r) => r.kind === kind), kind).toBe(true);
+    for (const op of Object.keys(ACTION_OPS.obs)) {
+      expect(sampled.some((r) => r.kind === "obs" && r.op === op), op).toBe(true);
     }
   });
 
@@ -113,6 +169,18 @@ describe("readAction", () => {
     expect(readAction({ kind: "tile", tileId: "\uD83D" })).toBeNull();
     expect(readAction({ kind: "speak", text: "Back.", voiceId: "af_heart\uD800" })).toBeNull();
     expect(readAction({ kind: "speak", text: "Back \u{1F642}", voiceId: "af_heart" })).toEqual(LINE("Back \u{1F642}"));
+    // v1.61.0: a scene's name counts code points, so a pair is one of 256.
+    const name = `${"a".repeat(255)}\u{1F642}`;
+    expect(readAction({ ...SCENE, sceneName: name })).toEqual({ ...SCENE, sceneName: name });
+    expect(readAction({ ...SCENE, sceneName: `${name}a` })).toBeNull();
+  });
+
+  it("restores and reapplies: Switch OBS back restores, Switch OBS scene doesn't; neither reapplies (v1.61.0)", () => {
+    expect(restores(SCENE_BACK)).toBe(true);
+    expect(restores(SCENE)).toBe(false);
+    expect(reapplies(SCENE_BACK)).toBe(false);
+    expect(reapplies(SCENE)).toBe(false);
+    expect(ACTION_KINDS.obs.runsIn).toBe("backend");
   });
 
   it("trims a line as the backend's str::trim does", () => {

@@ -6,7 +6,7 @@
 // `onFire`), sends the actions Rust would read with every `sync_timers`, and
 // runs the page's half of a hook when a `timer-actions` event says so:
 // preset switches and clips. The backend runs the rest: the mute, Stop all
-// clips and lines, a replay, a line.
+// clips and lines, a replay, a line, and (v1.61.0) OBS's scene switches.
 //
 // Reading is lenient and goes action by action, by the rules Rust's
 // `action_from_wire` and `hooks_from_wire` apply (the fixture's
@@ -16,6 +16,7 @@
 // Pure, so it unit-tests.
 
 import { isTimerId, type TimerPhase } from "../overlay/timerState";
+import { readObsName, readObsUuid, type ObsOp, type ObsOpName } from "./obs";
 import { ptmKeyWhere } from "./ptm";
 // A cycle (timers.ts sends lists with `actionsForSync`): both sides only
 // call each other's functions, never at load, so either may load first.
@@ -46,7 +47,9 @@ export const LATE_ONE_SHOTS_MS = 30_000;
 /** One action of a countdown's list (D1). `preset`, `tile` and `panic` keep
  *  the glyph actions' shape (types.ts `GlyphAction`); the glyph's toggles
  *  (`monitor`, `mute`) aren't timer actions: Mute my voice and Unmute my
- *  voice set the state they name. */
+ *  voice set the state they name. v1.61.0: `obs`, Switch OBS scene
+ *  (`op: "scene"`) and Switch OBS back (`op: "sceneBack"`), flat on the wire
+ *  like every other kind (data/obs.ts `ObsOp`). */
 export type TimerAction =
   | { kind: "preset"; presetId: string }
   | { kind: "randomPreset" }
@@ -55,7 +58,8 @@ export type TimerAction =
   | { kind: "speak"; text: string; voiceId: string }
   | { kind: "saveReplay" }
   | { kind: "setMuted"; muted: boolean }
-  | { kind: "panic" };
+  | { kind: "panic" }
+  | ({ kind: "obs" } & ObsOp);
 export type TimerActionKind = TimerAction["kind"];
 
 /** A stored timer's two lists: At start and At zero. */
@@ -94,10 +98,16 @@ export interface PresetReturn {
   to: string;
 }
 
+/** Where a hook runs an action: `start` (At start) or `zero` (At zero). */
+export type ActionAt = "start" | "zero";
+
 /** Each kind: where it runs (D5) and which list offers it (§7.2). Back to
- *  the preset before never runs at a start. In the fixture's order. */
+ *  the preset before never runs at a start. In the fixture's order.
+ *  v1.61.0: `obs` is one kind with two ops; its row is Switch OBS scene's,
+ *  and `ACTION_OPS` says where each op runs (Switch OBS back only at zero),
+ *  so whether an action runs at a hook is `runsAt`'s to say. */
 export const ACTION_KINDS: Readonly<
-  Record<TimerActionKind, { runsIn: "page" | "backend"; at: readonly ("start" | "zero")[] }>
+  Record<TimerActionKind, { runsIn: "page" | "backend"; at: readonly ActionAt[] }>
 > = {
   preset: { runsIn: "page", at: ["start", "zero"] },
   randomPreset: { runsIn: "page", at: ["start", "zero"] },
@@ -107,13 +117,32 @@ export const ACTION_KINDS: Readonly<
   saveReplay: { runsIn: "backend", at: ["start", "zero"] },
   setMuted: { runsIn: "backend", at: ["start", "zero"] },
   panic: { runsIn: "backend", at: ["start", "zero"] },
+  obs: { runsIn: "backend", at: ["start", "zero"] },
 };
 
+/** v1.61.0: for a kind with ops, where each op runs. Pinned by
+ *  timer.fixture.json (`actionOps`), which the backend reads too. */
+export const ACTION_OPS: Readonly<{ obs: Readonly<Record<ObsOpName, { at: readonly ActionAt[] }>> }> = {
+  obs: {
+    scene: { at: ["start", "zero"] },
+    sceneBack: { at: ["zero"] },
+  },
+};
+
+/** v1.61.0: whether a hook ever runs `a`, as the backend's `runs_at` says:
+ *  Back to the preset before and Switch OBS back never run at a start
+ *  (there is nothing to go back to yet); everything else runs at either. */
+export function runsAt(a: TimerAction, at: ActionAt): boolean {
+  return a.kind === "obs" ? ACTION_OPS.obs[a.op].at.includes(at) : ACTION_KINDS[a.kind].at.includes(at);
+}
+
 /** It puts back what a start changed: Back to the preset before, Unmute my
- *  voice. Only these run when a countdown ends late or ran out, and (when
- *  they undo the start) on a Reset or a delete. */
+ *  voice and (v1.61.0) Switch OBS back. Only these run when a countdown ends
+ *  late or ran out, and (when they undo the start) on a Reset or a delete. */
 export function restores(a: TimerAction): boolean {
-  return a.kind === "revertPreset" || (a.kind === "setMuted" && !a.muted);
+  return (
+    a.kind === "revertPreset" || (a.kind === "setMuted" && !a.muted) || (a.kind === "obs" && a.op === "sceneBack")
+  );
 }
 
 /** At start, it runs again when Divora restarts mid-run: the mute is never
@@ -170,11 +199,14 @@ function readLine(v: unknown): string | null {
 
 /** One stored or sent action, or null when it can't run here (§7.2): not an
  *  object; a `kind` that is missing, not a string or one this build doesn't
- *  know (the glyph's `monitor` and `mute`, v1.61.0's `obs`); a field it
- *  needs that is missing, of the wrong type or out of its range. Only the
- *  kind's own fields are kept, a line trimmed: exactly what Rust's
+ *  know (the glyph's `monitor` and `mute`); an `obs` op other than `scene`
+ *  or `sceneBack`, spelled exactly (a later release's); a field it needs
+ *  that is missing, of the wrong type or out of its range. Only the kind's
+ *  (and the op's) own fields are kept, a line trimmed: exactly what Rust's
  *  `action_from_wire` reads. A lone surrogate in any text is refused here
- *  only (Rust never receives one). */
+ *  only (Rust never receives one). v1.61.0: a scene's uuid is 1-128
+ *  characters and its name a string of at most 256, empty allowed
+ *  (data/obs.ts `readObsUuid`, `readObsName`). */
 export function readAction(raw: unknown): TimerAction | null {
   if (!isObject(raw) || typeof raw.kind !== "string") return null;
   switch (raw.kind) {
@@ -201,14 +233,32 @@ export function readAction(raw: unknown): TimerAction | null {
       return { kind: "saveReplay" };
     case "panic":
       return { kind: "panic" };
+    case "obs":
+      return readObsAction(raw);
+    default:
+      return null;
+  }
+}
+
+/** v1.61.0: an `obs` action, by its op. */
+function readObsAction(raw: Record<string, unknown>): TimerAction | null {
+  switch (raw.op) {
+    case "scene": {
+      const sceneUuid = readObsUuid(raw.sceneUuid);
+      const sceneName = readObsName(raw.sceneName);
+      return sceneUuid === null || sceneName === null ? null : { kind: "obs", op: "scene", sceneUuid, sceneName };
+    }
+    case "sceneBack":
+      return { kind: "obs", op: "sceneBack" };
     default:
       return null;
   }
 }
 
 /** One stored entry as the card shows it. `runs`: sent, and run, but for
- *  Back to the preset before in At start (a hand edit), which Rust never
- *  runs there (the card's `shownRow` marks it). Otherwise
+ *  Back to the preset before (or v1.61.0's Switch OBS back) in At start (a
+ *  hand edit), which Rust never runs there (`runsAt`; the card's `shownRow`
+ *  marks it). Otherwise
  *  why not: it can't be read here, it is a list's second line, or it is
  *  past the 8th entry (which Rust never reads, whatever it holds). */
 export type ActionRow =
@@ -235,7 +285,8 @@ export function readStoredActions(raw: unknown): ActionRow[] {
 }
 
 /** What `sync_timers` sends for a list: the rows marked `runs`, in order (a
- *  `revertPreset` in `onStart` among them, though it never runs there). */
+ *  `revertPreset` or a Switch OBS back in `onStart` among them, though
+ *  neither runs there). */
 export function actionsForSync(raw: unknown): TimerAction[] {
   const out: TimerAction[] = [];
   for (const row of readStoredActions(raw)) if (row.runs) out.push(row.action);
@@ -480,6 +531,10 @@ export function actionWords(a: TimerAction, names: ActionNames): string {
       return a.muted ? "Mute my voice" : "Unmute my voice";
     case "panic":
       return "Stop all clips and lines";
+    case "obs":
+      // v1.61.0: by the stored name, which an inventory refreshes; the uuid
+      // is what switches.
+      return a.op === "scene" ? `Switch OBS to ${a.sceneName}` : "Switch OBS back";
   }
 }
 

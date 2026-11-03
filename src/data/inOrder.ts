@@ -17,9 +17,11 @@ export type InOrder = <T>(send: () => Promise<T>) => Promise<T>;
  *  is in flight goes out at once, in the caller's turn, so a command sent at
  *  the store's creation still goes before App's onMount sends anything. A
  *  failure never holds the rest back; a send that never settles holds back
- *  every one queued after it. The store queues only sync commands, which
- *  answer once the main thread runs them: one held up there holds up every
- *  sync command sent after it, queued or not. */
+ *  every one queued after it. The store queues sync commands, which answer
+ *  once the main thread runs them: one held up there holds up every sync
+ *  command sent after it, queued or not. v1.61.0: and OBS's four async
+ *  commands that change something, on their own queue; none of them waits
+ *  on OBS, so a slow OBS holds nothing up. */
 export function inOrder(): InOrder {
   let tail: Promise<void> = Promise.resolve();
   // Sends queued and not yet settled, the one in flight included.

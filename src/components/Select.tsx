@@ -21,6 +21,11 @@
 //   - `blurOnPointer` hands the focus back to the page after a mouse or
 //     touch click, so Space reaches push-to-modulate again; from the
 //     keyboard the focus stays (blurOnPointer.ts).
+//
+// v1.61.0 (declared for Talk to OBS's pickers; not acted on yet): `onOpen`,
+// called each time the list opens, so a picker can read OBS's sources
+// again; and an option's `disabled`, shown with `aria-disabled`, kept in
+// the arrow and Home/End order, and refused by Enter, Space and a click.
 
 import type { JSX } from "solid-js";
 import { createSignal, createUniqueId, For, onCleanup, onMount, Show } from "solid-js";
@@ -31,6 +36,10 @@ export interface SelectOption {
   value: string;
   label: string;
   sub?: string;
+  /** v1.61.0 (declared; not acted on yet): it can't be picked (a text
+   *  source that reads a file, or one another timer shows); `sub` says
+   *  why. */
+  disabled?: boolean;
 }
 
 export interface SelectProps {
@@ -50,6 +59,9 @@ export interface SelectProps {
   /** v1.60.0: a pointer click leaves the focus on the page, not on the
    *  trigger. */
   blurOnPointer?: boolean;
+  /** v1.61.0 (declared; not called yet): each time the list opens, by a
+   *  click or a key. */
+  onOpen?: () => void;
 }
 
 /** v1.60.0: where an open listbox's highlight goes for a key: Down and Up

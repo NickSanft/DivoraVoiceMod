@@ -34,6 +34,9 @@ import {
   type TimerVerb,
 } from "./timers";
 
+/** An OBS source's uuid (OBS's are 36 characters). */
+const UUID = "a7e2c94b-1f3d-4b8a-9c6e-0d5f7b2e4a91";
+
 const cd = (id: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
   id,
   name: id.toUpperCase(),
@@ -238,6 +241,22 @@ describe("readTimers", () => {
     ]);
   });
 
+  // v1.61.0: read only when sent (`defsForSync`); storage keeps whatever is
+  // there, as it keeps the lists.
+  it("keeps obsText and followObs as written, whatever they hold", () => {
+    const raw = {
+      version: 1,
+      timers: [
+        cd("timer-1", { obsText: { uuid: UUID, name: "Timer text", later: 1 }, followObs: "record" }),
+        cd("timer-2", { kind: "countup", obsText: "x", followObs: true }),
+      ],
+    };
+    const s = readTimers(raw);
+    expect(s.timers[0]).toMatchObject({ obsText: { uuid: UUID, name: "Timer text", later: 1 }, followObs: "record" });
+    expect(s.timers[1]).toMatchObject({ obsText: "x", followObs: true });
+    expect(readTimers(JSON.parse(JSON.stringify(timersForSave(s))))).toEqual(s);
+  });
+
   it("keeps entries past the 64th (the backend skips them)", () => {
     const many = Array.from({ length: 70 }, (_, i) => cd(`timer-${i + 1}`));
     expect(stored(many).timers).toHaveLength(70);
@@ -311,25 +330,94 @@ describe("defsForSync", () => {
   // The seam with the backend's `entry_from_wire`, which reads these keys:
   // timers.rs `sync_entry_keys_are_the_fixtures` reads the same list.
   // v1.60.0: `onStart` and `onFire` go, like `resume`, only when there is
-  // something in them, and only for a countdown.
-  it("sends exactly the fixture's defKeys: resume only with a run, lists only for a countdown with some", () => {
+  // something in them, and only for a countdown. v1.61.0: `defKeys` is the
+  // union of a countdown's keys and a count-up's: `obsText` on either,
+  // `followObs` on a count-up only.
+  it("sends exactly the fixture's defKeys: each optional key only when it is there, and only for its kinds", () => {
     const lists = {
       onStart: [{ kind: "setMuted", muted: true }],
       onFire: [{ kind: "preset", presetId: "x" }],
     };
-    const [all, without, countup, empty] = defsForSync(
+    const obs = { obsText: { uuid: UUID, name: "Timer text" }, followObs: "record" };
+    const [countdown, countup, without, upWithout, empty] = defsForSync(
       stored([
-        cd("timer-1", { run: { phase: "paused", ms: 5_000 }, colour: "red", ...lists }),
-        cd("timer-2"),
-        cd("timer-3", { kind: "countup", ...lists }),
-        cd("timer-4", { onStart: [], onFire: [{ kind: "mute" }] }),
+        cd("timer-1", { run: { phase: "paused", ms: 5_000 }, colour: "red", ...lists, ...obs }),
+        cd("timer-2", { kind: "countup", run: { phase: "paused", ms: 5_000 }, ...lists, ...obs }),
+        cd("timer-3"),
+        cd("timer-4", { kind: "countup" }),
+        cd("timer-5", { onStart: [], onFire: [{ kind: "mute" }] }),
       ]),
     );
-    expect(Object.keys(all!).sort()).toEqual(fixture.defKeys);
-    expect(all).toMatchObject(lists);
-    const optional = ["onFire", "onStart", "resume"];
-    for (const def of [without, countup, empty]) {
-      expect(Object.keys(def!).sort()).toEqual(fixture.defKeys.filter((k) => !optional.includes(k)));
+    const keys = (d: object | undefined): string[] => Object.keys(d!).sort();
+    expect([...new Set([...keys(countdown), ...keys(countup)])].sort()).toEqual(fixture.defKeys);
+    const required = ["durationMs", "id", "kind", "name"];
+    const countdownKeys = [...required, "obsText", "onFire", "onStart", "resume"].sort();
+    const countupKeys = [...required, "followObs", "obsText", "resume"].sort();
+    expect(keys(countdown)).toEqual(countdownKeys);
+    expect(keys(countup)).toEqual(countupKeys);
+    expect(countdown).toMatchObject(lists);
+    expect(countdown!.obsText).toEqual({ uuid: UUID });
+    expect(countup).toMatchObject({ obsText: { uuid: UUID }, followObs: "record" });
+    for (const def of [without, upWithout, empty]) expect(keys(def)).toEqual(required);
+    for (const k of keys(countdown).concat(keys(countup))) expect(fixture.defKeys).toContain(k);
+  });
+
+  // v1.61.0: a timer without `obsText` or `followObs` sends what v1.60.0
+  // sent, key for key and byte for byte.
+  it("sends a v1.60.0 timer exactly as v1.60.0 did", () => {
+    const run = { phase: "running", totalMs: 300_000, anchorMs: 1_793_213_878_100 };
+    const s = stored([
+      cd("timer-1", { run, onStart: [{ kind: "setMuted", muted: true }], onFire: [{ kind: "setMuted", muted: false }] }),
+      cd("timer-2", { kind: "countup", run: { phase: "paused", ms: 754_321 } }),
+      { id: "timer-3", name: "Laps", kind: "interval", durationMs: 9, laps: [1] },
+    ]);
+    expect(JSON.stringify(defsForSync(s))).toBe(
+      JSON.stringify([
+        {
+          id: "timer-1",
+          name: "TIMER-1",
+          kind: "countdown",
+          durationMs: 300_000,
+          resume: run,
+          onStart: [{ kind: "setMuted", muted: true }],
+          onFire: [{ kind: "setMuted", muted: false }],
+        },
+        { id: "timer-2", name: "TIMER-2", kind: "countup", durationMs: 300_000, resume: { phase: "paused", ms: 754_321 } },
+        { id: "timer-3", name: "Laps", kind: "interval", durationMs: 9 },
+      ]),
+    );
+  });
+
+  it("sends obsText as its uuid only, and only a uuid it can read (v1.61.0)", () => {
+    const sent = (obsText: unknown, kind = "countdown") => defsForSync(stored([cd("timer-1", { kind, obsText })]))[0]!;
+    expect(sent({ uuid: UUID, name: "Timer text", later: 1 }).obsText).toEqual({ uuid: UUID });
+    expect(sent({ uuid: UUID }, "countup").obsText).toEqual({ uuid: UUID });
+    // Rust never uses the name, so one it couldn't show doesn't stop the uuid.
+    expect(sent({ uuid: UUID, name: 5 }).obsText).toEqual({ uuid: UUID });
+    expect(sent({ uuid: "f".repeat(128) }).obsText).toEqual({ uuid: "f".repeat(128) });
+    for (const bad of [
+      UUID,
+      null,
+      [UUID],
+      {},
+      { uuid: "" },
+      { uuid: "f".repeat(129) },
+      { uuid: `${UUID}\uD800` },
+      { uuid: 5 },
+    ]) {
+      expect("obsText" in sent(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("sends followObs on a count-up only, spelled exactly (v1.61.0)", () => {
+    const sent = (followObs: unknown, kind: string) =>
+      defsForSync(stored([cd("timer-1", { kind, followObs })]))[0]!;
+    expect(sent("stream", "countup").followObs).toBe("stream");
+    expect(sent("record", "countup").followObs).toBe("record");
+    expect("followObs" in sent("stream", "countdown")).toBe(false);
+    expect("followObs" in sent("stream", "interval")).toBe(false);
+    for (const bad of [true, "Stream", "streaming", "", null, { what: "stream" }]) {
+      expect("followObs" in sent(bad, "countup"), String(bad)).toBe(false);
     }
   });
 

@@ -6,6 +6,9 @@
 // v1.58.0: `blurOnPointer` hands focus back to the page after a mouse or
 // touch click, so Space reaches push-to-modulate again (Push to modulate's
 // Hold to apply / Hold to bypass).
+// v1.61.0 (declared for Follow OBS; not acted on yet): `ariaLabel` names the
+// group, which is then a radio group (`role="radiogroup"`, each option a
+// `radio` with `aria-checked`); without it, the tab list it has always been.
 
 import type { JSX } from "solid-js";
 import { For } from "solid-js";
@@ -23,6 +26,9 @@ export interface SegmentedProps<T extends string> {
   disabled?: boolean;
   /** A pointer click leaves the focus on the page, not on the option. */
   blurOnPointer?: boolean;
+  /** v1.61.0 (declared; not acted on yet): the group's name, which makes
+   *  it a radio group ("Follow OBS for Uptime"). */
+  ariaLabel?: string;
 }
 
 export function Segmented<T extends string>(props: SegmentedProps<T>): JSX.Element {

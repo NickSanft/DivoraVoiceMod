@@ -9,7 +9,7 @@
   "snapshotKeys": ["seq", "timers"],
   "stateKeys": ["anchorMs", "fires", "id", "kind", "ms", "name", "phase", "text", "totalMs"],
   "runKeys": ["anchorMs", "ms", "phase", "totalMs"],
-  "defKeys": ["durationMs", "id", "kind", "name", "onFire", "onStart", "resume"],
+  "defKeys": ["durationMs", "followObs", "id", "kind", "name", "obsText", "onFire", "onStart", "resume"],
   "phases": ["idle", "running", "paused", "done", "expired"],
   "kinds": ["countdown", "countup"],
   "limits": {
@@ -424,8 +424,15 @@
     { "kind": "speak", "fields": ["text", "voiceId"], "runsIn": "backend", "at": ["start", "zero"] },
     { "kind": "saveReplay", "fields": [], "runsIn": "backend", "at": ["start", "zero"] },
     { "kind": "setMuted", "fields": ["muted"], "runsIn": "backend", "at": ["start", "zero"] },
-    { "kind": "panic", "fields": [], "runsIn": "backend", "at": ["start", "zero"] }
+    { "kind": "panic", "fields": [], "runsIn": "backend", "at": ["start", "zero"] },
+    { "kind": "obs", "fields": ["op", "sceneName", "sceneUuid"], "runsIn": "backend", "at": ["start", "zero"] }
   ],
+  "actionOps": {
+    "obs": {
+      "scene": { "fields": ["op", "sceneName", "sceneUuid"], "at": ["start", "zero"] },
+      "sceneBack": { "fields": ["op"], "at": ["zero"] }
+    }
+  },
   "actionLimits": { "maxActions": 8, "maxLineChars": 200, "maxTargetChars": 128, "lateOneShotsMs": 30000 },
   "actionSamples": {
     "valid": [
@@ -586,6 +593,76 @@
         "reapplies": false
       },
       {
+        "name": "obs scene",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": "BRB"
+        },
+        "read": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": "BRB"
+        },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "obs scene, a 128-character sceneUuid and a 256-character sceneName",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "sceneName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "read": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "sceneName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "obs scene, an empty sceneName (the uuid switches; the name is only shown)",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": ""
+        },
+        "read": { "kind": "obs", "op": "scene", "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", "sceneName": "" },
+        "runsIn": "backend",
+        "restores": false,
+        "reapplies": false
+      },
+      {
+        "name": "obs sceneBack",
+        "action": { "kind": "obs", "op": "sceneBack" },
+        "read": { "kind": "obs", "op": "sceneBack" },
+        "runsIn": "backend",
+        "restores": true,
+        "reapplies": false
+      },
+      {
+        "name": "obs sceneBack, a scene's fields are ignored",
+        "action": {
+          "kind": "obs",
+          "op": "sceneBack",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": "BRB"
+        },
+        "read": { "kind": "obs", "op": "sceneBack" },
+        "runsIn": "backend",
+        "restores": true,
+        "reapplies": false
+      },
+      {
         "name": "extra keys are ignored",
         "action": { "kind": "setMuted", "muted": true, "label": "Mute", "at": "start" },
         "read": { "kind": "setMuted", "muted": true },
@@ -612,7 +689,6 @@
       { "name": "kind null", "action": { "kind": null } },
       { "name": "kind unknown: monitor (a glyph toggle)", "action": { "kind": "monitor" } },
       { "name": "kind unknown: mute (a glyph toggle)", "action": { "kind": "mute" } },
-      { "name": "kind unknown: obs (v1.61.0's)", "action": { "kind": "obs", "op": "sceneBack" } },
       { "name": "kind spelled in another case", "action": { "kind": "Panic" } },
       { "name": "preset without presetId", "action": { "kind": "preset" } },
       { "name": "preset, presetId empty", "action": { "kind": "preset", "presetId": "" } },
@@ -657,11 +733,67 @@
       { "name": "setMuted, muted a string", "action": { "kind": "setMuted", "muted": "true" } },
       { "name": "setMuted, muted a number", "action": { "kind": "setMuted", "muted": 0 } },
       { "name": "setMuted, muted null", "action": { "kind": "setMuted", "muted": null } },
+      { "name": "obs, op unknown: startStream (a later release's)", "action": { "kind": "obs", "op": "startStream" } },
+      { "name": "obs without op", "action": { "kind": "obs" } },
+      { "name": "obs, op spelled in another case", "action": { "kind": "obs", "op": "SceneBack" } },
+      { "name": "obs scene without sceneUuid", "action": { "kind": "obs", "op": "scene", "sceneName": "BRB" } },
+      {
+        "name": "obs scene, sceneUuid empty",
+        "action": { "kind": "obs", "op": "scene", "sceneUuid": "", "sceneName": "BRB" }
+      },
+      {
+        "name": "obs scene, a 129-character sceneUuid",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "sceneName": "BRB"
+        }
+      },
+      {
+        "name": "obs scene without sceneName",
+        "action": { "kind": "obs", "op": "scene", "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13" }
+      },
+      {
+        "name": "obs scene, sceneName not a string",
+        "action": { "kind": "obs", "op": "scene", "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13", "sceneName": 5 }
+      },
+      {
+        "name": "obs scene, a 257-character sceneName",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
       {
         "name": "speak, a lone surrogate in the line (page only: JSON can't hold one, so the test appends \\uD800 to text; Rust never receives one, serde_json refuses the whole invoke)",
         "pageOnly": true,
         "appendLoneSurrogate": "text",
         "action": { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" }
+      },
+      {
+        "name": "obs scene, a lone surrogate in sceneUuid (page only, as the line's: the test appends \\uD800 to sceneUuid)",
+        "pageOnly": true,
+        "appendLoneSurrogate": "sceneUuid",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": "BRB"
+        }
+      },
+      {
+        "name": "obs scene, a lone surrogate in sceneName (page only, as the line's: the test appends \\uD800 to sceneName)",
+        "pageOnly": true,
+        "appendLoneSurrogate": "sceneName",
+        "action": {
+          "kind": "obs",
+          "op": "scene",
+          "sceneUuid": "5d3f1c9e-7a2b-4e6d-8f10-2c4b6a8e0d13",
+          "sceneName": "BRB"
+        }
       }
     ]
   },
@@ -712,7 +844,7 @@
       }
     },
     {
-      "name": "ten entries, the third an unknown kind: only the first eight are read, so seven run; an empty list isn't sent",
+      "name": "ten entries, the third an unknown op: only the first eight are read, so seven run; an empty list isn't sent",
       "entry": {
         "id": "timer-1",
         "name": "BRB",
@@ -722,7 +854,7 @@
         "onFire": [
           { "kind": "setMuted", "muted": true },
           { "kind": "preset", "presetId": "villager" },
-          { "kind": "obs", "op": "sceneBack" },
+          { "kind": "obs", "op": "startStream" },
           { "kind": "tile", "tileId": "9f2c4e1a7b3d5f60" },
           { "kind": "speak", "text": "Be right back.", "voiceId": "af_heart" },
           { "kind": "saveReplay" },

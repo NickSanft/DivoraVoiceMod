@@ -33,6 +33,7 @@ use divora_capture::sleep::Discontinuities;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::obs::MAX_UUID_CHARS;
 use crate::timer_actions::{hooks_from_wire, Hooks};
 
 /// The event every change goes out as, to every window. Payload:
@@ -146,6 +147,57 @@ pub struct TimerDef {
     /// [`hooks_from_wire`]; a count-up's are empty (D32). Shared with every
     /// transition the timer records.
     pub hooks: Arc<Hooks>,
+    /// v1.61.0: the OBS text source its text goes to, any kind (D18).
+    pub obs_text: Option<ObsTarget>,
+    /// v1.61.0: the OBS output a count-up follows (D26); a countdown's is
+    /// dropped.
+    pub follow_obs: Option<FollowObs>,
+}
+
+/// v1.61.0 (D18): an OBS text source a timer's text goes to, by uuid (1 to
+/// [`MAX_UUID_CHARS`] characters). The page keeps its name; Rust never uses
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObsTarget {
+    pub uuid: String,
+}
+
+/// v1.61.0 (D26): the OBS output a count-up follows: it starts at 0 when the
+/// output starts, and pauses when it stops (and with a paused recording).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum FollowObs {
+    Stream,
+    Record,
+}
+
+/// v1.61.0 (D18): one mapped timer's text, for its OBS source.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ObsText {
+    /// The source's uuid.
+    pub uuid: String,
+    /// What the timer's `.txt` file gets.
+    pub text: String,
+}
+
+/// v1.61.0 (D26): one count-up that follows an OBS output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Follow {
+    /// The timer id.
+    pub id: String,
+    pub what: FollowObs,
+}
+
+/// v1.61.0 (D17, D18, D26): what the timer thread hands the OBS link on
+/// each pass, through a `watch` (latest wins): each mapped run timer's text
+/// by source uuid (the first timer per uuid, in list order), each count-up
+/// that follows OBS, and how many count-ups the core has sleep-paused, so a
+/// wake re-seeds them.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ObsFeed {
+    pub texts: Vec<ObsText>,
+    pub follows: Vec<Follow>,
+    pub sleeps: u64,
 }
 
 /// What the page stores of a running, paused, done or ran-out timer, and
@@ -238,6 +290,14 @@ pub enum TimerOp {
     /// through the one [`Transition::Fired`], not late. Anything else —
     /// idle, ended, a count-up — changes nothing.
     Finish,
+    /// v1.61.0 (D27): Follow OBS sets a count-up to `ms`, running or paused,
+    /// through the one `seed` a restart uses (so the 10 000 h clamp holds).
+    /// A countdown is unchanged. Only the OBS link sends it: never a key or
+    /// a command.
+    SetElapsed {
+        ms: u64,
+        running: bool,
+    },
 }
 
 /// v1.60.0: why an active countdown stopped without firing (D6, D10).
@@ -353,11 +413,13 @@ fn push_note(notes: &mut Vec<Note>, n: Note) {
 }
 
 /// What the file writer needs: each run timer's text, in list order, and
-/// every id whose file stays (the ones run and the ones kept).
+/// every id whose file stays (the ones run and the ones kept). v1.61.0: and
+/// the OBS link's feed, which the file writer ignores (D17).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct TextUpdate {
     pub texts: Vec<(String, String)>,
     pub keep: Vec<String>,
+    pub obs: ObsFeed,
 }
 
 /// D35, §7.14: one `sync_timers` entry, read on its own so one bad field
@@ -366,7 +428,9 @@ pub struct TextUpdate {
 /// becomes none (the timer starts idle). Unknown keys are ignored: later
 /// releases add fields (D33). v1.60.0: a countdown's `onStart` and `onFire`
 /// are read by [`hooks_from_wire`], an action at a time (D4); a count-up's
-/// are dropped (D32).
+/// are dropped (D32). v1.61.0: `obsText` (any kind) and a count-up's
+/// `followObs`, each read on its own: one that can't be read is none (D18,
+/// D26).
 pub fn entry_from_wire(v: &Value) -> Result<WireEntry, String> {
     let Some(entry) = v.as_object() else {
         return Err("not an object".to_string());
@@ -394,6 +458,10 @@ pub fn entry_from_wire(v: &Value) -> Result<WireEntry, String> {
         TimerKind::Countdown => hooks_from_wire(entry),
         TimerKind::Countup => Hooks::default(),
     };
+    let follow_obs = match kind {
+        TimerKind::Countdown => None,
+        TimerKind::Countup => entry.get("followObs").and_then(follow_from_wire),
+    };
     Ok(WireEntry::Def(TimerDef {
         id: id.to_string(),
         name,
@@ -401,7 +469,29 @@ pub fn entry_from_wire(v: &Value) -> Result<WireEntry, String> {
         duration_ms: length_from_wire(entry.get("durationMs")),
         resume: entry.get("resume").and_then(run_from_wire),
         hooks: Arc::new(hooks),
+        obs_text: entry.get("obsText").and_then(obs_target_from_wire),
+        follow_obs,
     }))
+}
+
+/// v1.61.0 (D18): an object whose `uuid` is a string of 1 to
+/// [`MAX_UUID_CHARS`] characters; its `name`, if any, is ignored.
+fn obs_target_from_wire(v: &Value) -> Option<ObsTarget> {
+    let uuid = v.as_object()?.get("uuid")?.as_str()?;
+    (1..=MAX_UUID_CHARS)
+        .contains(&uuid.chars().count())
+        .then(|| ObsTarget {
+            uuid: uuid.to_string(),
+        })
+}
+
+/// v1.61.0 (D26): `"stream"` or `"record"`, nothing else.
+fn follow_from_wire(v: &Value) -> Option<FollowObs> {
+    match v.as_str()? {
+        "stream" => Some(FollowObs::Stream),
+        "record" => Some(FollowObs::Record),
+        _ => None,
+    }
 }
 
 /// The name a sync entry without a usable one runs under. The page sends a
@@ -867,6 +957,8 @@ impl Timer {
             (TimerOp::Adjust(delta_ms), Running | Paused) => {
                 return self.adjust(delta_ms, now, wall_ms);
             }
+            // S1: track C gives `SetElapsed` its arm (D27); until then it
+            // changes nothing, and nothing sends it.
             _ => return false,
         }
         true
@@ -1437,6 +1529,8 @@ impl TimerCore {
                 .map(|t| t.id.clone())
                 .chain(self.kept.iter().cloned())
                 .collect(),
+            // S1: track C fills the feed (D18, D26).
+            obs: ObsFeed::default(),
         }
     }
 
@@ -1464,11 +1558,13 @@ mod tests {
     use super::TimerPhase::{Done, Expired, Idle, Paused, Running};
     use super::{
         adjust_delta, entry_from_wire, hotkey_timer_request, is_timer_id, run_from_wire,
-        timer_text, CancelWhy, NoTimer, Note, TextUpdate, TimerCore, TimerDef, TimerKind, TimerOp,
-        TimerPhase, TimerRun, TimerSnapshot, TimerState, Transition, WireEntry, DEFAULT_LENGTH_MS,
-        MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_NOTES, MAX_SEED_ELAPSED_MS,
-        MAX_SYNC_ENTRIES, MAX_TIMERS, MAX_TRANSITIONS, MIN_LENGTH_MS, TICK, TIMER_STATE_EVENT,
+        timer_text, CancelWhy, FollowObs, NoTimer, Note, ObsTarget, TextUpdate, TimerCore,
+        TimerDef, TimerKind, TimerOp, TimerPhase, TimerRun, TimerSnapshot, TimerState, Transition,
+        WireEntry, DEFAULT_LENGTH_MS, MAX_ID_CHARS, MAX_LENGTH_MS, MAX_NAME_CHARS, MAX_NOTES,
+        MAX_SEED_ELAPSED_MS, MAX_SYNC_ENTRIES, MAX_TIMERS, MAX_TRANSITIONS, MIN_LENGTH_MS, TICK,
+        TIMER_STATE_EVENT,
     };
+    use crate::obs::MAX_UUID_CHARS;
     use crate::timer_actions::{
         hooks_from_wire, plan, replay_at, Action, Hook, Hooks, TimerActionsEvent, Why,
         LATE_ONE_SHOTS_MS, MAX_ACTIONS, MAX_LINE_CHARS, MAX_TARGET_CHARS, SOUNDBOARD_STOPPED_EVENT,
@@ -1756,6 +1852,8 @@ mod tests {
             duration_ms,
             resume: None,
             hooks: Arc::default(),
+            obs_text: None,
+            follow_obs: None,
         }))
     }
 
@@ -1880,21 +1978,45 @@ mod tests {
     /// same `defKeys`): an entry spelled with exactly the fixture's keys has
     /// every field read, none fallen back. v1.60.0: a countdown, since only
     /// a countdown's lists are sent and read (D32), with a backend action at
-    /// the start and a page action at zero.
+    /// the start and a page action at zero. v1.61.0 (W3): `defKeys` is the
+    /// union of a countdown's keys (with `obsText`) and a count-up's (with
+    /// `obsText` and `followObs`); every field of each is read, and a
+    /// countdown that carries `followObs` (the page never sends one) reads
+    /// none.
     #[test]
     fn sync_entry_keys_are_the_fixtures() {
-        let entry = json!({
+        let source = "a7e2c94b-1f3d-4b8a-9c6e-0d5f7b2e4a91";
+        let countdown = json!({
             "id": "brb",
             "name": "Intro",
             "kind": "countdown",
             "durationMs": 90_000,
             "resume": {"phase": "paused", "ms": 5_000, "totalMs": 90_000},
+            "obsText": {"uuid": source},
             "onStart": [{"kind": "setMuted", "muted": true}],
             "onFire": [{"kind": "preset", "presetId": "x"}],
         });
-        assert_eq!(sorted_keys(&entry), strings(&fixture()["defKeys"]));
+        let countup = json!({
+            "id": "uptime",
+            "name": "Uptime",
+            "kind": "countup",
+            "durationMs": 300_000,
+            "resume": {"phase": "paused", "ms": 125_000},
+            "obsText": {"uuid": source},
+            "followObs": "record",
+        });
+        let mut keys = sorted_keys(&countdown);
+        keys.extend(sorted_keys(&countup));
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys, strings(&fixture()["defKeys"]));
+        let target = || {
+            Some(ObsTarget {
+                uuid: source.into(),
+            })
+        };
         assert_eq!(
-            entry_from_wire(&entry),
+            entry_from_wire(&countdown),
             Ok(WireEntry::Def(TimerDef {
                 id: "brb".into(),
                 name: "Intro".into(),
@@ -1912,8 +2034,96 @@ mod tests {
                         preset_id: "x".into()
                     }],
                 }),
+                obs_text: target(),
+                follow_obs: None,
             }))
         );
+        assert_eq!(
+            entry_from_wire(&countup),
+            Ok(WireEntry::Def(TimerDef {
+                id: "uptime".into(),
+                name: "Uptime".into(),
+                kind: TimerKind::Countup,
+                duration_ms: 300_000,
+                resume: Some(TimerRun {
+                    phase: TimerPhase::Paused,
+                    ms: Some(125_000),
+                    total_ms: None,
+                    anchor_ms: None,
+                }),
+                hooks: Arc::default(),
+                obs_text: target(),
+                follow_obs: Some(FollowObs::Record),
+            }))
+        );
+        let mut following = countdown;
+        following["followObs"] = json!("stream");
+        let Ok(WireEntry::Def(def)) = entry_from_wire(&following) else {
+            panic!("a definition");
+        };
+        assert_eq!((def.obs_text, def.follow_obs), (target(), None));
+    }
+
+    /// v1.61.0 (D18, D26): `obsText` is an object with a `uuid` of 1 to 128
+    /// characters, on any kind (its `name` ignored); `followObs` is
+    /// `"stream"` or `"record"`, on a count-up only. Anything else reads as
+    /// none and the timer still runs (HD D35).
+    #[test]
+    fn entry_from_wire_reads_obs_fields() {
+        let with = |kind: &str, key: &str, value: Value| {
+            let mut v = json!({"id": "timer-1", "name": "BRB", "kind": kind});
+            v[key] = value;
+            let Ok(WireEntry::Def(def)) = entry_from_wire(&v) else {
+                panic!("{v}: a definition");
+            };
+            (def.obs_text.map(|t| t.uuid), def.follow_obs)
+        };
+        let uuid = |n: usize| "f".repeat(n);
+        for kind in ["countdown", "countup"] {
+            for (value, want) in [
+                (json!({"uuid": "abc"}), Some("abc".to_string())),
+                (json!({"uuid": "abc", "name": "Timer"}), Some("abc".into())),
+                (
+                    json!({"uuid": uuid(MAX_UUID_CHARS)}),
+                    Some(uuid(MAX_UUID_CHARS)),
+                ),
+                (
+                    json!({"uuid": "é".repeat(MAX_UUID_CHARS)}),
+                    Some("é".repeat(MAX_UUID_CHARS)),
+                ),
+                (json!({"uuid": uuid(MAX_UUID_CHARS + 1)}), None),
+                (json!({"uuid": ""}), None),
+                (json!({"uuid": 5}), None),
+                (json!({"name": "Timer"}), None),
+                (json!("abc"), None),
+                (json!(null), None),
+            ] {
+                assert_eq!(
+                    with(kind, "obsText", value.clone()),
+                    (want, None),
+                    "{kind} {value}"
+                );
+            }
+        }
+        for (value, want) in [
+            (json!("stream"), Some(FollowObs::Stream)),
+            (json!("record"), Some(FollowObs::Record)),
+            (json!("Stream"), None),
+            (json!("recording"), None),
+            (json!(true), None),
+            (json!({"what": "stream"}), None),
+        ] {
+            assert_eq!(
+                with("countup", "followObs", value.clone()),
+                (None, want),
+                "{value}"
+            );
+            assert_eq!(
+                with("countdown", "followObs", value.clone()),
+                (None, None),
+                "{value}"
+            );
+        }
     }
 
     /// §7.8, §7.14: what makes a stored run malformed (the timer then starts
@@ -2026,6 +2236,8 @@ mod tests {
             duration_ms: length_ms,
             resume: None,
             hooks: Arc::default(),
+            obs_text: None,
+            follow_obs: None,
         })
     }
 
@@ -2038,6 +2250,8 @@ mod tests {
             duration_ms: DEFAULT_LENGTH_MS,
             resume: None,
             hooks: Arc::default(),
+            obs_text: None,
+            follow_obs: None,
         })
     }
 
@@ -3509,6 +3723,8 @@ mod tests {
             duration_ms: length_ms,
             resume: Some(run),
             hooks: Arc::default(),
+            obs_text: None,
+            follow_obs: None,
         };
         core.sync(vec![WireEntry::Def(def)], now, wall_ms, None);
         (state(&mut core, now, id), core.take_transitions())
@@ -4312,6 +4528,7 @@ mod tests {
     /// D33: fields a later release sends (`obsText`, `followObs`, actions of
     /// a kind this build doesn't know) don't stop a definition: it runs.
     /// v1.60.0: its readable actions are read, the rest skipped (D4).
+    /// v1.61.0: an `obsText` or `followObs` it can't read is none.
     #[test]
     fn later_fields_are_ignored() {
         let sent = json!({
@@ -4327,6 +4544,10 @@ mod tests {
         // `somethingNew` is skipped, and so is a line with no voice.
         let hooks = lists(vec![MUTE], vec![]);
         assert_eq!(def.hooks, hooks);
+        // v1.61.0 reads both fields, and these two shapes are neither: a
+        // string `obsText` and a `true` `followObs` (on a countdown, too)
+        // read as none.
+        assert_eq!((&def.obs_text, def.follow_obs), (&None, None));
         let mut core = TimerCore::new();
         core.sync(vec![read], Duration::ZERO, WALL0, None);
         op(&mut core, "timer-1", TimerOp::Arm, Duration::ZERO);
@@ -4383,6 +4604,8 @@ mod tests {
                 duration_ms,
                 resume: None,
                 hooks: hooks.clone(),
+                obs_text: None,
+                follow_obs: None,
             })
         };
         let clocks = [

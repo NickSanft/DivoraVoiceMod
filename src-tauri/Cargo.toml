@@ -47,6 +47,24 @@ tracing-appender = "0.2"
 # v1.55.0: charm pictures are named by their content's SHA-256. Already in
 # Cargo.lock through tauri-codegen; =0.10.9 adds no package.
 sha2 = "=0.10.9"
+# v1.61.0: Talk to OBS (D1, D38). Divora's own obs-websocket v5 client in
+# src/obs/, on tokio-websockets with no TLS feature: Cargo.lock gains
+# tokio-websockets, sha1_smol (BSD-3-Clause) and simdutf8, and nothing else.
+# A direct tokio for the link's two tasks on Tauri's runtime: `net` (the
+# socket; it also gives that runtime an I/O driver), `time`, `sync`, `rt`.
+# No `macros`: the tasks wait with a hand-written `poll_fn` (D6), so
+# tokio-macros and syn stay out. Every other crate here is locked already.
+tokio = { version = "1", default-features = false, features = ["net", "time", "sync", "rt"] }
+tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "fastrand", "sha1_smol"] }
+futures-core = "0.3"
+futures-sink = "0.3"
+base64 = "0.22"
+zeroize = "1"
+fastrand = "2"
+
+[dev-dependencies]
+# v1.61.0: the fake obs-websocket server the link's tests run against (§10.2).
+tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "fastrand", "sha1_smol", "server"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
