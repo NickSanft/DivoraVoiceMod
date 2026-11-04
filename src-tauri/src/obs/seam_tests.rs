@@ -45,7 +45,7 @@ use super::{
     lock, wall_ms, Emit, Follow, FollowObs, LinkOp, LinkPeriods, LinkTiming, ObsFeed, ObsOp,
     ObsShared, ObsText, SlotStore, StatusSink, TimerControl, EXIT_WAIT, NOT_CONNECTED,
 };
-use crate::timer_actions::{ActionBatch, Planned};
+use crate::timer_actions::{ActionBatch, Hook, Planned};
 use crate::timer_thread::{
     hand_off, run_action_worker, run_timer_loop, ActionHost, ChannelWaiter, SleepCheck, TextSlot,
     TimerClock, TimerEvents, TimerShared, TimerSinks, Waiter, Woke, ACTION_QUEUE,
@@ -191,6 +191,13 @@ async fn connected(obs: &ObsShared) {
 /// Waits for the slot saver to have written everything handed to it.
 async fn saved(obs: &ObsShared) {
     assert!(eventually(ms(2_000), || obs.shared.saver.idle()).await);
+}
+
+/// The test's folder removed once `obs`'s slot saver is idle: a save still
+/// queued would make the folder again.
+async fn clean(obs: &ObsShared, dir: &std::path::Path) {
+    saved(obs).await;
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// Waits for `returns.json` in `dir` to read `json`, the saver then idle:
@@ -427,8 +434,8 @@ impl ActionHost for Host {
 
     fn end_run(&self, _timer: &str) {}
 
-    fn obs(&self, timer: &str, op: &ObsOp) {
-        self.0.offer(timer, op);
+    fn obs(&self, timer: &str, hook: Hook, op: &ObsOp) {
+        self.0.offer_run(timer, hook, op);
     }
 }
 
@@ -518,6 +525,16 @@ impl Rig {
     fn advance(&self, by: Duration) {
         self.clock.advance(by);
         let _ = self.timers.status();
+    }
+
+    /// Waits for the timer thread to have handed `ObsShared`'s feed `n`
+    /// follows: a link configured after it seeds them from its startup's
+    /// answers, with no request of their own.
+    async fn fed(&self, n: usize) {
+        assert!(
+            eventually(ms(2_000), || self.obs.feed.borrow().follows.len() == n).await,
+            "the feed never held {n} follows"
+        );
     }
 
     /// Waits for `id` to pass `f`.
@@ -645,7 +662,7 @@ fn l26_a_break_end_to_end() {
         kept(&rig.obs, &rig.dir, &Slots::default().to_json()).await;
         assert_eq!(fake.accepts(), 1);
         fake.assert_clean();
-        std::fs::remove_dir_all(&rig.dir).ok();
+        clean(&rig.obs, &rig.dir).await;
     });
 }
 
@@ -710,8 +727,10 @@ fn l32_a_run_out_at_boot_switches_back() {
             "{after:?}"
         );
         assert_eq!(fake.program(), GAME);
-        assert_eq!(rig.obs.status().held_back, 0);
+        // Held back until OBS answers the Set and the plan is committed.
+        assert!(eventually(ms(500), || rig.obs.status().held_back == 0).await);
         fake.assert_clean();
+        saved(&rig.obs).await;
         drop(rig);
         std::fs::remove_dir_all(&dir).ok();
 
@@ -731,6 +750,7 @@ fn l32_a_run_out_at_boot_switches_back() {
         assert!(set[0].at - synced < timing().scene_back_grace);
         assert_eq!(fake.program(), GAME);
         fake.assert_clean();
+        saved(&rig.obs).await;
         drop(rig);
         std::fs::remove_dir_all(&dir).ok();
     });
@@ -768,8 +788,67 @@ fn l32_a_run_out_obs_never_readies_for_ends_at_its_grace() {
         assert_eq!(sets(&fake), [""; 0]);
         assert_eq!(rig.obs.status().held_back, 0);
         fake.assert_clean();
+        saved(&rig.obs).await;
         drop(rig);
         std::fs::remove_dir_all(&dir).ok();
+    });
+}
+
+/// D23 (review): a switch back OBS answers 207 to a few times stays held
+/// back while it is tried: `heldBack` doesn't drop to 0 for each try (the
+/// page would say "Waiting for OBS" again each time), only once it has
+/// switched.
+#[test]
+fn a_held_switch_back_stays_held_while_it_is_tried() {
+    guarded(async {
+        let fake = FakeObs::start(Config::default()).await;
+        fake.model(|m| m.program = BRB.into());
+        let p = plain(scratch("held-steady"));
+        p.obs.configure(on(&fake)).unwrap();
+        connected(&p.obs).await;
+        assert!(p.obs.shared.after_scene("brb", game(), brb()));
+        fake.script(Rule::on("GetCurrentProgramScene").times(3).not_ready());
+        p.obs.offer("brb", &ObsOp::SceneBack);
+        assert!(fake.wait(ms(3_000), |f| sets(f) == [GAME]).await);
+        assert!(eventually(ms(500), || p.obs.status().held_back == 0).await);
+        assert_eq!(fake.requests_of("GetCurrentProgramScene").len(), 4);
+        let held: Vec<u32> = p.seen.lock().unwrap().iter().map(|s| s.held_back).collect();
+        let drops = held.windows(2).filter(|w| w[0] > 0 && w[1] == 0).count();
+        assert_eq!(drops, 1, "{held:?}");
+        fake.assert_clean();
+        clean(&p.obs, &p.dir).await;
+    });
+}
+
+/// D23 (review): a break that ends while the link is parked in a stop state
+/// (`needsPassword`): its switch back expires at its grace, said (`lastSkip
+/// {sceneBack, notConnected}`, `heldBack` 0), not whenever a link next
+/// starts.
+#[test]
+fn a_parked_link_expires_a_switch_back_made_due_while_parked() {
+    guarded(async {
+        let fake = FakeObs::start(Config::default().with_password(PASSWORD)).await;
+        let p = plain(scratch("parked-expiry"));
+        p.obs.configure(on(&fake)).unwrap();
+        assert!(state(&p.obs, ObsState::NeedsPassword, ms(2_000)).await);
+        assert!(p.obs.shared.after_scene("brb", game(), brb()));
+        let offered = Instant::now();
+        p.obs.offer("brb", &ObsOp::SceneBack);
+        assert_eq!(p.obs.status().held_back, 1);
+        let grace = timing().scene_back_grace;
+        assert!(
+            eventually(grace + ms(1_500), || p.obs.status().held_back == 0).await,
+            "{:?}",
+            p.obs.status()
+        );
+        assert!(offered.elapsed() >= grace, "{:?}", offered.elapsed());
+        assert_eq!(
+            skip_now(&p.obs),
+            Some((SkipOp::SceneBack, SkipWhy::NotConnected, "brb".into()))
+        );
+        assert_eq!(p.obs.status().state, ObsState::NeedsPassword);
+        fake.assert_clean();
+        clean(&p.obs, &p.dir).await;
     });
 }
 
@@ -790,6 +869,7 @@ fn l18_follow_obs_runs_the_core_s_count_ups() {
             mapped(countup("up", Some("stream")), TEXT_V3),
             mapped(countup("rec", Some("record")), TEXT_FT2),
         ]);
+        rig.fed(2).await;
         rig.obs.configure(on(&fake)).unwrap();
         connected(&rig.obs).await;
         assert!(fake.wait(ms(1_000), |f| pushes(f).len() == 2).await);
@@ -851,7 +931,7 @@ fn l18_follow_obs_runs_the_core_s_count_ups() {
             "the push was answered first"
         );
         fake.assert_clean();
-        std::fs::remove_dir_all(&rig.dir).ok();
+        clean(&rig.obs, &rig.dir).await;
     });
 }
 
@@ -876,6 +956,7 @@ fn l19_seeds_set_the_core_s_count_ups() {
             countup("rec", Some("record")),
             countup("up", Some("stream")),
         ]);
+        rig.fed(2).await;
         rig.obs.configure(on(&fake)).unwrap();
         connected(&rig.obs).await;
         let rec = rig
@@ -957,7 +1038,7 @@ fn l19_seeds_set_the_core_s_count_ups() {
             .await;
         assert_eq!(rig.timer("live").phase, TimerPhase::Running);
         fake.assert_clean();
-        std::fs::remove_dir_all(&rig.dir).ok();
+        clean(&rig.obs, &rig.dir).await;
     });
 }
 
@@ -1010,7 +1091,7 @@ fn l17c_a_stop_state_keeps_the_switch_backs() {
         assert!(fake.requests_of("GetCurrentProgramScene").len() >= 10);
         assert!(!fake.sessions()[0].identified, "parked: never identified");
         fake.assert_clean();
-        std::fs::remove_dir_all(&p.dir).ok();
+        clean(&p.obs, &p.dir).await;
     });
 }
 
@@ -1068,7 +1149,7 @@ fn l22_off_opens_nothing() {
         assert_eq!(fake.accepts(), 1);
         assert_eq!(p.obs.status().state, ObsState::Off);
         fake.assert_clean();
-        std::fs::remove_dir_all(&p.dir).ok();
+        clean(&p.obs, &p.dir).await;
     });
 }
 
@@ -1123,7 +1204,7 @@ fn l29_offer_never_waits_on_a_stalled_link() {
         assert!(p.obs.shared.next_expiry().is_some(), "op-20 due, no slot");
         assert_eq!(fake.max_outstanding(), 1);
         fake.assert_clean();
-        std::fs::remove_dir_all(&p.dir).ok();
+        clean(&p.obs, &p.dir).await;
     });
 }
 
@@ -1187,7 +1268,7 @@ fn l25b_a_restart_clears_only_what_this_divora_wrote() {
             .collect();
         assert!(theirs.is_empty(), "a new Divora clears nothing: {theirs:?}");
         fake.assert_clean();
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&again.obs, &dir).await;
     });
 }
 
@@ -1252,7 +1333,7 @@ fn l33_a_restart_mid_break_still_switches_back() {
         // The later state.
         kept(&p.obs, &dir, &Slots::default().to_json()).await;
         fake.assert_clean();
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&p.obs, &dir).await;
     });
 }
 
@@ -1340,7 +1421,7 @@ fn l33_a_stale_driver_applies_nothing() {
         assert_eq!(p.obs.status(), after, "no stale write");
         drop((held, ops));
         fake.assert_clean();
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&p.obs, &dir).await;
     });
 }
 
@@ -1399,10 +1480,16 @@ fn configure_with_the_same_address_keeps_the_link() {
             "the attempt met OBS still down"
         );
 
-        // OBS back; Try again while retrying: an attempt now.
+        // OBS back; Try again while retrying: an attempt now, well before
+        // the backoff's own (backoff(4) is at least 1 280 ms here).
         fake.set_accept(Accept::Normal);
         assert!(eventually(ms(1_000), || retries() == 4).await);
+        let n = fake.accepts();
         assert_eq!(p.obs.reconnect().state, ObsState::Retrying);
+        assert!(
+            fake.wait_accepts(n + 1, ms(800)).await,
+            "Try again: an attempt now, not at the backoff"
+        );
         connected(&p.obs).await;
 
         // A kick: a reload opens nothing; Try again connects.
@@ -1419,7 +1506,7 @@ fn configure_with_the_same_address_keeps_the_link() {
         connected(&p.obs).await;
         assert_eq!(fake.accepts(), accepts + 1);
         fake.assert_clean();
-        std::fs::remove_dir_all(&p.dir).ok();
+        clean(&p.obs, &p.dir).await;
     });
 }
 
@@ -1533,6 +1620,6 @@ fn a_saved_password_is_the_one_the_link_sends() {
         let identified = fake.sessions().iter().filter(|s| s.identified).count();
         assert_eq!(identified, 1, "only the saved password got in");
         fake.assert_clean();
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&p.obs, &dir).await;
     });
 }

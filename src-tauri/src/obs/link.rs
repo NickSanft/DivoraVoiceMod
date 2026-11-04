@@ -2,8 +2,13 @@
 //! one outstanding request, ops, the feed, Follow OBS, commands, due marks)
 //! and the *session* (owns the socket: reads, writes, keepalive, the close),
 //! two tasks on [`LinkDeps::spawner`] (§5.5). Every wait also watches
-//! `cmds`, whose end is the stop (D4, D6). The link connects only to
-//! [`LinkDeps::cfg`]'s IP and port and looks no name up (D7).
+//! `cmds`, whose end is the stop (D4, D6), except two bounded ones: the
+//! 1000 close after a failed handshake (`give_up`, at most `close_flush` +
+//! `close_echo`), and the wait for the session's end after the driver drops
+//! a connection itself (`Exit::Drop`, at most 2 × `close_flush` +
+//! `close_echo`), so a Quit's ack still follows the close. The link
+//! connects only to [`LinkDeps::cfg`]'s IP and port and looks no name up
+//! (D7).
 //!
 //! tokio's `select!` needs its `macros` feature, which stays off (D6), so
 //! each wait is one hand-written [`poll_fn`] over its sources in a fixed
@@ -75,6 +80,12 @@ const REPLIES: usize = 64;
 /// D18: a failed push is tried again after the base, doubling, at most 30
 /// times the base (30 s in the app).
 const PUSH_RETRY_MAX: u32 = 30;
+
+/// D7: control frames (pings, pongs) the handshake skips in one wait at
+/// most: each ping read queues a pong that nothing flushes before
+/// Identified, so a peer that floods them is cut off here (`notObs`).
+/// obs-websocket sends none before Identified.
+const HANDSHAKE_CONTROL_FRAMES: usize = 64;
 
 // ---- The capped reader (D7) ---------------------------------------------------
 
@@ -279,7 +290,10 @@ enum Turn {
 }
 
 /// The session's wait, in order: what the driver sends (while the socket
-/// takes a frame), the flush of what is queued, the next frame, the
+/// takes a frame), the flush of what is queued, the next frame — only once
+/// that flush is done, so a peer that sends and never reads (a ping flood:
+/// the crate queues a pong for each ping read) can't grow the queue; it
+/// stops being read, and the keepalive deadline ends it (`silent`) — the
 /// keepalive deadline, the ping tick.
 fn next_turn(
     cx: &mut Context<'_>,
@@ -304,8 +318,10 @@ fn next_turn(
             Poll::Pending => {}
         }
     }
-    if let Poll::Ready(frame) = Pin::new(&mut *ws).poll_next(cx) {
-        return Poll::Ready(Turn::In(frame));
+    if !*flushing {
+        if let Poll::Ready(frame) = Pin::new(&mut *ws).poll_next(cx) {
+            return Poll::Ready(Turn::In(frame));
+        }
     }
     if alive.armed && alive.silent.as_mut().poll(cx).is_ready() {
         return Poll::Ready(Turn::Silent);
@@ -607,7 +623,8 @@ fn poll_session<T>(c: &mut Conn, reply: bool, cx: &mut Context<'_>) -> Option<Go
 
 /// A command that finds no connection: an inventory hears "not connected";
 /// a wake outside `retrying` does nothing (a stop state restarts as a new
-/// generation, D4).
+/// generation, D4); nor does `Due`, whose wait then reads the next expiry
+/// again.
 fn refuse(cmd: LinkCmd) {
     if let LinkCmd::Inventory(reply) = cmd {
         let _ = reply.send(Err(NOT_CONNECTED.to_string()));
@@ -711,6 +728,7 @@ struct Driver {
 pub async fn run(deps: LinkDeps) {
     let mut driver = Driver::new(deps);
     driver.drive().await;
+    driver.leave_ops();
     if let Some(ack) = driver.ack.take() {
         let _ = ack.try_send(());
     }
@@ -912,11 +930,38 @@ impl Driver {
 
     /// D23: `timer`'s switch back is due (again), keeping its first stamp:
     /// `stamp` for one from the queue, the one the slots kept for a due
-    /// mark taken. Never once OBS is switched off (`off` drops due marks).
+    /// mark taken (`None`). Never once OBS is switched off (`off` drops due
+    /// marks), and never for a run before the timer's latest start.
     fn due_again(&mut self, timer: &str, stamp: Option<Instant>) {
         if self.status.enabled() {
-            self.slots
-                .mark_due(timer, stamp.unwrap_or_else(Instant::now));
+            match stamp {
+                Some(at) => self.slots.mark_due(timer, at),
+                None => self.slots.remark(timer),
+            }
+            // A newer generation runs, waiting for the marks it last read:
+            // it reads them again. (Never this driver itself: it reads them
+            // on its next turn, and a wake of its own could spin it.)
+            if self.status.current_gen() != self.gen {
+                self.slots.nudge();
+            }
+        }
+    }
+
+    /// D23: the driver has ended (a stop, a restart, staleness): the ops
+    /// still in its queue — handed over while it was connected, and not
+    /// yet taken because a request was outstanding — go nowhere else. A
+    /// switch back is due again with its own stamp, so the next generation
+    /// still runs it (D23 keeps due marks across a saved password or an
+    /// address change); a `scene` is dropped, as it would never run late.
+    fn leave_ops(&mut self) {
+        let Some(mut ops) = self.ops.take() else {
+            return;
+        };
+        while let Ok(op) = ops.try_recv() {
+            match op.op {
+                ObsOp::SceneBack => self.due_again(&op.timer, Some(op.at)),
+                ObsOp::Scene { .. } => log::op_dropped(&op.timer, "scene", SkipWhy::NotConnected),
+            }
         }
     }
 
@@ -1023,8 +1068,9 @@ impl Driver {
     }
 
     /// §5.5 step 2: a stop state, parked until the stop: ops are *not
-    /// connected*, due marks stay and expire at their grace (D23). A restart
-    /// is a new generation (D4), so this driver only ends.
+    /// connected*, due marks stay and expire at their grace (D23): one made
+    /// while parked sends `Due`, so the wait reads the expiry again. A
+    /// restart is a new generation (D4), so this driver only ends.
     async fn park(&mut self, stop: Stop) {
         let (state, reason, detail) = stop_fields(stop);
         if !self.write_state(state, reason, detail, None) {
@@ -1154,9 +1200,13 @@ impl Driver {
         attempt
     }
 
-    /// The next data frame by `until`, control frames skipped; a close is
-    /// §7.1's outcome for its code.
+    /// The next data frame by `until`, control frames skipped — at most
+    /// [`HANDSHAKE_CONTROL_FRAMES`] of them, since the crate queues a pong
+    /// for each ping, which nothing flushes before Identified: past them
+    /// it isn't OBS (`notObs`), which sends none first; a close is §7.1's
+    /// outcome for its code.
     async fn next_frame(&mut self, ws: &mut Ws, until: Instant) -> Result<Message, Attempt> {
+        let mut controls = 0_usize;
         loop {
             let mut next = pin!(poll_fn(|cx| Pin::new(&mut *ws).poll_next(cx)));
             match self
@@ -1171,6 +1221,10 @@ impl Driver {
                     }
                     if !msg.is_ping() && !msg.is_pong() {
                         return Ok(msg);
+                    }
+                    controls = controls.saturating_add(1);
+                    if controls > HANDSHAKE_CONTROL_FRAMES {
+                        return Err(retry(ObsReason::NotObs));
                     }
                 }
                 Got::Timer => return Err(retry(ObsReason::NoAnswer)),
@@ -1401,6 +1455,11 @@ struct Conn {
     next_ops: VecDeque<LinkOp>,
     stream: Option<StreamState>,
     record: Option<RecordState>,
+    /// D26: stream and record events handled on this connection, so far: a
+    /// status answer an event of its output overtook (one came while it
+    /// was asked) is never applied over it.
+    stream_events: u64,
+    record_events: u64,
     /// D18: what OBS confirmed on this connection.
     pushed: Pushed,
     /// D20: sources OBS can't find, and since when.
@@ -1443,6 +1502,8 @@ impl Conn {
             next_ops: VecDeque::new(),
             stream: None,
             record: None,
+            stream_events: 0,
+            record_events: 0,
             pushed: Pushed::default(),
             missing: HashMap::new(),
             held: HashMap::new(),
@@ -1459,10 +1520,11 @@ impl Conn {
     }
 
     /// A command while connected: an inventory starts or joins the run
-    /// (D19), once `connected` is published; a wake does nothing.
+    /// (D19), once `connected` is published; a wake does nothing, and a due
+    /// mark is looked at by the next turn.
     fn on_cmd(&mut self, cmd: LinkCmd) {
         match cmd {
-            LinkCmd::Wake => {}
+            LinkCmd::Wake | LinkCmd::Due => {}
             LinkCmd::Inventory(reply) if self.live => match self.inventory.as_mut() {
                 Some(run) => run.repliers.push(reply),
                 None => self.inventory = Some(Inventory::new(reply)),
@@ -1475,6 +1537,14 @@ impl Conn {
     fn queue_seed(&mut self, id: &str, what: FollowObs) {
         if !self.seeds.iter().any(|(i, w)| i == id && *w == what) {
             self.seeds.push((id.to_string(), what));
+        }
+    }
+
+    /// D26: how many of `what`'s output events this connection has handled.
+    fn events_of(&self, what: FollowObs) -> u64 {
+        match what {
+            FollowObs::Stream => self.stream_events,
+            FollowObs::Record => self.record_events,
         }
     }
 
@@ -1520,6 +1590,12 @@ impl Driver {
         )));
         let mut conn = Conn::new(out, events, end, self.timing.rev_coalesce);
         let exit = self.connected(&mut conn).await;
+        // D23: a switch back taken off the queue and not run yet stays due.
+        for op in std::mem::take(&mut conn.next_ops) {
+            if matches!(op.op, ObsOp::SceneBack) {
+                self.due_again(&op.timer, Some(op.at));
+            }
+        }
         match exit {
             Exit::Stopped | Exit::Stale => {
                 // D5: the session sends 1001 and then acks; if it had already
@@ -1722,7 +1798,11 @@ impl Driver {
 
     /// After Identified, in order: `GetVersion` (every one of the nine
     /// offered, or `unsupported`), `GetStreamStatus`, `GetRecordStatus`;
-    /// the follows seeded from those answers; then `connected`.
+    /// the follows seeded from those answers; then `connected`. An output
+    /// whose event came in while its answer was asked or held (events are
+    /// handled at once, D10) keeps what the event set: its answer is older
+    /// than the event, or may be, so its follows are seeded again by the
+    /// first idle turn instead.
     async fn startup(&mut self, conn: &mut Conn) -> Result<(), Exit> {
         let began = Instant::now();
         let version = self.startup_step(conn, &Request::GetVersion, began).await?;
@@ -1734,25 +1814,35 @@ impl Driver {
             let missing = Unsupported::MissingRequest(name);
             return Err(Exit::Drop(Outcome::Stop(Stop::Unsupported(missing))));
         }
+        let stream_mark = conn.stream_events;
         let stream = proto::stream_status(
             &self
                 .startup_step(conn, &Request::GetStreamStatus, began)
                 .await?,
         );
+        let record_mark = conn.record_events;
         let record = proto::record_status(
             &self
                 .startup_step(conn, &Request::GetRecordStatus, began)
                 .await?,
         );
-        conn.stream = Some(stream_status_word(stream));
-        conn.record = Some(record_status_word(record));
+        let stream_held = conn.stream_events == stream_mark;
+        let record_held = conn.record_events == record_mark;
+        if stream_held {
+            conn.stream = Some(stream_status_word(stream));
+        }
+        if record_held {
+            conn.record = Some(record_status_word(record));
+        }
         let feed = self.take_feed(conn);
         for follow in &feed.follows {
-            let status = match follow.what {
-                FollowObs::Stream => stream,
-                FollowObs::Record => record,
+            let (status, held) = match follow.what {
+                FollowObs::Stream => (stream, stream_held),
+                FollowObs::Record => (record, record_held),
             };
-            if let Some(op) = join_seed(follow.what, status, true) {
+            if !held {
+                conn.queue_seed(&follow.id, follow.what);
+            } else if let Some(op) = join_seed(follow.what, status, true) {
                 self.apply(&follow.id, op)?;
             }
         }
@@ -1909,9 +1999,12 @@ impl Driver {
     }
 
     /// The latest feed, cloned out of the `watch` at once (D17); while
-    /// connected, follows new to it are queued for a seed (D26).
+    /// connected, follows new to it are queued for a seed (D26), and seeds
+    /// for follows it no longer holds are dropped.
     fn take_feed(&mut self, conn: &mut Conn) -> Arc<ObsFeed> {
         let next = Arc::clone(&*self.feed.borrow_and_update());
+        conn.seeds
+            .retain(|(id, w)| next.follows.iter().any(|f| f.id == *id && f.what == *w));
         if conn.live {
             for (id, what) in seed_pairs(&conn.prev_feed, &next) {
                 conn.queue_seed(&id, what);
@@ -1948,6 +2041,7 @@ impl Driver {
                 conn.rev.mark();
             }
             ObsEvent::Stream(state) => {
+                conn.stream_events = conn.stream_events.wrapping_add(1);
                 if let Some(word) = stream_word(*state) {
                     conn.stream = Some(word);
                     self.write_words(conn);
@@ -1955,6 +2049,7 @@ impl Driver {
                 self.follow(conn, FollowObs::Stream, e);
             }
             ObsEvent::Record(state) => {
+                conn.record_events = conn.record_events.wrapping_add(1);
                 if let Some(word) = record_word(*state) {
                     conn.record = Some(word);
                     self.write_words(conn);
@@ -1995,7 +2090,10 @@ impl Driver {
     }
 
     /// D26: one seed request for the first queued output; every follow of
-    /// that output queued takes its answer (`join_seed`). A 207 waits
+    /// that output queued, and still in the feed as a follow of it, takes
+    /// its answer (`join_seed`). An answer an event of that output came in
+    /// ahead of (while it was asked) is never applied over the event: the
+    /// seeds stay, and the next turn asks again. A 207 waits
     /// `not_ready_wait`; another refusal drops them, logged.
     async fn seed(&mut self, conn: &mut Conn) -> Result<(), Exit> {
         let Some(&(_, what)) = conn.seeds.first() else {
@@ -2005,7 +2103,9 @@ impl Driver {
             FollowObs::Stream => Request::GetStreamStatus,
             FollowObs::Record => Request::GetRecordStatus,
         };
+        let mark = conn.events_of(what);
         match self.request(conn, &req).await? {
+            Reply::Ok(_) if conn.events_of(what) != mark => {}
             Reply::Ok(data) => {
                 let data = data.unwrap_or(Value::Null);
                 let status = match what {
@@ -2016,7 +2116,14 @@ impl Driver {
                 let (now, later): (Vec<_>, Vec<_>) =
                     conn.seeds.drain(..).partition(|(_, w)| *w == what);
                 conn.seeds = later;
+                // The live feed, cloned at once: a follow switched off,
+                // moved to the other output or deleted while it was asked
+                // (or held by a 207 or a timeout) takes nothing.
+                let feed = Arc::clone(&*self.feed.borrow());
                 for (id, _) in now {
+                    if !feed.follows.iter().any(|f| f.id == id && f.what == what) {
+                        continue;
+                    }
                     if let Some(op) = join_seed(what, status, true) {
                         self.apply(&id, op)?;
                     }
@@ -2308,9 +2415,11 @@ impl Driver {
         }
     }
 
-    /// §7.6: the plan done, unless stale.
+    /// §7.6: the plan done, unless stale: then the take is let go (OBS
+    /// answered; it isn't held back any more), the slot left as it is.
     fn commit(&mut self, timer: &str, plan: BackPlan) -> Result<(), Exit> {
         if !self.fresh() {
+            self.slots.release(timer);
             return Err(Exit::Stale);
         }
         self.busy_backs.remove(timer);
@@ -2444,7 +2553,7 @@ mod tests {
     use crate::timers::TimerOp;
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::runtime::Handle;
@@ -2458,6 +2567,34 @@ mod tests {
     /// §10.2's timings: 100 ms units.
     fn timing() -> LinkTiming {
         LinkTiming::scaled(ms(100)).unwrap()
+    }
+
+    /// [`timing`] with the connect, the upgrade and Hello, and Identify
+    /// each given 3 s: what [`start`] uses, so a loaded runner never cuts
+    /// a first attempt short in a test that counts attempts. The tests of
+    /// those timeouts start with [`timing`] itself ([`start_timed`]).
+    fn roomy() -> LinkTiming {
+        LinkTiming::new(crate::obs::LinkPeriods {
+            connect: ms(3_000),
+            handshake: ms(3_000),
+            identify: ms(3_000),
+            ..*timing()
+        })
+        .unwrap()
+    }
+
+    /// [`roomy`] with a 2 s request timeout and a 4 s late-answer cap: for
+    /// a test that stalls an answer on purpose (a few hundred ms) or sends
+    /// a long run of requests, so the stall is never a timeout on a loaded
+    /// runner (L8, L8b, L8c are the timeout tests).
+    fn patient() -> LinkTiming {
+        LinkTiming::new(crate::obs::LinkPeriods {
+            request_loopback: ms(2_000),
+            request_other: ms(2_000),
+            late_answer_cap: ms(4_000),
+            ..*roomy()
+        })
+        .unwrap()
     }
 
     /// §10.2: the backoff's draw, fixed.
@@ -2503,6 +2640,8 @@ mod tests {
         slots: Mutex<Slots>,
         grace: Duration,
         written: Mutex<HashSet<String>>,
+        /// [`SlotStore::nudge`]s: what the newest link would have been told.
+        nudges: AtomicUsize,
     }
 
     impl SlotStore for Store {
@@ -2523,6 +2662,18 @@ mod tests {
 
         fn mark_due(&self, timer: &str, at: Instant) {
             self.slots.lock().unwrap().mark_due(timer, at);
+        }
+
+        fn remark(&self, timer: &str) {
+            self.slots.lock().unwrap().remark(timer);
+        }
+
+        fn release(&self, timer: &str) {
+            self.slots.lock().unwrap().release(timer);
+        }
+
+        fn nudge(&self) {
+            self.nudges.fetch_add(1, Ordering::SeqCst);
         }
 
         fn take_due(&self, now: Instant) -> (Option<String>, Vec<String>) {
@@ -2586,14 +2737,29 @@ mod tests {
         cmds: Option<mpsc::Sender<LinkCmd>>,
         acked: std::sync::mpsc::Receiver<()>,
         cipher: Arc<MemCipher>,
+        /// The test's folder (the stored password's), removed on drop.
+        dir: std::path::PathBuf,
     }
 
-    /// A link to `fake`, with `password` stored (if any) and `feed` first.
+    impl Drop for Link {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    /// A link to `fake`, with `password` stored (if any) and `feed` first,
+    /// on [`roomy`] timings.
     fn start(fake: &FakeObs, password: Option<&str>, feed: ObsFeed) -> Link {
         start_at(fake.port(), password, feed)
     }
 
     fn start_at(port: u16, password: Option<&str>, feed: ObsFeed) -> Link {
+        start_timed(port, password, feed, &roomy())
+    }
+
+    /// [`start_at`] on `timing`.
+    fn start_timed(port: u16, password: Option<&str>, feed: ObsFeed, timing: &LinkTiming) -> Link {
+        let timing = *timing;
         let cfg = LinkConfig {
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
@@ -2614,8 +2780,9 @@ mod tests {
         }
         let store = Arc::new(Store {
             slots: Mutex::default(),
-            grace: timing().scene_back_grace,
+            grace: timing.scene_back_grace,
             written: Mutex::default(),
+            nudges: AtomicUsize::new(0),
         });
         let timers = Arc::new(Timers::default());
         let (feed_tx, feed_rx) = watch::channel(Arc::new(feed));
@@ -2630,13 +2797,13 @@ mod tests {
             slots: store.clone(),
             timers: timers.clone(),
             password: Arc::new(StoredPassword {
-                dir,
+                dir: dir.clone(),
                 cipher: as_cipher,
             }),
             feed: feed_rx,
             ops,
             cmds,
-            timing: timing(),
+            timing,
             rand: half,
             spawner: Handle::current(),
             closed_ack,
@@ -2650,6 +2817,7 @@ mod tests {
             cmds: Some(cmds_tx),
             acked,
             cipher,
+            dir,
         }
     }
 
@@ -2951,7 +3119,7 @@ mod tests {
                     fake.set_identified(Stage::Never);
                 }
                 let began = Instant::now();
-                let link = start(&fake, None, ObsFeed::default());
+                let link = start_timed(fake.port(), None, ObsFeed::default(), &timing());
                 assert!(link.state(ObsState::Retrying, ms(2_000)).await, "{stage}");
                 let took = began.elapsed();
                 assert_eq!(link.now().reason, Some(ObsReason::NoAnswer), "{stage}");
@@ -2961,7 +3129,7 @@ mod tests {
             let fake = FakeObs::start(Config::default()).await;
             fake.set_accept(Accept::EndlessHeader);
             let began = Instant::now();
-            let link = start(&fake, None, ObsFeed::default());
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &timing());
             assert!(link.state(ObsState::Retrying, ms(2_000)).await);
             assert_eq!(link.now().reason, Some(ObsReason::NotObs));
             assert!(began.elapsed() < ms(450), "{:?}", began.elapsed());
@@ -3061,7 +3229,7 @@ mod tests {
                 held.local_addr().unwrap().port()
             };
             let began = Instant::now();
-            let link = start_at(port, None, ObsFeed::default());
+            let link = start_timed(port, None, ObsFeed::default(), &timing());
             assert!(link.state(ObsState::Retrying, ms(3_000)).await);
             let reason = link.now().reason;
             assert!(
@@ -3160,22 +3328,27 @@ mod tests {
         });
     }
 
-    /// L8c: two `scene`s queued behind a 900 ms stall: the one queued 100 ms
-    /// in is dropped when taken (`late`), the one queued 100 ms before the
-    /// release runs.
+    /// L8c: two `scene`s queued behind a 700 ms stall (its late answer 300
+    /// ms inside the 1 s cap): the one stamped 100 ms in is 600 ms old when
+    /// taken, so dropped (`late`); the one stamped 600 ms in runs. The
+    /// stamps are the test's, so a stalled runner can't move them.
     #[test]
     fn l8c_a_scene_behind_a_stall_is_never_run_late() {
         guarded(async {
             let fake = FakeObs::start(Config::default()).await;
-            fake.script(Rule::on("SetInputSettings").times(1).delay(ms(900)));
+            fake.script(Rule::on("SetInputSettings").times(1).delay(ms(700)));
             let link = start(&fake, None, texts_feed(&[(TEXT_V3, "0:01")]));
             link.connected().await;
             assert!(fake.wait(ms(1_000), |f| pushes(f).len() == 1).await);
             let stalled = pushes(&fake)[0].2;
             tokio::time::sleep_until((stalled + ms(100)).into()).await;
-            link.op("early", scene_op(BRB, "BRB"));
-            tokio::time::sleep_until((stalled + ms(800)).into()).await;
-            link.op("fresh", scene_op(JUST_CHATTING, "Just Chatting"));
+            link.op_at("early", scene_op(BRB, "BRB"), stalled + ms(100));
+            tokio::time::sleep_until((stalled + ms(600)).into()).await;
+            link.op_at(
+                "fresh",
+                scene_op(JUST_CHATTING, "Just Chatting"),
+                stalled + ms(600),
+            );
             assert!(fake.wait(ms(2_000), |f| sets(f).len() == 1).await);
             tokio::time::sleep(ms(200)).await;
             assert_eq!(sets(&fake), [JUST_CHATTING]);
@@ -3189,12 +3362,19 @@ mod tests {
     }
 
     /// L9: ops and pushes queued together, every answer slowed: the fake
-    /// never sees two outstanding.
+    /// never sees two outstanding. A scene's age limit of 5 s, so all ten
+    /// run however slow the runner (the 20 requests take ~0.5 s idle; L8c
+    /// is the `late` test).
     #[test]
     fn l9_one_request_at_a_time() {
         guarded(async {
             let fake = FakeObs::start(Config::default()).await;
-            let link = start(&fake, None, ObsFeed::default());
+            let patient = LinkTiming::new(crate::obs::LinkPeriods {
+                scene_max_age: ms(5_000),
+                ..*roomy()
+            })
+            .unwrap();
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &patient);
             link.connected().await;
             fake.script(Rule::any().delay(ms(15)));
             for i in 0..10 {
@@ -3632,7 +3812,12 @@ mod tests {
                 fake.wait_requests("GetCurrentProgramScene", 1, ms(1_000))
                     .await
             );
-            tokio::time::sleep(ms(300)).await;
+            // Due again once the Get times out (200 ms), however late the
+            // runner gets to it.
+            let end = Instant::now() + ms(2_000);
+            while link.store.next_expiry().is_none() && Instant::now() < end {
+                tokio::time::sleep(ms(2)).await;
+            }
             let grace = timing().scene_back_grace;
             let expiry = link.store.next_expiry().unwrap();
             assert!(
@@ -3841,11 +4026,433 @@ mod tests {
         });
     }
 
+    /// D26 (review): an output event that comes in while the startup asks
+    /// (here while `GetRecordStatus` is outstanding) outranks the older
+    /// `GetStreamStatus` answer. STOPPED after a live answer leaves `up`
+    /// paused and the stream off; STARTED after an idle answer leaves it
+    /// running and the stream live. Either way the stream is asked again.
+    #[test]
+    fn a_stream_event_during_startup_outranks_its_answer() {
+        guarded(async {
+            for live in [true, false] {
+                let mut model = Model::standard();
+                if live {
+                    model.stream = Output {
+                        active: true,
+                        duration_ms: 60_000,
+                        ..Output::default()
+                    };
+                }
+                let fake = FakeObs::start(Config::default().model(model)).await;
+                fake.script(Rule::on("GetRecordStatus").times(1).delay(ms(600)));
+                let feed = follows(&[("up", FollowObs::Stream)], 0);
+                let link = start_timed(fake.port(), None, feed, &patient());
+                assert!(fake.wait_requests("GetRecordStatus", 1, ms(2_000)).await);
+                fake.stream_state(if live { Out::Stopped } else { Out::Started });
+                link.connected().await;
+                assert!(
+                    fake.wait_requests("GetStreamStatus", 2, ms(1_000)).await,
+                    "live {live}: the stream is asked again"
+                );
+                assert!(ops_count(&link, 2).await);
+                tokio::time::sleep(ms(100)).await;
+                let ops = link.timers.ops();
+                let (_, last) = ops.last().unwrap();
+                if live {
+                    assert_eq!(*last, TimerOp::Pause, "{ops:?}");
+                    assert!(
+                        !ops.iter()
+                            .any(|(_, op)| matches!(op, TimerOp::SetElapsed { .. })),
+                        "{ops:?}"
+                    );
+                    assert_eq!(link.now().stream, Some(super::StreamState::Off));
+                } else {
+                    assert!(
+                        matches!(last, TimerOp::SetElapsed { running: true, .. }),
+                        "{ops:?}"
+                    );
+                    assert!(!ops.iter().any(|(_, op)| *op == TimerOp::Pause), "{ops:?}");
+                    assert_eq!(link.now().stream, Some(super::StreamState::Live));
+                }
+                fake.assert_clean();
+            }
+        });
+    }
+
+    /// D26 (review, mutation round): the record's half. The recording stops
+    /// while the startup's `GetRecordStatus` is outstanding, and OBS's
+    /// answer (made before the stop) says recording: `rec` stays paused,
+    /// the record reads off, and the record is asked again.
+    #[test]
+    fn a_record_event_during_startup_outranks_its_answer() {
+        guarded(async {
+            let recording = || Output {
+                active: true,
+                duration_ms: 60_000,
+                ..Output::default()
+            };
+            let mut model = Model::standard();
+            model.record = recording();
+            let fake = FakeObs::start(Config::default().model(model)).await;
+            // The startup's answer and the seed's each come 600 ms late.
+            fake.script(Rule::on("GetRecordStatus").times(2).delay(ms(600)));
+            let feed = follows(&[("rec", FollowObs::Record)], 0);
+            let link = start_timed(fake.port(), None, feed, &patient());
+            assert!(fake.wait_requests("GetRecordStatus", 1, ms(2_000)).await);
+            // OBS stops recording; the answer it made just before says
+            // recording.
+            fake.record_state(Out::Stopped);
+            fake.model(|m| m.record = recording());
+            let answered = |f: &FakeObs, n: usize| {
+                f.requests_of("GetRecordStatus")
+                    .get(n)
+                    .is_some_and(|r| r.answer.is_some())
+            };
+            assert!(fake.wait(ms(2_000), |f| answered(f, 0)).await);
+            fake.model(|m| m.record = Output::default());
+            link.connected().await;
+            assert!(
+                fake.wait_requests("GetRecordStatus", 2, ms(1_000)).await,
+                "the record is asked again"
+            );
+            assert!(fake.wait(ms(2_000), |f| answered(f, 1)).await);
+            assert!(ops_count(&link, 2).await);
+            tokio::time::sleep(ms(50)).await;
+            let ops = link.timers.ops();
+            assert_eq!(ops.last(), Some(&("rec".into(), TimerOp::Pause)), "{ops:?}");
+            assert!(
+                !ops.iter()
+                    .any(|(_, op)| matches!(op, TimerOp::SetElapsed { .. })),
+                "{ops:?}"
+            );
+            assert_eq!(link.now().record, Some(super::RecordState::Off));
+            fake.assert_clean();
+        });
+    }
+
+    /// D26 (review): a seed's answer that an event of its output came in
+    /// ahead of is never applied over it: the stream stops while a new
+    /// follow's `GetStreamStatus` is outstanding, and OBS's answer (made
+    /// before the stop) says live; `up` stays paused, the stream reads off,
+    /// and the stream is asked again.
+    #[test]
+    fn a_stream_event_during_a_seed_outranks_its_answer() {
+        guarded(async {
+            let live = || Output {
+                active: true,
+                duration_ms: 60_000,
+                ..Output::default()
+            };
+            let mut model = Model::standard();
+            model.stream = live();
+            let fake = FakeObs::start(Config::default().model(model)).await;
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &patient());
+            link.connected().await;
+            fake.script(Rule::on("GetStreamStatus").times(2).delay(ms(600)));
+            link.feed
+                .send_replace(Arc::new(follows(&[("up", FollowObs::Stream)], 0)));
+            assert!(fake.wait_requests("GetStreamStatus", 2, ms(1_000)).await);
+            // OBS stops the stream; the answer it made just before says live.
+            fake.stream_state(Out::Stopped);
+            fake.model(|m| m.stream = live());
+            let answered = |f: &FakeObs, n: usize| {
+                f.requests_of("GetStreamStatus")
+                    .get(n)
+                    .is_some_and(|r| r.answer.is_some())
+            };
+            assert!(fake.wait(ms(2_000), |f| answered(f, 1)).await);
+            fake.model(|m| m.stream = Output::default());
+            assert!(
+                fake.wait_requests("GetStreamStatus", 3, ms(1_000)).await,
+                "asked again"
+            );
+            assert!(fake.wait(ms(2_000), |f| answered(f, 2)).await);
+            tokio::time::sleep(ms(50)).await;
+            let ops = link.timers.ops();
+            assert_eq!(ops.last(), Some(&("up".into(), TimerOp::Pause)), "{ops:?}");
+            assert!(
+                !ops.iter()
+                    .any(|(_, op)| matches!(op, TimerOp::SetElapsed { .. })),
+                "{ops:?}"
+            );
+            assert_eq!(link.now().stream, Some(super::StreamState::Off));
+            fake.assert_clean();
+        });
+    }
+
+    /// D26 (review): a seed for a follow that leaves the feed while the seed
+    /// waits (a 207's hold) is dropped unasked; one that leaves while its
+    /// request is outstanding takes nothing from the answer.
+    #[test]
+    fn a_seed_skips_a_follow_that_left_the_feed() {
+        guarded(async {
+            let mut model = Model::standard();
+            model.stream = Output {
+                active: true,
+                duration_ms: 60_000,
+                ..Output::default()
+            };
+            let fake = FakeObs::start(Config::default().model(model)).await;
+            // A 207 holds the seed 1 s: room to switch the follow off.
+            let held = LinkTiming::new(crate::obs::LinkPeriods {
+                not_ready_wait: ms(1_000),
+                ..*patient()
+            })
+            .unwrap();
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &held);
+            link.connected().await;
+            let up = || Arc::new(follows(&[("up", FollowObs::Stream)], 0));
+
+            // Held by a 207, then switched off.
+            fake.script(Rule::on("GetStreamStatus").times(1).not_ready());
+            link.feed.send_replace(up());
+            assert!(fake.wait_requests("GetStreamStatus", 2, ms(1_000)).await);
+            link.feed.send_replace(Arc::new(ObsFeed::default()));
+            tokio::time::sleep(ms(1_500)).await;
+            assert_eq!(fake.requests_of("GetStreamStatus").len(), 2, "not asked");
+            assert_eq!(link.timers.ops(), []);
+
+            // Outstanding, then switched off.
+            fake.script(Rule::on("GetStreamStatus").times(1).delay(ms(1_000)));
+            link.feed.send_replace(up());
+            assert!(fake.wait_requests("GetStreamStatus", 3, ms(1_000)).await);
+            link.feed.send_replace(Arc::new(ObsFeed::default()));
+            assert!(
+                fake.wait(ms(2_000), |f| f.requests_of("GetStreamStatus")[2]
+                    .answer
+                    .is_some())
+                    .await
+            );
+            tokio::time::sleep(ms(100)).await;
+            assert_eq!(link.timers.ops(), []);
+            fake.assert_clean();
+        });
+    }
+
+    /// D23 (review): a switch back still in the queue when the link stops —
+    /// a restart while a request is outstanding, which takes no op — is due
+    /// again with its own stamp, for the next generation.
+    #[test]
+    fn a_queued_switch_back_outlives_its_driver() {
+        guarded(async {
+            let fake = FakeObs::start(Config::default()).await;
+            fake.script(Rule::on("SetInputSettings").times(1).drop_answer());
+            // The push stays outstanding (2 s) well past the stop.
+            let feed = texts_feed(&[(TEXT_V3, "1")]);
+            let mut link = start_timed(fake.port(), None, feed, &patient());
+            link.connected().await;
+            assert!(fake.wait(ms(1_000), |f| pushes(f).len() == 1).await);
+            let stamp = Instant::now();
+            link.op_at("brb", ObsOp::SceneBack, stamp);
+            tokio::time::sleep(ms(50)).await;
+            assert_eq!(link.store.next_expiry(), None, "queued, not due");
+            link.stop();
+            let end = Instant::now() + ms(1_000);
+            while link.store.next_expiry().is_none() && Instant::now() < end {
+                tokio::time::sleep(ms(2)).await;
+            }
+            let grace = timing().scene_back_grace;
+            assert_eq!(
+                link.store.next_expiry(),
+                Some(stamp + grace + Duration::from_nanos(1)),
+                "due with its own stamp"
+            );
+            // A stop with no newer generation: there's no link to tell.
+            assert_eq!(link.store.nudges.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// D23 (review): a driver a restart replaced leaves its queued switch
+    /// back due, and tells the newest link (`nudge`), which would otherwise
+    /// wait for the marks it last read — up to the grace, then a
+    /// `notConnected` skip while connected.
+    #[test]
+    fn a_replaced_driver_tells_the_newest_link_of_a_switch_back_it_left() {
+        guarded(async {
+            let fake = FakeObs::start(Config::default()).await;
+            fake.script(Rule::on("SetInputSettings").times(1).drop_answer());
+            let feed = texts_feed(&[(TEXT_V3, "1")]);
+            let mut link = start_timed(fake.port(), None, feed, &patient());
+            link.connected().await;
+            assert!(fake.wait(ms(1_000), |f| pushes(f).len() == 1).await);
+            link.op_at("brb", ObsOp::SceneBack, Instant::now());
+            tokio::time::sleep(ms(50)).await;
+            // A newer generation begins (a saved password, an address
+            // change); the old driver's commands close.
+            let cfg = LinkConfig {
+                ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: fake.port(),
+            };
+            let _ = link.status.cell.lock().unwrap().begin(&cfg);
+            link.stop();
+            let end = Instant::now() + ms(1_000);
+            while link.store.nudges.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+                tokio::time::sleep(ms(2)).await;
+            }
+            assert!(link.store.next_expiry().is_some(), "due");
+            assert_eq!(link.store.nudges.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// D23 (review): a due switch back taken by a driver that goes stale
+    /// while OBS answers its Get (a restart then) can't be committed: the
+    /// take is let go, so it isn't held back for good; the slot stays. Also:
+    /// `Due` wakes an idle connected driver to take a mark made meanwhile.
+    #[test]
+    fn a_stale_drivers_answered_switch_back_is_let_go() {
+        guarded(async {
+            let fake = FakeObs::start(Config::default()).await;
+            fake.model(|m| m.program = JUST_CHATTING.into());
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &patient());
+            link.connected().await;
+            assert!(link
+                .store
+                .after_scene("brb", scene(GAME, "Game"), scene(BRB, "BRB")));
+            fake.script(Rule::on("GetCurrentProgramScene").times(1).delay(ms(300)));
+            link.store.mark_due("brb", Instant::now());
+            link.cmd(LinkCmd::Due);
+            assert!(
+                fake.wait_requests("GetCurrentProgramScene", 1, ms(1_000))
+                    .await
+            );
+            assert_eq!(link.store.slots.lock().unwrap().due_count(), 1, "taken");
+            // A newer generation starts while OBS answers.
+            let cfg = LinkConfig {
+                ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: fake.port(),
+            };
+            let _ = link.status.cell.lock().unwrap().begin(&cfg);
+            assert!(
+                fake.wait(ms(1_000), |f| f.requests_of("GetCurrentProgramScene")[0]
+                    .answer
+                    .is_some())
+                    .await
+            );
+            let held = || link.store.slots.lock().unwrap().due_count();
+            let end = Instant::now() + ms(1_000);
+            while held() != 0 && Instant::now() < end {
+                tokio::time::sleep(ms(2)).await;
+            }
+            assert_eq!(held(), 0, "let go");
+            assert_eq!(link.store.next_expiry(), None);
+            assert_eq!(
+                link.store.plan_back("brb", BRB).to,
+                Some(scene(GAME, "Game")),
+                "the slot stays"
+            );
+            assert_eq!(sets(&fake), [""; 0]);
+        });
+    }
+
+    /// D23 (review, mutation round): a due switch back taken and in flight
+    /// when its timer starts again (the start's `scene`, as
+    /// `ObsShared::offer_run` records it): OBS answering its Get 207 makes
+    /// nothing due — it was the earlier run's — so the new break is never
+    /// switched back by it.
+    #[test]
+    fn a_switch_back_failing_after_a_new_start_is_not_due_again() {
+        guarded(async {
+            let fake = FakeObs::start(Config::default()).await;
+            fake.model(|m| m.program = BRB.into());
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &patient());
+            link.connected().await;
+            assert!(link
+                .store
+                .after_scene("brb", scene(GAME, "Game"), scene(BRB, "BRB")));
+            fake.script(
+                Rule::on("GetCurrentProgramScene")
+                    .times(1)
+                    .delay(ms(300))
+                    .not_ready(),
+            );
+            link.store.mark_due("brb", Instant::now());
+            link.cmd(LinkCmd::Due);
+            assert!(
+                fake.wait_requests("GetCurrentProgramScene", 1, ms(1_000))
+                    .await
+            );
+            // The break starts again while OBS answers.
+            link.store
+                .slots
+                .lock()
+                .unwrap()
+                .started("brb", Instant::now());
+            assert!(
+                fake.wait(ms(1_000), |f| f.requests_of("GetCurrentProgramScene")[0]
+                    .answer
+                    .is_some())
+                    .await
+            );
+            // Well past the 207's hold, nothing more is asked or switched.
+            tokio::time::sleep(timing().not_ready_wait + ms(400)).await;
+            assert_eq!(fake.requests_of("GetCurrentProgramScene").len(), 1);
+            assert_eq!(sets(&fake), [""; 0]);
+            assert_eq!(fake.program(), BRB);
+            assert_eq!(link.store.slots.lock().unwrap().due_count(), 0);
+            assert_eq!(link.store.next_expiry(), None);
+            fake.assert_clean();
+        });
+    }
+
+    // ---- A peer that floods pings (D7, D8) ----------------------------------------
+
+    /// D7 (review): a peer that sends pings before Hello is cut off as
+    /// `notObs` after 64 of them, not read on to the handshake's timeout
+    /// (each ping read queues a pong nothing flushes yet).
+    #[test]
+    fn pings_before_hello_are_not_obs() {
+        guarded(async {
+            let fake = FakeObs::start(Config::default()).await;
+            fake.set_hello(Stage::Never);
+            let began = Instant::now();
+            let link = start(&fake, None, ObsFeed::default());
+            assert!(
+                fake.wait(ms(2_000), |f| f
+                    .sessions()
+                    .first()
+                    .is_some_and(|s| s.upgraded))
+                    .await
+            );
+            fake.send_raw(&[0x89, 0x00].repeat(1_000));
+            assert!(link.state(ObsState::Retrying, ms(2_000)).await);
+            assert_eq!(link.now().reason, Some(ObsReason::NotObs));
+            assert!(began.elapsed() < ms(2_000), "{:?}", began.elapsed());
+        });
+    }
+
+    /// D8 (review): connected, a peer that floods pings and reads nothing:
+    /// once Divora's own frames (the pongs) stop draining it stops reading,
+    /// so nothing more is queued, and the keepalive ends the connection
+    /// (`silent`) within the ping and its deadline.
+    #[test]
+    fn a_ping_flood_that_reads_nothing_ends_silent() {
+        guarded(async {
+            let fake = FakeObs::start(Config::default()).await;
+            let link = start(&fake, None, ObsFeed::default());
+            link.connected().await;
+            let flooded = Instant::now();
+            // 4 MiB of empty pings, sent while the fake reads nothing: the
+            // loopback buffers here fill on about 0.6 MiB of them.
+            let chunk = [0x89, 0x00].repeat(64 << 10);
+            for _ in 0..32 {
+                fake.send_raw(&chunk);
+            }
+            assert!(
+                link.state(ObsState::Retrying, ms(3_000)).await,
+                "{:?}",
+                link.now()
+            );
+            assert_eq!(link.now().reason, Some(ObsReason::Silent));
+            assert!(flooded.elapsed() < ms(3_000), "{:?}", flooded.elapsed());
+        });
+    }
+
     // ---- How a connection ends (L20, L21, L30, L31) --------------------------------
 
     /// L20: OBS answers no ping and sends nothing: `silent` 400 ms to 1 s
-    /// in. The variant: no pongs, but an event every 100 ms keeps it up (any
-    /// frame counts, D8).
+    /// in. The variant: no pongs, but an event every 50 ms keeps it up (any
+    /// frame counts, D8; 50 ms against the 200 ms deadline, so a stalled
+    /// runner can't read as silence).
     #[test]
     fn l20_keepalive_counts_any_frame() {
         guarded(async {
@@ -3864,9 +4471,9 @@ mod tests {
             fake.set_ignore_pings(true);
             let link = start(&fake, None, ObsFeed::default());
             link.connected().await;
-            for i in 0..15 {
+            for i in 0..30 {
                 fake.rename_scene(JUST_CHATTING, &format!("Chat {i}"));
-                tokio::time::sleep(ms(100)).await;
+                tokio::time::sleep(ms(50)).await;
             }
             assert_eq!(link.now().state, ObsState::Connected);
             assert_eq!(fake.accepts(), 1);
@@ -4137,7 +4744,9 @@ mod tests {
         guarded(async {
             let model = Model::standard().with_text_sources(100);
             let fake = FakeObs::start(Config::default().model(model)).await;
-            let link = start(&fake, None, ObsFeed::default());
+            // ~105 requests in a row: a 2 s request timeout, so one stall of
+            // the runner can't time a step out (L8 is the timeout test).
+            let link = start_timed(fake.port(), None, ObsFeed::default(), &patient());
             link.connected().await;
             fake.script(Rule::on("GetInputSettings").delay(ms(5)));
             let first = link.inventory();

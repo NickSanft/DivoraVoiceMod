@@ -954,6 +954,35 @@ mod tests {
         assert_eq!(v["d"]["requestData"]["overlay"], true);
     }
 
+    /// D9 (mutation round): nothing is built beside the nine: the variants
+    /// of `RequestKind` and `Request`, read from this file, are the nine
+    /// (`SetText` is `SetInputSettings`). A tenth given an arm in
+    /// `the_nine_requests_are_exact`'s match and never sent by a link test
+    /// (whose fake answers 204 and fails it) passes every row there.
+    #[test]
+    fn only_the_nine_requests_are_built() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/obs/proto.rs"),
+        )
+        .unwrap()
+        .replace('\r', "");
+        let variants = |head: &str| -> Vec<String> {
+            let body = &src[src.find(head).unwrap() + head.len()..];
+            body[..body.find("\n}\n").unwrap()]
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+                .filter_map(|l| l.split([',', ' ', '{']).next())
+                .filter(|w| w.starts_with(|c: char| c.is_ascii_uppercase()))
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(variants("pub enum RequestKind {"), REQUEST_TYPES);
+        let mut built = REQUEST_TYPES.map(String::from);
+        built[6] = "SetText".into();
+        assert_eq!(variants("pub enum Request {"), built);
+    }
+
     /// The fixture's `gateTable` row's Hello, as a frame.
     fn hello_frame(d: &Value) -> String {
         json!({"op": 0, "d": d}).to_string()

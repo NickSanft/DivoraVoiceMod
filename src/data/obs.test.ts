@@ -16,6 +16,7 @@ import {
   OBS_MAX_SCENES,
   OBS_MAX_TEXT_SOURCES,
   OBS_MAX_UUID_CHARS,
+  OBS_NOT_CONNECTED,
   OBS_PORT_ERROR,
   OBS_REASONS,
   OBS_RECORD_STATES,
@@ -102,6 +103,7 @@ describe("the wire is the fixture's (v1.61.0)", () => {
     expect(OBS_HOST_ERRORS).toEqual(fixture.hostErrors);
     // The page says Rust's port words itself, for a port it never sends.
     expect(OBS_PORT_ERROR).toBe(fixture.commandErrors.configure.badPort);
+    expect(OBS_NOT_CONNECTED).toBe(fixture.commandErrors.inventory.notConnected);
   });
 
   it("sends exactly configKeys, and nothing else of divora.obs", () => {

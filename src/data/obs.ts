@@ -64,6 +64,9 @@ export const OBS_HOST_ERRORS = {
  *  Rust takes a `u16`, and Tauri would refuse anything else with words of
  *  its own. */
 export const OBS_PORT_ERROR = "Type a port from 1 to 65535.";
+/** Rust's words for a read made while OBS isn't connected; the page says
+ *  them itself when an answer came from a connection that's gone. */
+export const OBS_NOT_CONNECTED = "OBS isn't connected.";
 
 /** v1.61.0: what Save password says, without sending it, for a password
  *  with a lone surrogate (a broken paste): the backend's JSON reader would

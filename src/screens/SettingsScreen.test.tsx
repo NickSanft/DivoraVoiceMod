@@ -2525,7 +2525,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     "Divora can show a timer's time in an OBS text source, switch OBS to a scene for a break and back, and start a count-up when you go live or start recording. It talks to the WebSocket server built into OBS.";
   const EXPLAINER = [
     "When this is on, Divora keeps one connection open to OBS at the address below — this PC unless you change it. For OBS, it connects nowhere else, and it never listens for connections.",
-    "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick.",
+    "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick, and of the scene a timer switched OBS away from, so it can switch back.",
     "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. It changes only the text of the sources you pick, and that text stays in OBS after Divora stops.",
     "OBS ships with its WebSocket server off. In OBS: Tools → WebSocket Server Settings → Enable WebSocket server, then Show Connect Info for the password.",
   ];
@@ -2857,14 +2857,25 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
       expect(within(obs).getByText(PASSWORD_NONE)).toBeInTheDocument();
       expect(within(obs).queryByRole("button", { name: "Forget password" })).toBeNull();
       const field = within(obs).getByLabelText("OBS password");
-      // A space at an end: a hint, since OBS's own would have to match.
+      // A space at an end: a hint, since OBS's own would have to match. The
+      // field is masked, so the hint describes it, and its status region
+      // (always there) says it as it appears.
+      const spacesSaid = within(obs).getByTestId("obs-password-spaces-said");
+      expect(spacesSaid).toHaveAttribute("role", "status");
+      expect(spacesSaid.textContent).toBe("");
       fireEvent.input(field, { target: { value: ` ${PW}` } });
-      expect(within(obs).getByText(SPACES)).toBeInTheDocument();
+      const hint = within(obs).getByText(SPACES, { selector: "div" });
+      expect(field).toHaveAttribute("aria-describedby", hint.id);
+      expect(field).toHaveAccessibleDescription(SPACES);
+      expect(within(obs).getByTestId("obs-password-spaces-said")).toBe(spacesSaid);
+      expect(spacesSaid).toHaveTextContent(SPACES);
       fireEvent.click(within(obs).getByRole("button", { name: "Save password" }));
       await flush();
       expect(sent("obs_set_password")).toEqual([{ password: ` ${PW}` }]);
       expect(field).toHaveValue("");
-      expect(within(obs).queryByText(SPACES)).toBeNull();
+      expect(within(obs).queryByText(SPACES, { selector: "div" })).toBeNull();
+      expect(spacesSaid.textContent).toBe("");
+      expect(field).not.toHaveAttribute("aria-describedby");
       expect(within(obs).getByText(PASSWORD_SAVED)).toBeInTheDocument();
       expect(field).not.toHaveAttribute("aria-invalid");
 
@@ -2884,18 +2895,23 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
       await flush();
       expect(within(obs).getByText("Paste a password first.")).toBeInTheDocument();
 
-      // Forget asks twice: one click sends nothing.
+      // Forget asks twice: one press sends nothing. From the keyboard
+      // (detail 0), so the focus stays on it.
       const forget = within(obs).getByRole("button", { name: "Forget password" });
-      fireEvent.click(forget);
+      forget.focus();
+      fireEvent.click(forget, { detail: 0 });
       await flush();
       expect(sent("obs_forget_password")).toEqual([]);
       expect(forget).toHaveTextContent("Forget?");
       expect(forget).toHaveAccessibleName("Click again to forget the OBS password");
-      fireEvent.click(forget);
+      expect(document.activeElement).toBe(forget);
+      fireEvent.click(forget, { detail: 0 });
       await flush();
       expect(sent("obs_forget_password")).toHaveLength(1);
       expect(within(obs).getByText(PASSWORD_NONE)).toBeInTheDocument();
       expect(within(obs).queryByRole("button", { name: /Forget/ })).toBeNull();
+      // Gone, it handed the focus to Save password, not to the page.
+      expect(document.activeElement).toBe(within(obs).getByRole("button", { name: "Save password" }));
 
       // Nothing connected, and the password went only into its command.
       expect(sent("obs_configure")).toEqual([]);
@@ -3319,6 +3335,8 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 1, missing: [TEXT.uuid] }));
     expect(showing(mine())).toEqual(["Timer text (not in OBS now)", null]);
     expect(within(at).getByText("OBS can't find this source now. Pick it again, or pick another.")).toBeInTheDocument();
+    // Each line under the picker describes its trigger, as a field's reason.
+    expect(mine()).toHaveAccessibleDescription("OBS can't find this source now. Pick it again, or pick another.");
     // A complete list without it: the same.
     answer = () => inventory({ textSources: [INTRO_TEXT] });
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 2 }));
@@ -3329,6 +3347,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 3 }));
     expect(showing(mine())).toEqual(["Timer text", "Text (GDI+)"]);
     expect(within(at).queryByText(/OBS can't find this source/)).toBeNull();
+    expect(mine()).toHaveAccessibleDescription("Text (GDI+)");
     // The list can't be read: what is stored, and Rust's words under it.
     answer = () => {
       throw "OBS didn't answer in time.";
@@ -3336,12 +3355,16 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 4 }));
     expect(showing(mine())).toEqual(["Timer text", null]);
     expect(within(at).getByText("Couldn't read OBS's sources: OBS didn't answer in time.")).toBeInTheDocument();
+    expect(mine()).toHaveAccessibleDescription("Couldn't read OBS's sources: OBS didn't answer in time.");
     // No text sources at all.
     answer = () => inventory({ textSources: [] });
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 5 }));
     expect(
       within(at).getByText("No text sources in OBS. Add a Text (GDI+) source there, then open this again."),
     ).toBeInTheDocument();
+    expect(mine()).toHaveAccessibleDescription(
+      "OBS can't find this source now. Pick it again, or pick another. No text sources in OBS. Add a Text (GDI+) source there, then open this again.",
+    );
     // A list cut at 100: said under it, and a source past the cut keeps its name.
     const hundred = Array.from({ length: 100 }, (_, i) => ({
       uuid: uuid(1000 + i),
@@ -3353,6 +3376,13 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 6 }));
     expect(within(at).getByText("Divora lists OBS's first 100 text sources.")).toBeInTheDocument();
     expect(showing(mine())).toEqual(["Timer text", null]);
+    // Read from file ticked in OBS since: why it can't show here is its
+    // sub, which the trigger's name leaves out and its description says.
+    answer = () => inventory({ textSources: [{ ...TEXT, readsFromFile: true }, INTRO_TEXT] });
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 7 }));
+    expect(showing(mine())).toEqual(["Timer text", READS_A_FILE]);
+    expect(mine()).toHaveAccessibleName("BRB OBS text source: Timer text");
+    expect(mine()).toHaveAccessibleDescription(READS_A_FILE);
   });
 
   it("Follow OBS on a count-up is a radio group named for its timer: a pick saves and syncs, the arrows move it, Off clears it", async () => {
@@ -3531,8 +3561,21 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     await emitTimers(1, timerState("timer-1"));
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
     invokeCalls.length = 0;
-    fireEvent.click(view.getByRole("button", { name: "Add action at zero of BRB" }), { detail: 1 });
-    fireEvent.click(view.getByRole("option", { name: "Switch OBS scene" }), { detail: 1 });
+    // The menu's status region is there before any note (one inserted with
+    // its text is commonly missed), and the focus stays on Add action.
+    const said = within(list("onFire")).getByTestId("add-action-note-said");
+    expect(said).toHaveAttribute("role", "status");
+    expect(said.textContent).toBe("");
+    const add = view.getByRole("button", { name: "Add action at zero of BRB" });
+    add.focus();
+    fireEvent.keyDown(add, { key: "Enter" });
+    // Switch OBS scene is next to last at zero (Switch OBS back is last).
+    fireEvent.keyDown(add, { key: "End" });
+    fireEvent.keyDown(add, { key: "ArrowUp" });
+    expect(document.getElementById(add.getAttribute("aria-activedescendant") ?? "")).toHaveTextContent(
+      "Switch OBS scene",
+    );
+    fireEvent.keyDown(add, { key: "Enter" });
     await flush();
     expect(sent("obs_inventory")).toHaveLength(1);
     expect(saved()[0]).not.toHaveProperty("onFire");
@@ -3540,9 +3583,236 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     expect(within(list("onFire")).getByTestId("add-action-note")).toHaveTextContent(
       "Couldn't read OBS's scenes: OBS isn't connected.",
     );
+    // Said, not only shown.
+    expect(within(list("onFire")).getByTestId("add-action-note-said")).toBe(said);
+    expect(said).toHaveTextContent("Couldn't read OBS's scenes: OBS isn't connected.");
     // Opening the menu again clears it.
     fireEvent.click(view.getByRole("button", { name: "Add action at zero of BRB" }), { detail: 1 });
     expect(within(list("onFire")).queryByTestId("add-action-note")).toBeNull();
+    expect(said.textContent).toBe("");
+  });
+
+  it("Switch OBS scene whose read answers for a connection that's gone: asked again once connected, else the note says OBS isn't connected", async () => {
+    const answers: Array<ReturnType<typeof deferred<unknown>>> = [];
+    obsOn(() => {
+      const d = deferred<unknown>();
+      answers.push(d);
+      return d.promise;
+    });
+    storeTimers(entry("timer-1"));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
+    answers.at(-1)!.resolve(inventory());
+    await flush();
+    const pick = async (): Promise<void> => {
+      const add = view.getByRole("button", { name: "Add action at zero of BRB" });
+      add.focus();
+      fireEvent.keyDown(add, { key: "Enter" });
+      fireEvent.keyDown(add, { key: "End" });
+      fireEvent.keyDown(add, { key: "ArrowUp" });
+      expect(document.getElementById(add.getAttribute("aria-activedescendant") ?? "")).toHaveTextContent(
+        "Switch OBS scene",
+      );
+      fireEvent.keyDown(add, { key: "Enter" });
+      await flush();
+    };
+    // The link drops while the pick's read is out: nothing is added, and
+    // the note says OBS isn't connected, not nothing.
+    await pick();
+    const reads = sent("obs_inventory").length;
+    await emitObs(obsStatus("retrying, noAnswer"));
+    answers.at(-1)!.resolve(inventory());
+    await flush();
+    expect(sent("obs_inventory")).toHaveLength(reads);
+    expect(saved()[0]).not.toHaveProperty("onFire");
+    expect(within(list("onFire")).getByTestId("add-action-note")).toHaveTextContent(
+      "Couldn't read OBS's scenes: OBS isn't connected.",
+    );
+    expect(within(list("onFire")).getByTestId("add-action-note-said")).toHaveTextContent(
+      "Couldn't read OBS's scenes: OBS isn't connected.",
+    );
+    // Connected again, the pick joins a read the link left behind it (the
+    // old connection's, answered after the reconnect): OBS is asked once
+    // more, and the new connection's scene is added.
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 2 }));
+    const before = answers.length;
+    await pick();
+    await emitObs(obsStatus(CONNECTING));
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 3 }));
+    answers[before - 1]!.resolve(inventory());
+    await flush();
+    const OTHER = { uuid: uuid(21), name: "Other scene" };
+    expect(answers.length).toBeGreaterThan(before);
+    answers.at(-1)!.resolve(inventory({ scenes: [GAME, OTHER], programSceneUuid: GAME.uuid }));
+    await flush();
+    expect(saved()[0]!.onFire).toEqual([
+      { kind: "obs", op: "scene", sceneUuid: OTHER.uuid, sceneName: "Other scene" },
+    ]);
+    expect(within(list("onFire")).queryByTestId("add-action-note")).toBeNull();
+  });
+
+  it("after a reconnect, every OBS picker offers only what is stored until the new connection's list answers", async () => {
+    let answer = deferred<unknown>();
+    obsOn(() => answer.promise);
+    window.localStorage.setItem(
+      OBS,
+      JSON.stringify({ enabled: true, host: "127.0.0.1", port: 4455, breakScene: { uuid: BRB_SCENE.uuid, name: "BRB" } }),
+    );
+    const SCENE = { kind: "obs", op: "scene", sceneUuid: CHAT.uuid, sceneName: "Just Chatting" };
+    storeTimers(entry("timer-1", { obsText: { uuid: TEXT.uuid, name: "Timer text" }, onStart: [SCENE] }));
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"));
+    const text = () => picker(card("timer-1"), "BRB OBS text source");
+    const scene = () => picker(rowsOf("onStart")[0]!, "BRB OBS scene at the start");
+    const brb = () => picker(view.getByTestId("obs-break-row"), "OBS scene for breaks");
+    /** What a picker offers once opened (and its open's read, if it can,
+     *  answered), then closed again. */
+    const offered = async (trigger: HTMLElement): Promise<string[]> => {
+      fireEvent.click(trigger, { detail: 1 });
+      await flush();
+      const out = within(view.getByRole("listbox"))
+        .getAllByRole("option")
+        .map((o) => words(o));
+      fireEvent.keyDown(trigger, { key: "Escape" });
+      return out;
+    };
+    await emitObs(obsStatus(CONNECTED, { inventoryRev: 1 }));
+    answer.resolve(inventory());
+    await flush();
+    expect(await offered(scene())).toEqual(["Game", "BRB", "Just Chatting"]);
+    // The address changes to another PC's OBS: the link connects again,
+    // and the new connection's read is on its way.
+    answer = deferred<unknown>();
+    const reads = sent("obs_inventory").length;
+    await emitObs(obsStatus(CONNECTING, { host: "192.168.1.20", loopback: false }));
+    expect(app.obsInventory()).toBeNull();
+    await emitObs(obsStatus(CONNECTED, { host: "192.168.1.20", loopback: false, inventoryRev: 2 }));
+    expect(sent("obs_inventory")).toHaveLength(reads + 1);
+    // Nothing of the first OBS's lists is offered meanwhile.
+    expect(await offered(text())).toEqual(["None", "Timer text Loading OBS sources…"]);
+    expect(await offered(scene())).toEqual(["Just Chatting Loading OBS scenes…"]);
+    expect(await offered(brb())).toEqual(["Don't switch", "BRB Loading OBS scenes…"]);
+    // Opening joined the read in flight.
+    expect(sent("obs_inventory")).toHaveLength(reads + 1);
+    // The new OBS's lists, once they answer.
+    const OTHER = { uuid: uuid(21), name: "Other scene" };
+    answer.resolve(inventory({ scenes: [OTHER], textSources: [INTRO_TEXT], programSceneUuid: OTHER.uuid }));
+    await flush();
+    expect(await offered(scene())).toEqual(["Other scene", "Just Chatting (not in OBS now)"]);
+    expect(await offered(text())).toEqual(["None", "Intro text Text (FreeType 2)", "Timer text (not in OBS now)"]);
+  });
+
+  it("Try again and Connect again, pressed from the keyboard, hand the focus to the status line as they go; a pointer press leaves it on the page", async () => {
+    let reconnects = 0;
+    obsReply = (cmd) => {
+      if (cmd === "obs_configure") return obsStatus(CONNECTING);
+      if (cmd === "obs_reconnect") {
+        reconnects += 1;
+        return obsStatus(CONNECTING);
+      }
+      if (cmd === "obs_inventory") return inventory();
+      return null;
+    };
+    window.localStorage.setItem(OBS, JSON.stringify({ enabled: true, host: "127.0.0.1", port: 4455 }));
+    const view = mount();
+    await flush();
+    const status = (): HTMLElement => view.getByTestId("obs-status");
+    const statusLine = view.getByTestId("obs-status-line");
+    // Try again from the keyboard (detail 0): it goes once connecting, and
+    // the focus goes to the status line it sat beside.
+    await emitObs(obsStatus("retrying, noAnswer"));
+    let retry = within(status()).getByRole("button", { name: "Try again" });
+    retry.focus();
+    fireEvent.click(retry, { detail: 0 });
+    await flush();
+    expect(reconnects).toBe(1);
+    expect(within(status()).queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(document.activeElement).toBe(statusLine);
+    // Focusable for that visit only: it isn't a Tab stop.
+    expect(statusLine).toHaveAttribute("tabindex", "-1");
+    // Failed again: the button is back, after the line in Tab order.
+    await emitObs(obsStatus("retrying, noAnswer"));
+    retry = within(status()).getByRole("button", { name: "Try again" });
+    expect(document.activeElement).toBe(statusLine);
+    retry.focus();
+    expect(statusLine).not.toHaveAttribute("tabindex");
+    // Connect again after a kick, the same.
+    await emitObs(obsStatus("kicked"));
+    const again = within(status()).getByRole("button", { name: "Connect again" });
+    expect(again).toBe(retry);
+    again.focus();
+    fireEvent.click(again, { detail: 0 });
+    await flush();
+    expect(reconnects).toBe(2);
+    expect(document.activeElement).toBe(statusLine);
+    // A pointer's press leaves the focus on the page, as before.
+    await emitObs(obsStatus("retrying, noAnswer"));
+    retry = within(status()).getByRole("button", { name: "Try again" });
+    retry.focus();
+    fireEvent.click(retry, { detail: 1 });
+    await flush();
+    expect(reconnects).toBe(3);
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("an off-but-set Show in OBS or Follow OBS cleared from the keyboard hands the focus to the card's next control", async () => {
+    storeTimers(
+      entry("timer-1", { obsText: { uuid: TEXT.uuid, name: "Timer text" } }),
+      entry("timer-2", { ...UPTIME, followObs: "record" }),
+    );
+    const view = mount();
+    await flush();
+    await emitTimers(1, timerState("timer-1"), timerState("timer-2", UPTIME));
+    // Show in OBS → None by the keys.
+    const shownIn = picker(card("timer-1"), "BRB OBS text source");
+    shownIn.focus();
+    fireEvent.keyDown(shownIn, { key: "Enter" });
+    fireEvent.keyDown(shownIn, { key: "Home" });
+    fireEvent.keyDown(shownIn, { key: "Enter" });
+    await flush();
+    expect(saved()[0]).not.toHaveProperty("obsText");
+    expect(within(card("timer-1")).queryByText("Show in OBS")).toBeNull();
+    expect(document.activeElement).toBe(
+      within(card("timer-1")).getByRole("button", { name: "Copy the path of BRB's file" }),
+    );
+    // Follow OBS: Right from Recording goes round to Off, which clears it.
+    const follow = within(card("timer-2")).getByRole("radiogroup", { name: "Follow OBS for Uptime" });
+    const recording = within(follow).getByRole("radio", { name: "Recording" });
+    recording.focus();
+    fireEvent.keyDown(recording, { key: "ArrowRight" });
+    await flush();
+    expect(saved()[1]).not.toHaveProperty("followObs");
+    expect(within(card("timer-2")).queryByRole("radiogroup")).toBeNull();
+    expect(document.activeElement).toBe(
+      within(card("timer-2")).getByRole("button", { name: "Copy the path of Uptime's file" }),
+    );
+    expect(view.container.contains(document.activeElement)).toBe(true);
+  });
+
+  it("an off-but-set Show in OBS cleared from the keyboard above a set Follow OBS hands the focus to its chosen radio, the group's one Tab stop", async () => {
+    storeTimers(entry("timer-2", { ...UPTIME, obsText: { uuid: TEXT.uuid, name: "Timer text" }, followObs: "record" }));
+    mount();
+    await flush();
+    await emitTimers(1, timerState("timer-2", UPTIME));
+    const shownIn = picker(card("timer-2"), "Uptime OBS text source");
+    shownIn.focus();
+    fireEvent.keyDown(shownIn, { key: "Enter" });
+    fireEvent.keyDown(shownIn, { key: "Home" });
+    fireEvent.keyDown(shownIn, { key: "Enter" });
+    await flush();
+    expect(saved()[0]).not.toHaveProperty("obsText");
+    expect(saved()[0]).toHaveProperty("followObs", "record");
+    expect(within(card("timer-2")).queryByText("Show in OBS")).toBeNull();
+    // Off comes first in the group but is out of the Tab order: the focus
+    // goes where Tab would, to the chosen radio.
+    const follow = within(card("timer-2")).getByRole("radiogroup", { name: "Follow OBS for Uptime" });
+    const recording = within(follow).getByRole("radio", { name: "Recording" });
+    expect(within(follow).getByRole("radio", { name: "Off" })).toHaveAttribute("tabindex", "-1");
+    expect(recording).toHaveAttribute("tabindex", "0");
+    expect(document.activeElement).toBe(recording);
   });
 
   it("a Switch OBS back stored in At start is a row that doesn't run, with its reason and Remove; at zero it runs", async () => {

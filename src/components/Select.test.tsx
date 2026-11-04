@@ -354,4 +354,79 @@ describe("Select (v1.61.0)", () => {
     expect(chosen).toHaveAttribute("aria-disabled", "true");
     expect(trigger.getAttribute("aria-activedescendant")).toBe(chosen.id);
   });
+
+  // An OBS picker's options are rebuilt while it's open: onOpen's read
+  // answering (the list was the fallback and the stored one), or OBS's
+  // scenes changing.
+  function mountRebuilt(first: SelectOption[], value: string) {
+    const onChange = vi.fn();
+    const [options, setOptions] = createSignal(first);
+    const view = render(() => (
+      <Select icon="link" value={value} options={options()} onChange={onChange} ariaLabel="BRB OBS text source" />
+    ));
+    const trigger = view.container.querySelector<HTMLButtonElement>("button.select")!;
+    const highlighted = (): HTMLElement | null =>
+      document.getElementById(trigger.getAttribute("aria-activedescendant") ?? "");
+    return { view, trigger, onChange, setOptions, highlighted };
+  }
+  const TIMER_TEXT: SelectOption = { value: "timer", label: "Timer text" };
+  const NONE: SelectOption = { value: "", label: "None" };
+
+  it("options rebuilt while open keep the highlight on its option, so Enter keeps the choice", () => {
+    const { view, trigger, onChange, setOptions, highlighted } = mountRebuilt([NONE, TIMER_TEXT], "timer");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    expect(highlighted()).toHaveTextContent("Timer text");
+    // The list arrives in OBS's order: Timer text is now third.
+    setOptions([NONE, { value: "chat", label: "Chat" }, { value: "title", label: "Title" }, TIMER_TEXT]);
+    expect(view.getAllByRole("option")).toHaveLength(4);
+    expect(highlighted()).toHaveTextContent("Timer text");
+    expect(highlighted()).toBe(view.getAllByRole("option")[3]);
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    expect(onChange.mock.calls).toEqual([["timer"]]);
+    expect(view.queryByRole("listbox")).toBeNull();
+  });
+
+  it("an option that goes while highlighted leaves the highlight at its place, within the list", () => {
+    const four = [NONE, { value: "chat", label: "Chat" }, { value: "title", label: "Title" }, TIMER_TEXT];
+    const { view, trigger, onChange, setOptions, highlighted } = mountRebuilt(four, "timer");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.keyDown(trigger, { key: "ArrowUp" });
+    expect(highlighted()).toHaveTextContent("Title");
+    // Title goes: the next one takes its place.
+    setOptions([NONE, { value: "chat", label: "Chat" }, TIMER_TEXT]);
+    expect(highlighted()).toHaveTextContent("Timer text");
+    // The read failed: back to the fallback, shorter than where it was.
+    setOptions([NONE]);
+    expect(highlighted()).toBe(view.getAllByRole("option")[0]);
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    expect(onChange.mock.calls).toEqual([[""]]);
+  });
+
+  it("with ariaLabel, the shown sub describes the trigger, and describedBy's lines follow it", () => {
+    const { trigger } = mountSources("c");
+    // The name leaves the sub out; the description carries it.
+    expect(trigger).toHaveAccessibleName("BRB OBS text source: Intro text");
+    expect(trigger).toHaveAccessibleDescription("shown by Intro");
+    expect(trigger.getAttribute("aria-describedby")).toBe(trigger.querySelector(".select-sub")!.id);
+    // None has no sub: no description.
+    const none = mountSources("");
+    expect(none.trigger).not.toHaveAttribute("aria-describedby");
+    // A host's lines, after the sub.
+    const view = render(() => (
+      <>
+        <Select value="c" options={SOURCES} onChange={() => {}} ariaLabel="BRB OBS text source" describedBy="why" />
+        <div id="why">OBS can't find this source now.</div>
+      </>
+    ));
+    const hosted = view.container.querySelector<HTMLButtonElement>("button.select")!;
+    expect(hosted).toHaveAccessibleDescription("shown by Intro OBS can't find this source now.");
+  });
+
+  it("without ariaLabel the sub is in the name, so it doesn't describe the trigger too", () => {
+    const { trigger } = mountSelect();
+    expect(trigger.querySelector(".select-sub")).toHaveTextContent("Bundled");
+    expect(trigger).not.toHaveAttribute("aria-describedby");
+  });
 });

@@ -1296,18 +1296,21 @@ export interface AppState {
   /** The mirror: the newest status seen (largest `seq`), or null before
    *  any. */
   obsStatus: () => ObsStatus | null;
-  /** The last inventory read, or null before one (so after every launch)
-   *  and after one that failed. */
+  /** The last inventory read, or null before one (so after every launch),
+   *  after one that failed, and from the moment the mirror isn't
+   *  `connected` until the next connection's read answers. */
   obsInventory: () => ObsInventory | null;
   /** True while an `obs_inventory` is in flight. */
   obsInventoryBusy: () => boolean;
-  /** Why the last inventory couldn't be read, in Rust's words; else null. */
+  /** Why the last inventory couldn't be read, in Rust's words; else null
+   *  (and null again once the mirror isn't `connected`). */
   obsInventoryError: () => string | null;
   /** Rust's words for the saved address when it refused it (at boot or on
    *  Connect to OBS), shown under Address; else null. */
   obsConfigError: () => string | null;
   /** How many OBS pickers (and the OBS section) are on screen: while any
-   *  is, the inventory is read again when `inventoryRev` changes. */
+   *  is, the inventory is read again when `inventoryRev` changes (once a
+   *  read in flight has ended). */
   obsWatchers: () => number;
   /** Counts one watcher in; the function it returns counts it out, once. */
   watchObs: () => () => void;
@@ -1338,7 +1341,9 @@ export interface AppState {
   /** Reads OBS's scenes and text sources (not queued; a second call joins
    *  the one in flight) and refreshes the stored names it lists. Answers
    *  the inventory, or null when it couldn't be read (`obsInventoryError`
-   *  says why) or OBS control is off (nothing is asked). */
+   *  says why), when the mirror left `connected` before it answered
+   *  (nothing of it is kept), or when OBS control is off (nothing is
+   *  asked). */
   refreshObsInventory: () => Promise<ObsInventory | null>;
   /** Show in OBS: the text source a timer shows in, or null for none, its
    *  name cut as stored. Saves, then syncs. */
@@ -3017,10 +3022,23 @@ export function createAppState(): AppState {
   // that order. None of them waits on OBS, so a slow OBS holds nothing
   // here. The reads (`obs_status`, `obs_inventory`) aren't queued.
   const obsQueue = inOrder();
+  // Counts the statuses taken that aren't `connected`. OBS's lists belong
+  // to one connection: once the mirror leaves `connected` (a drop, Off, a
+  // new address, OBS restarted with another scene collection) they go, and
+  // a read begun before then keeps nothing from its answer, so the next
+  // connection's pickers offer only what is stored until its own read
+  // answers.
+  let obsLeft = 0;
   const applyObsStatus: AppState["applyObsStatus"] = (raw) => {
     if (obsDisposed) return;
     const next = adoptObsStatus(obsStatus(), readObsStatus(raw));
-    if (next !== obsStatus()) setObsStatus(next);
+    if (next === obsStatus()) return;
+    setObsStatus(next);
+    if (next !== null && next.state !== "connected") {
+      obsLeft += 1;
+      setObsInventory(null);
+      setObsInventoryError(null);
+    }
   };
   const watchObs: AppState["watchObs"] = () => {
     setObsWatchers((n) => n + 1);
@@ -3140,18 +3158,24 @@ export function createAppState(): AppState {
   // save behind it. One at a time: a call while one is in flight gets that
   // one's answer. A failure clears the list, since a list from another
   // connection (or another scene collection) would offer what may not be
-  // there. While OBS control is off nothing is asked.
+  // there. An answer that lands once the mirror has left `connected` since
+  // the read began (`obsLeft`), or while it isn't `connected`, is the
+  // answer of a connection that's gone (an invoke's answer can land after
+  // the events it came before): nothing of it is kept, and it answers
+  // null. While OBS control is off nothing is asked.
   let obsInventoryInFlight: Promise<ObsInventory | null> | null = null;
   const refreshObsInventory: AppState["refreshObsInventory"] = () => {
     if (obsInventoryInFlight) return obsInventoryInFlight;
     if (!obsSettings().enabled) return Promise.resolve(null);
     setObsInventoryBusy(true);
+    const leftAtStart = obsLeft;
+    const gone = (): boolean => obsLeft !== leftAtStart || obsStatus()?.state !== "connected";
     obsInventoryInFlight = (async () => {
       try {
         const inv = readObsInventory(await obsInventoryCmd());
         // An answer that isn't an inventory: the two sides don't agree.
         if (inv === null) throw new Error("OBS and Divora didn't understand each other.");
-        if (obsDisposed) return null;
+        if (obsDisposed || gone()) return null;
         setObsInventory(inv);
         setObsInventoryError(null);
         refreshObsNames(inv);
@@ -3160,6 +3184,7 @@ export function createAppState(): AppState {
         if (obsDisposed) return null;
         const words = obsWords(e);
         console.warn("[obs] obs_inventory failed:", words);
+        if (gone()) return null;
         setObsInventory(null);
         setObsInventoryError(words);
         return null;
@@ -3192,8 +3217,12 @@ export function createAppState(): AppState {
   // connected, the inventory is read again once per `inventoryRev`: Rust
   // bumps it at each connection and at most once per 250 ms of scene
   // changes in OBS, so a scene made, removed or renamed there shows here.
+  // A rev that comes while a read is in flight is asked for once that read
+  // ends: joining it would mark the rev read with a list OBS may have
+  // answered before the change (or on the connection before).
   let obsRevAsked: number | null = null;
   createEffect(() => {
+    if (obsInventoryBusy()) return;
     const s = obsStatus();
     if (obsWatchers() <= 0 || s === null || s.state !== "connected" || s.inventoryRev === obsRevAsked) return;
     obsRevAsked = s.inventoryRev;

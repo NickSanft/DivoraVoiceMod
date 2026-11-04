@@ -31,9 +31,15 @@
 //     order, so the keys reach it and a screen reader says why; Enter, Space
 //     and a click refuse it, and the list stays open. A stored value whose
 //     option is disabled shows and highlights as any other.
+//   - Options that change while the list is open (onOpen's read answering,
+//     or OBS's scenes changing) keep the highlight on the option it was on,
+//     found by its value, so Enter never picks whatever moved into its
+//     place; one that went leaves it at the same place, within the list.
+//   - With `ariaLabel`, the trigger's shown sub (which the name leaves out)
+//     is its description, with `describedBy`'s lines after it.
 
 import type { JSX } from "solid-js";
-import { createSignal, createUniqueId, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, createUniqueId, For, on, onCleanup, onMount, Show } from "solid-js";
 import { blurOnPointer } from "./blurOnPointer";
 import { Sigil, type SigilName } from "./Sigil";
 
@@ -66,6 +72,10 @@ export interface SelectProps {
   blurOnPointer?: boolean;
   /** v1.61.0: called each time the list opens, by a click or a key. */
   onOpen?: () => void;
+  /** v1.61.0: the ids of lines that say more about the value (an OBS
+   *  picker's "OBS can't find this source now…"), its description after
+   *  the shown sub. */
+  describedBy?: string;
 }
 
 /** v1.60.0: where an open listbox's highlight goes for a key: Down and Up
@@ -107,6 +117,7 @@ export function Select(props: SelectProps): JSX.Element {
   let trigger: HTMLButtonElement | undefined;
   const uid = createUniqueId();
   const listId = `select-${uid}-list`;
+  const subId = `select-${uid}-sub`;
   const optionId = (i: number): string => `select-${uid}-opt-${i}`;
 
   onMount(() => {
@@ -121,7 +132,13 @@ export function Select(props: SelectProps): JSX.Element {
   // the control doesn't act on.
   const current = () => props.options.find((o) => o.value === props.value);
   const shown = (): string => current()?.label ?? props.missing ?? "—";
+  const sub = (): string | undefined => current()?.sub ?? props.sub;
   const icon = () => props.icon ?? "mic";
+  // An `aria-label` names the trigger without its sub, so the sub (and the
+  // host's lines) describe it. Without one the sub is already in the name.
+  const describedBy = (): string | undefined =>
+    [props.ariaLabel !== undefined && sub() ? subId : "", props.describedBy ?? ""].filter((x) => x !== "").join(" ") ||
+    undefined;
 
   /** Opens it with the chosen option highlighted (the first without one). */
   const openList = (): void => {
@@ -130,6 +147,21 @@ export function Select(props: SelectProps): JSX.Element {
     setOpen(true);
     props.onOpen?.();
   };
+  // The options changed while open: the highlight stays on its option, by
+  // value (an index would now name another), or, that option gone, at the
+  // same place within the list. (Not `defer`: `on` would then hand the
+  // first change no `prev`.)
+  createEffect(
+    on(
+      () => props.options,
+      (next, prev) => {
+        if (!open() || prev === undefined) return;
+        const was = prev[active()]?.value;
+        const at = was === undefined ? -1 : next.findIndex((o) => o.value === was);
+        setActive(at >= 0 ? at : Math.max(0, Math.min(active(), next.length - 1)));
+      },
+    ),
+  );
   /** Picks option `i` and closes; a disabled one is refused, and the list
    *  stays open. True when it picked. */
   const pick = (i: number): boolean => {
@@ -189,14 +221,17 @@ export function Select(props: SelectProps): JSX.Element {
         aria-controls={open() ? listId : undefined}
         aria-activedescendant={open() && props.options.length > 0 ? optionId(active()) : undefined}
         aria-label={props.ariaLabel !== undefined ? `${props.ariaLabel}: ${shown()}` : undefined}
+        aria-describedby={describedBy()}
       >
         <span class="select-icon">
           <Sigil name={icon()} size={18} />
         </span>
         <span class="select-text">
           <div class="select-main">{shown()}</div>
-          <Show when={current()?.sub ?? props.sub}>
-            <div class="select-sub">{current()?.sub ?? props.sub}</div>
+          <Show when={sub()}>
+            <div id={subId} class="select-sub">
+              {sub()}
+            </div>
           </Show>
         </span>
         <Sigil

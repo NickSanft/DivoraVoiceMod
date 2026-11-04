@@ -66,7 +66,9 @@ use screen::{
     sanitize_fps, screen_recording_path, ArmRequest, CaptureStatusDto, DesktopSourceDto,
     MonitorDto, Quality, ScreenRecorder, ScreenRecordingUpdate, StartRequest,
 };
-use timer_actions::{ActionBatch, ObsOp, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT};
+use timer_actions::{
+    ActionBatch, Hook, ObsOp, Planned, SOUNDBOARD_STOPPED_EVENT, TIMER_ACTIONS_EVENT,
+};
 use timer_lines::{run_line_thread, Line, TimerLines, TIMER_LINE_CLIP_ID};
 use timer_thread::{
     hand_off, spawn_action_worker, spawn_text_writer, spawn_timer_thread, ActionHost,
@@ -3284,9 +3286,9 @@ impl ActionHost for AppHost {
 
     /// v1.61.0: to the OBS link, which never waits (D17). Before `obs::init`
     /// has managed it, nothing.
-    fn obs(&self, timer: &str, op: &ObsOp) {
+    fn obs(&self, timer: &str, hook: Hook, op: &ObsOp) {
         if let Some(obs) = self.app.try_state::<ObsShared>() {
-            obs.offer(timer, op);
+            obs.offer_run(timer, hook, op);
         }
     }
 }
@@ -6675,9 +6677,9 @@ mod tests {
     }
 
     /// v1.61.0 (D17, seam 2): the worker's production host hands an `obs`
-    /// action to `ObsShared::offer`, which never waits, and does nothing
-    /// before `obs::init` has managed it. The host needs an `AppHandle`, so
-    /// this reads the source.
+    /// action, with its hook, to `ObsShared::offer_run`, which never
+    /// waits, and does nothing before `obs::init` has managed it. The host
+    /// needs an `AppHandle`, so this reads the source.
     #[test]
     fn the_timer_host_hands_obs_ops_to_the_link() {
         let prod = production_source();
@@ -6686,7 +6688,7 @@ mod tests {
             squashed(body_of(host, "fn obs(")),
             concat!(
                 "{ifletSome(obs)=self.app.try_state::<ObsShared>(){",
-                "obs.offer(timer,op);}}"
+                "obs.offer_run(timer,hook,op);}}"
             )
         );
     }

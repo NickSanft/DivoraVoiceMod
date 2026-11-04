@@ -71,7 +71,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
-pub use crate::timer_actions::ObsOp;
+pub use crate::timer_actions::{Hook, ObsOp};
 pub use crate::timers::{Follow, FollowObs, ObsFeed, ObsText};
 
 use crate::timer_thread::TimerShared;
@@ -220,7 +220,8 @@ pub struct LinkOp {
 }
 
 /// What a command asks of a running link. Dropping the sender is the stop:
-/// every wait in the driver watches for it (D4, D6).
+/// every wait in the driver watches for it (D4, D6), except the two bounded
+/// closes named in `link.rs`'s module doc.
 #[derive(Debug)]
 pub enum LinkCmd {
     /// `obs_inventory`: scenes and text sources, one request per idle turn
@@ -229,6 +230,10 @@ pub enum LinkCmd {
     /// `obs_reconnect` while retrying: attempt now, the failure count kept
     /// (D4).
     Wake,
+    /// [`ObsShared::offer`] made a switch back due: the driver's wait looks
+    /// at the due marks again (their earliest expiry, or, connected, one to
+    /// run). Does nothing else in any state.
+    Due,
 }
 
 /// Every period the link waits by (D5, D8, D14, D18, D20, D23), as
@@ -421,8 +426,19 @@ pub trait SlotStore: Send + Sync {
     /// §7.6: the plan done (its Set answered, or none needed).
     fn commit_back(&self, timer: &str, plan: BackPlan);
     /// D23: `timer`'s switch back is due, stamped `at` (an earlier stamp
-    /// stays).
+    /// stays; one from before the timer's latest start is ignored).
     fn mark_due(&self, timer: &str, at: Instant);
+    /// D23: a mark `take_due` handed out couldn't finish: due again with its
+    /// first stamp, unless the take is gone or an earlier run's.
+    fn remark(&self, timer: &str);
+    /// D23: a mark `take_due` handed out is let go without a commit (the
+    /// driver went stale first): no longer held back. The slot stays.
+    fn release(&self, timer: &str);
+    /// D23 (review): a driver a newer generation replaced made a switch
+    /// back due (on its way out, or a request the restart cut off): the
+    /// newest link, which waits for the marks it last read, reads them
+    /// again (`LinkCmd::Due`). Never waits; nothing with no link running.
+    fn nudge(&self) {}
     /// D23: the due mark to run next, and the timers whose marks the grace
     /// let go.
     fn take_due(&self, now: Instant) -> (Option<String>, Vec<String>);
@@ -434,7 +450,7 @@ pub trait SlotStore: Send + Sync {
     fn expire_due(&self, now: Instant) -> Vec<String> {
         let (next, expired) = self.take_due(now);
         if let Some(timer) = next {
-            self.mark_due(&timer, now);
+            self.remark(&timer);
         }
         expired
     }
@@ -560,6 +576,9 @@ struct Shared {
     saver: Arc<SlotSaver>,
     /// D23: how long a switch back stays due.
     grace: Duration,
+    /// The newest link's commands, for [`SlotStore::nudge`]: weak, so a
+    /// stopped link's commands still close (its stop, D4).
+    newest: Mutex<Option<mpsc::WeakSender<LinkCmd>>>,
 }
 
 impl Shared {
@@ -656,6 +675,23 @@ impl SlotStore for Shared {
 
     fn mark_due(&self, timer: &str, at: Instant) {
         self.with_slots(false, |s| s.mark_due(timer, at));
+    }
+
+    fn remark(&self, timer: &str) {
+        self.with_slots(false, |s| s.remark(timer));
+    }
+
+    fn release(&self, timer: &str) {
+        self.with_slots(false, |s| s.release(timer));
+    }
+
+    fn nudge(&self) {
+        let newest = lock(&self.newest)
+            .as_ref()
+            .and_then(mpsc::WeakSender::upgrade);
+        if let Some(cmds) = newest {
+            let _ = cmds.try_send(LinkCmd::Due);
+        }
     }
 
     fn take_due(&self, now: Instant) -> (Option<String>, Vec<String>) {
@@ -783,6 +819,7 @@ impl ObsShared {
                 written: Mutex::new(HashSet::new()),
                 saver: SlotSaver::new(spawner.clone(), dir.clone()),
                 grace: timing.scene_back_grace,
+                newest: Mutex::new(None),
             }),
             link: Mutex::new(None),
             feed,
@@ -934,7 +971,9 @@ impl ObsShared {
     /// slot); otherwise only if its timer has a slot (its `scene` ran) and
     /// OBS isn't switched off (`off` drops due marks; before the first
     /// configure — a launch — it is kept). So a switch back is never
-    /// `queueFull` or `late`.
+    /// `queueFull` or `late`. A mark made tells the running link
+    /// (`LinkCmd::Due`, `try_send`), so a parked or retrying one expires it
+    /// on time.
     pub fn offer(&self, timer: &str, op: &ObsOp) {
         if !OBS_LINK {
             return;
@@ -980,9 +1019,33 @@ impl ObsShared {
                 let on = self.shared.last().is_none_or(|c| c.enabled);
                 if full || (on && self.shared.has_slot(timer)) {
                     self.shared.mark_due(timer, at);
+                    // A parked or retrying driver waits for the expiry it
+                    // last read: it reads the marks again. A full command
+                    // queue already wakes it.
+                    if let Some(h) = lock(&self.link).as_ref() {
+                        let _ = h.cmds.try_send(LinkCmd::Due);
+                    }
                 }
             }
         }
+    }
+
+    /// v1.61.0: `timer`'s `obs` action from a hook run (the action worker's
+    /// host). A start's `scene` begins a new run: the timer's switch backs
+    /// from earlier runs — due, or still in flight — no longer apply (D23),
+    /// so a break started again isn't switched back by the run before it.
+    /// Then [`offer`](Self::offer).
+    pub fn offer_run(&self, timer: &str, hook: Hook, op: &ObsOp) {
+        if !OBS_LINK {
+            return;
+        }
+        if hook == Hook::Start && matches!(op, ObsOp::Scene { .. }) {
+            let at = Instant::now();
+            if self.shared.with_slots(false, |s| s.started(timer, at)) {
+                log::scene_back_superseded(timer);
+            }
+        }
+        self.offer(timer, op);
     }
 
     /// D5: the tray's Quit. With no link, returns at once; otherwise stops
@@ -1032,9 +1095,25 @@ impl ObsShared {
         if running && !restart {
             return;
         }
+        // D23: marks whose grace ran out while no link ran (OBS off, or
+        // before the first configure) go now, without a skip line: that
+        // break ended while nothing could switch OBS back. A running link
+        // expires its own marks and says so.
+        if link.as_ref().is_none_or(|h| h.cmds.is_closed()) {
+            let grace = self.shared.grace;
+            for timer in self
+                .shared
+                .with_slots(false, |s| s.expire_due(Instant::now(), grace))
+            {
+                log::scene_back_expired(&timer);
+            }
+        }
         let (ops_tx, ops) = mpsc::channel(OPS_QUEUE);
         let (cmds_tx, cmds) = mpsc::channel(CMDS_QUEUE);
         let (closed_ack, closed) = std::sync::mpsc::sync_channel(1);
+        // Before the generation moves: an old driver that finds itself
+        // stale and leaves a switch back due tells this one.
+        *lock(&self.shared.newest) = Some(cmds_tx.downgrade());
         let gen = {
             let mut cell = lock(&self.shared.status);
             let (gen, began) = cell.begin(&at);
@@ -1340,7 +1419,7 @@ mod shared_tests {
     use super::scenes::SceneRef;
     use super::testing::{assert_none_in, scratch, secret_forms, traced, MemCipher};
     use super::{
-        lock, Emit, LastConfig, LinkCmd, LinkConfig, LinkHandle, LinkOp, LinkTiming, ObsOp,
+        lock, Emit, Hook, LastConfig, LinkCmd, LinkConfig, LinkHandle, LinkOp, LinkTiming, ObsOp,
         ObsShared, SlotStore, StatusSink, TimerControl, BAD_PORT, BUSY, CMDS_QUEUE, ENCRYPT_FAILED,
         LONG_PASSWORD, MAX_PASSWORD_CHARS, NOT_CONNECTED, NO_ANSWER, NO_PASSWORD, OPS_QUEUE,
         REFUSED, WRITE_FAILED,
@@ -1348,7 +1427,7 @@ mod shared_tests {
     use crate::timers::TimerOp;
     use serde_json::Value;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, watch};
@@ -1399,6 +1478,16 @@ mod shared_tests {
         let dir = scratch(name);
         let (obs, seen) = shared_with(rt, dir.clone(), MemCipher::default());
         (obs, seen, dir)
+    }
+
+    /// The test's folder removed once `obs`'s slot saver has written what
+    /// it was handed: a save still queued would make the folder again.
+    fn clean(obs: &ObsShared, dir: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !obs.shared.saver.idle() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// An address nothing will answer on: a listener this test holds and
@@ -1539,7 +1628,7 @@ mod shared_tests {
             (None, vec![]),
             "no mark for timer-3"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
 
         // On, not connected (connecting, retrying, a stop state): a scene is
         // a `notConnected` skip, a switch back with a slot is due, none goes
@@ -1572,7 +1661,7 @@ mod shared_tests {
                 vec![],
                 "{state:?}: a parked driver gets nothing"
             );
-            std::fs::remove_dir_all(&dir).ok();
+            clean(&obs, &dir);
         }
 
         // Connected: both go to the link, stamped, in order, a switch back
@@ -1638,7 +1727,7 @@ mod shared_tests {
         obs.offer("timer-22", &brb());
         assert!(lock(&obs.link).is_none(), "a dead link's handle goes");
         assert_eq!(skip(&obs).unwrap().1, SkipWhy::NotConnected);
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
 
         // Off: no skip, and a switch back is nothing, slot or not.
         let (obs, _seen, dir) = shared(&rt, "offer-off");
@@ -1648,7 +1737,7 @@ mod shared_tests {
         obs.offer("timer-1", &back);
         assert_eq!((skip(&obs), obs.status().held_back), (None, 0));
         assert_eq!(obs.shared.next_expiry(), None);
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
     }
 
     /// D17: `offer` never waits, whatever the link does: 2 000 offers from
@@ -1674,7 +1763,7 @@ mod shared_tests {
             started.elapsed()
         );
         drop(stub);
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
     }
 
     /// D4: `obs_configure {enabled:false}` drops every due mark (the slots
@@ -1726,7 +1815,113 @@ mod shared_tests {
             off
         );
         assert_eq!(seen.lock().unwrap().len(), said);
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
+    }
+
+    /// D23: a break started again while its earlier run's switch back is
+    /// due (it ended while OBS was down): the start's `scene`, as the
+    /// action worker's host hands it, drops that mark, so the new break
+    /// isn't switched back by the run before it. An end's `scene` isn't a
+    /// new run; the new run's own end is due again.
+    #[test]
+    fn a_start_drops_an_earlier_runs_switch_back() {
+        let rt = runtime();
+        let (obs, seen, dir) = shared(&rt, "offer-run");
+        give_slot(&obs, "timer-1");
+        obs.offer_run("timer-1", Hook::End, &ObsOp::SceneBack);
+        assert_eq!(obs.status().held_back, 1);
+        obs.offer_run("timer-1", Hook::End, &brb());
+        assert_eq!(obs.status().held_back, 1, "an end's scene isn't a run");
+        obs.offer_run("timer-1", Hook::Start, &brb());
+        assert_eq!(obs.status().held_back, 0, "said");
+        assert_eq!(seen.lock().unwrap().last().unwrap().held_back, 0);
+        assert_eq!(obs.shared.next_expiry(), None);
+        assert_eq!(obs.shared.take_due(Instant::now()), (None, vec![]));
+        obs.offer_run("timer-1", Hook::End, &ObsOp::SceneBack);
+        assert_eq!(obs.status().held_back, 1, "the new run's end");
+        clean(&obs, &dir);
+    }
+
+    /// D23: a switch back made due with no link to expire it (before the
+    /// first configure, or while off) whose grace has run out when a link
+    /// starts is dropped then, unsaid; one still within its grace stays
+    /// for the link.
+    #[test]
+    fn a_start_drops_marks_that_expired_with_no_link() {
+        let rt = runtime();
+        let (_listener, port) = black_hole();
+        let (obs, _seen, dir) = shared(&rt, "start-expires");
+        give_slot(&obs, "old");
+        give_slot(&obs, "new");
+        let grace = obs.shared.grace;
+        obs.shared.mark_due(
+            "old",
+            Instant::now()
+                .checked_sub(grace + Duration::from_millis(1))
+                .unwrap(),
+        );
+        obs.offer("new", &ObsOp::SceneBack);
+        assert_eq!(obs.status().held_back, 2);
+        let s = rt
+            .block_on(async { obs.configure(config(true, "127.0.0.1", port)) })
+            .unwrap();
+        assert_eq!(
+            (s.state, s.held_back, s.last_skip),
+            (ObsState::Connecting, 1, None)
+        );
+        assert_eq!(
+            obs.shared.take_due(Instant::now()).0.as_deref(),
+            Some("new")
+        );
+        obs.configure(config(false, "127.0.0.1", port)).unwrap();
+        clean(&obs, &dir);
+    }
+
+    /// D23 (review): a nudge goes to the newest link's commands — through
+    /// a restart, the new one's — and holds none of them open: once the
+    /// link is stopped there is nothing to tell (its stop is its commands
+    /// closing, D4).
+    #[test]
+    fn a_nudge_reaches_the_newest_link_and_holds_none_open() {
+        let rt = runtime();
+        let (_listener, port) = black_hole();
+        let (other, other_port) = black_hole();
+        let (obs, _seen, dir) = shared(&rt, "nudge");
+        let newest = |obs: &ObsShared| {
+            lock(&obs.shared.newest)
+                .as_ref()
+                .and_then(mpsc::WeakSender::upgrade)
+        };
+        // No link yet: nothing to tell.
+        obs.shared.nudge();
+        assert!(newest(&obs).is_none());
+        // What a nudge sends: a `Due`, never waiting (a full queue drops
+        // it; that link already has a command to wake it).
+        let (tx, mut rx) = mpsc::channel(1);
+        *lock(&obs.shared.newest) = Some(tx.downgrade());
+        obs.shared.nudge();
+        obs.shared.nudge();
+        assert!(matches!(rx.try_recv(), Ok(LinkCmd::Due)));
+        assert!(rx.try_recv().is_err());
+        drop(tx);
+        obs.shared.nudge();
+        *lock(&obs.shared.newest) = None;
+        for p in [port, other_port] {
+            rt.block_on(async { obs.configure(config(true, "127.0.0.1", p)) })
+                .unwrap();
+            let up = newest(&obs).expect("the running link's");
+            assert!(lock(&obs.link).as_ref().unwrap().cmds.same_channel(&up));
+        }
+        obs.shared.nudge();
+        obs.configure(config(false, "127.0.0.1", other_port))
+            .unwrap();
+        assert!(
+            newest(&obs).is_none(),
+            "a stopped link's commands are closed"
+        );
+        obs.shared.nudge();
+        drop(other);
+        clean(&obs, &dir);
     }
 
     /// D4, D16, D30: while off, every command works and nothing connects —
@@ -1783,7 +1978,7 @@ mod shared_tests {
         assert!(lock(&obs.link).is_none(), "no link ever started");
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
         assert!(!dialed(&listener), "nothing connected");
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
     }
 
     /// D4: switched on, `configure` moves the generation and says
@@ -1815,7 +2010,7 @@ mod shared_tests {
         // Off: the generation moves again, so that driver is stale.
         obs.configure(config(false, "127.0.0.1", port)).unwrap();
         assert!(obs.shared.current_gen() > gen + 1);
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&obs, &dir);
     }
 
     /// D24, D28: a new `ObsShared` (a Divora launch) reads the slots
@@ -1844,7 +2039,7 @@ mod shared_tests {
         // At launch, before any configure, a switch back for it is due.
         again.offer("timer-1", &ObsOp::SceneBack);
         assert_eq!(again.status().held_back, 1);
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&again, &dir);
     }
 
     /// §4: every message a command can refuse with is the fixture's
@@ -1913,11 +2108,8 @@ mod shared_tests {
             set(&obs, "a".repeat(MAX_PASSWORD_CHARS + 1)).unwrap_err(),
             said("setPassword", "tooLong")
         );
-        let (refusing, _seen) = shared_with(
-            &rt,
-            scratch("command-errors-refusing"),
-            MemCipher::refusing(),
-        );
+        let refusing_dir = scratch("command-errors-refusing");
+        let (refusing, _seen) = shared_with(&rt, refusing_dir.clone(), MemCipher::refusing());
         assert_eq!(
             set(&refusing, "pw".into()).unwrap_err(),
             said("setPassword", "encryptFailed")
@@ -1953,7 +2145,8 @@ mod shared_tests {
         // "OBS didn't answer in time." and "OBS refused the request." come
         // from a link that is asked: the seam's tests (§10.2 L24).
         std::fs::remove_file(&blocked).ok();
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&refusing, &refusing_dir);
+        clean(&obs, &dir);
     }
 
     /// §10.3: `obs_set_password`'s body, through success, a refused encrypt
@@ -1964,11 +2157,9 @@ mod shared_tests {
     fn set_password_logs_nothing_secret() {
         let rt = runtime();
         let (obs, seen, dir) = shared(&rt, "password-secret");
-        let (refusing, refused_seen) = shared_with(
-            &rt,
-            scratch("password-secret-refusing"),
-            MemCipher::refusing(),
-        );
+        let refusing_dir = scratch("password-secret-refusing");
+        let (refusing, refused_seen) =
+            shared_with(&rt, refusing_dir.clone(), MemCipher::refusing());
         let blocked = scratch("password-secret-blocked");
         std::fs::write(&blocked, "a file").unwrap();
         let (unwritable, blocked_seen) = shared_with(&rt, blocked.clone(), MemCipher::default());
@@ -2007,7 +2198,8 @@ mod shared_tests {
             PASSWORD.as_bytes()
         );
         std::fs::remove_file(&blocked).ok();
-        std::fs::remove_dir_all(&dir).ok();
+        clean(&refusing, &refusing_dir);
+        clean(&obs, &dir);
     }
 }
 
@@ -2190,6 +2382,42 @@ mod source_tests {
             assert!(!text.contains(&close), "{name}: {close}");
             assert!(!text.contains(&sink), "{name}: {sink}");
         }
+    }
+
+    /// D4 (mutation round): `ObsShared::start` moves the generation
+    /// (`begin`, under the status cell's lock) before it spawns the driver
+    /// with it, and holds that lock until the spawn. A driver spawned first
+    /// on a runtime with workers (Tauri's) could read the older generation,
+    /// take itself for stale for good and leave `connecting` up forever.
+    /// Every link test runs on a current-thread runtime, where a spawned
+    /// driver can't run before `start` returns, so no behaviour test can
+    /// see the order; this reads it.
+    #[test]
+    fn the_link_starts_after_its_generation() {
+        let mod_rs = &sources()
+            .into_iter()
+            .find(|(n, _)| n == "mod.rs")
+            .unwrap()
+            .1;
+        let head = format!(
+            "fn {}(&self, link: &mut Option<LinkHandle>, at: LinkConfig, restart: bool) {{",
+            "start"
+        );
+        let body = &mod_rs[mod_rs.find(&head).unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let at = |needle: String| {
+            assert_eq!(body.matches(&needle).count(), 1, "{needle}");
+            body.find(&needle).unwrap()
+        };
+        let locked = at(format!("let mut cell = {}(&self.shared.status);", "lock"));
+        let begun = at(format!("cell.{}(&at)", "begin"));
+        let spawned = at(format!("self.spawner.{}(link::run(", "spawn"));
+        assert!(locked < begun && begun < spawned, "lock, begin, spawn");
+        // The guard lives from the lock to the spawn: no drop, and its block
+        // (one level in) doesn't close in between.
+        let span = &body[locked..spawned];
+        assert!(!span.contains("drop(cell)"), "{span}");
+        assert!(!span.contains("\n        }"), "{span}");
     }
 
     /// §10.2: no test under `obs/` dials 4455, where a real OBS may listen.

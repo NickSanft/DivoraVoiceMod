@@ -204,6 +204,12 @@ pub fn seed_refused(gen: u64, request: &'static str, code: u64) {
     tracing::warn!(gen, request, code, "obs: couldn't read OBS's output status");
 }
 
+/// D23: `timer` started a new run (a `scene`) while an earlier run's
+/// switch back was due: that switch back was dropped.
+pub fn scene_back_superseded(timer: &str) {
+    tracing::info!(timer = %timer, "obs: a break started again; its earlier switch back was dropped");
+}
+
 /// D23: `timer`'s switch back waited out its grace and was dropped.
 pub fn scene_back_expired(timer: &str) {
     tracing::warn!(timer = %timer, "obs: a switch back waited too long and was dropped");

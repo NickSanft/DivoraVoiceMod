@@ -380,8 +380,13 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect(statusLine(page)).toHaveText(LINES.kicked);
     await expect.poll(stops).toEqual([LINES.needsPassword, LINES.authFailed, LINES.tooOld, LINES.kicked]);
     await expect(tryAgain).toHaveCount(0);
-    await connectAgain.click();
+    // From the keyboard: Connect again goes once it's connecting, and hands
+    // its focus to the status line beside it, not to the page.
+    await connectAgain.focus();
+    await page.keyboard.press("Enter");
     await expect(statusLine(page)).toHaveText("Connecting to 127.0.0.1:4455…");
+    await expect(connectAgain).toHaveCount(0);
+    await expect(statusLine(page)).toBeFocused();
     await frames(page);
     expect(await spoken(page)).toHaveLength(6);
     expect(await obsWrites(page)).toEqual([CONFIGURE(true), RECONNECT, RECONNECT, RECONNECT]);

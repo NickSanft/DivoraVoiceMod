@@ -7669,8 +7669,13 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
   });
 
   describe("the inventory", () => {
+    // Connected (an answer is kept only then), with nothing on screen, so
+    // the store reads only when a test asks it to.
+    const connected = (be: ReturnType<typeof rust>) => be.emit({ state: "connected", inventoryRev: 1 });
+
     it("reads OBS's lists, one call at a time: a second joins the one in flight", async () => {
       const { result, be } = await boot({ obs: ON });
+      connected(be);
       be.hold("obs_inventory");
       const a = result.refreshObsInventory();
       const b = result.refreshObsInventory();
@@ -7688,6 +7693,7 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
     it("one that fails clears the list and keeps Rust's words; the next that works clears them", async () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const { result, be } = await boot({ obs: ON });
+      connected(be);
       await result.refreshObsInventory();
       be.refuseNext("obs_inventory", "OBS is busy. Try again in a moment.");
       expect(await result.refreshObsInventory()).toBeNull();
@@ -7721,6 +7727,7 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
           countdown("timer-2", { name: "Uptime", kind: "countup", obsText: { uuid: GAME, name: "Not a source" } }),
         ],
       });
+      connected(be);
       const setItem = vi.spyOn(Storage.prototype, "setItem");
       await result.refreshObsInventory();
       await settle();
@@ -7748,6 +7755,7 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
         obs: ON,
         timers: [countdown("timer-1", { obsText: { uuid: TEXT, name: "Old text" } })],
       });
+      connected(be);
       await result.refreshObsInventory();
       await settle();
       expect(storedTimers()[0]!.obsText).toEqual({ uuid: TEXT, name: "Timer text" });
@@ -7784,6 +7792,111 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
       be.emit({ state: "connected", inventoryRev: 5 });
       await settle();
       expect(inventories()).toBe(3);
+    });
+
+    it("a rev that comes while a read is in flight is read once that read ends, not marked read by it", async () => {
+      const { result, be } = await boot({ obs: ON });
+      const inventories = () => obsCmds().filter((c) => c === "obs_inventory").length;
+      result.watchObs();
+      be.hold("obs_inventory");
+      be.emit({ state: "connected", inventoryRev: 1 });
+      await settle();
+      expect(inventories()).toBe(1);
+      // OBS's scenes change while that read is held: its list may be from
+      // before the change, so the new rev isn't joined to it.
+      be.emit({ inventoryRev: 2 });
+      await settle();
+      expect(inventories()).toBe(1);
+      be.release("obs_inventory");
+      await settle();
+      expect(inventories()).toBe(2);
+      expect(result.obsInventoryBusy()).toBe(false);
+      // A picker's open read, the same: rev 3 comes while it's held.
+      be.hold("obs_inventory");
+      void result.refreshObsInventory();
+      await settle();
+      expect(inventories()).toBe(3);
+      be.emit({ inventoryRev: 3 });
+      await settle();
+      expect(inventories()).toBe(3);
+      be.release("obs_inventory");
+      await settle();
+      expect(inventories()).toBe(4);
+      // Nothing newer: no more.
+      be.emit({ stream: "live" });
+      await settle();
+      expect(inventories()).toBe(4);
+    });
+
+    it("leaving connected drops the list and its words, and a read begun before keeps nothing; the next connection reads its own", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const B = { ...INVENTORY, rev: 2, scenes: [{ uuid: GAME, name: "Game" }], textSources: [] };
+      const { result, be } = await boot({ obs: ON });
+      const inventories = () => obsCmds().filter((c) => c === "obs_inventory").length;
+      result.watchObs();
+      be.emit({ state: "connected", inventoryRev: 1 });
+      await settle();
+      expect(result.obsInventory()).toEqual(INVENTORY);
+      // A drop: the list goes at once.
+      be.emit({ state: "retrying" });
+      expect(result.obsInventory()).toBeNull();
+      // So do a failed read's words.
+      be.emit({ state: "connected", inventoryRev: 2 });
+      await settle();
+      be.refuseNext("obs_inventory", "OBS is busy. Try again in a moment.");
+      await result.refreshObsInventory();
+      expect(result.obsInventoryError()).toBe("OBS is busy. Try again in a moment.");
+      be.emit({ state: "retrying" });
+      expect(result.obsInventoryError()).toBeNull();
+      be.emit({ state: "connected", inventoryRev: 3 });
+      await settle();
+      expect(result.obsInventory()).toEqual(INVENTORY);
+      // A picker's read on this connection, answered (with this OBS's
+      // list) only after the link dropped and connected to another OBS.
+      const reads = inventories();
+      be.hold("obs_inventory");
+      const late = result.refreshObsInventory();
+      await settle();
+      be.emit({ state: "connecting", host: "192.168.1.20" });
+      expect(result.obsInventory()).toBeNull();
+      be.emit({ state: "connected", inventoryRev: 4 });
+      await settle();
+      // The new connection's read waits for the one in flight.
+      expect(inventories()).toBe(reads + 1);
+      be.setInventory(B);
+      be.release("obs_inventory");
+      // The late answer is kept nowhere and answers null…
+      expect(await late).toBeNull();
+      await settle();
+      // …and the new connection reads its own list.
+      expect(inventories()).toBe(reads + 2);
+      expect(result.obsInventory()).toEqual(B);
+      // An error that lands late is kept nowhere either.
+      be.hold("obs_inventory");
+      be.refuseNext("obs_inventory", "OBS isn't connected.");
+      const failed = result.refreshObsInventory();
+      await settle();
+      be.emit({ state: "retrying" });
+      be.release("obs_inventory");
+      expect(await failed).toBeNull();
+      expect(result.obsInventory()).toBeNull();
+      expect(result.obsInventoryError()).toBeNull();
+    });
+
+    it("a read that answers while the mirror isn't connected keeps nothing, even one begun then: the list is null until connected", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { result, be } = await boot({ obs: ON });
+      // Booted on: connecting, and never connected yet.
+      expect(result.obsStatus()?.state).toBe("connecting");
+      expect(await result.refreshObsInventory()).toBeNull();
+      expect(result.obsInventory()).toBeNull();
+      be.refuseNext("obs_inventory", "OBS isn't connected.");
+      expect(await result.refreshObsInventory()).toBeNull();
+      expect(result.obsInventoryError()).toBeNull();
+      // Connected, the same read is kept.
+      connected(be);
+      expect(await result.refreshObsInventory()).toEqual(INVENTORY);
+      expect(result.obsInventory()).toEqual(INVENTORY);
     });
   });
 
@@ -7870,6 +7983,8 @@ describe("app store — Talk to OBS (v1.61.0)", () => {
         obs: { ...ON, breakScene: { uuid: BRB, name: "BRB" } },
         timers: [countdown("timer-1", { onFire: [{ ...SCENE, sceneName: "Old BRB" }] }), TIMERS[1]],
       });
+      // Connected, as an inventory's answer is kept only then.
+      be.emit({ state: "connected", inventoryRev: 1 });
       be.hold("reset_timer");
       const first = result.resetTimer("timer-1");
       await settle();

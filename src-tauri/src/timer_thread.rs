@@ -133,8 +133,9 @@ pub trait ActionHost: Send + 'static {
     /// being prepared, is stale (D21).
     fn end_run(&self, timer: &str);
     /// v1.61.0: `Obs`: hand `timer`'s scene switch to the OBS link, which
-    /// never waits (D17).
-    fn obs(&self, timer: &str, op: &ObsOp);
+    /// never waits (D17). `hook`: which list it came from (a start's `scene`
+    /// begins a new run, D23).
+    fn obs(&self, timer: &str, hook: Hook, op: &ObsOp);
 }
 
 /// v1.60.0: `b` to the action worker without waiting (`try_send`, as the
@@ -212,7 +213,7 @@ pub fn run_action_worker(rx: Receiver<ActionBatch>, host: &dyn ActionHost) {
                 Action::Panic => host.stop_all(),
                 Action::SaveReplay => host.save_replay(b.at),
                 Action::Speak { text, voice_id } => host.speak(&b.id, text, voice_id),
-                Action::Obs(op) => host.obs(&b.id, op),
+                Action::Obs(op) => host.obs(&b.id, b.hook, op),
                 Action::Preset { .. }
                 | Action::RandomPreset
                 | Action::RevertPreset
@@ -1736,8 +1737,8 @@ mod tests {
         /// The timer, the text and the voice.
         Speak(String, String, String),
         EndRun(String),
-        /// v1.61.0: the timer and its OBS op.
-        Obs(String, ObsOp),
+        /// v1.61.0: the timer, the list it came from and its OBS op.
+        Obs(String, Hook, ObsOp),
     }
 
     fn end_run(id: &str) -> Call {
@@ -1797,8 +1798,8 @@ mod tests {
             self.push(end_run(timer));
         }
 
-        fn obs(&self, timer: &str, op: &ObsOp) {
-            self.push(Call::Obs(timer.to_string(), op.clone()));
+        fn obs(&self, timer: &str, hook: Hook, op: &ObsOp) {
+            self.push(Call::Obs(timer.to_string(), hook, op.clone()));
         }
     }
 
@@ -2951,8 +2952,9 @@ mod tests {
     }
 
     /// v1.61.0 (seam 2, the worker's half): an `obs` action reaches the
-    /// host's `obs` with its timer, in list order with the rest; the host
-    /// hands it to the OBS link (`AppHost::obs`, which never waits).
+    /// host's `obs` with its timer and its batch's list (a start's `scene`
+    /// begins a new run, D23), in list order with the rest; the host hands
+    /// it to the OBS link (`AppHost::obs`, which never waits).
     #[test]
     fn the_worker_hands_obs_ops_to_its_host() {
         let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
@@ -2992,10 +2994,10 @@ mod tests {
             host.calls(),
             [
                 Call::Muted(true),
-                Call::Obs("timer-1".to_string(), brb),
+                Call::Obs("timer-1".to_string(), Hook::Start, brb),
                 end_run("timer-1"),
                 Call::Muted(false),
-                Call::Obs("timer-1".to_string(), ObsOp::SceneBack),
+                Call::Obs("timer-1".to_string(), Hook::End, ObsOp::SceneBack),
             ]
         );
     }

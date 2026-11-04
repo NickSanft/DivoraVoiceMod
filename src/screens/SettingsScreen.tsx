@@ -47,6 +47,7 @@ import { LISTBOX_MOVES, listboxStep, revealOption, Select, type SelectOption } f
 import { Sigil, type SigilName } from "../components/Sigil";
 import { Toggle } from "../components/Toggle";
 import { blurOnPointer } from "../components/blurOnPointer";
+import { handOffFocus } from "../components/handOffFocus";
 import { clearWizardSeenFlag } from "../components/Wizard";
 import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
@@ -110,6 +111,7 @@ import {
   type TimerHook,
 } from "../data/timerActions";
 import {
+  OBS_NOT_CONNECTED,
   OBS_PORT_ERROR,
   OBS_SAVED_ADDRESS_LINE,
   obsAnnouncement,
@@ -3606,6 +3608,12 @@ function ObsPicker(props: {
     const s = props.stored;
     return s !== null && shown().text === `${s.name === "" ? "(no name)" : s.name} (not in OBS now)`;
   };
+  // The lines under it describe the trigger, as a field's reason does.
+  const goneId = `obs-picker-gone-${createUniqueId()}`;
+  const noteId = `obs-picker-note-${createUniqueId()}`;
+  const describedBy = (): string | undefined =>
+    [gone() && props.goneLine ? goneId : "", shown().note ? noteId : ""].filter((x) => x !== "").join(" ") ||
+    undefined;
   return (
     <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
       <Select
@@ -3619,13 +3627,22 @@ function ObsPicker(props: {
           if (connected()) void app.refreshObsInventory();
         }}
         ariaLabel={props.ariaLabel}
+        describedBy={describedBy()}
         blurOnPointer
       />
       <Show when={gone() && props.goneLine}>
-        {(line) => <div style={reasonStyle}>{line()}</div>}
+        {(line) => (
+          <div id={goneId} style={reasonStyle}>
+            {line()}
+          </div>
+        )}
       </Show>
       <Show when={shown().note}>
-        {(note) => <div style={app.obsInventoryError() !== null ? reasonStyle : helpStyle}>{note()}</div>}
+        {(note) => (
+          <div id={noteId} style={app.obsInventoryError() !== null ? reasonStyle : helpStyle}>
+            {note()}
+          </div>
+        )}
       </Show>
     </div>
   );
@@ -3660,7 +3677,7 @@ function TimerObsRows(props: { id: string; name: string; timer: StoredTimer }): 
   return (
     <>
       <Show when={obsOn() || shownIn() !== null}>
-        <FieldRow label="Show in OBS">
+        <FieldRow label="Show in OBS" handsOnFocus>
           <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)" }}>
             <div style={{ "max-width": "280px" }}>
               <ObsPicker
@@ -3694,7 +3711,7 @@ function TimerObsRows(props: { id: string; name: string; timer: StoredTimer }): 
         </FieldRow>
       </Show>
       <Show when={props.timer.kind === "countup" && (obsOn() || follow() !== null)}>
-        <FieldRow label="Follow OBS">
+        <FieldRow label="Follow OBS" handsOnFocus>
           <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s1)", "align-items": "flex-start" }}>
             <Segmented<"off" | FollowObs>
               options={FOLLOW_OBS_CHOICES}
@@ -4303,10 +4320,17 @@ function AddActionMenu(props: {
         // v1.61.0: OBS's scenes as they are now (the list is null after
         // every launch), then one other than the live scene, so it switches
         // something. Unreadable: nothing is added, and the note says why.
-        const inv = await app.refreshObsInventory();
+        // A null with no error is an answer from a connection that's gone
+        // (the pick joined a read from before a reconnect, or the link
+        // dropped while it was read): asked once more if OBS is connected
+        // again, else the note says it isn't.
+        let inv = await app.refreshObsInventory();
+        if (inv === null && app.obsInventoryError() === null && app.obsStatus()?.state === "connected") {
+          inv = await app.refreshObsInventory();
+        }
         if (inv === null) {
-          const why = app.obsInventoryError();
-          if (why !== null) setNote(`Couldn't read OBS's scenes: ${why}`);
+          const why = app.obsInventoryError() ?? OBS_NOT_CONNECTED;
+          setNote(`Couldn't read OBS's scenes: ${why}`);
           return null;
         }
         const scene = inv.scenes.find((x) => x.uuid !== inv.programSceneUuid) ?? inv.scenes[0];
@@ -4430,6 +4454,12 @@ function AddActionMenu(props: {
           </div>
         )}
       </Show>
+      {/* Said as it appears (the focus stays on Add action, which the note
+          isn't tied to). Always mounted: a region inserted together with
+          its text is commonly missed. */}
+      <span class="sr-only" role="status" aria-live="polite" data-testid="add-action-note-said">
+        {note() ?? ""}
+      </span>
     </>
   );
 }
@@ -4449,7 +4479,7 @@ const OBS_INTRO =
   "Divora can show a timer's time in an OBS text source, switch OBS to a scene for a break and back, and start a count-up when you go live or start recording. It talks to the WebSocket server built into OBS.";
 const OBS_EXPLAINER: readonly string[] = [
   "When this is on, Divora keeps one connection open to OBS at the address below — this PC unless you change it. For OBS, it connects nowhere else, and it never listens for connections.",
-  "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick.",
+  "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick, and of the scene a timer switched OBS away from, so it can switch back.",
   "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. It changes only the text of the sources you pick, and that text stays in OBS after Divora stops.",
   // The menu path is the plan's; U15 checks it against OBS before the tag.
   "OBS ships with its WebSocket server off. In OBS: Tools → WebSocket Server Settings → Enable WebSocket server, then Show Connect Info for the password.",
@@ -4611,7 +4641,20 @@ function ObsSection(): JSX.Element {
   const [password, setPassword] = createSignal("");
   const [passwordError, setPasswordError] = createSignal<string | null>(null);
   const passwordReasonId = `obs-password-reason-${createUniqueId()}`;
+  // A space at either end, which the masked field doesn't show: said by
+  // the field's own status region as it appears (a description added while
+  // the field has the focus isn't read), and describing the field after.
+  const passwordSpacesId = `obs-password-spaces-${createUniqueId()}`;
+  const spaced = () => /^\s|\s$/.test(password());
+  const passwordDescribedBy = (): string | undefined =>
+    [passwordError() !== null ? passwordReasonId : "", spaced() ? passwordSpacesId : ""]
+      .filter((x) => x !== "")
+      .join(" ") || undefined;
   const hasPassword = () => status()?.hasPassword ?? null;
+  // Try again and Forget password go once pressed (connecting; forgotten):
+  // the focus they held goes to the status line and to Save password.
+  let statusLineRef: HTMLDivElement | undefined;
+  let savePasswordRef: HTMLButtonElement | undefined;
   const savePassword = async (): Promise<void> => {
     const refused = await app.obsSavePassword(password());
     setPassword("");
@@ -4676,7 +4719,11 @@ function ObsSection(): JSX.Element {
                     {/* Plain text, never a live region: its countdown would
                         talk every second. The announcer says the edges. */}
                     <div style={{ ...rowLineStyle, "justify-content": "space-between" }}>
-                      <div data-testid="obs-status-line" style={{ ...rowLineStyle, ...rowTextStyle, flex: "1 1 240px" }}>
+                      <div
+                        ref={statusLineRef}
+                        data-testid="obs-status-line"
+                        style={{ ...rowLineStyle, ...rowTextStyle, flex: "1 1 240px" }}
+                      >
                         <Sigil
                           name="link"
                           size={16}
@@ -4688,18 +4735,26 @@ function ObsSection(): JSX.Element {
                         <span style={{ flex: 1, "min-width": 0 }}>{obsStatusLine(s(), now())}</span>
                       </div>
                       <Show when={obsRetryLabel(s())}>
-                        {(label) => (
-                          <Button
-                            size="sm"
-                            icon="refresh"
-                            onClick={(e) => {
-                              blurOnPointer(e);
-                              void app.obsReconnect();
-                            }}
-                          >
-                            {label()}
-                          </Button>
-                        )}
+                        {(label) => {
+                          let retry: HTMLButtonElement | undefined;
+                          handOffFocus(
+                            () => retry,
+                            () => statusLineRef,
+                          );
+                          return (
+                            <Button
+                              ref={retry}
+                              size="sm"
+                              icon="refresh"
+                              onClick={(e) => {
+                                blurOnPointer(e);
+                                void app.obsReconnect();
+                              }}
+                            >
+                              {label()}
+                            </Button>
+                          );
+                        }}
                       </Show>
                     </div>
                     <Show when={obsSkipLine(s(), obsClockTime)}>
@@ -4824,7 +4879,7 @@ function ObsSection(): JSX.Element {
                 placeholder="Paste OBS's password"
                 aria-label="OBS password"
                 aria-invalid={passwordError() !== null ? "true" : undefined}
-                aria-describedby={passwordError() !== null ? passwordReasonId : undefined}
+                aria-describedby={passwordDescribedBy()}
                 autocomplete="off"
                 spellcheck={false}
                 onInput={(e) => {
@@ -4846,6 +4901,7 @@ function ObsSection(): JSX.Element {
                 }}
               />
               <Button
+                ref={savePasswordRef}
                 size="sm"
                 onClick={(e) => {
                   blurOnPointer(e);
@@ -4855,25 +4911,35 @@ function ObsSection(): JSX.Element {
                 Save password
               </Button>
               <Show when={hasPassword()}>
-                <Button
-                  variant="danger"
-                  size="sm"
-                  icon="trash"
-                  aria-label={forgetting() ? "Click again to forget the OBS password" : undefined}
-                  onClick={(e) => {
-                    blurOnPointer(e);
-                    clearTimeout(forgetReset);
-                    if (forgetting()) {
-                      setForgetting(false);
-                      void forgetPassword();
-                      return;
-                    }
-                    setForgetting(true);
-                    forgetReset = setTimeout(() => setForgetting(false), 3000);
-                  }}
-                >
-                  {forgetting() ? "Forget?" : "Forget password"}
-                </Button>
+                {(_saved) => {
+                  let forget: HTMLButtonElement | undefined;
+                  handOffFocus(
+                    () => forget,
+                    () => savePasswordRef,
+                  );
+                  return (
+                    <Button
+                      ref={forget}
+                      variant="danger"
+                      size="sm"
+                      icon="trash"
+                      aria-label={forgetting() ? "Click again to forget the OBS password" : undefined}
+                      onClick={(e) => {
+                        blurOnPointer(e);
+                        clearTimeout(forgetReset);
+                        if (forgetting()) {
+                          setForgetting(false);
+                          void forgetPassword();
+                          return;
+                        }
+                        setForgetting(true);
+                        forgetReset = setTimeout(() => setForgetting(false), 3000);
+                      }}
+                    >
+                      {forgetting() ? "Forget?" : "Forget password"}
+                    </Button>
+                  );
+                }}
               </Show>
             </div>
             <Show when={passwordError()}>
@@ -4883,9 +4949,16 @@ function ObsSection(): JSX.Element {
                 </div>
               )}
             </Show>
-            <Show when={/^\s|\s$/.test(password())}>
-              <div style={reasonStyle}>{OBS_PASSWORD_SPACES}</div>
+            <Show when={spaced()}>
+              <div id={passwordSpacesId} style={reasonStyle}>
+                {OBS_PASSWORD_SPACES}
+              </div>
             </Show>
+            {/* Always mounted: a region inserted together with its text is
+                commonly missed. */}
+            <span class="sr-only" role="status" aria-live="polite" data-testid="obs-password-spaces-said">
+              {spaced() ? OBS_PASSWORD_SPACES : ""}
+            </span>
             <Show when={hasPassword() !== null}>
               <div style={helpStyle}>{hasPassword() ? OBS_PASSWORD_SAVED : OBS_PASSWORD_NONE}</div>
             </Show>
@@ -5233,11 +5306,17 @@ function AboutSection(): JSX.Element {
 interface FieldRowProps {
   label: string;
   children: JSX.Element;
+  /** v1.61.0: a row that can go because of its own control (a timer's OBS
+   *  row cleared while Settings → OBS is off) hands the focus it holds to
+   *  the next control as it goes (handOffFocus). */
+  handsOnFocus?: boolean;
 }
 
 function FieldRow(props: FieldRowProps): JSX.Element {
+  let row: HTMLDivElement | undefined;
+  if (props.handsOnFocus) handOffFocus(() => row);
   return (
-    <div>
+    <div ref={row}>
       <div class="field-label">{props.label}</div>
       {props.children}
     </div>

@@ -70,6 +70,10 @@ pub struct Slots {
     /// first) is marked due again and keeps that stamp, so its grace still
     /// counts from `offer` (D23).
     taken: Vec<(String, Instant)>,
+    /// `(timer, when its latest run started)`: a start that switches a
+    /// scene, as [`started`](Self::started) recorded it, one per timer. A
+    /// switch back stamped before it is an earlier run's and never runs.
+    starts: Vec<(String, Instant)>,
 }
 
 impl Slots {
@@ -146,17 +150,80 @@ impl Slots {
 
     /// D23: `timer`'s switch back is due, stamped `at`; a mark already there
     /// keeps its earlier stamp, and so does one taken and not committed
-    /// (due again with its first stamp).
+    /// (due again with its first stamp). A mark from before the timer's
+    /// latest start is an earlier run's: it is ignored, so a break started
+    /// again is never switched back by the run before it.
     pub fn mark_due(&mut self, timer: &str, at: Instant) {
         let first = self
             .taken
             .iter()
-            .find(|(t, _)| t == timer)
+            .find(|(t, stamp)| t == timer && !self.superseded(timer, *stamp))
             .map_or(at, |&(_, first)| first.min(at));
+        if self.superseded(timer, first) {
+            return;
+        }
         match self.due.iter_mut().find(|(t, _)| t == timer) {
             Some((_, stamp)) => *stamp = (*stamp).min(first),
             None => self.due.push((timer.to_string(), first)),
         }
+    }
+
+    /// D23: a mark [`take_due`](Self::take_due) handed out couldn't finish
+    /// (a Get that timed out or got 207, a session that ended first): due
+    /// again with its first stamp. Nothing when the take is gone — its
+    /// grace ran out, OBS was switched off, the timer's next `scene` ran —
+    /// or belongs to a run before the timer's latest start (then the take
+    /// goes too).
+    pub fn remark(&mut self, timer: &str) {
+        let Some(first) = self
+            .taken
+            .iter()
+            .find(|(t, _)| t == timer)
+            .map(|&(_, first)| first)
+        else {
+            return;
+        };
+        if self.superseded(timer, first) {
+            self.release(timer);
+            return;
+        }
+        self.mark_due(timer, first);
+    }
+
+    /// D23: the timer's take is let go without a commit (a driver that went
+    /// stale before it could commit): it no longer counts as held back.
+    /// The slot stays.
+    pub fn release(&mut self, timer: &str) {
+        self.taken.retain(|(t, _)| t != timer);
+    }
+
+    /// D23: `timer` started a new run at `at` with a `scene` op: its switch
+    /// backs from earlier runs — due, or in flight and failing later — no
+    /// longer apply (a mark taken and in flight keeps its stamp, so its
+    /// failure is known for an earlier run's). Answers whether a due mark
+    /// was dropped.
+    pub fn started(&mut self, timer: &str, at: Instant) -> bool {
+        let before = self.due.len();
+        self.due.retain(|(t, stamp)| t != timer || *stamp >= at);
+        match self.starts.iter_mut().find(|(t, _)| t == timer) {
+            Some((_, s)) => *s = (*s).max(at),
+            None => self.starts.push((timer.to_string(), at)),
+        }
+        self.due.len() != before
+    }
+
+    /// When `timer`'s latest run started, if [`started`](Self::started)
+    /// recorded it.
+    fn start_of(&self, timer: &str) -> Option<Instant> {
+        self.starts
+            .iter()
+            .find(|(t, _)| t == timer)
+            .map(|&(_, at)| at)
+    }
+
+    /// Whether `stamp` is from before `timer`'s latest start.
+    fn superseded(&self, timer: &str, stamp: Instant) -> bool {
+        self.start_of(timer).is_some_and(|s| stamp < s)
     }
 
     /// D23: the due mark to run next (taken out; one whose timer has no slot
@@ -208,15 +275,24 @@ impl Slots {
             false
         });
         self.taken.retain(|(_, stamp)| within(stamp));
+        // A start older than the grace can't outrank a live mark: every
+        // mark it would ignore is past the grace too.
+        self.starts.retain(|(_, at)| within(at));
         expired
     }
 
     /// D23: when the earliest due mark's `grace` runs out: the first moment
     /// [`take_due`](Self::take_due) drops it (a mark is still live at
-    /// exactly `grace`).
+    /// exactly `grace`). A take not yet committed counts too, so one that
+    /// is never finished still goes at its grace.
     pub fn next_expiry(&self, grace: Duration) -> Option<Instant> {
         let past = grace.saturating_add(Duration::from_nanos(1));
-        let earliest = self.due.iter().map(|(_, stamp)| *stamp).min()?;
+        let earliest = self
+            .due
+            .iter()
+            .chain(&self.taken)
+            .map(|(_, stamp)| *stamp)
+            .min()?;
         earliest.checked_add(past)
     }
 
@@ -227,9 +303,21 @@ impl Slots {
         self.taken.clear();
     }
 
-    /// D23: the status's `heldBack`: due marks whose timer has a slot.
+    /// D23: the status's `heldBack`: the timers with a slot whose switch
+    /// back is due, or taken and not yet committed (so a switch back OBS
+    /// keeps answering 207 stays held while it is tried, rather than
+    /// dropping to 0 for each try), each once. A take from before the
+    /// timer's latest start doesn't count: it never switches back again.
     pub fn due_count(&self) -> u32 {
-        let n = self.due.iter().filter(|(t, _)| self.has_slot(t)).count();
+        let due = self.due.iter().map(|(t, _)| t);
+        let taken = self
+            .taken
+            .iter()
+            .filter(|(t, stamp)| {
+                !self.superseded(t, *stamp) && !self.due.iter().any(|(d, _)| d == t)
+            })
+            .map(|(t, _)| t);
+        let n = due.chain(taken).filter(|t| self.has_slot(t)).count();
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 
@@ -536,12 +624,15 @@ mod tests {
         assert_eq!(slot_of(&late, "A"), pair("Game", "BRB"));
 
         // Taken at 100 s, its Get timed out, made due again at 110 s: the
-        // grace still counts from t0.
+        // grace still counts from t0. While taken it is still held back
+        // (a switch back OBS answers 207 to stays 1 while it is tried).
         let (next, gone) = s.take_due(t0 + s_(100), grace);
         assert_eq!((next.as_deref(), gone.len()), (Some("A"), 0));
-        assert_eq!(s.due_count(), 0);
+        assert_eq!(s.due_count(), 1);
+        assert_eq!(s.next_expiry(grace), Some(expiry), "a take expires too");
         s.mark_due("A", t0 + s_(110));
         assert_eq!(s.due, vec![("A".to_string(), t0)]);
+        assert_eq!(s.due_count(), 1, "due and taken: one timer");
         assert_eq!(s.next_expiry(grace), Some(expiry));
         assert_eq!(
             s.take_due(t0 + s_(121), grace),
@@ -576,10 +667,19 @@ mod tests {
         s.mark_due("A", t0 + s_(1));
         assert_eq!(s.due_count(), 2);
         assert_eq!(s.take_due(t0 + s_(3), grace).0.as_deref(), Some("A"));
-        assert_eq!(s.due_count(), 1);
+        assert_eq!(s.due_count(), 2, "A taken, B due");
+        let plan = s.plan_back("A", "uuid-BRB");
+        s.commit_back("A", plan);
+        assert_eq!(s.due_count(), 1, "A committed");
         assert_eq!(s.take_due(t0 + s_(3), grace).0.as_deref(), Some("B"));
+        assert_eq!(s.due_count(), 1, "B taken");
         assert_eq!(s.take_due(t0 + s_(3), grace), (None, Vec::new()));
         assert_eq!(s.due, Vec::<(String, Instant)>::new());
+        // A take let go (a stale driver's) is no longer held back; the slot
+        // stays.
+        s.release("B");
+        assert_eq!((s.due_count(), s.next_expiry(grace)), (0, None));
+        assert_eq!(slot_of(&s, "B"), pair("Game", "Chat"));
         let mut s = with(&[("A", "Game", "BRB")]);
         s.mark_due("none", t0);
         s.mark_due("A", t0 + s_(10));
@@ -619,6 +719,88 @@ mod tests {
         assert_eq!(s.list.len(), 2);
         s.mark_due("A", t0 + s_(300));
         assert_eq!(s.due, vec![("A".to_string(), t0 + s_(300))]);
+    }
+
+    /// D23: a timer started again (its start's `scene`) drops the switch
+    /// backs of its earlier runs: one due, one taken and failing after the
+    /// start, one still queued and failing after it; its new run's own
+    /// mark, made after the start, still counts. A mark taken that can't
+    /// finish is due again with its first stamp, or nothing once the take
+    /// is gone.
+    #[test]
+    fn a_new_run_drops_earlier_switch_backs() {
+        let grace = Duration::from_secs(120);
+        let s_ = Duration::from_secs;
+        let t0 = Instant::now();
+
+        // Due while OBS was down, then Start again: dropped at once.
+        let mut s = with(&[("A", "Game", "BRB"), ("B", "Game", "Chat")]);
+        s.mark_due("A", t0);
+        s.mark_due("B", t0);
+        assert!(s.started("A", t0 + s_(5)));
+        assert_eq!(s.due, vec![("B".to_string(), t0)], "B's run goes on");
+        assert_eq!(s.due_count(), 1);
+        assert!(!s.started("A", t0 + s_(6)), "nothing left to drop");
+        // The run before it, failing later (a queued op's stamp): ignored.
+        s.mark_due("A", t0 + s_(1));
+        assert_eq!(s.take_due(t0 + s_(7), grace).0.as_deref(), Some("B"));
+        assert_eq!(s.take_due(t0 + s_(7), grace), (None, Vec::new()));
+        // The new run's own end: due.
+        s.mark_due("A", t0 + s_(8));
+        assert_eq!(s.due, vec![("A".to_string(), t0 + s_(8))]);
+
+        // Taken and in flight when Start comes: its failure isn't due
+        // again, and the take goes, so it isn't held back.
+        let mut s = with(&[("A", "Game", "BRB")]);
+        s.mark_due("A", t0);
+        assert_eq!(s.take_due(t0 + s_(1), grace).0.as_deref(), Some("A"));
+        s.started("A", t0 + s_(2));
+        assert_eq!(s.due_count(), 0, "an earlier run's take isn't held back");
+        s.remark("A");
+        assert_eq!((s.due_count(), s.next_expiry(grace)), (0, None));
+        // The new run's end, after its scene was skipped (the slot is the
+        // old one): due with its own stamp.
+        s.mark_due("A", t0 + s_(3));
+        assert_eq!(s.due, vec![("A".to_string(), t0 + s_(3))]);
+
+        // The new run ends while the earlier run's take is still in flight:
+        // its mark is due with its own stamp (the earlier take's isn't its
+        // first), and the earlier take failing after leaves it as it is.
+        let mut s = with(&[("A", "Game", "BRB")]);
+        s.mark_due("A", t0);
+        assert_eq!(s.take_due(t0 + s_(1), grace).0.as_deref(), Some("A"));
+        s.started("A", t0 + s_(2));
+        s.mark_due("A", t0 + s_(3));
+        assert_eq!(s.due, vec![("A".to_string(), t0 + s_(3))]);
+        assert_eq!(s.due_count(), 1, "the new run's");
+        s.remark("A");
+        assert_eq!(s.due, vec![("A".to_string(), t0 + s_(3))]);
+        assert_eq!(
+            s.next_expiry(grace),
+            (t0 + s_(3)).checked_add(grace + Duration::from_nanos(1))
+        );
+
+        // A take that can't finish: due again with its first stamp; once
+        // the take is gone (expired, off, committed, the next scene), the
+        // failure makes nothing.
+        let mut s = with(&[("A", "Game", "BRB")]);
+        s.mark_due("A", t0);
+        s.take_due(t0 + s_(1), grace);
+        s.remark("A");
+        assert_eq!(s.due, vec![("A".to_string(), t0)]);
+        s.take_due(t0 + s_(2), grace);
+        s.drop_due();
+        s.remark("A");
+        assert_eq!(s.due, Vec::<(String, Instant)>::new());
+        s.remark("never-taken");
+        assert_eq!(s.due, Vec::<(String, Instant)>::new());
+
+        // A start older than the grace is forgotten with the marks it
+        // could outrank.
+        let mut s = with(&[("A", "Game", "BRB")]);
+        s.started("A", t0);
+        s.expire_due(t0 + grace + s_(1), grace);
+        assert_eq!(s.starts, Vec::<(String, Instant)>::new());
     }
 
     /// D24: `returns.json` round-trips; on reading, slots older than 24 h,
