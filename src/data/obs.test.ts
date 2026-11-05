@@ -795,7 +795,7 @@ describe("pickerShown (§9.3's table)", () => {
 
   it("no text sources: None, and how to add one", () => {
     const empty = { ...INV, textSources: [] };
-    const note = "No text sources in OBS. Add a Text (GDI+) source there, then open this again.";
+    const note = "No text sources in OBS. Add a Text (GDI+) or Text (FreeType 2) source there, then open this again.";
     expect(p({ stored: null, inventory: empty })).toEqual(shown("None", null, note));
     expect(p({ inventory: empty })).toEqual(shown("Old name (not in OBS now)", null, note));
     expect(p({ what: "scene", stored: { uuid: UUID, name: "Old" }, inventory: empty })).toEqual(shown("BRB"));

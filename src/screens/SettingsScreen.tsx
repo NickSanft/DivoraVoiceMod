@@ -2615,7 +2615,7 @@ const LIST_WORDS: Record<TimerHook, { title: string; help: string; at: string; f
  *  general limit, with its cause, examples and a way to check (D37).
  *  v1.61.0: OBS not connected is one, Switch OBS back excepted. */
 const ACTIONS_LIMIT =
-  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, OBS isn't connected (a Switch OBS back excepted: it waits up to 2 minutes for OBS), or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
+  "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, OBS isn't connected (a Switch OBS back excepted: it waits up to 2 minutes for OBS), or Divora's window was reloading (Back to the preset before excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
 
 const LIST_FULL = "Up to 8 actions here. Remove one to add another.";
 

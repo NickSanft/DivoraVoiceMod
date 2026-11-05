@@ -885,7 +885,7 @@ export function pickerShown(p: {
   const cut = inv.truncated && list.length >= (scenes ? OBS_MAX_SCENES : OBS_MAX_TEXT_SOURCES);
   const note =
     !scenes && inv.textSources.length === 0
-      ? "No text sources in OBS. Add a Text (GDI+) source there, then open this again."
+      ? "No text sources in OBS. Add a Text (GDI+) or Text (FreeType 2) source there, then open this again."
       : cut
         ? scenes
           ? "Divora lists OBS's first 200 scenes."

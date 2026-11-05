@@ -1457,7 +1457,7 @@ describe("SettingsScreen — Timers that change your voice (v1.60.0)", () => {
   const ZERO_HELP =
     "Runs at 00:00 and when you press End now. If it ran out while your PC slept or Divora was closed, or finished more than 30 seconds late, only Unmute my voice, Back to the preset before and Switch OBS back run. If you reset or delete it while it's running or paused, they run only to undo its start: Unmute my voice only if its start muted you, and Switch OBS back only if its start switched OBS. A change here counts for the run that's going on.";
   const LIMIT =
-    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, OBS isn't connected (a Switch OBS back excepted: it waits up to 2 minutes for OBS), or Divora's window was reloading (a switch back excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
+    "An action that can't run when its moment comes is skipped, not tried later: for example its preset, clip or voice is gone, Replay is off (it's off after every launch) or already saving, the engine is stopped, OBS isn't connected (a Switch OBS back excepted: it waits up to 2 minutes for OBS), or Divora's window was reloading (Back to the preset before excepted: it comes once the window is back). To try a list, give it a 0:05 countdown and watch while it runs: the titlebar shows a mute and a change between Clean and Modulated, this card names a preset its start switched to, a save shows a notice, and a clip or a line in it plays on your call too.";
   const WARN = {
     muteNoUnmute:
       "This mutes you when it starts, and nothing at zero unmutes you, so you stay muted after it ends, is reset or is deleted. Add Unmute my voice at zero.",
@@ -3360,10 +3360,10 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     answer = () => inventory({ textSources: [] });
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 5 }));
     expect(
-      within(at).getByText("No text sources in OBS. Add a Text (GDI+) source there, then open this again."),
+      within(at).getByText("No text sources in OBS. Add a Text (GDI+) or Text (FreeType 2) source there, then open this again."),
     ).toBeInTheDocument();
     expect(mine()).toHaveAccessibleDescription(
-      "OBS can't find this source now. Pick it again, or pick another. No text sources in OBS. Add a Text (GDI+) source there, then open this again.",
+      "OBS can't find this source now. Pick it again, or pick another. No text sources in OBS. Add a Text (GDI+) or Text (FreeType 2) source there, then open this again.",
     );
     // A list cut at 100: said under it, and a source past the cut keeps its name.
     const hundred = Array.from({ length: 100 }, (_, i) => ({
