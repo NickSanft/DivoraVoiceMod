@@ -328,7 +328,7 @@ export function SpeakScreen(): JSX.Element {
               Without their voice models (the release installer includes them),
               the preset voices can't speak here and you can't add your own
               voice. Critter Chatter needs no download and works right away.
-              Everything stays on-device; no text you type here leaves your machine.
+              Speech is made on-device; no text you type here leaves your machine.
             </span>
           </div>
         </Show>

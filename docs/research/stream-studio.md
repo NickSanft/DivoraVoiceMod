@@ -1179,6 +1179,7 @@ The protocol Divora needs is small and frozen: rpcVersion 1, unchanged since 202
   - **Pings and pongs,** after U10: if OBS answers pings, the keepalive could wait for a pong rather than any frame.
   - **The OBS 30.1 wording,** after U9 (owner Q7), and the 3 s connect timeout against T6's refused-connect time on this PC (2,013 and 2,031 ms, and 2,056 ms twice in the first run: about 2 s, about 1 s under the timeout).
   - **A file of the sources Divora wrote** (owner Q3's alternative), so a source unmapped while Divora was closed is cleared too.
+  - **Two breaks to the same scene nest** (the What's-new gate, round 1): today, if the break that started first ends first, it switches OBS back while the other still runs. The fix needs `Slots` to know which timers are still running, so a stale slot (a countdown with Switch OBS scene and no Switch OBS back) isn't mistaken for a running one.
 
 ### Tail releases (optional; each its own minor; the plan can stop before any of them)
 

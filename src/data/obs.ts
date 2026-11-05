@@ -745,8 +745,8 @@ const SCENE_SKIP: Record<SkipWhy, (t: string, n: string) => string> = {
  *  refuses a status with either): a full queue or a slow OBS makes it wait
  *  instead. */
 const BACK_SKIP: Partial<Record<SkipWhy, (t: string) => string>> = {
-  notConnected: (t) => `${t}: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes of the break's end.`,
-  notReady: (t) => `${t}: Didn't switch OBS back: OBS stayed busy for 2 minutes after the break's end.`,
+  notConnected: (t) => `${t}: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes.`,
+  notReady: (t) => `${t}: Didn't switch OBS back: OBS stayed busy for 2 minutes.`,
   notFound: (t) => `${t}: Didn't switch OBS back: OBS doesn't have that scene now.`,
   timedOut: (t) => `${t}: OBS didn't answer the switch back in time. It may switch late, or not at all.`,
   failed: (t) => `${t}: OBS refused the switch back.`,

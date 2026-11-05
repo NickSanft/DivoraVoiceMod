@@ -6457,7 +6457,13 @@ So a scene you picked by hand during a break stays
 (Game → BRB), then B (BRB → Just Chatting); A ends under B and hands B Game,
 so B's end goes back to Game (`l16_a_stacked_break_inherits_the_way_back`).
 This is Back to the preset before's rule ("Timers that change your voice
-(v1.60.0)"), ported to Rust.
+(v1.60.0)"), ported to Rust. Two breaks to the SAME scene don't nest: B
+(BRB → BRB) records `from` BRB and sends no Set; if A ends first, OBS is
+still on A's `to`, so A switches to Game while B runs, and B's end then
+finds Game and does nothing (what's-new gate, round 1; from the code, no
+test). Telling a still-running B from a stale slot (a countdown whose list
+has no Switch OBS back leaves its slot) needs the timers' run state in
+`Slots`, so it waits ("Not in this release").
 
 When a scene op doesn't switch (`request_failure` and the driver):
 
@@ -7258,6 +7264,9 @@ In `obs/mod.rs`:
   will send it. `obs_reconnect` (Try again) is new instead.
 - Inputs and Config events, so a deleted or renamed source and a
   scene-collection switch are seen late ("The protocol").
+- Nesting two timers that switch to the same scene (two breaks from Add
+  break): the first to end switches back while the other runs ("Scenes:
+  slots, switch backs and the grace").
 - TLS, host names, a second OBS, hotkey ids or tray items for OBS, showing or
   hiding a source, starting or stopping a stream or a recording.
 - A clear that survives a Divora restart (a file of the uuids Divora wrote).

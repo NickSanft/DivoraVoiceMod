@@ -2546,7 +2546,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     "Starts from 0:00 when OBS starts, pauses when it stops (its last time stays until OBS starts again), and pauses with a paused recording. If OBS was already going when Divora connected, it starts from OBS's own count, so it's about right, and can be further behind after the stream reconnected. Its own buttons and keys still work; OBS's next start, stop, pause or resume, each time Divora connects to OBS, and a wake from sleep set it again. If Divora loses OBS, it keeps counting on its own until it connects again.";
   const READS_A_FILE = "reads a file — untick Read from file in its Properties in OBS to show a timer here";
   const SCENE_NOTE =
-    "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS takes more than 5 seconds to get to it, it doesn't switch.";
+    "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS is busy for more than 5 seconds before Divora can ask it, it doesn't switch. Once asked, a slow OBS can still switch late.";
   const BACK_NOTE =
     "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.";
   const ACTION_OFF = "Settings → OBS is off, so this does nothing until you turn it on.";
@@ -2673,7 +2673,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     for (let n = walk.nextNode(); n; n = walk.nextNode()) texts.push(n.nodeValue ?? "");
     return squash(texts.join(" "));
   };
-  /** A picker's trigger, by its name's start ("BRB OBS text source"). */
+  /** A picker's trigger, by its name's start ("Show in OBS for BRB"). */
   const picker = (el: HTMLElement, name: string): HTMLElement =>
     within(el).getByRole("button", { name: new RegExp(`^${name}: `) });
   /** What a picker's trigger shows: its text and its sub. */
@@ -3219,7 +3219,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     const view = mount();
     await flush();
     await emitTimers(1, timerState("timer-1"), timerState("timer-2", UPTIME), timerState("timer-3", { name: "Plain" }));
-    const shownIn = picker(card("timer-1"), "BRB OBS text source");
+    const shownIn = picker(card("timer-1"), "Show in OBS for BRB");
     expect(showing(shownIn)).toEqual(["Timer text", null]);
     expect(within(card("timer-1")).getByText("Shows in OBS's “Timer text” when Settings → OBS is on.")).toBeInTheDocument();
     expect(within(card("timer-1")).queryByText(SHOW_HELP)).toBeNull();
@@ -3254,8 +3254,8 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     const view = mount();
     await flush();
     await emitTimers(1, timerState("timer-1"), timerState("timer-2", { name: "Intro" }));
-    const mine = () => picker(card("timer-1"), "BRB OBS text source");
-    const theirs = () => picker(card("timer-2"), "Intro OBS text source");
+    const mine = () => picker(card("timer-1"), "Show in OBS for BRB");
+    const theirs = () => picker(card("timer-2"), "Show in OBS for Intro");
     // Connecting: what is stored, and that it isn't connected.
     expect(showing(mine())).toEqual(["None", null]);
     expect(showing(theirs())).toEqual(["Intro text (not connected)", null]);
@@ -3308,7 +3308,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     expect(saved()[0]!.obsText).toEqual({ uuid: TEXT.uuid, name: "Timer text" });
     expect(lastSync()[0]!.obsText).toEqual({ uuid: TEXT.uuid });
     expect(showing(mine())).toEqual(["Timer text", "Text (GDI+)"]);
-    expect(mine()).toHaveAccessibleName("BRB OBS text source: Timer text");
+    expect(mine()).toHaveAccessibleName("Show in OBS for BRB: Timer text");
     // A name past 256 characters is stored cut, so it still reads.
     fireEvent.click(mine(), { detail: 1 });
     fireEvent.click(view.getByRole("option", { name: /^L{300}/ }), { detail: 1 });
@@ -3329,7 +3329,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     const view = mount();
     await flush();
     await emitTimers(1, timerState("timer-1"));
-    const mine = () => picker(card("timer-1"), "BRB OBS text source");
+    const mine = () => picker(card("timer-1"), "Show in OBS for BRB");
     const at = card("timer-1");
     // OBS said it can't find it on this connection.
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 1, missing: [TEXT.uuid] }));
@@ -3381,7 +3381,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     answer = () => inventory({ textSources: [{ ...TEXT, readsFromFile: true }, INTRO_TEXT] });
     await emitObs(obsStatus(CONNECTED, { inventoryRev: 7 }));
     expect(showing(mine())).toEqual(["Timer text", READS_A_FILE]);
-    expect(mine()).toHaveAccessibleName("BRB OBS text source: Timer text");
+    expect(mine()).toHaveAccessibleName("Show in OBS for BRB: Timer text");
     expect(mine()).toHaveAccessibleDescription(READS_A_FILE);
   });
 
@@ -3665,7 +3665,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     const view = mount();
     await flush();
     await emitTimers(1, timerState("timer-1"));
-    const text = () => picker(card("timer-1"), "BRB OBS text source");
+    const text = () => picker(card("timer-1"), "Show in OBS for BRB");
     const scene = () => picker(rowsOf("onStart")[0]!, "BRB OBS scene at the start");
     const brb = () => picker(view.getByTestId("obs-break-row"), "OBS scene for breaks");
     /** What a picker offers once opened (and its open's read, if it can,
@@ -3767,7 +3767,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     await flush();
     await emitTimers(1, timerState("timer-1"), timerState("timer-2", UPTIME));
     // Show in OBS → None by the keys.
-    const shownIn = picker(card("timer-1"), "BRB OBS text source");
+    const shownIn = picker(card("timer-1"), "Show in OBS for BRB");
     shownIn.focus();
     fireEvent.keyDown(shownIn, { key: "Enter" });
     fireEvent.keyDown(shownIn, { key: "Home" });
@@ -3797,7 +3797,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     mount();
     await flush();
     await emitTimers(1, timerState("timer-2", UPTIME));
-    const shownIn = picker(card("timer-2"), "Uptime OBS text source");
+    const shownIn = picker(card("timer-2"), "Show in OBS for Uptime");
     shownIn.focus();
     fireEvent.keyDown(shownIn, { key: "Enter" });
     fireEvent.keyDown(shownIn, { key: "Home" });

@@ -268,7 +268,7 @@ describe("Select (v1.61.0)", () => {
             setV(next);
           }}
           onOpen={onOpen}
-          ariaLabel="BRB OBS text source"
+          ariaLabel="Show in OBS for BRB"
           blurOnPointer
         />
       );
@@ -337,7 +337,7 @@ describe("Select (v1.61.0)", () => {
     expect(view.getByRole("listbox")).toBeInTheDocument();
     expect(document.activeElement).toBe(trigger);
     expect(onChange).not.toHaveBeenCalled();
-    expect(trigger).toHaveAttribute("aria-label", "BRB OBS text source: None");
+    expect(trigger).toHaveAttribute("aria-label", "Show in OBS for BRB: None");
     // One that can be picked still is.
     fireEvent.click(options[1]!, { detail: 1 });
     expect(onChange.mock.calls).toEqual([["a"]]);
@@ -346,7 +346,7 @@ describe("Select (v1.61.0)", () => {
 
   it("a stored value whose option is disabled shows as any other, and opening highlights it", () => {
     const { view, trigger } = mountSources("c");
-    expect(trigger).toHaveAttribute("aria-label", "BRB OBS text source: Intro text");
+    expect(trigger).toHaveAttribute("aria-label", "Show in OBS for BRB: Intro text");
     expect(trigger.querySelector(".select-sub")).toHaveTextContent("shown by Intro");
     trigger.focus();
     fireEvent.keyDown(trigger, { key: "Enter" });
@@ -362,7 +362,7 @@ describe("Select (v1.61.0)", () => {
     const onChange = vi.fn();
     const [options, setOptions] = createSignal(first);
     const view = render(() => (
-      <Select icon="link" value={value} options={options()} onChange={onChange} ariaLabel="BRB OBS text source" />
+      <Select icon="link" value={value} options={options()} onChange={onChange} ariaLabel="Show in OBS for BRB" />
     ));
     const trigger = view.container.querySelector<HTMLButtonElement>("button.select")!;
     const highlighted = (): HTMLElement | null =>
@@ -407,7 +407,7 @@ describe("Select (v1.61.0)", () => {
   it("with ariaLabel, the shown sub describes the trigger, and describedBy's lines follow it", () => {
     const { trigger } = mountSources("c");
     // The name leaves the sub out; the description carries it.
-    expect(trigger).toHaveAccessibleName("BRB OBS text source: Intro text");
+    expect(trigger).toHaveAccessibleName("Show in OBS for BRB: Intro text");
     expect(trigger).toHaveAccessibleDescription("shown by Intro");
     expect(trigger.getAttribute("aria-describedby")).toBe(trigger.querySelector(".select-sub")!.id);
     // None has no sub: no description.
@@ -416,7 +416,7 @@ describe("Select (v1.61.0)", () => {
     // A host's lines, after the sub.
     const view = render(() => (
       <>
-        <Select value="c" options={SOURCES} onChange={() => {}} ariaLabel="BRB OBS text source" describedBy="why" />
+        <Select value="c" options={SOURCES} onChange={() => {}} ariaLabel="Show in OBS for BRB" describedBy="why" />
         <div id="why">OBS can't find this source now.</div>
       </>
     ));

@@ -438,8 +438,8 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect.poll(() => listenCount(page, "timer-state")).toBe(1);
     await emitTimers(page, TIMER_SAMPLES.idle);
     const uptime = card(page, "timer-2");
-    const picker = uptime.getByRole("button", { name: /^Uptime OBS text source: / });
-    await expect(picker).toHaveAccessibleName("Uptime OBS text source: None");
+    const picker = uptime.getByRole("button", { name: /^Show in OBS for Uptime: / });
+    await expect(picker).toHaveAccessibleName("Show in OBS for Uptime: None");
     // Only a count-up follows OBS.
     await expect(card(page, "timer-1").getByRole("radiogroup")).toHaveCount(0);
 
@@ -450,7 +450,7 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect(picker).toContainText("Loading OBS sources…");
     await expect.poll(reads).toBe(1);
     await picker.click();
-    const list = page.getByRole("listbox", { name: "Uptime OBS text source" });
+    const list = page.getByRole("listbox", { name: "Show in OBS for Uptime" });
     await expect(list.getByRole("option")).toHaveCount(1);
     // The open joined the read on its way; its answer fills the list.
     expect(await answerObsInventory(page)).toBe(1);
@@ -476,17 +476,17 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect(list).toHaveCount(0);
     const shown = { ...UPTIME, obsText: { uuid: TIMER_TEXT.uuid } };
     await expect.poll(() => invokesOf(page, "sync_timers")).toEqual([SYNC([BRB, UPTIME]), SYNC([BRB, shown])]);
-    await expect(picker).toHaveAccessibleName("Uptime OBS text source: Timer text");
+    await expect(picker).toHaveAccessibleName("Show in OBS for Uptime: Timer text");
     expect(await stored(page, "divora.timers")).toMatchObject({
       timers: [{ id: "timer-1" }, { id: "timer-2", obsText: { uuid: TIMER_TEXT.uuid, name: "Timer text" } }],
     });
 
     // BRB's picker reads OBS's list again as it opens, and offers Timer
     // text as shown by Uptime.
-    const brbPicker = card(page, "timer-1").getByRole("button", { name: /^BRB OBS text source: / });
+    const brbPicker = card(page, "timer-1").getByRole("button", { name: /^Show in OBS for BRB: / });
     await brbPicker.click();
     await expect.poll(reads).toBe(2);
-    const brbList = page.getByRole("listbox", { name: "BRB OBS text source" });
+    const brbList = page.getByRole("listbox", { name: "Show in OBS for BRB" });
     const taken = brbList.getByRole("option", { name: /^Timer text/ });
     await expect(taken).toHaveAttribute("aria-disabled", "true");
     await expect(taken).toContainText("shown by Uptime");
@@ -557,7 +557,7 @@ test.describe("Talk to OBS (v1.61)", () => {
     const scenePicker = brb.getByRole("button", { name: /^BRB OBS scene at the start: / });
     await expect(scenePicker).toHaveAccessibleName("BRB OBS scene at the start: BRB scene");
     await expect(brb).toContainText(
-      "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS takes more than 5 seconds to get to it, it doesn't switch.",
+      "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS is busy for more than 5 seconds before Divora can ask it, it doesn't switch. Once asked, a slow OBS can still switch late.",
     );
     const NO_BACK =
       "This switches OBS's scene when it starts, and At zero has no Switch OBS back, so a reset or a delete leaves OBS on that scene, as does its end unless At zero switches scene. Add Switch OBS back at zero.";
@@ -640,8 +640,8 @@ test.describe("Talk to OBS (v1.61)", () => {
     await emitTimers(page, TIMER_SAMPLES.idle);
     // BRB shows in Timer text; Uptime follows the stream; a password saved
     // (the link restarts with it, and connects).
-    await card(page, "timer-1").getByRole("button", { name: /^BRB OBS text source: / }).click();
-    await page.getByRole("listbox", { name: "BRB OBS text source" }).getByRole("option", { name: /^Timer text/ }).click();
+    await card(page, "timer-1").getByRole("button", { name: /^Show in OBS for BRB: / }).click();
+    await page.getByRole("listbox", { name: "Show in OBS for BRB" }).getByRole("option", { name: /^Timer text/ }).click();
     await card(page, "timer-2")
       .getByRole("radiogroup", { name: "Follow OBS for Uptime" })
       .getByRole("radio", { name: "Streaming" })
@@ -671,8 +671,8 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect(statusLine(page)).toHaveText(LINES.connected);
     await expect(obs(page)).toContainText(SAVED);
     await emitTimers(page, TIMER_SAMPLES.idle);
-    await expect(card(page, "timer-1").getByRole("button", { name: /^BRB OBS text source: / })).toHaveAccessibleName(
-      "BRB OBS text source: Timer text",
+    await expect(card(page, "timer-1").getByRole("button", { name: /^Show in OBS for BRB: / })).toHaveAccessibleName(
+      "Show in OBS for BRB: Timer text",
     );
     await expect(
       card(page, "timer-2").getByRole("radiogroup", { name: "Follow OBS for Uptime" }).getByRole("radio", { name: "Streaming" }),

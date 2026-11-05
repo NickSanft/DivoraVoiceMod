@@ -2687,7 +2687,7 @@ const ADD_CHOICES: Array<{ choice: AddChoice; at: readonly ActionAt[]; label: st
 /** v1.61.0: an `obs` row's note (§9.4), and the line both say while
  *  Settings → OBS is off. */
 const OBS_SCENE_NOTE =
-  "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS takes more than 5 seconds to get to it, it doesn't switch.";
+  "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS is busy for more than 5 seconds before Divora can ask it, it doesn't switch. Once asked, a slow OBS can still switch late.";
 const OBS_BACK_NOTE =
   "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.";
 const OBS_ACTION_OFF = "Settings → OBS is off, so this does nothing until you turn it on.";
@@ -3686,7 +3686,7 @@ function TimerObsRows(props: { id: string; name: string; timer: StoredTimer }): 
                 stored={shownIn()}
                 options={(inv) => textSourceOptions(inv, owners())}
                 fallback={[NO_SOURCE]}
-                ariaLabel={`${props.name} OBS text source`}
+                ariaLabel={`Show in OBS for ${props.name}`}
                 goneLine={SHOW_IN_OBS_GONE}
                 onPick={(uuid) => {
                   if (uuid === "") {

@@ -585,9 +585,9 @@ describe("obsSkipLine and obsTextSkipLine (§9.1)", () => {
     },
     sceneBack: {
       notConnected:
-        "14:04: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes of the break's end.",
+        "14:04: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes.",
       notFound: "14:04: Didn't switch OBS back: OBS doesn't have that scene now.",
-      notReady: "14:04: Didn't switch OBS back: OBS stayed busy for 2 minutes after the break's end.",
+      notReady: "14:04: Didn't switch OBS back: OBS stayed busy for 2 minutes.",
       timedOut: "14:04: OBS didn't answer the switch back in time. It may switch late, or not at all.",
       failed: "14:04: OBS refused the switch back.",
     },
@@ -703,7 +703,7 @@ describe("obsAnnouncement (§9.1: edges only)", () => {
     expect(obsAnnouncement(connected, sample("off, configured with enabled:false, a password saved"), fmt)).toBe("");
     const both = at(retrying, 30, { heldBack: 1 });
     expect(obsAnnouncement(connected, both, fmt)).toBe(
-      "Lost the connection to OBS. Divora keeps trying. 14:04: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes of the break's end. Waiting for OBS, to switch it back after a break (up to 2 minutes).",
+      "Lost the connection to OBS. Divora keeps trying. 14:04: Didn't switch OBS back: Divora wasn't connected to OBS within 2 minutes. Waiting for OBS, to switch it back after a break (up to 2 minutes).",
     );
   });
 
