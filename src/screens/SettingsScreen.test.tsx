@@ -2555,7 +2555,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
   const BACK_NO_SCENE = "The start doesn't switch OBS's scene, so there's nothing to switch back to.";
   const START_SCENE_BACK = "Switch OBS back runs only at zero. This one stays saved and doesn't run.";
   const BREAK_HELP =
-    "Breaks you add from now on switch OBS to this scene at their start and back at zero, as two actions you can change on their card. For a break you already have, add Switch OBS scene and Switch OBS back on its card.";
+    "Breaks you add from now on, while Connect to OBS is on, switch OBS to this scene at their start and back at zero, as two actions you can change on their card. For a break you already have, or one added while Connect to OBS was off, add Switch OBS scene and Switch OBS back on its card.";
 
   // ---- Rust's side ----
   type Status = Record<string, unknown>;

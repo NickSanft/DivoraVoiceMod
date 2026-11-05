@@ -3768,9 +3768,10 @@ function BreakSceneRow(): JSX.Element {
         <span style={rowTextStyle}>for the break</span>
       </div>
       <div style={helpStyle}>
-        Breaks you add from now on switch OBS to this scene at their start and back at zero, as two
-        actions you can change on their card. For a break you already have, add Switch OBS scene and
-        Switch OBS back on its card.
+        Breaks you add from now on, while Connect to OBS is on, switch OBS to this scene at their
+        start and back at zero, as two actions you can change on their card. For a break you already
+        have, or one added while Connect to OBS was off, add Switch OBS scene and Switch OBS back on
+        its card.
       </div>
     </div>
   );
