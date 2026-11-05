@@ -2543,7 +2543,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
   const SHOW_HELP =
     "Pick a text source made for this timer: Divora replaces its text, and what it said before isn't kept. Set its font, colour and position in OBS. While the timer runs, each new second refreshes the source's Properties window in OBS if it's open, so pause the timer to edit it there. When this timer stops showing here, Divora clears the source's text the next time it's connected to OBS, unless Divora was closed in between.";
   const FOLLOW_HELP =
-    "Starts from 0:00 when OBS starts, pauses when it stops (its last time stays until OBS starts again), and pauses with a paused recording. If OBS was already going when Divora connected, it starts from OBS's own count, so it's about right, and can be further behind after the stream reconnected. Its own buttons and keys still work; OBS's next start, stop, pause or resume, each time Divora connects to OBS, and a wake from sleep set it again. If Divora loses OBS, it keeps counting on its own until it connects again.";
+    "Starts from 0:00 when OBS starts, pauses when it stops (its last time stays until OBS starts again), and pauses with a paused recording. If OBS was already going when Divora connected, it starts from OBS's own count, so it's about right, and can be further behind after the stream reconnected. Its own buttons and keys still work; OBS's next start, stop, pause or resume, a stream it follows reconnecting, each time Divora connects to OBS, and a wake from sleep set it again. If Divora loses OBS, it keeps counting on its own until it connects again.";
   const READS_A_FILE = "reads a file — untick Read from file in its Properties in OBS to show a timer here";
   const SCENE_NOTE =
     "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS is busy for more than 5 seconds before Divora can ask it, it doesn't switch. Once asked, a slow OBS can still switch late.";
@@ -2988,7 +2988,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
       [
         "needsPassword",
         {},
-        "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password. Or turn off Enable Authentication in OBS and press Try again.",
+        "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password.",
         ["Try again"],
       ],
       [

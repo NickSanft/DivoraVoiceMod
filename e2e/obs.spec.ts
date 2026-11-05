@@ -83,7 +83,7 @@ const SAVED = "A password is saved, stored encrypted for your Windows account. O
 const LINES = {
   connected: "Connected to OBS 30.2.2 (WebSocket 5.5.2)",
   needsPassword:
-    "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password. Or turn off Enable Authentication in OBS and press Try again.",
+    "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password.",
   authFailed: "OBS rejected the password. Paste it again from OBS's Show Connect Info, then Save password.",
   tooOld: "Update OBS, then press Try again. Its WebSocket server is 5.3.3, and Divora needs 5.4.0 or later.",
   kicked: "OBS disconnected Divora from its list of connections. Divora won't reconnect on its own.",

@@ -418,7 +418,7 @@ describe("obsStatusLine (§9.1)", () => {
     "retrying, tooBig": `${CAN_T} OBS sent a message over 4 MiB, more than Divora takes. Trying again in 1 s.`,
     "retrying, protocol": `${CAN_T} OBS and Divora didn't understand each other. Trying again in 1 s.`,
     needsPassword:
-      "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password. Or turn off Enable Authentication in OBS and press Try again.",
+      "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password.",
     authFailed: "OBS rejected the password. Paste it again from OBS's Show Connect Info, then Save password.",
     passwordUnreadable:
       "Re-enter your OBS password. Windows couldn't read the saved one, which can happen after a change to your Windows account.",

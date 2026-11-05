@@ -668,7 +668,7 @@ export function obsStatusLine(s: ObsStatus, nowMs: number): string {
       return parts.join(" ");
     }
     case "needsPassword":
-      return "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password. Or turn off Enable Authentication in OBS and press Try again.";
+      return "OBS is asking for a password. Paste it from OBS's Show Connect Info, then Save password.";
     case "authFailed":
       return "OBS rejected the password. Paste it again from OBS's Show Connect Info, then Save password.";
     case "passwordUnreadable":
