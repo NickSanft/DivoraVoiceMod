@@ -585,7 +585,7 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect(brb.locator('[data-timer-list="onFire"]')).toContainText("Switch OBS back");
     await expect(brb).not.toContainText(NO_BACK);
     await expect(brb).toContainText(
-      "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.",
+      "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If this timer started on the scene another timer switched OBS to, and that timer's Switch OBS back came first and didn't switch, this one goes back to the scene before that timer's start instead. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.",
     );
     expect(await stored(page, "divora.timers")).toMatchObject({
       timers: [{ id: "timer-1", onStart: [toChatting], onFire: [back] }, { id: "timer-2" }],

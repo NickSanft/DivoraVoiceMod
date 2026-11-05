@@ -2689,7 +2689,7 @@ const ADD_CHOICES: Array<{ choice: AddChoice; at: readonly ActionAt[]; label: st
 const OBS_SCENE_NOTE =
   "Switches OBS's Program scene, in Studio Mode too. If Divora isn't connected to OBS then, or OBS is busy for more than 5 seconds before Divora can ask it, it doesn't switch. Once asked, a slow OBS can still switch late.";
 const OBS_BACK_NOTE =
-  "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.";
+  "Switches back to the scene OBS was on before this timer's start, but only if OBS is still on the scene the start switched to. If this timer started on the scene another timer switched OBS to, and that timer's Switch OBS back came first and didn't switch, this one goes back to the scene before that timer's start instead. If Divora isn't connected to OBS then, it switches back if it reconnects within 2 minutes; after that, OBS stays where it is.";
 const OBS_ACTION_OFF = "Settings → OBS is off, so this does nothing until you turn it on.";
 
 /** The sigil a row leads with. */
@@ -3650,7 +3650,7 @@ function ObsPicker(props: {
 }
 
 const SHOW_IN_OBS_HELP =
-  "Pick a text source made for this timer: Divora replaces its text, and what it said before isn't kept. Set its font, colour and position in OBS. While the timer runs, each new second refreshes the source's Properties window in OBS if it's open, so pause the timer to edit it there. When this timer stops showing here, Divora clears the source's text the next time it's connected to OBS, unless Divora was closed in between.";
+  "Pick a text source made for this timer: Divora replaces its text, and what it said before isn't kept. Set its font, colour and position in OBS. While the timer runs, each new second refreshes the source's Properties window in OBS if it's open, so pause the timer to edit it there. When this timer stops showing here, Divora clears the source's text the next time it's connected to OBS, but only if it has put a time there since Divora last started.";
 const SHOW_IN_OBS_GONE = "OBS can't find this source now. Pick it again, or pick another.";
 const FOLLOW_OBS_HELP =
   "Starts from 0:00 when OBS starts, pauses when it stops (its last time stays until OBS starts again), and pauses with a paused recording. If OBS was already going when Divora connected, it starts from OBS's own count, so it's about right, and can be further behind after the stream reconnected. Its own buttons and keys still work; OBS's next start, stop, pause or resume, a stream it follows reconnecting, each time Divora connects to OBS, and a wake from sleep set it again. If Divora loses OBS, it keeps counting on its own until it connects again.";
