@@ -396,7 +396,7 @@ test.describe("Talk to OBS (v1.61)", () => {
     await expect(statusLine(page)).toHaveText(LINES.connected);
     await expect.poll(async () => (await spoken(page)).slice(6)).toEqual(["Connected to OBS."]);
     await expect(obs(page).getByTestId("obs-warning")).toHaveText([
-      "192.168.1.20 is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent.",
+      "192.168.1.20 is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent, but someone who records a connection's start can test guesses at it offline, so keep it long and random.",
       "OBS isn't asking for a password, so anything that can reach it on your network can control it. Turn on Enable Authentication in OBS's WebSocket Server Settings.",
     ]);
 

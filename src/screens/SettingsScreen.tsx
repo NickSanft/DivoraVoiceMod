@@ -2944,8 +2944,9 @@ function HourglassSection(): JSX.Element {
               In OBS, add a <strong>Text (GDI+)</strong> source, tick{" "}
               <strong>Read from file</strong> and pick a timer's file from this folder. OBS checks
               the file about once a second, so its text can run up to about 2 seconds behind the
-              overlay, and now and then it may show nothing for a second or two. While Divora is
-              closed, a file keeps the last time it showed.
+              overlay, and now and then it may show nothing until the time next changes: a second or
+              two while the timer runs, longer while it's paused. While Divora is closed, a file
+              keeps the last time it showed.
             </div>
             {/* v1.61.0: the direct way, for those with Settings → OBS on. */}
             <div data-testid="hourglass-obs-direct" style={{ ...helpStyle, "margin-top": "var(--s1)" }}>
@@ -4479,8 +4480,8 @@ const OBS_INTRO =
   "Divora can show a timer's time in an OBS text source, switch OBS to a scene for a break and back, and start a count-up when you go live or start recording. It talks to the WebSocket server built into OBS.";
 const OBS_EXPLAINER: readonly string[] = [
   "When this is on, Divora keeps one connection open to OBS at the address below — this PC unless you change it. For OBS, it connects nowhere else, and it never listens for connections.",
-  "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick, and of the scene a timer switched OBS away from, so it can switch back.",
-  "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. It changes only the text of the sources you pick, and that text stays in OBS after Divora stops.",
+  "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry the file paths of your recordings and saved replays, and anything other apps connected to OBS broadcast; Divora ignores them. Of all this, Divora saves only the names and ids of the scenes and sources you pick, and of the scene a timer switched OBS away from, so it can switch back. Its log notes the versions of OBS and its WebSocket server at each connection, and the id of a text source OBS can't find or won't share the settings of.",
+  "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. Of your sources, it changes only the text of the ones you pick, and that text stays in OBS after Divora stops.",
   // The menu path is the plan's; U15 checks it against OBS before the tag.
   "OBS ships with its WebSocket server off. In OBS: Tools → WebSocket Server Settings → Enable WebSocket server, then Show Connect Info for the password.",
 ];

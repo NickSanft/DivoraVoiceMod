@@ -35,14 +35,16 @@ accidental break fails CI before it ships:
 - `set_ptm_held`'s sources: `"key"`, `"button"`, `"midi"` parse; `"hotkey"`, other spellings and `""` don't — `src-tauri/src/lib.rs` (`ptm_page_source_wire_values_are_frozen`; v1.58.0).
 - The `ptm` hotkey id: a press holds push-to-modulate and its release lets go; `PTM`, `ptm:toggle`, `mute` and `sb:ptm` do nothing to it — `src-tauri/src/lib.rs` (`hotkey_ptm_request_table`; v1.58.0).
 - `set_ptm_mode` and `set_ptm_held` stay sync commands — `src-tauri/src/lib.rs` (`ptm_commands_stay_sync`; v1.58.0).
-- `TimerSnapshot` / `TimerState` / `TimerRun` / `TimerDefWire` keys, the phase and kind strings, the timer id grammar, the `tm:` hotkey-id table, the timer limits, the run samples (what the page stores for a state, and what the backend seeds from it), and the `timer-state` event and `timer_status` command names — `src/overlay/timer.fixture.json`, read by `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`, `timer_id_table`, `hotkey_timer_request_table`, `seed_table`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/overlay/timerState.test.ts` / `src/data/timers.test.ts` (v1.59.0).
-- The timer actions' wire (v1.60.0): the `TimerAction` kinds, their fields, where each runs and which list offers it; the action limits; how an action is read (the valid and skipped samples) and how a list is read (the list samples); `TimerActionsEvent`'s keys, the `why` and `hook` strings, and one event per `why` as the backend builds it from its plan; `TimerDefWire`'s optional `onStart` / `onFire`; the `timer-actions` and `soundboard-stopped` event names and the `finish_timer` command name — the same fixture's v1.60.0 keys, read by `src-tauri/src/timer_actions.rs` (`action_kinds_match_the_fixture`, `action_from_wire_table`, `to_wire_round_trips`, `hooks_from_wire_reads_eight`, `actions_event_samples_are_rusts`, `actions_event_samples_are_plans`), `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/data/timerActions.test.ts` / `src/data/timers.test.ts`. v1.59.0's `events`, `commands` and `limits` objects are left as they were, so `timerState.test.ts`'s exact checks of them still hold.
-- A timer's actions: what runs at a start, at zero, on End now, on a fire more than 30 s late, after a sleep or a close, at a restart mid-run, and on a Reset or a delete — `src-tauri/src/timer_actions.rs` (`plan_table`, `late_boundary`, `restart_reapplies_only_the_mute`, `a_stored_end_runs_nothing`, `revert_never_runs_at_a_start`, `route_table`) and `src-tauri/src/timers.rs` (`op_table`, `a_cancel_undoes_what_its_start_did`; v1.60.0).
+- `TimerSnapshot` / `TimerState` / `TimerRun` / `TimerDefWire` keys, the phase and kind strings, the timer id grammar, the `tm:` hotkey-id table, the timer limits, the run samples (what the page stores for a state, and what the backend seeds from it), and the `timer-state` event and `timer_status` command names — `src/overlay/timer.fixture.json`, read by `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`, `timer_id_table`, `hotkey_timer_request_table`, `seed_table`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/overlay/timerState.test.ts` / `src/data/timers.test.ts` (v1.59.0). Since v1.61.0 `TimerDefWire` also has the optional `obsText` and `followObs`, and the fixture's `defKeys` is the union of a countdown's keys and a count-up's: each test reads one entry of each kind and checks its own kind's optional keys (`sync_entry_keys_are_the_fixtures`, `entry_from_wire_reads_obs_fields`, `src/data/timers.test.ts`).
+- The timer actions' wire (v1.60.0): the `TimerAction` kinds, their fields, where each runs and which list offers it; the action limits; how an action is read (the valid and skipped samples) and how a list is read (the list samples); `TimerActionsEvent`'s keys, the `why` and `hook` strings, and one event per `why` as the backend builds it from its plan; `TimerDefWire`'s optional `onStart` / `onFire`; the `timer-actions` and `soundboard-stopped` event names and the `finish_timer` command name — the same fixture's v1.60.0 keys, read by `src-tauri/src/timer_actions.rs` (`action_kinds_match_the_fixture`, `action_from_wire_table`, `to_wire_round_trips`, `hooks_from_wire_reads_eight`, `actions_event_samples_are_rusts`, `actions_event_samples_are_plans`), `src-tauri/src/timers.rs` (`timer_wire_fixture_matches_rust`, `sync_entry_keys_are_the_fixtures`), `src-tauri/src/lib.rs` (`the_timer_commands_are_registered`) and `src/data/timerActions.test.ts` / `src/data/timers.test.ts`. v1.59.0's `events`, `commands` and `limits` objects are left as they were, so `timerState.test.ts`'s exact checks of them still hold. v1.61.0: the `obs` kind, which v1.60.0's skipped samples pinned as an unknown kind ("v1.61.0's"), is now read with that meaning, and the pinned skipped sample is now an `obs` action whose `op` is `startStream`, an op a later release may add — a reserved kind gaining its meaning, which is additive, so no ruling. For `obs`, which list offers it is per `op` (the fixture's `actionOps`: `scene` At start and At zero, `sceneBack` At zero only), and its `actionKinds` row lists the union of its ops' fields (`action_ops_match_the_fixture`, `action_kinds_match_the_fixture`, `action_from_wire_table`, `src/data/timerActions.test.ts`).
+- A timer's actions: what runs at a start, at zero, on End now, on a fire more than 30 s late, after a sleep or a close, at a restart mid-run, and on a Reset or a delete — `src-tauri/src/timer_actions.rs` (`plan_table`, `late_boundary`, `restart_reapplies_only_the_mute`, `a_stored_end_runs_nothing`, `revert_never_runs_at_a_start`, `route_table`) and `src-tauri/src/timers.rs` (`op_table`, `a_cancel_undoes_what_its_start_did`; v1.60.0). Since v1.61.0 the same for Switch OBS scene and Switch OBS back (`plan_table`'s `obs` rows, `scene_back_never_runs_at_a_start`).
 - The `tm:` hotkey ids: a press of `tm:<id>:toggle`, `tm:<id>:reset` or (since v1.60.0) `tm:<id>:finish` with a valid id acts on that timer; a release and any other spelling don't — `src-tauri/src/timers.rs` (`hotkey_timer_request_table`), and `src-tauri/src/lib.rs` (`the_shortcut_handler_runs_the_timer_hotkey`; v1.59.0).
 - The nine Hourglass commands stay sync (eight in v1.59.0; `finish_timer` since v1.60.0) — `src-tauri/src/lib.rs` (`timer_commands_stay_sync`; v1.59.0).
-- The main window sends five features' state-changing commands one at a time, one queue per feature, each once the one before it in that queue has answered or failed: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands (`finish_timer` since v1.60.0) and `tm:` key registers and unregisters (v1.59.0); and since v1.60.0 the effect chain's (`set_effect_chain`, `set_effect_param`, `set_effect_enabled`, `set_voice_model`) and the soundboard's (`play_soundboard_clip`, `stop_soundboard_clip`, `stop_all_soundboard_clips`, and Speak's saved-clip play). The reads (`input_mute`, `timer_status`) aren't held back, and no other command the page sends goes through these queues (the stream overlay's controller has kept its own since v1.55.0, for opening, closing, Fit, the background and pictures) — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" and "one mute command at a time" tests, v1.59.0; "one chain and one soundboard command at a time", which holds each answer and lands what is in flight together reversed, v1.60.0). Being sync orders only commands that aren't in flight together. A timer's own actions in the backend (its mute, its Stop all clips and lines) go through none of these queues.
-- `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0); since v1.60.0 `onStart`, `onFire` and `presetReturns` kept as written, whatever they hold (`readTimers`), a list sent only for a countdown with an action that runs, or a `revertPreset`, though one in `onStart` never runs (`defsForSync`), and a list read entry by entry with what can't run kept in place (`src/data/timerActions.test.ts`: `readStoredActions`, the editing-by-index rows, `readReturns`). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`); and with its `onStart` / `onFire`, since v1.60.0 — `src-tauri/src/timer_actions.rs` (`action_from_wire_table`, `hooks_from_wire_reads_eight`, `hooks_from_wire_keeps_one_line`, `to_wire_round_trips`).
-- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, the Hourglass ones since v1.59.0, and `finish_timer` since v1.60.0).
+- The main window sends six features' state-changing commands one at a time, one queue per feature, each once the one before it in that queue has answered or failed: the mute's set and toggle, push-to-modulate's held edges, mode and boot restore, and Hourglass's syncs, labelled commands (`finish_timer` since v1.60.0) and `tm:` key registers and unregisters (v1.59.0); since v1.60.0 the effect chain's (`set_effect_chain`, `set_effect_param`, `set_effect_enabled`, `set_voice_model`) and the soundboard's (`play_soundboard_clip`, `stop_soundboard_clip`, `stop_all_soundboard_clips`, and Speak's saved-clip play); and since v1.61.0 OBS's (`obs_configure`, `obs_reconnect`, `obs_set_password`, `obs_forget_password`: async commands, none of which waits on OBS, so a slow OBS holds nothing in it). The reads (`input_mute`, `timer_status`, `obs_status`, `obs_inventory`) aren't held back, and no other command the page sends goes through these queues (the stream overlay's controller has kept its own since v1.55.0, for opening, closing, Fit, the background and pictures) — `src/data/inOrder.test.ts` and `src/stores/app.test.tsx` (the "one command at a time" and "one mute command at a time" tests, v1.59.0; "one chain and one soundboard command at a time", which holds each answer and lands what is in flight together reversed, v1.60.0; "one OBS command at a time", over the same reversing wire, v1.61.0). Being sync orders only commands that aren't in flight together. A timer's own actions in the backend (its mute, its Stop all clips and lines, its OBS scene switches) go through none of these queues.
+- `divora.timers`' read and write rules (unknown keys, kinds and hotkey verbs kept; a field that can't be read falls back; `version` never lowered) — `src/data/timers.test.ts` (`readTimers`; v1.59.0); since v1.60.0 `onStart`, `onFire` and `presetReturns` kept as written, whatever they hold (`readTimers`), a list sent only for a countdown with an action that runs, or a `revertPreset`, though one in `onStart` never runs (`defsForSync`), and a list read entry by entry with what can't run kept in place (`src/data/timerActions.test.ts`: `readStoredActions`, the editing-by-index rows, `readReturns`); since v1.61.0 `obsText` and `followObs` kept as written, whatever they hold (`readTimers`), `obsText` sent as `{uuid}` for any kind when its uuid can be read and `followObs` sent only for a count-up, spelled exactly (`defsForSync`). What `sync_timers` does with each entry — `src-tauri/src/timers.rs` (`entry_from_wire_table`, `entry_from_wire_falls_back_field_by_field`, `run_from_wire_table`) and `src-tauri/src/timer_thread.rs` (`sync_skips_bad_entries_and_stops_at_64`); and with its `onStart` / `onFire`, since v1.60.0 — `src-tauri/src/timer_actions.rs` (`action_from_wire_table`, `hooks_from_wire_reads_eight`, `hooks_from_wire_keeps_one_line`, `to_wire_round_trips`); and with its `obsText` and `followObs`, since v1.61.0 — `src-tauri/src/timers.rs` (`entry_from_wire_reads_obs_fields`, `redefine_takes_obs_fields`).
+- Every command wrapper's command-name string — `src/audio/api.test.ts` (the screen-recording ones since v1.53.0, the stream-overlay ones since v1.55.0, the mute ones since v1.56.0, the push-to-modulate ones since v1.58.0, the Hourglass ones since v1.59.0, `finish_timer` since v1.60.0, and the OBS ones since v1.61.0).
+- The OBS link's wire (v1.61.0): the six command names, each an async command registered once (`obs_commands_are_async_and_registered`), and the `obs-status` event name; `ObsConfig`'s, `ObsStatus`'s (with its `lastSkip` and `textSkip`) and `ObsInventory`'s (with its scenes and text sources) keys; the state, reason, skip, stream, record and text-source-kind words, and which skip words each op can have; the limits; and every message a command refuses with — `src/data/obs.fixture.json`, read by `src-tauri/src/obs/machine.rs` (`obs_config_keys_are_frozen`, `obs_status_keys_are_frozen`, `obs_status_samples_are_rusts`, `obs_inventory_keys_are_frozen`, `every_word_is_listed`), `src-tauri/src/obs/mod.rs` (`limits_are_the_fixtures`, `command_errors_are_the_fixtures`), `src-tauri/src/lib.rs` (`obs_commands_are_async_and_registered`), `src/data/obs.test.ts` and `src/audio/api.test.ts`. The e2e mock (`e2e/tauri-mock.ts`) answers from the same fixture and refuses a status, a skip or an inventory it doesn't have.
+- `divora.obs`'s read and write rules (v1.61.0): read field by field (`enabled` only when it is `true`; `host` a non-empty string after trimming, else 127.0.0.1; `port` a whole number from 1 to 65535, else 4455; `breakScene` only when its uuid and name can be read), unknown keys kept, every save a merge into the value stored at that moment, and never a secret — `src/data/obs.test.ts` (`readObsSettings`, `mergeObsSettings`) and `src/stores/app.test.tsx` ("an address answered after Off keeps Off", "is never in localStorage, a store signal or a console line"), as `divora.timers` and `divora.overlayScene` have theirs.
 
 > See also [ARCHITECTURE.md](ARCHITECTURE.md) for *how* these pieces fit
 > together; this file is only *what* is frozen.
@@ -368,7 +370,8 @@ without being run).
 
 Since v1.60.0 a countdown can carry two lists of actions, `onStart` (At
 start) and `onFire` (At zero), and the backend decides what each change runs:
-it runs the mute, Stop all clips and lines, a replay save and a line itself,
+it runs the mute, Stop all clips and lines, a replay save and a line itself
+(since v1.61.0 it also hands OBS's scene switches to the OBS link, §1 "OBS"),
 and tells the main window what it runs (preset switches and clips) with a
 `timer-actions` event (§2). The rule is under `TimerAction` notes (§3). A
 command's answer doesn't wait for the actions it caused, and can land before
@@ -377,7 +380,7 @@ have no lists.
 
 | Command | Args | Returns |
 |---|---|---|
-| `sync_timers` | `timers: TimerDefWire[]` — every stored timer, in list order | `TimerSnapshot`. The definitions become `timers`. Reads each entry on its own and never fails, apart from Tauri's own ``"invalid args `timers` for command `sync_timers`: {e}"`` when `timers` isn't a list: an entry that isn't an object, has no `id` passing the timer id grammar (§1 hotkey ids) or no string `kind`, repeats an earlier entry's id, or comes after the 64th is skipped; a `name` that isn't 1-40 characters after trimming runs as "Countdown" or "Count-up"; a `durationMs` that isn't a finite number is 300 000 (5:00), any other is rounded and held to 1 000..86 400 000; a `resume` that can't be read is ignored and the timer starts idle; unknown keys are ignored. The first 16 entries of kind `"countdown"` or `"countup"` run; any other kind, and a known kind past the 16th, is kept, not run, and its file stays. A timer already running keeps its run through a new name or length; a new kind makes it idle. `resume` seeds a timer only for an id the backend hasn't accepted since it started (`TimerRun` notes, §3); after that the backend's own state wins. v1.60.0: an entry may carry `onStart` and `onFire` (`TimerAction[]`, §3). Each is read on its own: absent or not a list → empty; only its first 8 entries are read, each on its own (one that can't be read — an unknown kind, a missing or bad field — is skipped, the rest kept); a `speak` after the list's first is skipped; a count-up's lists are ignored. A list change, like a new name or length, keeps the run and runs nothing; the lists are read when something happens to the timer, so an `onFire` change counts for the run going on and an `onStart` change from the next start, or from a relaunch while it runs or is paused: the seed's re-mute and a later Reset's or delete's Unmute my voice follow `onStart` as it is at the relaunch. A sync that stops a running or paused countdown — it changed kind, or it no longer runs (left out, past the 16th, or a kind this build doesn't run) — runs the At zero actions that undo its start (`timer-actions`, `why` `reset` for a kind change, else `deleted`). A seed that picks up a running or paused countdown runs its At start's `setMuted` actions again (so a break mutes you again), with no event; one that finds a running countdown's end passed while Divora was closed runs At zero's putting-back actions (`ranOut`) |
+| `sync_timers` | `timers: TimerDefWire[]` — every stored timer, in list order | `TimerSnapshot`. The definitions become `timers`. Reads each entry on its own and never fails, apart from Tauri's own ``"invalid args `timers` for command `sync_timers`: {e}"`` when `timers` isn't a list: an entry that isn't an object, has no `id` passing the timer id grammar (§1 hotkey ids) or no string `kind`, repeats an earlier entry's id, or comes after the 64th is skipped; a `name` that isn't 1-40 characters after trimming runs as "Countdown" or "Count-up"; a `durationMs` that isn't a finite number is 300 000 (5:00), any other is rounded and held to 1 000..86 400 000; a `resume` that can't be read is ignored and the timer starts idle; unknown keys are ignored. The first 16 entries of kind `"countdown"` or `"countup"` run; any other kind, and a known kind past the 16th, is kept, not run, and its file stays. A timer already running keeps its run through a new name or length; a new kind makes it idle. `resume` seeds a timer only for an id the backend hasn't accepted since it started (`TimerRun` notes, §3); after that the backend's own state wins. v1.60.0: an entry may carry `onStart` and `onFire` (`TimerAction[]`, §3). Each is read on its own: absent or not a list → empty; only its first 8 entries are read, each on its own (one that can't be read — an unknown kind, a missing or bad field — is skipped, the rest kept); a `speak` after the list's first is skipped; a count-up's lists are ignored. A list change, like a new name or length, keeps the run and runs nothing; the lists are read when something happens to the timer, so an `onFire` change counts for the run going on and an `onStart` change from the next start, or from a relaunch while it runs or is paused: the seed's re-mute and a later Reset's or delete's Unmute my voice follow `onStart` as it is at the relaunch. A sync that stops a running or paused countdown — it changed kind, or it no longer runs (left out, past the 16th, or a kind this build doesn't run) — runs the At zero actions that undo its start (`timer-actions`, `why` `reset` for a kind change, else `deleted`). A seed that picks up a running or paused countdown runs its At start's `setMuted` actions again (so a break mutes you again), with no event; one that finds a running countdown's end passed while Divora was closed runs At zero's putting-back actions (`ranOut`). v1.61.0: an entry may carry `obsText` (any kind: an object whose `uuid` is a string of 1 to 128 characters; its `name` and anything else are ignored) and, on a count-up, `followObs` (`"stream"` or `"record"`, spelled exactly; a countdown's is ignored); either, when it can't be read, is read as absent. Setting, changing or clearing either keeps the run and runs nothing. Only the first timer in list order that the backend runs is shown in a given source |
 | `arm_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Idle, done or ran out → running from the full length (a count-up from 0); v1.60.0: a countdown's start runs its At start list (`timer-actions`, `armed`). Otherwise unchanged |
 | `pause_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Running → paused. Otherwise unchanged |
 | `resume_timer` | `id: string` | `TimerSnapshot` / `"no such timer"`. Paused → running. Otherwise unchanged |
@@ -386,6 +389,36 @@ have no lists.
 | `timer_status` | — | `TimerSnapshot`, the set now. Main and the overlay page each call it once after they start listening to `timer-state`, since a paused or idle set sends no events |
 | `timers_dir` | — | `string`, the absolute path of the timers' folder (§6), created if missing / `"couldn't create the timers folder: {e}"` |
 | `finish_timer` | `id: string` | `TimerSnapshot` / `"no such timer"` — v1.60.0, End now. A running or paused countdown finishes now: `done`, `fires` + 1, and its whole At zero list runs (`timer-actions`, `endNow`, `lateMs` 0). One already past a deadline nothing had read finishes as that deadline's (the tick before the op takes it), so it runs as a finish that late: `zero` at 30 000 ms or less, `late` beyond. Idle, done, ran out, or a count-up: unchanged |
+
+### OBS (v1.61.0)
+
+Talk to OBS: the backend's own client for the WebSocket server built into
+OBS, off until the page turns it on. All six commands are async: they run on
+tokio workers, never on the main thread beside `WM_HOTKEY`, because
+`obs_inventory` waits on OBS and `obs_set_password` on Windows' encryption
+and the disk. Async commands in flight together reach Rust in any order, so
+the main window sends the four that change something (`obs_configure`,
+`obs_reconnect`, `obs_set_password`, `obs_forget_password`) through one
+queue, each once the one before it has answered; none of the four waits on
+OBS. The reads (`obs_status`, `obs_inventory`) aren't queued. Every command
+but `obs_inventory` answers the whole `ObsStatus` (§3), the shape the
+`obs-status` events (§2) carry; an answer can land after the events its
+command caused, so of two, the larger `seq` is newer. Rust keeps the
+address and the switch in memory only: `divora.obs` (§5) is the record,
+sent again at each page load while OBS control is on. `obs_configure` with
+`enabled: false`, `obs_set_password`, `obs_forget_password` and
+`obs_status` work while OBS control is off; `obs_reconnect` then does
+nothing and `obs_inventory` answers "OBS isn't connected.". No command
+sends a secret back.
+
+| Command | Args | Returns |
+|---|---|---|
+| `obs_configure` | `config: ObsConfig` | `ObsStatus` / "Type an IP address, like 127.0.0.1, or localhost." / "Divora can't use a link-local IPv6 address (fe80::…). Type the PC's IPv4 address, like 192.168.1.20." / "Type a port from 1 to 65535." (a port of 0; one that isn't a whole number from 0 to 65535 gets Tauri's own ``"invalid args `config` for command `obs_configure`: {e}"``). The host is an IP address or `localhost` (any case), trimmed, one pair of brackets allowed, and never looked up as a name; refused: a name, a URL, a port inside the host, an unspecified, multicast or broadcast address, and an IPv6 link-local one or any zone id (`%`). The address in use is the canonical one (`::ffff:127.0.0.1` is 127.0.0.1). `enabled: true` starts the link, keeps one already running for the same address (a reload changes nothing, a stop state included), or restarts it for another. `enabled: false` checks the address, stops any link, drops the switch backs still due, and connects nothing |
+| `obs_reconnect` | — | `ObsStatus` — Try again, and Connect again after a Kick. While retrying, an attempt now, the failure count kept; in a stop state (§3 `ObsStatus` notes), a new link; with a link whose task had ended, a new one; otherwise, and while off, nothing. Never fails |
+| `obs_set_password` | `password: string` | `ObsStatus` / "Paste a password first." (empty) / "The password can be up to 256 characters." (more than 256 Unicode scalar values) / "Couldn't save the password: Windows couldn't encrypt it." / "Couldn't save the password: the file couldn't be written." (the old file, if any, kept). Encrypted for the current Windows user into `obs/password.bin` (§6); then a link that is on restarts, a stop state included, so it uses it. Works while off. Never echoed: the answer has `hasPassword` only. A password holding a lone surrogate never reaches Rust: the page refuses it, since Rust's JSON reader would refuse the whole invoke |
+| `obs_forget_password` | — | `ObsStatus`. `obs/password.bin` deleted (none there is fine); then a link that is on restarts. Works while off. Never fails: a file that couldn't be deleted reads `hasPassword: true` |
+| `obs_status` | — | `ObsStatus`, the status now. Only reads, and connects nothing: the Settings section calls it once while OBS control is off, for `hasPassword` |
+| `obs_inventory` | — | `ObsInventory` / "OBS isn't connected." (no connected link, or it went before answering) / "OBS didn't answer in time." / "OBS is busy. Try again in a moment." (OBS answered 207 throughout, or the link couldn't take the request) / "OBS refused the request." (OBS refused the scene or the input list). OBS's scenes and text sources, read from a connected link one request at a time, waiting on OBS for up to 15 s; a second call while one runs joins it. A text source whose settings OBS refuses is listed as not reading a file. At most 200 scenes and 100 text sources (`truncated`) |
 
 ### MIDI control surfaces (v1.9.0)
 
@@ -420,6 +453,7 @@ Emitted by the backend, subscribed via `@tauri-apps/api/event`.
 | `timer-state` | `TimerSnapshot` | backend → all windows, on every change of a timer the backend runs: a command or `tm:` key that changed one, every `sync_timers`, a countdown finishing or running out, a sleep handled, an anchor moved after a wall-clock change, and each whole-second change of a running timer's `text`; nothing on a schedule beyond that, so a paused or idle set sends nothing — v1.59.0. Sent by the backend's timer thread alone, in `seq` order; a command's answer can arrive after the event that follows it, so readers keep the snapshot with the larger `seq` |
 | `timer-actions` | `TimerActionsEvent` | backend → all windows, once for each countdown start (`armed`) and each end (`zero`, `endNow`, `late`, `ranOut`, `reset`, `deleted`), even one with no page actions (an end still lets the page settle a preset return); never for a restart's re-mute — v1.60.0. Sent by the timer thread, before its `timer-state` for the same change; a command's answer can arrive before or after either. Only the main window acts on it. An event no page listens for (a reload, the moments before the page's listeners are up) is lost: nothing sends it again |
 | `soundboard-stopped` | `null` | backend → all windows, when a timer's Stop all clips and lines has stopped every clip and line (v1.60.0). The page's own `stop_all_soundboard_clips` sends none |
+| `obs-status` | `ObsStatus` | backend → all windows, on every change of the OBS link's status and only then: an unchanged write sends nothing, and OBS's scene events move `inventoryRev` at most once per 250 ms — v1.61.0. Emitted under the status's own lock as `seq` moves, so the events go out in `seq` order; a command's answer can land after the events it caused, so readers keep the status with the larger `seq` and ignore one that isn't a status. Never holds a secret (`ObsStatus` notes, §3). The main window listens from the first time OBS control is on in a page load (before its `obs_configure`), and a page whose `divora.obs` is absent or off listens to none |
 
 **Why `voice-reading` is its own event and not a field on `LevelUpdate`.**
 Additive-only permits either, so this is a design choice, recorded here because
@@ -437,7 +471,8 @@ push-to-modulate (`ptm`, a `PtmState`) for the same reasons: the backend
 changes it with no page involved (the global key), and the page needs it to
 say Clean or Modulated. Hourglass (v1.59.0) has its own event, `timer-state`,
 for the reading's reasons: it changes about once a second, and only for
-people who use timers.
+people who use timers. Talk to OBS (v1.61.0) has its own too, `obs-status`,
+sent only on a change: it changes rarely, and only for people who turn it on.
 
 ---
 
@@ -647,7 +682,8 @@ TimerRun          { phase: "running" | "paused" | "done" | "expired",
                     // countdown's totalMs; paused: ms and a countdown's
                     // totalMs; done or expired: totalMs. Idle has none
 TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun,
-                    onStart?: TimerAction[], onFire?: TimerAction[] }
+                    onStart?: TimerAction[], onFire?: TimerAction[],
+                    obsText?: { uuid }, followObs?: "stream" | "record" }
                     // v1.59.0: an argument only (sync_timers). The page sends
                     // validated fields only; later releases add fields, which
                     // older builds ignore. v1.60.0: onStart / onFire, a
@@ -655,18 +691,60 @@ TimerDefWire      { id, name, kind, durationMs, resume?: TimerRun,
                     // backend. The page sends each only for a countdown, and
                     // only when it holds an action that runs, or a
                     // revertPreset, though one in onStart never runs (as
-                    // resume goes only with a run)
+                    // resume goes only with a run). v1.61.0: obsText, the OBS
+                    // text source the timer's text goes to (any kind; its
+                    // uuid only, 1 to 128 characters: the page keeps the
+                    // name, Rust never uses one), and followObs, the OBS
+                    // output a count-up follows (a countdown's is ignored);
+                    // each sent only when it can be read, OBS control on or
+                    // off. Anything else in either is read as absent
 TimerAction       { kind: "preset", presetId } | { kind: "randomPreset" }
                   | { kind: "revertPreset" } | { kind: "tile", tileId }
                   | { kind: "speak", text, voiceId } | { kind: "saveReplay" }
                   | { kind: "setMuted", muted: boolean } | { kind: "panic" }
+                  | { kind: "obs", op: "scene", sceneUuid, sceneName }
+                  | { kind: "obs", op: "sceneBack" }
                     // v1.60.0: in sync_timers, in divora.timers (§5), and
                     // out in timer-actions. preset, tile and panic keep
-                    // GlyphAction's shape
+                    // GlyphAction's shape. obs v1.61.0 (Switch OBS scene,
+                    // Switch OBS back): its op a flat field like every
+                    // other kind's; never in timer-actions
 TimerActionsEvent { seq, id, hook: "start" | "end",
                     why: "armed" | "zero" | "endNow" | "late" | "ranOut"
                          | "reset" | "deleted",
                     lateMs, actions: TimerAction[] }  // v1.60.0
+ObsConfig         { enabled, host, port }            // v1.61.0: an argument only
+                                                     // (obs_configure). host as
+                                                     // typed: an IP address or
+                                                     // "localhost"; port 1..65535
+ObsStatus         { seq, state, host, port, loopback, hasPassword,
+                    authRequired (nullable), obsVersion (nullable),
+                    websocketVersion (nullable),
+                    stream (nullable: "off" | "starting" | "live"
+                      | "reconnecting" | "stopping"),
+                    record (nullable: "off" | "starting" | "recording"
+                      | "paused" | "stopping"),
+                    reason (nullable), detail (nullable),
+                    retryAtMs (nullable), missing: string[],
+                    lastSkip (nullable: { op: "scene" | "sceneBack", why,
+                      name (nullable), timer, atMs }),
+                    textSkip (nullable: { why: "failed" | "timedOut", atMs }),
+                    heldBack, inventoryRev }         // v1.61.0
+                    // state: "off" | "connecting" | "connected" | "retrying"
+                    //   | "needsPassword" | "authFailed" | "passwordUnreadable"
+                    //   | "tooOld" | "needsNewerDivora" | "kicked" | "unsupported"
+                    // reason: "refused" | "unreachable" | "noAnswer" | "notObs"
+                    //   | "notReady" | "closed" | "obsExiting" | "silent"
+                    //   | "tooBig" | "protocol" | "badVersion" | "missingRequest"
+                    // lastSkip.why: "notConnected" | "queueFull" | "notFound"
+                    //   | "notReady" | "timedOut" | "failed" | "late"; a
+                    //   sceneBack's never queueFull or late
+ObsInventory      { rev, scenes: { uuid, name }[],
+                    textSources: { uuid, name, kind: "gdiplus" | "ft2",
+                      readsFromFile }[],
+                    programSceneUuid (nullable), truncated }  // v1.61.0:
+                    // obs_inventory's answer. scenes top first, as OBS lists
+                    // them; truncated past 200 scenes or 100 text sources
 ```
 
 **`TimerState` notes (v1.59.0).**
@@ -707,27 +785,45 @@ TimerActionsEvent { seq, id, hook: "start" | "end",
   type or length — can't be read: the backend skips it, and the page keeps
   it in storage and never sends it. The page also refuses a `text` holding a
   lone surrogate.
+- v1.61.0, `obs`: `op` exactly `"scene"` or `"sceneBack"` (any other op,
+  such as a later release's, can't be read); a `scene`'s `sceneUuid` 1 to
+  128 characters and `sceneName` a string of at most 256, empty allowed
+  (the uuid is what switches; the name is only shown); a `sceneBack`'s
+  other fields are ignored. The page also refuses a `sceneUuid` or
+  `sceneName` holding a lone surrogate. An older build skips an `obs`
+  action and the page keeps it, as for any kind it can't read.
 - A list: only its first 8 entries are read, readable or not; a `speak`
   after the list's first readable one is skipped (one line per list).
 - Where each runs: `preset`, `randomPreset`, `revertPreset` and `tile` in the
-  main window; `speak`, `saveReplay`, `setMuted` and `panic` in the backend.
-  `revertPreset` never runs at a start.
+  main window; `speak`, `saveReplay`, `setMuted` and `panic` in the backend,
+  and since v1.61.0 `obs`, which the backend hands to the OBS link.
+  `revertPreset` never runs at a start, nor does an `obs` `sceneBack`.
 - When: At start runs when a countdown starts from idle, done or ran out
   (`arm_timer`, or the toggle key from those), never on resume. At zero runs
   whole at 00:00 when 30 000 ms late or less, and on End now. A countdown
   found due more than 30 000 ms late, or that ran out while the PC slept or
   Divora was closed, runs only At zero's putting-back actions: `setMuted
-  {muted: false}` and `revertPreset`. A Reset (or a kind change) or a delete
+  {muted: false}`, `revertPreset` and (v1.61.0) an `obs` `sceneBack`. A
+  Reset (or a kind change) or a delete
   of a running or paused countdown runs only those of them that undo its
   start: `setMuted {muted: false}` when the `onStart` its run started with
   (after a relaunch, the one the relaunch picked it up with) has
-  `setMuted {muted: true}`, and `revertPreset` (which the page acts on
-  only with a return the start noted, §5). A relaunch that picks a running or
+  `setMuted {muted: true}`, `revertPreset` (which the page acts on
+  only with a return the start noted, §5), and an `obs` `sceneBack` when
+  that `onStart` has an `obs` `scene`. A relaunch that picks a running or
   paused countdown up runs its `onStart`'s `setMuted` actions again, in the
   backend only, with no event. Nothing else runs. Lists are read when the
   change happens, so an `onFire` edit counts for the run going on.
 - `setMuted` is a plain set, never a toggle: the last one wins, and an
   unmute unmutes a mute made any other way.
+- `obs` (v1.61.0) never makes the timer wait. A `scene` that finds OBS not
+  connected, or that the link gets to more than 5 s after it ran, doesn't
+  switch and is never run later (a `lastSkip` says so while OBS control is
+  on). A `sceneBack` switches back only while OBS is still on the scene its
+  start switched to; one that finds OBS not connected while OBS control is
+  on waits up to 2 minutes for a connection (turning OBS control off drops
+  it). Which scene each start replaced is kept in
+  `obs/returns.json` (§6), so a restart doesn't lose it.
 
 **`TimerActionsEvent` notes (v1.60.0).**
 
@@ -760,6 +856,42 @@ starts; otherwise its own state wins. Time passes while Divora is closed:
   running one with 0), a count-up done or expired, a run that isn't one of
   the shapes above — starts idle, and the timer is kept. `fires` is never
   stored or seeded.
+
+**`ObsStatus` notes (v1.61.0).**
+
+- No secret: `hasPassword` says whether `obs/password.bin` exists, and
+  nothing else of the password is in any status, answer or event.
+- No free text from OBS: `obsVersion` (from GetVersion) and
+  `websocketVersion` (from Hello) are kept only when they are at most 32
+  characters of `[0-9A-Za-z.+-]`, else null; `reason` and the skip words are
+  codes; `detail` is set only with `missingRequest`, and is then one of the
+  nine request names Divora sends; a skip's `name` is the scene name the
+  action stored (the user's own), null for a `sceneBack`; `missing` holds
+  source uuids from the user's own timers.
+- `seq` counts changes since launch, by 1 each; it can move by 2 at once
+  (turning OBS control off retires the running link first). Of two
+  statuses, the larger `seq` is newer.
+- `host` is the canonical address in use (`""` and `port` 0 before any
+  `obs_configure`); `loopback` is that address's. `authRequired` and the
+  two versions come from the last connection to that address and are
+  cleared for another; `stream` and `record` are null while not connected.
+- `reason` says why the link is retrying or stopped, and reads `obsExiting`
+  while still connected once OBS has said it is quitting. `retryAtMs` is the
+  next attempt's wall time, while retrying. The stop states — `needsPassword`,
+  `authFailed`, `passwordUnreadable`, `tooOld`, `needsNewerDivora`, `kicked`
+  and `unsupported` — last until the address changes, a password is saved or
+  forgotten, `obs_reconnect` is called, or OBS control is turned off and on.
+- `lastSkip` is the last Switch OBS scene or Switch OBS back that didn't
+  switch, with its timer id and wall time: replaced by the next one, cleared
+  by the next switch or switch back that goes through. `textSkip` is the last
+  text push OBS refused or didn't answer in time, separate so it never hides
+  a scene skip, and cleared by the next push OBS confirms.
+- `heldBack` counts the timers whose switch back waits for a connected OBS,
+  or is being tried and not yet answered;
+  `inventoryRev` goes up at each connection and at most once per 250 ms of
+  OBS's scene events, so a page reads OBS's lists again when it changes.
+- The page reads a status with every key checked and ignores keys a later
+  version adds, at the top and in a skip; one it can't read is ignored whole.
 
 **`StreamInfo` notes.**
 
@@ -910,7 +1042,8 @@ to defaults (never throw).
 | `divora.tileOrder` | per-folder tile order |
 | `divora.tileHotkeys` | per-tile global hotkey accelerators |
 | `divora.hotkeyBindings` | `{ ptm, panic, monitor }` global hotkey accelerators, each `""` when unbound (the default for all three) — v1.51.4; plus `"rec:screen"` and `"rec:wav"` — v1.52.0; plus `"replay:save"` and `"replay:toggle"` — v1.54.0 (a save without them reads them as unbound); plus `"overlay:arrange"` — v1.55.0 (likewise); plus `"mute"` — v1.56.0 (likewise). Unknown keys are ignored on load; "Win" is read as "Super". `ptm`'s key also sets the in-app push-to-modulate key (`Space` while unbound). Hourglass's `tm:` keys (v1.59.0) aren't kept here: each timer's are in `divora.timers` |
-| `divora.timers` | `{version: 1, timers: [{id, name, kind, durationMs, hotkeys?: {toggle?, reset?, finish?, …}, run?: TimerRun, onStart?, onFire?}], presetReturns?}` — v1.59.0 (`finish`, `onStart`, `onFire`, `presetReturns` v1.60.0), Hourglass's timers in list order. Read field by field, each falling back alone: missing, unparseable or not an object → no timers; `version` an integer ≥ 1 (else 1), a larger one read with these rules and never lowered on write; an entry is dropped when it isn't an object, its `id` fails the timer id grammar (§1 hotkey ids) or repeats an earlier one, or its `kind` isn't a string; a `name` that isn't 1-40 characters after trimming gets a default ("Countdown", "Count-up", "Timer", numbered " 2", " 3"… to stay unique); a `"countdown"` or `"countup"` `durationMs` that isn't a finite number is 300 000, any other is rounded and held to 1 000..86 400 000 (another kind's finite value is kept as it is); `hotkeys` keeps every string value, read as `divora.hotkeyBindings`' are ("Win" → "Super"), and anything else is `{}`; a `run` that isn't a `TimerRun` (§3) is dropped and the timer is idle. Unknown keys, kinds and hotkey verbs are kept and written back. The page adds no timer once 16 are stored (a kind it doesn't know counted); the first 16 of kind `"countdown"` or `"countup"` among the first 64 entries run, and the rest are kept, shown with Delete only, and their keys never registered. v1.59.0 registers `toggle` and `reset` only; since v1.60.0 `finish` (End now, a countdown's) is registered too. `run` is the last running, paused, done or ran-out state the page saw, written only when a snapshot changes it (a start, a pause, a finish — never a running timer's text alone); every `sync_timers` sends it as `resume`, and the backend uses it only for an id it hasn't accepted since it started. Absent: boot sends no timer command. Once written it stays, `timers: []` after the last delete. **Never `fires`**, and never the backend's clock. v1.60.0: `onStart` and `onFire` are a countdown's At start and At zero lists of `TimerAction` (§3), kept exactly as written whatever they hold. The page reads a list that isn't an array as empty, reads its first 8 entries as §3 says, and sends those that run, plus a `revertPreset` in `onStart`, which is sent and never runs there; any other entry that doesn't run (one it can't read, a second line, one past the 8th) stays in place, is written back and is never sent. An edit changes one entry by its index, so nothing it can't read is dropped, and Add stops at 8 stored entries, readable or not. A count-up's lists are kept and never sent. `presetReturns` is `[{timer, from, to}]`: where a timer's start switched the preset from and to, at most one per timer, read leniently (an entry that can't be read is left out of the reading, and the key is kept as written until the page next writes it) and removed once empty. A return is settled when its timer's end is heard, by a delete of its timer (unless it is running or paused with Back to the preset before at zero: the cancel's end then settles it), or at the next page load when no page heard it (a reload, or a run-out while Divora was closed); one left for a timer no longer stored means "switch back" |
+| `divora.timers` | `{version: 1, timers: [{id, name, kind, durationMs, hotkeys?: {toggle?, reset?, finish?, …}, run?: TimerRun, onStart?, onFire?}], presetReturns?}` — v1.59.0 (`finish`, `onStart`, `onFire`, `presetReturns` v1.60.0), Hourglass's timers in list order. Read field by field, each falling back alone: missing, unparseable or not an object → no timers; `version` an integer ≥ 1 (else 1), a larger one read with these rules and never lowered on write; an entry is dropped when it isn't an object, its `id` fails the timer id grammar (§1 hotkey ids) or repeats an earlier one, or its `kind` isn't a string; a `name` that isn't 1-40 characters after trimming gets a default ("Countdown", "Count-up", "Timer", numbered " 2", " 3"… to stay unique); a `"countdown"` or `"countup"` `durationMs` that isn't a finite number is 300 000, any other is rounded and held to 1 000..86 400 000 (another kind's finite value is kept as it is); `hotkeys` keeps every string value, read as `divora.hotkeyBindings`' are ("Win" → "Super"), and anything else is `{}`; a `run` that isn't a `TimerRun` (§3) is dropped and the timer is idle. Unknown keys, kinds and hotkey verbs are kept and written back. The page adds no timer once 16 are stored (a kind it doesn't know counted); the first 16 of kind `"countdown"` or `"countup"` among the first 64 entries run, and the rest are kept, shown with Delete only, and their keys never registered. v1.59.0 registers `toggle` and `reset` only; since v1.60.0 `finish` (End now, a countdown's) is registered too. `run` is the last running, paused, done or ran-out state the page saw, written only when a snapshot changes it (a start, a pause, a finish — never a running timer's text alone); every `sync_timers` sends it as `resume`, and the backend uses it only for an id it hasn't accepted since it started. Absent: boot sends no timer command. Once written it stays, `timers: []` after the last delete. **Never `fires`**, and never the backend's clock. v1.60.0: `onStart` and `onFire` are a countdown's At start and At zero lists of `TimerAction` (§3), kept exactly as written whatever they hold. The page reads a list that isn't an array as empty, reads its first 8 entries as §3 says, and sends those that run, plus a `revertPreset` in `onStart`, which is sent and never runs there; any other entry that doesn't run (one it can't read, a second line, one past the 8th) stays in place, is written back and is never sent. An edit changes one entry by its index, so nothing it can't read is dropped, and Add stops at 8 stored entries, readable or not. A count-up's lists are kept and never sent. `presetReturns` is `[{timer, from, to}]`: where a timer's start switched the preset from and to, at most one per timer, read leniently (an entry that can't be read is left out of the reading, and the key is kept as written until the page next writes it) and removed once empty. A return is settled when its timer's end is heard, by a delete of its timer (unless it is running or paused with Back to the preset before at zero: the cancel's end then settles it), or at the next page load when no page heard it (a reload, or a run-out while Divora was closed); one left for a timer no longer stored means "switch back". v1.61.0: an entry may hold `obsText` (`{uuid, name}`, the OBS text source the timer's text goes to, any kind; the name is shown, the uuid sent) and `followObs` (`"stream"` or `"record"`, what a count-up follows), each kept exactly as written whatever it holds and checked only when sent (§3 `TimerDefWire`); None or Off removes the key. A name OBS lists under another for the same uuid is brought up to date when the page reads OBS's lists |
+| `divora.obs` | `{ enabled, host, port, breakScene? }` — v1.61.0, Settings → OBS: whether OBS control is on, the address and port as last taken by Rust, and the scene Add break (BRB) switches OBS to (`{uuid, name}`). Read field by field: `enabled` only when it is `true`; `host` a non-empty string after trimming (stored trimmed), else `127.0.0.1`; `port` a whole number from 1 to 65535, else 4455; `breakScene` only when its uuid (1-128 characters) and name (at most 256) can be read, else absent. Unknown keys are kept. Every save merges into the value stored at that moment. Absent, off or unreadable: boot sends no OBS command and listens to no OBS event. On: the page listens to `obs-status`, then sends `obs_configure` with it, after Hourglass's boot `sync_timers` (the two can still reach Rust in either order). An address Rust refuses (a hand edit, or a later version's value after a downgrade) is kept and shown, the switch left on. **Never the password** (`obs/password.bin`, §6), and never anything Rust reports |
 | `divora.ptm` | `{ on: bool, hold: "apply" \| "bypass" }` — v1.58.0: whether push-to-modulate is on, and which way the Mixer card's hold goes (kept while it is off, so turning it back on restores it). Written only from the engine's answer to `set_ptm_mode`, from the mode that answer carries, so a refused call changes nothing. Absent or malformed (not an object, `on` not a boolean, `hold` neither value) reads as `{ on: false, hold: "apply" }`: off. Sent back to the engine as `set_ptm_mode {mode, restore: true}` each time the main window loads (`mode` is `hold` while on, `"always"` while off). **Never a hold**: what holds it lives in the engine |
 | `divora.replayBuffer` | `{ seconds: 15\|30\|60\|120, explained: bool, explainedDesktop: bool }` — v1.54.0; each falls back alone (30, false, false). **Never an armed flag**: Replay is off after every launch |
 | `divora.screenRecording` | `{ monitorId (nullable: the main screen), fps: 30\|60, quality: "small"\|"balanced"\|"high", cursor, avOffsetMs }` — v1.52.0; `desktopAudio: "everything"\|"off"\|"device:<id>", desktopGainDb (−30…0), stems` — v1.53.0. Each field falls back to its default on its own when missing or malformed — except `desktopAudio`, which reads as `"off"` when missing (settings saved before v1.53.0) or malformed, and is `"everything"` only on a first run with nothing saved |
@@ -954,10 +1087,21 @@ held, because the backend tracks that one.
 **Hourglass's timers are stored by the page, in `divora.timers` (v1.59.0);
 the backend keeps no timer state on disk** (its text files, §6, are output
 only). Since v1.60.0 so are each countdown's action lists and the preset
-returns. Each timer's last run is kept with wall-clock anchors, so a restart
+returns, and since v1.61.0 each timer's OBS source and follow. Each timer's
+last run is kept with wall-clock anchors, so a restart
 picks a running timer up with the time that passed while Divora was closed. A
 page reload changes nothing in the backend, which keeps its own state and
 ignores the runs the reload sends.
+
+**OBS control's settings are stored by the page, in `divora.obs`
+(v1.61.0); the password never is.** The page sends it from its field to
+`obs_set_password` and stores it nowhere; the backend keeps it encrypted in
+`obs/password.bin` (§6). The OBS link keeps one thing on disk besides the
+password: which scene each timer's start replaced (`obs/returns.json`), so
+its switch back survives a restart. Everything else it knows — the status,
+OBS's lists, which sources it wrote — lives in memory for one run of Divora,
+apart from what its log lines note (fixed codes, OBS's versions, uuids, timer
+ids and counts; ARCHITECTURE.md, "Talk to OBS (v1.61.0)", "Logging").
 
 > **Ruling (v1.56.0): `{kind: "mute"}` keeps its name and now mutes.** Until
 > v1.56.0 the `mute` glyph action toggled a status label only. It was
@@ -1032,11 +1176,14 @@ timers/<id>.txt          an Hourglass timer's text — v1.59.0: exactly what the
                          each timer it runs, from its first sync of each run on,
                          whenever the text changes. Replaced by writing
                          `.<id>.tmp` and renaming it over the file, never removed
-                         first, so the file is never missing, empty or
-                         part-written (an open that lands inside a rename can
-                         fail with a sharing violation; OBS's Text (GDI+) then
-                         shows nothing until the next change — from OBS's code;
-                         OBS itself wasn't run). Removed once
+                         first, so the file is never empty or part-written. An
+                         open that lands inside a rename can fail with a sharing
+                         violation, or, now and then, not find the file: Windows
+                         itself leaves the name unfound for a moment in about 1
+                         in 12,000 to 20,000 renames (measured on this PC,
+                         v1.61.0; 1.59.0 said never missing). OBS's Text (GDI+)
+                         then shows nothing until the next change — from OBS's
+                         code; OBS itself wasn't run. Removed once
                          nothing holds it when its timer
                          leaves the sync (deleted); written again if it goes missing.
                          Kept, with its last text, while Divora is closed. Named by
@@ -1055,6 +1202,34 @@ timers/.<id>.tmp         a write in flight — v1.59.0. A `.timer-<n>.tmp` left 
                          never at startup.
                          `tauri dev` builds use `timers-dev/` (a `tauri build --debug`
                          build uses `timers/`, as the installed app does)
+obs/password.bin         the OBS password — v1.61.0: its UTF-8 bytes encrypted
+                         with DPAPI for the current Windows user, with the
+                         entropy "DivoraVoice OBS password v1" and no
+                         description: the file is DPAPI's blob, nothing else.
+                         The entropy is part of the format: changing it orphans
+                         every saved password (`entropy_is_pinned`). It opens
+                         only for that user on that PC; one that won't (a
+                         profile reset, another user's file) reads as
+                         `passwordUnreadable`. Written by `obs_set_password` as
+                         `.password.bin.tmp`, flushed and renamed over the file
+                         (a failed write keeps the old one); deleted by
+                         `obs_forget_password`
+obs/returns.json         which scene each timer's start replaced — v1.61.0:
+                         `{version: 1, returns: [{timer, from: {uuid, name},
+                         to: {uuid, name}, setAtMs}]}`, oldest first, one per
+                         timer, at most 64. Read once at launch: a slot older
+                         than 24 h, or one that can't be read, is dropped; a
+                         file that can't be read, or has another `version`, reads
+                         as none and is replaced at the next change. Written
+                         after each change, by `.returns.json.tmp` and a rename,
+                         off the link's thread, the later state winning
+obs/.password.bin.tmp,   a write in flight — v1.61.0; one left by a crash is
+obs/.returns.json.tmp    harmless (Forget password removes the password's)
+                         The folder is made at the first write (a saved password,
+                         or a break's first switch), never at startup or when
+                         OBS control is turned on.
+                         `tauri dev` builds use `obs-dev/` (a `tauri build
+                         --debug` build uses `obs/`, as the installed app does)
 ```
 
 Installer-bundled, read-only, next to the executable's resource dir:

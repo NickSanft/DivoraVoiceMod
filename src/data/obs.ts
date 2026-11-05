@@ -718,7 +718,7 @@ export function obsWarnings(s: ObsStatus): string[] {
   const out: string[] = [];
   if (!s.loopback) {
     out.push(
-      `${s.host} is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent.`,
+      `${s.host} is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent, but someone who records a connection's start can test guesses at it offline, so keep it long and random.`,
     );
   }
   if (s.authRequired === false) {

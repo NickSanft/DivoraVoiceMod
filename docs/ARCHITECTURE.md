@@ -2237,7 +2237,10 @@ Windows N edition without the Media Feature Pack the app would then not start
 at all. COM methods are vtable calls and import nothing.
 `src-tauri/tests/no_static_media_foundation.rs` reads the built
 `divora-app.exe`'s import tables, normal and delay-load, and fails on any
-`mf*.dll` — verified by adding one static call, which it caught.
+`mf*.dll` — verified by adding one static call, which it caught. Since
+v1.61.0 it also fails on `crypt32.dll`: the OBS password's DPAPI
+(`native/dpapi.rs`) is loaded the same way ("Talk to OBS (v1.61.0)", "The
+password").
 
 ### The picture
 
@@ -4103,8 +4106,10 @@ thread, `divora-timers`, wakes at each running timer's next second boundary
 and emits `timer-state`. The main window can hide to the tray; its page's
 JavaScript timers play no part. Besides Settings, a timer shows in
 two places: a `timer` element on the stream overlay, and a text file,
-`timers/<id>.txt`, for an OBS **Text (GDI+)** source's **Read from file**. A
-second thread, `divora-timer-files`, writes the files, so no file write's disk
+`timers/<id>.txt`, for an OBS **Text (GDI+)** source's **Read from file**.
+Since v1.61.0 the backend can also send the text to an OBS text source
+itself, once Settings → OBS is on ("Talk to OBS (v1.61.0)"). A second
+thread, `divora-timer-files`, writes the files, so no file write's disk
 wait reaches the timer thread (a stuck log write still can). At zero a
 countdown shows `00:00` and says Done; since v1.60.0 it also runs its At
 zero list (see "Timers that change your voice (v1.60.0)", which also adds
@@ -4348,8 +4353,8 @@ this process (`seen`) and seeds a timer from its `resume` only at the first
 acceptance of its id. After that `resume` is ignored: a page reload sends the
 runs again, and the backend, which kept running, keeps its own state. A
 restart starts the core empty, so the stored runs are all there is. Time
-keeps passing while Divora is closed (`seed`, one function, so v1.61.0 can
-reuse its arithmetic):
+keeps passing while Divora is closed (`seed`, one function, whose arithmetic
+v1.61.0's `TimerOp::SetElapsed` reuses):
 
 | Stored run | Seeds |
 |---|---|
@@ -4520,6 +4525,21 @@ in so the tests drive time):
   `1:00:00`: every read is one of the two, and every failed open is raw 32,
   none NotFound. With the defect put back, an in-place write gave 39 empty
   reads, and removing first gave 7,966 NotFound opens.
+- **v1.61.0: Windows' own moment.** The test then failed about one full
+  parallel run in six on a NotFound open (raw 2). Measured on this PC with a
+  standalone copy of its reader loop: Windows itself leaves the name unfound
+  for a moment inside about 1 in 12,000 to 20,000 renames that land (17 of
+  200,005 lightly loaded, 2 of 40,020 under 24 busy threads), every time
+  while the writer was inside a rename that succeeded, for `std::fs::rename`
+  (`MoveFileExW`), a raw `MoveFileExW` and a POSIX-semantics rename alike.
+  No rename avoids it, and writing in place would let a reader see part of a
+  text, so the write is unchanged and the test accepts raw 2 beside 32; it
+  still fails on any empty or part-written read. A writer that removes the
+  file first still fails it (step R, measured: a delete leaves a moment in
+  which the reader's open is refused with another code). So the file is
+  never empty or part-written, and is missing only for that moment: an OBS
+  GDI+ read that lands in it shows nothing until the file's next change
+  (from OBS's code; for a paused timer, until it next changes).
 - **Retries.** A write or removal that fails stays pending and is tried again
   at every pass; while anything is pending the writer comes back after 10 ms
   (`RETRY_WAIT`), a wait that on Windows ends at the next system timer tick
@@ -4888,7 +4908,8 @@ with the mirror.
   it the name is still its content, "Click to set".
 - **The folder footer** names Text (GDI+) and Read from file, and says OBS's
   text can run up to about 2 s behind the overlay and now and then show
-  nothing for a second or two. Open folder (named "Open the
+  nothing until the time next changes: a second or two while the timer runs,
+  longer while it's paused (v1.61.0; it said "a second or two"). Open folder (named "Open the
   timer files folder", apart from Recordings' Open folder on the same page) and
   Copy path ask for `timers_dir` when clicked, never on mount, so opening
   Settings creates no folder.
@@ -4910,7 +4931,10 @@ path of BRB's file").
 v1.60.0 adds the hand-off of each transition's actions to `divora-timers`
 (before its emit and the texts, with the log lines last) and two threads,
 `divora-timer-actions` and `divora-timer-lines`: see "Timers that change your
-voice (v1.60.0)", "Threads".
+voice (v1.60.0)", "Threads". v1.61.0 adds the OBS link's feed to the
+hand-off: built by `text_update` under the core lock, and put in a `watch`
+after the writer's slot, only when it changed: see "Talk to OBS (v1.61.0)",
+"Threads".
 
 **Latency**, from the code, with S2's figures from the real app on this PC
 (debug builds; the setup is under "Tests"):
@@ -5200,11 +5224,11 @@ running.
   `sync_timers`, read one by one. The open question was answered: a
   countdown that ran out runs only its putting-back actions (an unmute, a
   preset switched back), never a line, a clip, a replay or a switch.
-- **v1.61.0, "Talk to OBS":** the same text pushed to an OBS source. The
-  thread hands texts to one `TextSink`, which is to take a `watch` sender
-  beside the writer's slot. A count-up that follows OBS's stream needs a core
-  op of its own to set a known timer's time, since a seed applies only to an
-  id not yet seen; it can reuse `seed`'s arithmetic.
+- **v1.61.0, "Talk to OBS":** shipped; see "Talk to OBS (v1.61.0)". As
+  planned here, the same text goes to an OBS source: the thread's one
+  `TextSink` is now `TimerSinks`, the writer's slot with a `watch` sender
+  beside it. A count-up that follows OBS's stream or recording is set by a
+  core op of its own, `TimerOp::SetElapsed`, through `seed`'s arithmetic.
 - Later, or not planned: overtime; laps; styling the face (style the text
   file in OBS instead); a sound at zero (done in v1.60.0: Play a clip at
   zero); a tray item; a Mixer card; a titlebar pill; MIDI or glyph actions
@@ -5295,17 +5319,19 @@ and tells the page nothing. It uses three subsets of a list:
 
 - **restoring** actions put back what a start changed: Unmute my voice
   (`setMuted {muted: false}`) and Back to the preset before
-  (`revertPreset`). Every other action is a one-shot.
+  (`revertPreset`); since v1.61.0, Switch OBS back too (`obs` with `op`
+  `sceneBack`, "Talk to OBS (v1.61.0)"). Every other action is a one-shot.
 - **the undo of the start** is those restoring actions that undo something
   the run's At start did: Unmute my voice only when that At start has Mute
   my voice; Back to the preset before always, because the page acts on it
-  only with a return the start noted (below).
+  only with a return the start noted (below); Switch OBS back (v1.61.0)
+  only when that At start has a Switch OBS scene.
 - **re-applied** actions are At start's `setMuted` actions: the mute is
   never stored, so a relaunch forgets it.
 
 | Transition | Runs | `hook` / `why` | `lateMs` | Page told |
 |---|---|---|---|---|
-| `Started` | At start (Back to the preset before never runs at a start) | start / `armed` | 0 | yes |
+| `Started` | At start (Back to the preset before, and since v1.61.0 Switch OBS back, never run at a start) | start / `armed` | 0 | yes |
 | `Fired`, at most 30 s late (`LATE_ONE_SHOTS_MS`) | At zero | end / `zero` | its lateness | yes |
 | `Fired {finished}` (End now) | At zero | end / `endNow` | 0 | yes |
 | `Fired`, more than 30 s late | At zero's restoring actions | end / `late` | its lateness | yes |
@@ -5321,7 +5347,8 @@ return and an end can retire its timer's start line (below).
 
 **The rule, said once.** A countdown that ends late — it ran out while the
 PC slept or Divora was closed, or was found due more than 30 s late — runs
-only its At zero list's Unmute my voice and Back to the preset before. A
+only its At zero list's Unmute my voice and Back to the preset before (and,
+since v1.61.0, Switch OBS back). A
 Reset or a delete runs them only to undo its own start. One-shots — a line,
 a clip, a replay, a switch — run only at zero on time and on End now.
 Nothing puts back a change At zero doesn't list: a start that mutes, with no
@@ -5538,6 +5565,11 @@ lock is held.
 | `saveReplay` | backend: the blocking pool | no | no | start, zero |
 | `setMuted` (Mute my voice, Unmute my voice) | backend: the worker | when `muted` is false | yes | start, zero |
 | `panic` (Stop all clips and lines) | backend: the worker | no | no | start, zero |
+| `obs`, `op` `scene` (Switch OBS scene; v1.61.0) | backend: the worker, to the OBS link | no | no | start, zero |
+| `obs`, `op` `sceneBack` (Switch OBS back; v1.61.0) | backend: the worker, to the OBS link | yes | no | zero |
+
+The `obs` rows are "Talk to OBS (v1.61.0)"'s: one kind with two ops, each
+offered where its own row says.
 
 The fields are checked the same on both sides (`action_from_wire`,
 `readAction`, against the fixture's samples): `presetId` any non-empty
@@ -5646,7 +5678,8 @@ end's switch notes nothing. When an end runs Back to the preset before,
 After an end's list, any return left for that timer is dropped, so an end
 without Back to the preset before stays on the timer's preset and forgets
 where it came from. "Only if still ours" keeps a timer from undoing a switch
-you made by hand; it is the rule v1.61.0's OBS scene back is to use. The
+you made by hand; it is the rule v1.61.0's Switch OBS back uses, against
+OBS's program scene ("Talk to OBS (v1.61.0)", "Scenes"). The
 splice makes two timers that both switch back nest: A (Hollow King →
 Villager), then B (Villager → Glass Oracle); A ends under B and hands B
 Hollow King, so B's end goes back to Hollow King. A timer that doesn't
@@ -5998,8 +6031,1236 @@ catching espeak-ng's.
   replayed; Compare's A/B kept across a timer's switch; an unmute that puts
   back only what the break found. The follow-ups are in
   [`research/stream-studio.md`](research/stream-studio.md).
-- **v1.61.0, "Talk to OBS":** `obs {op}` is to be a backend kind, run by
-  `divora-timer-actions`. Its scene back restores, so End now, a late fire
-  and a sleep are to run it, and Reset and delete when the start set a
-  scene; across a restart or a run-out while closed only if v1.61.0 stores
-  its return slot.
+- **v1.61.0, "Talk to OBS":** shipped; see the next section. `obs` is a
+  backend kind, run by `divora-timer-actions`, which hands it to the OBS
+  link; its `op` is a flat field (`scene` or `sceneBack`), not a nested
+  object. Switch OBS back restores, so End now, a late fire, a run-out and a
+  sleep run it, and Reset and delete do when the start switched a scene.
+  v1.61.0 stores its slot (`obs/returns.json`), so a restart mid-break
+  still switches back, and so does a run-out while Divora was closed, once
+  the OBS link connects within 2 minutes of the launch's first sync.
+
+## Talk to OBS (v1.61.0)
+
+**Settings → OBS** connects Divora to the WebSocket server built into OBS
+(obs-websocket 5.4.0 or later), once **Connect to OBS** is turned on; it is
+off until then. Turned on, the OBS link keeps one connection to OBS at an IP
+address, 127.0.0.1:4455 unless you change it, and does three things with it.
+A timer's time goes into an OBS text source picked on its card (**Show in
+OBS**), sent when it changes. Two new timer actions, **Switch OBS scene** and
+**Switch OBS back**, and a scene for **Add break (BRB)**, switch OBS's
+program scene for a break and back. A count-up can **Follow OBS**: it starts
+from 0:00 when the stream (or the recording) starts, pauses when it stops,
+and pauses with a paused recording. The client is Divora's own, on
+tokio-websockets 0.13.3, and builds nine requests and no others, none of
+which creates, deletes or restyles anything in OBS or starts or stops a
+stream or a recording (from the code: `only_the_nine_requests_are_built`).
+The plan, and what the build changed from it, are in
+[`research/stream-studio.md`](research/stream-studio.md) (v1.61.0).
+
+OBS isn't installed on this PC, so nothing here was tried against OBS
+itself. What OBS does is from obs-websocket's and OBS's sources and the
+protocol doc; what Divora does is from its code and its tests, most of them
+against a fake obs-websocket server written from that doc by a different
+hand from the client ("Tests"). The runs in the real app against a stand-in
+OBS are under "What was measured".
+
+Where it lives:
+
+- `src-tauri/src/obs/mod.rs`: `ObsShared`, the state the commands, the
+  timer worker and every link generation reach (the status cell, the last
+  config, the running link's handle, the slots and due marks, the source
+  uuids Divora wrote, the slot saver), built and managed by `obs::init` at
+  setup; `offer_run` and `offer`; `before_exit`; `blocking`; the kill
+  switches and limits; and what a link runs with — `LinkOp`, `LinkCmd`
+  (`Inventory`, `Wake`, `Due`), `LinkTiming`, `LinkDeps` and four traits,
+  `StatusSink`, `SlotStore`, `TimerControl` and `PasswordSource`, so the
+  link's tests run it against stubs.
+- `obs/proto.rs` (pure): Hello and the version gate, Identify and the auth
+  string, the nine requests, what comes in (answers and six events), close
+  codes, which inputs are text sources.
+- `obs/machine.rs` (pure): the wire types (`ObsConfig`, `ObsStatus`,
+  `ObsInventory`), `StatusCell`, `parse_host` and `LinkConfig`, the
+  backoff, `follow_op`, `join_seed` and `seed_pairs`, `next_push`,
+  `request_failure`, `RevCoalesce`, `sanitize_version`.
+- `obs/scenes.rs` (pure): `Slots`: which scene each timer's start replaced,
+  the switch backs due, and `returns.json`'s format.
+- `obs/link.rs`: a running link's two tasks, the *driver* and the
+  *session*, the capped reader, and the driver's one wait, `first_of`.
+- `obs/files.rs`: the `Cipher` trait and `Dpapi`, `write_atomically`, the
+  password's save, load and forget, `load_returns`, `SlotSaver`.
+- `obs/log.rs`: the only file under `obs/` that names a `tracing` macro.
+- `obs/fake.rs`, `obs/seam_tests.rs`, `obs/testing.rs`: tests only.
+- `src-tauri/src/timers.rs`: `TimerDef.obs_text` and `.follow_obs`,
+  `ObsFeed`, `TimerOp::SetElapsed`, the core's sleep count, `TextUpdate.obs`.
+- `src-tauri/src/timer_thread.rs`: `TimerSinks`, `ActionHost::obs(timer,
+  hook, op)` and the worker's arm for it.
+- `src-tauri/src/timer_actions.rs`: `Action::Obs(ObsOp)`.
+- `src-tauri/src/lib.rs`: the six commands, `AppHost::obs`, the setup (the
+  feed's channel, `TimerSinks`, `obs::init`) and the tray Quit's
+  `obs::before_exit`.
+- `divora-capture`: `dpapi` (`protect`, `unprotect`, `DpapiError`) over
+  `native/dpapi.rs`, inside the crate's one `unsafe` scope; `elsewhere.rs`
+  answers "unavailable".
+- `src/data/obs.ts` (pure): the page's half — reading `divora.obs`, the
+  status and the inventory, every line the card says, the pickers' states.
+  `src/data/obs.fixture.json`: the wire contract both sides' tests read, and
+  the e2e mock. `src/data/timerActions.ts` gains the `obs` kind,
+  `ACTION_OPS`, `runsAt` and `breakTemplate(scene)`; `src/data/timers.ts`
+  gains `obsText` and `followObs`, `obsTextOwners` and `withObsNames`.
+- The store's OBS block (`src/stores/app.tsx`); in
+  `src/screens/SettingsScreen.tsx`, `ObsSection`, `ObsPicker`, a timer
+  card's two OBS rows, the Break row and the action editor's two OBS
+  choices. `Select` gains `onOpen` and disabled options, `Segmented` an
+  `ariaLabel` that makes it a radio group, `Sigil` a `link`, and
+  `src/components/handOffFocus.ts` is new.
+
+`obs` is a `pub` module, as Hourglass's are, so `lib.rs`'s and the timer
+modules' tests drive the real functions. Cargo.lock gains three crates:
+tokio-websockets 0.13.3, sha1_smol 1.0.1 and simdutf8 0.1.5. tokio becomes a
+direct dependency with `net`, `time`, `sync` and `rt` (no `macros`), and
+futures-core, futures-sink, base64, zeroize and fastrand become direct
+dependencies, all already locked. No TLS crate is built. `divora-capture`
+gains the `windows` crate's `Win32_Security_Cryptography` feature, for
+DPAPI's blob type and flag only.
+
+### The protocol
+
+obs-websocket v5: JSON over `ws://`, with no subprotocol header. A
+connection, in order:
+
+1. TCP to the IP and port, within 3 s, with Nagle off (a small frame isn't
+   held for a delayed ACK).
+2. The WebSocket upgrade, through a reader that fails past 64 KiB until the
+   upgrade has finished: tokio-websockets reads the upgrade's answer with no
+   cap of its own (from its code). Once upgraded, a frame over 4 MiB ends the
+   connection (`tooBig`). The upgrade and Hello come within 5 s of the TCP
+   connect.
+3. Hello, before anything is sent. A first data frame that isn't a Hello —
+   op 0 with an unsigned `rpcVersion` of at least 1 — is `notObs`, retried.
+   The version gate reads `obsWebSocketVersion`'s leading `x.y.z` (a
+   `-suffix` dropped, so `5.5.0-beta1` is 5.5.0): below 5.4.0 is `tooOld`; a
+   value that isn't a string with one, a number included, is `unsupported`
+   (`badVersion`). Both stop, with no Identify sent. Hello's `rpcVersion` is
+   read and never compared.
+4. If Hello asks for a password: none saved is `needsPassword`, one that
+   won't decrypt `passwordUnreadable`; both stop, with no Identify.
+   Otherwise the auth string (below).
+5. Identify, always with RPC 1, whatever Hello announced, and always with
+   `eventSubscriptions` 69 (General, Scenes, Outputs): an absent mask means
+   every category, and Inputs would echo an `InputSettingsChanged` for every
+   push (from obs-websocket's code). Identified must come within 5 s of
+   Hello, the password's load included. A close 4010 here means this OBS no
+   longer serves RPC 1: `needsNewerDivora`, a stop.
+6. The startup steps: GetVersion, whose `availableRequests` must list all
+   nine (else `unsupported`, `missingRequest`, with `detail` the first one
+   missing, a stop); then GetStreamStatus and GetRecordStatus. A 207
+   (NotReady: OBS is starting, closing or changing scene collection) waits
+   1 s and sends that step again, for at most 30 s from the first step
+   (`notReady`); after ExitStarted the first 207 ends the connection
+   (`obsExiting`). Any other error answer is `protocol`, and a step that
+   times out is `noAnswer`. Then `connected`.
+
+While waiting for Hello and for Identified, pings and pongs are skipped,
+but more than 64 in a row end the attempt as `notObs` (step R): the crate
+queues a pong for each ping it reads, and nothing flushes them before
+Identified. obs-websocket sends none then (from its code). Any other data
+frame before Identified is skipped, and a second Hello or Identified on a
+live connection is ignored.
+
+So no auth string goes to a server whose Hello Divora refuses. A refusal
+from GetVersion's list, or a 4010, comes after the Identify; obs-websocket
+checks the password before the RPC version (from its code), so a 4010 costs
+one connection and raises no auth-failed alert in OBS.
+
+**The auth string** is `base64(sha256(base64(sha256(password ‖ salt)) ‖
+challenge))`, standard padded base64 over UTF-8 bytes. The fixture's two
+vectors, one with a non-ASCII password, were computed with Python's
+`hashlib` and Node's `crypto`, which agreed
+(`auth_string_matches_python_and_node`); the protocol doc's own example
+output matches neither order and isn't used.
+
+**The nine requests**, built only through `proto::Request`, scenes and
+inputs named by uuid alone, since a name beside a uuid risks 404
+TooManyRequestFields (`the_nine_requests_are_exact` pins each byte for
+byte):
+
+| Request | Sent for |
+|---|---|
+| GetVersion | startup: OBS's version and the requests it offers |
+| GetStreamStatus, GetRecordStatus | startup, and Follow OBS's seeds |
+| GetCurrentProgramScene | each Switch OBS scene and Switch OBS back, before its Set |
+| SetCurrentProgramScene `{sceneUuid}` | the switch |
+| SetInputSettings `{inputUuid, inputSettings: {text}, overlay: true}` | a timer's text; `overlay` keeps the source's other settings |
+| GetSceneList, GetInputList, GetInputSettings `{inputUuid}` | `obs_inventory`: the scenes, every input (the text sources are picked out here), each text source's file flag |
+
+**The six events read:** ExitStarted, SceneCreated, SceneRemoved,
+SceneNameChanged, StreamStateChanged and RecordStateChanged. Of an output
+event only `outputState` is read, one of the nine `OBS_WEBSOCKET_OUTPUT_*`
+identifiers (any other text reads as unknown); its other fields, the
+recording's file path among them, never are. Every other event, field and
+op is ignored, and an answer's `comment`, OBS's own text, is dropped. Mask 69
+doesn't carry Inputs or Config events, so a mapped text source deleted in
+OBS, and a scene-collection switch, show up only as a request that fails,
+and a source renamed there only at the next inventory read ("Text in an OBS
+source", "Reloads, restarts").
+
+**How a connection ends** (`close_outcome`, `connect_reason`, and the
+driver's own ends):
+
+| Ends as | When |
+|---|---|
+| `authFailed` (stop) | close 4009 |
+| `needsNewerDivora` (stop) | close 4010 |
+| `kicked` (stop) | close 4011, OBS's Kick: the protocol says a client must not reconnect on its own |
+| `needsPassword`, `passwordUnreadable`, `tooOld`, `unsupported` (stop) | steps 3, 4 and 6 above |
+| `retrying`, `refused` | the TCP connect refused |
+| `retrying`, `unreachable` | the 3 s connect timed out, or any other I/O error while connecting (the first of a run logged with its `ErrorKind`) |
+| `retrying`, `notObs` | the upgrade refused, or answered with something that isn't an HTTP upgrade, or past 64 KiB; a first frame that isn't a Hello; more than 64 control frames in a row before Identified |
+| `retrying`, `noAnswer` | no upgrade, Hello or Identified in time; a startup step that timed out; a request still unanswered 15 s after it was sent |
+| `retrying`, `notReady` | 207 through the startup steps for 30 s |
+| `retrying`, `closed` (`obsExiting` after ExitStarted) | OBS's close with any code not listed here (1000, 1001, none, …), or the stream's end, during the upgrade included |
+| `retrying`, `silent` | no frame of any kind within 10 s of a ping |
+| `retrying`, `tooBig` | a frame over 4 MiB |
+| `retrying`, `protocol` | a close 4000-4999 other than the three above (4002-4008 logged at warn, as a client bug), or 1002, 1003 or 1007-1010; a frame the crate refuses; the events queue full; any other error answer at startup |
+
+A stop lasts until `obs_configure` changes the address, a password is saved
+or forgotten, **Try again** (`obs_reconnect`) is pressed, or OBS control is
+turned off and on. Due switch backs outlive it ("Scenes").
+
+**Backoff** (`backoff_ms`): before attempt n + 1 after n failures in a row,
+1, 2, 4, 8, 15 s, then 30 s, each times `0.8 + 0.4·r` with r from
+`fastrand`, then capped at 30 s, so no wait passes 30 s
+(`backoff_never_passes_30_s`). A connection that stayed Identified 10 s or
+more sets n back to 0 when it ends. Network failures never stop it. Each
+`retrying` status carries the attempt's wall time in `retryAtMs`, which the
+card counts down. Try again while retrying attempts now and keeps n. The
+first failure of a run logs at warn, then at most one "still can't reach
+OBS" line per 5 minutes.
+
+### The link: two tasks, one request at a time
+
+No link task exists while OBS control is off. `obs_configure` with
+`enabled: true` starts one when none runs, restarts it for another
+canonical address, and otherwise leaves it alone, so a page reload neither
+drops the connection nor resets the backoff
+(`configure_with_the_same_address_keeps_the_link`), a Kick's stop included.
+A start happens under the status cell's lock, in this order: the
+generation moves up by one, `connecting` is written and emitted, then the
+driver is spawned with that generation
+(`the_link_starts_after_its_generation`). A driver checks its
+generation before every request, slot change, timer op and status write
+(the cell refuses a stale one) and ends quietly once a newer one runs.
+
+Each running link is two tasks on Tauri's tokio runtime (in tests, the
+test's own), spawned through `ObsShared`'s `spawner`:
+
+- **The driver** connects, handshakes, waits out the backoff, sends the one
+  request outstanding, and handles ops, the feed, Follow OBS, commands and
+  due switch backs.
+- **The session** owns the socket: it writes what the driver hands it,
+  routes each answer to its request by `requestId` (at most 64 waiting,
+  answered ones dropped first), stamps each decoded event with the moment it
+  was read and hands it over a queue of 256 (`try_send`; a full queue ends
+  the connection as `protocol`), pings every 15 s with an empty payload, and
+  ends the connection when no frame of any kind comes within 10 s of a ping
+  (`silent`). It reads the next frame only once what it has queued is
+  flushed (step R): a peer that pings and never reads had grown the crate's
+  pong queue, one pong per ping, until an allocation failed, which aborts
+  Divora; now it stops being read, and the keepalive ends it
+  (`a_ping_flood_that_reads_nothing_ends_silent`).
+
+tokio's `select!` needs its `macros` feature, which stays off (it would
+bring tokio-macros and syn), so each wait is one hand-written `poll_fn`
+over its sources in a fixed order, the command channel first: the driver's
+`first_of`, the session's `next_turn`. A source that has ended is never
+polled again: a closed feed means "no more feed", never "changed", so the
+driver can't spin on it (`l35_a_closed_feed_never_spins_the_driver`).
+Dropping the command sender is the stop, and every wait watches for it, the
+connect and the handshake included (`l23c_a_stop_is_seen_inside_every_wait`),
+except two bounded ones: the 1000 close after a failed handshake (at most
+1.25 s) and the wait for the session's end after the driver has dropped a
+connection itself (at most 2.25 s), so a Quit's ack still follows the
+close.
+
+**One request outstanding.** The driver sends a request only once the
+one before it has its answer. A request has 3 s to a loopback address, 5 s
+to any other. A timeout records its result then (a skip, a switch back due
+again, a push's retry), and sends nothing more until the late answer arrives
+— used only to record a push's success — or the late-answer cap, 15 s from
+sending, ends the connection (`noAnswer`). obs-websocket runs each request
+as its own task and lets go of the session first (from its code), so a
+request that timed out is still running inside OBS: had the next one gone
+out, the two could finish in either order, and a late text could overwrite
+a newer one, or a late switch to BRB land after the next switch back had
+read the program scene. Events and commands are still handled while a
+request waits, and feed changes keep coalescing in the `watch`.
+
+**The driver's idle turn** takes the first work there is, one request each
+turn, in this order: an op from the queue (a `scene` stamped more than 5 s
+earlier is skipped as `late`); a due switch back; a Follow OBS seed; one text
+push; one step of an inventory. With none, it waits on everything that
+makes some: the commands, the session's end, events, ops, the feed, and its
+timers (the push retry, a missing source's re-check, the coalesced
+`inventoryRev`, the earliest due mark's expiry). Events are handled in every
+state as they are read, so a stream's start is applied while a push is
+outstanding (`l18_follow_obs_applies_events_as_they_come`).
+
+### Nothing waits on OBS
+
+- **Text.** The timer thread's sink, `TimerSinks`, puts each pass's texts in
+  the files' slot as before, and the OBS feed in a `watch` with
+  `send_if_modified`, only when the feed differs from the one there, so an
+  unchanged pass doesn't wake the link
+  (`unchanged_feeds_dont_wake_the_link`). The `watch` keeps the value with
+  or without a receiver, so a link that starts later reads the latest first
+  (`the_sink_hands_the_obs_feed_only_when_it_changes`). The driver clones
+  out of it when it reads it and never holds a borrow across an `.await`.
+- **Ops.** The action worker's `AppHost::obs` calls `ObsShared::offer_run`,
+  which calls `offer`. `offer` stamps the op, reads the status, and: while
+  `connected`, hands it to the link by `try_send` on a queue of 16; with the
+  queue full, a `scene` is a skip (`queueFull`) and a `sceneBack` is marked
+  due; with the link's driver gone, the handle is dropped (the next change
+  starts a new link) and the op is handled as not connected. Not connected,
+  a `scene` is a skip (`notConnected`) while OBS control is on, and a log
+  line only otherwise: it is never run late; a `sceneBack` is marked due if
+  its timer has a slot (its `scene` ran) and OBS isn't switched off ("Due
+  marks", below). `offer` never waits
+  (`offer_never_waits`; `l29_offer_never_waits_on_a_stalled_link`: 20 offers
+  from a plain thread against a stalled link, each under 5 ms).
+- **The engine and `divora-core`** are untouched. `WM_HOTKEY` gains nothing.
+
+### Threads
+
+| Work | Thread | Holds | Never |
+|---|---|---|---|
+| building the feed (`text_update`) | `divora-timers` | the core lock, for at most 16 short strings, the follows and a count, inside the pass's text update | — |
+| handing it over (`send_if_modified`) | `divora-timers`, unlocked | the `watch`'s own lock, for a compare and a pointer swap | waiting on the link |
+| `offer_run`, `offer` | `divora-timer-actions` | `ObsShared`'s leaf locks, one at a time: the status cell, the link handle, the slots | waiting on the link, OBS or the disk |
+| the six commands | tokio workers (async commands) | `ObsShared`'s locks, briefly; `obs_inventory` then waits up to 15 s holding none | the main thread |
+| the driver and the session, while on | tokio workers | the status cell's, the slots' and the written set's locks, for microseconds; the core lock only through `TimerShared::apply` | a lock held across an `.await`, a socket call or a disk call |
+| the password's decrypt and the auth string; `password.bin`'s writes; the slot saver's one job | the blocking pool, only through `obs::blocking` | none of `ObsShared`'s | — |
+| `obs::init`: `returns.json` read and `password.bin` looked for, once | main, at setup | — | — |
+| `obs::before_exit` | main (the tray's Quit) | the link handle's lock, to take it | an untimed wait: at most 300 ms |
+
+`obs::blocking` carries the caller's `tracing` dispatcher onto the pool
+thread, so a test's log capture sees what a blocking job logs; it is the only
+`spawn_blocking` under `obs/` (`obs_blocking_work_carries_the_dispatcher`).
+In the app the subscriber is global, so nothing changes there.
+
+The core's lock stays a leaf: the link takes it only through
+`TimerShared::apply`, with no lock of its own held. `ObsShared`'s locks are
+leaves but one: a start, a stop, Try again and `obs_inventory` hold the link
+handle's lock while they take another (the status cell's, the slots', the
+config's, for example), so two starts can't interleave; nothing takes the
+link handle's lock while holding another (checked across every path by the
+joint gate). A status emit goes out under the status cell's lock, and posts
+and returns.
+
+### Text in an OBS source
+
+**The feed** (`text_update`, under the core lock): each run timer that has
+an `obsText`, its `text` — what its `.txt` file gets — by source uuid, in
+list order, the first timer per uuid only; each count-up that follows OBS;
+and the core's sleep count (`obs_feed_table`). The card offers a source
+another timer already shows as listed and not pickable ("shown by
+{name}"), so two timers can't fight over one source.
+
+**Pushes.** The driver keeps, per connection, what OBS *confirmed*
+(`pushed`: uuid → text), and each idle turn pushes at most one uuid:
+`next_push` re-reads the latest feed and picks the first uuid in feed order
+whose text differs from what OBS confirmed, then a clear (below). A new
+connection starts with nothing confirmed, so every mapped text goes on its
+first turns. While OBS is slow, newer feeds replace each other in the
+`watch`: only the push outstanding and the latest go
+(`l10_feeds_coalesce_behind_a_slow_push`), and no push carries a text older
+than the newest feed when it was sent (`l10b_each_push_reads_the_newest_feed`).
+An unchanged text goes once (`l11_an_unchanged_text_is_pushed_once`).
+
+A push OBS refuses (`request_failure`, `request_failure_table`):
+
+| Answer | Then |
+|---|---|
+| success | recorded as confirmed; `textSkip` cleared |
+| a resource code, 600-699 | the uuid into `status.missing`; no text skip; nothing more to it until the next connection, an inventory that lists it, an `inventoryRev` change, or 60 s |
+| 207 | a rate-limited log line; no text skip; the retry |
+| any other code, a 7xx included | `textSkip {failed}`; the retry |
+| no answer in time | `textSkip {timedOut}`; the connection wedged (above); the retry |
+
+The retry comes after 1 s, doubling to 30 s, and runs the diff again even if
+the feed hasn't changed, so a paused or finished timer's last time isn't left
+wrong after one refused push (`l34_a_refused_final_push_is_retried`). A new
+text for that source goes on the next turn. Which code OBS answers for a
+source that's gone isn't in the sources read (U8): any resource code is
+treated as gone, and a 7xx, a processing failure, never is.
+
+**Clears** (owner answer Q3). `ObsShared` keeps the uuids Divora wrote in
+this process. One that is no longer in the feed — its timer picked None,
+was deleted, or is no longer one the backend runs — gets `text: ""` once,
+while connected or at the next connection, and leaves the set when OBS
+confirms it
+(`l25_an_unmapped_source_is_cleared_once`,
+`l25b_a_source_unmapped_while_disconnected_is_cleared_on_reconnect`). A
+clear never goes to a source OBS can't find, nor one OBS confirmed empty. A
+Divora restart forgets the set, so a source unmapped while Divora was closed
+keeps its last time (`l25b_a_restart_clears_only_what_this_divora_wrote`).
+
+**In OBS** (from OBS's code): `overlay: true` keeps the source's font,
+colour and other settings and replaces its text, so what it said before
+isn't kept; the pushed text stays in the source's settings after Divora
+stops; each push refreshes the source's Properties window if it's open
+(U7). A source set to Read from file is listed and can't be picked, since a
+source reading a file shows the file, not its text setting (from OBS's
+code); Divora never changes that flag.
+
+The push for a second goes out on the driver's first idle turn after the
+timer thread's pass hands the feed: a `watch` wake, with no polling (from
+the code). The time from a second's start to its push is T3's ("What was
+measured").
+
+### Scenes: slots, switch backs and the grace
+
+**Switch OBS scene** (`scene {to}`): GetCurrentProgramScene, then the slot
+for its timer is recorded and saved — before the Set, so a switch back
+works even if a Set that timed out lands later — then
+SetCurrentProgramScene, unless OBS is on `to` already. **Switch OBS back**
+(`sceneBack`): GetCurrentProgramScene, then `plan_back` against it (pure; it
+changes nothing), the Set if the plan has one, and the plan committed (the
+slot dropped, an inheritance applied, saved) once the Set is answered or
+none was needed. Both read the Program scene, which SetCurrentProgramScene
+switches in Studio Mode too (from OBS's code; whether OBS runs your
+transition then is U4). Asking for the program scene at that moment, rather
+than following CurrentProgramSceneChanged, keeps the rule safe from an event
+that crosses an answer (obs-websocket can send either first, from its code).
+
+`after_scene` (`after_scene_table`):
+
+| The timer's slot | OBS's program | Slot after | Set |
+|---|---|---|---|
+| none | not `to` | `{from: program, to}` | `to` |
+| none | `to` | `{from: program, to}`, so its back does nothing | none |
+| `{from: F, to: T}` | still `T` (a start again) | `{from: F, to}` | `to` unless the program is `to` |
+| `{from: F, to: T}` | not `T` (its run ended without a back) | `{from: program, to}` | `to` unless the program is `to` |
+
+`plan_back` (`plan_back_table`):
+
+| Case | Switch to | Other slots |
+|---|---|---|
+| no slot | nothing | — |
+| OBS still on the slot's `to`, `from` another scene | `from` | — |
+| OBS still on `to`, `from` the same scene | nothing | — |
+| OBS elsewhere, another slot's `from` is this `to` (stacked) | nothing | that slot's `from` becomes this one's |
+| OBS elsewhere, none stacked: you moved on | nothing | — |
+
+So a scene you picked by hand during a break stays
+(`l15_a_switch_back_leaves_a_scene_you_moved_to`), and two breaks nest: A
+(Game → BRB), then B (BRB → Just Chatting); A ends under B and hands B Game,
+so B's end goes back to Game (`l16_a_stacked_break_inherits_the_way_back`).
+This is Back to the preset before's rule ("Timers that change your voice
+(v1.60.0)"), ported to Rust.
+
+When a scene op doesn't switch (`request_failure` and the driver):
+
+| What happened | Switch OBS scene | Switch OBS back |
+|---|---|---|
+| not connected, or more than 5 s behind | `lastSkip {notConnected}` or `{late}`; never run late | due (below) |
+| the Get times out, gets 207, or the session ends before an answer | `lastSkip {timedOut}`, `{notReady}`, `{notConnected}`; no Set | due again with its first stamp |
+| the Set gets 207, or the session ends before its answer | `lastSkip {notReady}` or `{timedOut}` | due again with its first stamp; nothing committed |
+| the Set times out | `lastSkip {timedOut}`; the slot kept, since it may still switch | `lastSkip {timedOut}`; the plan committed |
+| 600 or 602 to the Get or the Set | `lastSkip {notFound}` | `lastSkip {notFound}`; the plan committed |
+| any other code, or a Get answered with no scene in it | `lastSkip {failed}` | `lastSkip {failed}`; the plan committed |
+| the Set answered | `lastSkip` cleared | `lastSkip` cleared; the plan committed |
+| no Set needed | `lastSkip` cleared | the plan committed |
+
+A switch to BRB 40 s late is worse than none, so a `scene` is never run
+late; a switch *back* is checked against the program scene again when it
+runs, so running it late is safe.
+
+**Due marks** (owner answer Q2). A switch back that can't run now is *due*
+in `ObsShared`, stamped when `offer` received it, and runs at the first
+connected, idle turn of whichever link generation runs then, after the ops
+queue, while it is within 2 minutes of that stamp (`SCENE_BACK_GRACE`).
+Past the grace it is dropped with a log line and, while OBS control is on,
+`lastSkip {sceneBack, notConnected}` — or `notReady` when a link was
+connected and OBS answered 207 throughout. After a 207 to a switch back,
+every due mark waits 1 s. `heldBack` counts the timers with a slot whose
+switch back is due, or taken and not yet committed (step R: a switch back
+OBS keeps answering 207 stays held while it is tried, so the card's
+held-back line isn't said again each second); a driver that goes stale
+before it can commit lets go of its take. A due mark is dropped only by its
+grace, by `obs_configure {enabled: false}`, and (step R) by its timer's next
+start that switches a scene. A stop state, Try again, a saved password and
+an address change keep it (`l17c_a_stop_state_keeps_the_switch_backs`,
+`l33_a_restart_mid_break_still_switches_back`).
+
+Step R closed four ways a switch back went wrong across runs and link
+generations:
+
+- **A new run.** `offer_run`, with the batch's hook, sees a start's `scene`
+  begin a new run (`Slots::started`): the timer's due marks from before it
+  are dropped, a mark stamped before its latest start is ignored, and a
+  switch back from the earlier run that fails later is not due again. A
+  re-mark of a take keeps its first stamp (`remark`); one whose take is
+  gone does nothing. So a break started again is never switched back by the
+  run before it (`a_start_drops_an_earlier_runs_switch_back`,
+  `a_switch_back_failing_after_a_new_start_is_not_due_again`).
+- **A parked or absent link.** A mark made while no link is connected sends
+  `LinkCmd::Due`, so a parked or retrying driver expires it on time instead
+  of leaving "(up to 2 minutes)" up for good
+  (`a_parked_link_expires_a_switch_back_made_due_while_parked`). A start
+  drops the marks whose grace ran out while no link ran (OBS off, or before
+  the first configure), with a log line and no skip line
+  (`a_start_drops_marks_that_expired_with_no_link`).
+- **An ending driver's queue.** Switch backs still in a driver's ops queue
+  when it ends (a restart cut it off while a request was outstanding) are
+  due again with their own stamps (`leave_ops`); `scene`s there are dropped,
+  logged (`a_queued_switch_back_outlives_its_driver`).
+- **A replaced driver.** One that a newer generation replaced, and that
+  leaves a switch back due, tells the newest link (`SlotStore::nudge`, a
+  weak handle to its commands, so a stopped link's channel still closes)
+  (`a_replaced_driver_tells_the_newest_link_of_a_switch_back_it_left`,
+  `a_nudge_reaches_the_newest_link_and_holds_none_open`).
+
+Until the first `obs_configure` of a launch — which a launch with OBS
+control off doesn't send — a switch back with a slot is still marked due;
+a page that turns OBS on within its grace runs it, and the first link
+started drops it otherwise.
+
+**The slots survive a restart** (owner answer Q1). Slots and due marks live
+in `ObsShared` for the life of the process, so every link generation reads
+and changes the same ones. Slots are also kept in `obs/returns.json`
+(`{version: 1, returns: [{timer, from: {uuid, name}, to: {uuid, name},
+setAtMs}]}`), read once by `obs::init` at setup. A slot older than 24 h is
+dropped when read, at most 64 are kept (the oldest goes), and a file that
+can't be read is logged and read as none. After each change the JSON goes to
+`SlotSaver`, latest wins: a pending value and at most one blocking job, which
+writes it by temp file and rename and loops while a newer one waits, so two
+writes or two temp files never overlap, the driver never waits on the disk,
+and of two saves that race, the later state stays
+(`two_saves_leave_the_later_state`). Due marks are in memory only.
+
+- **A restart mid-break:** the launch re-mutes the break (v1.60.0's rule);
+  the slot is read at setup, so At zero, End now, a Reset or a delete
+  still switches back, or is due until the OBS link connects.
+- **A run-out while Divora was closed:** the first `sync_timers` plans
+  `ranOut`, and its switch back is offered before any link has connected:
+  the boot `sync_timers` goes at the store's creation and the OBS boot's
+  `obs_configure` after a listen, through another queue, so the two can
+  reach Rust in either order. The mark is due from that moment and runs at
+  the first connected moment within its grace
+  (`l32_a_run_out_at_boot_switches_back`, in both orders). In the real
+  app the page sent `sync_timers` first; which of the two reached Rust
+  first wasn't seen (T8, "What was measured").
+  In the real app, a break under way at a tray Quit re-muted at the
+  relaunch, and End now then switched the stand-in back.
+
+Stated, not covered: a switch made by hand in the few milliseconds between
+a Get and its Set; a Set that timed out can still land inside OBS later,
+also after the late-answer cap and a reconnect, though the next switch
+back's "still on the scene the break set" check still holds (from OBS's
+code: the switch waits on OBS's UI thread). A known one, low (step R):
+after a 207 to an earlier run's switch back, a later expiry of the new
+run's mark can read `notReady` instead of `notConnected`.
+
+### Follow OBS
+
+A count-up's `followObs` (`"stream"` or `"record"`; a countdown's is
+dropped) puts it in the feed's follows. An output event does this to each
+count-up that follows that output (`follow_op`, `follow_table`):
+
+| Follows | `outputState` | Op |
+|---|---|---|
+| either | `…_STARTED` | `SetElapsed {the time since the event was read, running}` |
+| stream | `…_STOPPED` | Pause |
+| record | `…_PAUSED`, `…_STOPPED` | Pause |
+| record | `…_RESUMED` | Resume |
+| stream | `…_RECONNECTED` | a seed |
+| either | anything else: `…_STARTING`, `…_STOPPING`, `…_RECONNECTING`, `…_UNKNOWN`, a state OBS never sends for that output, any other text, the other output's events | nothing |
+
+The rule keys on `outputState` alone, never `outputActive`, which is false
+while a stream reconnects or a recording pauses. A stop keeps the last
+value: the card shows Resume. The event's stamp, taken when the session
+read it, keeps a start handled late from starting the clock late.
+
+A **seed** asks GetStreamStatus or GetRecordStatus and applies `join_seed`
+(`seed_table`):
+
+| OBS's output | Op |
+|---|---|
+| a stream reconnecting, whatever `outputActive` says | nothing |
+| active, not paused, `outputDuration` d | `SetElapsed {d, running}` |
+| a recording active and paused, d | `SetElapsed {d, paused}` |
+| not active | Pause, which changes only a running timer |
+
+Seeds come at each connected moment (from the startup steps' own answers),
+for a `(timer, output)` pair new in the feed (a new follow, or one switched
+between Streaming and Recording), for every follow when the feed's sleep
+count changed, and on a stream's RECONNECTED (`seed_pairs_table`,
+`l19_seeds_set_the_core_s_count_ups`). A 207 waits 1 s; another refusal
+drops the seed, logged; a timeout keeps it for after the late answer. Step R
+added two guards: an answer that an event of the same output overtook (per
+output, the connection counts the events it handled) is never applied over
+the event — the event's word stands and the follows are seeded again on the
+next idle turn (`a_stream_event_during_startup_outranks_its_answer`,
+`a_stream_event_during_a_seed_outranks_its_answer`) — and a seed applies only
+to follows still in the live feed, so one switched off, moved to the other
+output or deleted while it was asked takes nothing
+(`a_seed_skips_a_follow_that_left_the_feed`).
+
+`TimerOp::SetElapsed {ms, running}` sets a count-up to `ms`, running or
+paused, through the one `seed()` and `take_seed()` a restart uses, so the
+10 000 h clamp and the saturating anchor are the same (`set_elapsed_table`,
+`set_elapsed_is_a_seed`, `nothing_panics_at_the_edges`); one that finds the
+count-up already at that time and phase changes nothing. A countdown ignores
+it. Only the link sends it: no key or command sets a time
+(`hotkey_timer_request_table`).
+The link applies ops through `TimerShared::apply`, which wakes the timer
+thread, so `timer-state` follows from there.
+
+`outputDuration` counts frames times the frame time, so a seed is about
+right, and further behind after a stream reconnected (from obs-websocket's
+code). The timer's own buttons and keys still work; OBS's next start, stop,
+pause or resume, each connected moment and each wake from sleep set it
+again. If the OBS link loses OBS, the count-up keeps counting on its own
+clock until the next connected moment. A PC sleep: the core sleep-pauses a
+running count-up, as before, and now also counts it (`sleeps`, bumped at
+both sleep-pause sites, `sleeps_counts_each_sleep_paused_count_up`); the
+count changes the feed, and a link still connected after the wake seeds
+every follow again — a loopback socket usually survives a sleep, so no
+reconnect would. Two output events from OBS's thread pool could in theory
+arrive reversed (from obs-websocket's code); at human rates, with the
+ignored STARTING and STOPPING between them, that is stated, not covered.
+How long an event takes to reach `timer-state` is T7's ("What was
+measured").
+
+### The password
+
+**Stored** by `obs_set_password` (1 to 256 characters): encrypted with
+DPAPI for the current Windows user (`CRYPTPROTECT_UI_FORBIDDEN`, no
+description), with the entropy `"DivoraVoice OBS password v1"`, and written
+to `obs/password.bin` by `.password.bin.tmp`, a flush to disk and a rename,
+on the blocking pool; a failed write leaves the old file
+(`password_file_is_written_by_rename`). The entropy keeps another program
+running as the same user from opening the blob with a bare
+`CryptUnprotectData`; it is in the binary, so it is no secret, and changing
+it orphans every saved password (`entropy_is_pinned`). `obs/` is
+`obs-dev/` for `tauri dev`, as the timers' folder is, and is made at the
+first write, never at launch.
+
+**crypt32.dll is loaded at run time**, as Media Foundation is:
+`native/dpapi.rs` loads it with `LoadLibraryExW` (System32 only) and
+resolves `CryptProtectData` and `CryptUnprotectData` with `GetProcAddress`,
+once per process; calling the `windows` crate's bindings would put
+crypt32.dll in the exe's load-time import table. The import guard fails on
+it (`the_app_does_not_import_media_foundation`).
+The release exe imports the same 25 DLLs as v1.60.0's, none delay-loaded
+and crypt32.dll not among them; it imports 11 functions more from them and
+none fewer, `LocalFree` among them (T10, "What was measured"). DPAPI's own
+output buffer is zeroed before `LocalFree`.
+
+**Used** only when OBS's Hello asks for auth: the blob is decrypted on the
+blocking pool and the auth string computed in the same closure, so the
+plaintext and the secret never leave that thread. One that won't decrypt (a
+profile reset, another user's file) is `passwordUnreadable`: "Re-enter your
+OBS password."
+
+**What Divora wipes** (`zeroize`): its copy of the password, wrapped the
+moment the command gets it and wiped once written; the decrypted bytes;
+the secret (`base64(sha256(password ‖ salt))`, which answers any challenge
+until OBS restarts its server); both digests; and its own copy of the auth
+string, once the Identify frame is built. The hashing is built without
+joining strings (`chain_update`, then encoding into a buffer sized for it),
+so no copy is left behind a reallocation. **What it can't:** the IPC
+request's JSON and serde's `String` before the wrap; the WebView's field,
+which the card empties once Save or Forget answers; sha2's internal block
+buffer (sha2 0.10.9 has no zeroize feature); and the Identify frame's text,
+an ordinary string handed to the crate, which holds the auth string for
+that connection's challenge only. OBS keeps its own copy in plain text in
+its settings (from OBS's code); the card says OBS keeps a copy. No test can
+see a wipe: this is from the code.
+
+**Where it never goes:** localStorage, a log line, an event, a command's
+answer, a store signal or `ObsStatus`, which has `hasPassword` only.
+`secrets_never_reach_a_log_line_or_a_status` runs L1's and L2's flows, a
+push and an inventory under a TRACE capture, the blocking pool's lines
+included, and looks for the password as typed, as base64 of its UTF-8 and
+of its UTF-16LE bytes, as a byte array and as hex, and for the secret, the
+auth strings, a pushed text and a source's text and file path, in every log
+line, status and answer; `set_password_logs_nothing_secret`
+and `load_password_logs_nothing_secret` do the same for the command and the
+real file functions, blocking threads included; the store's test checks
+storage, signals and console lines.
+
+**On CI:** user-scope DPAPI works on the Windows runner.
+The first CI run with the tests, at `a00160a`, ran all three of
+`divora-capture/tests/dpapi.rs` and logged "dpapi: ran: a 246-byte blob",
+so the skip, which applies only outside CI, was never needed there. The
+real app's file and log are T2's ("What was measured").
+
+### Addresses
+
+`obs_configure`'s host is read by `parse_host`, the only judge: trimmed;
+`localhost` in any case is 127.0.0.1; one pair of brackets stripped; any `%`
+(a zone id) gets the link-local refusal; then `IpAddr`'s own parse, and
+`to_canonical()` before every check, so `::ffff:127.0.0.1` is loopback and
+`::ffff:0.0.0.0` unspecified. Refused: names, URLs, a port inside the host,
+unspecified, multicast and broadcast addresses, and IPv6 link-local, which
+names no interface without a zone id. The port is 1 to 65535. The page's
+`hostPrecheck` refuses only an empty host, a space inside or `://`, in
+Rust's words; the fixture's `hostSamples` is one table for both sides
+(`host_table`). Loopback is the canonical address's `is_loopback()`. Rust
+keeps the last config in memory only; `divora.obs` is the record.
+
+The OBS link connects only to that address: one `TcpStream::connect(addr)`,
+`addr` a `SocketAddr` built from the parsed IP, which never resolves, and one
+`connect_on` over that stream. `.connect()`, which resolves through
+`getaddrinfo`, `lookup_host` and `ToSocketAddrs` never appear under `obs/`
+(`the_obs_link_never_resolves_a_name`, `the_obs_link_connects_one_way`; the
+joint gate found that a dial by string passed the first version, and it was
+tightened). So the OBS link looks no name up. Divora's own code binds no
+listening socket (from the code: `TcpListener` and `UdpSocket` appear only
+in tests).
+
+A connection to OBS on another PC isn't encrypted: no TLS. From
+obs-websocket's code, nothing after Identify is authenticated, so someone who
+can see the traffic can read what crosses (scene and source names, a text
+source's settings, the recording's path), change it, or send requests and
+control OBS; a captured salt, challenge and auth string allow an offline
+guess at a weak password; the password itself is never sent. While on, the
+card warns of the reading, the changing and the taking over for an address
+that isn't loopback, and of the offline guess (keep it long and random), and warns
+when OBS asks for no password at all. OBS's generated passwords are random
+(from its code). Two PCs weren't tried here (U11).
+
+### Status and order
+
+`ObsStatus` (STABLE-SURFACE §3) lives in a `StatusCell` in `ObsShared`,
+with the link generation beside it: the only copy of either. A write applies
+to a clone; if that differs, `seq` + 1, it is stored, and `obs-status` is
+emitted under the same lock, so emits go out in `seq` order; an unchanged
+write emits nothing
+(`status_cell_bumps_seq_only_on_change_and_ignores_stale_generations`).
+Writes come from a start's `begin` (the generation + 1 and `connecting`,
+what belonged to the last connection cleared, Hello's and GetVersion's
+answers kept for the same address), a driver (refused for a stale
+generation), and `ObsShared` itself (skips, `heldBack`, `hasPassword`,
+`off`). Turning off moves the generation too, so a driver on its way out
+can't write over `off`; `seq` can then jump by 2, and the page only
+compares. Every OBS command answers the status, and the page keeps the
+larger `seq` from answers and events alike, since an answer can land after
+the events its command caused.
+
+`inventoryRev` goes up at each connected moment, and at most once per
+250 ms of Scene events (`RevCoalesce`, `rev_coalesce_table`), so a script
+renaming scenes in a loop can't flood the main thread's event loop, which
+also runs `WM_HOTKEY` (`l31_an_event_flood_ends_the_connection`). No field
+holds a secret or OBS's free text: versions are kept only as up to 32
+characters of `[0-9A-Za-z.+-]`, else null (`sanitize_version_table`);
+reasons are codes; `detail` is one of the nine request names; a skip's name
+is the scene name the action stored. A scene skip (`lastSkip`) carries its
+op, why, the scene's name (null for a switch back), the timer id and the wall
+time; it is replaced by the next scene skip and cleared by the next switch
+or switch back that goes through. A text skip (`textSkip`) is separate, so
+it never hides a scene skip, and is cleared by the next push OBS confirms.
+
+**Order:**
+
+- **On the wire:** Hello, then Identify, then nothing before Identified
+  (obs-websocket would close 4007), then one request outstanding.
+- **Between ops:** the ops queue is first in, first out and is taken before
+  due marks, so a `scene` and then a `sceneBack` from one timer reach OBS in
+  that order.
+- **Events against answers:** obs-websocket can send an event before or
+  after the answer to the request that caused it. Nothing infers state from
+  that order: a switch back asks for the program scene; Follow OBS keys on
+  the event alone, and an answer an event overtook isn't applied.
+- **The page's queue:** a Save password then a Forget land in that order
+  ("The page", "The queue").
+
+### Reloads, restarts
+
+- **A reload:** the link lives in Rust and keeps running; the new page's
+  `obs_configure` with the same address changes nothing and answers the
+  status. Texts and ops never involve the page.
+- **Hidden to the tray:** nothing changes. The "Trying again in N s" line
+  shows as of its last render while the page is hidden, which is cosmetic.
+- **A link restart** (Save or Forget password, an address change, Try again
+  in a stop state, Off and on): slots and due marks stay in `ObsShared`;
+  Off drops the due marks.
+- **OBS restarts:** `closed` (or `obsExiting`), the backoff, a reconnect;
+  every mapped text goes again on the first turns, a source unmapped
+  meanwhile is cleared, the follows are seeded, and due switch backs run
+  within their grace. In the real app, against the stand-in, T6 measured
+  the backoff, the reconnect and the texts pushed again; no switch back
+  was due in it ("What was measured").
+- **A scene-collection switch in OBS:** requests get 207 during it; after
+  it, stored uuids may not resolve, so pushes go `missing` and scene ops
+  fail `notFound`. Nothing under mask 69 announces it, so `inventoryRev`
+  doesn't move for it: a picker reads OBS's lists again each time it opens,
+  and until then the lists read before the switch stay on offer (step R,
+  known). A switch back to the first collection is picked up by the missing
+  sources' re-check.
+
+### The page
+
+The store keeps `divora.obs` (`{enabled, host, port, breakScene?}`) and a
+read-only mirror of Rust's status.
+
+- **Boot.** With `divora.obs` absent, off or unreadable, nothing
+  OBS-related happens: no `obs_*` command and no `obs-status` listener (e2e:
+  "a profile without divora.obs sends no OBS command…", and the same with
+  it off). On: it listens first, then sends `obs_configure` with the stored
+  address, after the Hourglass boot. A saved address Rust refuses (a hand
+  edit, or a later version's value after a downgrade) is kept in
+  `obsConfigError` and shown under Address, the toggle left on.
+- **The queue.** `obs_configure`, `obs_reconnect`, `obs_set_password` and
+  `obs_forget_password` go through `obsQueue`, the store's sixth `inOrder`
+  queue, each once the one before it answered; `obs_status` and
+  `obs_inventory` stay out. Every answer, every `obs_status` read and every
+  event goes through `applyObsStatus`: the larger `seq` wins, and one that
+  isn't a status is ignored.
+- **Saves.** Every save of `divora.obs` merges into the value stored at that
+  moment (`mergeObsSettings`), never one read when a command went out, so an
+  address answered after Off can't write `enabled: true` back. Each
+  `obs_configure` carries the settings as they stand when it goes, and an
+  address being tried is saved only once Rust took it. While off, an address
+  edit sends `obs_configure {enabled: false}`, which only checks it.
+- **The password** goes from the card's own field into `obs_set_password`
+  and nowhere else. One holding a lone surrogate is refused on the page:
+  Rust's JSON reader would refuse the whole invoke.
+- **The inventory** (`refreshObsInventory`): not queued, one at a time (a
+  second call joins the one in flight). It is read when an OBS picker opens
+  while connected, when Switch OBS scene is picked, and once per
+  `inventoryRev` while connected and an OBS picker or the OBS section is on
+  screen (`watchObs`); a rev that comes during a read is read once that read
+  ends. Leaving `connected` drops the lists and their error, and a read begun
+  before keeps nothing (step R), so no picker offers another connection's
+  sources. A list that names a stored uuid under a new name renames it: the
+  timers in one save, with one `sync_timers` only if what Rust reads changed
+  (a text source's name alone doesn't: Rust gets its uuid), and the break
+  scene in `divora.obs`.
+- **A timer's fields.** `obsText` (`{uuid, name}`, any kind) and `followObs`
+  (a count-up's) live in `divora.timers`, kept as written, and go in every
+  `sync_timers`, OBS on or off: `obsText` as `{uuid}` only, when the uuid
+  reads (1 to 128 characters, no lone surrogate); `followObs` only on a
+  count-up. Each edit is one save and one sync through the timers' queue.
+  The Break row's scene is stored only: Add break uses it while OBS control
+  is on (`breakTemplate(scene)`: At start Mute my voice and Switch OBS to
+  it, At zero Unmute my voice and Switch OBS back), and it reaches Rust
+  inside that break's lists.
+- **Actions.** `readAction` reads an `obs` action as Rust does, and
+  `runsAt(action, hook)` mirrors `runs_at`, so the store refuses a Switch
+  OBS back in At start and the editor shows one stored there as a row that
+  doesn't run; `setTimerAction` won't turn a `scene` into a `sceneBack`.
+  The page never runs an `obs` action: it is a backend kind.
+
+### The card
+
+**Settings → OBS**, after Hourglass: the intro and the explainer (what
+Divora sends OBS, what it reads, what it keeps, and where OBS's server is
+turned on), **Connect to OBS**, Address, Port and Password, all shown on or
+off. Save password and Forget password (two clicks: "Forget?") work while
+off. While on: the status line (visible, with the `link` sigil, not a live
+region, since its "Trying again in N s" changes every second), Try again
+where pressing it can help or Connect again after a Kick, the scene-skip
+line, the text-skip line, the held-back line, and two warnings (a network
+address; OBS asking for no password). An always-mounted announcer says edges
+only (`obsAnnouncement`): entering `connected`, a drop from it, entering a
+stop state, a new scene skip, switch backs going from none held to some;
+never `connecting`, a countdown, or a retry after a retry. Mounted while off
+with nothing heard, the section reads `obs_status` once, for
+`hasPassword`. A control that goes once pressed hands its focus on
+(`handOffFocus`, step R): Try again and Connect again to the status line,
+Forget password to Save password, a cleared off-but-set row to the next
+control.
+
+A timer's card: **Show in OBS** (any kind) and **Follow OBS** (count-ups:
+Off, Streaming, Recording, a radio group named "Follow OBS for {name}"),
+shown while OBS control is on, or while set, with a line saying OBS is off.
+The pickers (`ObsPicker`) show what `pickerShown` says: a stored source OBS
+can't find, not connected, "Loading OBS sources…", a read that failed with
+Rust's words under it. A source that reads a file, or that another timer
+shows, is listed, can't be picked, and says why. While a timer runs or is
+paused and the last scene skip names it, the skip line shows on its card
+too. The action editor offers Switch OBS scene (At start and At zero) and
+Switch OBS back (At zero), each disabled while OBS control is off, and
+Switch OBS scene also while not connected; picking it reads OBS's scenes and
+adds the first that isn't the program scene, else the first. If they can't
+be read, nothing is added and the note says why; when the connection went
+and came back meanwhile, it asks once more (step R). Two new pairing
+warnings: a start that switches OBS with no Switch OBS back at zero, and a
+Switch OBS back with no switch at the start.
+
+`Select` gains `onOpen` and disabled options, which stay in the arrow and
+Home/End order with `aria-disabled` and are refused by Enter, Space and a
+click; it keeps its highlight on the same option when the list is rebuilt
+under it (step R). `Segmented` gains `ariaLabel`: with it, a radio group
+(`radiogroup`, `radio`, `aria-checked`), Tab reaching the checked option and
+the arrows moving and picking; without it, the tablist as before. No screen
+reader was run: the roles, names and live regions are pinned by tests.
+
+### Exit and Off
+
+The tray's Quit calls `obs::before_exit` after the overlay's: with no link
+it returns; otherwise it takes the link's handle, drops its senders, and
+waits at most 300 ms (`recv_timeout`, never an untimed wait) for the ack,
+then `app.exit(0)` (`the_tray_quit_closes_the_obs_link`,
+`l36_quit_closes_the_connection_in_time`). The session closes the connection
+itself: close 1001 (GOING_AWAY, which keeps OBS from showing a "client
+disconnected" alert when its alerts are on; from obs-websocket's code, U12),
+the flush within 1 s, reading to OBS's close within 250 ms, then the drop
+and the ack. It never uses the crate's own close, which sends 1000 and then
+waits for the echo with no bound (`the_obs_link_closes_itself`). With no
+connection open the driver acks as it ends. A kill sends nothing. Off goes
+the same way: after a stop the old socket is gone within 1.25 s whether or
+not OBS answers the close (`l23b_a_stop_never_waits_on_obs`). Off and a
+tray Quit in the real app are T11 and T12 ("What was measured").
+
+### A broken or hostile peer
+
+Memory and time are bounded at every step: the upgrade's answer at 64 KiB,
+a frame at 4 MiB, events waiting at 256, answers waiting at 64, control
+frames before Identified at 64 in a row, Hello's salt and challenge at 128
+characters each, an inventory at 200 scenes and 100 text sources
+(`truncated`), and the session's reads held while its writes can't drain;
+Scene events reach the page as at most one
+`inventoryRev` change per 250 ms; and every wait has a timeout or a cap
+(the connect 3 s, the upgrade and Hello 5 s, Identified 5 s, a request 3 or
+5 s and then the 15 s cap, the startup 30 s, an inventory 15 s). Release
+builds abort on a panic with no hook, so a panic in a link task would end
+Divora silently: `obs/mod.rs` denies `unwrap`, `expect`, indexing and
+`panic!` (clippy), every arithmetic step saturates, `LinkTiming::new`
+refuses a zero period (`tokio::time::interval` panics on one), and pings
+carry an empty payload (`Message::ping` asserts 125 bytes at most).
+
+### Logging
+
+Every line under `obs/` goes through `obs/log.rs`, whose helpers take only
+fixed codes, versions (sanitized), uuids, timer ids, counts and
+`io::ErrorKind`s; no other file there names a `tracing` macro
+(`obs_logs_only_through_its_log_module`). At info: a link started or
+stopped, connected (with the versions), OBS closing or closing the
+connection, a password saved or forgotten, a break started again over an
+earlier run's switch back. At warn: the first failure of a run (with its
+`ErrorKind`), then "still can't reach OBS" at most once per 5 minutes; a
+stop state; a close code only a faulty client earns (4002-4008); a link
+whose driver had ended; a dropped scene op, a request timeout and a refused
+push, each at most once per 10 s; a source OBS can't find; a text source's
+file flag unread; a refused seed; a switch back dropped at its grace; a
+password or returns file that couldn't be saved, read or deleted. The log
+writer is synchronous on the calling thread, a tokio worker included, so
+lines are few.
+
+### What was measured
+
+S2, 2026-11-05 (16:08 to 16:27 UTC), on this PC (Windows 11), against a
+stand-in OBS, never OBS itself. The stand-in is a Node obs-websocket 5
+server written from the protocol doc and obs-websocket's sources by a
+different hand, which read none of Divora's OBS code. It listened on
+127.0.0.1:4455 only, reported OBS 32.0.2 and WebSocket 5.6.2, and asked
+for auth with a throwaway password made for each run (27 characters,
+never printed or written). Every run but T10 ran on a debug build made that
+day from `7c9dece`'s tree plus copy-only changes not in it (the page's
+words and a comment in `lib.rs`); T10 ran on a release build of `7c9dece`,
+not installed. The harness drove the app through its own UI over WebView2's
+DevTools port (Playwright `connectOverCDP`): clicks, and fields set by the
+page's input events, with no key event sent. A guard page, loaded before
+the app's code, refused any engine start off the route, any key
+registration, and any `obs_configure` to an address other than
+127.0.0.1:4455. Every run used one route: input "Analogue 1 + 2 (2-
+Focusrite USB Audio)", output "Speakers (Realtek USB Audio)", no monitor
+device, Monitor off, so the output played silence. There was no CABLE
+device, and nothing was played. T8 (twice) and T12 (once) quit Divora from
+its tray, with the owner's consent given right before: UI Automation found
+the icon, and two mouse clicks by SendInput, a right-click on it and a
+left-click on Quit, did the rest. Every run but T10 and T11 had a harness
+mutation that had to fail (those two had none), and every one did. After
+each run storage was restored, the `obs/` and `timers/` folders were as
+before, and main's window was put back. About 19 minutes with the app
+running, in six invocations. All twelve passed, T6 on a run of its own
+(below).
+
+- **T1, a boot without `divora.obs`, Settings not opened:** watched
+  60,514 ms from the reload. No `obs_*` command among the 55 requests in
+  the IPC log (the CDP Network log), no `obs-status` listen from the page
+  (the guard's own aside), and 0 accepts at the stand-in.
+- **T2, turn on, a password, Save:** Connect to OBS with no password saved read
+  `needsPassword` first. With the password set in the field (by its input
+  event: no key was pressed), Save password read `connected`, with OBS
+  32.0.2 and WebSocket 5.6.2 (the stand-in's) and `hasPassword`; the
+  stand-in identified one session, its own auth check passing.
+  `password.bin` was a 246-byte DPAPI blob holding the password neither in
+  UTF-8 nor in UTF-16LE. The IPC log held `obs_set_password` only as the
+  password's length and SHA-256 (the guard's record; the Network log kept
+  no body). The app log since the reload, with 6 OBS lines, "obs:
+  connected" among them, held none of the needles: the password, base64 of
+  its UTF-8 and UTF-16LE bytes, its byte array, its hex, and "secret" or
+  "auth" on an OBS line.
+- **T3, a 1:00 countdown's text, Divora hidden:** main hidden to the tray
+  by its titlebar Close; 01:00 went at the mapping, before Start. 60 of 60
+  seconds arrived, 00:59 to 00:00, one push each and no other text. From a
+  second's start (from `anchorMs`, on one wall clock) to its push at the
+  stand-in: median 10 ms, worst 17 ms, none early (the earliest 2 ms after
+  its second; the bars were 20 ms early and 500 ms late). Main stayed
+  hidden throughout.
+- **T4, a break with a scene:** Add break (BRB) put Switch OBS scene (BRB)
+  in At start and Switch OBS back in At zero, beside the mute and the
+  unmute. Start: the first muted level tick 26 ms after the click, and
+  GetCurrentProgramScene then one SetCurrentProgramScene(BRB), the Set
+  16 ms after the click; every tick through the break read muted. End now:
+  the first unmuted tick 20 ms after the click, and Get then one Set(Game),
+  the Set 16 ms after it. A second break: Get and Set(BRB) at its start, the
+  Set 16 ms after the click; with the stand-in's program moved to Just
+  Chatting mid-break, its End now asked (one Get) and made no Set. Every Set
+  named the scene by uuid only: 3 Sets and 4 Gets in all.
+- **T5, a wrong password:** the wrong password saved while off, then
+  Connect to OBS turned on (turning on first would add a `needsPassword`
+  connection). `authFailed` came 24 ms after the turn-on, after exactly 1
+  accept, which the stand-in closed with 4009 without identifying it. Never
+  connected, no attempt after it, and 0 more accepts in the 60,507 ms
+  watched after it. The app log held none of the wrong password's needles.
+- **T6, a stand-in that closes every connection for 20 s, then back, then
+  gone for 10 s:** in accept-and-close, five attempts, each an accept at
+  the stand-in and each failing `closed`, with waits after them of 1,037,
+  2,188, 3,626, 9,064 and 15,229 ms (n 1 to 5). Back to normal:
+  `connected` 11,202 ms later. Held 11.5 s (so n went back to 0), then the
+  stand-in stopped for 10 s: the loss read `closed` (a 973 ms wait), and
+  the two connects after it read `refused` (waits of 1,768 and 3,445 ms).
+  All eight waits were inside the backoff's base times 0.8 to 1.2 for
+  their n. On this PC a refused connect to
+  127.0.0.1 took about 2 s, 2,013 and 2,031 ms from `connecting` to
+  `retrying` (2,056 and 2,056 ms on the first run), under the 3 s connect
+  timeout. Each attempt began 5 to 13 ms after its `retryAtMs` on the
+  page's clock, and each that reached the stand-in was accepted 6 to 13 ms
+  after it on the stand-in's. Restored with the same password and a fresh
+  salt: `connected` 269 ms later, the stand-in's auth passing with the new
+  salt; the mapped text was pushed 1 ms and 0 ms after the two Identifieds
+  (after normal, after the restore). The first run failed one harness check
+  for a harness bug (an attempt's `connecting` and `retrying` reached the
+  page in the same millisecond, and the harness paired the failure with
+  the wrong attempt; the stand-in's accepts had every attempt on time);
+  with the harness fixed, T6 passed when re-run alone.
+- **T7, Follow OBS:** a count-up following Recording. A bare `"STARTED"`
+  changed nothing (it stayed idle at 00:00). RecordStateChanged with
+  `OBS_WEBSOCKET_OUTPUT_STARTED`: running in `timer-state` 1 ms after the
+  stand-in sent it, from 00:00; PAUSED to paused, RESUMED to running and
+  STOPPED to paused, 1 ms each. Joining (Off and on, the stand-in
+  recording with `outputDuration` 125,000): the first `timer-state` after
+  the GetRecordStatus answer, 3 ms after it, read 02:05, 3 ms short of
+  125,000 ms plus those 3 ms.
+- **T8, a restart mid-break:** A: a 5:00 break started (Set(BRB) 16 ms
+  after the click); 12 s later Divora quit from the tray by UI Automation
+  (the 1001 close at the stand-in 6 ms after the click on Quit, the
+  process's end 44 ms after it) and was relaunched at once. The boot sync answered 743.5 ms after the
+  relaunch, and every level tick from 50 ms after that to End now (162)
+  read muted. End now then made Get + Set(Game), the Set 16 ms after the
+  click, from the slot in `returns.json`. B: a 0:20 break started, and 12 s
+  later the same Quit; Divora was closed 30,918 ms, and the break's deadline
+  passed 6,700 ms into that. At the relaunch the page sent `sync_timers`
+  before `obs_configure` (the IPC log; which reached Rust first wasn't
+  seen), and the run-out's switch back reached the stand-in 2 ms after
+  Identified, GetCurrentProgramScene (BRB) first, then Set(Game).
+- **T9, a stalled OBS:** a 5:00 countdown shown in the source and running;
+  the stand-in held SetInputSettings unanswered for 10 s. During the hold
+  exactly 1 push arrived (the held one) and nothing else was sent while it
+  was unanswered; the stand-in never saw two requests outstanding. A
+  break's `scene` offered 2 s into the hold was skipped `late` at the
+  release (the status 2 ms after it); one offered 1 s before the release
+  ran right after it, Set(BRB) 1 ms after the release, the only Set. The
+  first push after the release carried 04:48, the newest text (the held
+  one, 04:57). The app log had one "obs: OBS didn't answer in time" line,
+  for SetInputSettings.
+- **T10, a release build:** the release build ran with the engine stopped
+  (every start refused), after the debug build had set the run's state.
+  Save password read `connected`, the stand-in's auth passing, and
+  `password.bin` (246 bytes) held the password neither in UTF-8 nor in
+  UTF-16LE. Killed and relaunched, the status said a password was saved,
+  and the link connected on it, auth passing, with no `obs_set_password`
+  sent in that launch: DPAPI read it back. The exe imports the same 25 DLLs
+  as `1c537fa`'s release exe (dumpbin, which a PE parser of the build
+  agent's own agreed with), none delay-loaded and no crypt32.dll: 442
+  functions against 431, 11 more and none fewer. They are `LocalFree`
+  (kernel32; `native/dpapi.rs` frees DPAPI's buffer with it), `fma` (the
+  CRT's maths), and nine from kernel32, ntdll and ws2_32:
+  `CreateIoCompletionPort`, `GetQueuedCompletionStatusEx`,
+  `PostQueuedCompletionStatus`, `SetFileCompletionNotificationModes`,
+  `NtCancelIoFileEx`, `NtCreateFile`, `NtDeviceIoControlFile`, `WSAIoctl`
+  and `bind` (this release adds tokio's `net`, the link's socket). Release
+  link time on this PC (i7-14700K; lto + codegen-units = 1): 84 s against
+  v1.60.0's 79 s, same PC, same day (+5 s, +6%); link.exe itself is 0.2 s
+  of it. The whole release rebuild after a change to the app crate (both
+  units, cargo's start-up left out): 154 s against 142 s (+12 s).
+- **T11, Off:** connected, then Off: the one open connection closed with
+  1001 from Divora 13 ms after the click, the status read `off` at 13 ms,
+  and the stand-in had 0 accepts in the 60,505 ms watched after.
+- **T12, Quit while connected:** connected, 12 s, then Quit from the tray
+  by UI Automation: the one open connection closed with 1001 from Divora,
+  35 ms before the process ended: 7 ms and 41 ms after the click on Quit
+  (the click's time from `win.ps1`, the close's from the stand-in, the end
+  from the harness, one clock).
+
+Not tried here, and not possible here: OBS itself. Anything this section
+says OBS does — how it draws a pushed text, whether Studio Mode runs your
+transition, which code it answers for a source that's gone, whether its
+WebSocket server answers a ping, which OBS release first shipped WebSocket
+5.4.0 — rests on OBS's and obs-websocket's sources and the protocol doc,
+not on a run; the owner checks U1-U15 in `MANUAL_TESTS.md` ("Talk to OBS
+(v1.61.0)") cover it, and none has run. To check a statement: if it says
+what OBS does, it is from OBS's code until a U check names it; if it says
+what Divora sends, reads or keeps, a pure table or a test against the fake
+server pins it ("Tests"); a figure from the real app is under one of T1-T12
+above.
+
+### Tests
+
+- **Counts at `7c9dece`** (local, Windows; `CI=true cargo test --workspace
+  --all-features`): `divora-app`'s lib 480 passed, 1 ignored;
+  `divora-capture` 181 passed, 1 ignored; `divora-core` 562 passed, 17
+  ignored; and the integration test binaries.
+  Vitest 2,120 in 60 files; E2E 75.
+- **Pure** (`proto.rs`, `machine.rs`, `scenes.rs`), against the fixture
+  where it has the table: `auth_string_matches_python_and_node`,
+  `identify_is_exact`, `the_nine_requests_are_exact`,
+  `only_the_nine_requests_are_built`, `gate_table`, `close_outcome_table`,
+  `text_kind_table`, `reads_from_file_table`; `backoff_table`,
+  `backoff_never_passes_30_s`, `host_table`, `connect_error_table`,
+  `status_cell_bumps_seq_only_on_change_and_ignores_stale_generations`,
+  `begin_writes_connecting_before_the_driver_can`, `follow_table`,
+  `seed_table`, `seed_pairs_table`, `request_failure_table`,
+  `rev_coalesce_table`, `sanitize_version_table`; the freeze tests
+  (`obs_config_keys_are_frozen`, `obs_status_keys_are_frozen`,
+  `obs_status_samples_are_rusts`, `obs_inventory_keys_are_frozen`,
+  `every_word_is_listed`, `limits_are_the_fixtures`,
+  `command_errors_are_the_fixtures`); `after_scene_table`,
+  `plan_back_table`, `due_table`, `a_new_run_drops_earlier_switch_backs`,
+  `returns_json_round_trip_and_prune`.
+- **The link against the fake** (`link.rs`, through `link::run` with stubs
+  for the status, the slots and the timers and the real stored password over
+  an in-memory cipher): L1-L36 of the design, among them the handshake and
+  its failures, the version gate, a Kick, the backoff and its reset, one
+  request at a time, a wedge and its cap, `late` scenes, coalesced pushes,
+  207s at startup, missing sources, switch backs nested and moved on, ops
+  while disconnected, Follow OBS, the keepalive, a 4 MiB frame, an event
+  flood, the stop inside every wait, the inventory, clears; and step R's own
+  (an event outranking its answer, seeds for follows that left, a queued
+  switch back outliving its driver, a replaced driver's nudge, a ping flood).
+- **The seam** (`seam_tests.rs`, through `ObsShared::new` and the fake, with
+  a real `TimerShared`): `l26_a_break_end_to_end` (a real timer loop and
+  worker, the host's own line, Start → Set(BRB), the finish → Set(Game), a
+  mapped timer's seconds at the fake); the boot run-out in both orders; a
+  stop state keeping switch backs; Off opening nothing; `offer` against a
+  stalled link; a restart clearing only what this Divora wrote and still
+  switching back; a stale driver applying nothing;
+  `configure_with_the_same_address_keeps_the_link`; Quit's close in time; the
+  saved password being the one the link sends; Follow OBS on the core's own
+  count-ups.
+- **The fake** (`fake.rs`, B2): written from the protocol doc and
+  obs-websocket's sources by a different hand from the client, citing them,
+  without reading `proto.rs`, `machine.rs` or the fixture; it types its own
+  request names, answers any other request with 204 UnknownRequestType (which
+  fails the test), asserts that it never sees two requests outstanding, and
+  checks the mask. It reads "nothing before Identified" as obs-websocket
+  does: any message but Identify before Identified closes 4007. Every link
+  test runs on its own current-thread runtime under a 10 s guard, with
+  timings scaled to 100 ms units, the backoff's draw fixed at 0.5, and the
+  fake on 127.0.0.1:0, never 4455 (`obs_tests_never_dial_4455`).
+- **Files and DPAPI:** `entropy_is_pinned`, `dpapi_protect_needs_the_entropy`,
+  `password_file_is_written_by_rename`, `a_blob_that_wont_decrypt_reads_unreadable`,
+  `forget_removes_the_file`, `returns_file_round_trip_and_prune`,
+  `two_saves_leave_the_later_state`; `divora-capture/tests/dpapi.rs`:
+  `round_trip`, `wrong_entropy_fails`, `blob_is_not_the_plaintext`.
+- **Source tests** (`lib.rs`, `obs/mod.rs`): `obs_commands_are_async_and_registered`,
+  `the_setup_spawns_the_timer_threads` (the feed before `TimerSinks`,
+  `obs::init` after the timer thread and before `AppState`),
+  `obs_init_manages_the_shared_state`, `the_timer_host_hands_obs_ops_to_the_link`,
+  `the_tray_quit_closes_the_obs_link`, `the_obs_link_never_resolves_a_name`,
+  `the_obs_link_connects_one_way`, `the_obs_link_closes_itself`,
+  `the_link_starts_after_its_generation`, `obs_logs_only_through_its_log_module`,
+  `obs_blocking_work_carries_the_dispatcher`, `obs_tests_never_dial_4455`.
+- **The timers:** `set_elapsed_table`, `set_elapsed_is_a_seed`,
+  `nothing_panics_at_the_edges` (with `SetElapsed`'s rows),
+  `entry_from_wire_reads_obs_fields`, `later_fields_are_ignored`,
+  `sync_entry_keys_are_the_fixtures` (`defKeys` the union of a countdown's
+  and a count-up's), `redefine_takes_obs_fields`, `obs_feed_table`,
+  `sleeps_counts_each_sleep_paused_count_up`, `hotkey_timer_request_table`;
+  `the_sink_hands_the_obs_feed_only_when_it_changes`,
+  `unchanged_feeds_dont_wake_the_link`, `the_worker_hands_obs_ops_to_its_host`;
+  `action_kinds_match_the_fixture`, `action_ops_match_the_fixture`,
+  `action_from_wire_table`, `to_wire_round_trips`, `plan_table` (with the
+  OBS rows), `scene_back_never_runs_at_a_start`.
+- **Vitest:** `obs.test.ts` (the wire against the fixture, the readers,
+  adoption by `seq`, every status sample's line × every stream and record
+  word, the warnings, the announcer's edges, the skip lines, `pickerShown`'s
+  table, the options); `timerActions.test.ts` (`ACTION_OPS`, `runsAt`, the
+  samples, `breakTemplate(scene)`); `timers.test.ts` (`obsText` and
+  `followObs` kept and sent, `defKeys`, `obsTextOwners`, `withObsNames`);
+  the store (the boot, Connect to OBS, Address and Port, the password, "one
+  OBS command at a time" over a wire that lands what is in flight together
+  reversed, the inventory, the timer fields and the Break row);
+  `SettingsScreen.test.tsx`; `Select.test.tsx`; `Segmented.test.tsx`;
+  `Sigil.test.tsx`; `api.test.ts`.
+- **E2E** (mocked Tauri, `e2e/obs.spec.ts`): a profile without `divora.obs`,
+  or with it off, sends no OBS command and doesn't listen; the card while
+  off, Connect to OBS and Off; Save and Forget password while off; each
+  status the mock sends, with its line, buttons, warnings and skips, and the
+  announcer's edges; Show in OBS and Follow OBS; the action editor's two
+  choices; Add break with a break scene; a reload. The mock refuses a
+  status, a skip or an inventory the fixture doesn't have.
+- **Mutations.** Each row of the design's mutation table was put back — by
+  the track that owns it, by the joint gate, or in step R's audit, which
+  found five rows whose test was weak or missing and gave each one that
+  fails — and seen failing its test, each file restored and checked by
+  hash. One defect is caught twice over, so putting back half of it passes:
+  removing only `SetElapsed`'s countdown guard, since `seed()` already
+  refuses a countdown's run with no total. The joint gate tried one more, a
+  dial by string, which looks the address up as a name; it passed
+  `the_obs_link_never_resolves_a_name`, which was tightened until it
+  failed.
+- **The review (step R)**, in eight lenses, confirmed 27 of 34 findings and
+  refuted 7. All are fixed, and each fix that changed behaviour had its
+  defect put back and seen failing its test: a status answer applied over
+  a newer output event; a seed applied to a follow that had left; an
+  earlier run's switch back switching OBS back mid-break; `heldBack`
+  dropping to 0 while a held switch back was tried; a mark made while
+  parked never expiring; switch backs lost
+  from a restarted driver's queue; a ping flood growing the pong queue; the
+  explainer leaving out the scene a break replaced; the inventory offered
+  across connections, and a rev read during a read marked read; a picker's
+  highlight moving to another option when its list was rebuilt; sub-lines,
+  the password's space hint and Add action's note never reaching a screen
+  reader; focus dropped to the page; comments that claimed every wait
+  watches the stop; and, in the tests, margins too thin for a loaded runner,
+  seed counts that hung on the timer thread's timing, a Try again test that
+  passed with Try again doing nothing, and test folders left in the temp
+  folder. The gate after it found two more, both low, both fixed in
+  `7c9dece`: Switch OBS scene doing nothing and saying nothing when the
+  connection went during its read, and a switch back left due by an ending
+  driver not waking the next one (`nudge`).
+
+### Kill switches
+
+In `obs/mod.rs`:
+
+- `OBS_LINK`: `false`, no link ever starts, the status stays `off`, and
+  `offer` does nothing.
+- `OBS_TEXT`: `false`, no text push is ever sent.
+- `SCENE_BACK_GRACE`: `0` is the plan's rule: a switch back that finds OBS
+  disconnected is dropped.
+- `KEEP_RETURNS`: `false`, no `returns.json`: slots still outlive a link,
+  not a Divora restart.
+- `KEEPALIVE_DEADLINE`: `None` pings with no deadline (in case OBS's server
+  doesn't answer pings, U10).
+- v1.60.0's `TIMER_ACTIONS` stops OBS actions with the rest.
+
+### Not in this release
+
+- `obs_run` and OBS actions for MIDI and glyphs: v1.64.0's bindings, which
+  will send it. `obs_reconnect` (Try again) is new instead.
+- Inputs and Config events, so a deleted or renamed source and a
+  scene-collection switch are seen late ("The protocol").
+- TLS, host names, a second OBS, hotkey ids or tray items for OBS, showing or
+  hiding a source, starting or stopping a stream or a recording.
+- A clear that survives a Divora restart (a file of the uuids Divora wrote).
+- "OBS 30.1 or later" in the copy: the card names the WebSocket version
+  until U9 checks which OBS release first shipped 5.4.0.
+- The follow-ups are in [`research/stream-studio.md`](research/stream-studio.md).

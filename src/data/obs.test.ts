@@ -545,7 +545,7 @@ describe("obsStatusLine (§9.1)", () => {
 
 describe("obsWarnings (§9.1)", () => {
   const NETWORK =
-    "192.168.1.20 is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent.";
+    "192.168.1.20 is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent, but someone who records a connection's start can test guesses at it offline, so keep it long and random.";
   const NO_PASSWORD =
     "OBS isn't asking for a password, so anything that can reach it on your network can control it. Turn on Enable Authentication in OBS's WebSocket Server Settings.";
   const lan = sample("retrying, unreachable, OBS on another PC");

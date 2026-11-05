@@ -3970,8 +3970,9 @@ pub fn run() {
             // v1.61.0: Talk to OBS (D3). `ObsShared` is managed here, before
             // any page exists, with the slots `obs/returns.json` holds, so a
             // break's switch back survives a restart (D24). Nothing starts:
-            // no link runs and no `obs/` folder is made until the page
-            // switches OBS on. `tauri dev` builds keep their own folder.
+            // no link runs until the page switches OBS on, and no `obs/`
+            // folder is made until a file is written there (Save password
+            // works while off). `tauri dev` builds keep their own folder.
             let obs_name = obs::obs_dir_name(tauri::is_dev());
             let obs_dir = match app.path().app_data_dir() {
                 Ok(dir) => dir.join(obs_name),

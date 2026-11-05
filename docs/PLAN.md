@@ -253,7 +253,7 @@ After v1.0, features follow standard semver:
 
 Further out (standard semver): VST3 host, community preset registry, etc. (Light theme shipped — v1.11.0.)
 
-**Planned — stream studio:** screen recording with your voice, game and Discord audio, a replay buffer, overlay Charms (pictures and GIFs), a real mic mute, Hourglass timers and opt-in OBS WebSocket control. Release-by-release plan, decisions and verified evidence in [`docs/research/stream-studio.md`](research/stream-studio.md).
+**Stream studio — shipped v1.52.0–v1.61.0:** screen recording with your voice (v1.52.0), game and Discord audio (v1.53.0), a replay buffer (v1.54.0), overlay Charms (pictures and GIFs, v1.55.0), a real mic mute (v1.56.0), push-to-modulate that modulates (v1.58.0), Hourglass timers (v1.59.0, with actions in v1.60.0) and opt-in OBS WebSocket control (v1.61.0); its optional tail (v1.62.0–v1.64.0) is still planned. Release-by-release plan, decisions, what was built and verified evidence in [`docs/research/stream-studio.md`](research/stream-studio.md).
 
 ## Roadmap detail — v1.8–v1.10 (all shipped)
 
@@ -492,7 +492,7 @@ Jobs:
 - MIDI controller bindings + Stream Deck integration — **shipped v1.9.0** (see roadmap detail)
 - Guided mic calibration — **shipped v1.10.0** (see roadmap detail)
 - VST3 plugin host inside the effect chain
-- OBS WebSocket integration — **planned**, opt-in (see [`research/stream-studio.md`](research/stream-studio.md))
+- OBS WebSocket integration — **shipped v1.61.0**, opt-in (Settings → OBS; see [`research/stream-studio.md`](research/stream-studio.md))
 - Community preset registry (GitHub-hosted JSON)
 - 30-second rolling clip recorder — **planned** as the replay buffer (see [`research/stream-studio.md`](research/stream-studio.md))
 - Light theme — **shipped v1.11.0** (light/dark Tweaks axis)

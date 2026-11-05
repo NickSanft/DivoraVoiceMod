@@ -734,7 +734,7 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     );
     expect(view.getByText("Timer files for OBS")).toBeInTheDocument();
     expect(squash(view.getByText(/pick a timer's file from this folder/).textContent)).toBe(
-      "In OBS, add a Text (GDI+) source, tick Read from file and pick a timer's file from this folder. OBS checks the file about once a second, so its text can run up to about 2 seconds behind the overlay, and now and then it may show nothing for a second or two. While Divora is closed, a file keeps the last time it showed.",
+      "In OBS, add a Text (GDI+) source, tick Read from file and pick a timer's file from this folder. OBS checks the file about once a second, so its text can run up to about 2 seconds behind the overlay, and now and then it may show nothing until the time next changes: a second or two while the timer runs, longer while it's paused. While Divora is closed, a file keeps the last time it showed.",
     );
     // A fresh profile asks the backend nothing about timers, Settings open
     // or not.
@@ -2525,8 +2525,8 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
     "Divora can show a timer's time in an OBS text source, switch OBS to a scene for a break and back, and start a count-up when you go live or start recording. It talks to the WebSocket server built into OBS.";
   const EXPLAINER = [
     "When this is on, Divora keeps one connection open to OBS at the address below — this PC unless you change it. For OBS, it connects nowhere else, and it never listens for connections.",
-    "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry your recording's file path, which Divora ignores. Divora keeps only the names and ids of the scenes and sources you pick, and of the scene a timer switched OBS away from, so it can switch back.",
-    "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. It changes only the text of the sources you pick, and that text stays in OBS after Divora stops.",
+    "It sends OBS the time of each timer you show there, and the scene switches your timers ask for. It reads your scenes and which one is live, the names and kinds of your sources, each text source's settings (its text, font and any file it reads; Divora uses only whether it reads a file), whether OBS is streaming or recording and for how long, and OBS's version and platform. OBS's messages also carry the file paths of your recordings and saved replays, and anything other apps connected to OBS broadcast; Divora ignores them. Of all this, Divora saves only the names and ids of the scenes and sources you pick, and of the scene a timer switched OBS away from, so it can switch back. Its log notes the versions of OBS and its WebSocket server at each connection, and the id of a text source OBS can't find or won't share the settings of.",
+    "Divora never creates, deletes or restyles anything in OBS, and never starts or stops your stream or recording. Of your sources, it changes only the text of the ones you pick, and that text stays in OBS after Divora stops.",
     "OBS ships with its WebSocket server off. In OBS: Tools → WebSocket Server Settings → Enable WebSocket server, then Show Connect Info for the password.",
   ];
   const ADDRESS_HELP =
@@ -2537,7 +2537,7 @@ describe("SettingsScreen — Talk to OBS (v1.61.0)", () => {
   const SPACES = "This starts or ends with a space. OBS's password has to as well, or OBS will reject it.";
   const SAVED_ADDRESS = "Not connected: the saved address isn't valid. Fix it below.";
   const NETWORK = (host: string) =>
-    `${host} is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent.`;
+    `${host} is a network address, so Divora talks to OBS over the network, without encryption. Anyone who can see that traffic can read what Divora and OBS send each other, including your sources' names and settings and your recording's file path, and could change it or take over the connection to control OBS. Your password itself is never sent, but someone who records a connection's start can test guesses at it offline, so keep it long and random.`;
   const NO_AUTH =
     "OBS isn't asking for a password, so anything that can reach it on your network can control it. Turn on Enable Authentication in OBS's WebSocket Server Settings.";
   const SHOW_HELP =
