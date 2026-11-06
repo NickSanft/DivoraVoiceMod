@@ -4,6 +4,8 @@ All notable changes to Divora are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.61.0] — 2026-11-06 — Talk to OBS
+
 If you stream with OBS, Divora can now talk to it, once you turn it on in **Settings → OBS**: a timer's time can go into an OBS text source, a break can switch OBS to your break scene and back, and a count-up can follow your stream or recording. The OBS connection goes only to the address you give there (your own PC unless you change it), and for OBS, Divora never listens for connections. Over that connection, Divora never starts or stops your stream or recording. OBS itself wasn't tried, since it isn't installed on this PC: these notes rest on the code and on tests against a fake OBS server, and on checks in the real app on this PC against a stand-in OBS server.
 
 ### Added
