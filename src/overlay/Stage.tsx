@@ -14,6 +14,18 @@
 // backend formats, in white Space Mono Bold with a dark outline, sized in
 // JS to fit its box. Nothing about it is animated by CSS, so Functional
 // motion can't freeze it; its text node changes only when the text does.
+//
+// v1.62.0 (Text charms): two more kinds. A text charm draws the streamer's
+// words as one text node (never markup), its look from text.ts's fixed
+// tables, never a stored string. The page measures the text itself, with
+// the canvas main uses and the same font stack, and fits the face inside
+// the box by that measure, so a font that measured differently in main
+// leaves space instead of spilling; if the laid-out face still spills, its
+// size is cut once (`data-fit-backstop` counts it). The recording light
+// draws recLight.ts's face from the recorder's events the page hears. A
+// drag or corner resize snaps to the viewport's and the other charms' edges
+// and centres (snap.ts), with a guide line, unless Ctrl is held; Ctrl
+// pressed or let go mid-drag applies at once. Keys never snap.
 
 import {
   batch,
@@ -21,10 +33,12 @@ import {
   createMemo,
   createSignal,
   For,
+  Index,
   on,
   onCleanup,
   onMount,
   Show,
+  untrack,
   type JSX,
 } from "solid-js";
 import { Sigil } from "../components/Sigil";
@@ -56,8 +70,26 @@ import {
   type SceneOp,
   type Size,
 } from "./scene";
+import { LIGHT_RED, recFace, type RecFace, type ReplayView, type TakeView } from "./recLight";
+import { SNAP_BYPASS, SNAP_PX, snapOn, snapTargets, type Guide, type SnapBypass } from "./snap";
 import { OVERLAY_BG_COLOR, type OverlayBg, type OverlayState } from "./state";
 import { requestLock, sendAlive, type OverlayStatus } from "./status";
+import {
+  drawText,
+  fitTextFont,
+  fontSpec,
+  fontStack,
+  LINE_H,
+  PAD_EM,
+  readTextFields,
+  textBox,
+  textShadow,
+  type TextAlign,
+  type TextFont,
+  type TextInput,
+  type TextMetrics,
+} from "./text";
+import { canvasMetrics, FONT_WAIT_MS } from "./textMetrics";
 import { fitTimerFont, type TimerSnapshot, type TimerState } from "./timerState";
 
 /** How often an arranging page tells the backend it is alive. */
@@ -85,6 +117,21 @@ export interface StageProps {
   timers: TimerSnapshot | null;
   /** v1.59.0: the face's font has loaded, or the page stopped waiting. */
   fontReady: boolean;
+  /** v1.62.0: the recorder's latest take, for the recording light; null
+   *  (or absent) before the page has heard one. */
+  take?: TakeView | null;
+  /** v1.62.0: Replay's latest state, for the recording light; null (or
+   *  absent) before the page has heard one. */
+  replay?: ReplayView | null;
+  /** v1.62.0: the page holds an `overlay:status` for its own instance.
+   *  Locked, the light draws nothing until it does. */
+  statusSeen?: boolean;
+  /** v1.62.0: how the page measures a text charm before fitting its face
+   *  (textMetrics.ts's canvas; a fake in tests). Its `load` should have no
+   *  cap of its own: a text row waits at most FONT_WAIT_MS itself, and
+   *  measures again whenever `load` settles later. Absent, the canvas with
+   *  no cap. */
+  textMetrics?: TextMetrics;
   /** One finished edit: a drag, a nudge run, Delete or a restack. */
   onEdit: (op: SceneOp) => void;
 }
@@ -187,6 +234,237 @@ const TIMER_FACE: JSX.CSSProperties = {
   "pointer-events": "none",
 };
 
+/** v1.62.0: the Arrange hint about snapping, naming SNAP_BYPASS's key. */
+const BYPASS_NAME: Readonly<Record<SnapBypass, string>> = { ctrl: "Ctrl", alt: "Alt", shift: "Shift" };
+export const SNAP_HINT = `Charms snap to edges and centres. Hold ${BYPASS_NAME[SNAP_BYPASS]} to place one freely.`;
+
+/** v1.62.0: a text face's lines across its box, by its alignment. */
+const JUSTIFY: Readonly<Record<TextAlign, string>> = { left: "flex-start", center: "center", right: "flex-end" };
+
+/** v1.62.0: how far, in CSS px, a laid-out text may read over its box
+ *  before the backstop cuts its size. `offsetWidth` and `offsetHeight` are
+ *  whole pixels, so a face that fits a fractional box can read up to a
+ *  pixel over it. */
+const BACKSTOP_SLACK_PX = 1;
+
+/** v1.62.0: the light's dot and its gap take two of fitTimerFont's 0.62 em
+ *  cells (a 0.62 em dot and a 0.3 em gap); it floors its `chars`, so a
+ *  fraction would be lost. */
+const LIGHT_DOT_CELLS = 2;
+
+/** v1.62.0: the light's dot. A shape, not a character, so it is the same in
+ *  every font and is never read out. */
+const LIGHT_DOT: JSX.CSSProperties = {
+  display: "inline-block",
+  flex: "none",
+  width: "0.62em",
+  height: "0.62em",
+  "margin-right": "0.3em",
+  "border-radius": "50%",
+  background: LIGHT_RED,
+  "box-shadow": "0 0 0 0.06em rgba(0, 0, 0, 0.85)",
+};
+
+/** v1.62.0: the dimmed "REC" the light shows in Arrange when nothing
+ *  records, so it can be found and placed. */
+const LIGHT_IDLE_OPACITY = "0.45";
+
+function sameSize(a: Size | undefined, b: Size | undefined): boolean {
+  return a === b || (a !== undefined && b !== undefined && a.w === b.w && a.h === b.h);
+}
+
+function sameFields(a: TextInput | null, b: TextInput | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.text === b.text &&
+    a.font === b.font &&
+    a.bold === b.bold &&
+    a.color === b.color &&
+    a.outline === b.outline &&
+    a.align === b.align
+  );
+}
+
+function sameFace(a: RecFace, b: RecFace): boolean {
+  return a.kind === b.kind && a.text === b.text;
+}
+
+/** The canvas with no cap of its own, for a Stage given no `textMetrics`:
+ *  made at the first text row, once. */
+let defaultMetrics: TextMetrics | undefined;
+function pageMetrics(): TextMetrics {
+  return (defaultMetrics ??= canvasMetrics(Infinity));
+}
+
+/** v1.62.0: what a text face draws, as the page measured it: the text and
+ *  font measured, the natural box at REF_PX by the page's own measure, and
+ *  which measure this is (a late font load measures again). */
+interface Measured {
+  text: string;
+  font: TextFont;
+  bold: boolean;
+  nw: number;
+  nh: number;
+  gen: number;
+}
+
+/** v1.62.0: a text charm's face. It draws once its font has loaded for its
+ *  text, or FONT_WAIT_MS on in the fallback; until a new text or font is
+ *  ready, the one before stays, so an edit never blanks the charm on
+ *  stream. It is fitted inside the box by the page's own measure, never the
+ *  stored `nw`/`nh` (they only shape the box). After it lays out at a new
+ *  size, a face that still spills (canvas and layout shaping differently)
+ *  has its size cut once by the larger ratio, counted on
+ *  `data-fit-backstop`. A drag re-measures nothing. */
+function TextFace(p: {
+  fields: () => TextInput;
+  box: () => Size | undefined;
+  metrics: () => TextMetrics;
+}): JSX.Element {
+  const drawn = createMemo(() => drawText(p.fields().text));
+  const font = createMemo(() => p.fields().font);
+  const bold = createMemo(() => p.fields().bold);
+  const [measured, setMeasured] = createSignal<Measured | null>(null);
+  let gen = 0;
+
+  createEffect(
+    on([drawn, font, bold], ([text, f, b]) => {
+      const spec = fontSpec(f, b);
+      const metrics = p.metrics();
+      let live = true;
+      const measure = (): void => {
+        gen += 1;
+        setMeasured({ text, font: f, bold: b, ...textBox(text, (line) => metrics.width(spec, line)), gen });
+      };
+      // In the fallback, if the font is slow; measured again when it comes.
+      const wait = setTimeout(measure, FONT_WAIT_MS);
+      const loaded = (): void => {
+        if (!live) return;
+        clearTimeout(wait);
+        measure();
+      };
+      metrics.load(spec, text).then(loaded, loaded);
+      onCleanup(() => {
+        live = false;
+        clearTimeout(wait);
+      });
+    }),
+  );
+
+  const fit = createMemo(() => {
+    const m = measured();
+    const b = p.box();
+    return m && b ? fitTextFont(b.w, b.h, m.nw, m.nh) : 0;
+  });
+  // The layout the backstop checked: this measure in this box.
+  const layoutKey = createMemo(() => {
+    const m = measured();
+    const b = p.box();
+    return m && b ? `${m.gen} ${b.w} ${b.h}` : "";
+  });
+  const [cut, setCut] = createSignal<{ key: string; k: number } | null>(null);
+  const [cuts, setCuts] = createSignal(0);
+  const size = createMemo(() => {
+    const c = cut();
+    return fit() * (c !== null && c.key === layoutKey() ? c.k : 1);
+  });
+
+  let lines: HTMLDivElement | undefined;
+  // After the face is laid out at a new size: render effects (its style)
+  // run before this one.
+  createEffect(
+    on(layoutKey, (key) => {
+      const b = untrack(p.box);
+      if (key === "" || !b || !lines) return;
+      // The words' own laid-out box (`flex: none`, so as wide as the widest
+      // line), not their scroll size: Chromium counts each font's ascent
+      // and descent in that, and Space Mono Bold's (about 1.47 em) is taller
+      // than its 1.15 em line and the padding, so a face that fits exactly
+      // read 1 to 2 px over and was cut (E1).
+      const sw = lines.offsetWidth;
+      const sh = lines.offsetHeight;
+      if (sw <= b.w + BACKSTOP_SLACK_PX && sh <= b.h + BACKSTOP_SLACK_PX) return;
+      const k = Math.min(1, b.w / sw, b.h / sh);
+      batch(() => {
+        setCut({ key, k });
+        setCuts((n) => n + 1);
+      });
+    }),
+  );
+
+  const text = createMemo(() => measured()?.text ?? "");
+  // All of it a style object, keyed property by property: the family comes
+  // from text.ts's table, never from a stored string.
+  const faceStyle = (): JSX.CSSProperties => {
+    const f = p.fields();
+    const m = measured();
+    return {
+      position: "absolute",
+      inset: "0",
+      display: "flex",
+      "align-items": "center",
+      "justify-content": JUSTIFY[f.align],
+      "font-family": fontStack(m?.font ?? f.font),
+      "font-weight": (m?.bold ?? f.bold) ? "700" : "400",
+      "font-size": px(size()),
+      "line-height": String(LINE_H),
+      "white-space": "pre",
+      "text-align": f.align,
+      "font-kerning": "normal",
+      "letter-spacing": "0",
+      "text-rendering": "optimizeLegibility",
+      color: f.color,
+      "text-shadow": f.outline ? textShadow(f.color) : "none",
+      "pointer-events": "none",
+    };
+  };
+
+  return (
+    <Show when={measured()}>
+      <div data-text-face data-fit-backstop={String(cuts())} aria-hidden="true" style={faceStyle()}>
+        <div ref={lines} style={{ flex: "none", padding: `${PAD_EM}em` }}>
+          {text()}
+        </div>
+      </div>
+    </Show>
+  );
+}
+
+/** v1.62.0: the light's dot, a component of its own so its style is
+ *  written once (Solid re-applies every style in an element's effect when
+ *  any of them changes). */
+function LightDot(): JSX.Element {
+  return <span data-rec-dot style={LIGHT_DOT} />;
+}
+
+/** v1.62.0: the recording light's face: recLight.ts's `recFace`, with the
+ *  dot. Its text node is written only when the face's words change. */
+function LightFace(p: { face: () => RecFace; box: () => Size | undefined }): JSX.Element {
+  const text = createMemo(() => p.face().text);
+  const idle = () => p.face().kind === "idle";
+  const style = (): JSX.CSSProperties => {
+    const b = p.box();
+    return {
+      ...TIMER_FACE,
+      "font-size": px(b ? fitTimerFont(b.w, b.h, text().length + LIGHT_DOT_CELLS) : 0),
+      opacity: idle() ? LIGHT_IDLE_OPACITY : undefined,
+    };
+  };
+  return (
+    <Show when={p.face().kind !== "none"}>
+      <div
+        data-rec-face={idle() ? undefined : ""}
+        data-rec-idle={idle() ? "" : undefined}
+        aria-hidden="true"
+        style={style()}
+      >
+        <LightDot />
+        {text()}
+      </div>
+    </Show>
+  );
+}
+
 /** The Arrange lease's beats: two frames after the chrome mounts, then
  *  every BEAT_MS until it unmounts (a lock, or the page going away). */
 function Beats(props: { instance: number; gen: () => number }): JSX.Element {
@@ -232,9 +510,27 @@ export function Stage(props: StageProps): JSX.Element {
   const labels = createMemo(() =>
     props.scene ? charmLabels(props.scene, (timer) => timerNames().get(timer)) : new Map<string, string>(),
   );
+  // v1.62.0: what the recording light shows. One for the scene (there is at
+  // most one live light), and it changes only when its words do.
+  const light = createMemo(
+    () =>
+      recFace(props.take ?? null, props.replay ?? null, {
+        arrange: arrange(),
+        statusSeen: props.statusSeen ?? false,
+        hideGate: props.status.hideWanted && props.status.hideAvailable,
+        capturing: props.status.capturing,
+      }),
+    undefined,
+    { equals: sameFace },
+  );
+  const metrics = (): TextMetrics => props.textMetrics ?? pageMetrics();
 
   const [selected, setSelected] = createSignal<string | null>(null);
   const [gesture, setGesture] = createSignal<Gesture | null>(null);
+  // v1.62.0: where the pointer last moved in the gesture, so a change of
+  // Ctrl mid-drag can snap (or free) the preview there at once. Null until
+  // it moves: a key alone never moves a charm.
+  let lastAt: { x: number; y: number } | null = null;
   // An arrow or +/− run, kept as a move gesture so it finishes the same way:
   // one `place`, NUDGE_FLUSH_MS after its last key.
   const [nudge, setNudge] = createSignal<Gesture | null>(null);
@@ -297,8 +593,18 @@ export function Stage(props: StageProps): JSX.Element {
     if ((e.buttons & 1) === 0) return finish();
     // Removed from Settings mid-drag.
     if (!byId().has(g.id)) return drop();
-    setGesture(updateGesture(g, { x: e.clientX, y: e.clientY }));
+    lastAt = { x: e.clientX, y: e.clientY };
+    setGesture(updateGesture(g, lastAt, snapOn(e)));
   }
+
+  /** v1.62.0: Ctrl pressed or let go mid-gesture re-runs the last pointer
+   *  point with the keys as they are now. Any modifier does, so a different
+   *  SNAP_BYPASS needs no change here. */
+  const resnap = (e: KeyboardEvent): void => {
+    const g = gesture();
+    if (!g || lastAt === null || !(e.key === "Control" || e.key === "Alt" || e.key === "Shift")) return;
+    setGesture(updateGesture(g, lastAt, snapOn(e)));
+  };
 
   function onUp(e: PointerEvent): void {
     const g = gesture();
@@ -332,10 +638,14 @@ export function Stage(props: StageProps): JSX.Element {
     const corner = handle?.getAttribute("data-corner") as Corner | null | undefined;
     const at = { x: e.clientX, y: e.clientY };
     const v = { w: props.viewport.w, h: props.viewport.h };
+    // v1.62.0: the lines it can snap to, fixed now: the viewport's and every
+    // other charm's as laid out at the press, in the viewport it keeps.
+    const targets = snapTargets(layout(), id, v);
+    lastAt = null;
     setGesture(
       corner && CORNERS.includes(corner)
-        ? beginResize(id, corner, pointerOf(e), at, r.rect, v)
-        : beginMove(id, pointerOf(e), at, r.rect, v),
+        ? beginResize(id, corner, pointerOf(e), at, r.rect, v, targets)
+        : beginMove(id, pointerOf(e), at, r.rect, v, targets),
     );
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
@@ -387,6 +697,7 @@ export function Stage(props: StageProps): JSX.Element {
   const onKey = (e: KeyboardEvent): void => {
     const onButton = e.target instanceof Element && e.target.closest("button") !== null;
     if (shouldPreventKey(e, onButton)) e.preventDefault();
+    resnap(e);
     const id = current();
     const act = keyAction(e, { arrange: arrange(), gesture: gesture() !== null, selected: id !== null });
     if (act.kind === "none") return;
@@ -425,12 +736,14 @@ export function Stage(props: StageProps): JSX.Element {
 
   onMount(() => {
     window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", resnap);
     window.addEventListener("contextmenu", onContextMenu);
     window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
   });
   onCleanup(() => {
     window.removeEventListener("keydown", onKey);
+    window.removeEventListener("keyup", resnap);
     window.removeEventListener("contextmenu", onContextMenu);
     window.removeEventListener("focus", onFocus);
     window.removeEventListener("blur", onBlur);
@@ -475,9 +788,32 @@ export function Stage(props: StageProps): JSX.Element {
       const h = hitRect(r, props.viewport);
       return { x: h.x - r.x, y: h.y - r.y, w: h.w, h: h.h };
     };
+    // v1.62.0: the drawn box's size, which a move doesn't change.
+    const size = createMemo(
+      (): Size | undefined => {
+        const r = rect();
+        return r ? { w: r.w, h: r.h } : undefined;
+      },
+      undefined,
+      { equals: sameSize },
+    );
+    // v1.62.0: a text's six fields as this build draws them; a new element
+    // object (a drag, an ack) with the same fields changes nothing.
+    const textFields = createMemo(
+      (): TextInput | null => {
+        const el = entry()?.el;
+        return el && el.type === "text" ? readTextFields(el) : null;
+      },
+      null,
+      { equals: sameFields },
+    );
     const isSelected = () => arrange() && current() === id;
     const label = () => {
       if (kind() === "timer") return `Timer: ${labels().get(id) ?? "Timer"}`;
+      // v1.62.0: the words as drawn, on one line.
+      const words = textFields()?.text;
+      if (words !== undefined) return `Text: ${drawText(words).split("\n").join(" ")}`;
+      if (kind() === "rec") return "Recording light";
       const name = labels().get(id) ?? "Picture";
       return circle() ? name : `Picture: ${name}`;
     };
@@ -618,6 +954,10 @@ export function Stage(props: StageProps): JSX.Element {
             </div>
           </Show>
         </Show>
+        <Show when={textFields()}>{(fields) => <TextFace fields={fields} box={size} metrics={metrics} />}</Show>
+        <Show when={kind() === "rec"}>
+          <LightFace face={light} box={size} />
+        </Show>
         <div
           data-hit
           style={{
@@ -650,6 +990,25 @@ export function Stage(props: StageProps): JSX.Element {
 
   const background = (): string => (props.background && OVERLAY_BG_COLOR[props.background]) || "transparent";
 
+  // v1.62.0: the lines the dragged charm is snapped to, while the pointer is
+  // down. In the gesture's own viewport, as its preview is; one pixel wide
+  // and kept on screen, so an edge's line shows too.
+  const guides = (): Guide[] => gesture()?.guides ?? [];
+  const guideStyle = (g: Guide): JSX.CSSProperties => {
+    const v = gesture()?.v0 ?? props.viewport;
+    const along = g.axis === "x" ? v.w : v.h;
+    const at = Math.min(Math.max(g.at, 0), Math.max(0, along - 1));
+    const line: JSX.CSSProperties = {
+      position: "absolute",
+      "pointer-events": "none",
+      "box-shadow": "0 0 0 1px rgba(0, 0, 0, 0.5)",
+      "z-index": CHROME_Z,
+    };
+    return g.axis === "x"
+      ? { ...line, left: px(at), top: "0", width: "0", height: "100%", "border-left": "1px dashed var(--indigo)" }
+      : { ...line, top: px(at), left: "0", height: "0", width: "100%", "border-top": "1px dashed var(--indigo)" };
+  };
+
   return (
     <div
       ref={stage}
@@ -669,6 +1028,11 @@ export function Stage(props: StageProps): JSX.Element {
     >
       <For each={ids()}>{(id) => <Row id={id} />}</For>
       <Show when={arrange()}>
+        <Index each={guides()}>
+          {(g) => (
+            <div data-guide data-axis={g().axis} data-at={String(g().at)} aria-hidden="true" style={guideStyle(g())} />
+          )}
+        </Index>
         <div
           aria-hidden="true"
           style={{
@@ -733,6 +1097,9 @@ export function Stage(props: StageProps): JSX.Element {
               }}
             >
               <span>{hasFocus() ? "Esc locks the overlay" : "Click Lock to lock the overlay"}</span>
+              <Show when={SNAP_PX > 0}>
+                <span>{SNAP_HINT}</span>
+              </Show>
               {/* Only where Locked would hide it: Hide on, and Windows able to. */}
               <Show when={props.status.capturing && props.status.hideWanted && props.status.hideAvailable}>
                 <span>Recordings can see the overlay while you arrange.</span>

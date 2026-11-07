@@ -109,7 +109,7 @@ test.describe("light theme (v1.11)", () => {
     await page.reload();
     await expect(html).toHaveAttribute("data-theme", "light");
 
-    // The light axis composes with a Color mood (specificity layering).
+    // The light axis composes with a Colour mood (specificity layering).
     await nav(page, "Settings").click();
     await seg(page, "Ink + Candle").click();
     await expect(html).toHaveAttribute("data-mood", "ink");

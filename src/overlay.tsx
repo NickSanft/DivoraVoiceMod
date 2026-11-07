@@ -23,6 +23,17 @@
 // `seq`. A timer face waits for Space Mono Bold, at most FONT_WAIT_MS, so a
 // first frame doesn't swap fonts on stream unless the font takes longer
 // than that.
+//
+// v1.62.0 (Text charms): the recording light. The page hears the recorder's
+// own broadcast events (`screen-recording`, `replay-buffer`) itself, and
+// after the handshake reads both statuses once, sent with the timers' read.
+// Neither event has a `seq`, so an answer is kept only if no event of its
+// kind came while it was on its way (one count per kind). Locked, the light
+// draws nothing until the page holds an `overlay:status` for its own
+// window: the status the handshake causes can land after an answer. Text
+// charms are measured here with the shared canvas, its `load` uncapped:
+// Stage waits at most FONT_WAIT_MS itself, and measures again when a slow
+// font arrives.
 
 import "@fontsource-variable/bricolage-grotesque";
 import "@fontsource-variable/space-grotesk";
@@ -30,8 +41,16 @@ import "@fontsource/space-mono/400.css";
 import "@fontsource/space-mono/700.css";
 
 import { render } from "solid-js/web";
-import { createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { batch, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { emptyMirror, HOLD_MS, proposeEdit, receiveScene, renderedScene } from "./overlay/mirror";
+import {
+  readReplayView,
+  readTakeView,
+  REC_COMMANDS,
+  REC_EVENTS,
+  type ReplayView,
+  type TakeView,
+} from "./overlay/recLight";
 import { defaultScene, type SceneOp, type Size } from "./overlay/scene";
 import { Stage, twoFrames } from "./overlay/Stage";
 import {
@@ -51,6 +70,7 @@ import {
   sendHandshake,
   type OverlayStatus,
 } from "./overlay/status";
+import { canvasMetrics, FONT_WAIT_MS } from "./overlay/textMetrics";
 import {
   adoptTimers,
   readTimerSnapshot,
@@ -61,8 +81,9 @@ import {
 import "./styles.css";
 
 /** The longest a timer face waits for its font before it draws in the
- *  fallback. */
-export const FONT_WAIT_MS = 1000;
+ *  fallback. v1.62.0: kept in textMetrics.ts, which main's text measure
+ *  shares, and re-exported here. */
+export { FONT_WAIT_MS };
 
 /** The face's font, as `document.fonts.load` names it: Space Mono Bold,
  *  bundled (no network). */
@@ -115,9 +136,31 @@ export function OverlayApp(): JSX.Element {
   // Null until the backend's first snapshot: no face draws before it.
   const [timers, setTimers] = createSignal<TimerSnapshot | null>(null);
   const [fontReady, setFontReady] = createSignal(false);
+  // v1.62.0: the recorder's latest take and Replay state, null until heard;
+  // and whether this window's own status has come.
+  const [take, setTake] = createSignal<TakeView | null>(null);
+  const [replay, setReplay] = createSignal<ReplayView | null>(null);
+  const [statusSeen, setStatusSeen] = createSignal(false);
+  // How many of each recorder event this page has heard: a status read's
+  // answer is kept only if the count didn't move while it was on its way.
+  const heard = { take: 0, replay: 0 };
+  // Text charms' measure. No cap on `load`: Stage keeps its own.
+  const textMetrics = canvasMetrics(Infinity);
 
   const adoptTimerSnapshot = (raw: unknown): void => {
     setTimers((held) => adoptTimers(held, readTimerSnapshot(raw)));
+  };
+
+  // An unreadable report changes nothing.
+  const onTake = (raw: unknown): void => {
+    heard.take += 1;
+    const v = readTakeView(raw);
+    if (v) setTake(v);
+  };
+  const onReplay = (raw: unknown): void => {
+    heard.replay += 1;
+    const v = readReplayView(raw);
+    if (v) setReplay(v);
   };
 
   let painted = false;
@@ -151,7 +194,10 @@ export function OverlayApp(): JSX.Element {
   const onStatus = (raw: unknown): void => {
     const s = readOverlayStatus(raw);
     if (!s || s.instance !== instance) return;
-    setStatus(s);
+    batch(() => {
+      setStatus(s);
+      setStatusSeen(true);
+    });
     // Painted means drawn since the window was shown: after the first status
     // that says it is shown, and two frames.
     if (!painted && s.phase === "shown") {
@@ -215,6 +261,9 @@ export function OverlayApp(): JSX.Element {
         keep(await listen<ScenePush>(OVERLAY_SCENE_EVENT, (e) => onScene(e.payload)));
         keep(await listen<unknown>(OVERLAY_STATUS_EVENT, (e) => onStatus(e.payload)));
         keep(await listen<unknown>(TIMER_STATE_EVENT, (e) => adoptTimerSnapshot(e.payload)));
+        // v1.62.0: the recording light's two sources, also before ready.
+        keep(await listen<unknown>(REC_EVENTS.take, (e) => onTake(e.payload)));
+        keep(await listen<unknown>(REC_EVENTS.replay, (e) => onReplay(e.payload)));
         if (gone) return;
         send = (event, payload) => emit(event, payload);
         // Only now can a push reach us, so only now ask for one. Deliberately
@@ -230,10 +279,25 @@ export function OverlayApp(): JSX.Element {
         // the handshake, so the window isn't kept waiting; by `seq`, so an
         // event that overtook this answer still wins. A failure leaves the
         // events to tell.
+        //
+        // v1.62.0: the take and Replay as they are now too (a page opened
+        // mid-take), sent together with the timers' read; each answer is
+        // kept on its own, and only if no event of its kind came meanwhile.
         void ready
           .then(async () => {
             const { invoke } = await import("@tauri-apps/api/core");
-            adoptTimerSnapshot(await invoke(TIMER_STATUS_CMD));
+            const ignore = (): void => undefined;
+            void invoke(TIMER_STATUS_CMD).then(adoptTimerSnapshot, ignore);
+            const takeAt = heard.take;
+            void invoke(REC_COMMANDS.take).then((raw) => {
+              const v = readTakeView(raw);
+              if (v && heard.take === takeAt) setTake(v);
+            }, ignore);
+            const replayAt = heard.replay;
+            void invoke(REC_COMMANDS.replay).then((raw) => {
+              const v = readReplayView(raw);
+              if (v && heard.replay === replayAt) setReplay(v);
+            }, ignore);
           })
           .catch(() => undefined);
       } catch {
@@ -255,6 +319,10 @@ export function OverlayApp(): JSX.Element {
       background={status().fit ? "transparent" : state()?.bg}
       timers={timers()}
       fontReady={fontReady()}
+      take={take()}
+      replay={replay()}
+      statusSeen={statusSeen()}
+      textMetrics={textMetrics}
       onEdit={onEdit}
     />
   );

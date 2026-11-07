@@ -224,6 +224,8 @@ import type { Point } from "../data/glyphs";
 import type { OverlayBg, ScenePush } from "../overlay/state";
 import type { OverlayScene } from "../overlay/scene";
 import type { OverlayStatus } from "../overlay/status";
+import type { TextInput } from "../overlay/text";
+import { canvasMetrics } from "../overlay/textMetrics";
 import {
   adoptTimers,
   readTimerSnapshot,
@@ -697,6 +699,16 @@ export interface AppState {
   addOverlayPicture: () => Promise<void>;
   removeOverlayElement: (id: string) => Promise<void>;
   addSpellCircle: () => void;
+  /** v1.62.0: Add text… — measures the text and adds a text charm, or
+   *  toasts why not. Settles after its commit or refusal. */
+  addOverlayText: (input: TextInput) => Promise<void>;
+  /** v1.62.0: Save for an existing text charm, with only the fields that
+   *  changed. Settles after its commit or refusal. */
+  editOverlayText: (id: string, changes: Partial<TextInput>) => Promise<void>;
+  /** v1.62.0: Add the recording light, unless the overlay has one. */
+  addRecordingLight: () => void;
+  /** v1.62.0: the scene has a live recording light. Reactive. */
+  overlayHasLight: () => boolean;
 
   // Audio engine
   audioInputs: () => DeviceInfo[];
@@ -1567,6 +1579,8 @@ export function createAppState(): AppState {
     toast: (text, tone) => showToast(text, tone),
     newId: () => `c-${randomHex(4)}`,
     session: randomHex(8),
+    // v1.62.0: text charms are measured here, as the overlay measures them.
+    text: canvasMetrics(),
   });
 
   // Audio engine signals.
@@ -5279,6 +5293,10 @@ export function createAppState(): AppState {
     addOverlayPicture: overlay.addOverlayPicture,
     removeOverlayElement: overlay.removeOverlayElement,
     addSpellCircle: overlay.addSpellCircle,
+    addOverlayText: overlay.addOverlayText,
+    editOverlayText: overlay.editOverlayText,
+    addRecordingLight: overlay.addRecordingLight,
+    overlayHasLight: overlay.overlayHasLight,
 
     audioInputs,
     setAudioInputs,

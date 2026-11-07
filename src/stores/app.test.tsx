@@ -3728,6 +3728,51 @@ describe("app store — stream overlay hotkey (v1.55.0)", () => {
   });
 });
 
+// v1.62.0: the store's text-charm and light members are the overlay
+// controller's (controller.test.ts drives it in full), wired to this
+// window's measure (textMetrics.ts's canvasMetrics, as jsdom runs it).
+describe("app store — text charms and the light (v1.62.0)", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise<void>((r) => setTimeout(r, 0));
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(null);
+    window.localStorage.clear();
+  });
+
+  it("addOverlayText, editOverlayText, addRecordingLight and overlayHasLight reach the controller", async () => {
+    const { result } = setupApp();
+    await settle();
+    const saved = () =>
+      (JSON.parse(window.localStorage.getItem("divora.overlayScene") ?? "null") as {
+        elements: Array<Record<string, unknown>>;
+      } | null)?.elements ?? [];
+
+    expect(result.overlayHasLight()).toBe(false);
+    result.addRecordingLight();
+    expect(result.overlayHasLight()).toBe(true);
+    expect(result.toast()?.text).toBe("Recording light added. Use Arrange to place it.");
+    expect(saved().filter((e) => e.type === "rec")).toHaveLength(1);
+
+    // Settles after its commit.
+    await result.addOverlayText({ text: "BRB", font: "mono", bold: true, color: "#ffffff", outline: true, align: "center" });
+    const text = () => result.overlayScene().elements.find((e) => e.type === "text")!;
+    expect(text()).toMatchObject({ text: "BRB", font: "mono" });
+    const nw = text().nw as number;
+    expect(Number.isInteger(nw) && nw >= 1).toBe(true);
+    expect(Number.isInteger(text().nh) && (text().nh as number) >= 1).toBe(true);
+    expect(result.toast()?.text).toBe("Text added. Use Arrange to place it.");
+
+    await result.editOverlayText(text().id, { text: "BRB now" });
+    expect(text()).toMatchObject({ text: "BRB now", font: "mono" });
+    expect(text().nw as number).toBeGreaterThan(nw);
+    expect(saved().find((e) => e.type === "text")).toMatchObject({ text: "BRB now" });
+  });
+});
+
 describe("app store — the mute (v1.56.0)", () => {
   const settle = async () => {
     for (let i = 0; i < 10; i++) await Promise.resolve();

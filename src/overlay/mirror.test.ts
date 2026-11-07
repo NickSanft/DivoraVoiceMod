@@ -156,6 +156,33 @@ describe("the scene mirror", () => {
     });
   });
 
+  it("a pending old-shape place over a reshaped server scene shows main's result: a move, the new size kept (v1.62.0)", () => {
+    // A 144 × 48 text charm (3 : 1). The overlay drags it while Settings
+    // saves an Edit that makes it 8 : 1; main's push of the edit arrives
+    // before the drag's ack, so the drag is re-applied over it.
+    const base = defaultScene();
+    const t = { id: "t", type: "text", x: 0.35, y: 0.4, w: 0.3, h: 0.1, z: 1, text: "BRB", nw: 300, nh: 100 };
+    const s0: OverlayScene = { ...base, elements: [...base.elements, t] };
+    const old = layoutScene(s0, V).find((r) => r.el.id === "t")!.rect;
+    const drag: SceneOp = { kind: "place", id: "t", rect: { ...old, x: old.x + 20, y: old.y + 30 }, viewport: V };
+    let m = proposeEdit(receiveScene(emptyMirror(), push(s0, 1), ME, 0, V), drag, ME).mirror;
+    const s1 = applyOp(s0, { kind: "set", id: "t", fields: { text: "BRB, back in five", nw: 800, nh: 100 } });
+    m = receiveScene(m, push(s1, 2), ME, 0, V);
+    // Main takes the drag after its edit, as a move.
+    const s2 = applyOp(s1, drag);
+    const shown = renderedScene(m, V, 0)!;
+    expect(shown).toEqual(s2);
+    const r = layoutScene(shown, V).find((x) => x.el.id === "t")!.rect;
+    expect(r.w).toBeCloseTo(384, 3);
+    expect(r.h).toBeCloseTo(48, 3);
+    expect(r.x + r.w / 2).toBeCloseTo(old.x + 20 + old.w / 2, 3);
+    expect(r.y + r.h / 2).toBeCloseTo(old.y + 30 + old.h / 2, 3);
+    // Its ack changes nothing on screen.
+    m = receiveScene(m, push(s2, 3, { ack: { instance: ME, seq: 0 } }), ME, 0, V);
+    expect(m.pending).toEqual([]);
+    expect(renderedScene(m, V, 0)).toEqual(shown);
+  });
+
   it("a malformed push changes nothing", () => {
     const m = receiveScene(emptyMirror(), push(sceneWith(0.1), 1), ME, 0, V);
     for (const bad of [null, {}, { session: "s1", revision: 2, scene: null }]) {

@@ -13,6 +13,8 @@ import type { MonitorInfo, OverlayGeometry, Rect } from "./geometry";
 import { emptyMirror, proposeEdit, receiveScene, renderedScene } from "./mirror";
 import {
   CIRCLE_ID,
+  defaultLightRect,
+  defaultTextRect,
   defaultTimerRect,
   frameOf,
   layoutScene,
@@ -25,6 +27,7 @@ import {
 } from "./scene";
 import { OVERLAY_READY_EVENT, OVERLAY_SCENE_EVENT, type ScenePush } from "./state";
 import type { OverlayStatus } from "./status";
+import { fontSpec, type TextFont, type TextInput, type TextMetrics } from "./text";
 import fixture from "./wire.fixture.json";
 
 // Drives the real controller with fake deps: an in-memory backend that
@@ -88,7 +91,16 @@ interface Options {
   backend?: OverlayStatus;
   /** What `overlay_status` answers at launch, when not simply the backend's. */
   pull?: () => Promise<unknown>;
+  /** v1.62.0: how text is measured, when not simply `TEN_PX`. */
+  text?: TextMetrics;
 }
+
+/** v1.62.0: a text charm's measure. No font to wait for, and 10 px a code
+ *  unit at 100 px, whatever the font. */
+const TEN_PX: TextMetrics = {
+  load: async () => undefined,
+  width: (_spec, line) => 10 * line.length,
+};
 
 const disposers: Array<() => void> = [];
 afterEach(() => {
@@ -220,6 +232,7 @@ function harness(o: Options = {}) {
     toast: (text, tone) => toasts.push({ text, tone }),
     newId: () => `c-${(ids++).toString(16).padStart(8, "0")}`,
     session: "s1",
+    text: o.text ?? TEN_PX,
   };
   let dispose: () => void = () => undefined;
   const c = createRoot((d) => {
@@ -1100,5 +1113,435 @@ describe("overlay controller — timer faces (v1.59.0)", () => {
     // Show on overlay again.
     h.c.addOverlayTimer("timer-1");
     expect(seen).toEqual([true, false, true]);
+  });
+});
+
+describe("overlay controller — text charms and the light (v1.62.0)", () => {
+  const TEXT_ADDED = "Text added. Use Arrange to place it.";
+  const LIGHT_ADDED = "Recording light added. Use Arrange to place it.";
+  const TEXT_GONE = "That text was removed, so there was nothing to change.";
+  const TEXT_REFUSED = "That text couldn't be saved. Use 1 to 200 characters on up to 5 lines.";
+  const HAS_LIGHT = "The overlay already has a recording light.";
+  const FULL = "The overlay is full. Remove something to add another.";
+  // The canvas font measures with the face's whole stack (D7, TV1).
+  const SANS_BOLD = '700 100px "Space Grotesk Variable", system-ui, sans-serif';
+  const MONO = '400 100px "Space Mono", ui-monospace, monospace';
+
+  async function opened(scene?: OverlayScene, text?: TextMetrics) {
+    const h = harness({ stored: { ...prefs(), ...(scene ? { [SCENE]: scene } : {}) }, text });
+    await flush();
+    await h.c.openOverlay();
+    await flush();
+    return h;
+  }
+
+  /** What Settings' editor saves: the read defaults, and these. */
+  const input = (more: Partial<TextInput> = {}): TextInput => ({
+    text: "BRB",
+    font: "sans",
+    bold: true,
+    color: "#ffffff",
+    outline: true,
+    align: "center",
+    ...more,
+  });
+
+  /** A stored text of the migrated 480 scene: 144 × 48 px at (168, 192),
+   *  3 : 1, the shape its `nw`/`nh` say. */
+  function textEl(id: string, more: Record<string, unknown> = {}): SceneElement {
+    return {
+      id,
+      type: "text",
+      x: 0.35,
+      y: 0.4,
+      w: 0.3,
+      h: 0.1,
+      z: 1,
+      text: "BRB",
+      font: "sans",
+      bold: true,
+      color: "#ffffff",
+      outline: true,
+      align: "center",
+      nw: 300,
+      nh: 100,
+      ...more,
+    };
+  }
+
+  const texts = (s: OverlayScene) => s.elements.filter((e) => e.type === "text");
+  const lights = (s: OverlayScene) => s.elements.filter((e) => e.type === "rec");
+
+  /** TEN_PX, recording each call, with the loads of the samples in `slow`
+   *  waiting until the test releases them. */
+  function slowMetrics(...slow: string[]) {
+    const calls: string[] = [];
+    const waits = new Map(slow.map((s) => [s, deferred<void>()]));
+    const metrics: TextMetrics = {
+      load: (spec, sample) => {
+        calls.push(`load ${spec} | ${sample}`);
+        return waits.get(sample)?.promise ?? Promise.resolve();
+      },
+      width: (spec, line) => {
+        calls.push(`width ${spec} | ${line}`);
+        return 10 * line.length;
+      },
+    };
+    const release = (sample: string) => waits.get(sample)!.resolve();
+    return { calls, metrics, release };
+  }
+
+  it("Add text waits for its font with the whole stack, then measures, adds where defaultTextRect says, saves, pushes and says so", async () => {
+    const m = slowMetrics("BRB");
+    const h = await opened(undefined, m.metrics);
+    const before = h.pushes.length;
+    const at = defaultTextRect(h.c.overlayScene(), 54, 139, V480);
+    const adding = h.c.addOverlayText(input());
+    await flush();
+    // Nothing is measured, and nothing added, until the font is in.
+    expect(m.calls).toEqual([`load ${SANS_BOLD} | BRB`]);
+    expect(SANS_BOLD).toBe(fontSpec("sans", true));
+    expect(texts(h.c.overlayScene())).toEqual([]);
+    m.release("BRB");
+    await adding;
+    expect(m.calls).toEqual([`load ${SANS_BOLD} | BRB`, `width ${SANS_BOLD} | BRB`]);
+    // 30 px of text + 0.12 em a side; one line of 1.15 em + 0.12 em top and
+    // bottom.
+    expect(texts(h.c.overlayScene())).toEqual([
+      {
+        id: "c-00000000",
+        type: "text",
+        ...at,
+        z: 1,
+        text: "BRB",
+        font: "sans",
+        bold: true,
+        color: "#ffffff",
+        outline: true,
+        align: "center",
+        nw: 54,
+        nh: 139,
+      },
+    ]);
+    expect(texts(h.loaded(SCENE))).toHaveLength(1);
+    expect(h.pushes.length).toBe(before + 1);
+    expect(texts(h.pushes.at(-1)!.scene)).toHaveLength(1);
+    expect(h.toasts).toEqual([{ text: TEXT_ADDED, tone: "success" }]);
+
+    // The next one goes 6 % lower.
+    await h.c.addOverlayText(input({ text: "!discord" }));
+    const [one, two] = texts(h.c.overlayScene()) as [SceneElement, SceneElement];
+    expect((two.y as number) - (one.y as number)).toBeCloseTo(0.06, 6);
+  });
+
+  it("Add text stores the text normalized and the colour lower-cased, measured as normalized", async () => {
+    const m = slowMetrics();
+    const h = await opened(undefined, m.metrics);
+    await h.c.addOverlayText(
+      input({ text: "  Hi\r\nthere\t! ", font: "mono", bold: false, color: "#FFD60A", outline: false, align: "right" }),
+    );
+    expect(m.calls).toEqual([`load ${MONO} | Hi\nthere !`, `width ${MONO} | Hi`, `width ${MONO} | there !`]);
+    expect(texts(h.c.overlayScene())[0]).toMatchObject({
+      text: "Hi\nthere !",
+      font: "mono",
+      bold: false,
+      color: "#ffd60a",
+      outline: false,
+      align: "right",
+      nw: 94,
+      nh: 254,
+    });
+  });
+
+  it("Add text over the limits, or of nothing, is refused without waiting for a font", async () => {
+    const m = slowMetrics();
+    const h = await opened(undefined, m.metrics);
+    const saves = h.saves(SCENE);
+    const refused = ["x".repeat(201), "1\n2\n3\n4\n5\n6", "1 2 3 4 5 6", "   ", "\u0007"];
+    for (const text of refused) await h.c.addOverlayText(input({ text }));
+    expect(m.calls).toEqual([]);
+    expect(texts(h.c.overlayScene())).toEqual([]);
+    expect(h.saves(SCENE)).toBe(saves);
+    expect(h.toasts).toEqual(refused.map(() => ({ text: TEXT_REFUSED, tone: "error" })));
+    // The limit itself is fine, in UTF-16 units: an emoji counts 2.
+    await h.c.addOverlayText(input({ text: "\u{1F3AE}".repeat(100) }));
+    expect(texts(h.c.overlayScene())).toHaveLength(1);
+  });
+
+  it("Add text at 64 stored elements says the overlay is full", async () => {
+    const stored = Array.from({ length: MAX_ELEMENTS - 1 }, (_, i) => ({ id: `t${i}`, type: "future" }));
+    const h = await opened(sceneWith(...stored));
+    await h.c.addOverlayText(input());
+    expect(texts(h.c.overlayScene())).toEqual([]);
+    expect(h.toasts).toEqual([{ text: FULL, tone: "error" }]);
+  });
+
+  it("a text is sized for the window, not for a scene grown bigger than it", async () => {
+    const big = { ...migrateScene({ w: 1200, h: 1200, scale: 1 }), designSize: { w: 1200, h: 1200 } };
+    const h = await opened(big);
+    await h.c.addOverlayText(input());
+    const t = texts(h.c.overlayScene())[0]!;
+    // 10 % of the window's 480, not of the scene's 1200.
+    expect((t.h as number) * 1200).toBeCloseTo(48, 3);
+  });
+
+  it("Edit commits a set of only the changed fields: the height and the side the alignment names kept, the rest as stored", async () => {
+    const m = slowMetrics();
+    const h = await opened(
+      sceneWith(
+        textEl("C", { font: "serif", color: "#ABCDEF", glow: 3 }),
+        textEl("L", { align: "left", y: 0.6 }),
+        textEl("R", { align: "right", y: 0.8 }),
+      ),
+      m.metrics,
+    );
+    const before = h.pushes.length;
+    for (const id of ["C", "L", "R"]) await h.c.editOverlayText(id, { text: "BRB now" });
+    // A font this build can't use measures as Sans, as the face draws it.
+    expect(m.calls.slice(0, 2)).toEqual([`load ${SANS_BOLD} | BRB now`, `width ${SANS_BOLD} | BRB now`]);
+    const byId = (id: string) => h.c.overlayScene().elements.find((e) => e.id === id)!;
+    // 70 px of text: 94 × 139, at the stored 48 px height.
+    const w = (48 * 94) / 139 / 480;
+    const c = byId("C");
+    expect(c).toMatchObject({ id: "C", z: 1, text: "BRB now", nw: 94, nh: 139, y: 0.4, h: 0.1 });
+    expect(c.w as number).toBeCloseTo(w, 6);
+    expect((c.x as number) + (c.w as number) / 2).toBeCloseTo(0.5, 6);
+    // Fields the edit didn't name, and unknown keys, as stored.
+    expect(c).toMatchObject({ font: "serif", color: "#ABCDEF", glow: 3, bold: true, outline: true, align: "center" });
+    expect(byId("L")).toMatchObject({ x: 0.35, y: 0.6, h: 0.1 });
+    const r = byId("R");
+    expect((r.x as number) + (r.w as number)).toBeCloseTo(0.65, 6);
+    expect(r).toMatchObject({ y: 0.8, h: 0.1 });
+    // Saved and pushed; an edit that saves says nothing: the overlay shows it.
+    expect(texts(h.loaded(SCENE)).map((e) => e.text)).toEqual(["BRB now", "BRB now", "BRB now"]);
+    expect(h.pushes.length).toBe(before + 3);
+    expect(h.toasts).toEqual([]);
+  });
+
+  it("Edit takes any #rrggbb, lower-cased, and a style-only edit keeps the box", async () => {
+    // Stored as TEN_PX measures "BRB": 54 × 139.
+    const h = await opened(sceneWith(textEl("t", { nw: 54, nh: 139, w: 0.038849 })));
+    const rect = () => {
+      const e = h.c.overlayScene().elements.find((x) => x.id === "t")!;
+      return { x: e.x, y: e.y, w: e.w, h: e.h };
+    };
+    const was = rect();
+    await h.c.editOverlayText("t", { color: "#ABCDEF", outline: false, align: "left" });
+    expect(texts(h.c.overlayScene())[0]).toMatchObject({ color: "#abcdef", outline: false, align: "left" });
+    expect(rect()).toEqual(was);
+    expect(h.toasts).toEqual([]);
+  });
+
+  it("an Edit that changes no stored value commits nothing: no save, no push, no toast", async () => {
+    // Stored as TEN_PX measures "BRB": 54 × 139.
+    const h = await opened(sceneWith(textEl("t", { nw: 54, nh: 139, w: 0.038849, color: "#abcdef" })));
+    const scene = h.c.overlayScene();
+    const saves = h.saves(SCENE);
+    const pushes = h.pushes.length;
+    const same: Array<Partial<TextInput>> = [{}, { text: "BRB" }, { text: "  BRB\n" }, { color: "#ABCDEF" }, { font: "sans" }];
+    for (const changes of same) await h.c.editOverlayText("t", changes);
+    expect(h.c.overlayScene()).toBe(scene);
+    expect(h.saves(SCENE)).toBe(saves);
+    expect(h.pushes.length).toBe(pushes);
+    expect(h.toasts).toEqual([]);
+  });
+
+  it("an Edit set won't take says so, without waiting for a font, and commits nothing", async () => {
+    const m = slowMetrics();
+    const h = await opened(sceneWith(textEl("t")), m.metrics);
+    const scene = h.c.overlayScene();
+    const bad: Array<Record<string, unknown>> = [
+      { text: "" },
+      { text: "x".repeat(201) },
+      { text: "1\n2\n3\n4\n5\n6" },
+      { font: "serif" },
+      { align: "middle" },
+      { bold: "yes" },
+      { outline: 1 },
+      { color: "red" },
+      { color: "#abcdeg" },
+    ];
+    for (const changes of bad) await h.c.editOverlayText("t", changes as Partial<TextInput>);
+    expect(m.calls).toEqual([]);
+    expect(h.c.overlayScene()).toBe(scene);
+    expect(h.toasts).toEqual(bad.map(() => ({ text: TEXT_REFUSED, tone: "error" })));
+  });
+
+  it("an Edit of a text that's gone says so: never there, not a text, or removed while its font loaded", async () => {
+    const m = slowMetrics("BRB now");
+    const h = await opened(sceneWith(textEl("t")), m.metrics);
+    await h.c.editOverlayText("nope", { text: "hi" });
+    await h.c.editOverlayText(CIRCLE_ID, { text: "hi" });
+    expect(m.calls).toEqual([]);
+    expect(h.toasts).toEqual([
+      { text: TEXT_GONE, tone: "error" },
+      { text: TEXT_GONE, tone: "error" },
+    ]);
+
+    // The overlay's Delete lands while the font loads.
+    const editing = h.c.editOverlayText("t", { text: "BRB now" });
+    await flush();
+    h.edit({ instance: 1, seq: 0, op: { kind: "remove", id: "t" } });
+    await flush();
+    m.release("BRB now");
+    await editing;
+    expect(texts(h.c.overlayScene())).toEqual([]);
+    expect(h.toasts.at(-1)).toEqual({ text: TEXT_GONE, tone: "error" });
+  });
+
+  it("two quick saves land in the order Settings asked, a slow first font load or not", async () => {
+    const m = slowMetrics("first");
+    const h = await opened(undefined, m.metrics);
+    const a = h.c.addOverlayText(input({ text: "first" }));
+    const b = h.c.addOverlayText(input({ text: "second" }));
+    await flush();
+    // The second waits its turn: it isn't even measured yet.
+    expect(m.calls).toEqual([`load ${SANS_BOLD} | first`]);
+    m.release("first");
+    await Promise.all([a, b]);
+    expect(texts(h.c.overlayScene()).map((e) => [e.id, e.text])).toEqual([
+      ["c-00000000", "first"],
+      ["c-00000001", "second"],
+    ]);
+
+    // Two edits: the words (slow), then the colour. The second is measured
+    // with the first's words, so the box fits the text it ends with.
+    const e = slowMetrics("BRB now");
+    const g = await opened(sceneWith(textEl("t")), e.metrics);
+    const words = g.c.editOverlayText("t", { text: "BRB now" });
+    const colour = g.c.editOverlayText("t", { color: "#ffd60a" });
+    await flush();
+    e.release("BRB now");
+    await Promise.all([words, colour]);
+    expect(texts(g.c.overlayScene())[0]).toMatchObject({ text: "BRB now", color: "#ffd60a", nw: 94, nh: 139 });
+    expect(e.calls.filter((c) => c.startsWith("load"))).toEqual([
+      `load ${SANS_BOLD} | BRB now`,
+      `load ${SANS_BOLD} | BRB now`,
+    ]);
+  });
+
+  it("a drag from the overlay that lands while the font loads is kept: the edit reads the scene after", async () => {
+    const m = slowMetrics("BRB now");
+    const h = await opened(sceneWith(textEl("t")), m.metrics);
+    const editing = h.c.editOverlayText("t", { text: "BRB now" });
+    await flush();
+    // Laid out at (168, 192) 144 × 48; dragged 10 right and 20 down.
+    h.edit({ instance: 1, seq: 0, op: { kind: "place", id: "t", rect: { x: 178, y: 212, w: 144, h: 48 }, viewport: V480 } });
+    await flush();
+    const moved = texts(h.c.overlayScene())[0]!;
+    expect(moved.y as number).toBeCloseTo(212 / 480, 6);
+    m.release("BRB now");
+    await editing;
+    const t = texts(h.c.overlayScene())[0]!;
+    expect(t).toMatchObject({ text: "BRB now", y: moved.y, h: moved.h });
+    // Centred: the dragged centre, the new width.
+    expect((t.x as number) + (t.w as number) / 2).toBeCloseTo((moved.x as number) + (moved.w as number) / 2, 6);
+    expect(t.w as number).toBeCloseTo((48 * 94) / 139 / 480, 6);
+    expect(texts(h.loaded(SCENE))[0]).toMatchObject({ text: "BRB now", y: moved.y });
+  });
+
+  it("a text Save during a Fit change that fails is kept: its commit waits for the change", async () => {
+    const h = await opened();
+    h.env.live = SAVED_RECT;
+    const placing = deferred<OverlayStatus>();
+    h.api.place.mockImplementationOnce(() => placing.promise);
+    const fitting = h.c.setOverlayFit(true);
+    await flush();
+    // The reframed scene is out and the place is on its way.
+    expect(h.api.place).toHaveBeenCalledTimes(1);
+    expect(frameOf(h.c.overlayScene())).toBe("monitor");
+    const adding = h.c.addOverlayText(input());
+    await flush();
+    expect(texts(h.c.overlayScene())).toEqual([]);
+    placing.reject("The overlay isn't open.");
+    await Promise.all([fitting, adding]);
+    // The Fit change rolled back its reframe; the text landed after it.
+    expect(frameOf(h.c.overlayScene())).toBe("window");
+    expect(texts(h.c.overlayScene()).map((e) => e.text)).toEqual(["BRB"]);
+    expect(texts(h.loaded(SCENE))).toHaveLength(1);
+    expect(texts(h.pushes.at(-1)!.scene)).toHaveLength(1);
+    expect(h.toasts.map((t) => t.text)).toEqual(["The overlay isn't open.", TEXT_ADDED]);
+  });
+
+  it("an Edit saved during a Fit change that fails is kept too: its set waits for the change", async () => {
+    // The seam check's twin of the row above: an Edit's `set` also commits
+    // on `placement`, or the failed Fit's restore would drop it.
+    const h = await opened(sceneWith(textEl("t1")));
+    h.env.live = SAVED_RECT;
+    const placing = deferred<OverlayStatus>();
+    h.api.place.mockImplementationOnce(() => placing.promise);
+    const fitting = h.c.setOverlayFit(true);
+    await flush();
+    expect(h.api.place).toHaveBeenCalledTimes(1);
+    expect(frameOf(h.c.overlayScene())).toBe("monitor");
+    const editing = h.c.editOverlayText("t1", { text: "BRB later" });
+    await flush();
+    expect(texts(h.c.overlayScene()).map((e) => e.text)).toEqual(["BRB"]);
+    placing.reject("The overlay isn't open.");
+    await Promise.all([fitting, editing]);
+    // The Fit change rolled back its reframe; the edit landed after it.
+    expect(frameOf(h.c.overlayScene())).toBe("window");
+    expect(texts(h.c.overlayScene()).map((e) => e.text)).toEqual(["BRB later"]);
+    expect(texts(h.loaded(SCENE)).map((e) => e.text)).toEqual(["BRB later"]);
+    expect(texts(h.pushes.at(-1)!.scene).map((e) => e.text)).toEqual(["BRB later"]);
+    // An edit that saves says nothing of its own.
+    expect(h.toasts.map((t) => t.text)).toEqual(["The overlay isn't open."]);
+  });
+
+  it("addRecordingLight adds one light where defaultLightRect says, saves and pushes it; a second says there is one", async () => {
+    const h = await opened();
+    const before = h.pushes.length;
+    const at = defaultLightRect(h.c.overlayScene(), V480);
+    expect(h.c.overlayHasLight()).toBe(false);
+    h.c.addRecordingLight();
+    await flush();
+    expect(lights(h.c.overlayScene())).toEqual([{ id: "c-00000000", type: "rec", ...at, z: 1 }]);
+    expect(lights(h.loaded(SCENE))).toHaveLength(1);
+    expect(h.pushes.length).toBe(before + 1);
+    expect(h.c.overlayHasLight()).toBe(true);
+    expect(h.toasts).toEqual([{ text: LIGHT_ADDED, tone: "success" }]);
+
+    h.c.addRecordingLight();
+    await flush();
+    expect(lights(h.c.overlayScene())).toHaveLength(1);
+    expect(h.pushes.length).toBe(before + 1);
+    expect(h.toasts.at(-1)).toEqual({ text: HAS_LIGHT, tone: "error" });
+  });
+
+  it("a stored light with unusable geometry doesn't count; at 64 stored elements, the overlay is full", async () => {
+    const h = await opened(sceneWith({ id: "flat", type: "rec", x: 0.1, y: 0.9, w: 0, h: 0.05, z: 1 }));
+    expect(h.c.overlayHasLight()).toBe(false);
+    h.c.addRecordingLight();
+    expect(h.c.overlayHasLight()).toBe(true);
+    expect(lights(h.c.overlayScene()).map((e) => e.id)).toEqual(["flat", "c-00000000"]);
+
+    const stored = Array.from({ length: MAX_ELEMENTS - 1 }, (_, i) => ({ id: `t${i}`, type: "future" }));
+    const full = await opened(sceneWith(...stored));
+    full.c.addRecordingLight();
+    expect(full.c.overlayHasLight()).toBe(false);
+    expect(full.toasts).toEqual([{ text: FULL, tone: "error" }]);
+  });
+
+  it("overlayHasLight follows an Arrange delete, reactively", async () => {
+    const h = await opened();
+    const seen: boolean[] = [];
+    createRoot((dispose) => {
+      disposers.push(dispose);
+      createEffect(() => seen.push(h.c.overlayHasLight()));
+    });
+    h.c.addRecordingLight();
+    expect(seen).toEqual([false, true]);
+    const id = lights(h.c.overlayScene())[0]!.id;
+    h.edit({ instance: 1, seq: 0, op: { kind: "remove", id } });
+    await flush();
+    expect(seen).toEqual([false, true, false]);
+    // Moving another charm changes the scene, not the answer: no re-run.
+    const scene = h.c.overlayScene();
+    h.edit({ instance: 1, seq: 1, op: { kind: "place", id: CIRCLE_ID, rect: { x: 10, y: 10, w: 440, h: 440 }, viewport: V480 } });
+    await flush();
+    expect(h.c.overlayScene()).not.toBe(scene);
+    expect(seen).toEqual([false, true, false]);
+    h.c.addRecordingLight();
+    expect(seen).toEqual([false, true, false, true]);
   });
 });

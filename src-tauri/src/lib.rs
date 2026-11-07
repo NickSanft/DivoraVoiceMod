@@ -6443,6 +6443,54 @@ mod tests {
         }
     }
 
+    /// v1.62.0: the overlay page reads the recorder's two status commands
+    /// once after its ready handshake, for its recording light, by the names
+    /// in the wire fixture's `recLight` (`recLight.test.ts` checks that
+    /// `api.ts` calls the same). Each is registered once.
+    /// `screen_recording_status` stays a cheap sync read, on the main thread
+    /// beside `WM_HOTKEY`, and `replay_buffer_status` an async one that reads
+    /// on a blocking thread. The commands need `State`, so this reads the
+    /// source.
+    #[test]
+    fn the_overlay_recorder_commands_are_registered() {
+        let prod = production_source();
+        let handler = &prod[prod.find("tauri::generate_handler![").expect("the handler")..];
+        let handler = &handler[..handler.find(']').expect("its end")];
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/overlay/wire.fixture.json")).unwrap();
+        let command = |kind: &str| {
+            fixture["recLight"]["commands"][kind]
+                .as_str()
+                .unwrap_or_else(|| panic!("recLight.commands.{kind}"))
+        };
+        let (take, replay) = (command("take"), command("replay"));
+        for name in [take, replay] {
+            let line = format!("\n            {name},\n");
+            assert_eq!(handler.matches(&line).count(), 1, "{name}");
+        }
+        assert!(
+            prod.contains(&format!("#[tauri::command]\nfn {take}(")),
+            "{take} is not a sync command"
+        );
+        assert!(
+            !prod.contains(&format!("async fn {take}(")),
+            "{take} must stay a sync command: one cheap read on the main thread"
+        );
+        assert!(
+            prod.contains(&format!("#[tauri::command]\nasync fn {replay}(")),
+            "{replay} is not an async command"
+        );
+        assert!(
+            !prod.contains(&format!("\nfn {replay}(")),
+            "{replay} is sync"
+        );
+        let body = body_of(&prod, &format!("async fn {replay}("));
+        assert!(
+            body.contains("tauri::async_runtime::spawn_blocking(move ||"),
+            "{replay} must read on a blocking thread"
+        );
+    }
+
     /// v1.59.0 (D19): the handler passes the event's real press state to the
     /// timer step once, and doesn't act on a timer any other way. The handler
     /// needs an `AppHandle`, so this reads the source. (It already locks the

@@ -9,7 +9,21 @@
 // px. An element this version can't show (an unknown type, a picture it
 // can't recognise, a second circle) is kept as stored and written back
 // unchanged. Pure: no DOM, no Tauri, and no component imports.
+//
+// v1.62.0 (Text charms): two more kinds, a text charm (`text`) and the
+// recording light (`rec`), which main adds itself, and a main-only `set`
+// that edits a text charm's fields. Older builds keep both kinds inert.
 
+import {
+  firstLine,
+  isTextAlign,
+  isTextColour,
+  isTextFont,
+  normalizeCharmText,
+  readCharmText,
+  readTextFields,
+  type TextPatch,
+} from "./text";
 import { isTimerId } from "./timerState";
 
 export const SCENE_VERSION = 1;
@@ -123,8 +137,50 @@ export interface TimerElement {
   [k: string]: unknown;
 }
 
+/** v1.62.0: a text charm, typed in Settings. Live when `text`, normalized,
+ *  isn't empty; the creation limits apply only when adding or setting.
+ *  The other fields are kept as stored and read through text.ts's
+ *  `readTextFields`, which gives a value this build can't use its
+ *  default. */
+export interface TextElement {
+  id: string;
+  type: "text";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  z: number;
+  text: string;
+  /** A `TextFont`, as main writes it. */
+  font?: unknown;
+  bold?: unknown;
+  /** `#rrggbb`, as main writes it. */
+  color?: unknown;
+  outline?: unknown;
+  /** A `TextAlign`, as main writes it. */
+  align?: unknown;
+  /** The text's natural box in whole CSS px at text.ts's REF_PX: the
+   *  element's shape, as a picture's own pixels are. */
+  nw?: unknown;
+  nh?: unknown;
+  [k: string]: unknown;
+}
+
+/** v1.62.0: the recording light. Only the scene's first one is live: it
+ *  reports one fact. */
+export interface RecElement {
+  id: string;
+  type: "rec";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  z: number;
+  [k: string]: unknown;
+}
+
 /** An element this version shows and edits. */
-export type KnownElement = CircleElement | ImageElement | TimerElement;
+export type KnownElement = CircleElement | ImageElement | TimerElement | TextElement | RecElement;
 
 /** An element as stored: shown or not, every key kept. */
 export type SceneElement = { id: string; type?: unknown } & Record<string, unknown>;
@@ -139,16 +195,24 @@ export interface OverlayScene {
 }
 
 /** One change to the scene. The overlay may send only `remove`, `place`
- *  and `order`; `add` and `reframe` are main's. */
+ *  and `order`; `add` and `reframe` are main's. v1.62.0: `set` is main's
+ *  own edit of a text charm, carrying `nw`/`nh` and only the fields that
+ *  changed; it is never on the wire, and `readOp` never returns it. */
 export type SceneOp =
   | { kind: "add"; element: KnownElement }
   | { kind: "remove"; id: string }
   | { kind: "place"; id: string; rect: PxRect; viewport: Size }
   | { kind: "order"; id: string; to: "front" | "back" | "forward" | "backward" }
-  | { kind: "reframe"; from: PxRect; to: PxRect; frame: Frame };
+  | { kind: "reframe"; from: PxRect; to: PxRect; frame: Frame }
+  | { kind: "set"; id: string; fields: TextPatch };
 
-/** Why an `add` was refused. */
-export type AddRefusal = "exists" | "elements" | "pictures" | "circle" | "budget" | "invalid";
+/** Why an `add` was refused. v1.62.0: `light`, the scene already has a
+ *  live recording light. */
+export type AddRefusal = "exists" | "elements" | "pictures" | "circle" | "budget" | "invalid" | "light";
+
+/** v1.62.0: why a `set` would change nothing. `gone`: no live text has that
+ *  id. `invalid`: the patch holds a field the reader wouldn't accept. */
+export type SetRefusal = "gone" | "invalid";
 
 /** The largest `designSize` side, and the largest viewport an edit may
  *  name. */
@@ -159,6 +223,16 @@ const MAX_ID = 64;
 
 /** The longest picture name shown. */
 const MAX_NAME = 120;
+
+/** v1.62.0: the longest first line a text charm's label shows. */
+const TEXT_LABEL_CHARS = 40;
+
+/** v1.62.0: how far a place's shape may be off a text's own (`nw`/`nh`)
+ *  before it counts as made against an older shape. */
+const STALE_SHAPE = 1e-3;
+
+/** v1.62.0: the text fields a `set` may carry besides `nw`/`nh`. */
+const TEXT_KEYS = ["text", "font", "bold", "color", "outline", "align"] as const;
 
 type Order = "front" | "back" | "forward" | "backward";
 const ORDERS: readonly string[] = ["front", "back", "forward", "backward"];
@@ -316,9 +390,29 @@ export function asTimer(e: SceneElement): TimerElement | null {
   return e as unknown as TimerElement;
 }
 
+/** v1.62.0: a text charm this version could draw: usable geometry, a valid
+ *  id and a `text` that, normalized, isn't empty. No length rule: a text
+ *  over the creation limits is live and drawn, cut at the drawing ceiling,
+ *  so a later build's longer text isn't hidden and stranded here. Every
+ *  other field has a read default (text.ts's `readTextFields`). */
+export function asText(e: SceneElement): TextElement | null {
+  if (!isObject(e) || e.type !== "text" || !validId(e.id) || !usable(e)) return null;
+  if (normalizeCharmText(e.text) === null) return null;
+  return e as unknown as TextElement;
+}
+
+/** v1.62.0: a recording light this version could draw: usable geometry and
+ *  a valid id. It is live only as the scene's first such light
+ *  (`liveElements`). */
+export function asRec(e: SceneElement): RecElement | null {
+  if (!isObject(e) || e.type !== "rec" || !validId(e.id) || !usable(e)) return null;
+  return e as unknown as RecElement;
+}
+
 function liveEntries(s: OverlayScene): Array<{ el: KnownElement; index: number }> {
   const out: Array<{ el: KnownElement; index: number }> = [];
   let circle = false;
+  let light = false;
   s.elements.forEach((e, index) => {
     const c = asCircle(e);
     if (c) {
@@ -335,7 +429,21 @@ function liveEntries(s: OverlayScene): Array<{ el: KnownElement; index: number }
     // v1.59.0: live whether or not its timer exists; the overlay draws a
     // face only for a timer the backend reports.
     const timer = asTimer(e);
-    if (timer) out.push({ el: timer, index });
+    if (timer) {
+      out.push({ el: timer, index });
+      return;
+    }
+    const text = asText(e);
+    if (text) {
+      out.push({ el: text, index });
+      return;
+    }
+    // v1.62.0: one live light, as for the circle: it reports one fact.
+    const rec = asRec(e);
+    if (rec) {
+      if (!light) out.push({ el: rec, index });
+      light = true;
+    }
   });
   return out;
 }
@@ -370,10 +478,13 @@ export function designedSize(e: KnownElement, design: Size): Size {
 
 /** Width over height, as the reducer keeps it: the picture's own pixels
  *  (its stored shape when those are missing), 1 for the circle, and a
- *  timer's stored shape. */
+ *  timer's stored shape. v1.62.0: a text's natural box (`nw`/`nh`, its
+ *  stored shape when those aren't whole numbers of at least 1), and the
+ *  light's stored shape. */
 export function aspectOf(e: KnownElement, design: Size): number {
   if (e.type === "spellcircle") return 1;
   if (e.type === "image" && pixelCount(e.nw) && pixelCount(e.nh)) return e.nw / e.nh;
+  if (e.type === "text" && pixelCount(e.nw) && pixelCount(e.nh)) return e.nw / e.nh;
   const d = designedSize(e, design);
   return d.w / d.h;
 }
@@ -431,6 +542,8 @@ export function applyOp(s: OverlayScene, op: SceneOp): OverlayScene {
       return order(s, op.id, op.to);
     case "reframe":
       return reframe(s, op.from, op.to, op.frame);
+    case "set":
+      return set(s, op.id, op.fields);
     default:
       return s;
   }
@@ -464,7 +577,8 @@ function stacking(elements: SceneElement[], extra = -1): number[] {
 function add(s: OverlayScene, element: KnownElement): OverlayScene {
   if (!isObject(element) || addRefusal(s, element) !== null) return s;
   const zs = s.elements.map((e) => e.z).filter(finite);
-  // The circle goes to the back, a picture to the front.
+  // The circle goes to the back, anything else (a picture, a timer face, a
+  // text, the light) to the front.
   const z = element.type === "spellcircle" ? Math.min(0, ...zs) - 1 : Math.max(-1, ...zs) + 1;
   const added: SceneElement = {
     ...element,
@@ -512,8 +626,13 @@ function place(s: OverlayScene, id: string, rect: PxRect, viewport: Size): Overl
   const grown = { w: round6(Math.max(d.w, v.w)), h: round6(Math.max(d.h, v.h)) };
   const grew = grown.w !== d.w || grown.h !== d.h;
   const target = entry.el;
-  const n = normalizeRect(rect, aspectOf(target, d), v);
   const shown = layoutBox(target, d, v, target.type === "spellcircle");
+  // v1.62.0: `set` can change a text's shape, so a place made against the
+  // old one can arrive after it (in flight from the overlay, or the
+  // mirror's pending copy re-applied). It lands as a move: the laid-out
+  // size around the rect's centre. Without this, `normalizeRect` would keep
+  // the old width and halve a widened text's height.
+  const n = staleShape(target, rect, shown) ? centredOn(rect, shown, v) : normalizeRect(rect, aspectOf(target, d), v);
   // A drag or a nudge keeps the designed size: a 1 px nudge of a shrunk
   // element would otherwise bake in its shrunk size. A resize takes the
   // new one.
@@ -532,6 +651,72 @@ function place(s: OverlayScene, id: string, rect: PxRect, viewport: Size): Overl
   // Unchanged elements stay the same objects: no re-rounding, no drift.
   const elements = s.elements.map((e, i) => (i === entry.index ? after : grew ? reexpress(e, d, grown) : e));
   return { ...s, designSize: grew ? { ...d, w: grown.w, h: grown.h } : d, elements };
+}
+
+/** v1.62.0: a place on a text made against an older shape: its rect is off
+ *  the text's own shape (`nw`/`nh`) by more than STALE_SHAPE, and off the
+ *  shape the text is laid out in (`shown`) too. Gestures, nudges, snaps
+ *  and keyboard resizes all carry the laid-out shape, which this build
+ *  keeps equal to `nw`/`nh`, so only a place made before a `set` meets
+ *  this. The second test keeps a stored shape that isn't the text's own (a
+ *  hand edit) resizable: its gestures carry that shape, and land as
+ *  resizes to `nw`/`nh`, as a picture's do. */
+function staleShape(target: KnownElement, rect: PxRect, shown: PxRect): boolean {
+  if (target.type !== "text" || !pixelCount(target.nw) || !pixelCount(target.nh)) return false;
+  const a = rect.w / rect.h;
+  const off = (b: number): boolean => Math.abs(a / b - 1) > STALE_SHAPE;
+  return off(target.nw / target.nh) && off(shown.w / shown.h);
+}
+
+/** A box of `size`'s width and height centred where `r` is, kept inside
+ *  `v`. */
+function centredOn(r: PxRect, size: PxRect, v: Size): PxRect {
+  const cx = r.x + r.w / 2;
+  const cy = r.y + r.h / 2;
+  return {
+    x: clamp(cx - size.w / 2, 0, v.w - size.w),
+    y: clamp(cy - size.h / 2, 0, v.h - size.h),
+    w: size.w,
+    h: size.h,
+  };
+}
+
+/** v1.62.0: main's edit of a live text (§7.4): the patch's fields over the
+ *  stored ones, the text normalized and a colour lower-cased; fields not
+ *  in it, and unknown keys, are kept as stored, so a later build's font or
+ *  a hand-set colour survives an edit of the words. The id and `z` never
+ *  change. If the shape (`nw : nh`) changed, it keeps its designed height
+ *  and the side its alignment names (left keeps its left edge, right its
+ *  right edge, centre its centre), takes the new shape's width, is scaled
+ *  down together by `fitSize`'s rule if that is wider than the design
+ *  (keeping its vertical centre), and is clamped inside. `s` itself when
+ *  `setRefusal` refuses or no stored value would change. */
+function set(s: OverlayScene, id: string, fields: TextPatch): OverlayScene {
+  if (setRefusal(s, id, fields) !== null) return s;
+  // setRefusal found a live text with this id.
+  const entry = liveEntries(s).find((x) => x.el.id === id)!;
+  const e = s.elements[entry.index]!;
+  const patch: Record<string, unknown> = { nw: fields.nw, nh: fields.nh };
+  for (const k of TEXT_KEYS) {
+    const v = fields[k];
+    if (v === undefined) continue;
+    patch[k] = k === "text" ? readCharmText(v) : k === "color" ? String(v).toLowerCase() : v;
+  }
+  if (Object.keys(patch).every((k) => e[k] === patch[k])) return s;
+  let next: SceneElement = { ...e, ...patch };
+  const sameShape = pixelCount(e.nw) && pixelCount(e.nh) && fields.nw * e.nh === fields.nh * e.nw;
+  if (!sameShape) {
+    const d = s.designSize;
+    const r = e as unknown as FracRect;
+    const size = fitSize((r.h * d.h * fields.nw) / fields.nh, r.h * d.h, d, MIN_ELEMENT_PX);
+    const w = round6(size.w / d.w);
+    const h = round6(size.h / d.h);
+    const align = readTextFields(next).align;
+    const left = align === "left" ? r.x : align === "right" ? r.x + r.w - w : r.x + r.w / 2 - w / 2;
+    const top = r.y + r.h / 2 - h / 2;
+    next = { ...next, x: round6(clamp(left, 0, 1 - w)), y: round6(clamp(top, 0, 1 - h)), w, h };
+  }
+  return { ...s, elements: s.elements.map((x, i) => (i === entry.index ? next : x)) };
 }
 
 function order(s: OverlayScene, id: string, to: Order): OverlayScene {
@@ -612,6 +797,8 @@ export function readOp(raw: unknown, from: "overlay" | "main"): SceneOp | null {
       if (!validId(raw.id) || typeof raw.to !== "string" || !ORDERS.includes(raw.to)) return null;
       return { kind: "order", id: raw.id, to: raw.to as Order };
     case "add": {
+      // A timer face, a text or the light is never read off the wire: main
+      // adds them itself.
       const e = raw.element;
       if (from !== "main" || !isObject(e) || !validId(e.id)) return null;
       if (e.type !== "spellcircle" && e.type !== "image") return null;
@@ -623,6 +810,10 @@ export function readOp(raw: unknown, from: "overlay" | "main"): SceneOp | null {
       if (from !== "main" || !f || !t || (raw.frame !== "window" && raw.frame !== "monitor")) return null;
       return { kind: "reframe", from: f, to: t, frame: raw.frame };
     }
+    case "set":
+      // v1.62.0: main's own edit, which never comes off the wire from
+      // either side.
+      return null;
     default:
       return null;
   }
@@ -630,13 +821,25 @@ export function readOp(raw: unknown, from: "overlay" | "main"): SceneOp | null {
 
 /** Why `add` would refuse `e`, or null. In order: the id is taken; 64
  *  elements are stored; a timer face that wouldn't be live (v1.59.0: no
- *  other limit applies to one); a live circle exists; 16 live pictures; it
- *  wouldn't be live, or a picture lacks its pixel size; the scene budget. */
+ *  other limit applies to one); v1.62.0: a text that wouldn't be live, is
+ *  over the creation limits or lacks its natural box, and a light when a
+ *  live one exists or it wouldn't be live (no other limit applies to
+ *  either: both are outside the picture budget); a live circle exists; 16
+ *  live pictures; it wouldn't be live, or a picture lacks its pixel size;
+ *  the scene budget. */
 export function addRefusal(s: OverlayScene, e: KnownElement): AddRefusal | null {
   if (s.elements.some((x) => x.id === e.id)) return "exists";
   if (s.elements.length >= MAX_ELEMENTS) return "elements";
   if (e.type === "timer") return asTimer(e) ? null : "invalid";
+  if (e.type === "text") {
+    const ok = asText(e) !== null && readCharmText(e.text) !== null && pixelCount(e.nw) && pixelCount(e.nh);
+    return ok ? null : "invalid";
+  }
   const live = liveElements(s);
+  if (e.type === "rec") {
+    if (live.some((x) => x.type === "rec")) return "light";
+    return asRec(e) ? null : "invalid";
+  }
   if (e.type === "spellcircle" && live.some((x) => x.type === "spellcircle")) return "circle";
   if (e.type === "image" && live.filter((x) => x.type === "image").length >= MAX_PICTURES) return "pictures";
   if (e.type === "spellcircle") return asCircle(e) ? null : "invalid";
@@ -655,6 +858,27 @@ export function addRefusal(s: OverlayScene, e: KnownElement): AddRefusal | null 
     if (typeof p.anim === "boolean" ? p.anim : p.src.endsWith(".gif")) animated += area;
   }
   if (bytes > BUDGET.bytes || animated > BUDGET.animatedPixels || pixels > BUDGET.pixels) return "budget";
+  return null;
+}
+
+/** v1.62.0: why `set` would refuse this patch, or null (it applies, or
+ *  changes nothing). `gone`: no live text has `id`. `invalid`: `nw`/`nh`
+ *  aren't whole numbers of at least 1, or a field it holds isn't one the
+ *  reader accepts as itself: a text within the creation limits, a font or
+ *  alignment among its three, a boolean bold or outline, a `#rrggbb`
+ *  colour in any case. Lets main tell a refusal from no change. */
+export function setRefusal(s: OverlayScene, id: string, fields: TextPatch): SetRefusal | null {
+  if (!liveEntries(s).some((e) => e.el.id === id && e.el.type === "text")) return "gone";
+  if (!isObject(fields) || !pixelCount(fields.nw) || !pixelCount(fields.nh)) return "invalid";
+  // The reader's own tests (text.ts), so a value it reads as itself is
+  // never refused.
+  const { text, font, bold, color, outline, align } = fields as Record<string, unknown>;
+  if (text !== undefined && readCharmText(text) === null) return "invalid";
+  if (font !== undefined && !isTextFont(font)) return "invalid";
+  if (align !== undefined && !isTextAlign(align)) return "invalid";
+  if (bold !== undefined && typeof bold !== "boolean") return "invalid";
+  if (outline !== undefined && typeof outline !== "boolean") return "invalid";
+  if (color !== undefined && !isTextColour(color)) return "invalid";
   return null;
 }
 
@@ -776,6 +1000,56 @@ export function defaultTimerRect(s: OverlayScene, view?: Size): FracRect {
   };
 }
 
+/** `w × h` scaled down together, never up, until its width is at most
+ *  `share` of `v`'s and it fits inside `d`. */
+function fitShare(w: number, h: number, share: number, v: Size, d: Size): Size {
+  const k = Math.min(1, (share * v.w) / w, d.w / w, d.h / h);
+  return { w: w * k, h: h * k };
+}
+
+/** v1.62.0: where a new text charm goes, as fractions of the scene's
+ *  `designSize`: the shape of its natural box (`nw × nh`), its height 10 %
+ *  of the window's short side (32 to 160 px), scaled down together to fit
+ *  90 % of the window's width, centred across, its top at 20 % of the
+ *  height and 6 % lower for each of the next four, then round again.
+ *  `view` is the window's CSS size. */
+export function defaultTextRect(s: OverlayScene, nw: number, nh: number, view?: Size): FracRect {
+  const d = s.designSize;
+  const v = view && positive(view.w) && positive(view.h) ? view : d;
+  const a = pixelCount(nw) && pixelCount(nh) ? nw / nh : 1;
+  const tall = clamp(0.1 * Math.min(v.w, v.h), 32, 160);
+  const { w, h } = fitShare(tall * a, tall, 0.9, v, d);
+  const texts = s.elements.filter((e) => asText(e) !== null).length;
+  const top = clamp((0.2 + 0.06 * (texts % 5)) * d.h, 0, d.h - h);
+  return {
+    x: round6((d.w - w) / 2 / d.w),
+    y: round6(top / d.h),
+    w: round6(w / d.w),
+    h: round6(h / d.h),
+  };
+}
+
+/** v1.62.0: where the recording light goes, as fractions of the scene's
+ *  `designSize`: 5:1, its height 7 % of the window's short side (24 to
+ *  96 px), scaled down together to fit 90 % of the window's width, at the
+ *  bottom left: its left edge 4 % of the width in, its bottom 4 % of the
+ *  height up. Clear of Arrange's Move window grip and Lock pill, which sit
+ *  at the top. `view` is the window's CSS size. */
+export function defaultLightRect(s: OverlayScene, view?: Size): FracRect {
+  const d = s.designSize;
+  const v = view && positive(view.w) && positive(view.h) ? view : d;
+  const tall = clamp(0.07 * Math.min(v.w, v.h), 24, 96);
+  const { w, h } = fitShare(5 * tall, tall, 0.9, v, d);
+  const left = clamp(0.04 * d.w, 0, d.w - w);
+  const top = clamp(0.96 * d.h - h, 0, d.h - h);
+  return {
+    x: round6(left / d.w),
+    y: round6(top / d.h),
+    w: round6(w / d.w),
+    h: round6(h / d.h),
+  };
+}
+
 // ---- hit testing ----
 
 /** An element's hit box: at least `min` a side (or the viewport's side),
@@ -851,8 +1125,9 @@ export function assetRefCount(s: OverlayScene, id: string): number {
 /** Each live element's name in Settings and the overlay's labels: "Spell
  *  circle", the picture's name ("Picture" without one), or the timer's name
  *  as `timerName` gives it ("Timer" when it gives none: no such timer, or
- *  no `timerName`). Repeats are numbered " (2)", " (3)"… in array order, so
- *  adding a copy never renames the ones before it, and a suffix another
+ *  no `timerName`). v1.62.0: a text's first line, cut at 40 with "…", and
+ *  "Recording light". Repeats are numbered " (2)", " (3)"… in array order,
+ *  so adding a copy never renames the ones before it, and a suffix another
  *  element's own name already uses is skipped. */
 export function charmLabels(
   s: OverlayScene,
@@ -865,6 +1140,9 @@ export function charmLabels(
       const name = timerName?.(e.timer);
       return typeof name === "string" && name.trim().length > 0 ? name.slice(0, MAX_NAME) : "Timer";
     }
+    // Never empty: a live text's normalized text isn't, and it is trimmed.
+    if (e.type === "text") return firstLine(normalizeCharmText(e.text) ?? "", TEXT_LABEL_CHARS);
+    if (e.type === "rec") return "Recording light";
     return typeof e.name === "string" && e.name.trim().length > 0 ? e.name.slice(0, MAX_NAME) : "Picture";
   };
   const names = new Set(live.map(base));

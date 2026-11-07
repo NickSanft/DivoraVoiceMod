@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   addRefusal,
   applyOp,
+  asRec,
+  asText,
   asTimer,
   aspectOf,
   assetRefCount,
@@ -13,7 +15,9 @@ import {
   CIRCLE_ID,
   CIRCLE_PX,
   defaultImageRect,
+  defaultLightRect,
   defaultScene,
+  defaultTextRect,
   defaultTimerRect,
   frameOf,
   handleRects,
@@ -32,6 +36,7 @@ import {
   readScene,
   scaleRect,
   sceneForSave,
+  setRefusal,
   type KnownElement,
   type OverlayScene,
   type PxRect,
@@ -41,6 +46,7 @@ import {
   type TimerElement,
 } from "./scene";
 import { SPELL_CIRCLE_PX } from "../components/SpellCircle";
+import type { TextPatch } from "./text";
 import fixture from "./wire.fixture.json";
 
 describe("charm picture ids (v1.55.0)", () => {
@@ -1300,5 +1306,602 @@ describe("timer elements (v1.59.0)", () => {
     ]);
     // Without names (as before v1.59.0's callers pass them), every face is "Timer".
     expect(charmLabels(s).get("f3")).toBe("Timer (3)");
+  });
+});
+
+// v1.62.0: text charms and the recording light. Main adds both itself and
+// edits a text with `set`; older builds keep both inert (the `"future"`
+// fixtures above stand in for them there).
+describe("text charms and the recording light (v1.62.0)", () => {
+  const T = "c-7e570001";
+  const L = "c-11647001";
+  // 240 × 48 px in a 480 design: 5 : 1, its own shape (`nw : nh`).
+  const text = (more: Record<string, unknown> = {}): SceneElement => ({
+    id: T,
+    type: "text",
+    x: 0.25,
+    y: 0.4,
+    w: 0.5,
+    h: 0.1,
+    z: 1,
+    text: "BRB",
+    font: "sans",
+    bold: true,
+    color: "#ffffff",
+    outline: true,
+    align: "center",
+    nw: 500,
+    nh: 100,
+    ...more,
+  });
+  // 168 × 33.6 px at (19.2, 427.2): defaultLightRect's in a 480 view.
+  const light = (more: Record<string, unknown> = {}): SceneElement => ({
+    id: L,
+    type: "rec",
+    x: 0.04,
+    y: 0.89,
+    w: 0.35,
+    h: 0.07,
+    z: 2,
+    ...more,
+  });
+  const known = (e: SceneElement): KnownElement => e as unknown as KnownElement;
+  const edit = (s: OverlayScene, fields: Record<string, unknown>, id = T): OverlayScene =>
+    applyOp(s, { kind: "set", id, fields: fields as unknown as TextPatch });
+  const at = (s: OverlayScene, id = T): SceneElement => s.elements.find((e) => e.id === id)!;
+  const box = (e: SceneElement) => ({ x: e.x, y: e.y, w: e.w, h: e.h });
+  const ch = (...codes: number[]): string => String.fromCharCode(...codes);
+  const GAME = "🎮";
+  const sixteen = (): SceneElement[] =>
+    Array.from({ length: 16 }, (_, i) =>
+      picture(`p${i}`, { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { src: `${i.toString(16).padStart(16, "0")}.png`, nw: 10, nh: 10 }),
+    );
+  const sixtyFour = (): SceneElement[] => Array.from({ length: MAX_ELEMENTS }, (_, i) => ({ id: `t${i}`, type: "future" }));
+
+  // ---- readers ----
+
+  it("text and rec readers: usable geometry and a valid id; a text also needs words", () => {
+    const t = text();
+    expect(asText(t)).toBe(t);
+    // Every other field has a read default, so these are live too.
+    expect(asText(text({ font: "serif", color: "red", align: 3, nw: undefined, future: { k: 1 } }))).not.toBeNull();
+    const l = light();
+    expect(asRec(l)).toBe(l);
+    expect(asRec(light({ future: "x" }))).not.toBeNull();
+  });
+
+  it.each([
+    ["an empty text", { text: "" }],
+    ["only spaces and newlines", { text: " \n \r\n\t" }],
+    ["only control characters", { text: ch(0x07, 0x85, 0x7f, 0x90) }],
+    ["a number for a text", { text: 5 }],
+    ["no text", { text: undefined }],
+    ["a zero width", { w: 0 }],
+    ["a negative height", { h: -0.1 }],
+    ["no x", { x: undefined }],
+    ["NaN y", { y: Number.NaN }],
+    ["an empty id", { id: "" }],
+    ["an id over 64", { id: "x".repeat(65) }],
+    ["another type", { type: "image" }],
+  ])("asText refuses %s, and the element stays inert", (_name, more) => {
+    const e = text(more);
+    expect(asText(e)).toBeNull();
+    expect(liveElements(sceneOf([e]))).toEqual([]);
+  });
+
+  it.each([
+    ["a zero height", { h: 0 }],
+    ["a negative width", { w: -0.35 }],
+    ["no y", { y: undefined }],
+    ["an id over 64", { id: "x".repeat(65) }],
+    ["another type", { type: "text" }],
+  ])("asRec refuses %s", (_name, more) => {
+    expect(asRec(light(more))).toBeNull();
+  });
+
+  it("a 201-unit or 6-line text is live and drawn; add and set refuse it", () => {
+    // Limits apply when adding or setting, never when reading: a later
+    // build's longer text isn't hidden and stranded here.
+    const s = sceneOf([circle(), text({ id: "long", text: "x".repeat(201) }), text({ id: "six", text: "1\n2\n3\n4\n5\n6" })]);
+    expect(liveElements(s).map((e) => e.id)).toEqual([CIRCLE_ID, "long", "six"]);
+    expect(layoutScene(s, D480).map((r) => r.el.id)).toEqual([CIRCLE_ID, "long", "six"]);
+    for (const raw of ["x".repeat(201), "1\n2\n3\n4\n5\n6", `${GAME.repeat(100)}x`]) {
+      const n = known(text({ id: "N", text: raw }));
+      expect(addRefusal(s, n), raw).toBe("invalid");
+      expect(applyOp(s, { kind: "add", element: n }), raw).toBe(s);
+      expect(setRefusal(s, "long", { nw: 500, nh: 100, text: raw }), raw).toBe("invalid");
+      expect(edit(s, { nw: 500, nh: 100, text: raw }, "long"), raw).toBe(s);
+    }
+    // Within the limits, set takes a new text for it.
+    expect(at(edit(s, { nw: 500, nh: 100, text: "short" }, "long"), "long").text).toBe("short");
+  });
+
+  it("one live light: the scene's first usable one; another is kept, inert", () => {
+    const s = sceneOf([light({ id: "flat", h: 0 }), light({ id: "L1" }), light({ id: "L2" }), circle()]);
+    expect(liveElements(s).map((e) => e.id)).toEqual(["L1", CIRCLE_ID]);
+    expect(isLive(s, "L2")).toBe(false);
+    expect(isLive(s, "flat")).toBe(false);
+    expect(pictureCount(s)).toBe(0);
+    // Inert: edits of it change nothing.
+    expect(applyOp(s, { kind: "place", id: "L2", rect: { x: 10, y: 10, w: 100, h: 20 }, viewport: D480 })).toBe(s);
+    expect(applyOp(s, { kind: "order", id: "L2", to: "front" })).toBe(s);
+    // Removing the live one brings the next one in.
+    expect(liveElements(applyOp(s, { kind: "remove", id: "L1" })).map((e) => e.id)).toEqual(["L2", CIRCLE_ID]);
+  });
+
+  it("aspectOf uses a text's nw/nh, and its stored shape when they're missing", () => {
+    expect(aspectOf(known(text({ nw: 337, nh: 139 })), D480)).toBeCloseTo(337 / 139, 12);
+    for (const more of [{ nw: undefined }, { nh: 0 }, { nw: 1.5 }, { nw: "337" }, { nh: Number.NaN }]) {
+      // Stored 240 × 48.
+      expect(aspectOf(known(text({ nw: 337, nh: 139, ...more })), D480), JSON.stringify(more)).toBeCloseTo(5, 9);
+    }
+    // The light keeps its stored shape, as a timer face does.
+    expect(aspectOf(known(light()), D480)).toBeCloseTo(5, 9);
+    expect(aspectOf(known(light({ w: 0.2, h: 0.2 })), { w: 960, h: 480 })).toBeCloseTo(2, 9);
+  });
+
+  it("a text stored off its own shape (a hand edit) still resizes, to its own shape", () => {
+    // Stored 240 × 48 (5 : 1) with a natural box of 337 : 139. Its corner
+    // drags carry the 5 : 1 it is drawn in; they land as resizes to
+    // 337 : 139, as a picture's do, not as stale moves.
+    const s = sceneOf([text({ nw: 337, nh: 139 })]);
+    const next = applyOp(s, { kind: "place", id: T, rect: { x: 120, y: 192, w: 300, h: 60 }, viewport: D480 });
+    const r = rectOf(next, T, D480);
+    expect(r.w).toBeCloseTo(300, 3);
+    expect(r.w / r.h).toBeCloseTo(337 / 139, 4);
+  });
+
+  // ---- set ----
+
+  it.each([
+    // [name, stored align, stored rect, new nw, new nh, result]
+    ["centre keeps the centre", "center", { x: 0.25, y: 0.4, w: 0.5, h: 0.1 }, 337, 139, { x: 0.378777, y: 0.4, w: 0.242446, h: 0.1 }],
+    ["left keeps the left edge", "left", { x: 0.25, y: 0.4, w: 0.5, h: 0.1 }, 337, 139, { x: 0.25, y: 0.4, w: 0.242446, h: 0.1 }],
+    ["right keeps the right edge", "right", { x: 0.25, y: 0.4, w: 0.5, h: 0.1 }, 337, 139, { x: 0.507554, y: 0.4, w: 0.242446, h: 0.1 }],
+    // 48 · 4000/139 = 1381.295 px: scaled down together to 480 × 16.68.
+    ["too wide: fitted to the design, the vertical centre kept", "center", { x: 0.25, y: 0.4, w: 0.5, h: 0.1 }, 4000, 139, { x: 0, y: 0.432625, w: 1, h: 0.03475 }],
+    ["right, past the left edge: clamped inside", "right", { x: 0.02, y: 0.4, w: 0.1, h: 0.1 }, 300, 100, { x: 0, y: 0.4, w: 0.3, h: 0.1 }],
+    ["left, past the right edge: clamped inside", "left", { x: 0.9, y: 0.4, w: 0.1, h: 0.1 }, 300, 100, { x: 0.7, y: 0.4, w: 0.3, h: 0.1 }],
+  ])("set table: a new shape keeps the height and the side its alignment names: %s", (_n, align, r, nw, nh, want) => {
+    const e = text({ ...r, align, nw: Math.round(r.w * 480), nh: Math.round(r.h * 480) });
+    const s = sceneOf([circle(), e, light()]);
+    const next = edit(s, { text: "new words", nw, nh });
+    expect(box(at(next))).toEqual(want);
+    // The id, z, type and every untouched field kept.
+    expect(at(next)).toEqual({ ...e, ...want, text: "new words", nw, nh });
+    // Nothing else changes.
+    expect(next.elements[0]).toBe(s.elements[0]);
+    expect(next.elements[2]).toBe(s.elements[2]);
+    expect(next.designSize).toEqual(s.designSize);
+  });
+
+  it("set table: the alignment after the patch names the side", () => {
+    const s = sceneOf([text({ align: "center" })]);
+    expect(box(at(edit(s, { align: "left", nw: 337, nh: 139 })))).toEqual({ x: 0.25, y: 0.4, w: 0.242446, h: 0.1 });
+    expect(box(at(edit(s, { align: "right", nw: 337, nh: 139 })))).toEqual({ x: 0.507554, y: 0.4, w: 0.242446, h: 0.1 });
+    // A stored alignment this build can't use reads as the centre.
+    const odd = sceneOf([text({ align: "justify" })]);
+    expect(box(at(edit(odd, { text: "x", nw: 337, nh: 139 })))).toEqual({ x: 0.378777, y: 0.4, w: 0.242446, h: 0.1 });
+    expect(at(edit(odd, { text: "x", nw: 337, nh: 139 })).align).toBe("justify");
+  });
+
+  it("set table: the same shape changes only the fields", () => {
+    const s = sceneOf([circle(), text()]);
+    const next = edit(s, { text: "BRB!", nw: 1000, nh: 200 });
+    expect(at(next)).toEqual({ ...text(), text: "BRB!", nw: 1000, nh: 200 });
+    // Missing nw/nh: the shape counts as changed, from the stored box.
+    const bare = text();
+    delete bare.nw;
+    delete bare.nh;
+    const fresh = edit(sceneOf([bare]), { text: "new words", nw: 337, nh: 139 });
+    expect(box(at(fresh))).toEqual({ x: 0.378777, y: 0.4, w: 0.242446, h: 0.1 });
+  });
+
+  it("set table: fields not in the patch, and unknown keys, are kept as stored", () => {
+    // A later build's font and a hand-set colour survive an edit of the
+    // words.
+    const e = text({ font: "serif", color: "#abcdef", bold: "heavy", future: { k: [1, 2] } });
+    const next = edit(sceneOf([e]), { text: "new words", nw: 500, nh: 100 });
+    expect(at(next)).toEqual({ ...e, text: "new words" });
+    // A patch that sets them replaces them, a colour lower-cased.
+    const set2 = edit(sceneOf([e]), { font: "mono", color: "#ABCDEF", bold: false, nw: 500, nh: 100 });
+    expect(at(set2)).toMatchObject({ font: "mono", color: "#abcdef", bold: false, future: { k: [1, 2] } });
+    // A non-swatch hex is a colour like any other.
+    expect(at(edit(sceneOf([text()]), { color: "#123456", nw: 500, nh: 100 })).color).toBe("#123456");
+    // The text is stored normalized.
+    expect(at(edit(sceneOf([text()]), { text: "  new\r\nwords\t! ", nw: 500, nh: 100 })).text).toBe("new\nwords !");
+    // Keys a patch can't carry are ignored: never the id, type, z or box.
+    const sneaky = edit(sceneOf([text()]), { text: "x", nw: 500, nh: 100, id: "other", type: "image", z: 99, x: 0.9 });
+    expect(at(sneaky)).toEqual({ ...text(), text: "x" });
+  });
+
+  it.each([
+    ["only nw/nh, as stored", { nw: 500, nh: 100 }],
+    ["the stored text", { nw: 500, nh: 100, text: "BRB" }],
+    ["the stored text, before normalizing", { nw: 500, nh: 100, text: " BRB\r\n" }],
+    ["the stored colour in capitals", { nw: 500, nh: 100, color: "#FFFFFF" }],
+    ["every field as stored", { nw: 500, nh: 100, text: "BRB", font: "sans", bold: true, color: "#ffffff", outline: true, align: "center" }],
+  ])("set table: %s changes nothing, so the scene itself comes back", (_n, fields) => {
+    const s = sceneOf([circle(), text()]);
+    expect(setRefusal(s, T, fields as unknown as TextPatch)).toBeNull();
+    expect(edit(s, fields)).toBe(s);
+  });
+
+  it("setRefusal: gone, invalid or null, as set applies", () => {
+    const s = sceneOf([
+      circle(),
+      text(),
+      text({ id: "inert", text: "" }),
+      picture("P", { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }),
+      light(),
+      { id: "future", type: "future", text: "hi", nw: 1, nh: 1 },
+    ]);
+    const ok = { nw: 337, nh: 139 };
+    // No live text with that id; checked before the patch.
+    for (const id of ["nope", "inert", "P", L, CIRCLE_ID, "future"]) {
+      expect(setRefusal(s, id, ok), id).toBe("gone");
+      expect(setRefusal(s, id, { nw: 0, nh: 0 }), id).toBe("gone");
+      expect(edit(s, ok, id), id).toBe(s);
+    }
+    // A field the reader wouldn't take as itself.
+    const invalid: Array<Record<string, unknown>> = [
+      { nw: 0, nh: 139 },
+      { nw: 1.5, nh: 139 },
+      { nw: Number.NaN, nh: 139 },
+      { nw: "337", nh: 139 },
+      { nw: 337, nh: -1 },
+      { nw: 337 },
+      { ...ok, text: "" },
+      { ...ok, text: " \n " },
+      { ...ok, text: 5 },
+      { ...ok, text: null },
+      { ...ok, text: "x".repeat(201) },
+      { ...ok, text: "1\n2\n3\n4\n5\n6" },
+      { ...ok, font: "serif" },
+      { ...ok, font: "Sans" },
+      { ...ok, font: "constructor" },
+      { ...ok, align: "centre" },
+      { ...ok, align: "middle" },
+      { ...ok, bold: "true" },
+      { ...ok, bold: 1 },
+      { ...ok, outline: null },
+      { ...ok, color: "#fff" },
+      { ...ok, color: "red" },
+      { ...ok, color: "#abcdeg" },
+      { ...ok, color: 0xffffff },
+    ];
+    for (const fields of invalid) {
+      expect(setRefusal(s, T, fields as unknown as TextPatch), JSON.stringify(fields)).toBe("invalid");
+      expect(edit(s, fields), JSON.stringify(fields)).toBe(s);
+    }
+    expect(setRefusal(s, T, null as unknown as TextPatch)).toBe("invalid");
+    expect(applyOp(s, { kind: "set", id: T, fields: null } as unknown as SceneOp)).toBe(s);
+    expect(applyOp(s, { kind: "set" } as unknown as SceneOp)).toBe(s);
+    // What it accepts, set applies.
+    const valid: Array<Record<string, unknown>> = [
+      ok,
+      { ...ok, text: "x".repeat(200) },
+      { ...ok, text: "1\n2\n3\n4\n5" },
+      { ...ok, color: "#ABCDEF" },
+      { ...ok, font: "display", bold: false, outline: false, align: "right" },
+    ];
+    for (const fields of valid) {
+      expect(setRefusal(s, T, fields as unknown as TextPatch), JSON.stringify(fields)).toBeNull();
+      expect(edit(s, fields), JSON.stringify(fields)).not.toBe(s);
+    }
+  });
+
+  // ---- a stale place ----
+
+  it("stale place on a text: a rect of its old shape after set lands as a move", () => {
+    // §7.4's worked row: a 144 × 48 "BRB" (3 : 1) at (168, 192).
+    const s = sceneOf([circle(), text({ x: 0.35, y: 0.4, w: 0.3, h: 0.1, nw: 300, nh: 100 })]);
+    const old = rectOf(s, T, D480);
+    expectRectNear(old, { x: 168, y: 192, w: 144, h: 48 }, 1e-6);
+    // Edited to an 8 : 1 text: 384 × 48, its centre kept.
+    const edited = edit(s, { text: "BRB, back in five", nw: 800, nh: 100 });
+    expectRectNear(rectOf(edited, T, D480), { x: 48, y: 192, w: 384, h: 48 }, 1e-3);
+    // A drag of the old rect, 20 px right and 30 down, released after it.
+    const dragged = moveRect(old, 20, 30, D480);
+    const next = applyOp(edited, { kind: "place", id: T, rect: dragged, viewport: D480 });
+    // A move: still 384 × 48 (the designed size kept), centred where the
+    // dragged rect was.
+    expectRectNear(rectOf(next, T, D480), { x: 68, y: 222, w: 384, h: 48 }, 1e-3);
+    expect([at(next).w, at(next).h]).toEqual([at(edited).w, at(edited).h]);
+    // Without the rule, the old width would have been kept: 144 × 18, then
+    // the 24 px minimum, half the height.
+    expectRectNear(normalizeRect(dragged, 8, D480), { x: 164, y: 234, w: 192, h: 24 }, 1e-9);
+    // Near an edge it is kept inside.
+    const far = applyOp(edited, { kind: "place", id: T, rect: { x: 330, y: 10, w: 144, h: 48 }, viewport: D480 });
+    expectRectNear(rectOf(far, T, D480), { x: 96, y: 10, w: 384, h: 48 }, 1e-3);
+    // In a smaller window: the size it is laid out at there, so still a move.
+    const small = { w: 300, h: 300 };
+    const there = applyOp(edited, { kind: "place", id: T, rect: { x: 100, y: 100, w: 90, h: 30 }, viewport: small });
+    expect([at(there).w, at(there).h]).toEqual([at(edited).w, at(edited).h]);
+    expect(there.designSize).toEqual(D480);
+    // A rect of its own shape still resizes; so does one within a
+    // thousandth of it.
+    const sized = applyOp(edited, { kind: "place", id: T, rect: { x: 0, y: 0, w: 192, h: 24 }, viewport: D480 });
+    expectRectNear(rectOf(sized, T, D480), { x: 0, y: 0, w: 192, h: 24 }, 1e-3);
+    const near = applyOp(edited, { kind: "place", id: T, rect: { x: 0, y: 0, w: 192, h: 24 * 1.0009 }, viewport: D480 });
+    expect(rectOf(near, T, D480).w).toBeCloseTo(192, 3);
+    expect(rectOf(near, T, D480).h).toBeCloseTo(24, 3);
+  });
+
+  it("the stale-shape rule is a text's only: other kinds given a rect off their shape resize as before", () => {
+    // A 2 : 1 picture: the width kept.
+    const pic = sceneOf([picture("P", { x: 0.1, y: 0.1, w: 0.2, h: 0.1 }, { nw: 2, nh: 1 })]);
+    const p = rectOf(applyOp(pic, { kind: "place", id: "P", rect: { x: 100, y: 100, w: 150, h: 50 }, viewport: D480 }), "P", D480);
+    expect([p.w, p.h]).toEqual([150, 75]);
+    // The light keeps its stored 5 : 1.
+    const lit = sceneOf([light()]);
+    const l = rectOf(applyOp(lit, { kind: "place", id: L, rect: { x: 100, y: 100, w: 200, h: 200 }, viewport: D480 }), L, D480);
+    expect(l.w).toBeCloseTo(200, 3);
+    expect(l.w / l.h).toBeCloseTo(5, 4);
+  });
+
+  // ---- add ----
+
+  it("addRefusal order (§7.7): the id, 64 stored, then by kind; text and the light skip the picture caps", () => {
+    const n = (more: Record<string, unknown> = {}) => known(text({ id: "N", ...more }));
+    const nl = (more: Record<string, unknown> = {}) => known(light({ id: "N", ...more }));
+    const full = sceneOf([circle(), ...sixteen()]);
+    const overBudget = sceneOf([picture("huge", { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { bytes: 300_000_000 })]);
+    const lit = sceneOf([light()]);
+    const cases: Array<[string, OverlayScene, KnownElement, string | null]> = [
+      ["a text beside a circle and 16 pictures", full, n(), null],
+      ["a text in a scene over the picture budget", overBudget, n(), null],
+      ["a text at the limits: 200 units on 5 lines", sceneOf([]), n({ text: `${"x".repeat(192)}\n1\n2\n3\n4` }), null],
+      ["a text with a font and colour this build only reads", sceneOf([]), n({ font: "serif", color: "#abcdef" }), null],
+      ["the light beside a circle and 16 pictures", full, nl(), null],
+      ["the light in a scene over the picture budget", overBudget, nl(), null],
+      ["the light beside an inert one", sceneOf([light({ id: "flat", h: 0 })]), nl(), null],
+      ["the light beside a text", sceneOf([text()]), nl(), null],
+      ["a text's id taken", sceneOf([text({ id: "N" })]), n(), "exists"],
+      ["a taken id before an empty text", sceneOf([text({ id: "N" })]), n({ text: "" }), "exists"],
+      ["the light's id taken by an inert element", sceneOf([{ id: "N", type: "future" }]), nl(), "exists"],
+      ["a text, 64 stored", sceneOf(sixtyFour()), n(), "elements"],
+      ["the light, 64 stored", sceneOf(sixtyFour()), nl(), "elements"],
+      ["the light, 64 stored with a live light: elements first", sceneOf([light(), ...sixtyFour().slice(1)]), nl(), "elements"],
+      ["a second light", lit, nl(), "light"],
+      ["a second light that wouldn't be live either", lit, nl({ w: 0 }), "light"],
+      ["a light with a zero width", sceneOf([]), nl({ w: 0 }), "invalid"],
+      ["a light with an id over 64", sceneOf([]), nl({ id: "x".repeat(65) }), "invalid"],
+      ["an empty text", sceneOf([]), n({ text: "" }), "invalid"],
+      ["a text of control characters", sceneOf([]), n({ text: ch(0x07, 0x85) }), "invalid"],
+      ["201 units", sceneOf([]), n({ text: "x".repeat(201) }), "invalid"],
+      ["6 lines", sceneOf([]), n({ text: "1\n2\n3\n4\n5\n6" }), "invalid"],
+      ["no nw", sceneOf([]), n({ nw: undefined }), "invalid"],
+      ["nw 0", sceneOf([]), n({ nw: 0 }), "invalid"],
+      ["nh 1.5", sceneOf([]), n({ nh: 1.5 }), "invalid"],
+      ["nh NaN", sceneOf([]), n({ nh: Number.NaN }), "invalid"],
+      ["nw as a string", sceneOf([]), n({ nw: "500" }), "invalid"],
+      ["a text with a zero height", sceneOf([]), n({ h: 0 }), "invalid"],
+      ["a text with an id over 64", sceneOf([]), n({ id: "x".repeat(65) }), "invalid"],
+    ];
+    for (const [name, s, e, why] of cases) {
+      expect(addRefusal(s, e), name).toBe(why);
+      const next = applyOp(s, { kind: "add", element: e });
+      if (why === null) {
+        expect(next.elements.at(-1), name).toMatchObject({ id: "N", type: e.type });
+        expect(isLive(next, "N"), name).toBe(true);
+      } else expect(next, name).toBe(s);
+    }
+  });
+
+  it("add puts a text and the light in front, every field kept", () => {
+    const s = sceneOf([circle(), picture("A", { x: 0.1, y: 0.1, w: 0.1, h: 0.1 }, { z: 1 })]);
+    const t = text({ id: "N", z: 0, x: 0.1234567, future: { k: 1 }, font: "serif" });
+    const withText = applyOp(s, { kind: "add", element: known(t) });
+    expect(withText.elements.at(-1)).toEqual({ ...t, x: 0.123457, z: 2 });
+    const withLight = applyOp(withText, { kind: "add", element: known(light({ z: -5 })) });
+    expect(withLight.elements.at(-1)).toEqual({ ...light(), z: 3 });
+    expect(layoutScene(withLight, D480).map((r) => r.el.id)).toEqual([CIRCLE_ID, "A", "N", L]);
+  });
+
+  // ---- labels ----
+
+  it("labels: a text's first line, cut at 40 with …; the light is Recording light; repeats numbered", () => {
+    const s = sceneOf([
+      circle(),
+      text({ id: "t1", text: "BRB" }),
+      text({ id: "t2", text: " BRB \r\n" }),
+      text({ id: "t3", text: "BRB\nback soon" }),
+      text({ id: "t4", text: "x".repeat(50) }),
+      text({ id: "t5", text: GAME.repeat(30) }),
+      text({ id: "empty", text: "" }),
+      light({ id: "L1" }),
+      light({ id: "L2" }),
+      picture("P", { x: 0, y: 0, w: 0.1, h: 0.1 }, { name: "Recording light" }),
+    ]);
+    expect([...charmLabels(s)]).toEqual([
+      [CIRCLE_ID, "Spell circle"],
+      ["t1", "BRB"],
+      ["t2", "BRB (2)"],
+      ["t3", "BRB (3)"],
+      ["t4", `${"x".repeat(40)}…`],
+      ["t5", `${GAME.repeat(20)}…`],
+      ["L1", "Recording light"],
+      ["P", "Recording light (2)"],
+    ]);
+  });
+
+  // ---- defaults ----
+
+  it("defaultLightRect is 5:1 at the bottom left, its height 7 % of the window's short side", () => {
+    // §7.8's row: 168 × 33.6 px at (19.2, 427.2) in a 480 × 480 view.
+    const r = defaultLightRect(sceneOf([circle()]), D480);
+    expectRectNear({ x: r.x * 480, y: r.y * 480, w: r.w * 480, h: r.h * 480 }, { x: 19.2, y: 427.2, w: 168, h: 33.6 }, 1e-3);
+    // Clamped to 24–96 px tall.
+    expect(defaultLightRect(sceneOf([]), { w: 200, h: 200 }).h * 480).toBeCloseTo(24, 3);
+    const big = defaultLightRect(sceneOf([], { w: 3840, h: 2160 }), { w: 3840, h: 2160 });
+    // Stored to 6 decimals: within a thousandth of a fraction's px.
+    expect(big.h * 2160).toBeCloseTo(96, 2);
+    // Scaled down together to 90 % of a narrow window's width.
+    const narrow = defaultLightRect(sceneOf([], { w: 100, h: 480 }), { w: 100, h: 480 });
+    expect(narrow.w * 100).toBeCloseTo(90, 3);
+    expect((narrow.w * 100) / (narrow.h * 480)).toBeCloseTo(5, 3);
+  });
+
+  it("defaultLightRect sits below Arrange's grip and Lock pill (top 6 px, 28 px tall)", () => {
+    for (const view of [D480, { w: 1920, h: 1080 }]) {
+      const r = defaultLightRect(sceneOf([], view), view);
+      expect(r.y * view.h, `${view.w}×${view.h}`).toBeGreaterThan(6 + 28);
+      expect(r.y + r.h).toBeLessThanOrEqual(1 + 1e-6);
+      expect(r.x + r.w).toBeLessThanOrEqual(1 + 1e-6);
+    }
+  });
+
+  it("the light's default box and its resize handles miss the Move window grip and the Lock pill", () => {
+    // Both pills are 6 px from the top and 28 px tall, at the left and the
+    // right (Stage.tsx's PILL).
+    for (const view of [D480, { w: 1920, h: 1080 }]) {
+      const where = defaultLightRect(sceneOf([], view), view);
+      const s = applyOp(sceneOf([], view), { kind: "add", element: known(light({ ...where })) });
+      const r = rectOf(s, L, view);
+      const hit = hitRect(r, view);
+      for (const b of [r, hit, ...Object.values(handleRects(hit))]) {
+        expect(b.y, `${view.w}×${view.h}`).toBeGreaterThan(6 + 28);
+      }
+      // 4 % in from the left edge and up from the bottom.
+      expect(r.x).toBeCloseTo(0.04 * view.w, 2);
+      expect(r.y + r.h).toBeCloseTo(0.96 * view.h, 2);
+      expect(r.x + r.w).toBeLessThanOrEqual(view.w);
+    }
+  });
+
+  it("defaultTextRect has its text's shape, 10 % of the short side tall, centred across, its top at 20 %", () => {
+    const r = defaultTextRect(sceneOf([circle()]), 337, 139, D480);
+    expect(r.h * 480).toBeCloseTo(48, 3);
+    expect((r.w * 480) / (r.h * 480)).toBeCloseTo(337 / 139, 4);
+    expect(r.x + r.w / 2).toBeCloseTo(0.5, 5);
+    expect(r.y).toBeCloseTo(0.2, 6);
+  });
+
+  it("defaultTextRect scales a wide text down to 90 % of the window's width, its shape kept", () => {
+    const r = defaultTextRect(sceneOf([]), 4000, 139, D480);
+    expect(r.w * 480).toBeCloseTo(432, 3);
+    expect((r.w * 480) / (r.h * 480)).toBeCloseTo(4000 / 139, 3);
+    expect(r.x).toBeCloseTo(0.05, 5);
+  });
+
+  it("defaultTextRect: each live text already there puts the next 6 % lower, five places round", () => {
+    const tops: number[] = [];
+    const elements: SceneElement[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const r = defaultTextRect(sceneOf(elements), 337, 139, D480);
+      tops.push(r.y);
+      elements.push(text({ id: `t${i}`, ...r, nw: 337, nh: 139 }));
+    }
+    expect(tops.map((y) => Math.round(y * 100))).toEqual([20, 26, 32, 38, 44, 20]);
+    // A text that isn't live doesn't count.
+    const inert = [text({ id: "a", text: "" }), text({ id: "b", w: 0 })];
+    expect(defaultTextRect(sceneOf(inert), 337, 139, D480).y).toBeCloseTo(0.2, 6);
+  });
+
+  it("defaultTextRect: 32 to 160 px tall, square without a shape, always inside the scene", () => {
+    expect(defaultTextRect(sceneOf([]), 337, 139, { w: 200, h: 200 }).h * 480).toBeCloseTo(32, 3);
+    const big = defaultTextRect(sceneOf([], { w: 3840, h: 2160 }), 337, 139, { w: 3840, h: 2160 });
+    expect(big.h * 2160).toBeCloseTo(160, 2);
+    for (const [nw, nh] of [
+      [0, 0],
+      [Number.NaN, 139],
+      [337.5, 139],
+    ]) {
+      const r = defaultTextRect(sceneOf([]), nw!, nh!, D480);
+      expect(r.w, `${nw}×${nh}`).toBeCloseTo(r.h, 6);
+    }
+    for (const view of [
+      { w: 4000, h: 4000 },
+      { w: 30, h: 30 },
+      { w: 2000, h: 200 },
+    ]) {
+      const r = defaultTextRect(sceneOf([]), 4000, 139, view);
+      expect(r.x).toBeGreaterThanOrEqual(0);
+      expect(r.y).toBeGreaterThanOrEqual(0);
+      expect(r.x + r.w).toBeLessThanOrEqual(1 + 1e-6);
+      expect(r.y + r.h).toBeLessThanOrEqual(1 + 1e-6);
+    }
+  });
+
+  // ---- through every op ----
+
+  const ops: Array<[string, SceneOp]> = [
+    ["add", { kind: "add", element: picture("N", { x: 0.1, y: 0.1, w: 0.2, h: 0.1 }, { src: SRC_B }) as unknown as KnownElement }],
+    ["remove", { kind: "remove", id: "A" }],
+    ["place", { kind: "place", id: "A", rect: { x: 1, y: 2, w: 100, h: 50 }, viewport: D480 }],
+    ["place, growing", { kind: "place", id: "A", rect: { x: 1, y: 2, w: 100, h: 50 }, viewport: { w: 900, h: 700 } }],
+    ["order", { kind: "order", id: "A", to: "back" }],
+    ["reframe", { kind: "reframe", from: { x: 10, y: 10, w: 480, h: 480 }, to: { x: 0, y: 0, w: 1280, h: 720 }, frame: "monitor" }],
+  ];
+  const bystanders = (): OverlayScene =>
+    sceneOf([
+      circle(),
+      picture("A", { x: 0.7, y: 0.4, w: 0.3, h: 0.15 }, { z: 1, name: "wave.gif" }),
+      text({ z: 2, font: "serif", color: "#ABCDEF", future: { k: [1] } }),
+      light({ z: 3, future: "x" }),
+    ]);
+
+  it.each(ops)("text and rec survive every op: %s keeps every key but the box and z, and both stay live", (_n, op) => {
+    const s = bystanders();
+    const next = applyOp(s, op);
+    expect(next).not.toBe(s);
+    const strip = (e: SceneElement) => json({ ...e, x: 0, y: 0, w: 0, h: 0, z: 0 });
+    for (const id of [T, L]) {
+      expect(strip(at(next, id)), id).toBe(strip(at(s, id)));
+      expect(isLive(next, id), id).toBe(true);
+    }
+    // Where they draw at the design size: unchanged unless reframed.
+    if (op.kind !== "reframe") {
+      for (const id of [T, L]) expectRectNear(rectOf(next, id, D480), rectOf(s, id, D480), 2e-3);
+    }
+  });
+
+  it("set on the text keeps the light and every other element as they were", () => {
+    const s = bystanders();
+    const next = edit(s, { text: "new words", nw: 337, nh: 139 });
+    s.elements.forEach((e, i) => {
+      if (e.id !== T) expect(next.elements[i]).toBe(e);
+    });
+    expect(at(next)).toMatchObject({ font: "serif", color: "#ABCDEF", future: { k: [1] } });
+  });
+
+  it("place, order, remove and reframe treat a text and the light as they treat a picture", () => {
+    for (const id of [T, L]) {
+      const s = sceneOf([circle(), picture("A", { x: 0.1, y: 0.6, w: 0.2, h: 0.1 }, { z: 1 }), text({ z: 2 }), light({ z: 3 })]);
+      const was = rectOf(s, id, D480);
+      // Moved: the same size, where it was dropped.
+      const moved = applyOp(s, { kind: "place", id, rect: moveRect(was, 30, -40, D480), viewport: D480 });
+      expectRectNear(rectOf(moved, id, D480), { ...was, x: was.x + 30, y: was.y - 40 }, 1e-3);
+      // Resized at its own shape.
+      const to = { x: 10, y: 10, w: was.w * 1.5, h: was.h * 1.5 };
+      expectRectNear(rectOf(applyOp(s, { kind: "place", id, rect: to, viewport: D480 }), id, D480), to, 1e-3);
+      // Restacked.
+      expect(layoutScene(applyOp(s, { kind: "order", id, to: "back" }), D480)[0]!.el.id, id).toBe(id);
+      // Removed.
+      expect(applyOp(s, { kind: "remove", id }).elements.map((e) => e.id), id).not.toContain(id);
+      // Fit on: nothing moves on screen.
+      const win = { x: 100, y: 50, w: 480, h: 480 };
+      const mon = { x: 0, y: 0, w: 1920, h: 1080 };
+      const fitted = applyOp(s, { kind: "reframe", from: win, to: mon, frame: "monitor" });
+      expectRectNear(rectOf(fitted, id, { w: 1920, h: 1080 }), { ...was, x: was.x + win.x, y: was.y + win.y }, 2e-3);
+    }
+  });
+
+  it("readOp never returns set, nor an add of a text or the light, from either side", () => {
+    const set = { kind: "set", id: T, fields: { nw: 337, nh: 139, text: "hi" } };
+    for (const from of ["main", "overlay"] as const) {
+      expect(readOp(set, from)).toBeNull();
+      expect(readOp({ kind: "add", element: text() }, from)).toBeNull();
+      expect(readOp({ kind: "add", element: light() }, from)).toBeNull();
+    }
+  });
+
+  it("an asset id typed as a text counts as a reference (K10)", () => {
+    // assetRefs reads every string in the scene: harmless, the file is
+    // kept while the text names it.
+    const s = sceneOf([text({ text: "ba7816bf8f01cfea.png" })]);
+    expect(assetRefCount(s, "ba7816bf8f01cfea.png")).toBe(1);
+    expect(assetRefCount(applyOp(s, { kind: "remove", id: T }), "ba7816bf8f01cfea.png")).toBe(0);
   });
 });

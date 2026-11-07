@@ -928,6 +928,44 @@ mod tests {
         assert_eq!((s.open, s.phase), (true, PhaseName::Starting));
     }
 
+    /// v1.62.0: the overlay page hears the recorder's own broadcast events
+    /// for its recording light, and reads only `state` and `elapsedMs` from
+    /// them. The fixture's `recLight` names both events and holds a sample of
+    /// each payload with just those fields; `recLight.test.ts` reads the same
+    /// rows, so a renamed event or field fails one side or the other.
+    #[test]
+    fn fixture_names_the_recorder_events_the_overlay_hears() {
+        use crate::replay::{ReplayState, ReplayStatus, EVENT_BUFFER};
+        use crate::screen::{Phase, ScreenRecordingUpdate, EVENT};
+
+        let f = &fixture()["recLight"];
+        assert_eq!(f["events"]["take"], EVENT);
+        assert_eq!(f["events"]["replay"], EVENT_BUFFER);
+
+        // Each sample is Rust's payload cut to the fields the overlay reads.
+        let take = serde_json::to_value(ScreenRecordingUpdate {
+            state: Phase::Recording,
+            elapsed_ms: 65_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let replay = serde_json::to_value(ReplayStatus {
+            state: ReplayState::Armed,
+            ..ReplayStatus::off(true, None, 30)
+        })
+        .unwrap();
+        for (kind, built, read) in [
+            ("take", &take, ["elapsedMs", "state"].as_slice()),
+            ("replay", &replay, ["state"].as_slice()),
+        ] {
+            let sample = &f["samples"][kind];
+            assert_eq!(sorted_keys(sample), read, "samples.{kind}");
+            for &field in read {
+                assert_eq!(built[field], sample[field], "samples.{kind}.{field}");
+            }
+        }
+    }
+
     /// OBS Window Capture sources match the title; the capability and
     /// `getByLabel` use the label.
     #[test]

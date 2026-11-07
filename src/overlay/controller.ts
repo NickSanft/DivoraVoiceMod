@@ -15,6 +15,14 @@
 //
 // v1.59.0: an Hourglass timer's Show on overlay adds and removes its face
 // here, one per timer; the scene is the toggle's only record.
+//
+// v1.62.0 (Text charms): Settings adds and edits text charms here, and
+// adds the recording light. A text is measured in this window (the `text`
+// dep) before it is committed, so the scene stores its natural box. Saves
+// run one at a time on the `texts` queue (fields, font load, measure), and
+// each commit step runs on `placement`, after any Fit change in flight, so
+// it reads the scene as it is then. An edit is a `set` carrying only the
+// fields the streamer changed, with the new `nw`/`nh`.
 
 import { createMemo, createSignal, onCleanup } from "solid-js";
 import type { ImportedAsset } from "../audio/api";
@@ -41,7 +49,9 @@ import {
   assetRefs,
   CIRCLE_ID,
   defaultImageRect,
+  defaultLightRect,
   defaultScene,
+  defaultTextRect,
   defaultTimerRect,
   frameOf,
   liveElements,
@@ -51,18 +61,31 @@ import {
   readOp,
   readScene,
   sceneForSave,
+  setRefusal,
   type AddRefusal,
   type ImageElement,
   type KnownElement,
   type OverlayScene,
   type PxRect,
+  type RecElement,
   type SceneOp,
+  type SetRefusal,
   type Size,
+  type TextElement,
   type TimerElement,
 } from "./scene";
 import type { OverlayBg, ScenePush } from "./state";
 import { closedStatus, readOverlayStatus, type OverlayStatus } from "./status";
 import { syncOverlayScene } from "./sync";
+import {
+  fontSpec,
+  readCharmText,
+  readTextFields,
+  textBox,
+  type TextInput,
+  type TextMetrics,
+  type TextPatch,
+} from "./text";
 import { isTimerId } from "./timerState";
 
 /** Where the overlay's settings and its scene are kept. */
@@ -86,6 +109,16 @@ const NO_MONITORS = "Couldn't read your monitors.";
 const HOTKEY_OFF = "The overlay is off. Turn it on in Settings first.";
 const STARTING = "The overlay is still starting. Try again in a moment.";
 const DAMAGED = "That picture looks damaged, so Divora can't add it.";
+// v1.62.0: text charms and the recording light.
+const TEXT_ADDED = "Text added. Use Arrange to place it.";
+const LIGHT_ADDED = "Recording light added. Use Arrange to place it.";
+const TEXT_GONE = "That text was removed, so there was nothing to change.";
+const TEXT_REFUSED = "That text couldn't be saved. Use 1 to 200 characters on up to 5 lines.";
+/** v1.62.0: why an edit of a text changed nothing, in words. */
+const SET_REFUSED: Record<SetRefusal, string> = {
+  gone: TEXT_GONE,
+  invalid: TEXT_REFUSED,
+};
 const REFUSED: Record<AddRefusal, string> = {
   pictures: AT_CAP,
   elements: "The overlay is full. Remove something to add another.",
@@ -96,6 +129,9 @@ const REFUSED: Record<AddRefusal, string> = {
   // timer id is checked first, and its rect is the default one.)
   exists: DAMAGED,
   circle: DAMAGED,
+  // v1.62.0: Settings shows Add the recording light only without one, so
+  // this answers only a race.
+  light: "The overlay already has a recording light.",
 };
 
 /** A geometry tracker: saves after a move or resize settles. */
@@ -142,6 +178,9 @@ export interface OverlayControllerDeps {
   toast(text: string, tone?: ToastTone): void;
   /** A fresh element id: "c-" and 8 hex digits. */
   newId(): string;
+  /** v1.62.0: how this window measures a text charm's natural box
+   *  (textMetrics.ts's canvas). */
+  text: TextMetrics;
   /** This page load; a new one tells the overlay main reloaded. */
   session: string;
 }
@@ -178,6 +217,21 @@ export interface OverlayController {
   /** v1.59.0: the scene has a live `timer` element for this timer.
    *  Reactive. */
   overlayHasTimer(timerId: string): boolean;
+  /** v1.62.0: Add text… in Settings. Measures the text, then adds a `text`
+   *  element where `defaultTextRect` says, or toasts why not. Settles after
+   *  its commit or refusal. */
+  addOverlayText(input: TextInput): Promise<void>;
+  /** v1.62.0: Save in Settings' editor for an existing text: `changes` is
+   *  only the fields the streamer changed. Measures the result and commits
+   *  a `set`, or toasts why not (the text was removed, or a field can't be
+   *  saved). A patch that changes no stored value commits nothing. Settles
+   *  after its commit or refusal. */
+  editOverlayText(id: string, changes: Partial<TextInput>): Promise<void>;
+  /** v1.62.0: Add the recording light: one `rec` element where
+   *  `defaultLightRect` says, unless the scene has a live one. */
+  addRecordingLight(): void;
+  /** v1.62.0: the scene has a live recording light. Reactive. */
+  overlayHasLight(): boolean;
 }
 
 /** Tasks run one at a time, in order. One failing never stops the rest. */
@@ -228,6 +282,10 @@ function fileName(path: string): string | undefined {
 export function createOverlayController(d: OverlayControllerDeps): OverlayController {
   const placement = makeQueue();
   const assets = makeQueue();
+  // v1.62.0: text saves, in the order Settings asked. Each waits for a font,
+  // so two quick saves would otherwise commit out of order. Each one's
+  // commit step runs on `placement`.
+  const texts = makeQueue();
 
   // ---- settings (`divora.overlay`) ----
   const prefs = d.storage.load(OVERLAY_PREFS_KEY);
@@ -570,13 +628,39 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
     { equals: (a, b) => a.size === b.size && [...a].every((t) => b.has(t)) },
   );
 
-  /** The window's CSS size, where a new picture or timer face is sized
-   *  for. */
+  // v1.62.0: whether the scene has a live light, for Settings' Add the
+  // recording light. Changes only when that does.
+  const hasLight = createMemo(() => liveElements(scene()).some((e) => e.type === "rec"));
+
+  /** The window's CSS size, where a new picture, timer face, text or light
+   *  is sized for. */
   const pictureView = (): Size | undefined => {
     // Fitted, the scene's own size is the monitor's.
     if (frameOf(scene()) === "monitor" || !geometry) return undefined;
     const k = geometry.scale ?? 1;
     return { w: geometry.w / k, h: geometry.h / k };
+  };
+
+  /** v1.62.0: a text's natural box as this window measures it: once its
+   *  font covers the text (`load` waits at most FONT_WAIT_MS), each line at
+   *  REF_PX with the face's whole stack, so it falls back as the face
+   *  does. A font that never loads is measured in its fallback, as the face
+   *  then draws. */
+  const measureText = async (f: TextInput): Promise<{ nw: number; nh: number }> => {
+    const spec = fontSpec(f.font, f.bold);
+    await d.text.load(spec, f.text).catch(() => undefined);
+    return textBox(f.text, (line) => d.text.width(spec, line));
+  };
+
+  /** v1.62.0: only the six text fields a caller passed, so a `set` never
+   *  carries anything else. */
+  const textChanges = (changes: Partial<TextInput>): Partial<TextInput> => {
+    const out: Partial<TextInput> = {};
+    if (typeof changes !== "object" || changes === null) return out;
+    for (const k of ["text", "font", "bold", "color", "outline", "align"] as const) {
+      if (changes[k] !== undefined) (out as Record<string, unknown>)[k] = changes[k];
+    }
+    return out;
   };
 
   return {
@@ -763,6 +847,90 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
     },
 
     overlayHasTimer: (timerId) => liveTimers().has(timerId),
+
+    addOverlayText: (input) =>
+      logged(
+        texts(async () => {
+          // As this build stores them: the text normalized, the colour
+          // lower-cased. Settings sends only its own choices, so the read
+          // defaults never stand in for one.
+          const fields = readTextFields({ ...input });
+          // Over the limits, it is refused below, without waiting for a font.
+          const box = readCharmText(input.text) === null ? { nw: 1, nh: 1 } : await measureText(fields);
+          await placement(async () => {
+            // Read now: a drag or a Fit change may have landed meanwhile.
+            const s = scene();
+            const element: TextElement = {
+              id: freshId(),
+              type: "text",
+              ...defaultTextRect(s, box.nw, box.nh, pictureView()),
+              z: 0,
+              ...fields,
+              ...box,
+            };
+            const refusal = addRefusal(s, element);
+            if (refusal) {
+              d.toast(refusal === "invalid" ? TEXT_REFUSED : REFUSED[refusal], WARN);
+              return;
+            }
+            if (!commit({ kind: "add", element })) return;
+            publish();
+            d.toast(TEXT_ADDED, INFO);
+          });
+        }),
+        "adding a text",
+      ),
+
+    editOverlayText: (id, changes) =>
+      logged(
+        texts(async () => {
+          const asked = textChanges(changes);
+          // Refused before any font load: the text is gone, or a field is
+          // one `set` won't take.
+          const early = setRefusal(scene(), id, { ...asked, nw: 1, nh: 1 });
+          if (early) {
+            d.toast(SET_REFUSED[early], WARN);
+            return;
+          }
+          // setRefusal found it live.
+          const stored = liveElements(scene()).find((e) => e.id === id && e.type === "text")!;
+          // Measured as it will be drawn: the stored fields with the changes.
+          const box = await measureText(readTextFields({ ...stored, ...asked }));
+          await placement(async () => {
+            // Asked again: an Arrange delete may have landed meanwhile.
+            const fields: TextPatch = { ...asked, ...box };
+            const refusal = setRefusal(scene(), id, fields);
+            if (refusal) {
+              d.toast(SET_REFUSED[refusal], WARN);
+              return;
+            }
+            // A patch that changes no stored value commits nothing: no save,
+            // no push. A save shows no toast: the overlay shows the change.
+            if (commit({ kind: "set", id, fields })) publish();
+          });
+        }),
+        "editing a text",
+      ),
+
+    addRecordingLight: () => {
+      const s = scene();
+      const element: RecElement = {
+        id: freshId(),
+        type: "rec",
+        ...defaultLightRect(s, pictureView()),
+        z: 0,
+      };
+      const refusal = addRefusal(s, element);
+      if (refusal) {
+        d.toast(REFUSED[refusal], WARN);
+        return;
+      }
+      if (!commit({ kind: "add", element })) return;
+      publish();
+      d.toast(LIGHT_ADDED, INFO);
+    },
+
+    overlayHasLight: hasLight,
   };
 }
 

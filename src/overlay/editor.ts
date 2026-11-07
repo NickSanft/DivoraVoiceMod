@@ -5,8 +5,22 @@
 // Nothing is sent while the pointer moves. A gesture keeps the viewport it
 // began in, so a window resized mid-drag can't mix two sizes in one edit.
 // Pure, so every rule is a table test.
+//
+// v1.62.0: a pointer gesture snaps (snap.ts). Its press fixes the lines it
+// can snap to; each update snaps the preview and keeps the guides to draw,
+// so what is drawn and what `place` stores is the snapped rectangle. Keys
+// never snap: a nudge run starts a gesture with no lines.
 
-import { moveRect, resizeRect, type Corner, type PxRect, type SceneOp, type Size } from "./scene";
+import {
+  MIN_ELEMENT_PX,
+  moveRect,
+  resizeRect,
+  type Corner,
+  type PxRect,
+  type SceneOp,
+  type Size,
+} from "./scene";
+import { snapMove, snapResize, type Guide, type SnapTargets } from "./snap";
 
 /** How long after the last arrow nudge or keyboard resize its one edit is
  *  sent. */
@@ -14,8 +28,25 @@ export const NUDGE_FLUSH_MS = 300;
 
 type Point = { x: number; y: number };
 
+/** v1.62.0: a gesture with nothing to snap to: a nudge run, and any
+ *  gesture begun without lines, which then behaves as before. */
+const NO_TARGETS: SnapTargets = Object.freeze({ xs: Object.freeze([]), ys: Object.freeze([]) });
+
+/** v1.62.0: `targets` are the lines fixed at the press (snap.ts's
+ *  `snapTargets`, in `v0`), and `guides` the lines the preview is snapped
+ *  to, drawn while the pointer is down. */
 export type Gesture =
-  | { kind: "move"; id: string; pointerId: number; start: Point; rect0: PxRect; v0: Size; preview: PxRect }
+  | {
+      kind: "move";
+      id: string;
+      pointerId: number;
+      start: Point;
+      rect0: PxRect;
+      v0: Size;
+      targets: SnapTargets;
+      preview: PxRect;
+      guides: Guide[];
+    }
   | {
       kind: "resize";
       id: string;
@@ -24,25 +55,48 @@ export type Gesture =
       start: Point;
       rect0: PxRect;
       v0: Size;
+      targets: SnapTargets;
       preview: PxRect;
+      guides: Guide[];
     };
 
-export function beginMove(id: string, pointerId: number, at: Point, rect: PxRect, v: Size): Gesture {
-  return { kind: "move", id, pointerId, start: at, rect0: rect, v0: v, preview: rect };
+export function beginMove(
+  id: string,
+  pointerId: number,
+  at: Point,
+  rect: PxRect,
+  v: Size,
+  targets: SnapTargets = NO_TARGETS,
+): Gesture {
+  return { kind: "move", id, pointerId, start: at, rect0: rect, v0: v, targets, preview: rect, guides: [] };
 }
 
-export function beginResize(id: string, corner: Corner, pointerId: number, at: Point, rect: PxRect, v: Size): Gesture {
-  return { kind: "resize", id, corner, pointerId, start: at, rect0: rect, v0: v, preview: rect };
+export function beginResize(
+  id: string,
+  corner: Corner,
+  pointerId: number,
+  at: Point,
+  rect: PxRect,
+  v: Size,
+  targets: SnapTargets = NO_TARGETS,
+): Gesture {
+  return { kind: "resize", id, corner, pointerId, start: at, rect0: rect, v0: v, targets, preview: rect, guides: [] };
 }
 
 /** The gesture with its preview for the pointer at `at`, from where it
- *  started, in the viewport it started in. */
-export function updateGesture(g: Gesture, at: Point): Gesture {
+ *  started, in the viewport it started in. v1.62.0: snapped to the press's
+ *  lines unless `snap` is false (snap.ts's `snapOn`: the bypass key held).
+ *  Re-run at the last pointer point when that key changes mid-gesture. */
+export function updateGesture(g: Gesture, at: Point, snap = true): Gesture {
   const dx = at.x - g.start.x;
   const dy = at.y - g.start.y;
-  const preview =
-    g.kind === "move" ? moveRect(g.rect0, dx, dy, g.v0) : resizeRect(g.rect0, g.corner, dx, dy, g.v0);
-  return { ...g, preview };
+  if (g.kind === "move") {
+    const { rect, guides } = snapMove(moveRect(g.rect0, dx, dy, g.v0), g.targets, g.v0, snap);
+    return { ...g, preview: rect, guides };
+  }
+  const raw = resizeRect(g.rect0, g.corner, dx, dy, g.v0);
+  const { rect, guides } = snapResize(raw, g.rect0, g.corner, g.targets, g.v0, snap, MIN_ELEMENT_PX);
+  return { ...g, preview: rect, guides };
 }
 
 /** The edit a released gesture makes; null when it moved nothing (under

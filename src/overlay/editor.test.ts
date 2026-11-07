@@ -9,6 +9,7 @@ import {
   updateGesture,
 } from "./editor";
 import { moveRect, resizeRect, type Corner, type PxRect, type Size } from "./scene";
+import { snapTargets } from "./snap";
 
 const V: Size = { w: 1000, h: 800 };
 const R: PxRect = { x: 300, y: 300, w: 300, h: 100 };
@@ -163,6 +164,92 @@ describe("gestures", () => {
     // Clamped by the starting viewport, and placed in it.
     expect(g.preview.x).toBe(540);
     expect(finishGesture(g)).toMatchObject({ viewport: v0 });
+  });
+});
+
+describe("gestures snap (v1.62.0)", () => {
+  // §7.5's viewport and other charm: lines x 0 / 240 / 480 and 300 / 350 /
+  // 400, y 0 / 240 / 480 and 100 / 125 / 150.
+  const V480: Size = { w: 480, h: 480 };
+  const T = snapTargets([{ el: { id: "o" }, rect: { x: 300, y: 100, w: 100, h: 50 } }], "p", V480);
+  const P: PxRect = { x: 100, y: 300, w: 100, h: 40 };
+  const R0: PxRect = { x: 100, y: 100, w: 100, h: 50 };
+
+  it("updateGesture snaps, and not with snap off", () => {
+    // Dragged 86 right: its centre at 236, 4 from the viewport's centre line.
+    let g = beginMove("p", 1, { x: 150, y: 320 }, P, V480, T);
+    expect(g.guides).toEqual([]);
+    g = updateGesture(g, { x: 236, y: 320 });
+    expect(g.preview).toEqual({ x: 190, y: 300, w: 100, h: 40 });
+    expect(g.guides).toEqual([{ axis: "x", at: 240 }]);
+    expect(finishGesture(g)).toEqual({ kind: "place", id: "p", rect: { x: 190, y: 300, w: 100, h: 40 }, viewport: V480 });
+    // The bypass key held: where dropped, no guide.
+    const free = updateGesture(g, { x: 236, y: 320 }, false);
+    expect(free.preview).toEqual({ x: 186, y: 300, w: 100, h: 40 });
+    expect(free.guides).toEqual([]);
+    expect(finishGesture(free)).toEqual({ kind: "place", id: "p", rect: { x: 186, y: 300, w: 100, h: 40 }, viewport: V480 });
+    // Released mid-gesture, the same point snaps again (Stage re-runs the
+    // last point on a Control change).
+    expect(updateGesture(free, { x: 236, y: 320 })).toEqual(g);
+    // Out of reach of every line: the guide goes.
+    const away = updateGesture(g, { x: 200, y: 320 });
+    expect(away.preview).toEqual({ x: 150, y: 300, w: 100, h: 40 });
+    expect(away.guides).toEqual([]);
+  });
+
+  it("a resize snaps its moving edge and keeps the shape, and not with snap off", () => {
+    let g = beginResize("p", "se", 1, { x: 200, y: 150 }, R0, V480, T);
+    g = updateGesture(g, { x: 236, y: 168 });
+    expect(g.preview.x).toBe(100);
+    expect(g.preview.y).toBe(100);
+    expect(g.preview.w).toBeCloseTo(140, 9);
+    expect(g.preview.h).toBeCloseTo(70, 9);
+    expect(g.guides).toEqual([{ axis: "x", at: 240 }]);
+    expect(finishGesture(g)).toMatchObject({ kind: "place", id: "p", viewport: V480 });
+    const free = updateGesture(g, { x: 236, y: 168 }, false);
+    expect(free.preview.w).toBeCloseTo(136, 9);
+    expect(free.preview.h).toBeCloseTo(68, 9);
+    expect(free.guides).toEqual([]);
+  });
+
+  it("a resize snaps against its press rect, not its last preview", () => {
+    // 20 × 10 in a 30 × 15 viewport (it can't reach 24): first grown out of
+    // reach of the line at 21 (right edge 29.5), then back to 22, where it
+    // snaps to 21 × 10.5. Its press size, 20 × 10, is the floor, not 29.5's.
+    const tiny = { x: 0, y: 0, w: 20, h: 10 };
+    const v = { w: 30, h: 15 };
+    let g = beginResize("p", "se", 1, { x: 20, y: 10 }, tiny, v, { xs: [{ at: 21, viewport: false }], ys: [] });
+    g = updateGesture(g, { x: 29.5, y: 14.75 });
+    expect(g.preview.w).toBeCloseTo(29.5, 9);
+    expect(g.guides).toEqual([]);
+    g = updateGesture(g, { x: 22, y: 11 });
+    expect(g.preview.w).toBeCloseTo(21, 9);
+    expect(g.preview.h).toBeCloseTo(10.5, 9);
+    expect(g.guides).toEqual([{ axis: "x", at: 21 }]);
+  });
+
+  it("a gesture with no lines behaves as before v1.62.0", () => {
+    // Begun without targets, as the existing callers and a nudge run do.
+    let g = beginMove("p", 1, { x: 150, y: 320 }, P, V480);
+    expect(g.targets.xs).toEqual([]);
+    expect(g.targets.ys).toEqual([]);
+    g = updateGesture(g, { x: 236, y: 320 });
+    expect(g.preview).toEqual(moveRect(P, 86, 0, V480));
+    expect(g.guides).toEqual([]);
+    let r = beginResize("p", "se", 1, { x: 200, y: 150 }, R0, V480);
+    r = updateGesture(r, { x: 236, y: 168 });
+    expect(r.preview).toEqual(resizeRect(R0, "se", 36, 18, V480));
+    expect(r.guides).toEqual([]);
+  });
+
+  it("snaps to the press's lines in the press's viewport", () => {
+    // Lines from a 480 × 480 press; the gesture keeps them (and v0) however
+    // far the pointer goes: the right edge reaches 480 and is held there.
+    let g = beginMove("p", 1, { x: 0, y: 0 }, P, V480, T);
+    g = updateGesture(g, { x: 5000, y: 0 });
+    expect(g.preview.x).toBe(380);
+    expect(g.guides).toEqual([{ axis: "x", at: 480 }]);
+    expect(finishGesture(g)).toMatchObject({ viewport: V480 });
   });
 });
 

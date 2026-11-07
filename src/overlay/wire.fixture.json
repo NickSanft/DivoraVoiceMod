@@ -1,5 +1,5 @@
 {
-  "about": "v1.55.0: the stream overlay's wire contract, read by both test suites (src-tauri/src/overlay_machine.rs and overlay_assets.rs; src/overlay/*.test.ts). Production code never imports it.",
+  "about": "v1.55.0: the stream overlay's wire contract, read by both test suites (src-tauri/src/overlay_machine.rs and overlay_assets.rs; src/overlay/*.test.ts). Production code never imports it. v1.62.0: textCharm holds the names a text charm stores for its font, colour (each with its Settings name, in Settings' order) and alignment, its creation limits, and the font size and line height nw/nh are measured at. recLight names the recorder's events and status commands the overlay page uses, with a sample of each payload cut to the fields the page reads, as Rust serializes them; lib.rs's tests read its commands too.",
   "events": {
     "state": "overlay:state",
     "ready": "overlay:ready",
@@ -96,5 +96,37 @@
   "debug": {
     "noReadyEnv": "DIVORA_PRETEND_OVERLAY_NO_READY",
     "noReadyGlobal": "__DIVORA_OVERLAY_NO_READY__"
+  },
+  "textCharm": {
+    "fonts": ["display", "sans", "mono"],
+    "colors": [
+      { "name": "White", "hex": "#ffffff" },
+      { "name": "Yellow", "hex": "#ffd60a" },
+      { "name": "Orange", "hex": "#ff9f0a" },
+      { "name": "Red", "hex": "#ff4500" },
+      { "name": "Blue", "hex": "#0a84ff" },
+      { "name": "Sky", "hex": "#64d2ff" },
+      { "name": "Grey", "hex": "#8e8e93" },
+      { "name": "Black", "hex": "#111111" }
+    ],
+    "aligns": ["left", "center", "right"],
+    "maxChars": 200,
+    "maxLines": 5,
+    "refPx": 100,
+    "lineHeight": 1.15
+  },
+  "recLight": {
+    "events": {
+      "take": "screen-recording",
+      "replay": "replay-buffer"
+    },
+    "commands": {
+      "take": "screen_recording_status",
+      "replay": "replay_buffer_status"
+    },
+    "samples": {
+      "take": { "state": "recording", "elapsedMs": 65000 },
+      "replay": { "state": "armed" }
+    }
   }
 }

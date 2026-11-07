@@ -17,8 +17,11 @@
 //     WebSocket server, after Hourglass), and in Hourglass a timer's Show in
 //     OBS and Follow OBS, the Switch OBS scene and Switch OBS back actions,
 //     and the scene Add break (BRB) switches OBS to
+//   • v1.62.0: Stream overlay's text charms (Add text…, Edit and the text
+//     editor under the charm list) and Add the recording light
 
 import {
+  batch,
   createEffect,
   createMemo,
   createSignal,
@@ -53,7 +56,26 @@ import { GlyphRecorder, GlyphPreview } from "../components/GlyphRecorder";
 import { type DiagStatus } from "../audio/diagnostics";
 import type { Point } from "../data/glyphs";
 import type { OverlayBg } from "../overlay/state";
-import { charmLabels, layoutScene, MAX_PICTURES, pictureCount } from "../overlay/scene";
+import { charmLabels, layoutScene, MAX_PICTURES, pictureCount, type KnownElement } from "../overlay/scene";
+import {
+  ALIGNS,
+  changedFields,
+  COLOURS,
+  drawText,
+  FONTS,
+  fontStack,
+  MAX_LINES,
+  MAX_TEXT,
+  normalizeCharmText,
+  readCharmText,
+  readTextFields,
+  TEXT_CHARMS,
+  textLength,
+  textShadow,
+  type TextAlign,
+  type TextFont,
+  type TextInput,
+} from "../overlay/text";
 import { openExternal } from "../lib/openExternal";
 import { EFFECTS } from "../data/effects";
 import {
@@ -2079,7 +2101,8 @@ function AppearanceSection(props: AppearanceProps): JSX.Element {
             onChange={(v) => app.setTweaks("theme", v)}
           />
         </Row>
-        <Row label="Color mood">
+        {/* v1.62.0: British, as the rest of the app's copy is. */}
+        <Row label="Colour mood">
           <Segmented<TweaksState["mood"]>
             options={[
               { value: "violet", label: "Dusk Violet" },
@@ -2340,10 +2363,44 @@ function OverlayArrangeButton(): JSX.Element {
   );
 }
 
+/** v1.62.0: a row's sigil, by what the charm is. */
+function charmSigil(e: KnownElement): SigilName {
+  switch (e.type) {
+    case "spellcircle":
+      return "modulated";
+    case "timer":
+      return "hourglass";
+    case "text":
+      return "pencil";
+    case "rec":
+      return "record";
+    default:
+      return "image";
+  }
+}
+
+/** v1.62.0: what the text editor edits: a new text (`id` null) or the text
+ *  charm with this id, and the fields it opened with. */
+interface TextEditing {
+  id: string | null;
+  initial: TextInput;
+}
+
 /** v1.55.0: what the overlay shows, front-most first. No thumbnails:
- *  Settings never loads a picture. */
+ *  Settings never loads a picture.
+ *
+ *  v1.62.0: the rows are keyed by id, each looking its charm up, so a
+ *  commit that replaces a charm's object (a drag or a nudge on the overlay,
+ *  a restack, a move that grows the scene, Save's own edit) keeps the row,
+ *  and a focused Edit or Remove with it. The text editor's state lives
+ *  here and the editor renders under the list, outside the rows, so those
+ *  commits never re-create it either: its draft, caret and focus stay. One
+ *  editor at a time; opening another discards this one's draft, as Cancel
+ *  would. It survives its charm being removed (Delete in Arrange); Save then
+ *  says the text was removed. */
 function OverlayCharmRows(): JSX.Element {
   const app = useApp();
+  let box: HTMLDivElement | undefined;
   const scene = () => app.overlayScene();
   // v1.59.0: a timer's row is named for the timer it shows.
   const timerName = (id: string): string | undefined =>
@@ -2355,10 +2412,77 @@ function OverlayCharmRows(): JSX.Element {
       .map((r) => r.el)
       .reverse(),
   );
+  const byId = createMemo(() => new Map(charms().map((e) => [e.id, e])));
+  // Changes only when a charm comes, goes or restacks, not on every drag.
+  const ids = createMemo(
+    () => charms().map((e) => e.id),
+    [],
+    { equals: (a, b) => a.length === b.length && a.every((id, i) => id === b[i]) },
+  );
   const full = () => pictureCount(scene()) >= MAX_PICTURES;
   const hasCircle = () => charms().some((e) => e.type === "spellcircle");
+
+  // ---- v1.62.0: the text editor ----
+  const [editing, setEditing] = createSignal<TextEditing | null>(null);
+  const [draft, setDraft] = createSignal<TextInput>(readTextFields({}));
+  // The editor is made again only when what it edits changes.
+  const editorKey = createMemo(() => {
+    const e = editing();
+    return e === null ? null : e.id === null ? "new" : `edit:${e.id}`;
+  });
+  const editButton = (id: string): HTMLElement | undefined =>
+    Array.from(box?.querySelectorAll<HTMLElement>("[data-charm-edit]") ?? []).find(
+      (b) => b.getAttribute("data-charm-edit") === id,
+    );
+  const addTextButton = (): HTMLElement | null =>
+    box?.querySelector<HTMLElement>('[data-testid="overlay-add-text"]') ?? null;
+  const open = (id: string | null, initial: TextInput): void => {
+    // Already open on it: keep the draft, go back to its Text field.
+    const now = editing();
+    if (now !== null && now.id === id) {
+      box?.querySelector<HTMLElement>('[data-testid="overlay-text-editor"] textarea')?.focus();
+      return;
+    }
+    batch(() => {
+      setDraft(initial);
+      setEditing({ id, initial });
+    });
+  };
+  const openEdit = (id: string): void => {
+    const e = byId().get(id);
+    if (e?.type === "text") open(id, readTextFields({ ...e }));
+  };
+  /** Close the editor if it still edits `which`, and give the focus back:
+   *  to its row's Edit (if the row is still there), else to Add text…. */
+  const close = (which: TextEditing): void => {
+    if (editing() !== which) return;
+    setEditing(null);
+    ((which.id !== null ? editButton(which.id) : undefined) ?? addTextButton())?.focus();
+  };
+  const [saving, setSaving] = createSignal(false);
+  const save = async (): Promise<void> => {
+    const which = editing();
+    const d = draft();
+    if (which === null || saving() || readCharmText(d.text) === null) return;
+    setSaving(true);
+    try {
+      if (which.id === null) {
+        await app.addOverlayText(d);
+      } else {
+        // Only what changed, so a field this build only reads (a later
+        // build's font, a hand-set colour) stays as stored.
+        const changes = changedFields(which.initial, d);
+        if (Object.keys(changes).length > 0) await app.editOverlayText(which.id, changes);
+      }
+    } finally {
+      setSaving(false);
+    }
+    close(which);
+  };
+
   return (
     <div
+      ref={box}
       data-testid="overlay-charms"
       style={{
         display: "flex",
@@ -2369,54 +2493,72 @@ function OverlayCharmRows(): JSX.Element {
       }}
     >
       <div class="eyebrow">Charms</div>
-      <For each={charms()}>
-        {(el) => {
-          const label = () => labels().get(el.id) ?? "Picture";
-          return (
-            <div
-              data-charm-row={el.id}
-              style={{
-                display: "flex",
-                "align-items": "center",
-                "justify-content": "space-between",
-                gap: "var(--s4)",
-              }}
-            >
-              <span
-                style={{
-                  display: "inline-flex",
-                  "align-items": "center",
-                  gap: "var(--s2)",
-                  "min-width": 0,
-                  "font-size": "var(--t-sm)",
-                  color: "var(--text-mid)",
-                }}
-              >
-                <Sigil
-                  name={
-                    el.type === "spellcircle" ? "modulated" : el.type === "timer" ? "hourglass" : "image"
-                  }
-                  size={16}
-                />
-                <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
-                  {el.type === "image"
-                    ? `${label()} · ${el.nw}×${el.nh}${el.anim === true ? " · animated" : ""}`
-                    : el.type === "timer" && timerName(el.timer) !== undefined
-                      ? `Timer · ${label()}`
-                      : label()}
-                </span>
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                aria-label={`Remove ${label()}`}
-                onClick={() => void app.removeOverlayElement(el.id)}
-              >
-                Remove
-              </Button>
-            </div>
-          );
-        }}
+      <For each={ids()}>
+        {(id) => (
+          <Show when={byId().get(id)}>
+            {(el) => {
+              const label = () => labels().get(id) ?? "Picture";
+              const words = (): string => {
+                const e = el();
+                if (e.type === "image") return `${label()} · ${e.nw}×${e.nh}${e.anim === true ? " · animated" : ""}`;
+                if (e.type === "timer" && timerName(e.timer) !== undefined) return `Timer · ${label()}`;
+                if (e.type === "text") return `Text · ${label()}`;
+                return label();
+              };
+              return (
+                <div
+                  data-charm-row={id}
+                  style={{
+                    display: "flex",
+                    "align-items": "center",
+                    "justify-content": "space-between",
+                    gap: "var(--s4)",
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      "align-items": "center",
+                      gap: "var(--s2)",
+                      "min-width": 0,
+                      "font-size": "var(--t-sm)",
+                      color: "var(--text-mid)",
+                    }}
+                  >
+                    <Sigil name={charmSigil(el())} size={16} />
+                    <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                      {words()}
+                    </span>
+                    <Show when={editing()?.id === id}>
+                      <Badge tone="accent">Editing</Badge>
+                    </Show>
+                  </span>
+                  <span style={{ display: "inline-flex", gap: "var(--s2)", "flex-shrink": 0 }}>
+                    <Show when={TEXT_CHARMS && el().type === "text"}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        data-charm-edit={id}
+                        aria-label={`Edit ${label()}`}
+                        onClick={() => openEdit(id)}
+                      >
+                        Edit
+                      </Button>
+                    </Show>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`Remove ${label()}`}
+                      onClick={() => void app.removeOverlayElement(id)}
+                    >
+                      Remove
+                    </Button>
+                  </span>
+                </div>
+              );
+            }}
+          </Show>
+        )}
       </For>
       <div style={{ display: "flex", gap: "var(--s3)", "flex-wrap": "wrap" }}>
         <Button
@@ -2433,13 +2575,290 @@ function OverlayCharmRows(): JSX.Element {
             Add the spell circle
           </Button>
         </Show>
+        <Show when={TEXT_CHARMS}>
+          <Button size="sm" icon="pencil" data-testid="overlay-add-text" onClick={() => open(null, readTextFields({}))}>
+            Add text…
+          </Button>
+        </Show>
+        <Show when={!app.overlayHasLight()}>
+          <Button size="sm" icon="record" data-testid="overlay-add-light" onClick={() => app.addRecordingLight()}>
+            Add the recording light
+          </Button>
+        </Show>
       </div>
       <Show when={full()}>
         <div style={reasonStyle}>The overlay holds up to 16 pictures.</div>
       </Show>
+      <Show keyed when={editorKey()}>
+        {(_key) => (
+          <CharmTextEditor
+            isNew={editing()?.id === null}
+            draft={draft()}
+            saving={saving()}
+            onDraft={setDraft}
+            onSave={() => void save()}
+            onCancel={() => {
+              const which = editing();
+              if (which) close(which);
+            }}
+          />
+        )}
+      </Show>
       <div style={helpStyle}>
-        If you use OBS, add images in OBS. Charms are for the window OBS captures and for
+        The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY
+        while Replay is on. It's part of the overlay, so Divora's recordings and OBS show it too,
+        unless Hide from recordings is on.
+      </div>
+      <Show when={app.overlayStatus().hideAvailable}>
+        <div style={helpStyle}>
+          With Hide from recordings on, it's drawn only while the overlay is locked and Divora has
+          asked Windows to leave it out of captures. While you arrange, recordings can see it. Like
+          the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release,
+          and for a moment when a recording ends without your Stop, such as Replay turning off or a
+          take that ends by itself.
+        </div>
+      </Show>
+      <div style={helpStyle}>
+        If you use OBS, add images and text in OBS. Charms are for the window OBS captures and for
         recordings without OBS.
+      </div>
+    </div>
+  );
+}
+
+/** v1.62.0: the line under the Text field, one at a time, first match: a
+ *  paste that was cut, then each limit. Nothing for an empty field: Save is
+ *  just off. */
+function textReason(text: string, pasteCut: boolean): string | null {
+  if (pasteCut) return `Only the first ${MAX_TEXT} fit.`;
+  if (textLength(text) > MAX_TEXT) return `Use up to ${MAX_TEXT} characters.`;
+  const lines = normalizeCharmText(text)?.split("\n").length ?? 0;
+  if (lines > MAX_LINES) return `Use up to ${MAX_LINES} lines.`;
+  return null;
+}
+
+const ALIGN_LABEL: Record<TextAlign, string> = { left: "Left", center: "Centre", right: "Right" };
+
+interface CharmTextEditorProps {
+  /** Add text… rather than Edit. */
+  isNew: boolean;
+  draft: TextInput;
+  saving: boolean;
+  onDraft(next: TextInput): void;
+  onSave(): void;
+  onCancel(): void;
+}
+
+/** v1.62.0: Settings' editor for a text charm (Add text… and Edit): the
+ *  text with its count, the font, bold, colour, outline and alignment, and
+ *  a preview of the look. Text is typed here, never on the overlay, whose
+ *  keys are blocked and which captures can see while arranging. Save
+ *  applies everything in one commit; Ctrl+Enter saves and Esc cancels
+ *  while the focus is inside it. A region, not a dialog. */
+function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
+  let field: HTMLTextAreaElement | undefined;
+  const helpId = createUniqueId();
+  const countId = createUniqueId();
+  const heading = () => (props.isNew ? "New text" : "Edit text");
+  const set = <K extends keyof TextInput>(k: K, v: TextInput[K]): void => props.onDraft({ ...props.draft, [k]: v });
+  // As this build would store and draw it: a colour it can't use shows white.
+  const look = createMemo(() => readTextFields({ ...props.draft }));
+  // "Only the first 200 fit." shows from a paste the field cut until the
+  // next input. The paste's own input comes in the same task as the paste,
+  // so it is let through once.
+  const [pasteCut, setPasteCut] = createSignal(false);
+  let pasteInput = false;
+  const onPaste = (e: ClipboardEvent): void => {
+    const el = e.currentTarget as HTMLTextAreaElement;
+    const pasted = (e.clipboardData?.getData("text/plain") ?? "").replace(/\r\n/g, "\n");
+    const kept = el.value.length - (el.selectionEnd - el.selectionStart);
+    if (kept + pasted.length <= MAX_TEXT) return;
+    setPasteCut(true);
+    pasteInput = true;
+    setTimeout(() => {
+      pasteInput = false;
+    }, 0);
+  };
+  const reason = () => textReason(props.draft.text, pasteCut());
+  const savable = () => !props.saving && readCharmText(props.draft.text) !== null;
+  const onKeyDown = (e: KeyboardEvent): void => {
+    if (e.isComposing) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      props.onCancel();
+    } else if (e.key === "Enter" && e.ctrlKey) {
+      e.preventDefault();
+      if (savable()) props.onSave();
+    }
+  };
+  onMount(() => field?.focus());
+  return (
+    <div
+      data-testid="overlay-text-editor"
+      role="group"
+      aria-label={heading()}
+      onKeyDown={onKeyDown}
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        gap: "var(--s3)",
+        padding: "var(--s4)",
+        "border-radius": "var(--r-md)",
+        border: "1px solid var(--line)",
+        background: "var(--surface-1)",
+      }}
+    >
+      <div style={{ "font-size": "var(--t-sm)", "font-weight": 600, color: "var(--text-hi)" }}>{heading()}</div>
+      <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s2)" }}>
+        <div class="field-label">Text</div>
+        <textarea
+          ref={field}
+          rows={3}
+          maxlength={MAX_TEXT}
+          spellcheck
+          aria-label="Overlay text"
+          aria-describedby={`${helpId} ${countId}`}
+          value={props.draft.text}
+          onPaste={onPaste}
+          onInput={(e) => {
+            if (pasteInput) pasteInput = false;
+            else setPasteCut(false);
+            set("text", e.currentTarget.value);
+          }}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            padding: "var(--s2) var(--s3)",
+            "border-radius": "var(--r-sm)",
+            border: "1px solid var(--line-strong)",
+            background: "var(--surface-1)",
+            color: "var(--text-hi)",
+            "font-family": "inherit",
+            "font-size": "var(--t-sm)",
+            "line-height": 1.5,
+          }}
+        />
+        <div style={{ display: "flex", "justify-content": "space-between", gap: "var(--s4)" }}>
+          <div id={helpId} style={helpStyle}>
+            Up to 200 characters on up to 5 lines. An emoji counts as 2 or more. Enter starts a new
+            line.
+          </div>
+          <div
+            id={countId}
+            data-testid="overlay-text-count"
+            style={{ ...helpStyle, "font-variant-numeric": "tabular-nums", "white-space": "nowrap" }}
+          >
+            {`${textLength(props.draft.text)} of ${MAX_TEXT}`}
+          </div>
+        </div>
+        <Show when={reason()}>
+          {(r) => (
+            <div data-testid="overlay-text-reason" style={reasonStyle}>
+              {r()}
+            </div>
+          )}
+        </Show>
+      </div>
+      <Row label="Font">
+        <Segmented<TextFont>
+          ariaLabel="Text font"
+          options={(Object.keys(FONTS) as TextFont[]).map((k) => ({ value: k, label: FONTS[k].label }))}
+          value={look().font}
+          onChange={(v) => set("font", v)}
+        />
+      </Row>
+      <Row label="Bold">
+        <Toggle on={look().bold} onChange={(v) => set("bold", v)} ariaLabel="Bold text" />
+      </Row>
+      <Row label="Colour">
+        <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--s2)", "flex-wrap": "wrap" }}>
+          {/* A stored colour that isn't a swatch checks none, and is kept
+              unless one is picked. */}
+          <Segmented<string>
+            ariaLabel="Text colour"
+            options={COLOURS.map((c) => ({ value: c.hex, label: c.name }))}
+            value={look().color}
+            onChange={(v) => set("color", v)}
+          />
+          <span
+            aria-hidden="true"
+            style={{
+              width: "16px",
+              height: "16px",
+              "border-radius": "50%",
+              border: "1px solid var(--line-strong)",
+              background: look().color,
+              "flex-shrink": 0,
+            }}
+          />
+        </span>
+      </Row>
+      <Row label="Outline">
+        <Toggle on={look().outline} onChange={(v) => set("outline", v)} ariaLabel="Outline the text" />
+      </Row>
+      <div style={helpStyle}>An outline keeps text readable over a game.</div>
+      <Row label="Alignment">
+        <Segmented<TextAlign>
+          ariaLabel="Text alignment"
+          options={ALIGNS.map((a) => ({ value: a, label: ALIGN_LABEL[a] }))}
+          value={look().align}
+          onChange={(v) => set("align", v)}
+        />
+      </Row>
+      <div style={helpStyle}>Lines break only where you press Enter.</div>
+      <div style={{ display: "flex", "flex-direction": "column", gap: "var(--s2)" }}>
+        <div class="field-label">Preview</div>
+        {/* The look, not the size: the overlay sizes the text to its box.
+            On --core-ink, which stays dark in the light theme. */}
+        <div
+          data-testid="overlay-text-preview"
+          aria-hidden="true"
+          style={{
+            background: "var(--core-ink)",
+            "border-radius": "var(--r-sm)",
+            padding: "var(--s3)",
+            overflow: "hidden",
+            "min-height": "48px",
+          }}
+        >
+          <div
+            style={{
+              "white-space": "pre",
+              "font-size": "20px",
+              "line-height": 1.15,
+              "font-family": fontStack(look().font),
+              "font-weight": look().bold ? 700 : 400,
+              "font-kerning": "normal",
+              "letter-spacing": 0,
+              "text-rendering": "optimizeLegibility",
+              color: look().color,
+              "text-shadow": look().outline ? textShadow(look().color) : "none",
+              "text-align": look().align,
+            }}
+          >
+            {drawText(props.draft.text)}
+          </div>
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: "var(--s3)" }}>
+        <Button
+          size="sm"
+          variant="primary"
+          data-testid="overlay-text-save"
+          disabled={!savable()}
+          onClick={() => props.onSave()}
+        >
+          Save
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => props.onCancel()}>
+          Cancel
+        </Button>
+      </div>
+      <div style={helpStyle}>
+        Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not
+        the size. Edit keeps its height and the side it's lined up to. Letters Divora's fonts don't
+        have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc
+        cancels.
       </div>
     </div>
   );
@@ -2536,7 +2955,9 @@ function StreamOverlaySection(): JSX.Element {
           a Window Capture that supports alpha, or pick{" "}
           <strong style={{ color: "var(--text-mid)" }}>Green</strong> /{" "}
           <strong style={{ color: "var(--text-mid)" }}>Magenta</strong> and add
-          a Chroma Key filter. It reopens where you left it.
+          a Chroma Key filter. In OBS's Chroma Key, keep Key Color Type on Green or
+          Magenta: a custom colour picked from the background can also remove white, grey
+          and black. It reopens where you left it.
         </div>
       </div>
     </section>
