@@ -94,7 +94,10 @@ export const REF_PX = 100;
 /** The face's line height, in em. */
 export const LINE_H = 1.15;
 
-/** The face's padding on each side, in em: it covers the outline. */
+/** The face's padding on each side, in em: the outline's room around its
+ *  lines. Above the first line and below the last, `textPads` adds however
+ *  far the ink reaches past the line's own box (Vietnamese capitals' stacked
+ *  marks reach about 0.25 em above it in Display). */
 export const PAD_EM = 0.12;
 
 /** What Settings' editor holds and saves: the six fields a streamer
@@ -120,13 +123,27 @@ export interface TextFields extends TextInput {
  *  fields the streamer changed. */
 export type TextPatch = { nw: number; nh: number } & Partial<TextInput>;
 
+/** One line's ink at REF_PX as a canvas measures it, in CSS px from the
+ *  baseline: how far its glyphs reach above and below it (`ascent`,
+ *  `descent`), and the ascent and descent of the face's first font, which
+ *  place the line's own box (LINE_H tall, centred on them). */
+export interface TextInk {
+  ascent: number;
+  descent: number;
+  fontAscent: number;
+  fontDescent: number;
+}
+
 /** How a window measures text: injected, so tests use fakes
  *  (textMetrics.ts holds the canvas one). `load` waits for the fonts a
  *  `spec` names to cover `sample`, and never rejects. `width` is one line's
- *  width at `spec`, in CSS px. */
+ *  width at `spec`, in CSS px. `ink` is one line's ink at `spec`, or null
+ *  where the window can't tell (no canvas); a measure without it pads by
+ *  PAD_EM alone. */
 export interface TextMetrics {
   load(spec: string, sample: string): Promise<void>;
   width(spec: string, line: string): number;
+  ink?(spec: string, line: string): TextInk | null;
 }
 
 /** A font name this build draws. A plain object lookup would also take
@@ -147,18 +164,32 @@ export function isTextColour(v: unknown): v is string {
   return typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v);
 }
 
+/** Half of a surrogate pair without its other half: a paste can bring one
+ *  in, though typing can't. */
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/** `text` with each half of a surrogate pair that lacks its other half
+ *  replaced by U+FFFD. A string holding one can't cross Tauri's IPC: its
+ *  JSON parser (serde_json) refuses the lone half's escape, so a scene
+ *  holding one would fail every push. */
+export function wellFormedText(text: string): string {
+  return text.replace(LONE_SURROGATE, "\ufffd");
+}
+
 /** The text as stored, read for drawing and liveness (§7.1), in order: CR
  *  LF, CR, U+2028, U+2029 and U+0085 become LF (left in, U+2028 and U+2029
  *  would break lines `split("\n")` doesn't count); a tab becomes a space;
  *  every other control character (U+0000–U+001F but LF, U+007F and
- *  U+0080–U+009F) is dropped; then the whole is trimmed. Null for a
- *  non-string or for nothing left. No length rule. */
+ *  U+0080–U+009F) is dropped; half of a surrogate pair without its
+ *  other half becomes U+FFFD (`wellFormedText`); then the whole is
+ *  trimmed. Null for a non-string or for nothing left. No length rule. */
 export function normalizeCharmText(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const text = raw
     .replace(/\r\n|[\r\u2028\u2029\u0085]/g, "\n")
     .replace(/\t/g, " ")
     .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, "")
+    .replace(LONE_SURROGATE, "\ufffd")
     .trim();
   return text.length > 0 ? text : null;
 }
@@ -242,22 +273,57 @@ function ceilPx(n: number): number {
   return Math.ceil(n - 1e-9);
 }
 
+/** The face's padding above its first line and below its last, in em:
+ *  PAD_EM, plus however far that line's ink (`inkOf`, at REF_PX) reaches
+ *  past the line's own box. The box is LINE_H tall, centred on the first
+ *  font's ascent and descent, as CSS lays a line out; Vietnamese capitals'
+ *  stacked marks reach past it, and drawn in PAD_EM alone their tops (and
+ *  the outline round them) would be cut off at the window's top edge, or
+ *  overlap a charm snapped above. PAD_EM alone without `inkOf`, or where it
+ *  gives null or a value that isn't finite. Main and the overlay page both
+ *  pad this way: the stored box is the shape the face is drawn in. */
+export function textPads(text: string, inkOf?: (line: string) => TextInk | null): { top: number; bottom: number } {
+  const lines = text.split("\n");
+  const past = (line: string | undefined, top: boolean): number => {
+    const ink = inkOf && line ? inkOf(line) : null;
+    if (!ink || ![ink.ascent, ink.descent, ink.fontAscent, ink.fontDescent].every(Number.isFinite)) return 0;
+    // Half the leading: the line's box reaches this far past the font's own
+    // ascent and descent (less than 0 when the font is taller than LINE_H).
+    const half = (LINE_H * REF_PX - ink.fontAscent - ink.fontDescent) / 2;
+    const over = top ? ink.ascent - (ink.fontAscent + half) : ink.descent - (ink.fontDescent + half);
+    return Math.max(0, over) / REF_PX;
+  };
+  return { top: PAD_EM + past(lines[0], true), bottom: PAD_EM + past(lines[lines.length - 1], false) };
+}
+
+/** The CSS `padding` of the face's words for `textPads`' answer: PAD_EM a
+ *  side, and its top and bottom. */
+export function facePadding(pads: { top: number; bottom: number }): string {
+  if (pads.top === PAD_EM && pads.bottom === PAD_EM) return `${PAD_EM}em`;
+  return `${pads.top}em ${PAD_EM}em ${pads.bottom}em`;
+}
+
 /** The text's natural box at REF_PX, in whole CSS px (§7.2): the widest
  *  line (an empty line is 0) plus PAD_EM a side, by its lines at LINE_H
- *  plus PAD_EM top and bottom. `widthOf` measures one line at REF_PX with
- *  `fontSpec`'s whole stack; a width that isn't a finite number of at
- *  least 0 counts as 0. `nw` is at least 1. */
-export function textBox(text: string, widthOf: (line: string) => number): { nw: number; nh: number } {
+ *  plus `textPads`' top and bottom (PAD_EM each, unless the ink reaches
+ *  past the first or last line). `widthOf` measures one line at REF_PX with
+ *  `fontSpec`'s whole stack, and `inkOf` its ink; a width that isn't a
+ *  finite number of at least 0 counts as 0. `nw` is at least 1. */
+export function textBox(
+  text: string,
+  widthOf: (line: string) => number,
+  inkOf?: (line: string) => TextInk | null,
+): { nw: number; nh: number } {
   const lines = text.split("\n");
   let widest = 0;
   for (const line of lines) {
     const w = line.length > 0 ? widthOf(line) : 0;
     if (Number.isFinite(w) && w > widest) widest = w;
   }
-  const pad = 2 * PAD_EM * REF_PX;
+  const pads = textPads(text, inkOf);
   return {
-    nw: Math.max(1, ceilPx(widest + pad)),
-    nh: ceilPx(lines.length * LINE_H * REF_PX + pad),
+    nw: Math.max(1, ceilPx(widest + 2 * PAD_EM * REF_PX)),
+    nh: ceilPx(lines.length * LINE_H * REF_PX + (pads.top + pads.bottom) * REF_PX),
   };
 }
 

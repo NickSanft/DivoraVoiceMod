@@ -1207,6 +1207,41 @@ describe("Stage: a text charm (v1.62.0)", () => {
     expect(face.getAttribute("style")).not.toMatch(/animation|transition/);
   });
 
+  it("pads the words for ink past the first line's box, and fits by the box that ink gives", async () => {
+    // Vietnamese capitals' stacked marks reach 116 above the baseline at
+    // 100 px; Display Bold's first font (93 and 27) puts the line's own box
+    // 90.5 above it, so they need 0.255 em more room on top.
+    const viet = "Ổ Ỗ Ộ";
+    const { metrics, width } = fakeMetrics();
+    const ink = vi.fn((_spec: string, line: string) => ({
+      ascent: line === viet ? 116 : 70,
+      descent: 20,
+      fontAscent: 93,
+      fontDescent: 27,
+    }));
+    const m = mount({
+      scene: textScene({ text: viet, font: "display" }),
+      status: locked(),
+      textMetrics: { ...metrics, ink },
+    });
+    await settle();
+    const spec = fontSpec("display", true);
+    expect(ink).toHaveBeenCalledWith(spec, viet);
+    const lines = textLines(m);
+    expect(parseFloat(lines.style.paddingTop)).toBeCloseTo(0.375, 6);
+    expect(parseFloat(lines.style.paddingBottom)).toBeCloseTo(0.12, 6);
+    expect(parseFloat(lines.style.paddingLeft)).toBeCloseTo(0.12, 6);
+    expect(parseFloat(lines.style.paddingRight)).toBeCloseTo(0.12, 6);
+    // Fitted by the page's own measure with that room: 165 tall, not 139.
+    const box = textBox(viet, (l) => width(spec, l), (l) => ink(spec, l));
+    expect(box.nh).toBe(165);
+    expect(parseFloat(textFace(m)!.style.fontSize)).toBeCloseTo(fitTextFont(337, 139, box.nw, box.nh), 9);
+    // Latin ink stays inside its line: PAD_EM alone.
+    const latin = mount({ scene: textScene(), status: locked(), textMetrics: { ...metrics, ink } });
+    await settle();
+    expect(textLines(latin).style.padding).toBe("0.12em");
+  });
+
   it("a stored string never reaches the style: an unknown font, colour or alignment reads its default", async () => {
     const { metrics } = fakeMetrics();
     const m = mount({
@@ -1590,6 +1625,28 @@ describe("Stage: the recording light (v1.62.0)", () => {
     expect(face.getAttribute("style")).not.toMatch(/animation|transition/);
   });
 
+  it("waits for its font as the timer face does: nothing until fontReady, the placeholder too", () => {
+    const m = mount({
+      scene: lightScene(),
+      status: locked(),
+      take: take("recording", 65_000),
+      statusSeen: true,
+      fontReady: false,
+    });
+    expect(faceOf(m)).toBeNull();
+    expect(m.charm("light").textContent).toBe("");
+    expect(m.charm("light").querySelector("[data-rec-dot]")).toBeNull();
+    m.setFontReady(true);
+    expect(faceOf(m)!.textContent).toBe("REC 1:05");
+
+    // Arrange is visible to recordings: the dimmed REC waits as well.
+    const a = mount({ scene: lightScene(), status: arranging(), fontReady: false });
+    expect(idleOf(a)).toBeNull();
+    expect(a.charm("light").textContent).toBe("");
+    a.setFontReady(true);
+    expect(idleOf(a)!.textContent).toBe("REC");
+  });
+
   it("its words' text node is written only when the words change", () => {
     const m = mount({ scene: lightScene(), status: locked(), take: take("recording", 65_000), statusSeen: true });
     const face = faceOf(m)!;
@@ -1750,6 +1807,13 @@ describe("Stage: snapping (v1.62.0)", () => {
     expect(guides(m)).toHaveLength(1);
     m.setStatus(locked());
     expect(guides(m)).toEqual([]);
+    expect(m.edits).toEqual([]);
+    // The drag itself is gone, not only hidden: the charm is drawn where it
+    // is stored, and the pointer moving on and letting go places nothing.
+    expectNear(rectOf(m.charm("drag")), { x: 180, y: 10, w: 100, h: 40 });
+    move(250, 30);
+    up(250, 30);
+    expectNear(rectOf(m.charm("drag")), { x: 180, y: 10, w: 100, h: 40 });
     expect(m.edits).toEqual([]);
   });
 

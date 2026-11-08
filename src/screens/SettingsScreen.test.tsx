@@ -556,6 +556,41 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     expect(view.getByTestId("toast-probe")).toHaveTextContent("Recording light added. Use Arrange to place it.");
   });
 
+  it("Add the recording light and Add the spell circle go once they've added: from the keyboard the focus moves on to Add text…, from a pointer it stays on the page", async () => {
+    storeScene([textCharm("t1")]);
+    const view = mount();
+    await flush();
+    const addText = view.getByTestId("overlay-add-text");
+    const circleButton = () => view.queryByRole("button", { name: "Add the spell circle" });
+    // From the keyboard: a click with `detail` 0, the focus on the button.
+    const addLight = view.getByTestId("overlay-add-light");
+    addLight.focus();
+    fireEvent.click(addLight, { detail: 0 });
+    await flush();
+    expect(view.queryByTestId("overlay-add-light")).toBeNull();
+    expect(document.activeElement).toBe(addText);
+    const addCircle = circleButton()!;
+    addCircle.focus();
+    fireEvent.click(addCircle, { detail: 0 });
+    await flush();
+    expect(circleButton()).toBeNull();
+    expect(stored().elements.filter((e) => e.type === "spellcircle")).toHaveLength(1);
+    expect(document.activeElement).toBe(addText);
+
+    // From a pointer: the click hands the focus back to the page, and the
+    // button's going moves nothing.
+    fireEvent.click(view.getByRole("button", { name: "Remove Recording light" }));
+    fireEvent.click(view.getByRole("button", { name: "Remove Spell circle" }));
+    await flush();
+    for (const add of [view.getByTestId("overlay-add-light"), circleButton()!]) {
+      add.focus();
+      fireEvent.click(add, { detail: 1 });
+      await flush();
+      expect(add.isConnected).toBe(false);
+      expect(document.activeElement).toBe(document.body);
+    }
+  });
+
   it("Add text… opens the editor under the list, outside the rows, its Text field focused; Save adds it and gives the focus back", async () => {
     storeScene([circle, textCharm("t1")]);
     const view = mount();
@@ -739,6 +774,157 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     expect(document.activeElement).toBe(view.getByTestId("overlay-add-text"));
   });
 
+  /** Save pressed from the keyboard, as Chromium does it: Save focused,
+   *  clicked, and (off while saving) the focus moved off it onto the page,
+   *  which jsdom doesn't do. jsdom's blur() ignores a button that's off, so
+   *  Save is on for the blur alone. */
+  const keyboardSave = (view: View) => {
+    const button = save(view) as HTMLButtonElement;
+    button.focus();
+    fireEvent.click(button, { detail: 0 });
+    expect(button).toBeDisabled();
+    button.disabled = false;
+    button.blur();
+    button.disabled = true;
+    expect(document.activeElement).toBe(document.body);
+  };
+  const FULL = "The overlay is full. Remove something to add another.";
+
+  it("an Add refused because the overlay is full keeps the editor and its draft, and Save its focus; after a Remove, Save adds it and closes", async () => {
+    // 64 stored elements: the text and 63 of a later build's.
+    const later = Array.from({ length: 63 }, (_, i) => ({ id: `later${i}`, type: "future" }));
+    storeScene([textCharm("t1"), ...later]);
+    const view = mount();
+    await flush();
+    fireEvent.click(view.getByTestId("overlay-add-text"));
+    const ed = editor(view);
+    type(field(view), "BRB soon");
+    fireEvent.click(view.getByRole("radio", { name: "Yellow" }));
+    keyboardSave(view);
+    await flush();
+    expect(view.getByTestId("toast-probe")).toHaveTextContent(FULL);
+    expect(editor(view)).toBe(ed);
+    expect(field(view).value).toBe("BRB soon");
+    expect(checked(view, "Text colour")).toEqual(["Yellow"]);
+    expect(save(view)).not.toBeDisabled();
+    // The focus back on Save, where it was.
+    expect(document.activeElement).toBe(save(view));
+    expect(stored().elements.filter((e) => e.type === "text").map((e) => e.id)).toEqual(["t1"]);
+
+    // Ctrl+Enter from the field: refused too, and the focus stays in it.
+    field(view).focus();
+    fireEvent.keyDown(field(view), { key: "Enter", ctrlKey: true });
+    expect(save(view)).toBeDisabled();
+    await flush();
+    expect(save(view)).not.toBeDisabled();
+    expect(editor(view)).toBe(ed);
+    expect(document.activeElement).toBe(field(view));
+    expect(stored().elements.filter((e) => e.type === "text").map((e) => e.id)).toEqual(["t1"]);
+
+    fireEvent.click(within(row(view, "t1")!).getByRole("button", { name: "Remove BRB" }));
+    await flush();
+    fireEvent.click(save(view));
+    await flush();
+    expect(view.getByTestId("toast-probe")).toHaveTextContent(TEXT_ADDED);
+    expect(view.queryByTestId("overlay-text-editor")).toBeNull();
+    expect(stored().elements.filter((e) => e.type === "text").map((e) => [e.text, e.color])).toEqual([["BRB soon", "#ffd60a"]]);
+    expect(document.activeElement).toBe(view.getByTestId("overlay-add-text"));
+  });
+
+  it("a refused Add puts back only a focus left on the page: one moved meanwhile stays; with Save off, the Text field", async () => {
+    const later = Array.from({ length: 64 }, (_, i) => ({ id: `later${i}`, type: "future" }));
+    storeScene(later);
+    let loaded!: () => void;
+    textLoad = () =>
+      new Promise<void>((r) => {
+        loaded = r;
+      });
+    const view = mount();
+    await flush();
+    fireEvent.click(view.getByTestId("overlay-add-text"));
+    const ed = editor(view);
+    type(field(view), "BRB soon");
+
+    // The focus moved out of the editor while the save waits: it stays.
+    keyboardSave(view);
+    const elsewhere = view.getByTestId("overlay-add-picture");
+    elsewhere.focus();
+    await flush();
+    expect(save(view)).toBeDisabled();
+    loaded();
+    await flush();
+    expect(view.getByTestId("toast-probe")).toHaveTextContent(FULL);
+    expect(editor(view)).toBe(ed);
+    expect(save(view)).not.toBeDisabled();
+    expect(document.activeElement).toBe(elsewhere);
+
+    // The text emptied while the save waits: Save is off after it, so the
+    // focus goes to the Text field.
+    keyboardSave(view);
+    type(field(view), "");
+    await flush();
+    expect(save(view)).toBeDisabled();
+    loaded();
+    await flush();
+    expect(editor(view)).toBe(ed);
+    expect(save(view)).toBeDisabled();
+    expect(document.activeElement).toBe(field(view));
+    expect(stored().elements.filter((e) => e.type === "text")).toEqual([]);
+  });
+
+  it("an Edit whose save fails keeps the editor and its draft, and Save its focus", async () => {
+    storeScene([circle, textCharm("t1")]);
+    const view = mount();
+    await flush();
+    fireEvent.click(view.getByRole("button", { name: "Edit BRB" }));
+    const ed = editor(view);
+    type(field(view), "BRB soon");
+    // The measure throws (a bug, logged), so the edit answers false.
+    textLoad = () => {
+      throw new Error("no canvas");
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      keyboardSave(view);
+      await flush();
+      expect(warn).toHaveBeenCalledWith("overlay: editing a text failed", expect.any(Error));
+    } finally {
+      warn.mockRestore();
+    }
+    expect(editor(view)).toBe(ed);
+    expect(field(view).value).toBe("BRB soon");
+    expect(within(row(view, "t1")!).getByText("Editing")).toBeInTheDocument();
+    expect(storedText("t1")).toMatchObject({ text: "BRB" });
+    expect(save(view)).not.toBeDisabled();
+    expect(document.activeElement).toBe(save(view));
+  });
+
+  it("a restack from the overlay moves the rows and keeps a focused row's Edit or Remove focused", async () => {
+    storeScene([circle, textCharm("t1"), textCharm("t2", { text: "Two", z: 2 }), textCharm("t3", { text: "Three", z: 3 })]);
+    const view = mount();
+    await flush();
+    const order = () =>
+      Array.from(charms(view).querySelectorAll("[data-charm-row]")).map((r) => r.getAttribute("data-charm-row"));
+    expect(order()).toEqual(["t3", "t2", "t1", "circle"]);
+    const r1 = row(view, "t1")!;
+    const edit = within(r1).getByRole("button", { name: "Edit BRB" });
+    edit.focus();
+    // `}` on BRB in Arrange: its row's node moves to the top.
+    fromOverlay(0, { kind: "order", id: "t1", to: "front" });
+    await flush();
+    expect(order()).toEqual(["t1", "t3", "t2", "circle"]);
+    expect(row(view, "t1")).toBe(r1);
+    expect(document.activeElement).toBe(edit);
+
+    // `{` on Three: its row's node is replaced where it was, then put last.
+    const remove = within(row(view, "t3")!).getByRole("button", { name: "Remove Three" });
+    remove.focus();
+    fromOverlay(1, { kind: "order", id: "t3", to: "back" });
+    await flush();
+    expect(order()).toEqual(["t1", "t2", "circle", "t3"]);
+    expect(document.activeElement).toBe(remove);
+  });
+
   it("Save waits for the save to settle before it closes; it is off meanwhile", async () => {
     storeScene([circle]);
     let loaded!: () => void;
@@ -771,9 +957,17 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     expect(ta).toHaveAttribute("maxlength", "200");
     expect(ta).toHaveAttribute("rows", "3");
     // The count is described, not announced.
-    const described = (ta.getAttribute("aria-describedby") ?? "").split(" ");
-    expect(described).toContain(view.getByTestId("overlay-text-count").id);
+    const described = () => (ta.getAttribute("aria-describedby") ?? "").split(" ");
+    expect(described()).toContain(view.getByTestId("overlay-text-count").id);
+    expect(described()).toHaveLength(2);
     expect(view.getByTestId("overlay-text-count")).not.toHaveAttribute("aria-live");
+    // The reason is described and said as it appears; a limit broken marks
+    // the field invalid.
+    const said = view.getByTestId("overlay-text-reason-said");
+    expect(said).toHaveAttribute("role", "status");
+    expect(said).toHaveAttribute("aria-live", "polite");
+    expect(said.textContent).toBe("");
+    expect(ta).not.toHaveAttribute("aria-invalid");
     expect(count(view)).toBe("0 of 200");
     expect(save(view)).toBeDisabled();
     expect(reason(view)).toBeNull();
@@ -794,6 +988,12 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     type(ta, "1\n2\n3\n4\n5\n6");
     expect(reason(view)).toBe("Use up to 5 lines.");
     expect(save(view)).toBeDisabled();
+    const why = view.getByTestId("overlay-text-reason");
+    expect(why.id).not.toBe("");
+    expect(described()).toContain(why.id);
+    expect(ta).toHaveAttribute("aria-invalid", "true");
+    expect(view.getByTestId("overlay-text-reason-said")).toBe(said);
+    expect(said.textContent).toBe("Use up to 5 lines.");
     // A Unicode line break counts as one.
     type(ta, "1 2 3 4 5 6");
     expect(reason(view)).toBe("Use up to 5 lines.");
@@ -802,6 +1002,9 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     expect(count(view)).toBe("200 of 200");
     expect(reason(view)).toBeNull();
     expect(save(view)).not.toBeDisabled();
+    expect(described()).toHaveLength(2);
+    expect(ta).not.toHaveAttribute("aria-invalid");
+    expect(said.textContent).toBe("");
   });
 
   it("a paste the field cuts says only the first 200 fit, until the next input", async () => {
@@ -811,10 +1014,16 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     const ta = field(view);
     const paste = (text: string) => fireEvent.paste(ta, { clipboardData: { getData: () => text } });
 
+    const said = view.getByTestId("overlay-text-reason-said");
     type(ta, "x".repeat(190));
     ta.setSelectionRange(190, 190);
     paste("y".repeat(20));
     expect(reason(view)).toBe("Only the first 200 fit.");
+    // Said while the focus stays in the field, and described; the text left
+    // fits, so the field isn't invalid.
+    expect(said.textContent).toBe("Only the first 200 fit.");
+    expect((ta.getAttribute("aria-describedby") ?? "").split(" ")).toContain(view.getByTestId("overlay-text-reason").id);
+    expect(ta).not.toHaveAttribute("aria-invalid");
     // The paste's own input, cut by maxlength.
     type(ta, "x".repeat(190) + "y".repeat(10));
     expect(reason(view)).toBe("Only the first 200 fit.");
@@ -844,6 +1053,10 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     expect(count(view)).toBe("250 of 200");
     expect(reason(view)).toBe("Use up to 200 characters.");
     expect(save(view)).toBeDisabled();
+    expect(field(view)).toHaveAttribute("aria-invalid", "true");
+    expect((field(view).getAttribute("aria-describedby") ?? "").split(" ")).toContain(
+      view.getByTestId("overlay-text-reason").id,
+    );
     type(field(view), "x".repeat(200));
     expect(reason(view)).toBeNull();
     expect(save(view)).not.toBeDisabled();
@@ -972,7 +1185,7 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
       "Up to 200 characters on up to 5 lines. An emoji counts as 2 or more. Enter starts a new line.",
       "An outline keeps text readable over a game.",
       "Lines break only where you press Enter.",
-      "Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not the size. Edit keeps its height and the side it's lined up to. Letters Divora's fonts don't have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc cancels.",
+      "Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not the size. Edit keeps its height and the side it's lined up to where it can: text too wide for the overlay, for example, is made smaller to fit. Letters Divora's fonts don't have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc cancels.",
     ]) {
       expect(within(ed).getByText(line)).toBeInTheDocument();
     }
@@ -987,9 +1200,9 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
 
   it("the copy: the light's help (its Hide line only where Windows offers Hide), the OBS line, the Background line and Colour mood", async () => {
     const LIGHT =
-      "The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY while Replay is on. It's part of the overlay, so Divora's recordings and OBS show it too, unless Hide from recordings is on.";
+      "The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY while Replay is on (not while it's held). It's part of the overlay, so Divora's recordings and OBS show it too, unless Hide from recordings is on.";
     const HIDE =
-      "With Hide from recordings on, it's drawn only while the overlay is locked and Divora has asked Windows to leave it out of captures. While you arrange, recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release, and for a moment when a recording ends without your Stop, such as Replay turning off or a take that ends by itself.";
+      "With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release, and for a moment when a recording ends without your Stop, such as Replay turning off or a take that ends by itself.";
     const first = mount();
     await flush();
     expect(first.getByText(LIGHT)).toBeInTheDocument();

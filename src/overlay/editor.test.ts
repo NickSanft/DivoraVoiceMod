@@ -6,6 +6,7 @@ import {
   keyAction,
   NUDGE_FLUSH_MS,
   shouldPreventKey,
+  SNAP_SLOP_PX,
   updateGesture,
 } from "./editor";
 import { moveRect, resizeRect, type Corner, type PxRect, type Size } from "./scene";
@@ -240,6 +241,58 @@ describe("gestures snap (v1.62.0)", () => {
     r = updateGesture(r, { x: 236, y: 168 });
     expect(r.preview).toEqual(resizeRect(R0, "se", 36, 18, V480));
     expect(r.guides).toEqual([]);
+  });
+
+  it("a click that only selects a charm never snaps it: under 3 px of travel it moves by the pointer", () => {
+    expect(SNAP_SLOP_PX).toBe(3);
+    // 4 px from the viewport's left edge (an arrow nudge put it there).
+    const near0 = { x: 4, y: 300, w: 100, h: 40 };
+    const begin = () => beginMove("p", 1, { x: 50, y: 320 }, near0, V480, T);
+    // A pixel of jitter down, or a move with no travel (a pen's pressure).
+    for (const [dx, dy] of [
+      [0, 1],
+      [0, 0],
+      [2, -2],
+      [-2.5, 0],
+    ]) {
+      const g = updateGesture(begin(), { x: 50 + dx!, y: 320 + dy! });
+      expect(g.preview, `${dx}, ${dy}`).toEqual(moveRect(near0, dx!, dy!, V480));
+      expect(g.guides).toEqual([]);
+      expect(g.armed).toBe(false);
+    }
+    expect(finishGesture(updateGesture(begin(), { x: 50, y: 320 }))).toBeNull();
+    expect(finishGesture(updateGesture(begin(), { x: 50, y: 321 }))).toEqual({
+      kind: "place",
+      id: "p",
+      rect: { x: 4, y: 301, w: 100, h: 40 },
+      viewport: V480,
+    });
+    // 3 px or more on either axis: it snaps, here onto the edge.
+    const g = updateGesture(begin(), { x: 50, y: 323 });
+    expect(g.armed).toBe(true);
+    expect(g.preview).toEqual({ x: 0, y: 303, w: 100, h: 40 });
+    expect(g.guides).toEqual([{ axis: "x", at: 0 }]);
+  });
+
+  it("once the pointer has gone 3 px, the gesture snaps until it ends, back near its start too", () => {
+    const near0 = { x: 4, y: 300, w: 100, h: 40 };
+    let g = beginMove("p", 1, { x: 50, y: 320 }, near0, V480, T);
+    g = updateGesture(g, { x: 60, y: 320 });
+    expect(g.armed).toBe(true);
+    g = updateGesture(g, { x: 51, y: 320 });
+    expect(g.preview.x).toBe(0);
+    expect(g.guides).toEqual([{ axis: "x", at: 0 }]);
+    // With Ctrl held it is still free, and snaps again when let go.
+    expect(updateGesture(g, { x: 51, y: 320 }, false).preview.x).toBe(5);
+    expect(updateGesture(updateGesture(g, { x: 51, y: 320 }, false), { x: 51, y: 320 }).preview.x).toBe(0);
+    // A corner resize too: a click on a handle doesn't snap it.
+    const r0 = { x: 100, y: 100, w: 136, h: 68 };
+    const begun = beginResize("p", "se", 1, { x: 236, y: 168 }, r0, V480, T);
+    const click = updateGesture(begun, { x: 237, y: 168 });
+    expect(click.guides).toEqual([]);
+    expect(click.preview).toEqual(resizeRect(r0, "se", 1, 0, V480));
+    const drag = updateGesture(updateGesture(begun, { x: 233, y: 168 }), { x: 237, y: 168 });
+    expect(drag.guides).toEqual([{ axis: "x", at: 240 }]);
   });
 
   it("snaps to the press's lines in the press's viewport", () => {

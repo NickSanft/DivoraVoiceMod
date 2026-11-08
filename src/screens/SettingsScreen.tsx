@@ -22,6 +22,7 @@
 
 import {
   batch,
+  createComputed,
   createEffect,
   createMemo,
   createSignal,
@@ -2392,12 +2393,14 @@ interface TextEditing {
  *  v1.62.0: the rows are keyed by id, each looking its charm up, so a
  *  commit that replaces a charm's object (a drag or a nudge on the overlay,
  *  a restack, a move that grows the scene, Save's own edit) keeps the row,
- *  and a focused Edit or Remove with it. The text editor's state lives
- *  here and the editor renders under the list, outside the rows, so those
- *  commits never re-create it either: its draft, caret and focus stay. One
- *  editor at a time; opening another discards this one's draft, as Cancel
- *  would. It survives its charm being removed (Delete in Arrange); Save then
- *  says the text was removed. */
+ *  and a focused Edit or Remove with it. A restack also moves the rows'
+ *  nodes, and moving a node drops the focus in it onto the page, so a
+ *  focused row button is focused again after the move. The text editor's
+ *  state lives here and the editor renders under the list, outside the
+ *  rows, so those commits never re-create it either: its draft, caret and
+ *  focus stay. One editor at a time; opening another discards this one's
+ *  draft, as Cancel would. It survives its charm being removed (Delete in
+ *  Arrange); Save then says the text was removed. */
 function OverlayCharmRows(): JSX.Element {
   const app = useApp();
   let box: HTMLDivElement | undefined;
@@ -2418,6 +2421,34 @@ function OverlayCharmRows(): JSX.Element {
     () => charms().map((e) => e.id),
     [],
     { equals: (a, b) => a.length === b.length && a.every((id, i) => id === b[i]) },
+  );
+  // A restack moves the rows' nodes (insertBefore, replaceChild), which
+  // drops the focus in a moved row onto the page. The focused row button is
+  // noted before the list moves them (a computation runs before the render
+  // effects that move nodes) and focused again after (a user effect runs
+  // after them).
+  let keptFocus: HTMLElement | null = null;
+  createComputed(
+    on(
+      ids,
+      () => {
+        const at = document.activeElement;
+        keptFocus =
+          at instanceof HTMLElement && box?.contains(at) === true && at.closest("[data-charm-row]") !== null ? at : null;
+      },
+      { defer: true },
+    ),
+  );
+  createEffect(
+    on(
+      ids,
+      () => {
+        const el = keptFocus;
+        keptFocus = null;
+        if (el?.isConnected && document.activeElement !== el) el.focus({ preventScroll: true });
+      },
+      { defer: true },
+    ),
   );
   const full = () => pictureCount(scene()) >= MAX_PICTURES;
   const hasCircle = () => charms().some((e) => e.type === "spellcircle");
@@ -2459,25 +2490,50 @@ function OverlayCharmRows(): JSX.Element {
     setEditing(null);
     ((which.id !== null ? editButton(which.id) : undefined) ?? addTextButton())?.focus();
   };
+  /** After a refused or failed save, if the editor still edits `which`:
+   *  the focus Save dropped, put back. Save is off while saving, and
+   *  Chromium moves the focus off a button that turns off, onto the page;
+   *  the editor stays open, so nothing else would put it back, and a
+   *  keyboard or screen-reader user would have lost their place. Back on
+   *  Save, where they were: a refusal's toast says why (a save that throws
+   *  is only logged, with no toast), Enter tries again, Tab reaches Cancel,
+   *  and a screen reader says only "Save" beside the toast (the Text field
+   *  would read its whole text and help). The Text field only if Save is
+   *  off (its text emptied meanwhile). Only a focus left on the page: one in
+   *  the editor (Ctrl+Enter from the field) or one the user moved elsewhere
+   *  meanwhile stays. */
+  const refocus = (which: TextEditing): void => {
+    if (editing() !== which) return;
+    const at = document.activeElement;
+    if (at !== null && at !== document.body) return;
+    const ed = box?.querySelector<HTMLElement>('[data-testid="overlay-text-editor"]');
+    const saveButton = ed?.querySelector<HTMLButtonElement>('[data-testid="overlay-text-save"]');
+    (saveButton && !saveButton.disabled ? saveButton : ed?.querySelector<HTMLElement>("textarea"))?.focus();
+  };
   const [saving, setSaving] = createSignal(false);
   const save = async (): Promise<void> => {
     const which = editing();
     const d = draft();
     if (which === null || saving() || readCharmText(d.text) === null) return;
     setSaving(true);
+    // A refused save (the overlay full, say) keeps the editor and its draft:
+    // its toast says why, and Save can try again, focused again. So does a
+    // save that throws, which is only logged.
+    let done = true;
     try {
       if (which.id === null) {
-        await app.addOverlayText(d);
+        done = await app.addOverlayText(d);
       } else {
         // Only what changed, so a field this build only reads (a later
         // build's font, a hand-set colour) stays as stored.
         const changes = changedFields(which.initial, d);
-        if (Object.keys(changes).length > 0) await app.editOverlayText(which.id, changes);
+        if (Object.keys(changes).length > 0) done = await app.editOverlayText(which.id, changes);
       }
     } finally {
       setSaving(false);
     }
-    close(which);
+    if (done) close(which);
+    else refocus(which);
   };
 
   return (
@@ -2570,10 +2626,29 @@ function OverlayCharmRows(): JSX.Element {
         >
           Add picture…
         </Button>
+        {/* The two Add buttons below go once they've added: from the
+            keyboard, the focus moves on to Add text…, not onto the page. */}
         <Show when={!hasCircle()}>
-          <Button size="sm" icon="modulated" onClick={() => app.addSpellCircle()}>
-            Add the spell circle
-          </Button>
+          {(_none) => {
+            let addCircle: HTMLButtonElement | undefined;
+            handOffFocus(
+              () => addCircle,
+              () => addTextButton() ?? undefined,
+            );
+            return (
+              <Button
+                ref={addCircle}
+                size="sm"
+                icon="modulated"
+                onClick={(e) => {
+                  blurOnPointer(e);
+                  app.addSpellCircle();
+                }}
+              >
+                Add the spell circle
+              </Button>
+            );
+          }}
         </Show>
         <Show when={TEXT_CHARMS}>
           <Button size="sm" icon="pencil" data-testid="overlay-add-text" onClick={() => open(null, readTextFields({}))}>
@@ -2581,9 +2656,27 @@ function OverlayCharmRows(): JSX.Element {
           </Button>
         </Show>
         <Show when={!app.overlayHasLight()}>
-          <Button size="sm" icon="record" data-testid="overlay-add-light" onClick={() => app.addRecordingLight()}>
-            Add the recording light
-          </Button>
+          {(_none) => {
+            let addLight: HTMLButtonElement | undefined;
+            handOffFocus(
+              () => addLight,
+              () => addTextButton() ?? undefined,
+            );
+            return (
+              <Button
+                ref={addLight}
+                size="sm"
+                icon="record"
+                data-testid="overlay-add-light"
+                onClick={(e) => {
+                  blurOnPointer(e);
+                  app.addRecordingLight();
+                }}
+              >
+                Add the recording light
+              </Button>
+            );
+          }}
         </Show>
       </div>
       <Show when={full()}>
@@ -2606,16 +2699,16 @@ function OverlayCharmRows(): JSX.Element {
       </Show>
       <div style={helpStyle}>
         The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY
-        while Replay is on. It's part of the overlay, so Divora's recordings and OBS show it too,
-        unless Hide from recordings is on.
+        while Replay is on (not while it's held). It's part of the overlay, so Divora's recordings
+        and OBS show it too, unless Hide from recordings is on.
       </div>
       <Show when={app.overlayStatus().hideAvailable}>
         <div style={helpStyle}>
-          With Hide from recordings on, it's drawn only while the overlay is locked and Divora has
-          asked Windows to leave it out of captures. While you arrange, recordings can see it. Like
-          the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release,
-          and for a moment when a recording ends without your Stop, such as Replay turning off or a
-          take that ends by itself.
+          With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked
+          Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings
+          can see it. Like the rest of the overlay, it may still show on Windows 10 and the first
+          Windows 11 release, and for a moment when a recording ends without your Stop, such as
+          Replay turning off or a take that ends by itself.
         </div>
       </Show>
       <div style={helpStyle}>
@@ -2659,6 +2752,7 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
   let field: HTMLTextAreaElement | undefined;
   const helpId = createUniqueId();
   const countId = createUniqueId();
+  const reasonId = createUniqueId();
   const heading = () => (props.isNew ? "New text" : "Edit text");
   const set = <K extends keyof TextInput>(k: K, v: TextInput[K]): void => props.onDraft({ ...props.draft, [k]: v });
   // As this build would store and draw it: a colour it can't use shows white.
@@ -2680,6 +2774,9 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
     }, 0);
   };
   const reason = () => textReason(props.draft.text, pasteCut());
+  // Invalid only for a limit the text breaks: a cut paste leaves text that
+  // fits.
+  const overLimit = () => textReason(props.draft.text, false) !== null;
   const savable = () => !props.saving && readCharmText(props.draft.text) !== null;
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.isComposing) return;
@@ -2717,7 +2814,8 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
           maxlength={MAX_TEXT}
           spellcheck
           aria-label="Overlay text"
-          aria-describedby={`${helpId} ${countId}`}
+          aria-describedby={reason() !== null ? `${helpId} ${countId} ${reasonId}` : `${helpId} ${countId}`}
+          aria-invalid={overLimit() ? "true" : undefined}
           value={props.draft.text}
           onPaste={onPaste}
           onInput={(e) => {
@@ -2753,11 +2851,17 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
         </div>
         <Show when={reason()}>
           {(r) => (
-            <div data-testid="overlay-text-reason" style={reasonStyle}>
+            <div id={reasonId} data-testid="overlay-text-reason" style={reasonStyle}>
               {r()}
             </div>
           )}
         </Show>
+        {/* Said as it appears, as the focus stays in the field (a cut paste,
+            a sixth line). Always mounted: a region inserted together with
+            its text is commonly missed. */}
+        <span class="sr-only" role="status" aria-live="polite" data-testid="overlay-text-reason-said">
+          {reason() ?? ""}
+        </span>
       </div>
       <Row label="Font">
         <Segmented<TextFont>
@@ -2856,8 +2960,9 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
       </div>
       <div style={helpStyle}>
         Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not
-        the size. Edit keeps its height and the side it's lined up to. Letters Divora's fonts don't
-        have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc
+        the size. Edit keeps its height and the side it's lined up to where it can: text too wide
+        for the overlay, for example, is made smaller to fit. Letters Divora's fonts don't have,
+        like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc
         cancels.
       </div>
     </div>

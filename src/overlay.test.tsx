@@ -655,6 +655,31 @@ describe("the overlay page's recording light (v1.62.0)", () => {
     fire(REC_EVENTS.take, RECORDING);
     expect(r.face()).toBe("REC 1:05");
   });
+
+  it("waits for Space Mono Bold as the timer face does, at most FONT_WAIT_MS", async () => {
+    // vi.waitFor would move the fake clock on and run out the wait: poll on
+    // the real one.
+    const realTimeout = globalThis.setTimeout.bind(globalThis);
+    const until = async (check: () => boolean): Promise<void> => {
+      for (let i = 0; i < 400 && !check(); i += 1) await new Promise((res) => realTimeout(res, 5));
+      expect(check()).toBe(true);
+    };
+    const load = vi.fn((_font: string) => new Promise(() => undefined));
+    Object.defineProperty(document, "fonts", { value: { load }, configurable: true });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const r = render(() => <OverlayApp />);
+    await until(() => log.includes("emit overlay:ready"));
+    const face = () => r.container.querySelector('[data-id="light"] [data-rec-face]')?.textContent ?? null;
+    fire("overlay:state", STATE);
+    fire("overlay:scene", push(lightScene(), 1));
+    fire("overlay:status", status());
+    fire(REC_EVENTS.replay, { state: "armed" });
+    expect(load).toHaveBeenCalledWith('700 1em "Space Mono"');
+    await vi.advanceTimersByTimeAsync(FONT_WAIT_MS - 1);
+    expect(face()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(face()).toBe("REPLAY");
+  });
 });
 
 describe("the overlay page's text charms (v1.62.0)", () => {
@@ -717,7 +742,8 @@ describe("the overlay page's text charms (v1.62.0)", () => {
     fire("overlay:scene", push(s, 1));
     fire("overlay:status", status());
     const face = () => q('[data-id="t"] [data-text-face]');
-    expect(load).toHaveBeenCalledWith('400 100px "Bricolage Grotesque Variable", system-ui, sans-serif', "BRB");
+    // Its words, and a space for the font's own first face (textMetrics.ts).
+    expect(load).toHaveBeenCalledWith('400 100px "Bricolage Grotesque Variable", system-ui, sans-serif', "BRB ");
     await vi.advanceTimersByTimeAsync(FONT_WAIT_MS - 1);
     expect(face()).toBeNull();
     await vi.advanceTimersByTimeAsync(1);

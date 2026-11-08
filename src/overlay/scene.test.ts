@@ -240,6 +240,27 @@ describe("readScene", () => {
     expect(s.elements[0]).toBe(e);
     expect(liveElements(s)).toEqual([]);
   });
+
+  it("v1.62.0: a stored text's lone surrogate half becomes U+FFFD, so the scene can still be pushed", () => {
+    // JSON.stringify writes a lone half as an escape that Rust's serde_json
+    // refuses, which would fail every push of the scene.
+    const lone = /\\ud[89a-f][0-9a-f]{2}/i;
+    const half = String.fromCharCode(0xd83c);
+    const raw = JSON.parse(JSON.stringify({ elements: [] })) as { elements: SceneElement[] };
+    const geo = { x: 0.1, y: 0.1, w: 0.2, h: 0.1, nw: 300, nh: 139 };
+    const bad = { id: "t", type: "text", ...geo, z: 1, text: ` BRB ${half}\r\n`, future: { k: 1 } };
+    const good = { id: "u", type: "text", ...geo, y: 0.5, z: 2, text: " 🎮 \r\n" };
+    const pic = picture("p", { x: 0.5, y: 0.5, w: 0.1, h: 0.1 }, { name: "a\tb" });
+    raw.elements.push(bad, good, pic);
+    expect(JSON.stringify(raw)).toMatch(lone);
+    const s = readScene(raw, fb);
+    expect(JSON.stringify(s)).not.toMatch(lone);
+    // Only that half changes; the rest of the text and every other key are
+    // kept as stored.
+    expect(s.elements[0]).toEqual({ ...bad, text: ` BRB �\r\n` });
+    expect(s.elements[1]).toBe(good);
+    expect(s.elements[2]).toBe(pic);
+  });
 });
 
 describe("migrateScene", () => {
@@ -1475,6 +1496,147 @@ describe("text charms and the recording light (v1.62.0)", () => {
     expect(next.designSize).toEqual(s.designSize);
   });
 
+  it("set keeps the aligned side where it is drawn in a window narrower than the design", () => {
+    // designSize grew to 1920 × 1080 in an earlier, bigger window; the
+    // window is now 960 × 540. Layout keeps a centre fraction, so the side
+    // is kept on screen, not as a fraction of the design.
+    const d = { w: 1920, h: 1080 };
+    const v = { w: 960, h: 540 };
+    const designed = { x: 0.3, y: 0.3, w: 600 / 1920, h: 100 / 1080 };
+    for (const [align, rect] of [
+      // Snapped to the window's left edge, and to its right edge.
+      ["left", { x: 0, y: 100, w: 600, h: 100 }],
+      ["right", { x: 360, y: 300, w: 600, h: 100 }],
+      ["center", { x: 100, y: 200, w: 600, h: 100 }],
+    ] as const) {
+      const s0 = sceneOf([text({ ...designed, align, nw: 600, nh: 100 })], d);
+      const s = applyOp(s0, { kind: "place", id: T, rect, viewport: v });
+      expectRectNear(rectOf(s, T, v), rect, 2e-3);
+      // Shortened to 200 × 100.
+      const next = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw: 200, nh: 100 }, viewport: v });
+      const after = rectOf(next, T, v);
+      expect(after.w, align).toBeCloseTo(200, 2);
+      expect(after.h, align).toBeCloseTo(100, 2);
+      if (align === "left") expect(after.x, align).toBeCloseTo(0, 2);
+      if (align === "right") expect(after.x + after.w, align).toBeCloseTo(960, 2);
+      if (align === "center") expect(after.x + after.w / 2, align).toBeCloseTo(400, 2);
+      expect(after.y + after.h / 2, align).toBeCloseTo(rect.y + 50, 2);
+      // Without a viewport, the design size's own: the side kept as a
+      // fraction of it, as in a window of that size.
+      const bare = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw: 200, nh: 100 } });
+      const there = rectOf(bare, T, d);
+      const was = rectOf(s, T, d);
+      if (align === "left") expect(there.x, align).toBeCloseTo(was.x, 2);
+      if (align === "right") expect(there.x + there.w, align).toBeCloseTo(was.x + was.w, 2);
+    }
+  });
+
+  it("set keeps the aligned side, and the box inside, in a window wider than the design", () => {
+    // The overlay was enlarged with no drag since, so the design is still
+    // 480 × 480 and the window draws a centre fraction of its own width: a
+    // stored x of 0 draws 50 px in. Keeping the side inside the design's
+    // fractions would move it.
+    const d = { w: 480, h: 480 };
+    const v = { w: 960, h: 540 };
+    for (const [align, x, side] of [
+      ["left", 0, 50],
+      ["right", 1 - 100 / 480, 910],
+    ] as const) {
+      const s = sceneOf([text({ x, y: 0.3, w: 100 / 480, h: 100 / 480, align, nw: 100, nh: 100 })], d);
+      const was = rectOf(s, T, v);
+      expect(align === "left" ? was.x : was.x + was.w, align).toBeCloseTo(side, 3);
+      // 1 : 1 to 3 : 1, 300 × 100: room in the window to keep its side.
+      const next = applyOp(s, { kind: "set", id: T, fields: { text: "wider", nw: 300, nh: 100 }, viewport: v });
+      const after = rectOf(next, T, v);
+      expect(after.w, align).toBeCloseTo(300, 2);
+      expect(align === "left" ? after.x : after.x + after.w, align).toBeCloseTo(side, 2);
+      expect(after.y + after.h / 2, align).toBeCloseTo(was.y + was.h / 2, 2);
+      expect(next.designSize).toEqual(d);
+    }
+  });
+
+  it("set keeps the aligned side, and the vertical centre, in a window that draws the text shrunk", () => {
+    const d = { w: 1920, h: 1080 };
+    // A 900 × 300 text in a short window, drawn 720 × 240, dragged to its
+    // left or right edge (place stores x past the design's own edge), then
+    // edited to 4 : 1: 1200 × 300, drawn 960 × 240. Its side stays on the
+    // window's edge.
+    const short = { w: 1920, h: 240 };
+    for (const align of ["left", "right"] as const) {
+      const s0 = sceneOf([text({ x: 0.3, y: 0.3, w: 900 / 1920, h: 300 / 1080, align, nw: 900, nh: 300 })], d);
+      const drawn = rectOf(s0, T, short);
+      expect(drawn.w).toBeCloseTo(720, 6);
+      expect(drawn.h).toBeCloseTo(240, 6);
+      const rect = { ...drawn, x: align === "left" ? 0 : 1920 - 720 };
+      const s = applyOp(s0, { kind: "place", id: T, rect, viewport: short });
+      if (align === "left") expect(at(s).x).toBeCloseTo(-0.046875, 6);
+      const after = rectOf(applyOp(s, { kind: "set", id: T, fields: { text: "long", nw: 1200, nh: 300 }, viewport: short }), T, short);
+      expect(after.w, align).toBeCloseTo(960, 2);
+      expect(after.h, align).toBeCloseTo(240, 2);
+      if (align === "left") expect(after.x, align).toBeCloseTo(0, 2);
+      else expect(after.x + after.w, align).toBeCloseTo(1920, 2);
+    }
+    // In a narrow window the same text is drawn 400 × 133.3 and dragged to
+    // the top or bottom edge (place stores y past the design's edge); at
+    // 4 : 1 it is drawn 400 × 100 around the same vertical centre.
+    const narrow = { w: 400, h: 1080 };
+    for (const edge of ["top", "bottom"] as const) {
+      const s0 = sceneOf([text({ x: 0.3, y: 0.3, w: 900 / 1920, h: 300 / 1080, align: "center", nw: 900, nh: 300 })], d);
+      const drawn = rectOf(s0, T, narrow);
+      const rect = { ...drawn, y: edge === "top" ? 0 : 1080 - drawn.h };
+      const s = applyOp(s0, { kind: "place", id: T, rect, viewport: narrow });
+      if (edge === "top") expect(at(s).y).toBeCloseTo(-0.07716, 5);
+      const after = rectOf(applyOp(s, { kind: "set", id: T, fields: { text: "long", nw: 1200, nh: 300 }, viewport: narrow }), T, narrow);
+      expect(after.w, edge).toBeCloseTo(400, 2);
+      expect(after.h, edge).toBeCloseTo(100, 2);
+      expect(after.y + after.h / 2, edge).toBeCloseTo(rect.y + rect.h / 2, 2);
+    }
+  });
+
+  it("set keeps the edited box inside the window it is seen in, vertically too", () => {
+    // A centred 1200 × 300 text in a 400 × 1080 window is drawn 400 × 100;
+    // dragged to the top edge, its centre is 50 px down. At 3 : 1 (900 ×
+    // 300) it is drawn 400 × 133.3, so keeping that centre would put its top
+    // 16.7 px above the window: it is kept inside, its centre at 66.7 px.
+    // This window's layout would clamp either way; what is stored shows in
+    // another window, e.g. 200 px wide.
+    const d = { w: 1920, h: 1080 };
+    const v = { w: 400, h: 1080 };
+    const s0 = sceneOf([text({ x: 0.3, y: 0.3, w: 1200 / 1920, h: 300 / 1080, align: "center", nw: 1200, nh: 300 })], d);
+    const drawn = rectOf(s0, T, v);
+    expect(drawn.h).toBeCloseTo(100, 6);
+    const s = applyOp(s0, { kind: "place", id: T, rect: { ...drawn, y: 0 }, viewport: v });
+    const next = applyOp(s, { kind: "set", id: T, fields: { text: "shorter", nw: 900, nh: 300 }, viewport: v });
+    const after = rectOf(next, T, v);
+    expect(after.h).toBeCloseTo(400 / 3, 2);
+    expect(after.y).toBeCloseTo(0, 2);
+    // Stored with the centre at 66.7 px of 1080, not 50: (200/3)/1080 − (300/1080)/2.
+    expect(at(next).y).toBeCloseTo(200 / 3 / 1080 - 150 / 1080, 5);
+    expect(rectOf(next, T, { w: 200, h: 1080 }).y).toBeCloseTo(100 / 3, 2);
+  });
+
+  it("set keeps the aligned side of a text the window draws scaled down to its height", () => {
+    // A 5-line text designed 600 × 700 in 1920 × 1080, in a 960 × 540
+    // window: drawn 462.9 × 540, at the window's left or right edge (the
+    // drawn size, so a move: 600 × 700 kept). Shortened to 400 × 700, it is
+    // drawn 308.6 × 540, its side on the same edge.
+    const d = { w: 1920, h: 1080 };
+    const v = { w: 960, h: 540 };
+    for (const align of ["left", "right"] as const) {
+      const s0 = sceneOf([text({ x: 0.3, y: 0.2, w: 600 / 1920, h: 700 / 1080, align, nw: 600, nh: 700 })], d);
+      const drawn = rectOf(s0, T, v);
+      expect(drawn.h).toBeCloseTo(540, 6);
+      const s = applyOp(s0, { kind: "place", id: T, rect: { ...drawn, x: align === "left" ? 0 : 960 - drawn.w }, viewport: v });
+      const designed = rectOf(s, T, d);
+      expect(designed.w).toBeCloseTo(600, 3);
+      expect(designed.h).toBeCloseTo(700, 3);
+      const after = rectOf(applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw: 400, nh: 700 }, viewport: v }), T, v);
+      expect(after.w, align).toBeCloseTo((400 * 540) / 700, 2);
+      if (align === "left") expect(after.x, align).toBeCloseTo(0, 2);
+      else expect(after.x + after.w, align).toBeCloseTo(960, 2);
+    }
+  });
+
   it("set table: the alignment after the patch names the side", () => {
     const s = sceneOf([text({ align: "center" })]);
     expect(box(at(edit(s, { align: "left", nw: 337, nh: 139 })))).toEqual({ x: 0.25, y: 0.4, w: 0.242446, h: 0.1 });
@@ -1737,10 +1899,48 @@ describe("text charms and the recording light (v1.62.0)", () => {
     const big = defaultLightRect(sceneOf([], { w: 3840, h: 2160 }), { w: 3840, h: 2160 });
     // Stored to 6 decimals: within a thousandth of a fraction's px.
     expect(big.h * 2160).toBeCloseTo(96, 2);
-    // Scaled down together to 90 % of a narrow window's width.
+    // Never below 24 px tall where the window allows, even past 90 % of
+    // its width: in a 125 px wide window 90 % would be 112.5 × 22.5, which
+    // its first drag would grow, so it starts at 120 × 24…
+    const slim = defaultLightRect(sceneOf([], { w: 125, h: 480 }), { w: 125, h: 480 });
+    expect(slim.w * 125).toBeCloseTo(120, 3);
+    expect(slim.h * 480).toBeCloseTo(24, 3);
+    // …and in a 100 px wide one, 90 × 18 becomes the whole width, 100 × 20.
     const narrow = defaultLightRect(sceneOf([], { w: 100, h: 480 }), { w: 100, h: 480 });
-    expect(narrow.w * 100).toBeCloseTo(90, 3);
-    expect((narrow.w * 100) / (narrow.h * 480)).toBeCloseTo(5, 3);
+    expect(narrow.w * 100).toBeCloseTo(100, 3);
+    expect(narrow.h * 480).toBeCloseTo(20, 3);
+    expect(narrow.x).toBe(0);
+  });
+
+  it("a new text or light is born the size place stores in a window the size of its design, so its first drag, nudge or key resize keeps it", () => {
+    // A 50-character one-line text (2900 × 139, about 21 : 1) in the default
+    // 480 × 480 window: 90 % of the width would be 432 × 20.7, under 24 px,
+    // and its first place would grow it to 480 × 23 at x 0.
+    const s0 = sceneOf([circle()]);
+    const r = defaultTextRect(s0, 2900, 139, D480);
+    expect(r.h * 480).toBeGreaterThanOrEqual(23);
+    const s = applyOp(s0, { kind: "add", element: known(text({ id: "N", ...r, nw: 2900, nh: 139 })) });
+    const shown = rectOf(s, "N", D480);
+    expect(shown.w).toBeCloseTo(480, 3);
+    expect(shown.h).toBeCloseTo((480 * 139) / 2900, 3);
+    for (const [name, rect] of [
+      ["dragged 10 px down", moveRect(shown, 0, 10, D480)],
+      ["nudged 1 px up", moveRect(shown, 0, -1, D480)],
+    ] as const) {
+      const next = applyOp(s, { kind: "place", id: "N", rect, viewport: D480 });
+      const after = rectOf(next, "N", D480);
+      // A move: the size kept, where it was dropped.
+      expect([at(next, "N").w, at(next, "N").h], name).toEqual([at(s, "N").w, at(s, "N").h]);
+      expectRectNear(after, rect, 1e-3);
+    }
+    // The light in a 100 px wide window: its first nudge is a move too.
+    const view = { w: 100, h: 480 };
+    const where = defaultLightRect(sceneOf([], view), view);
+    const lit = applyOp(sceneOf([], view), { kind: "add", element: known(light({ ...where })) });
+    const was = rectOf(lit, L, view);
+    const nudged = applyOp(lit, { kind: "place", id: L, rect: moveRect(was, 0, -1, view), viewport: view });
+    expect([at(nudged, L).w, at(nudged, L).h]).toEqual([at(lit, L).w, at(lit, L).h]);
+    expectRectNear(rectOf(nudged, L, view), { ...was, y: was.y - 1 }, 1e-3);
   });
 
   it("defaultLightRect sits below Arrange's grip and Lock pill (top 6 px, 28 px tall)", () => {
@@ -1779,10 +1979,30 @@ describe("text charms and the recording light (v1.62.0)", () => {
   });
 
   it("defaultTextRect scales a wide text down to 90 % of the window's width, its shape kept", () => {
-    const r = defaultTextRect(sceneOf([]), 4000, 139, D480);
+    // 1000 : 139 at 48 px tall is 345 px: under 432, kept.
+    const fits = defaultTextRect(sceneOf([]), 1000, 139, D480);
+    expect(fits.w * 480).toBeCloseTo((48 * 1000) / 139, 3);
+    // 2000 : 139 is 691 px: scaled down to 432 × 30, still 24 px or more.
+    const r = defaultTextRect(sceneOf([]), 2000, 139, D480);
     expect(r.w * 480).toBeCloseTo(432, 3);
-    expect((r.w * 480) / (r.h * 480)).toBeCloseTo(4000 / 139, 3);
+    expect((r.w * 480) / (r.h * 480)).toBeCloseTo(2000 / 139, 3);
     expect(r.x).toBeCloseTo(0.05, 5);
+  });
+
+  it("defaultTextRect keeps a very wide text 24 px tall where it can, up to the window's whole width", () => {
+    // 3000 : 139 at 90 % would be 432 × 20: 24 px tall is 518, wider than
+    // the window, so it takes the whole width, 480 × 22.24, at x 0.
+    const r = defaultTextRect(sceneOf([]), 3000, 139, D480);
+    expect(r.w * 480).toBeCloseTo(480, 3);
+    expect(r.h * 480).toBeCloseTo((480 * 139) / 3000, 3);
+    expect(r.x).toBe(0);
+    // Where 24 px tall fits the window's width, it is 24 px tall, past 90 %:
+    // 3336 : 139 (24 : 1) in a 600 px wide window is 576 × 24, centred.
+    const view = { w: 600, h: 300 };
+    const past = defaultTextRect(sceneOf([], view), 3336, 139, view);
+    expect(past.h * 300).toBeCloseTo(24, 3);
+    expect(past.w * 600).toBeCloseTo(576, 3);
+    expect(past.x + past.w / 2).toBeCloseTo(0.5, 5);
   });
 
   it("defaultTextRect: each live text already there puts the next 6 % lower, five places round", () => {

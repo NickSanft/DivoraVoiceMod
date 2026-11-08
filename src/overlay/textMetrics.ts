@@ -14,7 +14,7 @@
 // the fallback when it fires, and measures again when the font does arrive,
 // which a capped `load` would never tell it.
 
-import { REF_PX, type TextMetrics } from "./text";
+import { REF_PX, type TextInk, type TextMetrics } from "./text";
 
 /** The longest a face waits for its font before it draws in the fallback,
  *  and the longest main waits before measuring. The overlay page
@@ -51,6 +51,21 @@ function faceSettings(ctx: CanvasRenderingContext2D): void {
   ctx.fontKerning = "normal";
   ctx.letterSpacing = "0px";
   ctx.textRendering = "optimizeLegibility";
+  // `ink` reads from the alphabetic baseline, as CSS lays a line out.
+  ctx.textBaseline = "alphabetic";
+}
+
+/** One line measured on the shared canvas at `spec`; null where the window
+ *  has no 2D canvas. */
+function measured(spec: string, line: string): ReturnType<CanvasRenderingContext2D["measureText"]> | null {
+  const ctx = context();
+  if (!ctx) return null;
+  if (sharedSpec !== spec) {
+    ctx.font = spec;
+    sharedSpec = spec;
+    faceSettings(ctx);
+  }
+  return ctx.measureText(line);
 }
 
 /** `document.fonts.load(spec, sample)` settled either way; at once where the
@@ -69,14 +84,24 @@ function fontsLoaded(spec: string, sample: string): Promise<void> {
 }
 
 /** The window's measure. `load` waits for `document.fonts.load(spec,
- *  sample)` (the named families' faces for those letters; generic families
- *  are skipped), at most `waitMs`, and never rejects; pass `Infinity` for
- *  no cap. `width` is one line's width at `spec` on the shared canvas, in
- *  CSS px, or NO_CANVAS_EM a code unit where the window has no 2D canvas. */
+ *  sample + " ")` (the named families' faces for those letters, and for
+ *  the space; generic families are skipped), at most `waitMs`, and never
+ *  rejects; pass `Infinity` for no cap. The space is there because the
+ *  face that has it is the line's first font, whose ascent and descent
+ *  place each line (`ink`'s font ascent and descent), and the face draws
+ *  in it. A text with none of the font's own letters (one Cyrillic word,
+ *  say, or an emoji) would otherwise load nothing, and a window that
+ *  hadn't loaded that face yet (the overlay page) would measure its lines
+ *  by a fallback's ascent and descent, while main, whose own UI has loaded
+ *  it, measures by the font's. `width` is one line's width at `spec` on
+ *  the shared canvas, in CSS px, or NO_CANVAS_EM a code unit where the
+ *  window has no 2D canvas. `ink` is the same measure's ink (its actual
+ *  and font bounding boxes from the baseline), or null with no 2D canvas
+ *  or a value that isn't a finite number. */
 export function canvasMetrics(waitMs: number = FONT_WAIT_MS): TextMetrics {
   return {
     load(spec, sample) {
-      const loaded = fontsLoaded(spec, sample);
+      const loaded = fontsLoaded(spec, `${sample} `);
       if (!Number.isFinite(waitMs)) return loaded;
       return new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, Math.max(0, waitMs));
@@ -87,14 +112,19 @@ export function canvasMetrics(waitMs: number = FONT_WAIT_MS): TextMetrics {
       });
     },
     width(spec, line) {
-      const ctx = context();
-      if (!ctx) return NO_CANVAS_EM * REF_PX * line.length;
-      if (sharedSpec !== spec) {
-        ctx.font = spec;
-        sharedSpec = spec;
-        faceSettings(ctx);
-      }
-      return ctx.measureText(line).width;
+      const m = measured(spec, line);
+      return m ? m.width : NO_CANVAS_EM * REF_PX * line.length;
+    },
+    ink(spec, line): TextInk | null {
+      const m = measured(spec, line);
+      if (!m) return null;
+      const ink = {
+        ascent: m.actualBoundingBoxAscent,
+        descent: m.actualBoundingBoxDescent,
+        fontAscent: m.fontBoundingBoxAscent,
+        fontDescent: m.fontBoundingBoxDescent,
+      };
+      return Object.values(ink).every((n) => typeof n === "number" && Number.isFinite(n)) ? ink : null;
     },
   };
 }

@@ -191,10 +191,12 @@ export function snapMove(r: PxRect, t: SnapTargets, v: Size, on: boolean): Snapp
  *  side taken from `rect0`'s shape. Only a size `resizeRect` itself could
  *  give is kept: its short side at least `min` (or, for an element that is
  *  already smaller and can't reach `min` here, at least its own) and
- *  inside `v`; a line that breaks either is passed over for the next
- *  nearest. The nearer of the two axes' snaps wins, x on a tie. One guide,
- *  for the snapped axis. `r` itself, and no guides, when nothing snaps or
- *  `on` is false. */
+ *  inside `v`, and only one whose other side, too, moves at most SNAP_PX
+ *  from the preview's (so a wide charm's x edge, or a tall one's y edge,
+ *  never jumps by the shape); a line that breaks any of these is passed
+ *  over for the next nearest. The nearer of the two axes' snaps wins, x on
+ *  a tie. One guide, for the snapped axis. `r` itself, and no guides, when
+ *  nothing snaps or `on` is false. */
 export function snapResize(
   r: PxRect,
   rect0: PxRect,
@@ -219,9 +221,13 @@ export function snapResize(
   const floor = short0 * (sFloor > sMax ? Math.min(1, sMax) : sFloor);
 
   /** The rect with this width and height, anchored at the still corner;
-   *  null when it is below the floor or outside `v`. */
+   *  null when it is below the floor, outside `v`, or either side is more
+   *  than SNAP_PX from the preview's. The last keeps the side the shape
+   *  derives from jumping: snapping a 10 : 1 text's bottom edge 8 px would
+   *  move its right edge 80 px, and hold it there across 160 px of drag. */
   const sized = (w: number, h: number): PxRect | null => {
     if (!(w > 0) || !(h > 0) || Math.min(w, h) < floor - EPS) return null;
+    if (!near(w - r.w) || !near(h - r.h)) return null;
     const x = sx > 0 ? ox : ox - w;
     const y = sy > 0 ? oy : oy - h;
     if (x < -EPS || y < -EPS || x + w > v.w + EPS || y + h > v.h + EPS) return null;

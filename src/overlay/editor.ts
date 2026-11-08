@@ -7,9 +7,10 @@
 // Pure, so every rule is a table test.
 //
 // v1.62.0: a pointer gesture snaps (snap.ts). Its press fixes the lines it
-// can snap to; each update snaps the preview and keeps the guides to draw,
-// so what is drawn and what `place` stores is the snapped rectangle. Keys
-// never snap: a nudge run starts a gesture with no lines.
+// can snap to; each update, once the pointer has gone SNAP_SLOP_PX from the
+// press, snaps the preview and keeps the guides to draw, so what is drawn
+// and what `place` stores is the snapped rectangle. Keys never snap: a
+// nudge run starts a gesture with no lines.
 
 import {
   MIN_ELEMENT_PX,
@@ -26,6 +27,13 @@ import { snapMove, snapResize, type Guide, type SnapTargets } from "./snap";
  *  sent. */
 export const NUDGE_FLUSH_MS = 300;
 
+/** v1.62.0: how far, in CSS px on either axis, the pointer must travel from
+ *  its press before a gesture snaps (under Windows' 4 px drag threshold).
+ *  A click that only selects a charm, with a pixel of jitter, moves it by
+ *  that jitter as before v1.62.0, never up to SNAP_PX onto a line. Once
+ *  reached, the gesture snaps until it ends, back near its start too. */
+export const SNAP_SLOP_PX = 3;
+
 type Point = { x: number; y: number };
 
 /** v1.62.0: a gesture with nothing to snap to: a nudge run, and any
@@ -33,8 +41,9 @@ type Point = { x: number; y: number };
 const NO_TARGETS: SnapTargets = Object.freeze({ xs: Object.freeze([]), ys: Object.freeze([]) });
 
 /** v1.62.0: `targets` are the lines fixed at the press (snap.ts's
- *  `snapTargets`, in `v0`), and `guides` the lines the preview is snapped
- *  to, drawn while the pointer is down. */
+ *  `snapTargets`, in `v0`), `guides` the lines the preview is snapped to,
+ *  drawn while the pointer is down, and `armed` whether the pointer has
+ *  gone SNAP_SLOP_PX from its press, so the gesture snaps. */
 export type Gesture =
   | {
       kind: "move";
@@ -46,6 +55,7 @@ export type Gesture =
       targets: SnapTargets;
       preview: PxRect;
       guides: Guide[];
+      armed: boolean;
     }
   | {
       kind: "resize";
@@ -58,6 +68,7 @@ export type Gesture =
       targets: SnapTargets;
       preview: PxRect;
       guides: Guide[];
+      armed: boolean;
     };
 
 export function beginMove(
@@ -68,7 +79,18 @@ export function beginMove(
   v: Size,
   targets: SnapTargets = NO_TARGETS,
 ): Gesture {
-  return { kind: "move", id, pointerId, start: at, rect0: rect, v0: v, targets, preview: rect, guides: [] };
+  return {
+    kind: "move",
+    id,
+    pointerId,
+    start: at,
+    rect0: rect,
+    v0: v,
+    targets,
+    preview: rect,
+    guides: [],
+    armed: false,
+  };
 }
 
 export function beginResize(
@@ -80,23 +102,39 @@ export function beginResize(
   v: Size,
   targets: SnapTargets = NO_TARGETS,
 ): Gesture {
-  return { kind: "resize", id, corner, pointerId, start: at, rect0: rect, v0: v, targets, preview: rect, guides: [] };
+  return {
+    kind: "resize",
+    id,
+    corner,
+    pointerId,
+    start: at,
+    rect0: rect,
+    v0: v,
+    targets,
+    preview: rect,
+    guides: [],
+    armed: false,
+  };
 }
 
 /** The gesture with its preview for the pointer at `at`, from where it
  *  started, in the viewport it started in. v1.62.0: snapped to the press's
- *  lines unless `snap` is false (snap.ts's `snapOn`: the bypass key held).
- *  Re-run at the last pointer point when that key changes mid-gesture. */
+ *  lines unless `snap` is false (snap.ts's `snapOn`: the bypass key held),
+ *  once the pointer has gone SNAP_SLOP_PX from its press on either axis;
+ *  until then the preview is the pointer's own. Re-run at the last pointer
+ *  point when that key changes mid-gesture. */
 export function updateGesture(g: Gesture, at: Point, snap = true): Gesture {
   const dx = at.x - g.start.x;
   const dy = at.y - g.start.y;
+  const armed = g.armed || Math.max(Math.abs(dx), Math.abs(dy)) >= SNAP_SLOP_PX;
+  const on = snap && armed;
   if (g.kind === "move") {
-    const { rect, guides } = snapMove(moveRect(g.rect0, dx, dy, g.v0), g.targets, g.v0, snap);
-    return { ...g, preview: rect, guides };
+    const { rect, guides } = snapMove(moveRect(g.rect0, dx, dy, g.v0), g.targets, g.v0, on);
+    return { ...g, preview: rect, guides, armed };
   }
   const raw = resizeRect(g.rect0, g.corner, dx, dy, g.v0);
-  const { rect, guides } = snapResize(raw, g.rect0, g.corner, g.targets, g.v0, snap, MIN_ELEMENT_PX);
-  return { ...g, preview: rect, guides };
+  const { rect, guides } = snapResize(raw, g.rect0, g.corner, g.targets, g.v0, on, MIN_ELEMENT_PX);
+  return { ...g, preview: rect, guides, armed };
 }
 
 /** The edit a released gesture makes; null when it moved nothing (under

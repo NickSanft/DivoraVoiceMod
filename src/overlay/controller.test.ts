@@ -1203,7 +1203,8 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
     expect(SANS_BOLD).toBe(fontSpec("sans", true));
     expect(texts(h.c.overlayScene())).toEqual([]);
     m.release("BRB");
-    await adding;
+    // True: added, so Settings closes its editor.
+    expect(await adding).toBe(true);
     expect(m.calls).toEqual([`load ${SANS_BOLD} | BRB`, `width ${SANS_BOLD} | BRB`]);
     // 30 px of text + 0.12 em a side; one line of 1.15 em + 0.12 em top and
     // bottom.
@@ -1258,7 +1259,8 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
     const h = await opened(undefined, m.metrics);
     const saves = h.saves(SCENE);
     const refused = ["x".repeat(201), "1\n2\n3\n4\n5\n6", "1 2 3 4 5 6", "   ", "\u0007"];
-    for (const text of refused) await h.c.addOverlayText(input({ text }));
+    // False: refused, so Settings keeps its editor and the draft.
+    for (const text of refused) expect(await h.c.addOverlayText(input({ text })), text).toBe(false);
     expect(m.calls).toEqual([]);
     expect(texts(h.c.overlayScene())).toEqual([]);
     expect(h.saves(SCENE)).toBe(saves);
@@ -1271,9 +1273,26 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
   it("Add text at 64 stored elements says the overlay is full", async () => {
     const stored = Array.from({ length: MAX_ELEMENTS - 1 }, (_, i) => ({ id: `t${i}`, type: "future" }));
     const h = await opened(sceneWith(...stored));
-    await h.c.addOverlayText(input());
+    expect(await h.c.addOverlayText(input())).toBe(false);
     expect(texts(h.c.overlayScene())).toEqual([]);
     expect(h.toasts).toEqual([{ text: FULL, tone: "error" }]);
+  });
+
+  it("a text save that fails (the measure throws) is logged and answers false, so Settings keeps its editor", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const broken: TextMetrics = {
+      load: async () => undefined,
+      width: () => {
+        throw new Error("no canvas");
+      },
+    };
+    const h = await opened(sceneWith(textEl("t")), broken);
+    const scene = h.c.overlayScene();
+    expect(await h.c.addOverlayText(input())).toBe(false);
+    expect(await h.c.editOverlayText("t", { text: "BRB now" })).toBe(false);
+    expect(h.c.overlayScene()).toBe(scene);
+    expect(warn.mock.calls.map((c) => c[0])).toEqual(["overlay: adding a text failed", "overlay: editing a text failed"]);
+    warn.mockRestore();
   });
 
   it("a text is sized for the window, not for a scene grown bigger than it", async () => {
@@ -1281,8 +1300,57 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
     const h = await opened(big);
     await h.c.addOverlayText(input());
     const t = texts(h.c.overlayScene())[0]!;
-    // 10 % of the window's 480, not of the scene's 1200.
-    expect((t.h as number) * 1200).toBeCloseTo(48, 3);
+    // 10 % of the window's 480, not of the scene's 1200: 48 px tall, so the
+    // 54 × 139 "BRB" is 18.6 px wide, raised to 24 wide and 61.8 tall (the
+    // floor `place` keeps). For the scene's 1200 it would be 120 tall.
+    expect((t.h as number) * 1200).toBeCloseTo((24 * 139) / 54, 2);
+  });
+
+  it("Add text and Edit measure the ink too: a Vietnamese capital's marks get room in the stored box", async () => {
+    // 116 above the baseline at 100 px; Display Bold's first font (93 and 27)
+    // puts the line's own box 90.5 above it: 25.5 px more on top.
+    const viet = "Ổ Ỗ Ộ";
+    const ink = vi.fn((_spec: string, line: string) => ({
+      ascent: line === viet ? 116 : 70,
+      descent: 20,
+      fontAscent: 93,
+      fontDescent: 27,
+    }));
+    const h = await opened(undefined, { ...TEN_PX, ink });
+    expect(await h.c.addOverlayText(input({ text: viet, font: "display" }))).toBe(true);
+    expect(ink).toHaveBeenCalledWith(fontSpec("display", true), viet);
+    // 50 px of text and 0.12 em a side, by one line, 0.375 em above and
+    // 0.12 below: 115 + 37.5 + 12 = 164.5, up to 165.
+    const t = texts(h.c.overlayScene())[0]!;
+    expect(t).toMatchObject({ text: viet, nw: 74, nh: 165 });
+    // Edited to Latin: back to 139.
+    expect(await h.c.editOverlayText(t.id, { text: "BRB" })).toBe(true);
+    expect(texts(h.c.overlayScene())[0]).toMatchObject({ text: "BRB", nw: 54, nh: 139 });
+  });
+
+  it("Edit keeps a text's aligned side where the window draws it, in a scene designed bigger than the window", async () => {
+    // Designed at 1200 × 1200 in an earlier, bigger window; the window is
+    // 480. A 300 × 100 left-aligned text on the window's left edge, and a
+    // right-aligned one on its right edge.
+    const big = migrateScene({ w: 1200, h: 1200, scale: 1 });
+    const one = { w: 0.25, h: 100 / 1200, nw: 300, nh: 100 };
+    const h = await opened({
+      ...big,
+      designSize: { w: 1200, h: 1200 },
+      elements: [
+        ...big.elements,
+        textEl("L", { ...one, align: "left", x: 0.3125 - 0.125, y: 0.2 }),
+        textEl("R", { ...one, align: "right", x: 0.6875 - 0.125, y: 0.6 }),
+      ],
+    });
+    const drawn = (id: string) => layoutScene(h.c.overlayScene(), V480).find((e) => e.el.id === id)!.rect;
+    expect(drawn("L").x).toBeCloseTo(0, 2);
+    expect(drawn("R").x + drawn("R").w).toBeCloseTo(480, 2);
+    // Shortened: "BRB now" measures 94 × 139.
+    for (const id of ["L", "R"]) expect(await h.c.editOverlayText(id, { text: "BRB now" })).toBe(true);
+    expect(drawn("L").w).toBeCloseTo((100 * 94) / 139, 2);
+    expect(drawn("L").x).toBeCloseTo(0, 2);
+    expect(drawn("R").x + drawn("R").w).toBeCloseTo(480, 2);
   });
 
   it("Edit commits a set of only the changed fields: the height and the side the alignment names kept, the rest as stored", async () => {
@@ -1296,7 +1364,7 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
       m.metrics,
     );
     const before = h.pushes.length;
-    for (const id of ["C", "L", "R"]) await h.c.editOverlayText(id, { text: "BRB now" });
+    for (const id of ["C", "L", "R"]) expect(await h.c.editOverlayText(id, { text: "BRB now" })).toBe(true);
     // A font this build can't use measures as Sans, as the face draws it.
     expect(m.calls.slice(0, 2)).toEqual([`load ${SANS_BOLD} | BRB now`, `width ${SANS_BOLD} | BRB now`]);
     const byId = (id: string) => h.c.overlayScene().elements.find((e) => e.id === id)!;
@@ -1339,7 +1407,8 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
     const saves = h.saves(SCENE);
     const pushes = h.pushes.length;
     const same: Array<Partial<TextInput>> = [{}, { text: "BRB" }, { text: "  BRB\n" }, { color: "#ABCDEF" }, { font: "sans" }];
-    for (const changes of same) await h.c.editOverlayText("t", changes);
+    // True: nothing to change, so the editor is done.
+    for (const changes of same) expect(await h.c.editOverlayText("t", changes)).toBe(true);
     expect(h.c.overlayScene()).toBe(scene);
     expect(h.saves(SCENE)).toBe(saves);
     expect(h.pushes.length).toBe(pushes);
@@ -1361,7 +1430,8 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
       { color: "red" },
       { color: "#abcdeg" },
     ];
-    for (const changes of bad) await h.c.editOverlayText("t", changes as Partial<TextInput>);
+    // False: Settings keeps its editor.
+    for (const changes of bad) expect(await h.c.editOverlayText("t", changes as Partial<TextInput>)).toBe(false);
     expect(m.calls).toEqual([]);
     expect(h.c.overlayScene()).toBe(scene);
     expect(h.toasts).toEqual(bad.map(() => ({ text: TEXT_REFUSED, tone: "error" })));
@@ -1370,8 +1440,9 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
   it("an Edit of a text that's gone says so: never there, not a text, or removed while its font loaded", async () => {
     const m = slowMetrics("BRB now");
     const h = await opened(sceneWith(textEl("t")), m.metrics);
-    await h.c.editOverlayText("nope", { text: "hi" });
-    await h.c.editOverlayText(CIRCLE_ID, { text: "hi" });
+    // True: nothing is left to edit, so the editor is done.
+    expect(await h.c.editOverlayText("nope", { text: "hi" })).toBe(true);
+    expect(await h.c.editOverlayText(CIRCLE_ID, { text: "hi" })).toBe(true);
     expect(m.calls).toEqual([]);
     expect(h.toasts).toEqual([
       { text: TEXT_GONE, tone: "error" },
@@ -1384,7 +1455,7 @@ describe("overlay controller — text charms and the light (v1.62.0)", () => {
     h.edit({ instance: 1, seq: 0, op: { kind: "remove", id: "t" } });
     await flush();
     m.release("BRB now");
-    await editing;
+    expect(await editing).toBe(true);
     expect(texts(h.c.overlayScene())).toEqual([]);
     expect(h.toasts.at(-1)).toEqual({ text: TEXT_GONE, tone: "error" });
   });

@@ -700,11 +700,13 @@ export interface AppState {
   removeOverlayElement: (id: string) => Promise<void>;
   addSpellCircle: () => void;
   /** v1.62.0: Add text… — measures the text and adds a text charm, or
-   *  toasts why not. Settles after its commit or refusal. */
-  addOverlayText: (input: TextInput) => Promise<void>;
+   *  toasts why not. Settles after its commit or refusal: true only when it
+   *  was added. */
+  addOverlayText: (input: TextInput) => Promise<boolean>;
   /** v1.62.0: Save for an existing text charm, with only the fields that
-   *  changed. Settles after its commit or refusal. */
-  editOverlayText: (id: string, changes: Partial<TextInput>) => Promise<void>;
+   *  changed. Settles after its commit or refusal: true when the editor is
+   *  done (saved, nothing to change, or the text removed). */
+  editOverlayText: (id: string, changes: Partial<TextInput>) => Promise<boolean>;
   /** v1.62.0: Add the recording light, unless the overlay has one. */
   addRecordingLight: () => void;
   /** v1.62.0: the scene has a live recording light. Reactive. */

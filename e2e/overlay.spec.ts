@@ -9,10 +9,14 @@
 // v1.59.0: the same for Hourglass's timers, with emitTimers.
 //
 // v1.62.0 (Text charms, design §10.4): text faces drawn in the real fonts
-// and fitted by the page's own measure (E1); the recording light from the
-// recorder's own events, through the page's status and the Hide gate (E2);
-// snapping, and Ctrl placing freely, with real pointer and key events (E3);
-// and a text added and edited in Settings, drawn on the overlay (E4). The
+// and fitted by the page's own measure (E1), Vietnamese marks and their
+// outline too (E1b), and a text with none of its font's letters measured
+// by that font's line, as main measures it (E1c); the recording light from
+// the recorder's own events,
+// through the page's status and the Hide gate (E2); snapping, and Ctrl
+// placing freely, with real pointer and key events (E3); and a text added
+// and edited in Settings, drawn on the overlay, an Add refused while the
+// overlay is full keeping the focus (E4). The
 // recorder's events are sent the same way: a take's with emitTake, Replay's
 // with emitReplay.
 
@@ -35,7 +39,7 @@ import {
 } from "./tauri-mock";
 import wire from "../src/overlay/wire.fixture.json" with { type: "json" };
 import type { OverlayStatus } from "../src/overlay/status";
-import { drawText, FONTS, fontSpec, type TextFont } from "../src/overlay/text";
+import { drawText, fitTextFont, FONTS, fontSpec, textBox, textPads, type TextFont } from "../src/overlay/text";
 import type { TimerSnapshot } from "../src/overlay/timerState";
 
 const INSTANCE = 3;
@@ -108,6 +112,183 @@ function textRow(i: number, fields: Record<string, unknown>): Record<string, unk
 /** v1.62.0: words the bundled fonts don't have (Cyrillic, Greek, CJK and an
  *  emoji), which fall back to Windows' fonts through the face's stack. */
 const NON_LATIN = "Привет Γειά 你好 🎮";
+
+/** v1.62.0: text charm `i` of E1b's four, one under another, each 432×96 at
+ *  480×480 (whole pixels): (24, 8 + 120·i). Wider than any of their words'
+ *  shapes, so each face is bound by its height, and only the room measured
+ *  for the marks above the line keeps them inside. Bold, white (the dark
+ *  outline), outlined and centred unless `fields` say otherwise. */
+function vietRow(i: number, fields: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: `viet-${i}`,
+    type: "text",
+    x: 0.05,
+    y: (8 + 120 * i) / 480,
+    w: 0.9,
+    h: 0.2,
+    z: i,
+    nw: 432,
+    nh: 96,
+    bold: true,
+    color: "#ffffff",
+    outline: true,
+    align: "center",
+    ...fields,
+  };
+}
+
+/** v1.62.0: what a text face draws, read in the page (E1, E1b): its font,
+ *  its words' extent and their ink, its outline's reach, its box, its laid-
+ *  out size and the backstop. Passed to `evaluate`, so it uses nothing from
+ *  this file. */
+function readFace(el: Element, a: { spec: string; words: string }) {
+  const lines = el.firstElementChild as HTMLElement;
+  const node = lines.firstChild as Text;
+  const box = (el.closest("[data-charm]") as HTMLElement).getBoundingClientRect();
+  const css = getComputedStyle(el);
+  // Where each line's words sit, and their glyphs' ink. A Range's box runs
+  // across the words' advances, but up and down it is the font's content
+  // area (its ascent and descent), not ink: Space Mono Bold's is about
+  // 1.47 em, taller than its 1.15 em line, so it reads past a row its
+  // glyphs are well inside. So the ink up and down is the canvas's, at the
+  // face's font, from each line's baseline (the Range's top plus the face's
+  // own font's ascent).
+  const ctx = document.createElement("canvas").getContext("2d")!;
+  ctx.font = `${css.fontWeight} ${css.fontSize} ${css.fontFamily}`;
+  ctx.fontKerning = "normal";
+  ctx.letterSpacing = "0px";
+  ctx.textRendering = "optimizeLegibility";
+  const ascent = ctx.measureText("x").fontBoundingBoxAscent;
+  const words = { left: Infinity, right: -Infinity };
+  const ink = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+  let at = 0;
+  for (const line of node.data.split("\n")) {
+    if (line.length > 0) {
+      const range = document.createRange();
+      range.setStart(node, at);
+      range.setEnd(node, at + line.length);
+      const r = range.getBoundingClientRect();
+      const m = ctx.measureText(line);
+      const baseline = r.top + ascent;
+      words.left = Math.min(words.left, r.left);
+      words.right = Math.max(words.right, r.right);
+      ink.left = Math.min(ink.left, r.left - m.actualBoundingBoxLeft);
+      ink.right = Math.max(ink.right, r.left + m.actualBoundingBoxRight);
+      ink.top = Math.min(ink.top, baseline - m.actualBoundingBoxAscent);
+      ink.bottom = Math.max(ink.bottom, baseline + m.actualBoundingBoxDescent);
+    }
+    at += line.length + 1;
+  }
+  // How far the outline reaches past the glyphs' ink, each way: each
+  // text-shadow layer's offset plus its blur radius, as computed (px).
+  const outline = { top: 0, right: 0, bottom: 0, left: 0 };
+  if (css.textShadow !== "none") {
+    for (const layer of css.textShadow.split(/,(?![^(]*\))/)) {
+      const [x = 0, y = 0, blur = 0] = (layer.match(/-?[\d.]+px/g) ?? []).map(parseFloat);
+      outline.top = Math.max(outline.top, blur - y);
+      outline.right = Math.max(outline.right, blur + x);
+      outline.bottom = Math.max(outline.bottom, blur + y);
+      outline.left = Math.max(outline.left, blur - x);
+    }
+  }
+  return {
+    family: css.fontFamily,
+    weight: css.fontWeight,
+    color: css.color,
+    fontSize: parseFloat(css.fontSize),
+    elements: el.querySelectorAll("*").length,
+    textNodes: Array.from(lines.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).length,
+    backstop: el.getAttribute("data-fit-backstop"),
+    // "Loaded" says nothing about fallback: it is also true when no face in
+    // the stack has those letters.
+    loaded: document.fonts.check(a.spec, a.words),
+    words,
+    ink,
+    outline,
+    box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
+    face: { w: el.clientWidth, h: el.clientHeight },
+    laid: { w: lines.offsetWidth, h: lines.offsetHeight },
+  };
+}
+
+type FaceSeen = ReturnType<typeof readFace>;
+
+/** v1.62.0: E1's check that a face fits its row: inside the row, give or
+ *  take a pixel's rounding, the words across (where a font measured
+ *  differently would spill) and their ink; laid out, it fits (whole
+ *  pixels); and the backstop never cut it. */
+function expectInside(seen: FaceSeen, id: string): void {
+  expect(seen.words.left, `${id} words left`).toBeGreaterThanOrEqual(seen.box.left - 1);
+  expect(seen.words.right, `${id} words right`).toBeLessThanOrEqual(seen.box.right + 1);
+  expect(seen.ink.left, `${id} ink left`).toBeGreaterThanOrEqual(seen.box.left - 1);
+  expect(seen.ink.top, `${id} ink top`).toBeGreaterThanOrEqual(seen.box.top - 1);
+  expect(seen.ink.right, `${id} ink right`).toBeLessThanOrEqual(seen.box.right + 1);
+  expect(seen.ink.bottom, `${id} ink bottom`).toBeLessThanOrEqual(seen.box.bottom + 1);
+  // Its laid-out size, not its scroll size, which counts each font's content
+  // area too (see readFace).
+  expect(seen.laid.w, `${id} laid-out width`).toBeLessThanOrEqual(seen.face.w + 1);
+  expect(seen.laid.h, `${id} laid-out height`).toBeLessThanOrEqual(seen.face.h + 1);
+  // The canvas measured what the face draws, so the backstop never cut it.
+  expect(seen.backstop, `${id} backstop`).toBe("0");
+}
+
+/** v1.62.0 (E1b): E1's ink check with the outline round the ink: inside the
+ *  row, give or take two pixels. The outline's reach past the ink (0.12 em
+ *  up and to the sides, the blur radius of its widest layer) is PAD_EM, the
+ *  padding past the ink that `textPads` measures, so by design its edge is
+ *  the box's, and it is read only as finely as the words are measured and
+ *  laid out: the page's ink in whole pixels at REF_PX (0.01 em) and E1's at
+ *  the face's size, and the font's ascent and descent rounded to whole
+ *  pixels in the layout. E1b's rows read at most 1.01 px past the top
+ *  (Display Bold "Ổ Ỗ Ộ") and 0.56 px past the bottom (Sans Bold "Ỗ Ộ", the
+ *  lowest layer reaching 0.14 em down). Without the room for the marks they
+ *  read 9 to 18 px past the top; the glyphs alone 0.7 to 9.7 px, Mono Bold
+ *  "Ỗ" inside E1's pixel. */
+function expectOutlineInside(seen: FaceSeen, id: string): void {
+  const o = seen.outline;
+  expect(seen.ink.left - o.left, `${id} outline left`).toBeGreaterThanOrEqual(seen.box.left - 2);
+  expect(seen.ink.top - o.top, `${id} outline top`).toBeGreaterThanOrEqual(seen.box.top - 2);
+  expect(seen.ink.right + o.right, `${id} outline right`).toBeLessThanOrEqual(seen.box.right + 2);
+  expect(seen.ink.bottom + o.bottom, `${id} outline bottom`).toBeLessThanOrEqual(seen.box.bottom + 2);
+}
+
+/** v1.62.0 (E1c): a face as drawn (its font size, its words' padding, its
+ *  row's size and the backstop), and each of its lines measured again on a
+ *  canvas once its font's own Latin face has loaded, as main's UI has it
+ *  loaded: the measure main stores, and the font the face draws its lines
+ *  in. Passed to `evaluate`, so it uses nothing from this file. */
+async function readMeasure(el: Element, a: { spec: string; text: string }) {
+  await document.fonts.load(a.spec, "A");
+  const ctx = document.createElement("canvas").getContext("2d")!;
+  ctx.font = a.spec;
+  ctx.fontKerning = "normal";
+  ctx.letterSpacing = "0px";
+  ctx.textRendering = "optimizeLegibility";
+  ctx.textBaseline = "alphabetic";
+  const lines = a.text.split("\n").map((line) => {
+    const m = ctx.measureText(line);
+    return {
+      line,
+      width: m.width,
+      ink: {
+        ascent: m.actualBoundingBoxAscent,
+        descent: m.actualBoundingBoxDescent,
+        fontAscent: m.fontBoundingBoxAscent,
+        fontDescent: m.fontBoundingBoxDescent,
+      },
+    };
+  });
+  const words = getComputedStyle(el.firstElementChild as HTMLElement);
+  const row = (el.closest("[data-charm]") as HTMLElement).getBoundingClientRect();
+  return {
+    fontSize: parseFloat(getComputedStyle(el).fontSize),
+    padTop: parseFloat(words.paddingTop),
+    padBottom: parseFloat(words.paddingBottom),
+    row: { w: row.width, h: row.height },
+    backstop: el.getAttribute("data-fit-backstop"),
+    lines,
+  };
+}
 
 /** v1.62.0: the recording light where main's default puts it at 480×480:
  *  bottom left, 168×33.6. */
@@ -595,65 +776,7 @@ test.describe("Text charms (v1.62)", () => {
       const face = row.locator("[data-text-face]");
       // The words as text: one text node, never markup.
       await expect(face, id).toHaveText(words);
-      const seen = await face.evaluate(
-        (el, a) => {
-          const lines = el.firstElementChild as HTMLElement;
-          const node = lines.firstChild as Text;
-          const box = (el.closest("[data-charm]") as HTMLElement).getBoundingClientRect();
-          const css = getComputedStyle(el);
-          // Where each line's words sit, and their glyphs' ink. A Range's
-          // box runs across the words' advances, but up and down it is the
-          // font's content area (its ascent and descent), not ink: Space
-          // Mono Bold's is about 1.47 em, taller than its 1.15 em line, so
-          // it reads past a row its glyphs are well inside. So the ink up
-          // and down is the canvas's, at the face's font, from each line's
-          // baseline (the Range's top plus the face's own font's ascent).
-          const ctx = document.createElement("canvas").getContext("2d")!;
-          ctx.font = `${css.fontWeight} ${css.fontSize} ${css.fontFamily}`;
-          ctx.fontKerning = "normal";
-          ctx.letterSpacing = "0px";
-          ctx.textRendering = "optimizeLegibility";
-          const ascent = ctx.measureText("x").fontBoundingBoxAscent;
-          const words = { left: Infinity, right: -Infinity };
-          const ink = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
-          let at = 0;
-          for (const line of node.data.split("\n")) {
-            if (line.length > 0) {
-              const range = document.createRange();
-              range.setStart(node, at);
-              range.setEnd(node, at + line.length);
-              const r = range.getBoundingClientRect();
-              const m = ctx.measureText(line);
-              const baseline = r.top + ascent;
-              words.left = Math.min(words.left, r.left);
-              words.right = Math.max(words.right, r.right);
-              ink.left = Math.min(ink.left, r.left - m.actualBoundingBoxLeft);
-              ink.right = Math.max(ink.right, r.left + m.actualBoundingBoxRight);
-              ink.top = Math.min(ink.top, baseline - m.actualBoundingBoxAscent);
-              ink.bottom = Math.max(ink.bottom, baseline + m.actualBoundingBoxDescent);
-            }
-            at += line.length + 1;
-          }
-          return {
-            family: css.fontFamily,
-            weight: css.fontWeight,
-            color: css.color,
-            fontSize: parseFloat(css.fontSize),
-            elements: el.querySelectorAll("*").length,
-            textNodes: Array.from(lines.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).length,
-            backstop: el.getAttribute("data-fit-backstop"),
-            // "Loaded" says nothing about fallback: it is also true when no
-            // face in the stack has those letters.
-            loaded: document.fonts.check(a.spec, a.words),
-            words,
-            ink,
-            box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
-            face: { w: el.clientWidth, h: el.clientHeight },
-            laid: { w: lines.offsetWidth, h: lines.offsetHeight },
-          };
-        },
-        { spec: fontSpec(font, bold), words },
-      );
+      const seen = await face.evaluate(readFace, { spec: fontSpec(font, bold), words });
       // The family from text.ts's table, first in the face's stack.
       expect(seen.family.replace(/["']/g, ""), id).toMatch(new RegExp(`^${FONTS[font].family},`));
       expect(seen.weight, id).toBe(bold ? "700" : "400");
@@ -662,25 +785,111 @@ test.describe("Text charms (v1.62)", () => {
       expect(seen.textNodes, id).toBe(1);
       expect(seen.fontSize, id).toBeGreaterThan(0);
       if (words !== NON_LATIN) expect(seen.loaded, `${id}: its font loaded`).toBe(true);
-      // Inside its row, give or take a pixel's rounding: the words across
-      // (where a font measured differently would spill), and their ink.
-      expect(seen.words.left, `${id} words left`).toBeGreaterThanOrEqual(seen.box.left - 1);
-      expect(seen.words.right, `${id} words right`).toBeLessThanOrEqual(seen.box.right + 1);
-      expect(seen.ink.left, `${id} ink left`).toBeGreaterThanOrEqual(seen.box.left - 1);
-      expect(seen.ink.top, `${id} ink top`).toBeGreaterThanOrEqual(seen.box.top - 1);
-      expect(seen.ink.right, `${id} ink right`).toBeLessThanOrEqual(seen.box.right + 1);
-      expect(seen.ink.bottom, `${id} ink bottom`).toBeLessThanOrEqual(seen.box.bottom + 1);
-      // Laid out, it fits (whole pixels). Its laid-out size, not its scroll
-      // size, which counts each font's content area too (see above).
-      expect(seen.laid.w, `${id} laid-out width`).toBeLessThanOrEqual(seen.face.w + 1);
-      expect(seen.laid.h, `${id} laid-out height`).toBeLessThanOrEqual(seen.face.h + 1);
-      // The canvas measured what the face draws, so the backstop never cut it.
-      expect(seen.backstop, `${id} backstop`).toBe("0");
+      // Inside its row: the words across, their ink, laid out, and no cut.
+      expectInside(seen, id);
     }
     // Markup is shown as typed.
     const markup = page.locator('[data-charm][data-id="text-2"]');
     await expect(markup.locator("[data-text-face]")).toHaveText("<b>hi</b>");
     await expect(markup.locator("b")).toHaveCount(0);
+
+    expect(noise, noise.join("\n")).toEqual([]);
+  });
+
+  test("E1b: Vietnamese capitals' stacked marks, and the outline round them, stay inside the box", async ({
+    page,
+  }) => {
+    const noise = watchConsole(page);
+    await load(page);
+    // E1's six rows fill the window; these four have one of their own. Marks
+    // stacked over a capital reach past the line's own box (about 0.25 em
+    // in Display), so each face is padded for its ink above and below.
+    const texts = [
+      vietRow(0, { text: "TIẾNG VIỆT", font: "display" }),
+      vietRow(1, { text: "Ổ Ỗ Ộ", font: "display" }),
+      vietRow(2, { text: "Ỗ Ộ", font: "sans" }),
+      vietRow(3, { text: "Ỗ", font: "mono" }),
+    ];
+    await shown(page, texts);
+    await expect(page.locator("[data-text-face]")).toHaveCount(texts.length);
+    await page.evaluate(async () => {
+      await document.fonts.ready;
+      await new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())));
+    });
+
+    for (const t of texts) {
+      const id = t.id as string;
+      const words = t.text as string;
+      const font = t.font as TextFont;
+      const row = page.locator(`[data-charm][data-id="${id}"]`);
+      await expect(row, id).toHaveAttribute("aria-label", `Text: ${words}`);
+      const face = row.locator("[data-text-face]");
+      await expect(face, id).toHaveText(words);
+      const seen = await face.evaluate(readFace, { spec: fontSpec(font, true), words });
+      expect(seen.family.replace(/["']/g, ""), id).toMatch(new RegExp(`^${FONTS[font].family},`));
+      expect(seen.weight, id).toBe("700");
+      // The bundled fonts have Vietnamese: their marks, not a fallback's.
+      expect(seen.loaded, `${id}: its font loaded`).toBe(true);
+      // Bound by its height: the words fill the box from top to bottom.
+      expect(seen.laid.h, `${id} fills its height`).toBeGreaterThanOrEqual(seen.face.h - 1);
+      // Outlined: the outline reaches past the glyphs on every side.
+      for (const side of ["top", "right", "bottom", "left"] as const) {
+        expect(seen.outline[side], `${id} outline ${side}`).toBeGreaterThan(0);
+      }
+      // E1's check: the glyphs' ink inside the box, and the backstop never
+      // cut it. Then the outline round them.
+      expectInside(seen, id);
+      expectOutlineInside(seen, id);
+    }
+
+    expect(noise, noise.join("\n")).toEqual([]);
+  });
+
+  test("E1c: a text with none of its font's letters is fitted by that font's line, as main measures it", async ({
+    page,
+  }) => {
+    const noise = watchConsole(page);
+    await load(page);
+    // One word the bundled fonts don't have, or an emoji, and no space: the
+    // words alone load no face of the font. The font's own first face (the
+    // one with the space) places each line, as the face draws it once
+    // mounted and as main, whose UI has it loaded, measures; measured
+    // before it loaded, a line was placed by the fallback's ascent and
+    // descent, and the face was fitted a few per cent off its box.
+    const texts = [
+      textRow(0, { text: "Привет", font: "display", bold: true, color: "#ffffff", outline: true, align: "center" }),
+      textRow(1, { text: "Перерыв", font: "sans", bold: true, color: "#ffffff", outline: true, align: "left" }),
+      textRow(2, { text: "Йога", font: "display", bold: false, color: "#ffd60a", outline: true, align: "center" }),
+      textRow(3, { text: "Привет", font: "mono", bold: false, color: "#ffffff", outline: false, align: "right" }),
+      textRow(4, { text: "Γειά", font: "sans", bold: false, color: "#64d2ff", outline: true, align: "center" }),
+      textRow(5, { text: "🎮", font: "display", bold: true, color: "#ffffff", outline: true, align: "center" }),
+    ];
+    await shown(page, texts);
+    await expect(page.locator("[data-text-face]")).toHaveCount(texts.length);
+    await page.evaluate(async () => {
+      await document.fonts.ready;
+      await new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())));
+    });
+
+    for (const t of texts) {
+      const id = t.id as string;
+      const words = t.text as string;
+      const face = page.locator(`[data-charm][data-id="${id}"] [data-text-face]`);
+      await expect(face, id).toHaveText(words);
+      const seen = await face.evaluate(readMeasure, { spec: fontSpec(t.font as TextFont, t.bold as boolean), text: words });
+      const of = (line: string) => seen.lines.find((l) => l.line === line)!;
+      const natural = textBox(words, (line) => of(line).width, (line) => of(line).ink);
+      const pads = textPads(words, (line) => of(line).ink);
+      // Fitted by that measure: its size, and its words' room above and
+      // below for their ink.
+      expect(seen.fontSize, `${id} font size`).toBeCloseTo(
+        fitTextFont(seen.row.w, seen.row.h, natural.nw, natural.nh),
+        1,
+      );
+      expect(seen.padTop / seen.fontSize, `${id} top padding (em)`).toBeCloseTo(pads.top, 2);
+      expect(seen.padBottom / seen.fontSize, `${id} bottom padding (em)`).toBeCloseTo(pads.bottom, 2);
+      expect(seen.backstop, `${id} backstop`).toBe("0");
+    }
 
     expect(noise, noise.join("\n")).toEqual([]);
   });
@@ -708,7 +917,12 @@ test.describe("Text charms (v1.62)", () => {
     const idle = row.locator("[data-rec-idle]");
 
     // A take starting before the page has its own status: nothing. The
-    // status the handshake causes may come after a take's answer.
+    // status the handshake causes may come after a take's answer. The light
+    // waits for its font too, so the font is loaded first: the nothing here
+    // is the status's.
+    await page.evaluate(async () => {
+      await document.fonts.load('700 1em "Space Mono"');
+    });
     await emitTake(page, { state: "starting" });
     await page.waitForTimeout(300);
     await expect(face).toHaveCount(0);
@@ -976,11 +1190,12 @@ test.describe("main window and overlay together (v1.55)", () => {
 
 // v1.62.0: the seam for text, both windows joined. Settings measures the
 // words and main stores them; the overlay draws what main pushes and
-// measures again for itself. A drag there while Settings' editor is open
-// lands in main's scene and leaves the draft alone, and Edit keeps the
+// measures again for itself. An Add refused while the overlay is full keeps
+// the editor, and the focus on Save. A drag there while Settings' editor is
+// open lands in main's scene and leaves the draft alone, and Edit keeps the
 // dragged height and centre.
 test.describe("main window and overlay together (v1.62)", () => {
-  test("E4: a text added in Settings shows on the overlay; Edit changes it, and a drag meanwhile keeps the draft", async ({
+  test("E4: a text added in Settings shows on the overlay (refused while full, with the focus kept); Edit changes it, and a drag meanwhile keeps the draft", async ({
     page: main,
     context,
     consoleErrors,
@@ -1005,6 +1220,35 @@ test.describe("main window and overlay together (v1.62)", () => {
         ).filter((e) => e.type === "text"),
       );
 
+    // Main's stored scene is full, at 64: the circle, an old text, and 62
+    // elements of a later build's, which this build keeps and never draws.
+    const OLD = {
+      id: "old",
+      type: "text",
+      x: 0.35,
+      y: 0.4,
+      w: 0.3,
+      h: 0.1,
+      z: 1,
+      text: "Old",
+      font: "sans",
+      bold: true,
+      color: "#ffffff",
+      outline: true,
+      align: "center",
+      nw: 300,
+      nh: 100,
+    };
+    const later = Array.from({ length: 62 }, (_, i) => ({ id: `later-${i}`, type: "future" }));
+    await main.addInitScript(
+      (scene) => {
+        if (localStorage.getItem("divora.overlayScene") === null) {
+          localStorage.setItem("divora.overlayScene", JSON.stringify(scene));
+        }
+      },
+      { version: 1, designSize: DESIGN, frame: "window", elements: [CIRCLE, OLD, ...later] },
+    );
+
     await main.goto("/");
     await expect(main.locator(".titlebar-wordmark")).toBeVisible();
     await main.locator(".sidebar-nav", { hasText: "Settings" }).click();
@@ -1012,6 +1256,7 @@ test.describe("main window and overlay together (v1.62)", () => {
     await expect.poll(() => invokesOf(main, "open_overlay")).toHaveLength(1);
     await overlay.goto("/overlay.html?instance=1");
     await expect(overlay.locator('[data-charm][data-id="circle"] [data-circle]')).toBeVisible();
+    await expect(overlay.locator('[data-charm][data-id="old"] [data-text-face]')).toHaveText("Old");
     await broadcast({ phase: "shown" });
     await expect.poll(() => invokesOf(overlay, "overlay_handshake")).toHaveLength(2);
     await broadcast({ phase: "painted", canArrange: true });
@@ -1022,7 +1267,29 @@ test.describe("main window and overlay together (v1.62)", () => {
     await expect(editor).toHaveAttribute("aria-label", "New text");
     const field = editor.getByRole("textbox", { name: "Overlay text" });
     await expect(field).toBeFocused();
+
+    // The overlay full: Save from the keyboard is refused, and the editor
+    // keeps its draft. Save is off while it saves; Chromium moves the focus
+    // off it onto the page, and it goes back to Save.
     await field.fill("!discord in chat");
+    const save = editor.getByTestId("overlay-text-save");
+    await save.focus();
+    await save.evaluate((el) =>
+      el.addEventListener("blur", () => ((el as unknown as { e2eBlurred?: boolean }).e2eBlurred = true), {
+        once: true,
+      }),
+    );
+    await main.keyboard.press("Enter");
+    await expect(main.getByTestId("toast")).toHaveText("The overlay is full. Remove something to add another.");
+    await expect(save).toBeEnabled();
+    await expect(save).toBeFocused();
+    expect(await save.evaluate((el) => (el as unknown as { e2eBlurred?: boolean }).e2eBlurred === true)).toBe(true);
+    await expect(field).toHaveValue("!discord in chat");
+    expect((await savedTexts()).map((e) => e.id)).toEqual(["old"]);
+    // Remove the old text: now there's room, and Save adds the draft.
+    await main.getByRole("button", { name: "Remove Old" }).click();
+    await expect(overlay.locator('[data-charm][data-id="old"]')).toHaveCount(0);
+
     await expect(editor.getByTestId("overlay-text-count")).toHaveText("16 of 200");
     await editor.getByRole("radio", { name: "Yellow" }).click();
     await editor.getByTestId("overlay-text-save").click();

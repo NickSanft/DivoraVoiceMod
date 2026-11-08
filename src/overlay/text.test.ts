@@ -9,6 +9,7 @@ import {
   DRAW_MAX_CHARS,
   DRAW_MAX_LINES,
   drawText,
+  facePadding,
   firstLine,
   fitTextFont,
   fontSpec,
@@ -19,13 +20,17 @@ import {
   MAX_TEXT,
   normalizeCharmText,
   outlineColor,
+  PAD_EM,
   readCharmText,
   readTextFields,
   REF_PX,
   textBox,
   textLength,
+  textPads,
   textShadow,
+  wellFormedText,
   type TextFont,
+  type TextInk,
   type TextInput,
 } from "./text";
 import fixture from "./wire.fixture.json";
@@ -47,6 +52,10 @@ const DEL = ch(0x7f);
 const DCS = ch(0x90);
 const APC = ch(0x9f);
 const GAME = "🎮"; // one emoji, two UTF-16 code units
+const HI = ch(0xd83c); // GAME's first half, alone
+const LO = ch(0xdfae); // GAME's second half, alone
+const FFFD = ch(0xfffd); // REPLACEMENT CHARACTER
+const X199 = "x".repeat(199);
 
 describe("the text charm's frozen names and limits (v1.62.0)", () => {
   it("fixture textCharm is text.ts's", () => {
@@ -124,12 +133,40 @@ describe("reading a text charm's text (v1.62.0, §7.1)", () => {
     ["trimmed first", "\n\n\nx", "x", "x"],
     ["lines counted after the trim", "\n\n\n\n\n\nx\n\n", "x", "x"],
     ["6 lines after the trim", "a\n\n\n\n\nb", "a\n\n\n\n\nb", null],
+    // A paste can bring in half a pair (typing can't); left in, every scene
+    // push would fail at the IPC.
+    ["a lone first half becomes U+FFFD", `BRB ${HI}`, `BRB ${FFFD}`, `BRB ${FFFD}`],
+    ["a lone second half becomes U+FFFD", `${LO}x`, `${FFFD}x`, `${FFFD}x`],
+    ["halves the wrong way round are two lone ones", `a${LO}${HI}b`, `a${FFFD}${FFFD}b`, `a${FFFD}${FFFD}b`],
+    ["a whole pair is kept", `${HI}${LO}`, GAME, GAME],
+    ["a pair split by a control is whole once it is dropped", `${HI}${BEL}${LO}`, GAME, GAME],
+    ["U+FFFD counts 1, as the half did", `${X199}${HI}`, `${X199}${FFFD}`, `${X199}${FFFD}`],
     ["a number", 42, null, null],
     ["null", null, null, null],
     ["undefined", undefined, null, null],
   ] as Array<[string, unknown, string | null, string | null]>)("normalize and read: %s", (_name, raw, normal, read) => {
     expect(normalizeCharmText(raw)).toBe(normal);
     expect(readCharmText(raw)).toBe(read);
+  });
+
+  it("a normalized text always crosses the IPC: its JSON has no lone half's escape", () => {
+    // JSON.stringify writes a lone half as a backslash-u escape, which
+    // Rust's serde_json refuses, failing the whole push; a pair it writes as
+    // is.
+    const lone = /\\ud[89a-f][0-9a-f]{2}/i;
+    expect(JSON.stringify({ text: `BRB ${HI}` })).toMatch(lone);
+    const raws = [`BRB ${HI}`, `${LO}`, `${LO}${HI}`, `${HI}${HI}${LO}`, `${GAME}${LO}${GAME}`, `x${HI}\n${LO}y`];
+    for (const raw of raws) {
+      const text = normalizeCharmText(raw);
+      expect(JSON.stringify({ text }), JSON.stringify(raw)).not.toMatch(lone);
+      // What add, Edit and Save store: readTextFields', changedFields'.
+      expect(JSON.stringify({ text: readTextFields({ text: raw }).text })).not.toMatch(lone);
+      const changed = changedFields(readTextFields({ text: "BRB" }), { ...readTextFields({}), text: raw });
+      expect(JSON.stringify(changed)).not.toMatch(lone);
+    }
+    expect(wellFormedText(`${HI}${HI}${LO}`)).toBe(`${FFFD}${GAME}`);
+    // A string with none is itself, untrimmed and unnormalized.
+    expect(wellFormedText(` ${GAME}\t\r\n`)).toBe(` ${GAME}\t\r\n`);
   });
 
   it("textLength counts as the limit counts", () => {
@@ -274,6 +311,65 @@ describe("a text charm's natural box and fit (v1.62.0, §7.2)", () => {
     // A width that isn't a number counts as 0.
     expect(textBox("x", () => Number.NaN)).toEqual({ nw: 24, nh: 139 });
     expect(textBox("x", () => -5)).toEqual({ nw: 24, nh: 139 });
+  });
+
+  // Display Bold's first font has an ascent of 93 and a descent of 27 at
+  // 100 px, so a line's own box (115 tall, centred on them) reaches 90.5
+  // above the baseline and 24.5 below it.
+  const inks =
+    (table: Record<string, [number, number]>) =>
+    (line: string): TextInk => {
+      const [ascent, descent] = table[line] ?? [70, 20];
+      return { ascent, descent, fontAscent: 93, fontDescent: 27 };
+    };
+  const VIET = "\u1ed4 \u1ed6 \u1ed8"; // O with circumflex and hook, tilde, dot below
+
+  it("textPads: room above the first line and below the last for ink past the line's own box", () => {
+    // Latin ink stays inside its line: PAD_EM alone, and the box as before.
+    expect(textPads("BRB", inks({}))).toEqual({ top: PAD_EM, bottom: PAD_EM });
+    expect(textBox("BRB", widths({ BRB: 312.4 }), inks({}))).toEqual({ nw: 337, nh: 139 });
+    // Vietnamese capitals' stacked marks reach 116 above the baseline in
+    // Display Bold: 25.5 past the line, so 0.255 em more room on top.
+    const viet = inks({ [VIET]: [116, 22] });
+    expect(textPads(VIET, viet).top).toBeCloseTo(PAD_EM + 0.255, 9);
+    expect(textPads(VIET, viet).bottom).toBe(PAD_EM);
+    // 115 + 12 + 37.5 = 164.5, up to 165.
+    expect(textBox(VIET, widths({ [VIET]: 300 }), viet)).toEqual({ nw: 324, nh: 165 });
+    // Below the last line: a descent of 30 is 5.5 past 24.5.
+    expect(textPads("gy", inks({ gy: [70, 30] })).bottom).toBeCloseTo(PAD_EM + 0.055, 9);
+    // Only the first line's top and the last line's bottom: a middle line's
+    // marks rise into the line above, still inside the box.
+    const three = inks({ a: [70, 20], [VIET]: [116, 30], b: [70, 20] });
+    expect(textPads(`a\n${VIET}\nb`, three)).toEqual({ top: PAD_EM, bottom: PAD_EM });
+    const pads = textPads(`${VIET}\nb\ngy`, inks({ [VIET]: [116, 30], b: [70, 20], gy: [70, 30] }));
+    expect(pads.top).toBeCloseTo(PAD_EM + 0.255, 9);
+    expect(pads.bottom).toBeCloseTo(PAD_EM + 0.055, 9);
+    // A font taller than LINE_H (Space Mono's ascent and descent are about
+    // 1.12 and 0.35 em): its line's box is inside the font's, at 96 above
+    // the baseline, so ink at 100 is 4 past it.
+    const mono = (): TextInk => ({ ascent: 100, descent: 10, fontAscent: 112, fontDescent: 35 });
+    expect(textPads("x", mono).top).toBeCloseTo(PAD_EM + 0.04, 9);
+  });
+
+  it("textPads without ink, or with ink it can't read, is PAD_EM alone", () => {
+    const none = { top: PAD_EM, bottom: PAD_EM };
+    expect(textPads(VIET)).toEqual(none);
+    expect(textPads(VIET, () => null)).toEqual(none);
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, undefined, "116"]) {
+      const ink: Record<string, unknown> = { ascent: 116, descent: 22, fontAscent: 93, fontDescent: 27 };
+      for (const k of ["ascent", "descent", "fontAscent", "fontDescent"]) {
+        const odd = { ...ink, [k]: bad } as unknown as TextInk;
+        expect(textPads(VIET, () => odd), `${k} ${String(bad)}`).toEqual(none);
+      }
+    }
+    // As textBox without ink: today's box.
+    expect(textBox(VIET, widths({ [VIET]: 300 }))).toEqual({ nw: 324, nh: 139 });
+  });
+
+  it("facePadding: PAD_EM a side, and the ink's room above and below", () => {
+    expect(facePadding({ top: PAD_EM, bottom: PAD_EM })).toBe(`${PAD_EM}em`);
+    expect(facePadding({ top: 0.375, bottom: PAD_EM })).toBe("0.375em 0.12em 0.12em");
+    expect(facePadding({ top: PAD_EM, bottom: 0.175 })).toBe("0.12em 0.12em 0.175em");
   });
 
   it.each([

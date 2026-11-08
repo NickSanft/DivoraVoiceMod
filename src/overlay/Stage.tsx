@@ -76,6 +76,7 @@ import { OVERLAY_BG_COLOR, type OverlayBg, type OverlayState } from "./state";
 import { requestLock, sendAlive, type OverlayStatus } from "./status";
 import {
   drawText,
+  facePadding,
   fitTextFont,
   fontSpec,
   fontStack,
@@ -83,9 +84,11 @@ import {
   PAD_EM,
   readTextFields,
   textBox,
+  textPads,
   textShadow,
   type TextAlign,
   type TextFont,
+  type TextInk,
   type TextInput,
   type TextMetrics,
 } from "./text";
@@ -115,7 +118,8 @@ export interface StageProps {
   /** v1.59.0: the backend's latest timers; null until its first snapshot,
    *  and no timer face draws before one. */
   timers: TimerSnapshot | null;
-  /** v1.59.0: the face's font has loaded, or the page stopped waiting. */
+  /** v1.59.0: the face's font has loaded, or the page stopped waiting.
+   *  v1.62.0: the recording light waits for it too. */
   fontReady: boolean;
   /** v1.62.0: the recorder's latest take, for the recording light; null
    *  (or absent) before the page has heard one. */
@@ -297,7 +301,8 @@ function pageMetrics(): TextMetrics {
 }
 
 /** v1.62.0: what a text face draws, as the page measured it: the text and
- *  font measured, the natural box at REF_PX by the page's own measure, and
+ *  font measured, the natural box at REF_PX by the page's own measure, the
+ *  padding above and below the words (text.ts's `textPads`, in em), and
  *  which measure this is (a late font load measures again). */
 interface Measured {
   text: string;
@@ -305,6 +310,8 @@ interface Measured {
   bold: boolean;
   nw: number;
   nh: number;
+  top: number;
+  bottom: number;
   gen: number;
 }
 
@@ -334,7 +341,11 @@ function TextFace(p: {
       let live = true;
       const measure = (): void => {
         gen += 1;
-        setMeasured({ text, font: f, bold: b, ...textBox(text, (line) => metrics.width(spec, line)), gen });
+        const width = (line: string): number => metrics.width(spec, line);
+        // The ink too: room above and below for marks that reach past the
+        // first or last line, as main measured the box.
+        const ink = (line: string): TextInk | null => metrics.ink?.(spec, line) ?? null;
+        setMeasured({ text, font: f, bold: b, ...textBox(text, width, ink), ...textPads(text, ink), gen });
       };
       // In the fallback, if the font is slow; measured again when it comes.
       const wait = setTimeout(measure, FONT_WAIT_MS);
@@ -393,6 +404,11 @@ function TextFace(p: {
   );
 
   const text = createMemo(() => measured()?.text ?? "");
+  // PAD_EM a side, with room above and below for the ink, as measured.
+  const padding = createMemo(() => {
+    const m = measured();
+    return m ? facePadding(m) : `${PAD_EM}em`;
+  });
   // All of it a style object, keyed property by property: the family comes
   // from text.ts's table, never from a stored string.
   const faceStyle = (): JSX.CSSProperties => {
@@ -422,7 +438,7 @@ function TextFace(p: {
   return (
     <Show when={measured()}>
       <div data-text-face data-fit-backstop={String(cuts())} aria-hidden="true" style={faceStyle()}>
-        <div ref={lines} style={{ flex: "none", padding: `${PAD_EM}em` }}>
+        <div ref={lines} style={{ flex: "none", padding: padding() }}>
           {text()}
         </div>
       </div>
@@ -438,8 +454,11 @@ function LightDot(): JSX.Element {
 }
 
 /** v1.62.0: the recording light's face: recLight.ts's `recFace`, with the
- *  dot. Its text node is written only when the face's words change. */
-function LightFace(p: { face: () => RecFace; box: () => Size | undefined }): JSX.Element {
+ *  dot. Its text node is written only when the face's words change. It
+ *  waits for Space Mono Bold as the timer face does (`ready`, at most
+ *  FONT_WAIT_MS), so a first frame doesn't swap fonts on stream unless the
+ *  font takes longer than that. */
+function LightFace(p: { face: () => RecFace; box: () => Size | undefined; ready: () => boolean }): JSX.Element {
   const text = createMemo(() => p.face().text);
   const idle = () => p.face().kind === "idle";
   const style = (): JSX.CSSProperties => {
@@ -451,7 +470,7 @@ function LightFace(p: { face: () => RecFace; box: () => Size | undefined }): JSX
     };
   };
   return (
-    <Show when={p.face().kind !== "none"}>
+    <Show when={p.ready() && p.face().kind !== "none"}>
       <div
         data-rec-face={idle() ? undefined : ""}
         data-rec-idle={idle() ? "" : undefined}
@@ -956,7 +975,7 @@ export function Stage(props: StageProps): JSX.Element {
         </Show>
         <Show when={textFields()}>{(fields) => <TextFace fields={fields} box={size} metrics={metrics} />}</Show>
         <Show when={kind() === "rec"}>
-          <LightFace face={light} box={size} />
+          <LightFace face={light} box={size} ready={() => props.fontReady} />
         </Show>
         <div
           data-hit

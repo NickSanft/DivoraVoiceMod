@@ -219,14 +219,18 @@ export interface OverlayController {
   overlayHasTimer(timerId: string): boolean;
   /** v1.62.0: Add text… in Settings. Measures the text, then adds a `text`
    *  element where `defaultTextRect` says, or toasts why not. Settles after
-   *  its commit or refusal. */
-  addOverlayText(input: TextInput): Promise<void>;
+   *  its commit or refusal: true only when the text was added, so Settings
+   *  keeps the editor and its draft open after a refusal (the overlay full,
+   *  say). */
+  addOverlayText(input: TextInput): Promise<boolean>;
   /** v1.62.0: Save in Settings' editor for an existing text: `changes` is
    *  only the fields the streamer changed. Measures the result and commits
    *  a `set`, or toasts why not (the text was removed, or a field can't be
    *  saved). A patch that changes no stored value commits nothing. Settles
-   *  after its commit or refusal. */
-  editOverlayText(id: string, changes: Partial<TextInput>): Promise<void>;
+   *  after its commit or refusal: true when the editor is done (saved,
+   *  nothing to change, or the text removed), false when a field can't be
+   *  saved or the save failed. */
+  editOverlayText(id: string, changes: Partial<TextInput>): Promise<boolean>;
   /** v1.62.0: Add the recording light: one `rec` element where
    *  `defaultLightRect` says, unless the scene has a live one. */
   addRecordingLight(): void;
@@ -255,6 +259,15 @@ function logged(p: Promise<unknown>, what: string): Promise<void> {
     () => undefined,
     (e) => console.warn(`overlay: ${what} failed`, e),
   );
+}
+
+/** `logged` for a task that answers whether it did its job: a failure
+ *  answers false. */
+function loggedDone(p: Promise<boolean>, what: string): Promise<boolean> {
+  return p.catch((e: unknown) => {
+    console.warn(`overlay: ${what} failed`, e);
+    return false;
+  });
 }
 
 function sameRect(a: Rect, b: Rect): boolean {
@@ -645,11 +658,16 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
    *  font covers the text (`load` waits at most FONT_WAIT_MS), each line at
    *  REF_PX with the face's whole stack, so it falls back as the face
    *  does. A font that never loads is measured in its fallback, as the face
-   *  then draws. */
+   *  then draws. Its ink too, so the box has room for marks that reach past
+   *  the first or last line, as the face pads for them. */
   const measureText = async (f: TextInput): Promise<{ nw: number; nh: number }> => {
     const spec = fontSpec(f.font, f.bold);
     await d.text.load(spec, f.text).catch(() => undefined);
-    return textBox(f.text, (line) => d.text.width(spec, line));
+    return textBox(
+      f.text,
+      (line) => d.text.width(spec, line),
+      (line) => d.text.ink?.(spec, line) ?? null,
+    );
   };
 
   /** v1.62.0: only the six text fields a caller passed, so a `set` never
@@ -849,7 +867,7 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
     overlayHasTimer: (timerId) => liveTimers().has(timerId),
 
     addOverlayText: (input) =>
-      logged(
+      loggedDone(
         texts(async () => {
           // As this build stores them: the text normalized, the colour
           // lower-cased. Settings sends only its own choices, so the read
@@ -857,7 +875,7 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
           const fields = readTextFields({ ...input });
           // Over the limits, it is refused below, without waiting for a font.
           const box = readCharmText(input.text) === null ? { nw: 1, nh: 1 } : await measureText(fields);
-          await placement(async () => {
+          return placement(async () => {
             // Read now: a drag or a Fit change may have landed meanwhile.
             const s = scene();
             const element: TextElement = {
@@ -871,42 +889,45 @@ export function createOverlayController(d: OverlayControllerDeps): OverlayContro
             const refusal = addRefusal(s, element);
             if (refusal) {
               d.toast(refusal === "invalid" ? TEXT_REFUSED : REFUSED[refusal], WARN);
-              return;
+              return false;
             }
-            if (!commit({ kind: "add", element })) return;
+            if (!commit({ kind: "add", element })) return false;
             publish();
             d.toast(TEXT_ADDED, INFO);
+            return true;
           });
         }),
         "adding a text",
       ),
 
     editOverlayText: (id, changes) =>
-      logged(
+      loggedDone(
         texts(async () => {
           const asked = textChanges(changes);
           // Refused before any font load: the text is gone, or a field is
-          // one `set` won't take.
+          // one `set` won't take. A text that's gone leaves nothing to edit.
           const early = setRefusal(scene(), id, { ...asked, nw: 1, nh: 1 });
           if (early) {
             d.toast(SET_REFUSED[early], WARN);
-            return;
+            return early === "gone";
           }
           // setRefusal found it live.
           const stored = liveElements(scene()).find((e) => e.id === id && e.type === "text")!;
           // Measured as it will be drawn: the stored fields with the changes.
           const box = await measureText(readTextFields({ ...stored, ...asked }));
-          await placement(async () => {
+          return placement(async () => {
             // Asked again: an Arrange delete may have landed meanwhile.
             const fields: TextPatch = { ...asked, ...box };
             const refusal = setRefusal(scene(), id, fields);
             if (refusal) {
               d.toast(SET_REFUSED[refusal], WARN);
-              return;
+              return refusal === "gone";
             }
             // A patch that changes no stored value commits nothing: no save,
             // no push. A save shows no toast: the overlay shows the change.
-            if (commit({ kind: "set", id, fields })) publish();
+            // A new shape keeps its aligned side where the window draws it.
+            if (commit({ kind: "set", id, fields, viewport: pictureView() })) publish();
+            return true;
           });
         }),
         "editing a text",

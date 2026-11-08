@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { beginMove, beginResize, finishGesture, updateGesture } from "./editor";
 import {
@@ -51,6 +52,50 @@ describe("snapping's switches (v1.62.0)", () => {
     const imports = source.split("\n").filter((l) => /^\s*import\b/.test(l));
     expect(imports.length).toBeGreaterThan(0);
     for (const line of imports) expect(line).toMatch(/^import type /);
+  });
+
+  it("SNAP_PX 0 turns snapping off, even for an edge already on a line (§11 K5)", () => {
+    // The kill switch is a module constant, so this runs snap.ts itself with
+    // only that line changed (its imports are types only, so it stands alone).
+    const at = (px: number): typeof import("./snap") => {
+      const source = readFileSync(join(process.cwd(), "src", "overlay", "snap.ts"), "utf8");
+      const decl = "export const SNAP_PX = 8;";
+      expect(source.split(decl)).toHaveLength(2);
+      const js = ts.transpileModule(source.replace(decl, `export const SNAP_PX = ${px};`), {
+        compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+      }).outputText;
+      const mod = {};
+      new Function("exports", js)(mod);
+      return mod as typeof import("./snap");
+    };
+    const v = { w: 480, h: 480 };
+    const laid = [{ el: { id: "o" }, rect: { x: 300, y: 100, w: 100, h: 50 } }];
+    // Its left edge on the other charm's 300 (d 0), and its centre 4 from
+    // the viewport's 240; a corner resize whose bottom edge is on 150.
+    const onLine = { x: 300, y: 300, w: 100, h: 40 };
+    const nearLine = { x: 186, y: 300, w: 100, h: 40 };
+    const rect0 = { x: 100, y: 100, w: 100, h: 50 };
+    for (const [px, snaps] of [
+      [8, true],
+      [0, false],
+    ] as const) {
+      const s = at(px);
+      expect(s.SNAP_PX).toBe(px);
+      const t = s.snapTargets(laid, "me", v);
+      for (const preview of [onLine, nearLine]) {
+        const out = s.snapMove(preview, t, v, true);
+        if (snaps) expect(out.guides.length, `${px}`).toBeGreaterThan(0);
+        else expect(out, `${px}`).toEqual({ rect: preview, guides: [] });
+      }
+      const grown = s.snapResize(rect0, rect0, "se", t, v, true);
+      if (snaps) expect(grown.guides).toEqual([{ axis: "y", at: 150 }]);
+      else expect(grown).toEqual({ rect: rect0, guides: [] });
+    }
+    // The copy at 8 snaps as the module the app imports does.
+    const eight = at(8);
+    expect(eight.snapMove(nearLine, eight.snapTargets(laid, "me", v), v, true)).toEqual(
+      snapMove(nearLine, snapTargets(laid, "me", v), v, true),
+    );
   });
 });
 
@@ -358,6 +403,45 @@ describe("snapResize (v1.62.0, §7.5)", () => {
     closeRect(out.rect, { x: 0, y: 0, w: 140, h: 70 });
     expect(out.guides).toEqual([{ axis: "x", at: 140 }]);
   });
+
+  it("a wide charm's y snap never moves its x edge more than 8 px: a 5 : 1 light", () => {
+    // The light's default shape, 150 × 30 at (100, 200), alone. Its bottom
+    // edge 8 px above the middle line (y 240) would snap to 200 × 40: the
+    // right edge 40 px from the pointer, then held there across 80 px.
+    const rect0 = { x: 100, y: 200, w: 150, h: 30 };
+    const t = targetsWith();
+    const preview = resizeRect(rect0, "se", 10, 2, V480);
+    closeRect(preview, { x: 100, y: 200, w: 160, h: 32 });
+    expect(snapResize(preview, rect0, "se", t, V480, true)).toEqual({ rect: preview, guides: [] });
+    // Within 8 / 5 px of the line it snaps, the right edge moving 4.
+    const close = resizeRect(rect0, "se", 46, 9.2, V480);
+    closeRect(close, { x: 100, y: 200, w: 196, h: 39.2 });
+    const out = snapResize(close, rect0, "se", t, V480, true);
+    closeRect(out.rect, { x: 100, y: 200, w: 200, h: 40 });
+    expect(out.guides).toEqual([{ axis: "y", at: 240 }]);
+    // A sweep of the corner along its diagonal: neither edge ever lands
+    // more than 8 px from where the pointer puts it.
+    for (let k = 0; k <= 200; k += 0.5) {
+      const p = resizeRect(rect0, "se", k, k / 5, V480);
+      const o = snapResize(p, rect0, "se", t, V480, true).rect;
+      expect(Math.abs(o.w - p.w), `k ${k}`).toBeLessThanOrEqual(SNAP_PX + 1e-9);
+      expect(Math.abs(o.h - p.h), `k ${k}`).toBeLessThanOrEqual(SNAP_PX + 1e-9);
+    }
+  });
+
+  it("a tall charm's x snap never moves its y edge more than 8 px", () => {
+    // 30 × 300 (1 : 10) at (200, 20), grown to 34 × 340: its right edge 6 px
+    // short of x 240 would make it 40 × 400, its bottom edge 60 px from the
+    // pointer. Refused; a line 0.5 px away still snaps (the bottom moves 5).
+    const rect0 = { x: 200, y: 20, w: 30, h: 300 };
+    const preview = resizeRect(rect0, "se", 4, 40, V480);
+    closeRect(preview, { x: 200, y: 20, w: 34, h: 340 });
+    const out = snapResize(preview, rect0, "se", { xs: lines(240), ys: [] }, V480, true);
+    expect(out).toEqual({ rect: preview, guides: [] });
+    const near = snapResize(preview, rect0, "se", { xs: lines(234.5), ys: [] }, V480, true);
+    closeRect(near.rect, { x: 200, y: 20, w: 34.5, h: 345 });
+    expect(near.guides).toEqual([{ axis: "x", at: 234.5 }]);
+  });
 });
 
 // ---- properties ----
@@ -399,6 +483,12 @@ const still = (r: PxRect, c: Corner): [number, number] => [
 function inside(r: PxRect, v: Size, tol = 1e-9): boolean {
   return r.x >= -tol && r.y >= -tol && r.x + r.w <= v.w + tol && r.y + r.h <= v.h + tol;
 }
+
+/** `t` without the viewport's own lines: the other charms' alone. */
+const charmsOnly = (t: SnapTargets): SnapTargets => ({
+  xs: t.xs.filter((l) => !l.viewport),
+  ys: t.ys.filter((l) => !l.viewport),
+});
 
 /** A random viewport, charms laid out in it and a dragged rect `me`. */
 function arena(r: Rand): { v: Size; laid: Array<{ el: { id: string }; rect: PxRect }>; me: PxRect } {
@@ -445,48 +535,55 @@ describe("snapping properties (v1.62.0, 500 seeded cases each)", () => {
       const dy = aim(r, spans(me, "y")[Math.floor(r() * 3)]!, t.ys);
       const preview = moveRect(me, dx, dy, v);
       const on = r() < 0.8;
-      const out = snapMove(preview, t, v, on);
-      expect(inside(out.rect, v)).toBe(true);
-      expect(out.rect.w).toBe(preview.w);
-      expect(out.rect.h).toBe(preview.h);
-      if (!on) {
-        expect(out).toEqual({ rect: preview, guides: [] });
-        continue;
-      }
-      if (out.guides.length > 0) snapped += 1;
-      for (const axis of ["x", "y"] as const) {
-        const ls = axis === "x" ? t.xs : t.ys;
-        const extent = axis === "x" ? v.w : v.h;
-        const size = axis === "x" ? preview.w : preview.h;
-        const from = axis === "x" ? preview.x : preview.y;
-        const to = axis === "x" ? out.rect.x : out.rect.y;
-        // Every (candidate, line) pair within 8 whose shift keeps it inside.
-        const fits = spans(preview, axis).flatMap((c, j) =>
-          ls
-            .map((l) => ({ d: l.at - c, start: l.at - (j * size) / 2 }))
-            .filter((p) => Math.abs(p.d) <= SNAP_PX && p.start >= -1e-9 && p.start + size <= extent + 1e-9),
-        );
-        const guides = out.guides.filter((g) => g.axis === axis);
-        expect(Math.abs(to - from)).toBeLessThanOrEqual(SNAP_PX + 1e-6);
-        if (fits.length === 0) {
-          expect(to).toBe(from);
-          expect(guides).toEqual([]);
+      // The viewport's own edge line is always nearer than, or tied with,
+      // a shift that would leave it, and wins the tie: with it, nothing
+      // here can tell whether a shift out of the viewport is refused. So
+      // each case also runs on the other charms' lines alone.
+      for (const tt of [t, charmsOnly(t)]) {
+        const out = snapMove(preview, tt, v, on);
+        expect(inside(out.rect, v)).toBe(true);
+        expect(out.rect.w).toBe(preview.w);
+        expect(out.rect.h).toBe(preview.h);
+        if (!on) {
+          expect(out).toEqual({ rect: preview, guides: [] });
           continue;
         }
-        const nearest = Math.min(...fits.map((p) => Math.abs(p.d)));
-        expect(guides.length).toBe(1);
-        expect(Math.abs(Math.abs(to - from) - nearest)).toBeLessThan(1e-6);
-        // The guide is a target and lies on an edge or the centre of the result.
-        expect(ls.some((l) => l.at === guides[0]!.at)).toBe(true);
-        expect(Math.min(...spans(out.rect, axis).map((c) => Math.abs(c - guides[0]!.at)))).toBeLessThan(1e-9);
+        if (tt === t && out.guides.length > 0) snapped += 1;
+        for (const axis of ["x", "y"] as const) {
+          const ls = axis === "x" ? tt.xs : tt.ys;
+          const extent = axis === "x" ? v.w : v.h;
+          const size = axis === "x" ? preview.w : preview.h;
+          const from = axis === "x" ? preview.x : preview.y;
+          const to = axis === "x" ? out.rect.x : out.rect.y;
+          // Every (candidate, line) pair within 8 whose shift keeps it inside.
+          const fits = spans(preview, axis).flatMap((c, j) =>
+            ls
+              .map((l) => ({ d: l.at - c, start: l.at - (j * size) / 2 }))
+              .filter((p) => Math.abs(p.d) <= SNAP_PX && p.start >= -1e-9 && p.start + size <= extent + 1e-9),
+          );
+          const guides = out.guides.filter((g) => g.axis === axis);
+          expect(Math.abs(to - from)).toBeLessThanOrEqual(SNAP_PX + 1e-6);
+          if (fits.length === 0) {
+            expect(to).toBe(from);
+            expect(guides).toEqual([]);
+            continue;
+          }
+          const nearest = Math.min(...fits.map((p) => Math.abs(p.d)));
+          expect(guides.length).toBe(1);
+          expect(Math.abs(Math.abs(to - from) - nearest)).toBeLessThan(1e-6);
+          // The guide is a target and lies on an edge or the centre of the result.
+          expect(ls.some((l) => l.at === guides[0]!.at)).toBe(true);
+          expect(Math.min(...spans(out.rect, axis).map((c) => Math.abs(c - guides[0]!.at)))).toBeLessThan(1e-9);
+        }
       }
     }
     expect(snapped).toBeGreaterThan(200);
   });
 
-  it("resize: inside, the shape and the still corner kept, the snapped edge at most 8 px, on its guide", () => {
+  it("resize: inside, the shape and the still corner kept, each side at most 8 px from the preview, on its guide", () => {
     const r = seeded(0x2e5);
     let snapped = 0;
+    let pushed = 0;
     for (let i = 0; i < 500; i++) {
       const { v, laid, me } = arena(r);
       const t = snapTargets(laid, "me", v);
@@ -505,12 +602,35 @@ describe("snapping properties (v1.62.0, 500 seeded cases each)", () => {
       expect(Math.abs(ay - by)).toBeLessThan(1e-9);
       expect(Math.min(o.w, o.h)).toBeGreaterThanOrEqual(MIN_ELEMENT_PX - 1e-9);
       expect(out.guides.length).toBeLessThanOrEqual(1);
+      // §7.5: each axis moves at most 8 from the preview, the side the
+      // shape derives as well as the snapped one.
+      expect(Math.abs(o.w - preview.w)).toBeLessThanOrEqual(SNAP_PX + 1e-6);
+      expect(Math.abs(o.h - preview.h)).toBeLessThanOrEqual(SNAP_PX + 1e-6);
+      // Pressed against the viewport: dragged far past it, the preview stops
+      // where the first wall binds. A line 1 to 8 px past the other axis's
+      // moving edge can only be reached by pushing the bound side out, so it
+      // is never taken (the aimed cases above rarely press a wall).
+      const pressed = resizeRect(me, c, sxOf(c) * 4 * v.w, syOf(c) * 4 * v.h, v);
+      const gap = (axis: "x" | "y"): number => {
+        const wall = axis === "x" ? (sxOf(c) > 0 ? v.w : 0) : syOf(c) > 0 ? v.h : 0;
+        return Math.abs(movingEdge(pressed, c, axis) - wall);
+      };
+      const free = gap("x") >= gap("y") ? "x" : "y";
+      const past = 1 + (i % 8);
+      const line = { at: movingEdge(pressed, c, free) + (free === "x" ? sxOf(c) : syOf(c)) * past, viewport: false };
+      expect(snapResize(pressed, me, c, free === "x" ? { xs: [line], ys: [] } : { xs: [], ys: [line] }, v, true)).toEqual({
+        rect: pressed,
+        guides: [],
+      });
+      // Within 8 on the bound side too, so only the inside rule refuses it.
+      if ((free === "x" ? past / a : past * a) <= SNAP_PX) pushed += 1;
       if (!on) {
         expect(out).toEqual({ rect: preview, guides: [] });
         continue;
       }
       // Every line within 8 of a moving edge that gives a size resizeRect
-      // could: at least 24 on the short side, inside.
+      // could (at least 24 on the short side, inside) with neither side
+      // more than 8 from the preview's.
       const [ox, oy] = still(me, c);
       const sx = sxOf(c);
       const sy = syOf(c);
@@ -525,6 +645,7 @@ describe("snapping properties (v1.62.0, 500 seeded cases each)", () => {
         }),
       ].filter((p) => {
         if (Math.abs(p.d) > SNAP_PX || !(Math.min(p.w, p.h) >= MIN_ELEMENT_PX - 1e-9)) return false;
+        if (Math.abs(p.w - preview.w) > SNAP_PX + 1e-9 || Math.abs(p.h - preview.h) > SNAP_PX + 1e-9) return false;
         return inside({ x: sx > 0 ? ox : ox - p.w, y: sy > 0 ? oy : oy - p.h, w: p.w, h: p.h }, v, 1e-9);
       });
       if (fits.length === 0) {
@@ -541,6 +662,7 @@ describe("snapping properties (v1.62.0, 500 seeded cases each)", () => {
       expect((g.axis === "x" ? t.xs : t.ys).some((l) => l.at === g.at)).toBe(true);
     }
     expect(snapped).toBeGreaterThan(150);
+    expect(pushed).toBeGreaterThan(100);
   });
 });
 

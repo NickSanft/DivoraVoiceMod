@@ -30,7 +30,8 @@
 // Neither event has a `seq`, so an answer is kept only if no event of its
 // kind came while it was on its way (one count per kind). Locked, the light
 // draws nothing until the page holds an `overlay:status` for its own
-// window: the status the handshake causes can land after an answer. Text
+// window: the status the handshake causes can land after an answer. It
+// waits for Space Mono Bold as the timer face does. Text
 // charms are measured here with the shared canvas, its `load` uncapped:
 // Stage waits at most FONT_WAIT_MS itself, and measures again when a slow
 // font arrives.
@@ -220,8 +221,8 @@ export function OverlayApp(): JSX.Element {
     };
     window.addEventListener("resize", onResize);
 
-    // A timer face draws once its font is loaded, or FONT_WAIT_MS on in the
-    // fallback; at once where the page can't tell.
+    // A timer face, and the recording light, draw once their font is loaded,
+    // or FONT_WAIT_MS on in the fallback; at once where the page can't tell.
     let fontWait: ReturnType<typeof setTimeout> | undefined;
     const fontLoaded = (): void => {
       clearTimeout(fontWait);

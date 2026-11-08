@@ -22,6 +22,7 @@ import {
   normalizeCharmText,
   readCharmText,
   readTextFields,
+  wellFormedText,
   type TextPatch,
 } from "./text";
 import { isTimerId } from "./timerState";
@@ -197,14 +198,16 @@ export interface OverlayScene {
 /** One change to the scene. The overlay may send only `remove`, `place`
  *  and `order`; `add` and `reframe` are main's. v1.62.0: `set` is main's
  *  own edit of a text charm, carrying `nw`/`nh` and only the fields that
- *  changed; it is never on the wire, and `readOp` never returns it. */
+ *  changed, and the overlay window's CSS size it is seen in (`viewport`,
+ *  the design size when absent); it is never on the wire, and `readOp`
+ *  never returns it. */
 export type SceneOp =
   | { kind: "add"; element: KnownElement }
   | { kind: "remove"; id: string }
   | { kind: "place"; id: string; rect: PxRect; viewport: Size }
   | { kind: "order"; id: string; to: "front" | "back" | "forward" | "backward" }
   | { kind: "reframe"; from: PxRect; to: PxRect; frame: Frame }
-  | { kind: "set"; id: string; fields: TextPatch };
+  | { kind: "set"; id: string; fields: TextPatch; viewport?: Size };
 
 /** Why an `add` was refused. v1.62.0: `light`, the scene already has a
  *  live recording light. */
@@ -331,10 +334,22 @@ export function migrateScene(overlayPrefs: unknown): OverlayScene {
   return defaultScene({ w: Math.round(w / k), h: Math.round(h / k) });
 }
 
+/** v1.62.0: a stored text element whose `text` holds half a surrogate pair
+ *  without its other half, with that half made U+FFFD (text.ts's
+ *  `wellFormedText`): left in, every push of the scene would fail at the
+ *  IPC. Every other element, and every other text, is `e` itself. */
+function wellFormedElement(e: SceneElement): SceneElement {
+  if (e.type !== "text" || typeof e.text !== "string") return e;
+  const text = wellFormedText(e.text);
+  return text === e.text ? e : { ...e, text };
+}
+
 /** A stored scene, or `fallback` when there is nothing to read. Reading
  *  changes no element: it drops only entries nothing can address (no
  *  string id) and later duplicate ids, and settles `version` and
- *  `designSize`. Every other key, at any level, is kept. */
+ *  `designSize`. Every other key, at any level, is kept. v1.62.0: but for
+ *  a text's lone surrogate half, which becomes U+FFFD
+ *  (`wellFormedElement`). */
 export function readScene(raw: unknown, fallback: OverlayScene): OverlayScene {
   if (!isObject(raw)) return fallback;
   const v = raw.version;
@@ -348,7 +363,7 @@ export function readScene(raw: unknown, fallback: OverlayScene): OverlayScene {
     for (const e of raw.elements as unknown[]) {
       if (!isObject(e) || typeof e.id !== "string" || e.id.length === 0 || seen.has(e.id)) continue;
       seen.add(e.id);
-      elements.push(e as SceneElement);
+      elements.push(wellFormedElement(e as SceneElement));
     }
   } else {
     elements = defaultElements(designSize);
@@ -543,7 +558,7 @@ export function applyOp(s: OverlayScene, op: SceneOp): OverlayScene {
     case "reframe":
       return reframe(s, op.from, op.to, op.frame);
     case "set":
-      return set(s, op.id, op.fields);
+      return set(s, op.id, op.fields, op.viewport);
     default:
       return s;
   }
@@ -685,13 +700,15 @@ function centredOn(r: PxRect, size: PxRect, v: Size): PxRect {
  *  stored ones, the text normalized and a colour lower-cased; fields not
  *  in it, and unknown keys, are kept as stored, so a later build's font or
  *  a hand-set colour survives an edit of the words. The id and `z` never
- *  change. If the shape (`nw : nh`) changed, it keeps its designed height
- *  and the side its alignment names (left keeps its left edge, right its
- *  right edge, centre its centre), takes the new shape's width, is scaled
- *  down together by `fitSize`'s rule if that is wider than the design
- *  (keeping its vertical centre), and is clamped inside. `s` itself when
- *  `setRefusal` refuses or no stored value would change. */
-function set(s: OverlayScene, id: string, fields: TextPatch): OverlayScene {
+ *  change. If the shape (`nw : nh`) changed, it keeps its designed height,
+ *  takes the new shape's width, and is scaled down together by `fitSize`'s
+ *  rule if that is wider than the design. Where it is drawn in `viewport`
+ *  (the overlay window's CSS size; the design size when absent), it keeps
+ *  its vertical centre and the side its alignment names (left its left
+ *  edge, right its right edge, centre its centre), and is then kept inside
+ *  that window. `s` itself when `setRefusal` refuses or no stored value
+ *  would change. */
+function set(s: OverlayScene, id: string, fields: TextPatch, viewport?: Size): OverlayScene {
   if (setRefusal(s, id, fields) !== null) return s;
   // setRefusal found a live text with this id.
   const entry = liveEntries(s).find((x) => x.el.id === id)!;
@@ -712,9 +729,26 @@ function set(s: OverlayScene, id: string, fields: TextPatch): OverlayScene {
     const w = round6(size.w / d.w);
     const h = round6(size.h / d.h);
     const align = readTextFields(next).align;
-    const left = align === "left" ? r.x : align === "right" ? r.x + r.w - w : r.x + r.w / 2 - w / 2;
-    const top = r.y + r.h / 2 - h / 2;
-    next = { ...next, x: round6(clamp(left, 0, 1 - w)), y: round6(clamp(top, 0, 1 - h)), w, h };
+    // The side is kept on screen, in the window it is seen in, and so is
+    // the vertical centre; then the box is kept inside that window. Layout
+    // keeps a centre fraction and the designed px size, shrunk to fit the
+    // window, so in a window that isn't the design's size, keeping the
+    // side's design fraction (or clamping inside the design's fractions)
+    // would move an edge-snapped label off its edge, or a label that fits
+    // where it is. In a window of the design size they are the same.
+    const v = validSize(viewport) ? viewport : d;
+    const shown = layoutBox(r, d, v, false);
+    // The new box as this window draws it.
+    const k = Math.min(1, v.w / size.w, v.h / size.h);
+    const lw = size.w * k;
+    const lh = size.h * k;
+    const lx =
+      align === "left" ? shown.x : align === "right" ? shown.x + shown.w - lw : shown.x + shown.w / 2 - lw / 2;
+    const ly = shown.y + shown.h / 2 - lh / 2;
+    // Stored as the centre fraction that draws it there.
+    const left = (clamp(lx, 0, v.w - lw) + lw / 2) / v.w - w / 2;
+    const top = (clamp(ly, 0, v.h - lh) + lh / 2) / v.h - h / 2;
+    next = { ...next, x: round6(left), y: round6(top), w, h };
   }
   return { ...s, elements: s.elements.map((x, i) => (i === entry.index ? next : x)) };
 }
@@ -1000,19 +1034,31 @@ export function defaultTimerRect(s: OverlayScene, view?: Size): FracRect {
   };
 }
 
-/** `w × h` scaled down together, never up, until its width is at most
- *  `share` of `v`'s and it fits inside `d`. */
+/** `w × h` scaled down together until its width is at most `share` of
+ *  `v`'s; then grown, as `fitSize` does, until its short side is at least
+ *  MIN_ELEMENT_PX where `v` allows (which can take it past `share`); then
+ *  scaled down to fit inside `d`. When the window is no bigger than `d`,
+ *  this is the box `place` would store, so a new element's first drag or
+ *  nudge is a move, not a resize. In a bigger window (enlarged with no drag
+ *  since), a box wider than `d` is scaled down to fit it and can be under
+ *  MIN_ELEMENT_PX, as a picture can; its first place then grows the design
+ *  and resizes it. */
 function fitShare(w: number, h: number, share: number, v: Size, d: Size): Size {
-  const k = Math.min(1, (share * v.w) / w, d.w / w, d.h / h);
-  return { w: w * k, h: h * k };
+  const k = Math.min(1, (share * v.w) / w);
+  const f = fitSize(w * k, h * k, v, MIN_ELEMENT_PX);
+  const kd = Math.min(1, d.w / f.w, d.h / f.h);
+  return { w: f.w * kd, h: f.h * kd };
 }
 
 /** v1.62.0: where a new text charm goes, as fractions of the scene's
  *  `designSize`: the shape of its natural box (`nw × nh`), its height 10 %
  *  of the window's short side (32 to 160 px), scaled down together to fit
- *  90 % of the window's width, centred across, its top at 20 % of the
- *  height and 6 % lower for each of the next four, then round again.
- *  `view` is the window's CSS size. */
+ *  90 % of the window's width, but its short side at least 24 px where the
+ *  window and the design allow (so a long one-line text can be wider than
+ *  90 %, up to the whole width, and a one-letter one taller than 10 %; see
+ *  `fitShare`), centred across, its top at 20 % of the height and 6 % lower
+ *  for each of the next four, then round again. `view` is the window's CSS
+ *  size. */
 export function defaultTextRect(s: OverlayScene, nw: number, nh: number, view?: Size): FracRect {
   const d = s.designSize;
   const v = view && positive(view.w) && positive(view.h) ? view : d;
@@ -1031,10 +1077,12 @@ export function defaultTextRect(s: OverlayScene, nw: number, nh: number, view?: 
 
 /** v1.62.0: where the recording light goes, as fractions of the scene's
  *  `designSize`: 5:1, its height 7 % of the window's short side (24 to
- *  96 px), scaled down together to fit 90 % of the window's width, at the
- *  bottom left: its left edge 4 % of the width in, its bottom 4 % of the
- *  height up. Clear of Arrange's Move window grip and Lock pill, which sit
- *  at the top. `view` is the window's CSS size. */
+ *  96 px), scaled down together to fit 90 % of the window's width, but its
+ *  short side at least 24 px where the window and the design allow (in a
+ *  window under about 133 px wide it is then wider than 90 %; see
+ *  `fitShare`), at the bottom left: its left edge 4 % of the width in,
+ *  its bottom 4 % of the height up. Clear of Arrange's Move window grip and
+ *  Lock pill, which sit at the top. `view` is the window's CSS size. */
 export function defaultLightRect(s: OverlayScene, view?: Size): FracRect {
   const d = s.designSize;
   const v = view && positive(view.w) && positive(view.h) ? view : d;
