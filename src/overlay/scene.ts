@@ -234,6 +234,19 @@ const TEXT_LABEL_CHARS = 40;
  *  before it counts as made against an older shape. */
 const STALE_SHAPE = 1e-3;
 
+/** v1.62.0: round6's error on a stored centre fraction, a few writes over.
+ *  Each write (an `add`, `place` or `set`, and each time a growing design
+ *  re-expresses it) can move it by 7.5e-7 (`x` and half of `w` rounded);
+ *  this is five writes' worth. `set` counts a box layout draws clamped at
+ *  a window's edge as pushed in from past it only beyond this. */
+const ROUNDED_CENTRE = 4e-6;
+
+/** v1.62.0: how near, in CSS px, a box `set` draws must be to a window's
+ *  edge to be on it: round6's error on a stored length (5e-7 of the design,
+ *  up to 0.008 px at MAX_DESIGN_PX), twice over for a design that grew
+ *  since. Far too little to see. */
+const ON_EDGE_PX = 0.02;
+
 /** v1.62.0: the text fields a `set` may carry besides `nw`/`nh`. */
 const TEXT_KEYS = ["text", "font", "bold", "color", "outline", "align"] as const;
 
@@ -704,10 +717,12 @@ function centredOn(r: PxRect, size: PxRect, v: Size): PxRect {
  *  takes the new shape's width, and is scaled down together by `fitSize`'s
  *  rule if that is wider than the design. Where it is drawn in `viewport`
  *  (the overlay window's CSS size; the design size when absent), it keeps
- *  its vertical centre and the side its alignment names (left its left
- *  edge, right its right edge, centre its centre), and is then kept inside
- *  that window. `s` itself when `setRefusal` refuses or no stored value
- *  would change. */
+ *  the side its alignment names (left its left edge, right its right edge,
+ *  centre its centre) and is kept inside that window, stored as a centre
+ *  fraction that draws it there (`drawnFraction`). Down, it keeps its
+ *  stored vertical centre (taken inside [0, 1]), as the design has it,
+ *  which layout draws kept inside every window. `s` itself when
+ *  `setRefusal` refuses or no stored value would change. */
 function set(s: OverlayScene, id: string, fields: TextPatch, viewport?: Size): OverlayScene {
   if (setRefusal(s, id, fields) !== null) return s;
   // setRefusal found a live text with this id.
@@ -729,28 +744,70 @@ function set(s: OverlayScene, id: string, fields: TextPatch, viewport?: Size): O
     const w = round6(size.w / d.w);
     const h = round6(size.h / d.h);
     const align = readTextFields(next).align;
-    // The side is kept on screen, in the window it is seen in, and so is
-    // the vertical centre; then the box is kept inside that window. Layout
-    // keeps a centre fraction and the designed px size, shrunk to fit the
-    // window, so in a window that isn't the design's size, keeping the
-    // side's design fraction (or clamping inside the design's fractions)
-    // would move an edge-snapped label off its edge, or a label that fits
-    // where it is. In a window of the design size they are the same.
+    // The side is kept on screen, in the window it is seen in; then the box
+    // is kept inside that window. Layout keeps a centre fraction and the
+    // designed px size, shrunk to fit the window, so in a window that isn't
+    // the design's size, keeping the side's design fraction (or clamping
+    // inside the design's fractions) would move an edge-snapped label off
+    // its edge, or a label that fits where it is. In a window of the design
+    // size, for a box stored inside the design, they are the same.
     const v = validSize(viewport) ? viewport : d;
     const shown = layoutBox(r, d, v, false);
-    // The new box as this window draws it.
-    const k = Math.min(1, v.w / size.w, v.h / size.h);
-    const lw = size.w * k;
-    const lh = size.h * k;
+    // The new box's width as this window draws it.
+    const lw = size.w * Math.min(1, v.w / size.w, v.h / size.h);
     const lx =
       align === "left" ? shown.x : align === "right" ? shown.x + shown.w - lw : shown.x + shown.w / 2 - lw / 2;
-    const ly = shown.y + shown.h / 2 - lh / 2;
-    // Stored as the centre fraction that draws it there.
-    const left = (clamp(lx, 0, v.w - lw) + lw / 2) / v.w - w / 2;
-    const top = (clamp(ly, 0, v.h - lh) + lh / 2) / v.h - h / 2;
+    // Across, stored as a centre fraction that draws it there
+    // (`drawnFraction`); `ux` is what the design-fraction rule keeps. Down,
+    // the stored vertical centre, taken inside [0, 1] (as `drawnFraction`
+    // takes `kept`). Its designed height is the same unless `fitSize`
+    // changed it, so it is where the design has it (on the design's top or
+    // bottom, say), and layout draws it kept inside every window: in this
+    // one around the vertical centre it was drawn on, or, drawn pushed in
+    // from past the top or bottom, on that edge or nearer it. The centre
+    // that draws it kept inside this window would draw the same here, but
+    // would move a label lined up on a top or bottom edge off it in another
+    // window, or here once it is edited back.
+    const ux = align === "left" ? r.x + w / 2 : align === "right" ? r.x + r.w - w / 2 : r.x + r.w / 2;
+    const pastX = r.x + r.w / 2 - (shown.x + shown.w / 2) / v.w;
+    const left = drawnFraction(lx, lw, v.w, pastX, ux, shown.w) - w / 2;
+    const top = clamp(r.y + r.h / 2, 0, 1) - h / 2;
     next = { ...next, x: round6(left), y: round6(top), w, h };
   }
   return { ...s, elements: s.elements.map((x, i) => (i === entry.index ? next : x)) };
+}
+
+/** `set`'s stored centre fraction across a window `span` px wide, for an
+ *  edited box `len` px wide that would be drawn from `at`: kept inside the
+ *  window. Usually the centre fraction that draws it there, so it is
+ *  stored inside the window. But when layout was drawing the stored box
+ *  pushed in from past this window's left or right edge (`past`: its
+ *  stored centre fraction less the drawn one; `pushedIn`), or shrunk to
+ *  fill the window's width (`was`: its drawn width), the stored fraction
+ *  holds where it is in a window of another size (the design's, say),
+ *  which this window can't show. Against an edge (to within ON_EDGE_PX, so
+ *  moved at most that far onto it), the drawn fraction and every one past
+ *  it draw the same here; of those, the one nearest `kept`, the
+ *  design-fraction rule's. A centre fraction outside [0, 1] draws the box
+ *  on that edge in every window, as 0 or 1 does, so `kept` is taken inside
+ *  it (and round6 stays finite for a hand edit's huge one). So a label that
+ *  rule keeps on a side of the design, drawn here pushed in or filling the
+ *  window's width, and its edited box drawn on the same side here, is
+ *  still on the design's side when the window grows back. */
+function drawnFraction(at: number, len: number, span: number, past: number, kept: number, was: number): number {
+  const p = clamp(at, 0, span - len);
+  const c = (p + len / 2) / span;
+  if (!pushedIn(past) && was < span - ON_EDGE_PX) return c;
+  const lo = p <= ON_EDGE_PX ? -Infinity : c;
+  const hi = p >= span - len - ON_EDGE_PX ? Infinity : c;
+  return Math.min(Math.max(clamp(kept, 0, 1), lo), hi);
+}
+
+/** `set`: layout draws the stored box clamped at a window's edge, pushed
+ *  in from past it, by more than round6's error (`past`: its stored centre
+ *  fraction less the drawn one). */
+function pushedIn(past: number): boolean {
+  return Math.abs(past) > ROUNDED_CENTRE;
 }
 
 function order(s: OverlayScene, id: string, to: Order): OverlayScene {

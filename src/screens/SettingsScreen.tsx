@@ -2707,8 +2707,8 @@ function OverlayCharmRows(): JSX.Element {
           With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked
           Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings
           can see it. Like the rest of the overlay, it may still show on Windows 10 and the first
-          Windows 11 release, and for a moment when a recording ends without your Stop, such as
-          Replay turning off or a take that ends by itself.
+          Windows 11 release, and for a moment as a recording starts, or when one ends without your
+          Stop, such as Replay turning off or a take that ends by itself.
         </div>
       </Show>
       <div style={helpStyle}>
@@ -3061,8 +3061,9 @@ function StreamOverlaySection(): JSX.Element {
           <strong style={{ color: "var(--text-mid)" }}>Green</strong> /{" "}
           <strong style={{ color: "var(--text-mid)" }}>Magenta</strong> and add
           a Chroma Key filter. In OBS's Chroma Key, keep Key Color Type on Green or
-          Magenta: a custom colour picked from the background can also remove white, grey
-          and black. It reopens where you left it.
+          Magenta: a custom colour picked from the Green background can also remove white,
+          grey, black, and the Blue and Sky text colours, and leave Yellow partly see-through.
+          It reopens where you left it.
         </div>
       </div>
     </section>

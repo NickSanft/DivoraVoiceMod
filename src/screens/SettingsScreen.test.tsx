@@ -1202,7 +1202,7 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     const LIGHT =
       "The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY while Replay is on (not while it's held). It's part of the overlay, so Divora's recordings and OBS show it too, unless Hide from recordings is on.";
     const HIDE =
-      "With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release, and for a moment when a recording ends without your Stop, such as Replay turning off or a take that ends by itself.";
+      "With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release, and for a moment as a recording starts, or when one ends without your Stop, such as Replay turning off or a take that ends by itself.";
     const first = mount();
     await flush();
     expect(first.getByText(LIGHT)).toBeInTheDocument();
@@ -1214,7 +1214,7 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     ).toBeInTheDocument();
     expect(
       first.getByText(
-        /add a Chroma Key filter\. In OBS's Chroma Key, keep Key Color Type on Green or Magenta: a custom colour picked from the background can also remove white, grey and black\. It reopens where you left it\./,
+        /add a Chroma Key filter\. In OBS's Chroma Key, keep Key Color Type on Green or Magenta: a custom colour picked from the Green background can also remove white, grey, black, and the Blue and Sky text colours, and leave Yellow partly see-through\. It reopens where you left it\./,
       ),
     ).toBeInTheDocument();
     expect(first.getByText("Colour mood")).toBeInTheDocument();

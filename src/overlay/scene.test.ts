@@ -1522,12 +1522,211 @@ describe("text charms and the recording light (v1.62.0)", () => {
       if (align === "center") expect(after.x + after.w / 2, align).toBeCloseTo(400, 2);
       expect(after.y + after.h / 2, align).toBeCloseTo(rect.y + 50, 2);
       // Without a viewport, the design size's own: the side kept as a
-      // fraction of it, as in a window of that size.
+      // fraction of it, as in a window of that size (this box is stored
+      // inside the design).
       const bare = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw: 200, nh: 100 } });
       const there = rectOf(bare, T, d);
       const was = rectOf(s, T, d);
       if (align === "left") expect(there.x, align).toBeCloseTo(was.x, 2);
       if (align === "right") expect(there.x + there.w, align).toBeCloseTo(was.x + was.w, 2);
+    }
+  });
+
+  it("set keeps a label the window draws pushed in from past its edge where the design has it, too", () => {
+    // designSize grew to 1920 × 1080 in an earlier, bigger window; the
+    // window is now smaller. A 600 × 100 label in the design's bottom-left
+    // or bottom-right corner is drawn pushed in from past the window's
+    // edges, on them. Edited to 300 or 900 wide, it is on those edges in
+    // this window, and still in the design's corner when the window grows
+    // back. (960 × 300 rounds the drawn bottom a hair off the edge.)
+    const d = { w: 1920, h: 1080 };
+    for (const v of [
+      { w: 960, h: 540 },
+      { w: 1280, h: 720 },
+      { w: 960, h: 300 },
+      { w: 1920, h: 540 },
+    ]) {
+      for (const align of ["left", "right"] as const) {
+        for (const nw of [300, 900]) {
+          const s = sceneOf([text({ x: align === "left" ? 0 : 0.6875, y: 0.907407, w: 0.3125, h: 0.092593, align, nw: 600, nh: 100 })], d);
+          const next = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw, nh: 100 }, viewport: v });
+          for (const win of [v, d]) {
+            const r = rectOf(next, T, win);
+            const where = `${align} ${nw} set in ${v.w}x${v.h}, seen in ${win.w}x${win.h}`;
+            expect(r.w, where).toBeCloseTo(nw, 2);
+            if (align === "left") expect(r.x, where).toBeCloseTo(0, 2);
+            else expect(r.x + r.w, where).toBeCloseTo(win.w, 2);
+            expect(r.y + r.h, where).toBeCloseTo(win.h, 2);
+          }
+          // Its height is the same, so its stored y is too.
+          expect(at(next).y, `${align} ${nw} ${v.w}x${v.h}`).toBeCloseTo(0.907407, 6);
+        }
+      }
+    }
+    // A right-aligned label a 200 px window draws shrunk to its whole width,
+    // its centre at 45 % of it (right edge 1164 px in the design). Edited
+    // narrower, it still fills that window, where any centre fraction draws
+    // the same, so its right edge stays where the design has it.
+    const narrow = { w: 200, h: 1080 };
+    const s = sceneOf([text({ x: 0.29375, y: 0.4, w: 0.3125, h: 0.092593, align: "right", nw: 600, nh: 100 })], d);
+    expect(rectOf(s, T, narrow).w).toBeCloseTo(200, 6);
+    const next = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw: 300, nh: 100 }, viewport: narrow });
+    const shown = rectOf(next, T, narrow);
+    expect(shown.x).toBeCloseTo(0, 2);
+    expect(shown.w).toBeCloseTo(200, 2);
+    const there = rectOf(next, T, d);
+    expect(there.w).toBeCloseTo(300, 2);
+    expect(there.x + there.w).toBeCloseTo(1164, 2);
+    // Pushed in, but where only the drawn fraction draws the edited box
+    // where it belongs in this window: its aligned side kept off the edge
+    // (the bottom-right label's left edge at 360 px, the bottom-left one's
+    // right edge at 600); on the edge it was pushed in from, but not on the
+    // design's (left-aligned at 192 px of the design, right-aligned at 1728
+    // px, each drawn pushed in by 54 px); and 3 px from the edge, not on it.
+    const half = { w: 960, h: 540 };
+    for (const [align, x, y, nw, side] of [
+      ["left", 0.6875, 0.907407, 300, 360],
+      ["right", 0, 0.907407, 300, 600],
+      ["left", 0.1, 0.4, 300, 0],
+      ["right", 0.5875, 0.4, 300, 960],
+      ["left", 0.5875, 0.4, 597, 360],
+    ] as const) {
+      const s = sceneOf([text({ x, y, w: 0.3125, h: 0.092593, align, nw: 600, nh: 100 })], d);
+      const r = rectOf(applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw, nh: 100 }, viewport: half }), T, half);
+      const where = `${align} at ${x}, ${nw} wide`;
+      expect(r.w, where).toBeCloseTo(nw, 2);
+      expect(align === "left" ? r.x : r.x + r.w, where).toBeCloseTo(side, 2);
+    }
+  });
+
+  it("set keeps a label the window draws shrunk to its whole width where the design has it", () => {
+    // A 240 × 96 label on the design's left or right edge, in a 1280 × 720
+    // window, is edited to a text wider than the design: 1920 × 80, drawn
+    // filling the window. Its stored centre is then the drawn one, but every
+    // centre fraction draws it the same here. Edited to 500 × 80, it is on
+    // the window's edge, and on the design's.
+    const d = { w: 1920, h: 1080 };
+    const v = { w: 1280, h: 720 };
+    for (const align of ["left", "right"] as const) {
+      const s = sceneOf([text({ x: align === "left" ? 0 : 0.875, y: 0.4, w: 0.125, h: 96 / 1080, align, nw: 250, nh: 100 })], d);
+      const full = applyOp(s, { kind: "set", id: T, fields: { text: "a long message", nw: 2400, nh: 100 }, viewport: v });
+      expect(at(full).w, align).toBe(1);
+      expect(rectOf(full, T, v).w, align).toBeCloseTo(1280, 6);
+      const next = applyOp(full, { kind: "set", id: T, fields: { text: "BRB", nw: 625, nh: 100 }, viewport: v });
+      for (const win of [v, d]) {
+        const r = rectOf(next, T, win);
+        const where = `${align} seen in ${win.w}x${win.h}`;
+        expect(r.w, where).toBeCloseTo(500, 2);
+        if (align === "left") expect(r.x, where).toBeCloseTo(0, 2);
+        else expect(r.x + r.w, where).toBeCloseTo(win.w, 2);
+      }
+    }
+  });
+
+  it("set keeps a label the window draws pushed in by under a px where the design has it", () => {
+    // A 24 × 100 label on the design's left or right edge, in a window 60 px
+    // narrower, is drawn pushed in by 12 × 60 / 1920 = 0.375 px; in one 3 px
+    // narrower, by 0.019 px. Widened to 1525 × 100, it is on the window's
+    // edge, and on the design's (keeping the drawn centre fraction put it
+    // 24.6 px off, and 1.2 px).
+    const d = { w: 1920, h: 1080 };
+    for (const v of [
+      { w: 1860, h: 1080 },
+      { w: 1917, h: 1080 },
+    ]) {
+      for (const align of ["left", "right"] as const) {
+        const s = sceneOf([text({ x: align === "left" ? 0 : 0.9875, y: 0.4, w: 0.0125, h: 100 / 1080, align, nw: 24, nh: 100 })], d);
+        const next = applyOp(s, { kind: "set", id: T, fields: { text: "a long line", nw: 1525, nh: 100 }, viewport: v });
+        for (const win of [v, d]) {
+          const r = rectOf(next, T, win);
+          const where = `${align} set in ${v.w}x${v.h}, seen in ${win.w}x${win.h}`;
+          expect(r.w, where).toBeCloseTo(1525, 2);
+          if (align === "left") expect(r.x, where).toBeCloseTo(0, 2);
+          else expect(r.x + r.w, where).toBeCloseTo(win.w, 2);
+        }
+      }
+    }
+  });
+
+  it("set keeps a pushed-in label on its edge when round6 drew the old box a hair wider", () => {
+    // 24 px of 1366 is stored as 0.01757 (24.0006 px). A 24 × 60 label on
+    // the design's left or right edge, in a 683 × 384 window, is drawn
+    // pushed in. Edited to 30 : 100 (24 × 80: its short side raised to
+    // 24), the new box, centred on or aligned to the far side of the old
+    // one, is 0.0003 or 0.0006 px off that edge: on it.
+    const d = { w: 1366, h: 768 };
+    const v = { w: 683, h: 384 };
+    for (const [align, x] of [
+      ["center", 0],
+      ["right", 0],
+      ["center", 1 - 0.01757],
+      ["left", 1 - 0.01757],
+    ] as const) {
+      const s = sceneOf([text({ x, y: 0.4, w: 0.01757, h: 0.078125, align, nw: 24, nh: 60 })], d);
+      const next = applyOp(s, { kind: "set", id: T, fields: { text: "l", nw: 30, nh: 100 }, viewport: v });
+      for (const win of [v, d]) {
+        const r = rectOf(next, T, win);
+        const where = `${align} at ${x}, seen in ${win.w}x${win.h}`;
+        expect(r.w, where).toBeCloseTo(24, 2);
+        if (x === 0) expect(r.x, where).toBeCloseTo(0, 2);
+        else expect(r.x + r.w, where).toBeCloseTo(win.w, 2);
+      }
+    }
+  });
+
+  it("set keeps a label the window draws pushed in from past its top or bottom there when it draws it shorter", () => {
+    // A 600 × 100 label on the design's top or bottom edge, in a 700 × 540
+    // window, is drawn pushed in by 25 px; edited to 900 × 100 it is drawn
+    // 700 × 77.8. A 600 × 400 one in a 700 × 300 window is drawn filling
+    // its height; at 1200 × 400 it is drawn 700 × 233.3. Each keeps its
+    // stored vertical centre, so its stored y: on the same edge here, and
+    // the design's (the drawn centre put the first 50 px off it).
+    const d = { w: 1920, h: 1080 };
+    for (const [v, tall, nw] of [
+      [{ w: 700, h: 540 }, 100, 900],
+      [{ w: 700, h: 300 }, 400, 1200],
+    ] as const) {
+      for (const edge of ["top", "bottom"] as const) {
+        const y = edge === "top" ? 0 : 1 - tall / 1080;
+        const s = sceneOf([text({ x: 0, y, w: 600 / 1920, h: tall / 1080, align: "left", nw: 600, nh: tall })], d);
+        const next = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw, nh: tall }, viewport: v });
+        for (const win of [v, d]) {
+          const r = rectOf(next, T, win);
+          const where = `${edge} ${nw} × ${tall} set in ${v.w}x${v.h}, seen in ${win.w}x${win.h}`;
+          expect(r.x, where).toBeCloseTo(0, 2);
+          if (edge === "top") expect(r.y, where).toBeCloseTo(0, 2);
+          else expect(r.y + r.h, where).toBeCloseTo(win.h, 2);
+        }
+        expect(rectOf(next, T, v).w).toBeCloseTo(700, 2);
+        expect(at(next).y, `${edge} ${v.w}x${v.h}`).toBeCloseTo(y, 5);
+      }
+    }
+  });
+
+  it("set keeps a text stored far past the design's edge (a hand edit) live, on that edge", () => {
+    // Layout draws a centre fraction of 1e303 on the window's edge; one of
+    // round6's size or more would round to Infinity, and the text would be
+    // dropped, then saved as null.
+    const d = { w: 1920, h: 1080 };
+    const v = { w: 960, h: 540 };
+    for (const [x, y] of [
+      [1e303, 0.4],
+      [0.1, 1e303],
+      [-1e303, -1e303],
+    ] as const) {
+      const s = sceneOf([text({ x, y, w: 0.3125, h: 0.092593, align: "left", nw: 600, nh: 100 })], d);
+      const next = applyOp(s, { kind: "set", id: T, fields: { text: "hi", nw: 900, nh: 100 }, viewport: v });
+      const e = at(next);
+      expect(Math.abs(e.x as number), `${x}, ${y}`).toBeLessThanOrEqual(1);
+      expect(Math.abs(e.y as number), `${x}, ${y}`).toBeLessThanOrEqual(1);
+      for (const win of [v, d]) {
+        const r = rectOf(next, T, win);
+        const where = `${x}, ${y} seen in ${win.w}x${win.h}`;
+        if (x > 1) expect(r.x + r.w, where).toBeCloseTo(win.w, 2);
+        if (x < 0) expect(r.x, where).toBeCloseTo(0, 2);
+        if (y > 1) expect(r.y + r.h, where).toBeCloseTo(win.h, 2);
+        if (y < 0) expect(r.y, where).toBeCloseTo(0, 2);
+      }
     }
   });
 
@@ -1593,13 +1792,15 @@ describe("text charms and the recording light (v1.62.0)", () => {
     }
   });
 
-  it("set keeps the edited box inside the window it is seen in, vertically too", () => {
+  it("set keeps the stored vertical centre of a box the window draws taller; layout keeps it inside", () => {
     // A centred 1200 × 300 text in a 400 × 1080 window is drawn 400 × 100;
     // dragged to the top edge, its centre is 50 px down. At 3 : 1 (900 ×
-    // 300) it is drawn 400 × 133.3, so keeping that centre would put its top
-    // 16.7 px above the window: it is kept inside, its centre at 66.7 px.
-    // This window's layout would clamp either way; what is stored shows in
-    // another window, e.g. 200 px wide.
+    // 300) it is drawn 400 × 133.3: keeping that centre would put its top
+    // 16.7 px above the window, so layout draws it on the top edge. The
+    // centre stays 50 px down, as stored: in a 200 px wide window it is
+    // drawn 200 × 66.7 around it, and edited back to 4 : 1 it is on the top
+    // edge here again (storing the centre that drew it inside, 66.7 px,
+    // put it 16.7 px below).
     const d = { w: 1920, h: 1080 };
     const v = { w: 400, h: 1080 };
     const s0 = sceneOf([text({ x: 0.3, y: 0.3, w: 1200 / 1920, h: 300 / 1080, align: "center", nw: 1200, nh: 300 })], d);
@@ -1610,9 +1811,102 @@ describe("text charms and the recording light (v1.62.0)", () => {
     const after = rectOf(next, T, v);
     expect(after.h).toBeCloseTo(400 / 3, 2);
     expect(after.y).toBeCloseTo(0, 2);
-    // Stored with the centre at 66.7 px of 1080, not 50: (200/3)/1080 − (300/1080)/2.
-    expect(at(next).y).toBeCloseTo(200 / 3 / 1080 - 150 / 1080, 5);
-    expect(rectOf(next, T, { w: 200, h: 1080 }).y).toBeCloseTo(100 / 3, 2);
+    // Stored with the centre at 50 px of 1080: 50/1080 − (300/1080)/2.
+    expect(at(next).y).toBeCloseTo(50 / 1080 - 150 / 1080, 5);
+    expect(at(next).y).toBeCloseTo(at(s).y as number, 6);
+    expect(rectOf(next, T, { w: 200, h: 1080 }).y).toBeCloseTo(50 / 3, 2);
+    const back = rectOf(applyOp(next, { kind: "set", id: T, fields: { text: "long", nw: 1200, nh: 300 }, viewport: v }), T, v);
+    expect(back.h).toBeCloseTo(100, 2);
+    expect(back.y).toBeCloseTo(0, 2);
+  });
+
+  it("set keeps a label lined up on a window's top or bottom there when an edit draws it taller, and edited back", () => {
+    // The design is 1920 × 1080. A centred 1200 × 100 label in a 960 × 540
+    // window is drawn 960 × 80, a 1700 × 100 one in 1280 × 720 is drawn
+    // 1280 × 75.3; each is dragged to the window's top or bottom edge.
+    // Edited to "BRB" (300 × 100) it is drawn taller, on that edge; edited
+    // back, it is on that edge again, its stored y unchanged, and where it
+    // was in the design (950..1050 or 30..130 for the first). Storing the
+    // centre that drew the taller box inside the window put it 10 px (and
+    // 12.4 px) off the edge, and 20 px up or down in the design.
+    const d = { w: 1920, h: 1080 };
+    for (const [v, nw] of [
+      [{ w: 960, h: 540 }, 1200],
+      [{ w: 1280, h: 720 }, 1700],
+    ] as const) {
+      for (const edge of ["top", "bottom"] as const) {
+        const s0 = sceneOf([text({ x: 0.05, y: 0.4, w: nw / 1920, h: 100 / 1080, align: "center", nw, nh: 100 })], d);
+        const drawn = rectOf(s0, T, v);
+        expect(drawn.w).toBeCloseTo(v.w, 6);
+        const s = applyOp(s0, { kind: "place", id: T, rect: { ...drawn, y: edge === "top" ? 0 : v.h - drawn.h }, viewport: v });
+        const brb = applyOp(s, { kind: "set", id: T, fields: { text: "BRB", nw: 300, nh: 100 }, viewport: v });
+        const back = applyOp(brb, { kind: "set", id: T, fields: { text: "a long line", nw, nh: 100 }, viewport: v });
+        for (const [step, next, h] of [
+          ["BRB", brb, 100],
+          ["back", back, drawn.h],
+        ] as const) {
+          const r = rectOf(next, T, v);
+          const where = `${edge} ${nw} in ${v.w}x${v.h}, ${step}`;
+          expect(r.h, where).toBeCloseTo(h, 2);
+          if (edge === "top") expect(r.y, where).toBeCloseTo(0, 2);
+          else expect(r.y + r.h, where).toBeCloseTo(v.h, 2);
+          expect(at(next).y, where).toBeCloseTo(at(s).y as number, 6);
+        }
+        expectRectNear(rectOf(back, T, d), rectOf(s, T, d), 0.01);
+        if (nw === 1200) expect(rectOf(back, T, d).y).toBeCloseTo(edge === "top" ? 30 : 950, 2);
+      }
+    }
+    // Lined up on the top or bottom of a 1280 × 720 window (1500 × 80,
+    // drawn 1280 × 68.3), edited to 240 × 80 in a 960 × 540 one, where it is
+    // drawn taller than it was (960 × 51.2): back in 1280 × 720 it is on
+    // that edge (the centre that drew it inside 960 × 540 put it 13.3 px
+    // off).
+    const lined = { w: 1280, h: 720 };
+    const small = { w: 960, h: 540 };
+    for (const edge of ["top", "bottom"] as const) {
+      const s0 = sceneOf([text({ x: 0.05, y: 0.4, w: 1500 / 1920, h: 80 / 1080, align: "center", nw: 1500, nh: 80 })], d);
+      const drawn = rectOf(s0, T, lined);
+      const s = applyOp(s0, { kind: "place", id: T, rect: { ...drawn, y: edge === "top" ? 0 : 720 - drawn.h }, viewport: lined });
+      const next = applyOp(s, { kind: "set", id: T, fields: { text: "BRB", nw: 240, nh: 80 }, viewport: small });
+      for (const win of [small, lined]) {
+        const r = rectOf(next, T, win);
+        const where = `${edge} seen in ${win.w}x${win.h}`;
+        expect(r.h, where).toBeCloseTo(80, 2);
+        if (edge === "top") expect(r.y, where).toBeCloseTo(0, 2);
+        else expect(r.y + r.h, where).toBeCloseTo(win.h, 2);
+      }
+    }
+  });
+
+  it("set keeps a label on the design's top or bottom there when a smaller window draws its edit taller", () => {
+    // A ticker, 2600 : 120, fitted to the 1920 × 1080 design (1920 × 88.6)
+    // and snapped to its top or bottom. A smaller window of the same shape
+    // draws it scaled down, on the same edge. Edited there to "BRB" (300 :
+    // 120, 221.5 × 88.6), it is drawn taller, on that edge, and is still on
+    // the design's edge when the window grows back (the centre that drew it
+    // inside 960 × 540 put it 44.3 px off).
+    const d = { w: 1920, h: 1080 };
+    for (const v of [
+      { w: 960, h: 540 },
+      { w: 1280, h: 720 },
+      { w: 1536, h: 864 },
+    ]) {
+      for (const edge of ["top", "bottom"] as const) {
+        const s0 = sceneOf([text({ x: 0.3, y: 0.3, w: 250 / 1920, h: 120 / 1080, align: "center", nw: 250, nh: 120 })], d);
+        const long = applyOp(s0, { kind: "set", id: T, fields: { text: "Thanks for watching!", nw: 2600, nh: 120 }, viewport: d });
+        const full = rectOf(long, T, d);
+        expect(full.w).toBeCloseTo(1920, 6);
+        const s = applyOp(long, { kind: "place", id: T, rect: { ...full, y: edge === "top" ? 0 : 1080 - full.h }, viewport: d });
+        const next = applyOp(s, { kind: "set", id: T, fields: { text: "BRB", nw: 300, nh: 120 }, viewport: v });
+        for (const win of [v, d]) {
+          const r = rectOf(next, T, win);
+          const where = `${edge} set in ${v.w}x${v.h}, seen in ${win.w}x${win.h}`;
+          expect(r.h, where).toBeCloseTo(full.h, 2);
+          if (edge === "top") expect(r.y, where).toBeCloseTo(0, 2);
+          else expect(r.y + r.h, where).toBeCloseTo(win.h, 2);
+        }
+      }
+    }
   });
 
   it("set keeps the aligned side of a text the window draws scaled down to its height", () => {
