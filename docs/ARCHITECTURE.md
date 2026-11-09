@@ -1284,12 +1284,13 @@ owns its mode. Main still decides where it goes and owns what it shows. The
 page is a second Vite entry (`overlay.html` → `src/overlay.tsx`,
 `rollupOptions.input` in `vite.config.ts`), loaded as
 `overlay.html?instance=<n>`. It draws the **scene** — the spell circle and the
-pictures and GIFs the user adds, together the **charms**, and since v1.59.0
-Hourglass timer faces (see "Hourglass (v1.59.0)") — through `Stage`
-(`src/overlay/Stage.tsx`). It has no store and no engine of its own. The plan,
-and what changed from it, are in
-[`research/stream-studio.md`](research/stream-studio.md) (v1.55.0, "As
-built").
+pictures and GIFs the user adds, together the **charms**, since v1.59.0
+Hourglass timer faces (see "Hourglass (v1.59.0)"), and since v1.62.0 text
+charms and the recording light (see "Text charms (v1.62.0)" and "The
+recording light (v1.62.0)") — through `Stage` (`src/overlay/Stage.tsx`). It
+has no store and no engine of its own. The plan, and what changed from it,
+are in [`research/stream-studio.md`](research/stream-studio.md) (v1.55.0,
+"As built").
 
 Three Rust modules split the backend's part:
 
@@ -1308,7 +1309,9 @@ Three Rust modules split the backend's part:
 Main's side is `src/overlay/controller.ts`, which replaced the overlay block
 `src/stores/app.tsx` carried since v1.16.0. Its dependencies are injected, so
 the tests drive the real controller. The pure maths is in `scene.ts`,
-`frame.ts`, `mirror.ts` and `editor.ts`.
+`frame.ts`, `mirror.ts` and `editor.ts`, and since v1.62.0 `text.ts`,
+`snap.ts` and `recLight.ts`. `textMetrics.ts` (v1.62.0) holds the one part
+of text measuring that needs the DOM: the canvas each window measures with.
 
 ### Window
 
@@ -1402,10 +1405,11 @@ after the events that followed it: `close_overlay`'s "closing" arrived about
 counter); the events carry every change anyway. Found in the real app: without
 this rule the Show overlay window toggle stayed on after 6 of 12 quick
 open/close cycles. A status with a new `error` is toasted once. The toast
-has two tones: success for "Picture added. Use Arrange to place it." and the
-hotkey's two notices; error for everything else, the large-picture warning
-included. The controller's public actions never reject: a failure they don't
-expect is logged with `console.warn`.
+has two tones: success for "Picture added. Use Arrange to place it.", the
+hotkey's two notices, and (v1.62.0) "Text added. Use Arrange to place it."
+and "Recording light added. Use Arrange to place it."; error for everything
+else, the large-picture warning included. The controller's public actions
+never reject: a failure they don't expect is logged with `console.warn`.
 
 **A main-window reload** (F5 / Ctrl+R reload a WebView2 page, and the overlay
 window survives it). At start the controller subscribes to `overlay:status`
@@ -1553,13 +1557,23 @@ is its own signal, after the show.
 scene (for the pictures).** The window can be shown before they arrive, and a
 first frame of defaults would be captured by OBS. A timer face (v1.59.0)
 also waits for the backend's first timer snapshot, which the page hears on
-`timer-state` and reads once with `timer_status`, and for its font.
+`timer-state` and reads once with `timer_status`, and for its font. A text
+face (v1.62.0) waits for its own font to cover its words, and the recording
+light for Space Mono Bold, each at most 1 s; Locked, the light also waits
+for an `overlay:status` for its own window.
 
 The event names, the `OverlayStatus` and `ImportedAsset` keys, and sample
 statuses are held once in `src/overlay/wire.fixture.json`. Rust
 (`wire_fixture_matches_rust`, `imported_asset_wire_keys_are_frozen`) and
 TypeScript (`status.test.ts`, `state.test.ts`) both read it, so a change on
-one side fails the other's tests.
+one side fails the other's tests. Since v1.62.0 it also holds `textCharm`
+(the font, colour and alignment names a text charm stores, its creation
+limits, and the size and line height `nw`/`nh` are measured at; read by
+`text.test.ts`) and `recLight` (the recorder's two events and two status
+commands the page uses, with a sample of each payload cut to the fields it
+reads; read by `recLight.test.ts`,
+`fixture_names_the_recorder_events_the_overlay_hears` and
+`the_overlay_recorder_commands_are_registered`).
 
 ### The scene
 
@@ -1585,7 +1599,10 @@ it.
   A drag or a nudge keeps a shrunk element's designed size and takes only its
   new centre; a resize takes the new size.
 - **The shape is always kept:** `nw/nh` for a picture, square for the circle,
-  and a timer face's stored shape (3:1 when it is added; v1.59.0).
+  a timer face's stored shape (3:1 when it is added; v1.59.0), and (v1.62.0)
+  a text's `nw/nh` and the recording light's stored shape (5:1 when it is
+  added). Only main's `set` (v1.62.0) changes one: a text's, when an edit
+  changes its words, font or weight.
 - **Frame.** `frame` says what `designSize` was measured against: the window,
   or the whole monitor (Fit to monitor). Changing Fit commits a `reframe` that
   keeps every element that lies wholly inside the new frame where it is on
@@ -1594,30 +1611,36 @@ it.
   the window's.
 - **Live and inert.** An element this version can show is live: the first
   usable `spellcircle`, each `image` with usable geometry and an asset-id
-  `src`, and (v1.59.0) each `timer` with usable geometry and a `timer` that
-  passes the timer id grammar, whether or not that timer exists. Anything
-  else — an unknown type, a picture it can't recognise, a second circle,
-  unusable geometry — is inert: kept exactly as stored, written back
-  unchanged, neither drawn nor listed. From v1.55.0 to v1.58.0 a `timer`
-  element was inert like any unknown type, and the tests used it as theirs;
-  they use `"future"` now. Reading drops only entries that aren't objects or
-  have no non-empty string id, and later duplicate ids. The caps (16
-  pictures, 64 stored elements, one live circle, and the budget under Charm
-  pictures) apply when adding, never when reading; a timer face counts toward
-  the 64 only.
+  `src`, (v1.59.0) each `timer` with usable geometry and a `timer` that
+  passes the timer id grammar, whether or not that timer exists, and
+  (v1.62.0) each `text` with usable geometry and a text that, normalized,
+  isn't empty, and the first usable `rec`. Anything else — an unknown type,
+  a picture it can't recognise, a second circle or light, unusable geometry
+  — is inert: kept exactly as stored, written back unchanged, neither drawn
+  nor listed. From v1.55.0 to v1.58.0 a `timer` element was inert like any
+  unknown type, and the tests used it as theirs; they use `"future"` now.
+  Reading drops only entries that aren't objects or have no non-empty
+  string id, and later duplicate ids; since v1.62.0 it also makes half a
+  surrogate pair in a text U+FFFD (see "Text charms (v1.62.0)"). The caps
+  (16 pictures, 64 stored elements, one live circle, one live light, a
+  text's 200 UTF-16 units and 5 lines, and the budget under Charm pictures)
+  apply when adding, never when reading; a text's limits also apply when it
+  is edited. A timer face, a text and the light count toward the 64 only.
 - **Migration.** With no stored scene, `migrateScene` puts the circle where
   v1.51.3 drew it: at most 440 px, centred in the saved window (its size in
   `divora.overlay`, divided by its scale). That scene is saved the first time
   the overlay is seen open, before a geometry save can change what it was
   migrated from. A window under 440 CSS px now shrinks the circle; v1.51.3 cut
   it off.
-- **The reducer** (`applyOp`: `add`, `remove`, `place`, `order`, `reframe`)
-  is pure, rounds what it writes to 6 decimals, and returns the same object
-  when nothing changes. Main and the overlay run the same function. The
-  overlay may send only `remove`, `place` and `order` (`readOp`); main ignores
-  anything else with a `console.warn`, and still acks it. Main adds a timer
-  face itself, from Settings' Show on overlay (v1.59.0); the overlay still
-  can't add one.
+- **The reducer** (`applyOp`: `add`, `remove`, `place`, `order`, `reframe`,
+  and since v1.62.0 `set`) is pure, rounds what it writes to 6 decimals, and
+  returns the same object when nothing changes. Main and the overlay run the
+  same function. The overlay may send only `remove`, `place` and `order`
+  (`readOp`); main ignores anything else with a `console.warn`, and still
+  acks it. Main adds a timer face itself, from Settings' Show on overlay
+  (v1.59.0), and a text charm and the recording light (v1.62.0); the overlay
+  still can't add one. `set`, main's edit of a text charm, never comes off
+  the wire: `readOp` never returns it, from either side.
 - The circle can be removed like a picture. Settings' Charms list then offers
   **Add the spell circle**, which adds it at the back.
 
@@ -1643,10 +1666,11 @@ focused charm keeps focus. Rows stay in scene-array order and stack with
   CSS px, round for the circle) or on a corner handle (12×12, centred on the
   hit layer's corners) selects it and captures the pointer on its row.
   `pointermove`, `pointerup`, `pointercancel` and `lostpointercapture` are
-  heard on `window`. A move only updates a preview; the `place` edit is sent
-  once, on `pointerup`. A cancel or a lost capture drops the gesture and sends
-  nothing, and a move with no button down ends it as a release. A corner
-  resizes from the opposite corner, keeping the shape.
+  heard on `window`. A move only updates a preview (since v1.62.0 a snapped
+  one: see Snapping below); the `place` edit is sent once, on `pointerup`. A
+  cancel or a lost capture drops the gesture and sends nothing, and a move
+  with no button down ends it as a release. A corner resizes from the
+  opposite corner, keeping the shape.
 - **Keys.** The arrows nudge 1 px (Shift: 10 px). `=` and `-` (and the
   numpad's + and −) resize about the centre by 2 px on the long side; `+` and
   `_` by 10 %. A run of these is sent as one `place`, 300 ms after the last
@@ -1670,12 +1694,64 @@ focused charm keeps focus. Rows stay in scene-array order and stack with
   right, the toolbar's first control, an icon alone below 160 px wide; the
   **Move window** grip top left, not while fitted, its text from 320 px wide;
   and the hints, from 320×120: "Esc locks the overlay" or "Click Lock to lock
-  the overlay", and "Recordings can see the overlay while you arrange." while
-  a capture runs with Hide on and available (`capturing`, `hideWanted` and
-  `hideAvailable`). A picture that won't load shows "Picture missing" while
-  arranging, and a timer face whose timer the backend's snapshot lacks shows
-  "Timer missing" (v1.59.0; only once a snapshot has arrived). Locked shows no
-  frame, outline or handle.
+  the overlay", (v1.62.0) "Charms snap to edges and centres. Hold Ctrl to
+  place one freely." (while `SNAP_PX` isn't 0), and "Recordings can see the
+  overlay while you arrange." while a capture runs with Hide on and available
+  (`capturing`, `hideWanted` and `hideAvailable`). A picture that won't load
+  shows "Picture missing" while arranging, and a timer face whose timer the
+  backend's snapshot lacks shows "Timer missing" (v1.59.0; only once a
+  snapshot has arrived). A recording light with nothing to show is a dimmed
+  "● REC" while arranging (v1.62.0). Locked shows no frame, outline, handle or
+  guide.
+
+**Snapping (v1.62.0)** (`snap.ts`, pure, applied by `editor.ts`'s
+`updateGesture`). A drag or a corner resize snaps the preview, so what is
+drawn while the pointer moves, and the one `place` the release sends, is
+the snapped rectangle.
+
+- **Lines.** Fixed at the press (`snapTargets`): the viewport's left,
+  centre and right and its top, middle and bottom, and the same six of
+  every other live charm as laid out then, in the viewport the gesture
+  keeps. The dragged charm's own lines move with it, so they are never
+  targets.
+- **Within 8 px** (`SNAP_PX`, CSS px). A move snaps each axis on its own:
+  of the rectangle's left, centre and right (top, middle and bottom), the
+  one nearest a line moves onto it, if the moved rectangle stays inside the
+  viewport. A tie goes to the viewport's line, then the line nearer the
+  left or top, then the charm's start (its left or top edge) before its
+  centre before its end. A move never changes the size, so the reducer
+  stores a move.
+- **A corner resize** snaps only an edge that moves. The other side follows
+  from the shape at the press, and the opposite corner stays still. A line
+  is passed over for the next nearest if the result would be smaller than a
+  drag can make it (24 px on the short side, where the viewport allows),
+  would leave the viewport, or would move either side more than 8 px from
+  where the pointer puts it. Without that last rule, snapping a 5:1 light's
+  bottom edge 8 px would move its right edge 40 px. The nearer of the two
+  axes' snaps wins, x on a tie, with one guide.
+- **Not on a click.** A gesture snaps only once the pointer has gone 3 px
+  from the press on either axis (`SNAP_SLOP_PX`, under Windows' 4 px drag
+  threshold), and from then until it ends, back near its start too. A click
+  that only selects a charm moves it by its jitter, as before v1.62.0,
+  never onto a line up to 8 px away.
+- **Guides.** One dashed 1 px line per snapped axis, at the line, in
+  Arrange only, while the pointer is down. A line on the window's edge is
+  drawn just inside it.
+- **Ctrl places freely**, as OBS's preview does (from OBS's source,
+  `OBSBasicPreview.cpp`; not tried in OBS). Each `pointermove` reads its
+  `ctrlKey`, and a Ctrl, Alt or Shift `keydown` or `keyup` mid-drag runs
+  the last pointer point again, so the preview follows the key at once. Not
+  Alt: OBS uses Alt to crop, and Alt released alone can start Windows' menu
+  mode. `SNAP_BYPASS` names the key, and the hint follows it.
+- **Keys never snap.** A nudge run (the arrows, `=`, `-`, `+`, `_`) is a
+  gesture with no lines; the arrows are the precise tool.
+- **What a snap means later.** The scene stores centres and designed sizes,
+  not edges (see "The scene"). An alignment holds in the viewport it was
+  made in, and so in a fitted window, whose viewport is its monitor. An
+  unfitted window that is resized lays its charms out again by their
+  centres, so edges lined up there can drift apart.
+- **Kill switches:** `SNAP_PX = 0` turns snapping off, and the hint with
+  it; `SNAP_BYPASS` changes the key.
 
 ### Charm pictures
 
@@ -1760,6 +1836,260 @@ installed app's localStorage and scene, so it keeps its pictures in
 `%APPDATA%\com.divora.voicemod\`, with a temp-folder fallback; the folder is
 created and logged at startup.
 
+### Text charms (v1.62.0)
+
+Settings → Stream overlay → **Add text…** puts the streamer's own words in
+the scene, and a text row's **Edit** changes them. The words are typed in
+Settings, never on the overlay. The overlay draws them and fits them inside
+the box the streamer gives them in Arrange.
+
+- **The element:** `{id, type: "text", x, y, w, h, z, text, font, bold,
+  color, outline, align, nw, nh}`. `font` is `display`, `sans` or `mono`;
+  `bold` and `outline` are booleans; `color` is `#rrggbb`; `align` is
+  `left`, `center` or `right`. `nw`/`nh` are the text's natural box in whole
+  CSS px at 100 px (`REF_PX`): its shape, as a picture's own pixels are.
+  The names and limits are frozen in the fixture's `textCharm`.
+- **Live** with usable geometry, a valid id and a text that, normalized,
+  isn't empty (`asText`). Nothing else is checked when reading. Each other
+  field has a read default (`readTextFields`: Sans, bold, `#ffffff`,
+  outline on, centre) for a value this build can't use, and the stored
+  value is kept as stored: a later build's font survives here, drawn in
+  Sans.
+- **Normalizing** (`normalizeCharmText`), in order: CR LF, CR, U+2028,
+  U+2029 and U+0085 become LF; a tab becomes a space; every other control
+  character (U+0000–U+001F but LF, U+007F, U+0080–U+009F) is dropped; half
+  a surrogate pair without its other half becomes U+FFFD; the whole is
+  trimmed. CSS breaks lines at U+2028 and U+2029, so left in they would make
+  lines that `split("\n")` doesn't count. A lone half can't cross Tauri's
+  IPC, whose JSON parser refuses its escape, so a scene holding one would
+  fail every push. What Settings saves is stored normalized, and
+  `readScene` repairs a lone half in a stored text (a hand edit) as it
+  reads, and changes nothing else.
+- **Creation limits, not read rules.** 200 UTF-16 code units and 5 lines,
+  counted after normalizing (`readCharmText`), checked by `addRefusal`, by
+  `set` and by Settings' Save. UTF-16 units are what HTML's `maxlength`
+  counts, so the field and the limit agree; an emoji counts as 2 or more,
+  which the editor says, and its count shows. A longer stored text (a later
+  build's, or a hand edit) is live and drawn, cut at a ceiling far above
+  the limits (`drawText`: its first 50 lines, then its first 4096 code
+  units, never ending inside a surrogate pair), as names are cut on
+  display. A limit applied when reading would hide such a text and leave it
+  counting toward the 64.
+- **Fonts.** The three the overlay already bundles: Display = Bricolage
+  Grotesque Variable, Sans = Space Grotesk Variable, Mono = Space Mono,
+  each regular (400) or bold (700). They come from the app's own bundle
+  (the `@fontsource` packages' latin, latin-ext and vietnamese subsets),
+  never the network. The face's `font-family` is a fixed stack per name
+  (`FONTS`, the same as the CSS tokens `--font-display`, `--font-ui` and
+  `--font-mono`, which a test reads), such as `"Space Grotesk Variable",
+  system-ui, sans-serif`. Letters the subsets don't have (Cyrillic, Greek,
+  Chinese, emoji) fall back through the rest of the stack to fonts installed
+  in Windows, so they can look different on another PC or Windows version.
+- **Drawn as text.** One Solid text node inside a `white-space: pre` div:
+  lines break only where the text has a newline, and markup shows as typed.
+  Every style is a Solid style object, set property by property, and the
+  family comes from `FONTS`, never from a stored string. A source scan
+  (`Stage.test.tsx`) finds no `innerHTML`, `insertAdjacentHTML`,
+  `outerHTML` or `DOMParser` in the overlay's sources.
+- **One measure, two windows.** `textBox(text, widthOf, inkOf)` is pure:
+  `nw` is the widest line at 100 px plus 0.12 em a side; `nh` is the lines
+  at a line height of 1.15, plus room above the first line and below the
+  last (`textPads`). That room is 0.12 em, for the outline, plus however
+  far the line's ink reaches past the line's own box: Vietnamese capitals'
+  stacked marks reach about 0.25 em above it in Display. `widthOf` and
+  `inkOf` are a canvas `measureText` (`canvasMetrics`, `textMetrics.ts`,
+  one canvas per window) at `fontSpec`, the weight, 100 px and the face's
+  whole stack, so the canvas runs the same fallback chain as the drawn face.
+  The canvas also takes the face's `fontKerning = "normal"`,
+  `letterSpacing = "0px"` and `textRendering = "optimizeLegibility"`.
+  Before measuring, a window waits for `document.fonts.load(spec, text +
+  " ")`: the named families' faces for those letters and for the space, so
+  the stack's first font, whose ascent and descent place each line, is
+  loaded even for a text it has no letters for. With no 2D canvas (jsdom)
+  a line is 0.6 em a code unit, and there is no ink.
+- **Main measures to store the shape.** Saves go through the controller's
+  `texts` queue, one at a time in the order Settings asked: the fields,
+  then the font load (at most `FONT_WAIT_MS`, 1 s; a font that never loads
+  is measured in its fallback, as the face then draws), then the measure.
+  The commit step runs on the `placement` queue, after any Fit change in
+  flight, and reads the scene then. So an overlay drag that landed during
+  the load is kept, and a Fit change that fails and puts its starting scene
+  back can't drop the save.
+- **The overlay measures to fit.** A text row measures its words again and
+  sizes its face by its own measure, never the stored `nw`/`nh`, which only
+  shape the box: `fitTextFont(boxW, boxH, nw', nh') = 100 · min(boxW / nw',
+  boxH / nh')`, fitted inside ("contain"). A font that measured differently
+  in main leaves space rather than spilling. A box wider than the text's
+  shape is bound by its height, and the lines are aligned across it. The
+  page's font load has no cap of its own: the row draws once its font has
+  loaded for its words, or 1 s on in the fallback, and measures again when
+  a slow font arrives. Until new words or a new font are ready, the face
+  before stays, so an edit never blanks the charm on stream; a colour,
+  outline or alignment change shows at once. A drag measures nothing.
+- **The backstop.** After the face lays out at a new size, if the words'
+  laid-out box (`offsetWidth`, `offsetHeight`) is more than 1 px over the
+  charm's box, the font size is cut once by the larger ratio, and
+  `data-fit-backstop` counts it. It reads the laid-out box, not
+  `scrollWidth`/`scrollHeight`: Chromium counts each font's own ascent and
+  descent in the scroll size, and Space Mono Bold's (about 1.47 em) is
+  taller than its 1.15 em line, so a face that fit read 1 to 2 px over
+  (found by E1). With one stack in both measures it shouldn't fire; in
+  the real app it fired on none of W1's six faces (S2, `data-fit-backstop`
+  0 on each).
+- **Colours.** Eight swatches: White `#ffffff`, Yellow `#ffd60a`, Orange
+  `#ff9f0a`, Red `#ff4500`, Blue `#0a84ff`, Sky `#64d2ff`, Grey `#8e8e93`,
+  Black `#111111`. OBS's Chroma Key keys by distance in CbCr, not RGB. Each
+  swatch, both outline colours and the recording light's dot are at least
+  0.50 in that distance from Chroma Key's Green (`#00ff00`) and Magenta
+  (`#ff00ff`) presets; at OBS's default similarity and smoothness a colour
+  stays fully opaque from 0.48. `text.test.ts` checks this with a port of
+  OBS's formula (`GetChromaDist`, from OBS's source), not with OBS. The
+  port pins its oracle: Violet `#a78bfa`, first proposed, is 0.401 from
+  Magenta, which keys it almost entirely out at the defaults. Divora's green
+  background `#00b140` is 0.241 from the Green preset, so the preset keys
+  it; a custom key colour picked from it would also remove white, grey,
+  black, sky and blue (0.26 to 0.39 from it by the same formula, under
+  OBS's default similarity of 0.40) and leave yellow (0.46) partly
+  see-through (worked out, not in a test), which is why the Background
+  help says to keep Key Color Type on Green or Magenta. Any `#rrggbb` is a
+  valid stored
+  colour and draws as itself; the editor keeps one that isn't a swatch
+  unless another is picked.
+- **The outline** is the timer face's three-layer `text-shadow`: dark for a
+  colour whose WCAG luminance is above 0.18 (every swatch but Black), light
+  for the rest.
+- **Editing** is a `set` op, main's alone: `{id, fields, viewport?}`, never
+  on the wire (`readOp` never returns it). `fields` holds `nw`, `nh` and
+  only the fields the streamer changed (`changedFields`, the text compared
+  normalized). It applies to a live text only, and each field is checked as
+  the reader takes it: the text within the creation limits, a font or
+  alignment among its three, booleans, any `#rrggbb` (stored lower-cased).
+  Fields not in it, and unknown keys, are kept as stored; the id and `z`
+  never change. If the shape (`nw : nh`) is the same, only the fields
+  change. If not, the charm keeps its designed height and takes the new
+  shape's width; `fitSize` scales it down together if that is wider than
+  the design, and raises a short side under 24 px where it fits. Where it
+  is drawn in `viewport`, the overlay window's CSS size (the design size
+  when absent), it keeps the side its alignment names (left edge, centre
+  or right edge) and is kept inside that window, stored as a centre
+  fraction that draws it there. When that window draws the old box pushed
+  in from past its left or right edge, or across its whole width, and draws
+  the edited box on that edge too, every centre fraction past the drawn one
+  draws it the same there; of those, `set` stores the one nearest the
+  design's own rule, the aligned side's design fraction (`drawnFraction`),
+  so a label on the design's side is still on it when the window grows
+  back. Down, it keeps its stored vertical centre (taken inside [0, 1]),
+  which layout draws kept inside each window: in this one around the
+  centre it was drawn at or, if it was drawn pushed in from past the top
+  or bottom, on that edge or nearer it. So while its designed height is
+  the same it stays where the design has it (on its top edge, say), and a
+  text made smaller to fit shrinks about that centre. Layout
+  keeps centres, so keeping the side's design fraction instead would move an
+  edge-snapped label off its edge in a window that isn't the design's size.
+  The side holds unless the box has to change to fit: text too wide for the
+  design is made smaller, and a box that would cross the window's edge is
+  drawn moved inside, for example. `set` returns the scene itself when nothing
+  would change, and `setRefusal` says why one would be refused (`gone`: no
+  live text has the id; `invalid`), so main can tell a refusal from no
+  change.
+- **An Edit in a window of another size.** The overlay keeps each charm as
+  a centre and a size in its design, and a window of another size draws it
+  at the same fraction of its own size, scaled down or kept inside where
+  it must be, so no one stored position draws a text in the same place
+  against every window's edges. `set` places the edited text by the rule
+  above in the window the Edit is made in. Made while the overlay window is
+  a different size from the one the charms were arranged in, an Edit can
+  leave a label off the place it was lined up to at that size: a
+  centre-aligned "Starting soon", 120 px wide, in the bottom-right corner
+  of a 1920×1080 design, edited to "Hi" in a 960×540 window, is centred at
+  x = 1800 once the window is back at 1920×1080, not at 1860 as an Edit at
+  that size puts it (from the code; the review's fifth round ran it).
+  Editing with the overlay window at the size the charms were arranged in
+  avoids it. Otherwise Arrange at that size shows where the label went,
+  and a drag lines it up again, snapping to the overlay's edges and
+  centre lines. The cause is the one under Snapping, "What a snap means
+  later".
+- **A stale `place`.** `set` is the only op that changes a live element's
+  shape, so a `place` made against the old shape can arrive after it: one
+  in flight from the overlay, or the mirror's pending edit applied again
+  over the new scene. On a text, a rect whose shape is more than 0.1 % off
+  both the text's own (`nw/nh`) and the shape it is laid out in lands as a
+  move: the laid-out size, centred where the rect is, kept inside. Without
+  it, `normalizeRect` would keep the old width and halve a widened text's
+  height. The second test keeps a text stored off its own shape (a hand
+  edit) resizable. Main and the mirror run the same reducer.
+- **Adding** (`addOverlayText`): the text normalized and the colour
+  lower-cased; a text over the limits refused ("That text couldn't be saved.
+  Use 1 to 200 characters on up to 5 lines.") without waiting for a font;
+  then measured and added at `defaultTextRect`, with "Text added. Use
+  Arrange to place it." `addRefusal` checks, in order, the id, the 64
+  stored elements, then a live text within the limits with whole `nw`/`nh`
+  of at least 1; the picture caps and budget don't apply. It answers
+  whether the text was added, so a refused Add (the overlay full, say)
+  leaves Settings' editor open with its draft.
+- **Where a new text goes** (`defaultTextRect`, sized for the window's CSS
+  size, as a picture is): its height 10 % of the window's short side (32 to
+  160 px), its width from its shape, both scaled down to fit 90 % of the
+  window's width, then its short side raised to 24 px where the window
+  allows (so a long one-line text can be wider than 90 %, up to the whole
+  width), then fitted inside the design. In a window no bigger than the
+  design, that is the box `place` would store, so the first drag or nudge
+  is a move, not a resize. In a bigger window (enlarged with no drag since)
+  a box wider than the design is scaled down to fit it and can be under
+  24 px, as a picture can; its first `place` then grows the design and
+  resizes it. It is centred across, its top at 20 % of the height and 6 %
+  lower for each live text already there, five places round.
+- **The editor** (`CharmTextEditor`, Settings), for Add text… and Edit, one
+  at a time, the edited row marked "Editing". It sits under the charm list
+  and its buttons, outside the rows, in a `<Show keyed>` on what it edits,
+  and the rows are a `<For>` over ids, each looking its charm up. Every
+  commit that touches a charm replaces its object (a drag, a nudge, a
+  restack, a `place` that grows `designSize`, Save's own `set`), so an
+  editor inside a row, or rows keyed by object, would lose the draft, the
+  caret and the focus to an overlay drag. A restack still moves the rows'
+  nodes, which drops a focus inside a moved row onto the page, so the list
+  notes a focused row button before it moves them and focuses it again
+  after. Fields: the Text field (3 rows, `maxlength="200"`, a live "{n} of
+  200"), Font, Bold, Colour, Outline, Alignment, and a preview of the look,
+  not the size, on a dark chip. Save applies all of it in one commit and
+  Cancel discards; Ctrl+Enter saves and Esc cancels from inside it. Save is
+  off while the text is empty or over a limit, and the reason shows ("Use
+  up to 200 characters.", "Use up to 5 lines.", or "Only the first 200
+  fit." after a paste the field cut). The reason is in the field's
+  `aria-describedby`, the field is `aria-invalid` while a limit is broken,
+  and a live region says the reason as it appears. Edit sends only the
+  changed fields, and Save with none just closes. A stored text over a
+  limit opens as stored, with Save off until it fits. After a save, the
+  focus goes to that row's Edit, or to Add text…. After a refused one the
+  editor stays open with its draft, and a focus that Save dropped onto the
+  page goes back to Save. A charm removed while its editor is open leaves
+  the editor; Save with a change then says "That text was removed, so there
+  was nothing to change." and closes it. An Edit that saves shows no
+  toast: the overlay shows the change.
+- **Why Settings, never the overlay.** The overlay cancels every `keydown`
+  but Tab, Alt+F4, and Enter or Space on a button (see Editing), which
+  stops typing; Arrange is visible to captures, so a caret or a field would
+  be recorded; and WebView2's own popups escape capture exclusion
+  (WebView2Feedback #4544), which a text field's autofill, IME or spellcheck
+  could open (none of those was tried over the overlay). The overlay only
+  ever gets the saved text.
+- **Older builds.** v1.55.0 to v1.61.0 keep a text, and the recording light,
+  as an unknown type: kept and written back, unshown, not listed in
+  Settings (so not removable there), and counting toward the 64. Their
+  reducer re-expresses every element's geometry when a `place` grows
+  `designSize`, and renumbers `z` on an add, as for any element; the other
+  fields stay as stored, as their own `scene.test.ts` pins for an unknown
+  type. That is from the code and the tests: no older build was run on
+  this build's profile (S2's W8 was skipped at the owner's choice).
+- **An asset id as text.** `assetRefs` counts every string in the scene, so
+  a text that is exactly a picture's id keeps that file. Harmless; a test
+  pins it.
+- **Labels.** In Settings, "Text · {its first line, cut at 40 with …}" with
+  the pencil sigil; on the overlay, the row is named "Text: {its words, the
+  lines joined by spaces}".
+- **Kill switch:** `TEXT_CHARMS = false` (`text.ts`) hides Add text… and
+  Edit. Saved text still draws and can be removed.
+
 ### Hiding from recordings
 
 **Hide from recordings** in Settings (off by default; shown only when
@@ -1813,6 +2143,119 @@ it. Only decoding a recording shows whether it worked.
   Replay on, for as long as Replay is on. It applies whatever monitor Divora
   records; hiding only when the overlay is on the recorded monitor is a
   follow-up.
+- **The recording light** (v1.62.0) is drawn, Locked with Hide on, only
+  while this request stands; see the next section.
+
+### The recording light (v1.62.0)
+
+Settings → Stream overlay → **Add the recording light** adds one element,
+`{id, type: "rec", x, y, w, h, z}`, and says "Recording light added. Use
+Arrange to place it." It shows "● REC" and the take's time while Divora
+records a screen, and "● REPLAY" while Replay arms or is armed. Only the
+scene's first usable light is live; another is kept, inert.
+Adding one while a live one exists is refused ("The overlay already has a
+recording light."); Settings shows the button only without one, so that
+answers only a race. Older builds keep it as they keep a text (see "Text
+charms (v1.62.0)").
+
+- **Where it goes** (`defaultLightRect`): 5:1, its height 7 % of the
+  window's short side (24 to 96 px), scaled down to fit 90 % of the width
+  but its short side kept at 24 px where the window allows, at the bottom
+  left, 4 % in from the left and the bottom. The top left is under
+  Arrange's Move window grip and the top right has the Lock pill; a test
+  checks that the box and its handles miss both, at 480×480 and 1920×1080.
+- **What it hears.** The page listens to the recorder's own broadcast
+  events itself, `screen-recording` and `replay-buffer`, after
+  `timer-state` and before it emits `overlay:ready`, never through main
+  (main's page may be hidden to the tray). After its ready handshake it
+  calls `screen_recording_status` and `replay_buffer_status` once, sent
+  together with `timer_status`, so a page opened mid-take shows the take
+  without waiting for the next report. Neither event has a `seq`, so an
+  answer is kept only if no event of its kind arrived while it was on its
+  way, one count per kind: a Replay event doesn't drop the take's answer.
+  A failed read changes nothing, and the events still apply. The readers
+  (`readTakeView`, `readReplayView`) keep only a take's `state` and
+  `elapsedMs` and Replay's `state`; a payload they can't read changes
+  nothing. There is no page timer: the time is the take's own report,
+  about once a second.
+- **What it shows** (`recFace`, pure). A take in any phase but idle shows
+  "REC", with its time from `recording` on (`m:ss`, `h:mm:ss` from an hour,
+  whole seconds rounded down, the second the Mixer's clock shows), and
+  `stopping` keeps the last time. Otherwise Replay arming or armed shows
+  "REPLAY". Otherwise nothing. A take outranks Replay because it is what is
+  being written. A held Replay takes in nothing new, so it shows nothing.
+  In Arrange, nothing becomes a dimmed "REC" placeholder at 45 % opacity,
+  so the light can be found and placed.
+- **The look.** A red dot (`#ff4500`, the Red swatch, clear of OBS's key
+  presets) and the words in the timer face's style: Space Mono Bold, white,
+  the dark outline, no animation, the text node written only when the
+  words change. The dot is a shape, 0.62 em with a 0.3 em gap, not a
+  character. The size is `fitTimerFont(w, h, chars + 2)`: two of its
+  0.62 em cells hold the dot and the gap (it rounds `chars` down, so a
+  fraction would be lost). It waits for Space Mono Bold as the timer face
+  does (`fontReady`, at most 1 s), the placeholder too, since Arrange is
+  visible to recordings.
+- **Its own status first.** The page's status starts as a closed one
+  (Locked, Hide off) and changes only on an `overlay:status` for its own
+  window, and the status that the ready handshake causes can land after a
+  take's answer. So, Locked, the light draws nothing until the page holds
+  one (`statusSeen`). Without that, a page opened during a take's
+  `starting` could draw "REC" before it knew Hide was on.
+- **The Hide gate.** With Hide from recordings wanted and available (from
+  that status) and the overlay Locked, the light is drawn only while the
+  status also says `capturing`, and a `stopping` take counts as no take.
+  Locked and shown, that is exactly while Divora has asked Windows to leave
+  the overlay out (see "Hiding from recordings"). In Arrange the gate
+  doesn't apply: Arrange is never left out, so the light is drawn as
+  without Hide, and the chrome says recordings can see the overlay. With
+  Hide off, the light is part of whatever captures the overlay, Divora's
+  recordings and OBS included. That is meant.
+- **The start.** A take reports `starting` before `before_capture` runs, so
+  the gate waits. `before_capture` steps the machine, which emits the
+  `capturing: true` status under `core`, then posts the affinity work to
+  the main thread. So the status that opens the gate goes out one
+  main-thread post ahead of the affinity call. The page paints at least a
+  frame after the event, so the request is expected to be in place first,
+  but nothing orders the two by cause. If the apply isn't confirmed within
+  300 ms (`CAPTURE_ACK`), the take goes on and the gate opens anyway, so
+  the light can show in those frames, as the whole overlay can. On this
+  PC (S2's W6, Windows 11), a stand-in capture of the light's rectangle by
+  Desktop Duplication (ffmpeg's `ddagrab`, not OBS) saw the dot, with Hide
+  on, in 0 of the 118 frames within 1 s of a take's start, 0 of 98 at the
+  start of a take inside Replay, and 0 of 120 at Replay's arming.
+- **The end.** At a user's Stop the take reports `stopping` well before
+  `finish` steps the capture flag off, so the light erases its take part
+  while the overlay is still asked to be left out. Two ends can't be
+  closed without a Rust change: Replay turning off (`publish` emits `off`,
+  then steps the capture flag, in one call), and a take that ends by itself
+  (it goes from `recording` to `idle` with no `stopping`). There Windows can
+  stop leaving the overlay out before the page has erased the light, so a
+  capture may see it for a frame or more. A take that ends by itself
+  wasn't produced here (there is no time limit, and sleep, unplugging, a
+  full disk and an encoder failure were out of bounds), so that edge is
+  unmeasured. The other ends were (S2's W6, the same stand-in, Hide on):
+  the dot in 0 of the 121 frames within 1 s of a take's Stop, 0 of 120 at
+  the Stop of a take inside Replay, and 0 of 117 at Replay off. So Replay
+  off showed no light there, on one PC with one capture method; that
+  doesn't show it never can. A later Rust change could hold the request
+  until the page says it has erased the light.
+- **Why not a window of its own.** Capture exclusion is per top-level
+  window (`SetWindowDisplayAffinity`), never per element. A window for the
+  light that is always left out would be another WebView2, whose own cost
+  has never been measured, another click-through window, and Windows 10's
+  open question (R3) again, before the per-window code the plan puts in
+  v1.66.0 exists.
+- **From v1.64.0** (planned): recording a window makes `capturing` stop
+  implying the request (a window take, or a take of another screen). That
+  release plans an additive status key, `hideApplies`, to stand in for
+  `hideWanted && hideAvailable && capturing` in the gate, with the same
+  tables. Until then the gate is exact.
+- **Added directly**, as the circle is, not on `placement`. A light added
+  while a Fit change fails can be undone when that change puts its starting
+  scene back, as a picture, a timer face or the circle can; text saves wait
+  on `placement`, so they can't. A follow-up.
+- **Kill switch:** `REPLAY_FACE = false` (`recLight.ts`) drops the "REPLAY"
+  face, and with it the Replay-off edge.
 
 ### Fit to monitor
 
@@ -1924,7 +2367,9 @@ part of the window off screen; the next open clamps it.
 `core:event:allow-listen`, `core:event:allow-unlisten`,
 `core:event:allow-emit`, `core:event:allow-emit-to` and
 `core:window:allow-start-dragging`. `allow-emit` is for `overlay:ready`, a
-broadcast, and `overlay:edit`. `capabilities/default.json` now applies to
+broadcast, and `overlay:edit`. `allow-listen` also covers the recorder's
+events the recording light hears (v1.62.0, no permission added).
+`capabilities/default.json` now applies to
 `main` only, and drops `core:webview:allow-create-webview-window`,
 `core:window:allow-set-position` and `core:window:allow-set-size`: their only
 users were main's creation and placement of the overlay. Main's tracking and
@@ -1933,19 +2378,27 @@ fit keeper read the overlay and listen to it through `core:default`.
 Capabilities don't restrict app commands. There is no app ACL manifest
 (`build.rs` is the plain `tauri_build::build()`), and tauri checks app commands
 only when one exists, so the overlay can invoke every `#[tauri::command]`. It
-relies on four: `set_overlay_mode` (Esc and Lock), `overlay_handshake`,
-`overlay_alive` and, since v1.59.0, `timer_status` (a sync command, read once
-after the ready handshake). `overlay.json`'s description says they must be
+relies on six: `set_overlay_mode` (Esc and Lock), `overlay_handshake`,
+`overlay_alive`, since v1.59.0 `timer_status` (a sync command, read once
+after the ready handshake), and since v1.62.0 `screen_recording_status`
+(sync) and `replay_buffer_status` (async), each read once after the ready
+handshake. `overlay.json`'s description names all six and says they must be
 granted if an app manifest is ever added. The overlay logs failed calls with
 `console.warn` (a failing beat once per Arrange), so a refusal would show in
-its console; a failed `timer_status` is left silent, and the events update
-the face.
+its console; a failed `timer_status`, `screen_recording_status` or
+`replay_buffer_status` is left silent, and the events update the timer face
+or the recording light.
 
 ### Threads and locks
 
 All ten overlay commands are `async`: Tauri 2 runs a sync command on the main
 thread, which both windows share, and building a window from a sync command
-deadlocks.
+deadlocks. The page also reads other modules' state once per load, after its
+ready handshake: `timer_status` (v1.59.0) and `screen_recording_status`
+(v1.62.0) are sync, so they run on the main thread beside `WM_HOTKEY`, and
+`replay_buffer_status` (v1.62.0) is async and reads on a blocking thread.
+`the_overlay_recorder_commands_are_registered` keeps the two recorder reads
+those kinds.
 
 | Caller | Thread | Locks | Window calls |
 |---|---|---|---|
@@ -2006,6 +2459,15 @@ identifiers; `controller.ts`, main's side, is among them. The scan doesn't
 look into subfolders, so `src/overlay has no subfolders` keeps the folder flat.
 `OverlayState` keeps its 8 keys: the scene and the mode travel on their own
 events.
+
+Since v1.62.0 it never shows a text field, a caret, or a font or colour
+picker either: text charms are typed in Settings (see "Text charms
+(v1.62.0)"). `Stage.test.tsx` checks that no `input`, `textarea`, `select`,
+`[contenteditable]` or `[title]` is drawn, Locked or arranging, with a
+circle, a picture, a timer face, a text and the light in the scene, and a
+source scan checks that the overlay's files never write one. The new files
+(`text.ts`, `snap.ts`, `recLight.ts`, `textMetrics.ts`) fall under the
+reading scan with no change to it.
 
 ### Tests
 
@@ -2138,6 +2600,215 @@ events.
     canvas (that one isn't unit-tested either); Discord, Teams and the
     Snipping Tool while protected; a 4K display; a long Replay with the toggle
     on.
+- **v1.62.0 (Text charms).** At `c68237a`: Vitest 2,528 tests in 64 files
+  (+408, +4 files), E2E 81 (+6), `CI=true cargo test --workspace
+  --all-features` 1,252 passed and 25 ignored (+2). Each defect in the
+  design's mutation list was put back in a scratch copy and its test seen
+  failing, but one that can't be told apart from the real code (guides drawn
+  while Locked: locking already drops the drag). An audit of that list found
+  one more that no test caught (a drag going on after Lock) and one whose
+  named test missed its defect, put back by a move and by a resize, though a
+  table row caught each (a snap leaving the viewport); each now has a test
+  that fails on it. In all, 204 defects were put back while the tracks were
+  built (201 failed a test; of the other three, two can't fail while the
+  code is as it is and one now has a test), and 93 against step R's fixes
+  over its five rounds (47, 22, 4, 15 and 5; all but one failed a test, and
+  that one, a clamp round 5 later dropped, was given one).
+  - **Rust, two tests and no other change:**
+    `fixture_names_the_recorder_events_the_overlay_hears`
+    (`overlay_machine.rs`: the fixture's `recLight` events are
+    `screen::EVENT` and `replay::EVENT_BUFFER`, and its samples are Rust's
+    own payloads cut to the fields the page reads) and
+    `the_overlay_recorder_commands_are_registered` (`lib.rs`: each of the
+    fixture's two commands is in `generate_handler!` once,
+    `screen_recording_status` sync and `replay_buffer_status` async,
+    reading on a blocking thread).
+  - **Pure:** `text.test.ts` (the fixture's `textCharm`; the families are
+    the CSS tokens; `fontSpec`; normalizing, the limits and the drawing
+    ceiling as tables, lone surrogate halves included, and a normalized
+    text's JSON crossing the IPC; read defaults that never rewrite;
+    `changedFields`; `textBox`, `textPads` and `fitTextFont`; the outline by
+    luminance; the port of OBS's key distance; `firstLine`; no imports);
+    `snap.test.ts` (the move and resize tables, the ties, the 8 px bound on
+    the side a resize derives, `SNAP_PX = 0`, two property tests of 500
+    seeded cases, and a place round trip for every kind, so a snapped edge
+    is within 0.5 px of its line after the reducer and layout);
+    `recLight.test.ts` (the fixture's names and samples, the names
+    `api.ts` uses, the readers, the face and gate tables, `fmtElapsed`, no
+    imports); `textMetrics.test.ts` (main's capped load, the page's
+    uncapped one, the space in each load, the canvas's settings, the ink);
+    `scene.test.ts` (the readers, a lone surrogate half repaired on read, a
+    201-unit or 6-line text live but refused by `add` and `set`, one live
+    light, `aspectOf`, the `set` table, in windows narrower and wider than
+    the design too, `setRefusal`, the stale `place`, the `addRefusal`
+    order, both defaults and their first drag, labels, `readOp` never
+    returning `set`, a text and the light through every op, an asset id as
+    text); `editor.test.ts` (snapping, and the 3 px slop);
+    `mirror.test.ts` (a pending old-shape `place` over a reshaped scene).
+  - **Components:** `Stage.test.tsx` (a text as one text node, its style
+    object, the fit from the page's own measure, the ink's padding, the font
+    wait and a late font's new measure, the backstop reading the laid-out
+    box; the light through every gate row, its dot, its size and its font
+    wait; snapping, Ctrl, guides and the nudge; no field, picker, editable
+    or tooltip, drawn or in the source; no HTML parsing);
+    `overlay.test.tsx` (six listens, then `overlay:ready`, the handshake,
+    then the three reads sent together; answers against events, a count per
+    kind; `statusSeen`; the light's font wait); `controller.test.ts` (Add
+    and Edit through the font load and the measure, refusals, saves in
+    order, a drag during the load, an Add and an Edit during a failing Fit
+    change, the light); `SettingsScreen.test.tsx`, with the real store and
+    controller (the rows; the editor kept through a drag, a restack and a
+    `place` that grows the scene; focus after a save, a restack and a
+    refused one; the count, the limits and the paste reason; every name
+    holding its visible words; the copy); `app.test.tsx`.
+  - **E2E** (`overlay.spec.ts`, mocked Tauri, in Playwright's Chromium, not
+    WebView2): E1, six texts (three Latin, and "Привет Γειά 你好 🎮" in
+    each font): the family first in the computed stack, the weight, one
+    text node, the words and their ink inside the box, the laid-out size
+    within the face, the backstop 0; E1b, Vietnamese capitals' marks, and
+    the outline round them, inside the box; E1c, a text with none of its
+    font's letters (a Cyrillic or Greek word, or an emoji) fitted by that
+    font's own line, as main measures it; E2, the light from emitted
+    events, before and after the page's own status and through the Hide
+    gate; E3, a real-pointer drag snapping to the centre line with a guide,
+    Ctrl, and an arrow beside a line; E4, Settings and the overlay linked:
+    Add, an Add refused while full keeping the focus, Edit, a drag while the
+    editor is open, a reload. Two v1.55.0 drags now keep more than 8 px
+    from every line: their paths changed, not their checks.
+- **In the real app (v1.62.0):** S2, 2026-11-09 (13:47 to 14:32 UTC,
+  about 45 minutes, 35 with the app running), on this PC (Windows 11 Pro
+  26200; i7-14700K, RTX 4090; a 3440×1440 and a 1920×1080 monitor, both at
+  100 %), on a debug build (`pnpm tauri build --debug --no-bundle`) of
+  `c9f066b`. Everything ran on the 1920×1080 screen, where the overlay
+  opened at 960×540; nothing recorded the main screen. The harness drove
+  the app through its own controls over WebView2's DevTools port
+  (Playwright over CDP): text put in by the protocol's `Input.insertText`,
+  Ctrl as a flag on its mouse events (`modifiers: 2`), no key pressed and
+  no tray click. Every delay is a difference on one clock the harness
+  mapped both pages onto (they agreed within 0.44 ms). The engine ran
+  Focusrite "Analogue 1 + 2" in to "Speakers (Realtek USB Audio)" out, no
+  monitor device, Monitor off; nothing played, and there was no CABLE
+  device. The app's whole localStorage (11 keys) was recorded at the first
+  boot and put back after every launch. Once, at the first W1 launch,
+  setup's restore hadn't reached the disk: Chromium rate-limits its
+  localStorage writes to disk, and the harness had killed the app 12 s
+  after the restore.
+  With the harness closing the browser first (CDP `Browser.close`), every
+  later boot read all 11 keys the same, and so did the final restore.
+  Main's window was put back. The takes and the Replay clip were moved out
+  of the recordings folder and analysed, then all 13 take, clip and
+  stand-in files were deleted by path; no S2 file is left in the
+  recordings folder. The owner's go-ahead came right before, for Hide on,
+  one Replay clip and the stand-in; W8 was skipped at the owner's choice.
+  The review's later rounds changed where `set` puts an edited text, after
+  this build. W2 ran in a window at its design size, on boxes inside it
+  that neither filled its width nor changed height; for those the final
+  rule stores what `c9f066b` stores (from the code).
+  The stand-in for OBS was ffmpeg's Desktop Duplication capture
+  (`ddagrab`) of only the light's rectangle (193×42 px) on the 1920×1080
+  screen at 60 fps, 3,048 frames over 52 s, each on its own wall clock;
+  never OBS. It had to see the dot in a Hide-off take before its Hide-on
+  counts meant anything, and it did: in 275 of 275 frames of the control
+  take's middle.
+  - W1, text: six texts added through Settings: Display Bold Yellow with
+    the outline, centred, "BRB"; Sans Regular White, left, three lines;
+    Mono Bold Black with the outline, right, `<b>hi</b>`, drawn as those
+    characters in one text node; and "Привет Γειά 你好 🎮" in Display, Sans
+    and Mono. 111 of 111 checks passed. On every face the computed family,
+    weight and colour were as stored, the laid-out box was inside its row
+    (±1 px), its bound side at least 99.9 % filled, and the backstop fired
+    0 times. Save to face drawn: 8 to 30 ms (worst 29.6 ms; the bar was
+    1,200 ms). By `CSS.getPlatformFontsForNode`, the Latin texts drew
+    entirely in the bundled family, and the mixed text's other letters in
+    Windows fonts: Segoe UI (Cyrillic, Greek), Microsoft YaHei (Chinese),
+    Segoe UI Emoji (🎮), and Consolas for Mono's Cyrillic and Greek. The
+    harness's mutation (font "mono" stored behind the page's back) failed
+    the family checks, as it had to.
+  - W2, Edit: a centred "BRB" and a right-aligned copy, each edited to
+    "BRB · back soon" (a real reshape: its stored width from 0.093 to 0.323
+    of the design's): the same id and `z`; `h` equal to 1e-6; the centre
+    (0.5) and the right edge (0.546336) kept to 1e-6; the face updated 8.2
+    and 5.7 ms after Save. An overlay drag of the first text while its
+    editor was open: the text moved and was stored, and the editor stayed
+    open on that text, the same field element, the draft "BRB draft" as
+    typed, the caret at 3 and the focus kept.
+  - W3, snapping (drags in Arrange by the protocol's mouse events): dropped
+    5 px off the overlay's vertical centre line, the stored centre was 0.5
+    (±1e-6), with a guide at x = 480 mid-drag; dropped near the circle's
+    left edge, the text's left edge lay on the circle's (259.98 px both),
+    with a guide there; with Ctrl (`modifiers: 2` on every mouse event, no
+    key event), no guide, and stored where dropped. The harness's mutation,
+    a drop 9 px from the centre line, didn't snap, as it must not.
+  - W4, the light with Hide off: takes of the 1920×1080 screen at 30 fps
+    by the Mixer's Record. (a) 20.6 s (617 frames): 24 `screen-recording`
+    events, the light's words changing within 0.1 ms of the page hearing
+    each, and gone within 0.1 ms of "idle". (b) A quick take, stopped
+    0.70 s after Record (14 frames): the light showed "REC", then
+    "REC 0:00". (c) A 12 s take with the overlay closed and reopened: the
+    reopened page heard its own status, read `screen_recording_status`
+    (recording, 4,015 ms) and drew "REC 0:04" from it 7 ms after its own
+    status, before the next event (173 ms after). Not measurable here:
+    whether "m:ss" rounds `elapsedMs` down, since no report's fraction of
+    a second reached 0.5 s, and below that rounding down and to the nearest
+    agree.
+  - W5, W4's takes decoded frame by frame: the dot in 607 of 607 frames of
+    (a), from its first frame to the last `recording` report; 14 of 14 of
+    (b); in (c), 101 of 101 before the close and 185 of 185 from the
+    reopened page's first light. No frame in those ranges missed it. The
+    gap while the overlay window was closed and reopening, 45 frames
+    (about 1.5 s), had no light.
+  - W6, Hide on (Locked, the overlay on the 1920×1080 screen): the overlay
+    window's display affinity read 0x11 (`WDA_EXCLUDEFROMCAPTURE`) only
+    during the protected take, while Replay was armed and during the take
+    inside it, and 0x0 otherwise. Divora's own files, decoded from frame 0:
+    0 frames with the dot in the 10 s protected take (312 frames), the take
+    inside Replay (162) and the saved Replay clip (481); the Hide-off
+    control take had the dot in 140 of 140 frames of its middle, so the
+    zeros mean something. The stand-in: 0 frames with the dot in the
+    protected take's steady middle (517) and 0 within 1 s of every edge:
+    the protected take's start (118 frames) and Stop (121), Replay arming
+    (120), the take inside Replay's start (98) and Stop (120), and Replay
+    off (117). So on this Windows 11 PC a Desktop Duplication capture never
+    showed the light with Hide on, the edges included. A window capture of
+    the overlay and OBS itself weren't tried (Y3), and a take that ends by
+    itself wasn't produced (there is no time limit). The harness's own
+    decode of the stand-in's file first stalled: ffmpeg warns once for
+    each frame with a repeated millisecond timestamp (161 lines), and the
+    analyser read those warnings only at the end, so the pipe filled.
+    Reading them as they came fixed it; every one of the 3,048 frames had
+    decoded.
+  - W7, Replay (Hide off): armed, "REPLAY"; a take inside, "REC 0:00" to
+    "REC 0:04"; the take's end, "REPLAY"; the engine stopped (Replay held),
+    nothing; started, "REPLAY"; off, nothing. 30 events, the light's words
+    changing within 0.1 ms of the page hearing each. The take inside
+    Replay, decoded before it was deleted: the dot in 137 of 137 frames.
+  - W8, an older build: not run (the owner chose to skip it). What "Older
+    builds" says under "Text charms (v1.62.0)" is from the code and the
+    tests.
+  - W9, cost: ten texts and the light against the circle alone, as the
+    overlay's renderer's private memory (5 samples, the median) and the 3D
+    engine time of dwm and Divora's processes (15 one-second samples a
+    state); gates +20 MB and +0.5 percentage points. It passed on the
+    third run. Runs 1 and 2 each failed the idle 3D gate, +1.13 and +1.12
+    points, because of the harness: they measured the idle circle alone
+    with main's window on Settings and the idle texts with it on the Mixer
+    (the Replay-armed pair the other way round), whose level meters move with the microphone and cost about 0.9 points on
+    their own. A diagnosis run measured each state on the same page,
+    per process: idle, the circle alone 0.885 % against ten texts and the
+    light 0.749 % with Settings showing, and 1.826 % against 1.566 % with
+    the Mixer showing. Run 3, every state with Settings showing: idle +0.27
+    points and +4.6 MB; the light drawn (Replay armed) −0.65 points and
+    +7.0 MB. Run to run the 3D figures vary by about ±0.3 points.
+  - Not tried (owner checks, in "Text charms (v1.62.0)" in
+    [`MANUAL_TESTS.md`](MANUAL_TESTS.md)): Ctrl held as a real key while
+    dragging, and Alt pressed alone in Arrange; typing with an IME and the
+    emoji panel; OBS's Window and Display Capture of the overlay with Hide
+    on, at a take's start and Stop and at Replay off; each colour over a
+    game, and keyed in OBS with its Green and Magenta presets; Windows 10;
+    a 150 % screen; a take over an hour. Not measured: a take that ends
+    by itself (sleep, unplugging a screen, a full disk and a failing
+    encoder were out of bounds). Not measurable here: mixed DPI, and the
+    fallback fonts on other PCs.
 
 Drag, border, taskbar, focus and reopen behaviour from v1.51.3 can only be
 checked on a desktop: see "Stream overlay (v1.16.0)" in
@@ -7260,8 +7931,9 @@ In `obs/mod.rs`:
 
 ### Not in this release
 
-- `obs_run` and OBS actions for MIDI and glyphs: v1.64.0's bindings, which
-  will send it. `obs_reconnect` (Try again) is new instead.
+- `obs_run` and OBS actions for MIDI and glyphs: the bindings release,
+  which will send it (v1.67.0 since the tail was split; labelled v1.64.0
+  when this shipped). `obs_reconnect` (Try again) is new instead.
 - Inputs and Config events, so a deleted or renamed source and a
   scene-collection switch are seen late ("The protocol").
 - Nesting two timers that switch to the same scene (two breaks from Add
