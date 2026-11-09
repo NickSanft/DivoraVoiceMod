@@ -1182,7 +1182,7 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
     expect(within(ed).getByRole("button", { name: "Cancel" })).toHaveTextContent("Cancel");
     expect(within(ed).getByText("Preview")).toBeInTheDocument();
     for (const line of [
-      "Up to 200 characters on up to 5 lines. An emoji counts as 2 or more. Enter starts a new line.",
+      "Up to 200 characters on up to 5 lines. Most emoji count as 2 or more. Enter starts a new line.",
       "An outline keeps text readable over a game.",
       "Lines break only where you press Enter.",
       "Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not the size. Edit keeps its height and the side it's lined up to where it can: text too wide for the overlay, for example, is made smaller to fit. Letters Divora's fonts don't have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc cancels.",
@@ -1200,13 +1200,15 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
 
   it("the copy: the light's help (its Hide line only where Windows offers Hide), the OBS line, the Background line and Colour mood", async () => {
     const LIGHT =
-      "The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY while Replay is on (not while it's held). It's part of the overlay, so Divora's recordings and OBS show it too, unless Hide from recordings is on.";
+      "The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY while Replay is on (not while it's held). It's part of the overlay, so Divora's recordings and OBS show it too.";
     const HIDE =
-      "With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release, and for a moment as a recording starts, or when one ends without your Stop, such as Replay turning off or a take that ends by itself.";
+      "With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked Windows to leave the overlay out of captures, so Divora's recordings don't show it, and OBS may not either. While you arrange, it's drawn and recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first Windows 11 release, and for a moment as a recording starts, or when one ends without your Stop, such as Replay turning off or a take that ends by itself.";
     const first = mount();
     await flush();
     expect(first.getByText(LIGHT)).toBeInTheDocument();
     expect(first.queryByText(HIDE)).toBeNull();
+    // Where Windows doesn't offer Hide, no copy names it.
+    expect(first.queryAllByText(/Hide from recordings/)).toHaveLength(0);
     expect(
       first.getByText(
         "If you use OBS, add images and text in OBS. Charms are for the window OBS captures and for recordings without OBS.",
@@ -1879,8 +1881,8 @@ describe("SettingsScreen — Hourglass (v1.59.0)", () => {
     await flush();
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(first.getByText(help)).toBeInTheDocument();
-    // The timer's line, by its colon: v1.62.0's recording-light help ends
-    // "unless Hide from recordings is on."
+    // The timer's line, by its colon: v1.62.0's recording-light help names
+    // Hide from recordings too.
     expect(first.queryByText(/Hide from recordings is on:/)).toBeNull();
     const scene = JSON.parse(window.localStorage.getItem("divora.overlayScene") ?? "{}") as {
       elements: Array<{ type: string; timer?: string }>;

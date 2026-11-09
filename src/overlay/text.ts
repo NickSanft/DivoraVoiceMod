@@ -79,7 +79,8 @@ export const COLOURS: readonly TextColour[] = Object.freeze([
 export const ALIGNS: readonly TextAlign[] = Object.freeze(["left", "center", "right"]);
 
 /** The creation limits: UTF-16 code units after normalization (as HTML
- *  `maxlength` counts them, so an emoji counts 2 or more), and lines. */
+ *  `maxlength` counts them, so most emoji count 2 or more; "⭐" counts 1),
+ *  and lines. */
 export const MAX_TEXT = 200;
 export const MAX_LINES = 5;
 

@@ -2700,13 +2700,13 @@ function OverlayCharmRows(): JSX.Element {
       <div style={helpStyle}>
         The recording light shows ● REC and the time while Divora records your screen, and ● REPLAY
         while Replay is on (not while it's held). It's part of the overlay, so Divora's recordings
-        and OBS show it too, unless Hide from recordings is on.
+        and OBS show it too.
       </div>
       <Show when={app.overlayStatus().hideAvailable}>
         <div style={helpStyle}>
           With Hide from recordings on and the overlay locked, it's drawn only while Divora has asked
-          Windows to leave the overlay out of captures. While you arrange, it's drawn and recordings
-          can see it. Like the rest of the overlay, it may still show on Windows 10 and the first
+          Windows to leave the overlay out of captures, so Divora's recordings don't show it, and OBS
+          may not either. While you arrange, it's drawn and recordings can see it. Like the rest of the overlay, it may still show on Windows 10 and the first
           Windows 11 release, and for a moment as a recording starts, or when one ends without your
           Stop, such as Replay turning off or a take that ends by itself.
         </div>
@@ -2838,7 +2838,7 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
         />
         <div style={{ display: "flex", "justify-content": "space-between", gap: "var(--s4)" }}>
           <div id={helpId} style={helpStyle}>
-            Up to 200 characters on up to 5 lines. An emoji counts as 2 or more. Enter starts a new
+            Up to 200 characters on up to 5 lines. Most emoji count as 2 or more. Enter starts a new
             line.
           </div>
           <div

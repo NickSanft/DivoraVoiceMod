@@ -1868,8 +1868,9 @@ the box the streamer gives them in Arrange.
 - **Creation limits, not read rules.** 200 UTF-16 code units and 5 lines,
   counted after normalizing (`readCharmText`), checked by `addRefusal`, by
   `set` and by Settings' Save. UTF-16 units are what HTML's `maxlength`
-  counts, so the field and the limit agree; an emoji counts as 2 or more,
-  which the editor says, and its count shows. A longer stored text (a later
+  counts, so the field and the limit agree; most emoji count as 2 or more
+  (one in the Basic Multilingual Plane with no variation selector, such
+  as ⭐, counts 1), which the editor says, and its count shows. A longer stored text (a later
   build's, or a hand edit) is live and drawn, cut at a ceiling far above
   the limits (`drawText`: its first 50 lines, then its first 4096 code
   units, never ending inside a surrogate pair), as names are cut on
