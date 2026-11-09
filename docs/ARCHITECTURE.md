@@ -1968,7 +1968,7 @@ the box the streamer gives them in Arrange.
   Fields not in it, and unknown keys, are kept as stored; the id and `z`
   never change. If the shape (`nw : nh`) is the same, only the fields
   change. If not, the charm keeps its designed height and takes the new
-  shape's width; `fitSize` scales it down together if that is wider than
+  shape's width (so a line added makes its letters smaller); `fitSize` scales it down together if that is wider than
   the design, and raises a short side under 24 px where it fits. Where it
   is drawn in `viewport`, the overlay window's CSS size (the design size
   when absent), it keeps the side its alignment names (left edge, centre

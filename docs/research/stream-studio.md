@@ -1209,7 +1209,7 @@ The tail was one row, "v1.62.0 Charms everywhere": one overlay window per monito
 
 The tail's first minor (owner Q1; Q2 moved the name "Charms everywhere" to v1.66.0, when charms reach every screen).
 
-**Goal.** Type a short text in Settings and show it on the overlay in one of Divora's own fonts and in colours OBS's key presets leave alone; snap charms into line while arranging; and show a small light that says when Divora is recording, without putting a text field on a window captures can see.
+**Goal.** Type a short text in Settings and show it on the overlay in one of Divora's own fonts and in colours OBS's key presets leave alone; snap charms into line while arranging; and show a small light that says when Divora is recording your screen, without putting a text field on a window captures can see.
 
 **Not.** No text typed on the overlay; no font size control (the box sets the size); no automatic wrapping; no free colour picker; no network fonts and no list of Windows' fonts to pick from (letters the bundled fonts lack fall back to them); no links, markup or animation; the light isn't a window of its own. No video charms, window capture or per-screen windows (later minors).
 

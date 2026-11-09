@@ -2960,10 +2960,10 @@ function CharmTextEditor(props: CharmTextEditorProps): JSX.Element {
       </div>
       <div style={helpStyle}>
         Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not
-        the size. Edit keeps its height and the side it's lined up to where it can: text too wide
-        for the overlay, for example, is made smaller to fit. Letters Divora's fonts don't have,
-        like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc
-        cancels.
+        the size. Edit keeps its height (so adding a line makes the letters smaller) and the side
+        it's lined up to where it can: text too wide for the overlay, for example, is made smaller
+        to fit. Letters Divora's fonts don't have, like Cyrillic, Chinese or emoji, show in a
+        Windows font instead. Ctrl+Enter saves. Esc cancels.
       </div>
     </div>
   );

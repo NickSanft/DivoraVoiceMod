@@ -1185,7 +1185,7 @@ describe("SettingsScreen — text charms and the light (v1.62.0)", () => {
       "Up to 200 characters on up to 5 lines. Most emoji count as 2 or more. Enter starts a new line.",
       "An outline keeps text readable over a game.",
       "Lines break only where you press Enter.",
-      "Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not the size. Edit keeps its height and the side it's lined up to where it can: text too wide for the overlay, for example, is made smaller to fit. Letters Divora's fonts don't have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc cancels.",
+      "Its size is its box: resize it in Arrange, like a picture. The preview shows the look, not the size. Edit keeps its height (so adding a line makes the letters smaller) and the side it's lined up to where it can: text too wide for the overlay, for example, is made smaller to fit. Letters Divora's fonts don't have, like Cyrillic, Chinese or emoji, show in a Windows font instead. Ctrl+Enter saves. Esc cancels.",
     ]) {
       expect(within(ed).getByText(line)).toBeInTheDocument();
     }
